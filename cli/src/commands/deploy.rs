@@ -234,6 +234,9 @@ pub struct PreparedDeploy {
     /// Declarations from the packed manifest, carried so activation never reads
     /// a source manifest that may have changed since upload.
     cron_triggers: Vec<CronTriggerReceipt>,
+    /// Webhook names whose packed manifest sets boolean `wake: true`. The
+    /// receipt path needs the deployed agent id, which activation returns.
+    wake_names: Vec<String>,
     label: String,
     env: String,
     requested_repo: Option<String>,
@@ -761,6 +764,7 @@ pub(super) async fn prepare_deploy_with_commit_sha(
     // or an empty-receipt fallback for an unreadable manifest.
     let (_, manifest_body) = packed_manifest.context("reading the uploaded bundle's manifest")?;
     let cron_triggers = deploy_cron_triggers_from_manifest(&manifest_body)?;
+    let wake_names = wake_names_from_manifest(&manifest_body)?;
 
     Ok(PreparedDeploy {
         delivery: opts.delivery,
@@ -768,6 +772,7 @@ pub(super) async fn prepare_deploy_with_commit_sha(
         outcome,
         plugin_name,
         cron_triggers,
+        wake_names,
         label,
         env,
         requested_repo: opts.repo,
@@ -855,6 +860,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         outcome,
         plugin_name,
         cron_triggers,
+        wake_names,
         label,
         env,
         requested_repo,
@@ -973,6 +979,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         bring_up_local(&plugin_dir, &decl, &lock, &outcome.agent.name, &project).await?;
     }
 
+    let wake_triggers = wake_trigger_receipts(&wake_names, &outcome.agent.id);
     Ok(DeployOutput {
         plugin_name,
         label,
@@ -989,6 +996,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         deployment_environment: outcome.deployment.environment,
         deployment_status: outcome.deployment.status,
         cron_triggers,
+        wake_triggers,
         warnings,
     })
 }
@@ -1039,7 +1047,22 @@ pub struct DeployOutput {
     pub deployment_environment: String,
     pub deployment_status: String,
     pub cron_triggers: Vec<CronTriggerReceipt>,
+    /// Targetless wake routes from the packed manifest. Empty when no webhook
+    /// declares boolean `wake: true` with a name.
+    pub wake_triggers: Vec<WakeTriggerReceipt>,
     pub warnings: Vec<String>,
+}
+
+/// One targetless webhook wake from the immutable bundle uploaded by a deploy.
+///
+/// `path` is the platform route `/hooks/{agent_id}/{name}/wake`, not the
+/// manifest webhook path and not an absolute URL. `mode` is the literal
+/// `targetless`. The receipt carries no credential.
+#[derive(Debug, Serialize)]
+pub struct WakeTriggerReceipt {
+    pub name: String,
+    pub path: String,
+    pub mode: String,
 }
 
 impl DeployOutput {
@@ -1059,6 +1082,15 @@ impl DeployOutput {
         }
         for warning in &self.warnings {
             ui.warn(warning);
+        }
+    }
+
+    fn render_wake(&self, ui: &crate::ui::Ui) {
+        for trigger in &self.wake_triggers {
+            ui.payload(&format!(
+                "{} {} {}",
+                trigger.name, trigger.path, trigger.mode
+            ));
         }
     }
 }
@@ -1101,6 +1133,7 @@ impl crate::ui::CliOutput for AllTargetsDeployOutput {
         if let Some((last, earlier)) = self.results.split_last() {
             for entry in earlier {
                 entry.result.render_cron(ui);
+                entry.result.render_wake(ui);
             }
             <DeployOutput as crate::ui::CliOutput>::render(&last.result, ui);
         }
@@ -1160,6 +1193,7 @@ impl crate::ui::CliOutput for DeployOutput {
                 "status": self.deployment_status,
             },
             "cron_triggers": self.cron_triggers,
+            "wake_triggers": self.wake_triggers,
             "warnings": self.warnings,
         })
     }
@@ -1193,6 +1227,7 @@ impl crate::ui::CliOutput for DeployOutput {
             ),
         );
         self.render_cron(ui);
+        self.render_wake(ui);
     }
 }
 
@@ -1225,6 +1260,39 @@ fn deploy_cron_triggers_from_manifest(body: &str) -> Result<Vec<CronTriggerRecei
             })
         })
         .collect())
+}
+
+/// Webhook names that declare a targetless wake. Invalid JSON is an error, the
+/// same one the cron reader raises. Omitted `wake`, `wake: false`, a
+/// non-boolean `wake`, cron rows, and rows without a name are skipped.
+fn wake_names_from_manifest(body: &str) -> Result<Vec<String>> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(body).context("plugin manifest is not valid JSON")?;
+    let Some(triggers) = manifest.get("triggers").and_then(|value| value.as_array()) else {
+        return Ok(Vec::new());
+    };
+    Ok(triggers.iter().filter_map(wake_name).collect())
+}
+
+fn wake_name(trigger: &serde_json::Value) -> Option<String> {
+    if trigger.get("type").and_then(|value| value.as_str()) != Some("webhook") {
+        return None;
+    }
+    if trigger.get("wake").and_then(|value| value.as_bool()) != Some(true) {
+        return None;
+    }
+    Some(trigger.get("name")?.as_str()?.to_string())
+}
+
+fn wake_trigger_receipts(names: &[String], agent_id: &str) -> Vec<WakeTriggerReceipt> {
+    names
+        .iter()
+        .map(|name| WakeTriggerReceipt {
+            name: name.clone(),
+            path: crate::api::hook_wake_route(agent_id, name),
+            mode: "targetless".to_string(),
+        })
+        .collect()
 }
 
 /// Match the selected hook-fire rule, using the resolved agent's API-normalized

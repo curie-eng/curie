@@ -60,6 +60,7 @@ INSTALLED = {
     "gitlab+gitlab@saas",
 }
 NOT_INSTALLED = sorted(EXPECTED_PAIRINGS - INSTALLED)
+CONTEXT = "scratch-cluster"
 NAMESPACE = "test-factory-acceptance"
 # The steps every forge-loop entry tears down, whatever its driver adds.
 GENERIC_TEARDOWN = {
@@ -365,7 +366,7 @@ def _args(tmp_path: Path, pairing: str = "github+github") -> Any:
             "--pairing",
             pairing,
             "--context",
-            "k8",
+            CONTEXT,
             "--candidate",
             "refs/pull/1/head",
             "--candidate-images",
@@ -399,7 +400,7 @@ def test_real_run_passes_shared_flags_and_judges_each_step(tmp_path: Path) -> No
         assert _contains(argv, list(step.command)), argv
         assert timeout == step.deadline_seconds
         for flag, value in (
-            ("--context", "k8"),
+            ("--context", CONTEXT),
             ("--candidate", "refs/pull/1/head"),
             ("--candidate-images", "build"),
             ("--kind-cluster", "dev"),
@@ -415,7 +416,7 @@ def test_real_run_passes_shared_flags_and_judges_each_step(tmp_path: Path) -> No
 
     assert kubectl.calls, "the namespace teardown check never ran"
     for argv in kubectl.calls:
-        assert argv[argv.index("--context") + 1] == "k8"
+        assert argv[argv.index("--context") + 1] == CONTEXT
         assert NAMESPACE in argv
 
     summary = json.loads((tmp_path / "summary.json").read_text())
@@ -511,8 +512,8 @@ def test_a_real_run_fails_on_an_unclassified_credential_expiry(tmp_path: Path) -
 @pytest.mark.parametrize(
     "stderr",
     [
-        'error: context "k8" does not exist',
-        "Unable to connect to the server: dial tcp: lookup k8: no such host",
+        f'error: context "{CONTEXT}" does not exist',
+        f"Unable to connect to the server: dial tcp: lookup {CONTEXT}: no such host",
         # An unrelated NotFound must not read as the namespace being gone.
         "Error from server (NotFound): the server could not find the requested resource",
     ],
@@ -543,7 +544,7 @@ def test_real_run_fails_a_step_that_overruns_its_deadline(tmp_path: Path) -> Non
 def test_real_run_of_a_not_installed_pairing_runs_no_step(
     key: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    args = fe.parse_args(["acceptance", "--pairing", key, "--context", "k8"])
+    args = fe.parse_args(["acceptance", "--pairing", key, "--context", CONTEXT])
     runner = _Runner(_passing_evidence())
     kubectl = _Kubectl()
     assert acceptance.run(args, runner=runner, kubectl=kubectl) == fe.EXIT_SCENARIO
@@ -567,7 +568,7 @@ def _github_loop_evidence() -> dict[str, Any]:
         "candidate_commit": "c" * 40,
         "image_tag": "sha-" + "c" * 40,
         "candidate_image_mode": "published",
-        "kube_context": "k8",
+        "kube_context": CONTEXT,
         "namespace": NAMESPACE,
         "release": "curie",
         "run_id": "0123456789ab",

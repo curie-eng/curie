@@ -53,6 +53,25 @@ class GitHubTrackerConnection:
         self.config = config
         self._app = _github_app(config.name, config.credential)
         self.html_base = html_base(config.api_url, config.host)
+        # Only to read the App's own bot login; tokens still come from the caller.
+        self._provider = github_app_provider(self._app, api_url=config.api_url, ca_bundle=ca_bundle)
+
+    async def _bot_login(self) -> str:
+        """The login an installation token of this App writes as, ``<slug>[bot]``.
+
+        The slug is read under the App JWT and cached
+        (`GitHubCredentials.app_slug`,
+        https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app).
+        Unreadable is ``Unavailable("own_identity_unreadable")``.
+        """
+
+        from curie_api.github_app import GitHubAppError
+
+        try:
+            slug: str = await run_in_threadpool(self._provider.credentials.app_slug)
+        except GitHubAppError:
+            raise Unavailable("own_identity_unreadable") from None
+        return f"{slug}[bot]"
 
     def for_repository(
         self,
@@ -75,6 +94,7 @@ class GitHubTrackerConnection:
             label=self.config.label if label is None else label,
             mention=self.config.mention,
             app_id=self._app.app_id,
+            own_login=self._bot_login,
         )
 
 

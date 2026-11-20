@@ -178,12 +178,20 @@ def target() -> tuple[str, str | None, str]:
 
 
 def prepare(payload: dict[str, Any]) -> tuple[bytes, str, str, str]:
-    """Return ``(body, signature, delivery, timestamp)`` for one forward."""
+    """Return ``(body, signature, delivery, timestamp)`` for one forward.
 
+    ``alerts`` may be absent, null or a list. Any other value is a malformed
+    payload and raises ``ValueError``, which the handler answers with 400. The
+    check runs first so nothing is signed, probed or forwarded for it.
+    """
+
+    supplied = payload.get("alerts")
+    if supplied is not None and not isinstance(supplied, list):
+        raise ValueError("alerts must be a list when present")
     hook, tool_access, secret = target()
     group_key = str(payload.get("groupKey") or "")
     status = str(payload.get("status") or "")
-    alerts = [alert for alert in payload.get("alerts") or [] if isinstance(alert, dict)]
+    alerts = [alert for alert in supplied or [] if isinstance(alert, dict)]
     fingerprints = sorted(str(alert.get("fingerprint") or "") for alert in alerts)
     starts_at = sorted(str(alert.get("startsAt") or "") for alert in alerts)
     forwarded = dict(payload)

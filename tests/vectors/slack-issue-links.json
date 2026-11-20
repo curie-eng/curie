@@ -1,0 +1,660 @@
+[
+  {
+    "text": "<@U0BOT> please start <https://github.com/acme-corp/acme-bot/issues/41>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<@U0BOT> start <https://github.com/acme-corp/acme-bot/issues/41|issue 41> today",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<@U0BOT> <https://github.com/acme-corp/acme-bot/issues/41|https://github.com/acme-corp/acme-bot/issues/41>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/41> and again <https://github.com/acme-corp/acme-bot/issues/41>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/41|https://github.com/acme-corp/acme-bot/issues/42>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 42
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/41> <https://github.com/acme-corp/acme-tools/issues/7>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-tools",
+        "kind": "issue",
+        "number": 7
+      }
+    ]
+  },
+  {
+    "text": "bare https://github.com/acme-corp/acme-bot/issues/41 in text",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/41/>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/41?notification_referrer_id=x&amp;y=1>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/41#issuecomment-abc>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<HTTPS://GitHub.COM/Acme-Corp/Acme-Bot/issues/41>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "Acme-Corp",
+        "repo": "Acme-Bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<https://ghe.example.com:8443/acme-corp/acme-bot/issues/7>",
+    "links": [
+      {
+        "host": "ghe.example.com:8443",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 7
+      }
+    ]
+  },
+  {
+    "text": "<http://ghe.example.com/acme-corp/acme-bot/issues/7>",
+    "links": [
+      {
+        "host": "ghe.example.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 7
+      }
+    ]
+  },
+  {
+    "text": "<https://acme@github.com/acme-corp/acme-bot/issues/41>",
+    "links": [
+      {
+        "host": "acme@github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/pull/12>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "pull",
+        "number": 12
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/pulls/12>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "pull",
+        "number": 12
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/pull/12/files>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://gitlab.example.com/acme-corp/acme-bot/-/issues/5>",
+    "links": [
+      {
+        "host": "gitlab.example.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://gitlab.example.com/acme-corp/acme-bot/-/merge_requests/5>",
+    "links": [
+      {
+        "host": "gitlab.example.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/abc>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/new>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/Issues/41>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/issues>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "issues",
+        "repo": "",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/0>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/041>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/2147483648>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/2147483647>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 2147483647
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme%2Dbot/issues/41>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme%2Dbot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/abc> <https://github.com/acme-corp/acme-bot/issues/def>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "see https://github.com/acme-corp/acme-bot/issues/41.",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  },
+  {
+    "text": "`https://github.com/acme-corp/acme-bot/issues/41`",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 41
+      }
+    ]
+  },
+  {
+    "text": "<@U0BOT> what does this repo do? <https://github.com/acme-corp/acme-bot>",
+    "links": []
+  },
+  {
+    "text": "<https://example.com/docs/factory?issues=41#pull>",
+    "links": []
+  },
+  {
+    "text": "<@U0BOT> <#C0EXAMPLE1|general> <!here> <mailto:dev@example.com|dev@example.com>",
+    "links": []
+  },
+  {
+    "text": "github.com/acme-corp/acme-bot/issues/41 without a scheme",
+    "links": []
+  },
+  {
+    "text": "ftp://github.com/acme-corp/acme-bot/issues/41",
+    "links": []
+  },
+  {
+    "text": "",
+    "links": []
+  },
+  {
+    "text": "<https://github.com/acme-corp/acme-bot/issues/1> <https://github.com/acme-corp/acme-bot/issues/2> <https://github.com/acme-corp/acme-bot/issues/3> <https://github.com/acme-corp/acme-bot/issues/4> <https://github.com/acme-corp/acme-bot/issues/5> <https://github.com/acme-corp/acme-bot/issues/6> <https://github.com/acme-corp/acme-bot/issues/7> <https://github.com/acme-corp/acme-bot/issues/8> <https://github.com/acme-corp/acme-bot/issues/9> <https://github.com/acme-corp/acme-bot/issues/10> <https://github.com/acme-corp/acme-bot/issues/11> <https://github.com/acme-corp/acme-bot/issues/12> <https://github.com/acme-corp/acme-bot/issues/13> <https://github.com/acme-corp/acme-bot/issues/14> <https://github.com/acme-corp/acme-bot/issues/15> <https://github.com/acme-corp/acme-bot/issues/16> <https://github.com/acme-corp/acme-bot/issues/17> <https://github.com/acme-corp/acme-bot/issues/18> <https://github.com/acme-corp/acme-bot/issues/19> <https://github.com/acme-corp/acme-bot/issues/20> <https://github.com/acme-corp/acme-bot/issues/21> <https://github.com/acme-corp/acme-bot/issues/22> <https://github.com/acme-corp/acme-bot/issues/23> <https://github.com/acme-corp/acme-bot/issues/24> <https://github.com/acme-corp/acme-bot/issues/25> <https://github.com/acme-corp/acme-bot/issues/26> <https://github.com/acme-corp/acme-bot/issues/27> <https://github.com/acme-corp/acme-bot/issues/28> <https://github.com/acme-corp/acme-bot/issues/29> <https://github.com/acme-corp/acme-bot/issues/30> <https://github.com/acme-corp/acme-bot/issues/31> <https://github.com/acme-corp/acme-bot/issues/32> <https://github.com/acme-corp/acme-bot/issues/33>",
+    "links": [
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 1
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 2
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 3
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 4
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 5
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 6
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 7
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 8
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 9
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 10
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 11
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 12
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 13
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 14
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 15
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 16
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 17
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 18
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 19
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 20
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 21
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 22
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 23
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 24
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 25
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 26
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 27
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 28
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 29
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 30
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 31
+      },
+      {
+        "host": "github.com",
+        "owner": "acme-corp",
+        "repo": "acme-bot",
+        "kind": "issue",
+        "number": 32
+      },
+      {
+        "host": "",
+        "owner": "",
+        "repo": "",
+        "kind": "malformed",
+        "number": null
+      }
+    ]
+  }
+]

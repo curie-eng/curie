@@ -76,6 +76,7 @@ GENERIC_TEARDOWN = {
     "restore fixture default branch",
     "delete namespaces",
 }
+CONTEXT = "scratch-cluster"
 NAMESPACE = "test-factory-acceptance"
 
 
@@ -326,7 +327,7 @@ def _args(tmp_path: Path, key: str) -> Any:
             "--pairing",
             key,
             "--context",
-            "k8",
+            CONTEXT,
             "--candidate-images",
             "build",
             "--namespace",
@@ -415,7 +416,7 @@ def _fixture_evidence(state_dir: Path) -> dict[str, Any]:
     return {
         "schema": "curie.factory-e2e.evidence/v1",
         "mode": "run:forge-loop",
-        "kube_context": "k8",
+        "kube_context": CONTEXT,
         "namespace": NAMESPACE,
         "forge": "gitlab",
         "forge_target": "fixture",

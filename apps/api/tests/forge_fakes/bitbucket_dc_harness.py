@@ -44,6 +44,7 @@ def jira_like_tracker(ledger: WriteLedger, faults: PageFaults) -> InMemoryTracke
     caps[Operation.LINK_PULL_REQUEST] = Support.NOOP
     caps[Operation.DEPENDENCIES] = Support.NOOP
     caps[Operation.GROUP_MEMBERSHIP] = Support.UNSUPPORTED
+    caps[Operation.CREATE_LINKED_ISSUE] = Support.UNSUPPORTED
     return InMemoryTracker(
         kind=types.JIRA_CLOUD, label=LABEL, capabilities=caps, ledger=ledger, faults=faults
     )
@@ -135,6 +136,9 @@ class BitbucketDcHarness:
     def close_pull_request(self, pull_request: PullRequestRef, *, merged: bool) -> None:
         self.fake.set_state(int(pull_request.number), "MERGED" if merged else "DECLINED")
 
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        return self._tracker.comment(issue, actor, body)
+
     def add_foreign_comment(
         self, target: ReplyTarget, author: Actor, marker: str, body: str
     ) -> None:
@@ -166,3 +170,15 @@ class BitbucketDcHarness:
 
     def write_count(self) -> int:
         return self._ledger.writes + self.fake.writes
+
+    # UI evidence hosting is declared unsupported on this host, and its commit
+    # read reports no tree, so there is nothing to observe from outside.
+
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return None
+
+    def evidence_ref(self, key: str) -> str | None:
+        return None
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        return None

@@ -4,6 +4,10 @@ The umbrella Helm chart: Langfuse + Postgres + Valkey + ClickHouse + RustFS +
 OTel Collector, plus the Agent Sandbox substrate and its security rails. Full
 component and rail detail in `charts/curie/README.md`.
 
+The gateway in `templates/channel-gateway.yaml` also requires one replica and
+Recreate: its durable SQLite replay ledger has one writer. Scaling requires a
+shared replay store and a separate reviewed change; there is no replica knob.
+
 ## Load-bearing invariants
 
 - **Values, not templates, for anything that varies by environment.** Per
@@ -266,7 +270,7 @@ component and rail detail in `charts/curie/README.md`.
   path for e2e/scratch clusters.
 - **CRDs in `crds/` are vendored, never templated.** Helm does not
   upgrade or delete `crds/` content; a teardown needs a manual
-  `kubectl delete crd <name>`. Do not move CRD definitions into `templates/`
+  `kubectl --context <context> delete crd <name>`. Do not move CRD definitions into `templates/`
   to make them "manageable" -- that changes install ordering guarantees
   Helm's `crds/` convention provides.
 - **The controller (`agentSandbox.controller.deploy`) is cluster-scoped.**
@@ -352,26 +356,25 @@ helm template charts/curie -f charts/curie/values-dev.yaml   # chart-authoring c
 Runtime check (the cheap default for a chart/sandbox/bundle change): installs a
 trimmed slice, runs the bundle-fetch init pair, and exec-asserts on the runner:
 ```bash
-curie dev chart-runtime-e2e            # implemented by scripts/chart-runtime-e2e.sh
-curie dev chart-runtime-e2e --force    # same, on a scratch context not named k8scratch
+curie dev chart-runtime-e2e --context <context>  # implemented by scripts/chart-runtime-e2e.sh
 ```
 A ticket whose AC is a runtime check (like #56, the bundle-fetch credential
 isolation) is only satisfied by running this and pasting its output -- lint /
 template do not exercise the init container or the live runner.
 
-It refuses any kube context not named `k8scratch`, because it installs and
-uninstalls a real release; `--force` is the override, and points at a disposable
-cluster only. The other script flags (`--namespace`, `--release`, `--chart`,
+It requires an explicit `--context <context>` for a disposable cluster because
+it installs and uninstalls a real release. The other script flags
+(`--namespace`, `--release`, `--chart`,
 `--runner-image`, `--expect-vulnerable`, `--keep`) are not yet exposed through
 `curie dev`; reach them with `bash scripts/chart-runtime-e2e.sh --help`.
 
 Cluster verification (a disposable local cluster, `kind` or `k3s`):
 ```bash
-helm install curie-dev charts/curie -n curie-dev --create-namespace \
+helm --kube-context <context> install curie-dev charts/curie -n curie-dev --create-namespace \
   -f charts/curie/values-dev.yaml
-kubectl get pods -n curie-dev -w
-helm test curie-dev -n curie-dev                              # re-runs the three preflights + the security probe suite
-kubectl logs -n curie-dev job/curie-dev-preflight-avx
-kubectl logs -n curie-dev job/curie-dev-security-probe        # rails 1, 2, 4
-kubectl logs -n curie-dev curie-dev-security-probe-hardening  # rail 3
+kubectl --context <context> get pods -n curie-dev -w
+helm --kube-context <context> test curie-dev -n curie-dev       # re-runs the three preflights + the security probe suite
+kubectl --context <context> logs -n curie-dev job/curie-dev-preflight-avx
+kubectl --context <context> logs -n curie-dev job/curie-dev-security-probe        # rails 1, 2, 4
+kubectl --context <context> logs -n curie-dev curie-dev-security-probe-hardening  # rail 3
 ```

@@ -956,7 +956,7 @@ def test_the_attachment_manifest_is_forwarded_to_the_runner(
     ADR 0205 decision 8: it names files and outcomes and carries no
     capability, and the runner needs it to tell the current message's files
     from earlier ones. The reference stays worker-owned; the manifest must not
-    join it in ``_WORKER_OWNED_ENV``.
+    join it in ``WORKER_OWNED_ENV``.
     """
 
     payload = b"x"

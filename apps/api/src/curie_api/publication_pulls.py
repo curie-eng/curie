@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 
 from curie_api.forges.errors import Ambiguous, ForgeError
@@ -45,12 +45,22 @@ class PullRequestContract:
 
 
 def revision_refusal(
-    commit: Commit, *, commit_sha: str, revision_id: uuid.UUID, expected_parent: str
+    commit: Commit,
+    *,
+    commit_sha: str,
+    revision_ids: Collection[uuid.UUID],
+    expected_parent: str,
 ) -> str | None:
-    """Why ``commit`` is not this revision's marked commit on its expected parent."""
+    """Why ``commit`` is not a marked commit of ``revision_ids`` on its expected parent.
 
-    if commit.sha != commit_sha or f"Curie-Revision: {revision_id}" not in (
-        commit.message.splitlines()
+    ``revision_ids`` is the publication's own revision, and for a publication
+    recovery also the earlier failed revisions it may adopt (#5429): their
+    pushed commit stands for this revision only on the same expected parent.
+    """
+
+    lines = commit.message.splitlines()
+    if commit.sha != commit_sha or not any(
+        f"Curie-Revision: {revision_id}" in lines for revision_id in revision_ids
     ):
         return "remote commit has no matching revision marker"
     if len(commit.parents) != 1 or commit.parents[0] != expected_parent:

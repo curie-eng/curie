@@ -1,0 +1,20 @@
+{
+  "source_run": "e2-live-4",
+  "candidate": "ab33bd597f373454bd3d553ab954d18059dbb68e",
+  "cli_turn_budget": 2,
+  "tool_calls": [
+    {"timestamp": "2026-11-12T10:47:05.874163+00:00", "name": "ToolSearch"},
+    {"timestamp": "2026-11-12T10:47:08.853440+00:00", "name": "Bash"},
+    {"timestamp": "2026-11-12T10:47:08.970984+00:00", "name": "mcp__sentinel__challenge"},
+    {"timestamp": "2026-11-12T10:47:09.022182+00:00", "name": "mcp__public__public_file"}
+  ],
+  "observed_response_hook_pids": [101, 102, 103],
+  "aci_events": [
+    {"ordinal": 3, "epoch": "example-revalidation-epoch", "kind": "error", "classification": "max-turns", "status": null, "output_tokens": null},
+    {"ordinal": 4, "epoch": "example-revalidation-epoch", "kind": "final", "classification": null, "status": "classified-failure", "output_tokens": null}
+  ],
+  "runner_turn_end": {"timestamp": "2026-11-12T10:49:53.236930+00:00", "status": "classified-failure", "duration_ms": 171981},
+  "cleanup_started_at": "2026-11-12T10:49:53.626400+00:00",
+  "last_response_reading": {"assistant_turns": 2, "output_tokens": 258},
+  "native_transcript_retained": false
+}

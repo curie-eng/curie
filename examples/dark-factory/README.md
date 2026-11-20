@@ -522,8 +522,11 @@ ephemeral-storage limit also caps their combined use, so a pod is evicted if any
 one volume passes its ceiling or the total passes 20Gi. The home volume holds
 the default uv, Cargo and pnpm caches; a run can instead put them under
 `/workspace`. Each factory sandbox requests 8Gi of memory, so the default
-`resourceQuota.hard.requestsMemory` of `8Gi` admits one at a time; raise
-`resourceQuota.hard.*` for concurrency. Sandboxes created before an upgrade keep
+`resourceQuota.hard.requestsMemory` of `10Gi` admits one at a time. Beside it,
+six standard sandboxes fit and a seventh is refused, because limits.cpu binds
+before requests.memory (factory CPU limit 2, standard CPU limit 1, limits.cpu
+8). A second factory sandbox does not fit. Raise
+`resourceQuota.hard.requestsMemory` for factory concurrency. Sandboxes created before an upgrade keep
 the limits they started with.
 
 To change one field, override it on the profile in your Helm values. For
@@ -569,7 +572,10 @@ factory against a disposable install.
 the start of each phase the skill calls `mcp__curie__report_progress`, and the
 platform edits one status comment on the issue with a live card showing the
 current phase, the loop rounds and the run's activity. A failed report never
-stops the run.
+stops the run. The card and the Slack progress card group the phases into
+seven plain-English steps declared under `stages`: reading the issue, planning
+the change, reviewing the plan, writing the change, reviewing the diff, opening
+the pull request, and waiting for CI.
 
 ## Evals
 

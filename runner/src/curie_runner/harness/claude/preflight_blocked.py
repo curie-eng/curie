@@ -39,6 +39,9 @@ class PreflightBlockedSession:
     async def close(self) -> None:
         return None
 
+    async def abort(self) -> None:
+        self._interrupted = True
+
     async def receive_turn(self) -> AsyncIterator[Any]:
         if self._interrupted:
             return

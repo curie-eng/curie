@@ -4,19 +4,27 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field, StrictBool, model_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, model_validator
 
-from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
+from curie_api.workitems.lifecycle import RetryConditionFact, WorkItemConflict, WorkItemOutcome
 
-from .. import workitem_dispatch
+from .. import (
+    memory_rules_context,
+    personal_execution,
+    requester_instruction_context,
+    workitem_dispatch,
+)
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import LivenessSessionDep, SessionDep
+from ..factory_tracker_result_runtime import CompletionContractName
 from ..forges.types import RepositoryRef, TrackerIssueRef
+from ..personal_execution import ModelAuthMode, OwnerContext
+from ..wirebody import RetryConditionBody
 from ..workitem_dispatch import DispatchConflict
 
 router = APIRouter(
@@ -45,6 +53,18 @@ class RepositoryIn(BaseModel):
     path: str = Field(min_length=1)
 
 
+class OwnerContextIn(BaseModel):
+    """The verified owner a personal execution runs as (#5376, ADR 0268).
+
+    Accepted only here, from the trusted worker: a principal of the agent's
+    tenant and the enrollment generation it is bound to.
+    """
+
+    tenant_id: uuid.UUID
+    principal_id: uuid.UUID
+    enrollment_generation: int = Field(ge=1)
+
+
 class AdmissionFacts(BaseModel):
     agent_id: uuid.UUID
     kind: str = Field(min_length=1)
@@ -56,9 +76,12 @@ class AdmissionFacts(BaseModel):
     objective: str = Field(min_length=1, max_length=65536)
     requester: str = Field(min_length=1)
     request_id: uuid.UUID
+    model_auth_mode: ModelAuthMode = "service"
+    owner: OwnerContextIn | None = None
+    requester_principal_id: uuid.UUID | None = None
 
     def admission(self) -> workitem_dispatch.Admission:
-        tracker, repository = self.tracker, self.repository
+        tracker, repository, owner = self.tracker, self.repository, self.owner
         return workitem_dispatch.Admission(
             agent_id=self.agent_id,
             kind=self.kind,
@@ -78,6 +101,17 @@ class AdmissionFacts(BaseModel):
             objective=self.objective,
             requester=self.requester,
             request_id=self.request_id,
+            requester_principal_id=self.requester_principal_id,
+            model_auth_mode=self.model_auth_mode,
+            owner=(
+                OwnerContext(
+                    tenant_id=owner.tenant_id,
+                    principal_id=owner.principal_id,
+                    enrollment_generation=owner.enrollment_generation,
+                )
+                if owner is not None
+                else None
+            ),
         )
 
 
@@ -103,12 +137,38 @@ class DeferBody(BaseModel):
     start_failure_detail: str | None = None
 
 
+# A Kubernetes volume name: a DNS label, as the sandbox pod spec names it.
+VOLUME_NAME_PATTERN = r"^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$"
+VolumeName = Annotated[str, StringConstraints(pattern=VOLUME_NAME_PATTERN)]
+
+
+class DeliveredLimitsIn(BaseModel):
+    """The limits the worker read from the sandbox it claimed (#5427).
+
+    Read from the created sandbox, never from desired configuration. A null or
+    absent volume means the substrate enforces no such limit, which can never
+    release a resource gate.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The runner container's memory limit.
+    memory_bytes: int | None = Field(ge=1)
+    # The sum of the pod's regular containers' ephemeral storage limits, the
+    # quantity the kubelet compares.
+    ephemeral_storage_bytes: int | None = Field(ge=1)
+    scratch_bytes: dict[VolumeName, Annotated[int, Field(ge=1)]]
+    # The turn limit in the boot environment the claim used.
+    max_turns: int | None = Field(ge=1)
+
+
 class StartBody(BaseModel):
     owner: str = Field(min_length=1)
     generation: int = Field(ge=1)
     claim_name: str = Field(min_length=1)
     sandbox_name: str = Field(min_length=1)
     context: workitem_dispatch.FactoryContext
+    delivered_limits: DeliveredLimitsIn
 
 
 class HeartbeatBody(BaseModel):
@@ -129,6 +189,16 @@ class FinishBody(BaseModel):
     # The CI fix round whose turn ended unpublished (#4330). Required for
     # ``ci_fix_unpublished`` and refused for every other cause.
     ci_fix_round: int | None = Field(default=None, ge=CI_FIRST_FIX_ROUND, le=CI_MAX_ROUNDS)
+    # The worker's typed safety fact for this turn (ADR 0269). A worker from
+    # an earlier release sends none; the body carries no protocol version to
+    # tell it from a current worker, so a missing fact is accepted as unknown:
+    # stored as NULL, which admits no implementation retry, never as clean.
+    retry_safety: Literal["no_effects", "flagged", "uncertain"] | None = None
+    # The provider retry condition the worker received, decoded tolerantly.
+    retry_condition: RetryConditionBody | None = None
+    # The scratch volume a scratch exhaustion filled (#5427). Required for
+    # ``sandbox_scratch_exhausted`` and refused for every other cause.
+    exhausted_volume: VolumeName | None = None
 
     @model_validator(mode="after")
     def _round_matches_cause(self) -> Self:
@@ -139,13 +209,38 @@ class FinishBody(BaseModel):
             raise ValueError("ci_fix_round is only valid with cause ci_fix_unpublished")
         return self
 
+    @model_validator(mode="after")
+    def _safety_absent_not_null(self) -> Self:
+        # Only an omitted fact reads as unknown; an explicit null is no fact.
+        if "retry_safety" in self.model_fields_set and self.retry_safety is None:
+            raise ValueError("retry_safety must be a safety fact when present")
+        return self
+
+    @model_validator(mode="after")
+    def _volume_matches_cause(self) -> Self:
+        scratch = self.cause.strip() == "sandbox_scratch_exhausted"
+        if scratch and self.exhausted_volume is None:
+            raise ValueError("sandbox_scratch_exhausted requires exhausted_volume")
+        if not scratch and self.exhausted_volume is not None:
+            raise ValueError("exhausted_volume is only valid with cause sandbox_scratch_exhausted")
+        return self
+
 
 class TerminationClaimBody(BaseModel):
     owner: str = Field(min_length=1)
 
 
+class TerminationClaimOut(BaseModel):
+    """What the claimant's termination record presents back (#5377)."""
+
+    runtime_epoch: int
+    request_version: int
+
+
 class TerminationBody(BaseModel):
     runtime_epoch: int = Field(ge=1)
+    # The request version the claim returned; a later claim or write moves it.
+    expected_request_version: int = Field(ge=1)
     observation: str = Field(min_length=1)
 
 
@@ -163,6 +258,73 @@ class RunningWorkItemRequest(BaseModel):
     repository_path: str
     context: workitem_dispatch.FactoryContext | None
     refusal: workitem_dispatch.RefusalCode | None
+    # How the running request completes (ADR 0277): by a pull request, or by
+    # one delivered tracker result with no pull request.
+    completion_contract: CompletionContractName
+
+
+class PersonalContextRequestOut(BaseModel):
+    """The WorkItem's latest request and the generation it snapshotted."""
+
+    id: uuid.UUID
+    sequence: int
+    status: str
+    version: int
+    enrollment_generation: int | None
+
+
+class PersonalContextEnrollmentOut(BaseModel):
+    """The owner's enrollment header: its generation, state and CAS version."""
+
+    generation: int
+    active: bool
+    version: int
+
+
+class PersonalContextOut(BaseModel):
+    """A personal WorkItem's owner, bound generation and versions (#5376).
+
+    Token free: identifiers, generations and versions only. ``enrollment`` is
+    null when the owner has no enrollment row.
+    """
+
+    work_item_id: uuid.UUID
+    agent_id: uuid.UUID
+    tenant_id: uuid.UUID
+    model_auth_mode: ModelAuthMode
+    owner_principal_id: uuid.UUID
+    enrollment_generation: int
+    work_item_version: int
+    request: PersonalContextRequestOut | None
+    enrollment: PersonalContextEnrollmentOut | None
+
+
+class RevalidationBody(BaseModel):
+    """The versions the caller read, compared and set in one transaction."""
+
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID
+    owner_principal_id: uuid.UUID
+    request_id: uuid.UUID
+    expected_work_item_version: int = Field(ge=1)
+    expected_request_version: int = Field(ge=1)
+    expected_enrollment_version: int = Field(ge=1)
+
+
+class RevalidationOut(BaseModel):
+    """The generation the WorkItem is now bound to and the versions it moved to."""
+
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    previous_generation: int
+    enrollment_generation: int
+    work_item_version: int
+    request_version: int
+    enrollment_version: int
+
+
+# One body for a missing, other-tenant, other-agent, other-owner or service item.
+_NOT_FOUND = {"code": "not_found"}
 
 
 def _raise_conflict(result: object) -> None:
@@ -233,6 +395,7 @@ async def running_work_item_request(
         repository_path=row.repository_path,
         context=row.context,
         refusal=row.refusal,
+        completion_contract=row.completion_contract,
     )
 
 
@@ -285,6 +448,57 @@ async def cancel_work_item(
     }
 
 
+@router.get("/{work_item_id}/personal-context", response_model=PersonalContextOut)
+async def read_personal_context(
+    work_item_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    owner_principal_id: uuid.UUID,
+    session: SessionDep,
+) -> PersonalContextOut:
+    """The token-free facts a worker revalidates a personal WorkItem from (#5376)."""
+
+    context = await personal_execution.read_context(
+        session,
+        work_item_id=work_item_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        owner_principal_id=owner_principal_id,
+    )
+    if context is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
+    return PersonalContextOut.model_validate(context, from_attributes=True)
+
+
+@router.post("/{work_item_id}/personal-context/revalidate", response_model=RevalidationOut)
+async def revalidate_personal_context(
+    work_item_id: uuid.UUID, body: RevalidationBody, session: SessionDep
+) -> RevalidationOut:
+    """Bind a personal WorkItem to its owner's current enrollment generation.
+
+    Compare-and-set on the WorkItem, request and enrollment versions; a stale
+    version, another owner, an inactive enrollment, a live runtime or an
+    unchanged generation is 409 with its code (#5376).
+    """
+
+    result = await personal_execution.revalidate(
+        session,
+        work_item_id=work_item_id,
+        tenant_id=body.tenant_id,
+        agent_id=body.agent_id,
+        owner_principal_id=body.owner_principal_id,
+        request_id=body.request_id,
+        expected_work_item_version=body.expected_work_item_version,
+        expected_request_version=body.expected_request_version,
+        expected_enrollment_version=body.expected_enrollment_version,
+    )
+    if isinstance(result, personal_execution.ContextConflict):
+        if result.code == "not_found":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return RevalidationOut.model_validate(result, from_attributes=True)
+
+
 @router.post("/requests/{request_id}/acquire")
 async def acquire_work_item_request(
     request_id: uuid.UUID, body: AcquireBody, session: SessionDep, request: Request
@@ -308,6 +522,11 @@ async def acquire_work_item_request(
         "wait_deadline": result.wait_deadline,
         "repository_path": result.repository_path,
         "context": result.context,
+        "completion_contract": result.completion_contract,
+        "execution_kind": result.execution_kind,
+        "recovery_candidate_id": result.recovery_candidate_id,
+        "resource_gate": result.resource_gate,
+        "predecessor_claim_name": result.predecessor_claim_name,
     }
 
 
@@ -346,6 +565,7 @@ async def start_work_item_request(
         claim_name=body.claim_name,
         sandbox_name=body.sandbox_name,
         context=body.context,
+        delivered_limits=body.delivered_limits.model_dump(),
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)
@@ -355,6 +575,7 @@ async def start_work_item_request(
         "execution_deadline": result.execution_deadline,
         "remaining_s": result.remaining_s,
         "heartbeat_interval_s": result.heartbeat_interval_s,
+        "completion_contract": result.completion_contract,
     }
 
 
@@ -417,6 +638,17 @@ async def finish_work_item_request(
         cause=body.cause,
         detail=body.detail,
         ci_fix_round=body.ci_fix_round,
+        retry_safety=body.retry_safety,
+        retry_condition=(
+            None
+            if body.retry_condition is None
+            else RetryConditionFact(
+                reason=body.retry_condition.reason.value,
+                retry_at=body.retry_condition.retry_at,
+                scope_key=body.retry_condition.scope_key,
+            )
+        ),
+        exhausted_volume=body.exhausted_volume,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)
@@ -430,14 +662,16 @@ async def finish_work_item_request(
 @router.post("/requests/{request_id}/termination/claim")
 async def claim_work_item_termination(
     request_id: uuid.UUID, body: TerminationClaimBody, session: SessionDep
-) -> dict[str, Any]:
+) -> TerminationClaimOut:
     result = await workitem_dispatch.claim_termination(
         session, request_id, owner=body.owner
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)
     assert not isinstance(result, DispatchConflict)
-    return {"runtime_epoch": result.runtime_epoch}
+    return TerminationClaimOut(
+        runtime_epoch=result.runtime_epoch, request_version=result.request_version
+    )
 
 
 @router.post("/requests/{request_id}/termination")
@@ -448,6 +682,7 @@ async def record_work_item_termination(
         session,
         request_id,
         runtime_epoch=body.runtime_epoch,
+        expected_request_version=body.expected_request_version,
         observation=body.observation,
     )
     if isinstance(result, DispatchConflict):
@@ -456,3 +691,75 @@ async def record_work_item_termination(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": "not_found"})
     return workitem_dispatch.request_view(row)
+
+
+# Requester coding instructions (ADR 0278 section 3 and 6, #5592) -----------------
+
+
+@router.post("/requests/{request_id}/requester-context")
+async def read_requester_context(
+    request_id: uuid.UUID,
+    body: requester_instruction_context.ContextBody,
+    session: SessionDep,
+    response: Response,
+) -> dict[str, Any]:
+    """The running request's version 1 context envelope, for the current fence."""
+
+    response.headers["Cache-Control"] = "no-store"
+    result = await requester_instruction_context.read_envelope(
+        session, request_id, runtime_epoch=body.runtime_epoch
+    )
+    await session.rollback()
+    if isinstance(result, requester_instruction_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return result
+
+
+@router.post("/requests/{request_id}/requester-context/acknowledgment")
+async def acknowledge_requester_context(
+    request_id: uuid.UUID,
+    body: requester_instruction_context.AcknowledgmentBody,
+    session: SessionDep,
+) -> dict[str, Any]:
+    """Accept the relayed acknowledgment only for the current request and fence."""
+
+    result = await requester_instruction_context.accept_acknowledgment(session, request_id, body)
+    if isinstance(result, requester_instruction_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return {"evidence": result}
+
+
+# Learned rules (#5798), delivered beside the requester envelope ---------------------
+
+
+@router.post("/requests/{request_id}/memory-rules-context")
+async def read_memory_rules_context(
+    request_id: uuid.UUID,
+    body: memory_rules_context.ContextBody,
+    session: SessionDep,
+    response: Response,
+) -> dict[str, Any]:
+    """The running request's version 1 learned rules envelope, for the current fence."""
+
+    response.headers["Cache-Control"] = "no-store"
+    result = await memory_rules_context.read_envelope(
+        session, request_id, runtime_epoch=body.runtime_epoch
+    )
+    await session.rollback()
+    if isinstance(result, memory_rules_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return result
+
+
+@router.post("/requests/{request_id}/memory-rules-context/acknowledgment")
+async def acknowledge_memory_rules_context(
+    request_id: uuid.UUID,
+    body: memory_rules_context.AcknowledgmentBody,
+    session: SessionDep,
+) -> dict[str, Any]:
+    """Accept the relayed acknowledgment only for the current request and fence."""
+
+    result = await memory_rules_context.accept_acknowledgment(session, request_id, body)
+    if isinstance(result, memory_rules_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return {"evidence": result}

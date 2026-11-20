@@ -8,21 +8,30 @@ per-version key.
 import hashlib
 import tempfile
 import uuid
+from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import plugin_format
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from curie_api.crud import versions as crud_versions
 from curie_api.schemas.versions import BundleOut
 
-from . import bundles
+from . import approver_tickets, bundles
 from .config import Settings, get_settings
-from .models import AgentVersion
+from .models import Agent, AgentChannel, AgentVersion
+from .publication_policy import POLICY_AUTO
 from .storage import ObjectStore
+from .tracker_result_declaration import (
+    DeclarationInvalid,
+    ResultDeclaration,
+    ResultKind,
+    read_declaration,
+)
 
 
 class BundleInvalid(Exception):
@@ -77,12 +86,48 @@ class SealingKeyCustody(Exception):
     stored before it did can still be deployed, promoted or rolled back to,
     and at the cluster tier the deploy path would then resolve a plain name
     into the per-agent connector Secret. Raised by
-    ``check_stored_sealing_key_custody``; the message is the intake refusal's
+    ``check_stored_bundle_intake``; the message is the intake refusal's
     own custody reason, and ``code`` is the intake issue's code, so a git push
     rejection and a 422 detail say the same thing.
     """
 
     code = bundles.SEALING_KEY_CODE
+
+
+class TrackerResultRefused(Exception):
+    """A valid tracker result declaration this agent cannot run (ADR 0277, #5586).
+
+    Deploy-time refusals, so no label can reach a binding that cannot finish
+    a tracker result. Raised by ``check_tracker_result_admissible`` at every
+    site that makes a declared version the one that boots: the bundle upload
+    (which then discards the version it was made for), ``POST /deployments``
+    before any deployment row, and git flow's three attach and promote paths.
+    ``code`` lets ``gitflow._rejected`` and the API routes build their
+    envelopes from the exception alone.
+    """
+
+    code = "tracker_result_refused"
+
+
+class TrackerResultUnsupported(TrackerResultRefused):
+    """The declaration allows a ticket and a tracker bound to the agent cannot
+    create a linked issue (GitLab, Jira Cloud)."""
+
+    code = "tracker_result_unsupported"
+
+
+class TrackerResultNeedsUnattendedPublication(TrackerResultRefused):
+    """The agent's publication policy requires an approval; unattended triage
+    cannot finish under it."""
+
+    code = "tracker_result_needs_unattended_publication"
+
+
+class TrackerResultTargetIsSelf(TrackerResultRefused):
+    """The declaration's implementation label is a trigger label of the agent's
+    own tracker surfaces, so a published ticket would start this triage again."""
+
+    code = "tracker_result_target_is_self"
 
 
 class ApprovalRoutesUnbound(Exception):
@@ -186,16 +231,22 @@ def _bound_clause(bound: Iterable[str]) -> str:
 
 def validate_archive(
     data: bytes, settings: Settings | None = None
-) -> tuple[str, str]:
-    """Validate an archive's bytes. Returns (extension, content_type).
+) -> tuple[str, str, ResultDeclaration | None]:
+    """Validate an archive's bytes. Returns (extension, content_type, declaration).
 
     Raises ``bundles.UnsupportedArchive`` if the bytes are not a zip/tar(.gz),
     ``BundleInvalid`` if the plugin bundle fails validation, and (via
     ``safe_extract``) ``bundles.UnsupportedArchive`` again if the archive
     exceeds the configured uncompressed-size or compression-ratio cap.
+    ``declaration`` is the bundle's valid tracker result declaration
+    (``workflow/result.json``), or None when it has none; a malformed
+    declaration is a ``BundleInvalid``. Whether this agent may run a declared
+    version is ``check_tracker_result_admissible``'s question, asked by the
+    caller that knows the agent.
     """
 
     settings = settings or get_settings()
+    declaration: ResultDeclaration | None = None
     with tempfile.TemporaryDirectory() as tmp:
         extension, content_type, result = bundles.extract_and_validate(
             data,
@@ -204,9 +255,13 @@ def validate_archive(
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
+        if result.valid:
+            # Cannot raise: `extract_and_validate` already reported any issue
+            # this declaration has, and the result is valid.
+            declaration = read_declaration(bundles.bundle_root(Path(tmp)))
     if not result.valid:
         raise BundleInvalid([e.model_dump() for e in result.errors])
-    return extension, content_type
+    return extension, content_type, declaration
 
 
 async def revalidate_stored_bundle(
@@ -241,8 +296,15 @@ async def revalidate_stored_bundle(
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
 
 
-def _stored_custody_reasons(data: bytes, settings: Settings) -> list[str]:
-    """Blocking half of ``check_stored_sealing_key_custody``; run in a threadpool."""
+def _stored_intake_refusals(
+    data: bytes, settings: Settings
+) -> tuple[list[str], list[plugin_format.ValidationIssue], ResultDeclaration | None]:
+    """Blocking half of ``check_stored_bundle_intake``; run in a threadpool.
+
+    One extraction answers both stored-bundle intake checks: the sealing key
+    custody reasons, and the tracker result declaration's issues or, when it
+    is valid, the declaration itself.
+    """
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp)
@@ -253,35 +315,159 @@ def _stored_custody_reasons(data: bytes, settings: Settings) -> list[str]:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        issues = bundles.sealing_key_custody_issues(plugin_format.bundle_root(dest))
-        return [issue.message for issue in issues]
+        root = plugin_format.bundle_root(dest)
+        reasons = [issue.message for issue in bundles.sealing_key_custody_issues(root)]
+        try:
+            declaration = read_declaration(root)
+        except DeclarationInvalid as exc:
+            return reasons, list(exc.issues), None
+        return reasons, [], declaration
 
 
-async def check_stored_sealing_key_custody(
+async def check_stored_bundle_intake(
     store: ObjectStore, version: AgentVersion, settings: Settings | None = None
-) -> None:
-    """Refuse a stored bundle that intake would now refuse for sealing key custody.
+) -> ResultDeclaration | None:
+    """Refuse a stored bundle that intake would now refuse; return its declaration.
 
     @spec ACTION-EXECUTOR-16: custody holds on every path that makes a version
-    the one that boots, not only on first upload. A no-op when the version
-    carries no bundle yet, like ``revalidate_stored_bundle``. Stored bytes the
-    current caps refuse report ``BundleTooLarge``, the settled answer for them
-    (ADR-0059 decision 3).
+    the one that boots, not only on first upload. So does the tracker result
+    declaration (ADR 0277): a stored object's ``workflow/result.json`` is read
+    from its own bytes, so the caller judges and records the policy those
+    bytes declare, not one copied from elsewhere. Returns the valid
+    declaration, or None when the bundle has none or the version carries no
+    bundle yet (a no-op, like ``revalidate_stored_bundle``). Raises, in this
+    order: ``BundleTooLarge`` for stored bytes the current caps refuse
+    (ADR-0059 decision 3), ``SealingKeyCustody``, and ``BundleInvalid``
+    carrying the declaration's own ``tracker_result.*`` issues when it is
+    malformed.
     """
 
     if version.bundle_ref is None:
-        return
+        return None
     settings = settings or get_settings()
     data = await store.get(version.bundle_ref)
     try:
-        reasons = await run_in_threadpool(_stored_custody_reasons, data, settings)
+        reasons, declaration_issues, declaration = await run_in_threadpool(
+            _stored_intake_refusals, data, settings
+        )
     except plugin_format.UnsupportedArchive as exc:
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
     if reasons:
         raise SealingKeyCustody("; ".join(reasons))
+    if declaration_issues:
+        raise BundleInvalid([issue.model_dump() for issue in declaration_issues])
+    return declaration
 
 
-def _declared_routes(data: bytes, settings: Settings) -> set[str] | None:
+def result_policy(declaration: ResultDeclaration) -> dict[str, Any]:
+    """The stored policy of a declaration: its kinds sorted, and its label."""
+
+    return {
+        "results": sorted(kind.value for kind in declaration.results),
+        "implementation_label": declaration.implementation_label,
+    }
+
+
+def apply_result_policy(version: AgentVersion, declaration: ResultDeclaration | None) -> None:
+    """Record on ``version`` the result policy its bundle declares (ADR 0277).
+
+    Every path that attaches or deploys a bundle calls this with the
+    declaration read from the very bytes the version points at, so the upload
+    route, git flow's clone and sibling paths and a stored object agree. A
+    bundle without a declaration clears the policy: the implementation
+    contract. The caller's commit writes it.
+    """
+
+    if declaration is None:
+        version.result_policy_schema_version = None
+        version.result_policy_digest = None
+        version.result_policy = None
+        return
+    version.result_policy_schema_version = declaration.schema_version
+    version.result_policy_digest = declaration.digest
+    version.result_policy = result_policy(declaration)
+
+
+async def check_tracker_result_admissible(
+    session: AsyncSession,
+    agent: Agent,
+    declaration: ResultDeclaration | None,
+    settings: Settings | None = None,
+) -> None:
+    """Refuse a declared version this agent's bindings could not finish (ADR 0277).
+
+    A no-op without a declaration. Otherwise raises, in this order:
+
+    1. ``TrackerResultUnsupported``: the declaration allows a ticket and a
+       tracker surface of the agent resolves to a tracker that does not
+       support ``Operation.CREATE_LINKED_ISSUE``.
+    2. ``TrackerResultNeedsUnattendedPublication``: the agent's publication
+       policy is not ``auto``.
+    3. ``TrackerResultTargetIsSelf``: the implementation label is the
+       effective trigger label of one of the agent's tracker surfaces
+       (compared case-insensitively, as trackers compare labels).
+
+    A surface no configured tracker serves starts no work and is skipped, so
+    an agent with no tracker surfaces passes 1 and 3. Reading a tracker's
+    declaration fails closed (unsupported).
+    """
+
+    if declaration is None:
+        return
+    from .factory_tracker_result_runtime import tracker_creates_linked_issues
+    from .forges.registry import forges_registry
+    from .forges.surfaces import (
+        TRACKER_SURFACE_KINDS,
+        SurfaceUnconfigured,
+        effective_trigger_label,
+        resolve_surface,
+    )
+
+    registry = forges_registry(settings or get_settings())
+    surfaces = list(
+        await session.scalars(
+            select(AgentChannel)
+            .where(
+                AgentChannel.agent_id == agent.id,
+                AgentChannel.kind.in_(sorted(TRACKER_SURFACE_KINDS)),
+            )
+            .order_by(AgentChannel.id)
+        )
+    )
+    if ResultKind.TICKET in declaration.results:
+        for surface in surfaces:
+            try:
+                tracker = resolve_surface(registry, surface.kind, surface.address).tracker
+            except SurfaceUnconfigured:
+                continue
+            if tracker is not None and not tracker_creates_linked_issues(
+                registry, tracker.kind, tracker.host
+            ):
+                raise TrackerResultUnsupported(
+                    f"the bundle declares ticket results, and the {surface.kind} surface "
+                    f"{surface.address!r} of this agent is served by tracker "
+                    f"{tracker.name!r}, which cannot create a linked issue; declare "
+                    "findings only or bind the agent to a tracker that can"
+                )
+    if agent.publication_policy != POLICY_AUTO:
+        raise TrackerResultNeedsUnattendedPublication(
+            f"tracker result runs are unattended, and this agent's publication policy is "
+            f"{agent.publication_policy!r}; set it to {POLICY_AUTO!r} before deploying "
+            "a version that declares workflow/result.json"
+        )
+    label = declaration.implementation_label
+    if label is not None:
+        for surface in surfaces:
+            trigger = effective_trigger_label(surface, registry)
+            if trigger is not None and trigger.casefold() == label.casefold():
+                raise TrackerResultTargetIsSelf(
+                    f"the bundle's implementation_label {label!r} is the trigger label of "
+                    f"this agent's {surface.kind} surface {surface.address!r}, so a published "
+                    "ticket would start this triage again; choose another label"
+                )
+
+
+def _declared_route_map(data: bytes, settings: Settings) -> dict[str, str] | None:
     """Blocking half of ``check_routes_from_bytes``; run in a threadpool."""
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -293,7 +479,7 @@ def _declared_routes(data: bytes, settings: Settings) -> set[str] | None:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        return bundles.declared_approval_routes(dest)
+        return bundles.declared_approval_route_map(dest)
 
 
 async def check_routes_from_bytes(
@@ -317,11 +503,53 @@ async def check_routes_from_bytes(
     ``validate_archive`` under these same caps a moment earlier, so only the
     stored-bytes wrapper below -- where the caps CAN have moved under the object
     -- maps it onto ``BundleTooLarge``.
+
+    The same read also judges gate ownership (ADR 0271 decision 2): every
+    ``approver_ticket`` registration in ``routes`` must be gated on its own
+    route by this bundle's last-declaration-wins map, or
+    ``approver_tickets.BundleGateMismatch`` refuses. The map is computed once,
+    so the declared set and the gate check read the same declaration.
     """
 
     settings = settings or get_settings()
-    declared = await run_in_threadpool(_declared_routes, data, settings)
+    route_map = await run_in_threadpool(_declared_route_map, data, settings)
+    declared = None if route_map is None else set(route_map.values())
     _raise_if_routes_unbound(declared, routes, version_id)
+    approver_tickets.check_bundle_gate(route_map, routes, version_id=version_id)
+
+
+# Effective route maps of stored bundles, keyed by their immutable object key
+# (write-once, ``store_bundle``), so the creation-time serving gate fetches and
+# extracts each serving bundle once per process. Bounded: least recently used
+# entries fall out.
+_STORED_ROUTE_MAPS: OrderedDict[str, dict[str, str] | None] = OrderedDict()
+_STORED_ROUTE_MAP_LIMIT = 128
+
+
+async def stored_route_map(
+    store: ObjectStore, bundle_ref: str, settings: Settings | None = None
+) -> dict[str, str] | None:
+    """A stored bundle's effective approval route map; ``None`` is poison.
+
+    For the creation-time serving gate (ADR 0271 decision 2, plan D9a). Stored
+    bytes the current caps refuse read as poison, never as an empty map. A
+    store failure propagates to the caller, which answers unavailable.
+    """
+
+    if bundle_ref in _STORED_ROUTE_MAPS:
+        _STORED_ROUTE_MAPS.move_to_end(bundle_ref)
+        cached = _STORED_ROUTE_MAPS[bundle_ref]
+        return None if cached is None else dict(cached)
+    settings = settings or get_settings()
+    data = await store.get(bundle_ref)
+    try:
+        route_map = await run_in_threadpool(_declared_route_map, data, settings)
+    except plugin_format.UnsupportedArchive:
+        route_map = None
+    _STORED_ROUTE_MAPS[bundle_ref] = None if route_map is None else dict(route_map)
+    while len(_STORED_ROUTE_MAPS) > _STORED_ROUTE_MAP_LIMIT:
+        _STORED_ROUTE_MAPS.popitem(last=False)
+    return route_map
 
 
 def _raise_if_routes_unbound(
@@ -361,6 +589,12 @@ async def check_approval_route_bindings(
     bundleless, then attach" would otherwise walk straight past this into the
     worker's active-deployment join (``curie_worker.binding``).
 
+    A bundleless version is still a no-op for the unbound-route check, but it
+    declares no approval gates and so cannot gate an ``approver_ticket`` pair:
+    it is judged as an empty route map for the ADR 0271 gate and refuses with
+    ``approver_tickets.BundleGateMismatch`` for an agent whose ``routes`` carry
+    a registration.
+
     ``routes`` is the map to judge: the agent's own ``approval_routes`` for the
     callers asking about the stored state, or the PROPOSED map the
     ``PATCH /agents/{id}`` preflight is about to write -- where an explicit
@@ -371,6 +605,7 @@ async def check_approval_route_bindings(
     """
 
     if version.bundle_ref is None:
+        approver_tickets.check_bundle_gate({}, routes, version_id=version.id)
         return
     settings = settings or get_settings()
     data = await store.get(version.bundle_ref)
@@ -401,12 +636,19 @@ async def store_bundle(
     data: bytes,
     extension: str,
     content_type: str,
+    *,
+    declaration: ResultDeclaration | None,
 ) -> BundleOut:
-    """Store validated bytes under the immutable key and record them."""
+    """Store validated bytes under the immutable key and record them.
+
+    ``declaration`` is the one ``validate_archive`` read from these bytes; its
+    result policy is recorded on ``version`` in the same commit as the bundle.
+    """
 
     key = f"bundles/{agent_id}/{version.id}{extension}"
     digest = hashlib.sha256(data).hexdigest()
     await store.put(key, data, content_type)
+    apply_result_policy(version, declaration)
     await crud_versions.attach_bundle(session, version, key, digest)
     return BundleOut(
         version_id=version.id,

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/subscription/v1.0.json",
+  "title": "curie cluster subscription --json",
+  "description": "The agent-facing payload of `curie cluster subscription status|enroll|replace|reconnect|disconnect`: a dry-run plan, the caller's personal Claude enrollment, or a write result. No variant carries the grant token, the session cookie, or where the grant is kept.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": { "const": true },
+        "plan": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["dry_run", "plan"]
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["absent", "active", "inactive"] },
+        "generation": { "type": ["integer", "null"], "minimum": 1 },
+        "version": { "type": ["integer", "null"], "minimum": 1 },
+        "teardown": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pending_runtimes": { "type": "integer", "minimum": 0 },
+            "pending_custody_cleanup": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["pending_runtimes", "pending_custody_cleanup"]
+        }
+      },
+      "required": ["state", "generation", "version", "teardown"]
+    },
+    "changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "action": { "enum": ["enroll", "replace", "reconnect", "disconnect"] },
+        "changed": { "type": "boolean" },
+        "previous_version": { "type": ["integer", "null"], "minimum": 1 },
+        "state": { "enum": ["absent", "active", "inactive"] },
+        "generation": { "type": ["integer", "null"], "minimum": 1 },
+        "version": { "type": ["integer", "null"], "minimum": 1 },
+        "teardown": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pending_runtimes": { "type": "integer", "minimum": 0 },
+            "pending_custody_cleanup": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["pending_runtimes", "pending_custody_cleanup"]
+        }
+      },
+      "required": [
+        "action",
+        "changed",
+        "previous_version",
+        "state",
+        "generation",
+        "version",
+        "teardown"
+      ]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/dryRun" },
+    { "$ref": "#/$defs/status" },
+    { "$ref": "#/$defs/changed" }
+  ]
+}

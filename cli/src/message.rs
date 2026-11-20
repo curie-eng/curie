@@ -578,6 +578,40 @@ pub(crate) const CLUSTER_MESSAGE_RELAY_ADAPTER: &str = "curie-cluster-message";
 const CLUSTER_EVAL_RELAY_TIMEOUT: &str =
     "the cluster message relay did not deliver a reply before the deadline";
 
+/// The failure class the worker writes on the cluster message relay when it
+/// refuses a turn that carries no HTTP identity (HTTP-INVOCATION-EXECUTION-31,
+/// #5518). Frozen with the worker in `tests/vectors/turn-failure-reply.json`.
+const IDENTITY_REFUSED_FAILURE_CLASS: &str = "identity-refused";
+
+/// The error that ends a cluster eval when the worker refused a case for lack
+/// of an HTTP identity, or `None` for any outcome that is graded as usual.
+///
+/// A cluster eval turn is enqueued with no HTTP identity, so on a binding that
+/// requires one the worker refuses every case the same way. Grading the rest
+/// would only repeat that refusal, so the suite stops with the reason and the
+/// tiers that can evaluate the bundle instead (#5518).
+fn identity_refusal_stop(outcome: &Outcome, channel: &str) -> Option<anyhow::Error> {
+    match outcome {
+        Outcome::Failed { class, .. } if class == IDENTITY_REFUSED_FAILURE_CLASS => {
+            Some(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "cluster eval cannot reach the binding on channel {channel}: the worker \
+                     refused the turn because the binding requires a verified HTTP identity, \
+                     and cluster eval turns carry none"
+                ))
+                .with_fix(
+                    "evaluate the bundle where no HTTP identity is required: `curie skill up` \
+                     then `curie skill eval` in the bundle directory, or `curie local eval` \
+                     against a local stack; or deploy it to the cluster as a separate eval \
+                     agent whose binding is not on the HTTP identity lane and run \
+                     `curie cluster eval --agent <that agent>`",
+                ),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// The kubectl read behind `dispatcher_connected_strict`, extracted pure so the
 /// Deployment NAME is unit-testable without a cluster (#1533).
 ///
@@ -856,6 +890,7 @@ async fn await_cluster_relay(
 /// published host port, authenticated with the same password the compose worker
 /// uses. Pure so the construction is unit-tested without a live Valkey.
 pub fn local_valkey_url(password: &str, host: &str, port: u16) -> String {
+    let password = queue::percent_encode_unreserved(password);
     format!("redis://:{password}@{host}:{port}")
 }
 
@@ -1612,7 +1647,7 @@ fn diagnostics_with_claim_wait(diagnostics: String, reason: Option<&str>) -> Str
 
 const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
 const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
-const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
+const DISPATCHER_ENQUEUE_MODULE: &str = "curie_channel_gateway.slack.enqueue_once";
 const DISPATCHER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 // The one-shot dispatcher shares the runner's bridge network, not the
 // worker's host network. Inspect this separately; it is never forwarded as a
@@ -1688,7 +1723,7 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
 ///   invocation. Compose substitutes its variables from each caller's own
 ///   environment, so after `local up --build` the stack ran `:dev` while this
 ///   verb resolved `:latest` and died on `No module named
-///   curie_dispatcher.enqueue_once`.
+///   curie_channel_gateway.slack.enqueue_once`.
 /// - Checked, because a tag that exists for the platform images need not exist
 ///   for the dispatcher. CI runs the ladder with `CURIE_BASE_TAG=ci-local` and
 ///   builds its dispatcher as `:latest`, so pointing this at `:ci-local` asked
@@ -2064,7 +2099,10 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             local_dry_run_channel_line(opts.agent.as_deref(), opts.channel.as_deref(), &api_base);
         let human_lines = vec![
             "local mode (compose stack; no kubectl/helm)".to_string(),
-            format!("enqueue onto redis {valkey_url}"),
+            format!(
+                "enqueue onto redis redis://{}:{}",
+                resources.valkey_host, resources.valkey_port
+            ),
             format!("stub advertised at {reply_endpoint}"),
             channel_line,
             format!("enqueue a synthetic QueuedTurn on stream {}", opts.stream),
@@ -2992,14 +3030,14 @@ async fn resume_cluster_after_approval(
 /// dispatcher is wired to the local stub -- NOT a real workspace.
 const LOCAL_STUB_BOT_TOKEN: &str = "xoxb-dev";
 
-/// The Slack transport the RUNNING compose worker is actually configured with:
+/// The Slack transport the RUNNING compose gateway is actually configured with:
 /// `(SLACK_API_BASE_URL, SLACK_BOT_TOKEN)` as the container holds them.
-type WorkerTransport = (Option<String>, Option<String>);
+type GatewayTransport = (Option<String>, Option<String>);
 
 /// The bot token to post a real placeholder with, or `None` when this stack is
 /// not wired to a real workspace.
 ///
-/// Decided from the worker's OWN transport, never from CLI-side config (#957).
+/// Decided from the gateway's OWN transport, never from CLI-side config (#957).
 /// The previous form read `CURIE_SLACK_BOT_TOKEN`/`SLACK_BOT_TOKEN`/the persisted
 /// secret vault and claimed a deliberate `--disconnect` could not be overridden
 /// by a stale vault entry. That claim was false and the failure was ugly:
@@ -3007,13 +3045,13 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// SUBPROCESS environment, and a child process cannot set its parent's env, so
 /// a vault token from `curie secrets set SLACK_BOT_TOKEN` (the documented #749
 /// setup) stayed visible to the CLI. A stub-only stack would then post a real
-/// placeholder into a real channel while the worker updated the stub -- an
+/// placeholder into a real channel while the gateway updated the stub -- an
 /// orphaned "..." in a customer channel and a reply nobody sees.
 ///
 /// Two conditions, both read from the container:
 ///
 /// 1. `SLACK_API_BASE_URL` must NOT point at the local stub. This is the
-///    definitive signal: it is literally the transport the worker will use to
+///    definitive signal: it is literally the transport the gateway will use to
 ///    edit the placeholder, so if it is the stub, no real post can ever be
 ///    updated, whatever any token says.
 ///
@@ -3024,14 +3062,14 @@ type WorkerTransport = (Option<String>, Option<String>);
 ///    compose's single-dash `${SLACK_API_BASE_URL-http://localhost:8155/api/}`
 ///    preserves an explicitly empty value rather than re-defaulting it, and
 ///    `docs/slack-local-runbook.md` documents the convention; the cluster tier
-///    says the same thing with `worker.slackApiBaseUrl=`. Empty therefore means
+///    says the same thing with `gateway.slackApiBaseUrl=`. Empty therefore means
 ///    "no override -> real slack.com", which is exactly what
 ///    `SlackTransport::new(None, ..)` resolves to. What genuinely carries no
 ///    information is an ABSENT value (`None`): the probe could not read the
 ///    container at all, and that stays the stub path.
 /// 2. the token must be a real one, not the `xoxb-dev` sentinel.
 ///
-/// Returning the worker's OWN token (rather than one the CLI resolved) also
+/// Returning the gateway's OWN token (rather than one the CLI resolved) also
 /// keeps the posting identity equal to the updating identity: Slack only lets the
 /// authoring bot `chat.update` a message, so two different tokens would leave the
 /// placeholder stuck at "..." with `cant_update_message` (#957 mode B).
@@ -3040,17 +3078,19 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// values were already read out of the same container here; only the token was
 /// kept, and the base was then re-read from the CLI's own process environment at
 /// post time. Carrying the pair means the placeholder goes exactly where the
-/// worker that will edit it is pointed, and a stale `SLACK_API_BASE_URL` in the
+/// gateway that will edit it is pointed, and a stale `SLACK_API_BASE_URL` in the
 /// operator's shell has nothing left to decide.
 ///
 /// Pure, so both conditions are unit-testable without Docker.
-fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack::SlackTransport> {
+fn connected_gateway_transport(
+    transport: GatewayTransport,
+) -> Option<crate::slack::SlackTransport> {
     let (api_base, token) = transport;
     // Absent, not empty. `None` means the value was never read off the container
-    // -- there is no worker transport to trust, so take the stub path (#1031).
+    // -- there is no gateway transport to trust, so take the stub path (#1031).
     let api_base = api_base?;
     // Wired to the stub is not connected: the stub is literally the transport the
-    // worker will edit the placeholder over, so no real post can ever be updated.
+    // gateway will edit the placeholder over, so no real post can ever be updated.
     let Ok(resources) = crate::local::current_resources() else {
         return None;
     };
@@ -3059,13 +3099,13 @@ fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack
     }
     let token = token?.trim().to_string();
     // An EMPTY base is carried through as "the source named no base", which
-    // `SlackTransport::new` resolves to real Slack -- the same answer the worker
+    // `SlackTransport::new` resolves to real Slack -- the same answer the gateway
     // itself reaches. See the empty-is-connected paragraph above (#1031).
     (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN)
         .then(|| crate::slack::SlackTransport::new(Some(api_base), token))
 }
 
-/// How long the whole worker-transport probe (resolve the container, then read
+/// How long the whole gateway-transport probe (resolve the container, then read
 /// its env) may take before `local message` gives up on it.
 ///
 /// A wedged docker daemon accepts the request and then never answers, so an
@@ -3073,33 +3113,33 @@ fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack
 /// "a probe failure falls back to the safe stub path" claim vacuous, since
 /// nothing ever fails. Two local `docker` reads have no business taking longer
 /// than this (#1031).
-const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Read the running compose worker's Slack transport out of the container.
+/// Read the running compose gateway's Slack transport out of the container.
 ///
-/// `docker inspect` on the worker container, so what we act on is what the worker
+/// `docker inspect` on the gateway container, so what we act on is what the gateway
 /// holds -- the reconciliation #957 asks for.
 ///
 /// The container is resolved through the compose SERVICE LABEL
-/// ([`local_worker_container`] / [`COMPOSE_WORKER_SERVICE`]), never by a
+/// ([`local_gateway_container`] / [`COMPOSE_GATEWAY_SERVICE`]), never by a
 /// hardcoded name. Container names carry the compose project
-/// (`<project>-curie-worker-1`, and the CLI pins `COMPOSE_PROJECT_NAME=curie`),
-/// so inspecting a bare `curie-worker` matched nothing on a default stack and
+/// (`<project>-curie-channel-gateway-1`, with the project selected per run),
+/// so inspecting a bare `curie-gateway` matched nothing on a default stack and
 /// silently classified every stack as disconnected (#1031). The selector also
 /// closes the inverse hazard: an unrelated container that merely happens to be
-/// NAMED `curie-worker` carries no compose service label, so it can no longer
-/// impersonate the worker and hand this probe a real token the actual worker
+/// NAMED `curie-gateway` carries no compose service label, so it can no longer
+/// impersonate the gateway and hand this probe a real token the actual gateway
 /// does not hold.
 ///
 /// Failures are returned rather than swallowed, so the caller can say that the
 /// probe could not run instead of asserting a disconnected stack it never saw.
-async fn running_worker_transport() -> Result<WorkerTransport> {
-    let worker = local_worker_container().await?;
+async fn running_gateway_transport() -> Result<GatewayTransport> {
+    let gateway = local_gateway_container().await?;
     let cmd = OpsCommand::new(
         "docker",
         vec![
             plain("inspect"),
-            plain(&worker),
+            plain(&gateway),
             plain("--format"),
             plain("{{range .Config.Env}}{{println .}}{{end}}"),
         ],
@@ -3107,7 +3147,7 @@ async fn running_worker_transport() -> Result<WorkerTransport> {
     let (ok, stdout, stderr) = run_capture(&cmd).await?;
     if !ok {
         bail!(
-            "inspecting the local worker container {worker}: {}",
+            "inspecting the local gateway container {gateway}: {}",
             stderr.trim()
         );
     }
@@ -3122,12 +3162,12 @@ async fn running_worker_transport() -> Result<WorkerTransport> {
 /// Bound `probe` by `budget`, flattening both a probe error and a timeout into
 /// one operator-facing reason string. Generic over the future purely so the
 /// timeout itself is testable without a wedged daemon.
-async fn bounded_worker_probe<F>(
+async fn bounded_gateway_probe<F>(
     probe: F,
     budget: Duration,
-) -> std::result::Result<WorkerTransport, String>
+) -> std::result::Result<GatewayTransport, String>
 where
-    F: std::future::Future<Output = Result<WorkerTransport>>,
+    F: std::future::Future<Output = Result<GatewayTransport>>,
 {
     match tokio::time::timeout(budget, probe).await {
         Ok(Ok(transport)) => Ok(transport),
@@ -3143,9 +3183,9 @@ where
 /// for the connected mode, got the other one, and was told nothing. Still fall
 /// back -- the stub path never posts to real Slack, and failing the whole command
 /// on a flaky docker would be worse -- but say so (#1031).
-fn worker_probe_warning(reason: &str) -> String {
+fn gateway_probe_warning(reason: &str) -> String {
     format!(
-        "could not determine whether a Slack workspace is connected (the local worker \
+        "could not determine whether a Slack workspace is connected (the local gateway \
          transport probe failed: {}); assuming NOT connected and using the local reply stub",
         reason.trim().lines().next().unwrap_or("no detail")
     )
@@ -3157,10 +3197,10 @@ fn worker_probe_warning(reason: &str) -> String {
 /// (resolve by label -> inspect -> classify) against a `docker` shim; the pure
 /// predicate alone cannot see the wiring both #1031 defects lived in.
 pub async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
-    match bounded_worker_probe(running_worker_transport(), WORKER_PROBE_TIMEOUT).await {
-        Ok(transport) => connected_worker_transport(transport),
+    match bounded_gateway_probe(running_gateway_transport(), GATEWAY_PROBE_TIMEOUT).await {
+        Ok(transport) => connected_gateway_transport(transport),
         Err(reason) => {
-            crate::ui::ui().warn(&worker_probe_warning(&reason));
+            crate::ui::ui().warn(&gateway_probe_warning(&reason));
             None
         }
     }
@@ -3419,10 +3459,10 @@ async fn message_connected(
         // #957 mode A failure arriving by a different road.
         crate::ops::SlackApiBase::Unknown => {
             anyhow::bail!(
-                "could not read the Slack API base from the worker Deployment for release \
+                "could not read the Slack API base from the channel gateway Deployment for release \
                  {} in namespace {}; refusing to guess where a real workspace token should be \
                  sent. Check `kubectl -n {} get deployment -l \
-                 app.kubernetes.io/instance={},app.kubernetes.io/component=worker`.",
+                 app.kubernetes.io/instance={},app.kubernetes.io/component=channel-gateway`.",
                 opts.release,
                 opts.namespace,
                 opts.namespace,
@@ -3431,10 +3471,7 @@ async fn message_connected(
         }
     };
 
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
     enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &transport)
         .await
@@ -3533,10 +3570,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     // Enqueue the exact Slack binding coordinates the dispatcher would produce,
     // with only the reserved adapter/ref selecting the built-in relay.
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
     let (channel, thread_ts, _) = resolve_targets(Some(&channel), opts.thread.as_deref());
     let (event, reply_ref) = cluster_relay_turn(&channel, identity.as_deref(), &opts, &thread_ts);
@@ -3890,14 +3924,12 @@ pub fn eval_dry_run_lines(
     )];
     if opts.local {
         let resources = crate::local::current_resources()?;
-        let valkey_url = local_valkey_url(
-            &opts.valkey_password,
-            &resources.valkey_host,
-            resources.valkey_port,
-        );
         let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
         lines.push("local mode (compose stack; no kubectl/helm)".to_string());
-        lines.push(format!("enqueue onto redis {valkey_url}"));
+        lines.push(format!(
+            "enqueue onto redis redis://{}:{}",
+            resources.valkey_host, resources.valkey_port
+        ));
         lines.push(format!(
             "stub advertised at http://localhost:{}/api/",
             resources.stub_port
@@ -3979,6 +4011,200 @@ enum EvalReplyTransport<'a> {
     Relay(&'a ApiClient),
 }
 
+/// The local/cluster tier's raw record of one trial, built from what the
+/// reply transport observed. These tiers see only the delivered reply, never
+/// the runner's tool frames, so `tool_calls` is `None` (not observable) rather
+/// than an empty list that would claim the turn called no tool. `output` is the
+/// case-row text this trial produced; on a timeout it is the diagnostic, which
+/// belongs in `error`, not in the reply.
+fn relay_trial(
+    index: u32,
+    outcome: &Outcome,
+    passed: bool,
+    seconds: f64,
+    output: &str,
+) -> crate::commands::EvalTrial {
+    let (reply, status, error) = match outcome {
+        Outcome::Replied(reply) => (reply.clone(), "replied", None),
+        Outcome::Failed { reply, class } => (
+            reply.clone(),
+            "failed",
+            Some(format!("runner turn failed: {class}")),
+        ),
+        Outcome::AwaitingApproval { reply, .. } => {
+            (reply.clone().unwrap_or_default(), "awaiting_approval", None)
+        }
+        Outcome::CompletedNoEdit => (String::new(), "completed_no_edit", None),
+        Outcome::TimedOut => (String::new(), "timed_out", Some(output.to_string())),
+    };
+    crate::commands::EvalTrial {
+        index,
+        outcome: if passed {
+            crate::evals::CaseOutcome::Pass
+        } else {
+            crate::evals::CaseOutcome::Fail
+        },
+        seconds,
+        reply,
+        tool_calls: None,
+        status: Some(status.to_string()),
+        detail: None,
+        error,
+    }
+}
+
+/// The agent the worker routes this eval's turns to: the one bound to the
+/// exact Slack route the turns are sent on, `("slack", channel, identity)`,
+/// where `identity` `None` is the installation's default identity (an omitted
+/// adapter or `default`). Matching the address alone is not enough: two agents
+/// may share one channel under different identities, and only one of them
+/// answers the turns this eval sends. When `agent` was named, the route must
+/// be that agent's. Zero or several agents on the route is an error, so the
+/// revision is reported as unknown rather than guessed.
+fn eval_route_agent_id(
+    agents: &[Agent],
+    agent: Option<&str>,
+    channel: &str,
+    identity: Option<&str>,
+) -> Result<String> {
+    let on_route: Vec<&Agent> = agents
+        .iter()
+        .filter(|a| {
+            a.channels.iter().any(|binding| {
+                binding.kind == "slack"
+                    && binding.address == channel
+                    && binding.named_adapter() == identity
+            })
+        })
+        .collect();
+    let route = match identity {
+        Some(identity) => format!("{channel} as {identity}"),
+        None => format!("{channel} as the default identity"),
+    };
+    match on_route.as_slice() {
+        [only] => match agent {
+            Some(named) if only.name != named && only.id != named => {
+                bail!(
+                    "the Slack route {route} is bound to {}, not {named}",
+                    only.name
+                )
+            }
+            _ => Ok(only.id.clone()),
+        },
+        [] => bail!("no agent is bound to the Slack route {route}"),
+        many => bail!(
+            "several agents are bound to the Slack route {route} ({})",
+            many.iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The bundle revision this eval is routed to: the agent bound to the exact
+/// Slack route the turns are sent on, its in-force deployment, and that
+/// deployment's version, read from the platform API.
+async fn eval_route_revision(
+    api: &ApiClient,
+    agent: Option<&str>,
+    channel: &str,
+    identity: Option<&str>,
+) -> Result<Option<crate::commands::EvalBundleRevision>> {
+    let agents = api
+        .list_agents()
+        .await
+        .context("listing agents to resolve the evaluated bundle revision")?;
+    let agent_id = eval_route_agent_id(&agents, agent, channel, identity)?;
+    let deployments = api
+        .list_deployments(&agent_id)
+        .await
+        .context("listing deployments to resolve the evaluated bundle revision")?;
+    let versions = api
+        .list_versions(&agent_id)
+        .await
+        .context("listing versions to resolve the evaluated bundle revision")?;
+    Ok(crate::commands::eval_bundle_revision(
+        &agent_id,
+        &deployments,
+        &versions,
+    ))
+}
+
+/// Wall-clock bound on one whole revision lookup (three API reads).
+/// `ApiClient` has a connect timeout but no read timeout, so this is the only
+/// thing stopping a stalled API from holding the eval before its first case or
+/// after its last.
+const EVAL_REVISION_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Best-effort revision lookup: an API hiccup or stall must not fail or hang
+/// an eval, so it is reported on stderr and the revision stays unknown. The
+/// whole lookup, not each request, is bounded by `budget`.
+async fn eval_route_revision_or_warn(
+    api: &ApiClient,
+    agent: Option<&str>,
+    channel: &str,
+    identity: Option<&str>,
+    budget: Duration,
+) -> Option<crate::commands::EvalBundleRevision> {
+    let warn = |reason: String| {
+        crate::ui::ui().warn(&format!(
+            "could not resolve the evaluated bundle revision, so bundle_revision is null: \
+             {reason}"
+        ));
+    };
+    match tokio::time::timeout(budget, eval_route_revision(api, agent, channel, identity)).await {
+        Ok(Ok(revision)) => revision,
+        Ok(Err(err)) => {
+            warn(format!("{err:#}"));
+            None
+        }
+        Err(_) => {
+            warn(format!(
+                "the platform API did not answer within {}s",
+                budget.as_secs_f64()
+            ));
+            None
+        }
+    }
+}
+
+/// The revision to report for a run bracketed by two lookups. Every sample
+/// binds the in-force deployment when its fresh thread is claimed, so a run
+/// names a revision only when the lookup before the first sample and the
+/// lookup after the last agree. A changed revision means the samples may have
+/// run on different bundles and is reported as unknown. Agreement is weaker
+/// than it looks: a deploy and a rollback inside the run leave both ends equal,
+/// so the value means "in force at the start and at the end, unchanged", not
+/// "served every sample". Neither the relay nor the reply exposes the version a
+/// sample's sandbox booted, so a per-sample revision is not observable here.
+fn stable_eval_revision(
+    before: Option<crate::commands::EvalBundleRevision>,
+    after: Option<crate::commands::EvalBundleRevision>,
+) -> Option<crate::commands::EvalBundleRevision> {
+    match (before, after) {
+        (Some(before), Some(after)) if before == after => Some(before),
+        _ => None,
+    }
+}
+
+/// Attach the bracketed revision to `report`, warning when a deploy moved the
+/// in-force version during the run.
+fn attach_eval_revision(
+    report: &mut crate::commands::EvalReport,
+    before: Option<crate::commands::EvalBundleRevision>,
+    after: Option<crate::commands::EvalBundleRevision>,
+) {
+    let moved = matches!((&before, &after), (Some(b), Some(a)) if b != a);
+    if moved {
+        crate::ui::ui().warn(
+            "the in-force deployment changed during the eval run, so its samples may have run \
+             on different bundles; bundle_revision is null",
+        );
+    }
+    report.bundle_revision = stable_eval_revision(before, after);
+}
+
 /// The shared per-tier eval engine: enqueue one synthetic `QueuedTurn` per case
 /// through the caller's reply transport + Valkey, grade the captured reply, and
 /// collect `(id, passed, seconds, output)` rows for `report_eval`.
@@ -4000,11 +4226,13 @@ async fn run_eval_turns(
     let mut results: Vec<crate::commands::EvalRow> = Vec::with_capacity(total);
     let mut sample_passes = std::collections::BTreeMap::new();
     let mut details = std::collections::BTreeMap::new();
+    let mut trials = std::collections::BTreeMap::new();
     let mut eval_threads: Vec<String> = Vec::with_capacity(total * sampling.n as usize);
     let run = async {
         for case in &suite.cases {
             let mut samples = Vec::with_capacity(sampling.n as usize);
-            for _ in 0..sampling.n {
+            let mut case_trials = Vec::with_capacity(sampling.n as usize);
+            for index in 0..sampling.n {
                 // Each sample is its own thread so draws never inherit prior
                 // turns (#550). Prefix the conversation_id so the worker omits
                 // ambient agent memory from that sandbox (#1909): durable memory
@@ -4091,6 +4319,11 @@ async fn run_eval_turns(
                 // path so a three-case suite run twice cannot pin eight
                 // curie-thread-* claims against the default ResourceQuota (#1534).
                 queue_thread_reset(conn, &thread_key).await?;
+                // A refused case means every case on this binding is refused:
+                // stop with the reason rather than grade the rest (#5518).
+                if let Some(stop) = identity_refusal_stop(&outcome, channel) {
+                    return Err(stop);
+                }
                 let elapsed = started.elapsed().as_secs_f64();
                 let output = match &outcome {
                     Outcome::Replied(reply) | Outcome::Failed { reply, .. } => reply.clone(),
@@ -4104,6 +4337,7 @@ async fn run_eval_turns(
                     },
                 };
                 let passed = reply_passes(case, &outcome);
+                case_trials.push(relay_trial(index, &outcome, passed, elapsed, &output));
                 let completed = matches!(
                     outcome,
                     Outcome::Replied(_)
@@ -4132,6 +4366,7 @@ async fn run_eval_turns(
             if let Some(variance) = &agg.variance {
                 details.insert(case.id.clone(), variance.clone());
             }
+            trials.insert(case.id.clone(), case_trials);
             results.push((case.id.clone(), agg.outcome, agg.seconds, agg.output));
         }
         anyhow::Ok(crate::commands::EvalReport {
@@ -4139,6 +4374,9 @@ async fn run_eval_turns(
             details,
             sampling,
             sample_passes,
+            trials,
+            // The caller attaches the revision it resolved around the run.
+            bundle_revision: None,
         })
     };
     let result = run.await;
@@ -4522,6 +4760,7 @@ async fn probe_fake_model(
 /// `the_probe_matches_the_worker_service_compose_declares` pins this against the
 /// compose file so a service rename cannot silently blind the probe again.
 pub(crate) const COMPOSE_WORKER_SERVICE: &str = "curie-worker";
+const COMPOSE_GATEWAY_SERVICE: &str = "curie-channel-gateway";
 
 /// The label selector the probe matches on, quoted into diagnostics so an
 /// operator can re-run the same `docker ps` and see what the CLI saw.
@@ -4583,6 +4822,41 @@ async fn local_worker_container() -> Result<String> {
         bail!("listing the local worker container: {}", stderr.trim());
     }
     select_worker_container(&stdout)
+}
+
+async fn local_gateway_container() -> Result<String> {
+    let project = crate::local::current_resources()?.project;
+    let cmd = OpsCommand::new(
+        "docker",
+        vec![
+            plain("ps"),
+            plain("--filter"),
+            plain(format!(
+                "label=com.docker.compose.service={COMPOSE_GATEWAY_SERVICE}"
+            )),
+            plain("--filter"),
+            plain(format!("label=com.docker.compose.project={project}")),
+            plain("--format"),
+            plain("{{.Names}}"),
+        ],
+    );
+    let (ok, stdout, _) = run_capture(&cmd).await?;
+    let names: Vec<_> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let selector = format!("label=com.docker.compose.service={COMPOSE_GATEWAY_SERVICE}");
+    if !ok {
+        bail!("listing the local gateway container failed");
+    }
+    match names.as_slice() {
+        [only] => Ok(only.trim().to_string()),
+        [] => bail!("no running container matches `{selector}`; start it with curie local up"),
+        many => bail!(
+            "{} running containers match `{selector}`; stop the extra gateways",
+            many.len()
+        ),
+    }
 }
 
 /// The `--model` sweep at the local/cluster tier: enqueue one platform eval per
@@ -5056,7 +5330,16 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     };
     ui.note(&format!("routing to channel {channel}"));
 
-    let results = run_eval_turns(
+    let api = ApiClient::new(&api_base, &opts.api_key)?;
+    let revision_before = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        identity.as_deref(),
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
+    let mut results = run_eval_turns(
         &opts,
         &channel,
         identity.as_deref(),
@@ -5065,6 +5348,15 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         EvalReplyTransport::Stub(&mut stub),
     )
     .await?;
+    let revision_after = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        identity.as_deref(),
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
+    attach_eval_revision(&mut results, revision_before, revision_after);
     crate::commands::report_eval(&results, None, stub)
 }
 
@@ -5176,13 +5468,18 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     };
     ui.note(&format!("routing to channel {channel}"));
 
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
 
-    let results = match run_eval_turns(
+    let revision_before = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        identity.as_deref(),
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
+    let mut results = match run_eval_turns(
         &opts,
         &channel,
         identity.as_deref(),
@@ -5195,6 +5492,15 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
+    let revision_after = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        identity.as_deref(),
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
+    attach_eval_revision(&mut results, revision_before, revision_after);
     // report_eval process::exits on a red suite without unwinding, so both
     // port-forwards must move in as guards (#1908). There is no stub guard.
     crate::commands::report_eval(&results, None, (valkey_pf, api_pf))
@@ -5243,13 +5549,13 @@ mod tests {
         let mut opts = MessageOpts::default();
         match mode.as_str() {
             "cluster-short" => {
-                opts.context = Some("pin-ctx".into());
+                opts.context = Some("scratch-cluster".into());
                 opts.namespace = "acme-platform".into();
                 opts.release = "acme-prod".into();
                 persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
             }
             "cluster-fallback" => {
-                opts.context = Some("pin-ctx".into());
+                opts.context = Some("scratch-cluster".into());
                 opts.namespace = "acme-platform".into();
                 opts.release = "acme-prod".into();
                 std::fs::write(".curie", "blocks the state directory")
@@ -5380,11 +5686,11 @@ mod tests {
             let text = captured_stderr(&output);
             assert!(output.status.success(), "{mode}: {text}");
             assert!(text.contains(
-                "curie cluster message --context pin-ctx --namespace acme-platform --release acme-prod"
+                "curie cluster message --context scratch-cluster --namespace acme-platform --release acme-prod"
             ), "{mode}: {text}");
             if mode == "cluster-short" {
                 assert!(text.contains("--continue"), "{text}");
-                assert_eq!(state.unwrap()["context"], "pin-ctx");
+                assert_eq!(state.unwrap()["context"], "scratch-cluster");
             } else {
                 assert!(text.contains("could not save turn context"), "{text}");
                 assert!(
@@ -5420,9 +5726,10 @@ mod tests {
             let output = capture_persist_hint(mode);
             let text = captured_stderr(&output);
             assert!(output.status.success(), "{mode}: {text}");
-            assert!(text.contains(
-                r"curie cluster message --context 'ctx '\''$;\name' --namespace 'ns space;$' --release 'rel'\''quote'"
-            ), "{mode}: {text}");
+            assert!(text.contains(&format!(
+                r"curie cluster message --context {} --namespace 'ns space;$' --release 'rel'\''quote'",
+                r"'ctx '\''$;\name'"
+            )), "{mode}: {text}");
         }
     }
 
@@ -5755,6 +6062,180 @@ mod tests {
     #[test]
     fn an_empty_thread_normalizes_to_no_thread() {
         assert_eq!(normalize_thread(Some(String::new())), None);
+    }
+
+    /// The local/cluster tiers see only the delivered reply, so a trial says
+    /// its tool calls are NOT observable (null) rather than claiming none were
+    /// made, and a timeout's diagnostic lands in `error`, never in `reply`.
+    #[test]
+    fn a_relay_trial_records_the_reply_and_never_claims_tool_calls() {
+        let replied = relay_trial(0, &Outcome::Replied("sunny".into()), true, 2.0, "sunny");
+        assert_eq!(replied.index, 0);
+        assert_eq!(replied.outcome, crate::evals::CaseOutcome::Pass);
+        assert_eq!(replied.reply, "sunny");
+        assert_eq!(replied.status.as_deref(), Some("replied"));
+        assert_eq!(replied.tool_calls, None, "this tier cannot see tool frames");
+        assert_eq!(replied.error, None);
+
+        let timed_out = relay_trial(1, &Outcome::TimedOut, false, 30.0, "no reply within 30s");
+        assert_eq!(timed_out.outcome, crate::evals::CaseOutcome::Fail);
+        assert_eq!(timed_out.reply, "", "a diagnostic is not a reply");
+        assert_eq!(timed_out.status.as_deref(), Some("timed_out"));
+        assert_eq!(timed_out.error.as_deref(), Some("no reply within 30s"));
+
+        let failed = relay_trial(
+            2,
+            &Outcome::Failed {
+                reply: "something went wrong".into(),
+                class: "runner_error".into(),
+            },
+            false,
+            1.0,
+            "something went wrong",
+        );
+        assert_eq!(failed.reply, "something went wrong");
+        assert_eq!(failed.status.as_deref(), Some("failed"));
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("runner turn failed: runner_error")
+        );
+    }
+
+    /// Review finding on #5553: two agents share one Slack address under
+    /// different identities. A channel-only eval speaks as the default
+    /// identity, so its revision must come from the default binding's agent
+    /// even when the named-identity agent is listed first; picking by address
+    /// alone reported the other agent's bundle.
+    #[test]
+    fn the_eval_revision_agent_is_the_one_bound_to_the_exact_route() {
+        let agents = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", Some("default"))]),
+        ];
+        let sre = &agents[1].id;
+        let ops = &agents[0].id;
+        // Channel only: the turn speaks as the default identity.
+        assert_eq!(
+            &eval_route_agent_id(&agents, None, "C0EXAMPLE1", None).unwrap(),
+            sre
+        );
+        // `--agent ops` resolves the named identity, which is what is sent.
+        assert_eq!(
+            &eval_route_agent_id(&agents, Some("ops"), "C0EXAMPLE1", Some("ops-bot")).unwrap(),
+            ops
+        );
+        // An omitted adapter is the default identity too.
+        let implicit = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+        ];
+        assert_eq!(
+            eval_route_agent_id(&implicit, None, "C0EXAMPLE1", None).unwrap(),
+            implicit[1].id
+        );
+    }
+
+    /// No binding, or more than one agent on the exact route, is an unknown
+    /// revision rather than a guess; a non-Slack binding on the same address
+    /// is a different route.
+    #[test]
+    fn the_eval_revision_agent_is_unknown_when_the_route_is_not_unique() {
+        let none = [agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))])];
+        assert!(eval_route_agent_id(&none, None, "C0EXAMPLE1", None).is_err());
+        let twice = [
+            agent_on("a", &[("C0EXAMPLE1", None)]),
+            agent_on("b", &[("C0EXAMPLE1", Some("default"))]),
+        ];
+        assert!(eval_route_agent_id(&twice, None, "C0EXAMPLE1", None).is_err());
+        let mut other_kind = agent_on("mail", &[("C0EXAMPLE1", None)]);
+        other_kind.channels[0].kind = "email".into();
+        assert!(eval_route_agent_id(&[other_kind], None, "C0EXAMPLE1", None).is_err());
+        // A named agent that is not the route's agent is refused, not swapped.
+        let agents = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+        ];
+        assert!(eval_route_agent_id(&agents, Some("ops"), "C0EXAMPLE1", None).is_err());
+    }
+
+    /// The revision lookup is best effort, so a platform API that accepts the
+    /// connection and never answers must cost at most the budget, then degrade
+    /// to an unknown revision. `ApiClient` has a connect timeout but no read
+    /// timeout, so without the wrapping bound this would block the eval before
+    /// its first case or after its last one indefinitely.
+    #[tokio::test]
+    async fn a_stalled_api_cuts_the_revision_lookup_off_at_its_budget() {
+        let (base, stall) = hint_stalling_peer().await;
+        let api = ApiClient::new(&base, HINT_API_KEY).unwrap();
+        let budget = Duration::from_millis(500);
+        let started = Instant::now();
+        let revision = tokio::time::timeout(
+            budget * 20,
+            eval_route_revision_or_warn(&api, None, "C0EXAMPLE1", None, budget),
+        )
+        .await
+        .expect("nothing bounded the lookup against a stalled API");
+        let elapsed = started.elapsed();
+        stall.abort();
+        assert_eq!(revision, None, "an expired budget is an unknown revision");
+        assert!(
+            elapsed >= budget,
+            "the stall was never reached; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < budget * 4,
+            "not cut off at its budget; took {elapsed:?}"
+        );
+    }
+
+    /// The limit of a before/after bracket, pinned so nobody reads more into
+    /// the field than it proves: a deploy of B and a redeploy of A inside one
+    /// run leaves both lookups on A, so the run still reports A even though
+    /// some samples may have run on B. The field means "the revision in force
+    /// at the start and at the end, unchanged", not "every sample's revision".
+    #[test]
+    fn an_a_to_b_to_a_run_still_reports_a_because_only_the_ends_are_observed() {
+        let revision = |version: &str| crate::commands::EvalBundleRevision {
+            agent_id: "agent-1".into(),
+            deployment_id: format!("dep-{version}"),
+            environment: "prod".into(),
+            version_id: version.into(),
+            version_label: version.into(),
+            commit_sha: None,
+            bundle_sha256: None,
+        };
+        // Observed: A before the first sample, A after the last. The B that
+        // served samples in between never reaches this function.
+        assert_eq!(
+            stable_eval_revision(Some(revision("A")), Some(revision("A"))),
+            Some(revision("A"))
+        );
+    }
+
+    /// A run names one revision only when the lookups before and after it
+    /// agree; a deploy mid-run, or a failed lookup on either side, is unknown.
+    #[test]
+    fn an_eval_names_a_revision_only_when_it_held_for_the_whole_run() {
+        let revision = |version: &str| crate::commands::EvalBundleRevision {
+            agent_id: "agent-1".into(),
+            deployment_id: format!("dep-{version}"),
+            environment: "prod".into(),
+            version_id: version.into(),
+            version_label: version.into(),
+            commit_sha: None,
+            bundle_sha256: Some(format!("sha-{version}")),
+        };
+        assert_eq!(
+            stable_eval_revision(Some(revision("v1")), Some(revision("v1"))),
+            Some(revision("v1"))
+        );
+        assert_eq!(
+            stable_eval_revision(Some(revision("v1")), Some(revision("v2"))),
+            None,
+            "a deploy landed mid-run, so the samples may span two bundles"
+        );
+        assert_eq!(stable_eval_revision(None, Some(revision("v1"))), None);
+        assert_eq!(stable_eval_revision(Some(revision("v1")), None), None);
     }
 
     #[test]
@@ -6595,6 +7076,8 @@ mod tests {
             publication_policy_version: 1,
             publication_draft: false,
             publication_branch_prefix: None,
+            connector_requester_identity: None,
+            connector_requester_identity_version: None,
         }
     }
 
@@ -7222,6 +7705,23 @@ mod tests {
     }
 
     #[test]
+    fn local_valkey_url_preserves_reserved_password_characters() {
+        for password in [
+            "example#token",
+            "example+token",
+            "example%2Ftoken",
+            "example/?@token",
+        ] {
+            let client =
+                redis::Client::open(local_valkey_url(password, "localhost", 6379)).unwrap();
+            assert_eq!(
+                client.get_connection_info().redis_settings().password(),
+                Some(password)
+            );
+        }
+    }
+
+    #[test]
     fn local_api_base_prefers_explicit_then_falls_back_to_compose_default() {
         assert_eq!(local_api_base(Some("http://host:9999")), "http://host:9999");
         assert_eq!(local_api_base(None), DEFAULT_LOCAL_API_URL);
@@ -7302,7 +7802,7 @@ mod tests {
 
         // Connected: the worker's transport is real Slack and its token is real.
         assert_eq!(
-            token(connected_worker_transport((
+            token(connected_gateway_transport((
                 t("https://slack.com/api/"),
                 t("xoxb-real")
             ))),
@@ -7313,7 +7813,7 @@ mod tests {
         // worker is wired to the stub, so posting would orphan a "..." in a real
         // channel that the worker can never edit. Not connected.
         assert_eq!(
-            connected_worker_transport((
+            connected_gateway_transport((
                 t("http://localhost:8155/api/"),
                 t("xoxb-real-from-the-vault")
             )),
@@ -7322,7 +7822,7 @@ mod tests {
 
         // The stub sentinel is not a workspace token even if the base URL is odd.
         assert_eq!(
-            connected_worker_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
+            connected_gateway_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
             None
         );
         // #1031: an EMPTY `SLACK_API_BASE_URL` is this repo's "talk to real Slack"
@@ -7331,7 +7831,7 @@ mod tests {
         // `${SLACK_API_BASE_URL-...}` preserves it, and the runbook documents it.
         // Reading it as disconnected made the connected local transport
         // unreachable. Connected, over real Slack's own base.
-        let empty_base = connected_worker_transport((t(""), t("xoxb-real")))
+        let empty_base = connected_gateway_transport((t(""), t("xoxb-real")))
             .expect("an empty SLACK_API_BASE_URL is the connected signal, not the stub one");
         assert_eq!(empty_base.api_base, crate::slack::DEFAULT_API_BASE);
         assert_eq!(empty_base.bot_token, "xoxb-real");
@@ -7339,14 +7839,14 @@ mod tests {
         // Absent is NOT empty. `None` means the value was never read off the
         // container (no stack, docker down, container renamed), so there is no
         // worker transport to trust -> stub path, never a real post.
-        assert_eq!(connected_worker_transport((None, None)), None);
-        assert_eq!(connected_worker_transport((None, t("xoxb-real"))), None);
+        assert_eq!(connected_gateway_transport((None, None)), None);
+        assert_eq!(connected_gateway_transport((None, t("xoxb-real"))), None);
         assert_eq!(
-            connected_worker_transport((t("https://slack.com/api/"), None)),
+            connected_gateway_transport((t("https://slack.com/api/"), None)),
             None
         );
         assert_eq!(
-            connected_worker_transport((t("https://slack.com/api/"), t("  "))),
+            connected_gateway_transport((t("https://slack.com/api/"), t("  "))),
             None
         );
     }
@@ -7371,7 +7871,7 @@ mod tests {
 
     /// The worker Slack env a `local comms` command actually applies, read back
     /// out of the built `OpsCommand`s the same way compose would.
-    fn worker_slack_env(commands: &[crate::ops::OpsCommand]) -> WorkerTransport {
+    fn gateway_slack_env(commands: &[crate::ops::OpsCommand]) -> GatewayTransport {
         let get = |key: &str| -> Option<String> {
             commands
                 .iter()
@@ -7391,7 +7891,7 @@ mod tests {
     #[test]
     fn local_comms_connect_and_disconnect_round_trip_through_the_probe() {
         let connect = crate::comms::local_connect_commands(&local_comms_opts(false));
-        let connected_env = worker_slack_env(&connect);
+        let connected_env = gateway_slack_env(&connect);
         assert_eq!(
             connected_env.0,
             Some(String::new()),
@@ -7399,7 +7899,7 @@ mod tests {
              ever changes, the probe's reading of empty must change with it"
         );
 
-        let transport = connected_worker_transport(connected_env)
+        let transport = connected_gateway_transport(connected_env)
             .expect("`local comms --connect` must leave the worker classified as connected");
         assert_eq!(transport.api_base, crate::slack::DEFAULT_API_BASE);
         assert_eq!(transport.bot_token, "xoxb-real-workspace");
@@ -7407,7 +7907,7 @@ mod tests {
         // Negative control on the same seam: --disconnect restores the stub, which
         // must stay classified as not connected however real the token looks.
         let disconnect = crate::comms::local_disconnect_commands(&local_comms_opts(true));
-        let disconnected_env = worker_slack_env(&disconnect);
+        let disconnected_env = gateway_slack_env(&disconnect);
         assert!(
             disconnected_env
                 .0
@@ -7416,7 +7916,7 @@ mod tests {
             "`local comms --disconnect` must point the worker back at the stub: {:?}",
             disconnected_env.0
         );
-        assert_eq!(connected_worker_transport(disconnected_env), None);
+        assert_eq!(connected_gateway_transport(disconnected_env), None);
     }
 
     /// #1031 mode C at the local tier: a probe that could not RUN is not evidence
@@ -7424,7 +7924,7 @@ mod tests {
     /// the stub path (the asymmetry `ops::dispatcher_connected` already closed).
     #[test]
     fn a_probe_that_could_not_run_warns_rather_than_claiming_disconnected() {
-        let warning = worker_probe_warning("no running container matches `label=x`");
+        let warning = gateway_probe_warning("no running container matches `label=x`");
         assert!(
             warning.contains("could not determine")
                 && warning.contains("no running container matches `label=x`")
@@ -7433,7 +7933,7 @@ mod tests {
         );
         // Only the first line of a multi-line failure, so a docker stack trace
         // cannot swamp the operator's terminal.
-        let multi = worker_probe_warning("first line\nsecond line");
+        let multi = gateway_probe_warning("first line\nsecond line");
         assert!(
             multi.contains("first line") && !multi.contains("second line"),
             "{multi}"
@@ -7454,7 +7954,7 @@ mod tests {
         // only fire when the budget is not being applied at all.
         let reason = tokio::time::timeout(
             Duration::from_secs(5),
-            bounded_worker_probe(std::future::pending(), budget),
+            bounded_gateway_probe(std::future::pending(), budget),
         )
         .await
         .expect("the probe must be bounded; it never returned")
@@ -7587,7 +8087,7 @@ mod tests {
             vec![plain(ready_path.to_str().expect("ready path is UTF 8"))],
         );
         let probe = tokio::spawn(async move {
-            bounded_worker_probe(
+            bounded_gateway_probe(
                 async {
                     let (_ok, _out, _err) = run_capture(&cmd).await?;
                     Ok((None, None))
@@ -7627,9 +8127,9 @@ mod tests {
     #[test]
     fn the_probe_budget_is_bounded_and_usable() {
         assert!(
-            WORKER_PROBE_TIMEOUT > Duration::ZERO
-                && WORKER_PROBE_TIMEOUT <= Duration::from_secs(30),
-            "{WORKER_PROBE_TIMEOUT:?}"
+            GATEWAY_PROBE_TIMEOUT > Duration::ZERO
+                && GATEWAY_PROBE_TIMEOUT <= Duration::from_secs(30),
+            "{GATEWAY_PROBE_TIMEOUT:?}"
         );
     }
 
@@ -7639,7 +8139,7 @@ mod tests {
         // the same `docker inspect`, so the placeholder goes where the worker that
         // will edit it is pointed. Before this, only the token survived and the base
         // came from whatever the operator happened to have exported.
-        let resolved = connected_worker_transport((
+        let resolved = connected_gateway_transport((
             Some("https://proxy.example/api".to_string()),
             Some("xoxb-worker-actual".to_string()),
         ))
@@ -7648,7 +8148,7 @@ mod tests {
         assert_eq!(resolved.bot_token, "xoxb-worker-actual");
 
         std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:18081/api");
-        let again = connected_worker_transport((
+        let again = connected_gateway_transport((
             Some("https://proxy.example/api".to_string()),
             Some("xoxb-worker-actual".to_string()),
         ))
@@ -7980,6 +8480,15 @@ mod tests {
     }
 
     #[test]
+    fn local_eval_dry_run_hides_raw_and_encoded_valkey_passwords() {
+        let mut opts = eval_opts(true, Some("C123"));
+        opts.valkey_password = "example#private%token".into();
+        let lines = eval_dry_run_lines(&opts, "smoke", 1).unwrap().join("\n");
+        assert!(!lines.contains(&opts.valkey_password));
+        assert!(!lines.contains(&queue::percent_encode_unreserved(&opts.valkey_password)));
+    }
+
+    #[test]
     fn local_eval_dry_run_plan_names_the_tier_suite_and_enqueue() {
         // The `local eval` path with no live stack: the plan is a pure render.
         let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3)
@@ -7993,7 +8502,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l == "enqueue onto redis redis://:valkeypass@localhost:26379"),
+                .any(|l| l == "enqueue onto redis redis://localhost:26379"),
             "{lines:?}"
         );
         assert!(lines.iter().any(|l| l == "channel C123"), "{lines:?}");
@@ -8196,6 +8705,8 @@ mod tests {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                connector_requester_identity: None,
+                connector_requester_identity_version: None,
             },
             Agent {
                 id: "a2".into(),
@@ -8223,6 +8734,8 @@ mod tests {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                connector_requester_identity: None,
+                connector_requester_identity_version: None,
             },
         ];
         // Explicit channel picks the matching agent's id.
@@ -8482,7 +8995,7 @@ mod tests {
     /// Compose substitutes its variables from each invocation's own environment,
     /// so after `local up --build` the stack ran `:dev` while `local message`
     /// resolved `:latest` and died on `No module named
-    /// curie_dispatcher.enqueue_once` -- the module the published image predates.
+    /// curie_channel_gateway.slack.enqueue_once` -- the module the published image predates.
     #[test]
     fn the_one_shot_producer_runs_the_stacks_dispatcher_image() {
         let cmd = dispatcher_enqueue_command(
@@ -8861,6 +9374,167 @@ mod tests {
         }
     }
 
+    /// The two events the worker writes on the relay when it refuses a turn
+    /// that carries no HTTP identity (HTTP-INVOCATION-EXECUTION-31, #5518).
+    fn identity_refusal_page() -> Vec<ClusterMessageReplyEvent> {
+        vec![
+            relay_event(
+                "reply.update",
+                Some(
+                    "curie-turn-failure: identity-refused\n\nThe worker refused this turn \
+                     before running it.",
+                ),
+                None,
+            ),
+            relay_event("turn.completed", None, Some("dropped")),
+        ]
+    }
+
+    /// #5518: the worker's refusal pair is a failed turn carrying its class,
+    /// not a reply the grader could match and not a reason to keep polling.
+    #[test]
+    fn an_identity_refusal_on_the_relay_is_a_failed_turn_with_its_class() {
+        let mut latest = None;
+        let outcome =
+            cluster_relay_page_outcome(&identity_refusal_page(), true, &mut latest, &mut |_| {})
+                .expect("refusal classification")
+                .expect("a refusal is terminal");
+        match outcome {
+            Outcome::Failed { class, .. } => assert_eq!(class, IDENTITY_REFUSED_FAILURE_CLASS),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// #5518: only the identity refusal class stops a suite; any other outcome,
+    /// another failure class included, is graded as before.
+    #[test]
+    fn only_an_identity_refusal_stops_a_cluster_eval() {
+        let refused = Outcome::Failed {
+            class: IDENTITY_REFUSED_FAILURE_CLASS.to_string(),
+            reply: "curie-turn-failure: identity-refused".to_string(),
+        };
+        let err = identity_refusal_stop(&refused, "C0EXAMPLE1").expect("a refusal stops the eval");
+        let cli = err
+            .downcast_ref::<crate::exit::CliError>()
+            .expect("a structured CLI error");
+        assert!(matches!(cli.class, crate::exit::ExitClass::Failure));
+        assert!(cli.message.contains("C0EXAMPLE1"), "{}", cli.message);
+        assert!(cli.message.contains("HTTP identity"), "{}", cli.message);
+        let fix = cli.fix.as_deref().expect("a fix");
+        assert!(
+            fix.contains("curie skill eval") && fix.contains("curie local eval"),
+            "{fix}"
+        );
+        assert!(
+            !looks_like_enqueue_timeout(&err),
+            "the stop must not be rewritten as an enqueue timeout"
+        );
+
+        let other_failure = Outcome::Failed {
+            class: "max-turns".to_string(),
+            reply: "curie-turn-failure: max-turns".to_string(),
+        };
+        for outcome in [
+            other_failure,
+            Outcome::Replied("pong".to_string()),
+            Outcome::CompletedNoEdit,
+            Outcome::TimedOut,
+        ] {
+            assert!(
+                identity_refusal_stop(&outcome, "C0EXAMPLE1").is_none(),
+                "{outcome:?} must be graded, not stop the suite"
+            );
+        }
+    }
+
+    /// #5518, through the real eval loop: a real Valkey stream and a stand-in
+    /// API whose relay answers every bucket with the worker's refusal pair. The
+    /// suite stops after its first case with the structured error, instead of
+    /// enqueueing every case and waiting out each one's deadline.
+    #[tokio::test]
+    async fn cluster_eval_stops_at_the_first_identity_refusal() {
+        let url = std::env::var("TEST_VALKEY_URL")
+            .unwrap_or_else(|_| "redis://:valkeypass@localhost:26379".to_string());
+        let mut conn = match connect(&url).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                if std::env::var_os("CI_REQUIRE_VALKEY_TESTS").is_some() {
+                    panic!("required Valkey is not reachable at {url}: {err}");
+                }
+                eprintln!("skipping: Valkey not reachable at {url}: {err}");
+                return;
+            }
+        };
+        const PAGE: &str = r#"{"events":[{"event":"reply.update","text":"curie-turn-failure: identity-refused\n\nThe worker refused this turn before running it."},{"event":"turn.completed","outcome":"dropped"}],"next_cursor":2,"terminal":true}"#;
+        let api = ApiClient::new(&hint_stub_api(200, PAGE).await, HINT_API_KEY).expect("client");
+        let stream = format!("test:eval-identity-refusal:{}", uuid::Uuid::new_v4());
+        let mut opts = eval_opts(false, Some("C0EXAMPLE1"));
+        opts.dry_run = false;
+        opts.stream = stream.clone();
+        opts.timeout_secs = 30;
+        let mut second = eval_case(GraderKind::Contains, "pong");
+        second.id = "c2".into();
+        let suite = EvalSuite {
+            name: "identity-refusal".into(),
+            cases: vec![eval_case(GraderKind::Contains, "pong"), second],
+        };
+
+        let started = Instant::now();
+        let result = run_eval_turns(
+            &opts,
+            "C0EXAMPLE1",
+            None,
+            &suite,
+            &mut conn,
+            EvalReplyTransport::Relay(&api),
+        )
+        .await;
+
+        let enqueued: Vec<(String, std::collections::HashMap<String, String>)> =
+            redis::cmd("XRANGE")
+                .arg(&stream)
+                .arg("-")
+                .arg("+")
+                .query_async(&mut conn)
+                .await
+                .expect("XRANGE");
+        let mut released = Vec::new();
+        for (_, fields) in &enqueued {
+            let turn: QueuedTurn =
+                serde_json::from_str(&fields[curie_aci_protocol::STREAM_PAYLOAD_FIELD])
+                    .expect("turn");
+            released.push(thread_key_for_turn(&turn));
+        }
+        let _: i64 = redis::cmd("DEL")
+            .arg(&stream)
+            .query_async(&mut conn)
+            .await
+            .expect("DEL");
+        for key in &released {
+            let _: i64 = redis::cmd("SREM")
+                .arg(crate::queue::THREAD_RESET_SET)
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .expect("SREM");
+        }
+
+        let err = match result {
+            Ok(report) => panic!("the suite ran to the end: {:?}", report.rows),
+            Err(err) => err,
+        };
+        let cli = err
+            .downcast_ref::<crate::exit::CliError>()
+            .unwrap_or_else(|| panic!("not a structured CLI error: {err:#}"));
+        assert!(cli.message.contains("HTTP identity"), "{}", cli.message);
+        assert_eq!(enqueued.len(), 1, "only the first case may be enqueued");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the refusal must end the wait, not the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn cluster_relay_page_keeps_waiting_on_card_post_without_result() {
         let mut latest = None;
@@ -8970,6 +9644,7 @@ mod tests {
         let allowed = [
             "comment",
             "reply_prefix",
+            "identity_refused_class",
             "factory_class_line_prefix",
             "examples",
         ];
@@ -8982,6 +9657,10 @@ mod tests {
         assert!(unknown.is_empty(), "unknown vector keys: {unknown:?}");
         let prefix = vector["reply_prefix"].as_str().expect("reply_prefix");
         assert_eq!(prefix, crate::chat::TURN_FAILURE_REPLY_PREFIX);
+        assert_eq!(
+            vector["identity_refused_class"].as_str(),
+            Some(IDENTITY_REFUSED_FAILURE_CLASS)
+        );
         for example in vector["examples"].as_array().expect("examples") {
             let line = example["reply_first_line"].as_str().expect("line");
             let class = example["classification"].as_str().expect("class");

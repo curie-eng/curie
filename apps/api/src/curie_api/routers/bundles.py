@@ -8,6 +8,8 @@ bytes so a runner can pull a bundle by version.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
+from sqlalchemy import delete, exists, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from curie_api.crud import agents as crud_agents
@@ -15,11 +17,11 @@ from curie_api.crud import deployments as crud_deployments
 from curie_api.crud import versions as crud_versions
 from curie_api.schemas.versions import BundleOut
 
-from .. import bundles, deploy
+from .. import approver_tickets, bundles, deploy
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
-from ..models import AgentVersion
+from ..models import AgentVersion, Deployment
 
 # Chunk size for the bounded read below; arbitrary, just small enough that a
 # rejected oversized upload never holds more than one chunk's worth of the
@@ -96,6 +98,42 @@ async def _read_bounded_upload(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+async def _discard_upload_version(session: AsyncSession, version_id: uuid.UUID) -> None:
+    """Delete the version a refused tracker result upload was made for (#5585, #5586).
+
+    A refused tracker result deployment leaves no agent version behind. Every
+    REST client (the CLI's ``prepare_deploy``, the UI's create-agent modal and
+    its deploy action) creates a fresh version with
+    ``POST /agents/{id}/versions`` and uploads into it at once, so a version
+    with no bundle that no deployment references exists only for this upload,
+    and nothing will ever upload into it again: a retry creates a new version.
+    A version a deployment already references (the documented
+    deploy-then-attach order) is kept. Only this refusal discards: any other
+    refused upload leaves the version as it always has.
+
+    The order is load-bearing because ``deployments.version_id`` cascades on
+    delete. A ``NOT EXISTS`` inside the DELETE could be judged before a
+    concurrent deployment INSERT commits and then cascade away that new
+    deployment. ``FOR UPDATE`` conflicts with the key-share lock the INSERT's
+    foreign key check holds on the version row, so it waits until that
+    transaction ends; the checks after it then see the committed deployment.
+    And once this lock is held, a new deployment INSERT waits for this
+    transaction, then fails its foreign key check if the row is gone.
+    """
+
+    locked = await session.scalar(
+        select(AgentVersion.bundle_ref)
+        .where(AgentVersion.id == version_id)
+        .with_for_update()
+    )
+    referenced = await session.scalar(
+        select(exists().where(Deployment.version_id == version_id))
+    )
+    if locked is None and not referenced:
+        await session.execute(delete(AgentVersion).where(AgentVersion.id == version_id))
+    await session.commit()
+
+
 @router.put("", response_model=BundleOut, status_code=status.HTTP_201_CREATED)
 async def upload_bundle(
     agent_id: uuid.UUID,
@@ -116,13 +154,28 @@ async def upload_bundle(
         )
 
     try:
-        extension, content_type = await run_in_threadpool(deploy.validate_archive, data)
+        extension, content_type, declaration = await run_in_threadpool(
+            deploy.validate_archive, data
+        )
     except bundles.UnsupportedArchive as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except deploy.BundleInvalid as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"detail": "bundle failed validation", "errors": exc.errors},
+        ) from exc
+
+    agent = await crud_agents.get_agent(session, agent_id)
+    if agent is None:  # pragma: no cover -- the version lookup above proves it
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    try:
+        await deploy.check_tracker_result_admissible(session, agent, declaration)
+    except deploy.TrackerResultRefused as exc:
+        # Before the route join, `store.put` and `attach_bundle`, so a refused
+        # bundle stores no object and leaves `bundle_ref` null (#5586).
+        await _discard_upload_version(session, version.id)
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
         ) from exc
 
     # The declared/bound approval-route join, CONDITIONAL on this version already
@@ -145,18 +198,19 @@ async def upload_bundle(
     # leaves `bundle_ref` null -- `crud.versions.attach_bundle` commits immediately, so a
     # check placed after it would already be live.
     if await crud_deployments.version_has_active_deployment(session, version_id):
-        agent = await crud_agents.get_agent(session, agent_id)
-        if agent is None:  # pragma: no cover -- the version lookup above proves it
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
         try:
             await deploy.check_routes_from_bytes(
                 data, agent.approval_routes, version_id, get_settings()
             )
         except deploy.ApprovalRoutesUnbound as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        except approver_tickets.BundleGateMismatch as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
+            ) from exc
 
     return await deploy.store_bundle(
-        store, session, agent_id, version, data, extension, content_type
+        store, session, agent_id, version, data, extension, content_type, declaration=declaration
     )
 
 

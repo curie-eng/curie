@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use base64::Engine;
+
 use curie::connector_caller::{generate_keypair, verify_key_of};
 
 fn corpus() -> serde_json::Value {
@@ -25,9 +27,13 @@ fn every_frozen_seed_derives_its_frozen_public_key() {
     let vectors = corpus["vectors"].as_array().expect("vectors");
     assert!(!vectors.is_empty());
     for vector in vectors {
-        let seed = vector["seed"].as_str().expect("seed");
+        let range = vector["seed_range"].as_array().expect("seed range");
+        let start = u8::try_from(range[0].as_u64().expect("start")).expect("start byte");
+        let end = u8::try_from(range[1].as_u64().expect("end")).expect("end byte");
+        let seed =
+            base64::engine::general_purpose::STANDARD.encode((start..end).collect::<Vec<_>>());
         let public = vector["public"].as_str().expect("public");
-        assert_eq!(verify_key_of(seed).unwrap(), public, "{}", vector["name"]);
+        assert_eq!(verify_key_of(&seed).unwrap(), public, "{}", vector["name"]);
     }
 }
 

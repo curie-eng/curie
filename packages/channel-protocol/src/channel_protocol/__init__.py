@@ -1,5 +1,6 @@
 """Rendering-neutral messages shared by Curie channel adapters."""
 
+from .formatted import Reply
 from .identity import (
     ScopedConversation,
     hook_conversation_id,
@@ -33,6 +34,7 @@ from .progress import (
 from .reply import (
     PROGRESS_REPLY_WIRE_VERSION,
     REPLY_WIRE_VERSION,
+    SCOPED_REPLY_WIRE_VERSION,
     VERBATIM_REPLY_WIRE_VERSION,
     NavAffordance,
     ReplyAck,
@@ -51,6 +53,7 @@ __all__ = [
     "PROGRESS_COMMAND_VERSION",
     "PROGRESS_REPLY_WIRE_VERSION",
     "REPLY_WIRE_VERSION",
+    "SCOPED_REPLY_WIRE_VERSION",
     "VERBATIM_REPLY_WIRE_VERSION",
     "TERMINAL_PROGRESS_STATES",
     "ScopedConversation",
@@ -69,6 +72,7 @@ __all__ = [
     "ProgressCommand",
     "ProgressMilestone",
     "ProgressState",
+    "Reply",
     "ReplyAck",
     "ReplyEvent",
     "ReplyPost",

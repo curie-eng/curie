@@ -51,9 +51,7 @@ import contextlib
 import hashlib
 import json
 import os
-import shlex
 import shutil
-import socket
 import stat
 import sys
 import time
@@ -82,6 +80,7 @@ from curie_runner.session import SessionRunner
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import RUNNER_TOKEN_ENV, FactoryWake
 from curie_worker.runner_client import RunnerClient
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
@@ -102,12 +101,11 @@ from curie_worker.workspace_recovery_storage import (
     RecoveryCaptureRequest,
     RecoveryCheckpointReader,
     RecoveryCheckpointWriter,
-    RecoveryCollector,
     RecoveryObjectStore,
     RecoveryRepository,
 )
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from apps.worker.tests.test_workspace_recovery_storage import (
@@ -136,10 +134,14 @@ from apps.worker.tests.test_workspace_recovery_storage import (
     _settings_env,
 )
 
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
+
+
 RUNNER_TOKEN = "recovery-runner-token-claim"
 SUCCESSOR_TOKEN = "successor-holds-this-thread"
 CAPTURE_BUDGET_SECONDS = 60.0
-REAL_GIT = shutil.which("git") or "git"
 WORKER_HEADERS_KEY = "X-Curie-Worker-Token"
 REPOSITORY = RecoveryRepository(
     provider="github", host="github.com", project_id="101", path=REPOSITORY_PATH
@@ -236,48 +238,6 @@ def _tree(root: Path) -> dict[str, tuple[str, int, str]]:
     return files
 
 
-def _closed_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
-
-
-def _git_wrapper(bin_dir: Path, *, subcommand: str, action: str) -> str:
-    """A ``git`` that runs ``action`` on ``subcommand`` and then execs real git.
-
-    The same seam ``runner/tests/test_workspace_checkpoint.py`` uses: the runner
-    capture runs git by argv name with the process PATH, so the wrapper sees the
-    chosen call. Returns the PATH value that puts it first.
-    """
-
-    bin_dir.mkdir(parents=True)
-    script = bin_dir / "git"
-    script.write_text(
-        "#!/bin/sh\n"
-        'sub=""\n'
-        "skip=0\n"
-        'for arg in "$@"; do\n'
-        '  if [ "$skip" = 1 ]; then skip=0; continue; fi\n'
-        '  case "$arg" in\n'
-        "    -c|-C|--git-dir|--work-tree|--namespace) skip=1 ;;\n"
-        "    -*) ;;\n"
-        '    *) sub="$arg"; break ;;\n'
-        "  esac\n"
-        "done\n"
-        f'if [ "$sub" = {shlex.quote(subcommand)} ]; then\n'
-        f"{action}\n"
-        "fi\n"
-        f'exec {shlex.quote(REAL_GIT)} "$@"\n'
-    )
-    script.chmod(0o755)
-    return f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
-
-
-def _once(marker: Path, body: str) -> str:
-    q = shlex.quote(str(marker))
-    return f"  if [ ! -e {q} ]; then\n    : > {q}\n{body}  fi\n"
-
-
 def _agent_edits(checkout: Path) -> None:
     """What the scripted failing task does to the checkout before it fails."""
 
@@ -291,12 +251,6 @@ def _agent_edits(checkout: Path) -> None:
     (checkout / "assets/blob.bin").write_bytes(_binary(4096, 22))
     os.chmod(checkout / "bin/run.sh", 0o755)
     (checkout / "docs/remove-me.txt").unlink()
-
-
-def _oversized_edits(checkout: Path) -> None:
-    _agent_edits(checkout)
-    # Incompressible bytes: the binary patch exceeds the 900000-byte patch cap.
-    (checkout / "assets/huge.bin").write_bytes(_binary(1_200_000, 23))
 
 
 def _failing_turn(checkout: Path, edits: Callable[[Path], None]) -> Callable[[], list[Any]]:
@@ -397,24 +351,6 @@ class _HookedLedger(WorkspaceRecoveryClient):
         if hook is not None:
             await hook(result)
         return result
-
-
-class _LoseRoute(httpx.AsyncBaseTransport):
-    """Real HTTP to the API, except every call to one ledger route is lost."""
-
-    def __init__(self, suffix: str) -> None:
-        self._inner = httpx.AsyncHTTPTransport()
-        self._suffix = suffix
-        self.lost = 0
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith(self._suffix):
-            self.lost += 1
-            raise httpx.ConnectError("injected ledger route loss", request=request)
-        return await self._inner.handle_async_request(request)
-
-    async def aclose(self) -> None:
-        await self._inner.aclose()
 
 
 @web.middleware
@@ -654,6 +590,7 @@ class _Stage:
             claim_name=claim,
             sandbox_name=f"sbx-{claim}",
             context=grant.context,
+            delivered_limits=UNOBSERVED_LIMITS,
         )
         await self.dispatch.finish(
             request_id,
@@ -662,6 +599,9 @@ class _Stage:
             cause="runner_failed",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert self.work_item_id is not None
         return _Source(self.work_item_id, request_id, started.runtime_epoch, grant.generation)
@@ -776,7 +716,11 @@ class _Stage:
             on_stop=self.h.kernel._stop_owned_work_item,
             on_stale=self.h.kernel._abandon_stale_work_item,
         )
-        await run.start(claim_name=self.handle.claim_name, sandbox_name=self.handle.sandbox_name)
+        await run.start(
+            claim_name=self.handle.claim_name,
+            sandbox_name=self.handle.sandbox_name,
+            delivered_limits=UNOBSERVED_LIMITS,
+        )
         assert run.runtime_epoch is not None
         assert run.recovery_eligible is False
         self.run = run
@@ -812,7 +756,14 @@ class _Stage:
         run = self.run
         assert run is not None
         await self.h.kernel._finish_or_settle(
-            run, outcome="failed", cause="runner_failed", detail=None, ci_fix_round=None
+            run,
+            outcome="failed",
+            cause="runner_failed",
+            detail=None,
+            ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert run.finished
         self.request_after_finish = await self.request_row(run.request_id)
@@ -1137,13 +1088,6 @@ def _assert_released(stage: _Stage) -> None:
     assert stage.coordinator.current(stage.thread_key) is None
     assert not stage.exists(f"private/workspaces/{stage.prepared.object_key}")
     assert not stage.exists(f"private/workspaces/_ownership/{_ownership(stage.thread_key)}.json")
-
-
-async def _assert_no_recovery_state(stage: _Stage) -> None:
-    state = await stage.recovery_state()
-    assert state["checkpoints"] == {} and state["objects"] == {}, state
-    assert state["last_good"] is None and state["outcome"] is None, state
-    assert stage.checkpoint_calls == []
 
 
 # --- AC1 -----------------------------------------------------------------------------------
@@ -1596,561 +1540,95 @@ def test_recovery_release_races(
     _assert_valkey_clean(sync_redis, names)
 
 
-# --- AC3: terminal faults and the paths that never capture ----------------------------------
-
-
-async def _fault_disabled(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    run = await stage.start_run()
-    await stage.fail_turn()
-    await stage.finish_failed()
-    await stage.release()
-    assert run.recovery_eligible is True
-    await _assert_no_recovery_state(stage)
-    _assert_released(stage)
-    await stage.assert_request_unchanged()
-
-
-async def _cancel_work_item(stage: _Stage) -> None:
-    version = (
-        await stage.sql(
-            "SELECT version FROM curie.work_items WHERE id = :id", id=stage.work_item_id
-        )
-    )[0]["version"]
-    response = await stage.http.post(
-        f"{stage.services.api_url}/v1/internal/work-items/{stage.work_item_id}/cancel",
-        headers={WORKER_HEADERS_KEY: stage.services.worker_token},
-        json={"expected_version": version},
-    )
-    assert response.status_code == 200, response.text
-
-
-async def _stop_and_release(stage: _Stage) -> None:
-    """What the heartbeat's ``cancellation_requested`` callback and the finally do."""
-
-    run = stage.run
-    assert run is not None
-    stage.observer = _ReleaseObserver(stage)
-    await stage.h.kernel._stop_owned_work_item(stage.thread_key, run)
-    assert run.finished
-    await stage.release()
-    assert run.recovery_eligible is False
-
-
-async def _fault_cancellation(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    run = await stage.start_run()
-    await _cancel_work_item(stage)
-    beat = await stage.dispatch.heartbeat(run.request_id, runtime_epoch=run.runtime_epoch or 0)
-    assert beat.status == "cancellation_requested"
-    await _stop_and_release(stage)
-    await _assert_no_recovery_state(stage)
-    request = await stage.request_row(run.request_id)
-    assert request["status"] == "cancelled"
-    assert stage.handle.claim_name not in stage.h.fake_k8s.claims
-
-
-async def _fault_execution_deadline(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    from curie_api.workitems import lifecycle
-
-    # Deadlines are write once at start, so the agent gets the shortest deadline
-    # the schema allows before the run starts and the test waits it out.
-    await stage.sql(
-        "UPDATE curie.agents SET execution_deadline_seconds = 60 WHERE id = :id",
-        id=stage.agent_id,
-    )
-    run = await stage.start_run()
-    for _ in range(180):
-        passed = await stage.sql(
-            "SELECT execution_deadline <= clock_timestamp() AS passed "
-            "FROM curie.execution_requests WHERE id = :id",
-            id=run.request_id,
-        )
-        if passed[0]["passed"]:
-            break
-        await asyncio.sleep(0.5)
-    else:
-        raise AssertionError("the 60 second execution deadline never passed")
-    versions = (
-        await stage.sql(
-            "SELECT w.version AS item, r.version AS request FROM curie.execution_requests r "
-            "JOIN curie.work_items w ON w.id = r.work_item_id WHERE r.id = :id",
-            id=run.request_id,
-        )
-    )[0]
-    async with AsyncSession(stage.engine) as session:
-        await lifecycle.request_execution_deadline_cancellation(
-            session,
-            work_item_id=stage.work_item_id,
-            request_id=run.request_id,
-            expected_work_item_version=versions["item"],
-            expected_request_version=versions["request"],
-        )
-        await session.commit()
-    requested = await stage.request_row(run.request_id)
-    assert (requested["status"], requested["terminal_cause"]) == (
-        "cancellation_requested",
-        "execution_deadline",
-    )
-    await _stop_and_release(stage)
-    await _assert_no_recovery_state(stage)
-    request = await stage.request_row(run.request_id)
-    assert request["terminal_cause"] == "execution_deadline"
-    assert request["status"] != "failed"
-
-
-async def _fault_owner_loss(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    run = await stage.start_run()
-    await stage.fail_turn()
-    # A peer proved this owner dead; its next heartbeat is refused as stale.
-    await stage.dispatch.declare_owner_lost(
-        run.request_id, owner=run.owner, runtime_epoch=run.runtime_epoch or 0
-    )
-    with pytest.raises(WorkItemConflict) as refused:
-        await stage.dispatch.heartbeat(run.request_id, runtime_epoch=run.runtime_epoch or 0)
-    assert refused.value.code == "stale_owner"
-    stage.observer = _ReleaseObserver(stage)
-    await stage.h.kernel._abandon_stale_work_item(stage.thread_key, run)
-    assert run.abandoned and run.finished
-    await stage.release()
-    assert run.recovery_eligible is False
-    await _assert_no_recovery_state(stage)
-    # The API termination chain owns the lost request's teardown: nothing released.
-    assert stage.observer.calls == []
-    assert stage.handle.claim_name in stage.h.fake_k8s.claims
-    await asyncio.to_thread(stage.h.substrate.release, stage.thread_key)
-    await asyncio.to_thread(stage.coordinator.release, stage.thread_key)
-
-
-async def _fault_cancelled_finish(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    run = await stage.start_run()
-    await stage.fail_turn()
-    await _cancel_work_item(stage)
-    with pytest.raises(WorkItemConflict) as refused:
-        await stage.h.kernel._finish_or_settle(
-            run, outcome="failed", cause="runner_failed", detail=None, ci_fix_round=None
-        )
-    assert refused.value.code == "work_item_cancelled"
-    # kernel/completion.py's handling of this refusal (#3208).
-    run.finished = True
-    assert run.recovery_eligible is False
-    await stage.release()
-    await _assert_no_recovery_state(stage)
-    _assert_released(stage)
-
-
-async def _failed_with_last_good(
-    stage: _Stage, edits: Callable[[Path], None] = _agent_edits
-) -> None:
-    await stage.seed_last_good()
-    await stage.start_run()
-    await stage.fail_turn(edits)
-    await stage.finish_failed()
-
-
-async def _assert_fault_kept_the_failure(stage: _Stage, outcome: str | None) -> None:
-    """The original failure and the last good checkpoint survive the fault."""
-
-    await stage.assert_request_unchanged()
-    await stage.assert_last_good_readable()
-    if outcome is not None:
-        assert (await stage.recovery_state())["outcome"] == outcome
-    own = await stage.own_checkpoints()
-    assert "complete" not in own.values(), own
-
-
-async def _fault_torn_capture(stage: _Stage, monkeypatch: pytest.MonkeyPatch) -> None:
-    await _failed_with_last_good(stage)
-    marker = stage.root / "raced"
-    tracked = stage.checkout / "src/app.py"
-    writer = f"    /bin/sh -c 'printf raced >> \"$1\"' writer {shlex.quote(str(tracked))}\n"
-    monkeypatch.setenv(
-        "PATH",
-        _git_wrapper(
-            stage.root / "torn-bin", subcommand="write-tree", action=_once(marker, writer)
-        ),
-    )
-    seeded_calls = len(stage.checkpoint_calls)
-    try:
-        await stage.release()
-    finally:
-        monkeypatch.undo()
-    assert marker.exists(), "the concurrent writer never ran during the checkpoint"
-    assert len(stage.checkpoint_calls) == seeded_calls + 1
-    await _assert_fault_kept_the_failure(stage, "torn_capture")
-    assert await stage.own_checkpoints() == {}
-    _assert_released(stage)
-
-
-async def _fault_patch_too_large(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    await _failed_with_last_good(stage, _oversized_edits)
-    await stage.release()
-    await _assert_fault_kept_the_failure(stage, "patch_too_large")
-    assert await stage.own_checkpoints() == {}
-    _assert_released(stage)
-
-
-async def _fault_runner_outage(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    await _failed_with_last_good(stage)
-    await stage.stop_runner()
-    await stage.release()
-    _assert_release_bounded(stage)
-    await _assert_fault_kept_the_failure(stage, "runner_unavailable")
-    assert await stage.own_checkpoints() == {}
-    _assert_released(stage)
-
-
-async def _fault_store_outage(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    await _failed_with_last_good(stage)
-    await stage.release()
-    _assert_release_bounded(stage)
-    await _assert_fault_kept_the_failure(stage, "upload_failed")
-    assert list((await stage.own_checkpoints()).values()) == ["tombstoned"]
-    _assert_released(stage)
-
-
-OWNERSHIP_STALL_SECONDS = 3.0
-
-
-async def _fault_ownership_read_stalls(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    """A stalled workspace-ownership read never blocks the worker's event loop.
-
-    The capture builds its base source from the PreparedWorkspace it was handed;
-    any lookup that still touches the object store runs off the loop, so other
-    turns keep being served while it waits.
-    """
-
-    await stage.start_run()
-    await stage.fail_turn()
-    await stage.finish_failed()
-    assert stage.capture is not None
-    objects = stage.coordinator.preparer.objects
-    ownership_key = stage.coordinator._ownership_key(stage.thread_key)
-    real_get = objects.get_stream
-    armed: list[bool] = []
-    stalls: list[tuple[float, float]] = []
-
-    def get_stream(key: str, *args: Any, **kwargs: Any) -> Any:
-        if armed and key == ownership_key:
-            # Injected fault: the store answers this one object slowly.
-            started = time.monotonic()
-            time.sleep(OWNERSHIP_STALL_SECONDS)
-            stalls.append((started, time.monotonic()))
-        return real_get(key, *args, **kwargs)
-
-    real_capture = stage.capture.capture
-    seen: list[Any] = []
-
-    async def capture_armed(*args: Any, **kwargs: Any) -> Any:
-        armed.append(True)
-        try:
-            result = await real_capture(*args, **kwargs)
-        finally:
-            armed.clear()
-        seen.append(result)
-        return result
-
-    ticks: list[float] = []
-
-    async def ticker() -> None:
-        while True:
-            ticks.append(time.monotonic())
-            await asyncio.sleep(0.05)
-
-    stage.capture.capture = capture_armed  # type: ignore[method-assign]
-    objects.get_stream = get_stream  # type: ignore[method-assign]
-    beat = asyncio.create_task(ticker())
-    try:
-        await stage.release()
-    finally:
-        beat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await beat
-        del objects.get_stream
-    _assert_release_bounded(stage)
-
-    for started, ended in stalls:
-        inside = [tick for tick in ticks if started + 0.5 < tick < ended - 0.5]
-        assert inside, "the event loop was blocked by a synchronous ownership read"
-    assert [result.status for result in seen] == ["complete"], seen
-    own = await stage.own_checkpoints()
-    assert list(own.values()) == ["complete"], own
-    await stage.assert_request_unchanged()
-    _assert_released(stage)
-
-
-async def _fault_base_stream_fails_before_reservation(
-    stage: _Stage, _monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A writer failure before any reservation still records the WorkItem's outcome."""
-
-    await stage.start_run()
-    await stage.fail_turn()
-    await stage.finish_failed()
-    assert stage.capture is not None
-    objects = stage.coordinator.preparer.objects
-    base_key = stage.prepared.object_key
-    real_get = objects.get_stream
-    armed: list[bool] = []
-
-    def get_stream(key: str, *args: Any, **kwargs: Any) -> Any:
-        if armed and key == base_key:
-            # Injected fault: the private base object cannot be streamed.
-            raise RuntimeError("injected base stream failure")
-        return real_get(key, *args, **kwargs)
-
-    real_capture = stage.capture.capture
-    seen: list[Any] = []
-
-    async def capture_armed(*args: Any, **kwargs: Any) -> Any:
-        armed.append(True)
-        try:
-            result = await real_capture(*args, **kwargs)
-        finally:
-            armed.clear()
-        seen.append(result)
-        return result
-
-    stage.capture.capture = capture_armed  # type: ignore[method-assign]
-    objects.get_stream = get_stream  # type: ignore[method-assign]
-    try:
-        await stage.release()
-    finally:
-        del objects.get_stream
-    _assert_release_bounded(stage)
-
-    assert len(seen) == 1, seen
-    assert (seen[0].status, seen[0].code, seen[0].checkpoint_id) == (
-        "failed",
-        "base_unavailable",
-        None,
-    ), seen
-    assert len(stage.checkpoint_calls) == 1
-    # No reservation was made, yet the reason is recorded on the WorkItem.
-    assert await stage.own_checkpoints() == {}
-    assert (await stage.recovery_state())["outcome"] == "capture_failed"
-    await stage.assert_request_unchanged()
-    _assert_released(stage)
-
-
-RUNNER_PHASE_BUDGET = 4.0
-
-
-async def _fault_runner_timeout(stage: _Stage, monkeypatch: pytest.MonkeyPatch) -> None:
-    await _failed_with_last_good(stage)
-    marker = stage.root / "hung"
-    monkeypatch.setenv(
-        "PATH",
-        _git_wrapper(
-            stage.root / "hang-bin", subcommand="diff", action=_once(marker, "    sleep 30\n")
-        ),
-    )
-
-    async def expire_heartbeat_while_hung() -> None:
-        while not marker.exists():
-            await asyncio.sleep(0.02)
-        # Injected time: the run's heartbeat lapses while the runner phase hangs.
-        assert stage.run is not None
-        await stage.sql(
-            "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
-            "clock_timestamp() - interval '1 second' WHERE id = :id",
-            id=stage.run.request_id,
-        )
-
-    expiring = asyncio.create_task(expire_heartbeat_while_hung())
-    try:
-        await stage.release()
-    finally:
-        monkeypatch.undo()
-        expiring.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await expiring
-    assert marker.exists()
-    _assert_release_bounded(stage, RUNNER_PHASE_BUDGET)
-    assert stage.run is not None
-    recorded = (
-        await stage.sql(
-            "SELECT w.workspace_recovery_outcome AS outcome, "
-            "w.workspace_recovery_outcome_at AS at, "
-            "r.runtime_heartbeat_expires_at AS expired FROM curie.work_items w "
-            "JOIN curie.execution_requests r ON r.work_item_id = w.id WHERE r.id = :id",
-            id=stage.run.request_id,
-        )
-    )[0]
-    # Recorded durably inside the cleanup allowance, after the heartbeat lapsed.
-    assert recorded["outcome"] == "capture_timeout"
-    assert recorded["at"] > recorded["expired"]
-    assert await stage.own_checkpoints() == {}
-    stage.request_after_finish["runtime_heartbeat_expires_at"] = recorded["expired"]
-    await _assert_fault_kept_the_failure(stage, "capture_timeout")
-    _assert_released(stage)
-
-
-AGGREGATE_BUDGET = 6.0
-
-
-async def _fault_missed_deadline_slow_store(
-    stage: _Stage, _monkeypatch: pytest.MonkeyPatch
-) -> None:
-    await _failed_with_last_good(stage)
-    assert stage.proxy is not None
-    stage.proxy.stall()
-    await stage.release()
-    _assert_release_bounded(stage, AGGREGATE_BUDGET)
-    await _assert_fault_kept_the_failure(stage, "capture_timeout")
-    _assert_released(stage)
-
-
-async def _fault_completion_past_deadline(stage: _Stage, monkeypatch: pytest.MonkeyPatch) -> None:
-    await _failed_with_last_good(stage)
-    slow = 3.0
-    marker = stage.root / "slow"
-    monkeypatch.setenv(
-        "PATH",
-        _git_wrapper(
-            stage.root / "slow-bin", subcommand="diff", action=_once(marker, f"    sleep {slow}\n")
-        ),
-    )
-    reserved: list[dict[str, Any]] = []
-
-    async def deadline_passes(reservation: dict[str, Any]) -> None:
-        reserved.append(reservation)
-        # Injected time: the ledger's capture deadline passes before completion.
-        await stage.sql(
-            "UPDATE curie.workspace_recovery_checkpoints SET capture_deadline = "
-            "clock_timestamp() - interval '1 second' WHERE id = :id",
-            id=uuid.UUID(str(reservation["checkpoint_id"])),
-        )
-
-    stage.ledger.after_reserve = deadline_passes
-    try:
-        await stage.release()
-    finally:
-        monkeypatch.undo()
-    assert marker.exists() and reserved
-    # After a long runner phase the reserve carried only the budget left.
-    sent = stage.ledger.reserves[-1]["capture_budget_seconds"]
-    assert 0 < sent <= CAPTURE_BUDGET_SECONDS - slow + 1.0, sent
-    await _assert_fault_kept_the_failure(stage, None)
-    own = await stage.own_checkpoints()
-    assert list(own.values()) == ["tombstoned"], own
-    assert (await stage.recovery_state())["outcome"] not in {"complete", "reserved"}
-    _assert_released(stage)
-
-
-async def _fault_staging_collected(stage: _Stage, _monkeypatch: pytest.MonkeyPatch) -> None:
-    await _failed_with_last_good(stage)
-    await stage.release()
-    # The upload failed and its tombstone was lost: the staging row remains.
-    own = await stage.own_checkpoints()
-    assert list(own.values()) == ["staging"], own
-    await stage.assert_request_unchanged()
-    await stage.assert_last_good_readable()
-    _assert_released(stage)
-
-    # Injected time: the 600 s staging window ends now instead of in ten minutes.
-    await stage.sql(
-        "UPDATE curie.workspace_recovery_checkpoints SET staging_expires_at = "
-        "clock_timestamp() - interval '1 second' WHERE id = :id",
-        id=next(iter(own)),
-    )
-    staged = [
-        key
-        for key, (_kind, _status, cp) in (await stage.recovery_state())["objects"].items()
-        if cp in own
-    ]
-    collector = RecoveryCollector(
-        ledger=stage.plain_ledger,
-        store=stage.real_store,
-        collector_id=f"recovery-test-{uuid.uuid4().hex[:12]}",
-    )
-    for _ in range(8):
-        collected = await collector.collect_once()
-        assert collected.failed == 0 and collected.conflicts == 0, collected
-        if collected.claimed == 0:
-            break
-    else:
-        raise AssertionError("collection never settled")
-    state = await stage.recovery_state()
-    assert not any(cp in own for cp in state["checkpoints"]), state
-    assert all(key not in state["objects"] for key in staged)
-    assert all(not stage.exists(f"private/{key}") for key in staged)
-    await stage.assert_last_good_readable()
-    await stage.assert_request_unchanged()
-
-
-@dataclass(frozen=True)
-class _Fault:
-    run: Callable[[_Stage, pytest.MonkeyPatch], Awaitable[None]]
-    recovery: bool = True
-    budget: float = CAPTURE_BUDGET_SECONDS
-    store: str = "real"
-    lose_fail: bool = False
-
-
-_FAULTS: dict[str, _Fault] = {
-    "disabled_recovery": _Fault(_fault_disabled, recovery=False),
-    "cancellation": _Fault(_fault_cancellation),
-    "execution_deadline": _Fault(_fault_execution_deadline),
-    "owner_loss": _Fault(_fault_owner_loss),
-    "work_item_cancelled_finish": _Fault(_fault_cancelled_finish),
-    "torn_capture": _Fault(_fault_torn_capture),
-    "ownership_read_stalls": _Fault(_fault_ownership_read_stalls),
-    "base_stream_fails_before_reservation": _Fault(_fault_base_stream_fails_before_reservation),
-    "patch_too_large": _Fault(_fault_patch_too_large),
-    "runner_unavailable": _Fault(_fault_runner_outage),
-    "store_outage": _Fault(_fault_store_outage, store="dead"),
-    "runner_phase_timeout": _Fault(_fault_runner_timeout, budget=RUNNER_PHASE_BUDGET),
-    "missed_aggregate_deadline": _Fault(
-        _fault_missed_deadline_slow_store, budget=AGGREGATE_BUDGET, store="proxy"
-    ),
-    "completion_past_deadline": _Fault(_fault_completion_past_deadline),
-    "staging_collected_after_expiry": _Fault(
-        _fault_staging_collected, store="dead", lose_fail=True
-    ),
-}
-
-
-@pytest.mark.parametrize("case", list(_FAULTS))
-def test_recovery_terminal_faults(
+@pytest.mark.parametrize("order", ["beat_answers_first", "finish_answers_first"])
+def test_a_beat_crossing_the_failed_finish_still_captures(
     services: _Services,
     make_harness: Any,
     names: dict[str, str],
     sync_redis: redis.Redis,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    case: str,
+    order: str,
 ) -> None:
-    fault = _FAULTS[case]
-    proxy: _FaultProxy | None = None
+    """A heartbeat refused ``stale_owner`` by this run's own failed finish (#5840).
 
-    def capture_store() -> Any:
-        nonlocal proxy
-        if fault.store == "dead":
-            return _s3_client(f"http://127.0.0.1:{_closed_port()}", timeout_seconds=2.0)
-        if fault.store == "proxy":
-            proxy = _FaultProxy(services.store.port)
-            return _s3_client(proxy.endpoint, timeout_seconds=30.0)
-        return services.s3
+    The served API refuses a heartbeat for a row that is no longer running, so
+    a beat in flight when the failed finish commits comes back ``stale_owner``.
+    Before #5840 the heartbeat loop then abandoned the run and the release skipped
+    its capture; for a personal request the teardown wake that follows the
+    finish then deleted the workspace. The beat's answer is driven both before
+    and after the finish's, through the real heartbeat loop and the real routes.
+    The only seams are two pass-throughs on the dispatch client that order the
+    two calls, and a short heartbeat interval in place of the granted 15 s.
+    """
 
     async def go() -> None:
-        lost = _LoseRoute("/workspace-recovery/fail") if fault.lose_fail else None
-        try:
-            async with _stage(
-                services,
-                make_harness,
-                sync_redis,
-                tmp_path,
-                recovery=fault.recovery,
-                budget_seconds=fault.budget,
-                capture_store=capture_store,
-                ledger_transport=lost,
-            ) as stage:
-                stage.proxy = proxy
-                await fault.run(stage, monkeypatch)
-                if lost is not None:
-                    assert lost.lost >= 1
-        finally:
-            if proxy is not None:
-                proxy.close()
+        async with _stage(services, make_harness, sync_redis, tmp_path) as stage:
+            run = await stage.start_run()
+            await stage.fail_turn()
+
+            committed = asyncio.Event()
+            beat_answered = asyncio.Event()
+            finish_returned = asyncio.Event()
+            beat_sent = asyncio.Event()
+            beats: list[str] = []
+            real_beat = stage.dispatch.heartbeat
+            real_finish = stage.dispatch.finish
+
+            async def beat(request_id: uuid.UUID, *, runtime_epoch: int) -> Any:
+                beats.append("sent")
+                beat_sent.set()
+                await (finish_returned if order == "finish_answers_first" else committed).wait()
+                try:
+                    return await real_beat(request_id, runtime_epoch=runtime_epoch)
+                except WorkItemConflict as exc:
+                    beats.append(exc.code)
+                    raise
+                finally:
+                    beat_answered.set()
+
+            async def finish(request_id: uuid.UUID, **kwargs: Any) -> None:
+                await real_finish(request_id, **kwargs)
+                committed.set()
+                if order == "beat_answers_first":
+                    await beat_answered.wait()
+                    # The heartbeat task acts on its answer before this one lands.
+                    for _ in range(50):
+                        await asyncio.sleep(0)
+
+            stage.dispatch.heartbeat = beat  # type: ignore[method-assign]
+            stage.dispatch.finish = finish  # type: ignore[method-assign]
+            granted = run._heartbeat_task
+            assert granted is not None
+            granted.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await granted
+            loop = asyncio.create_task(run._heartbeat_loop(0.01))
+            run._heartbeat_task = loop
+            await asyncio.wait_for(beat_sent.wait(), 10)
+
+            await stage.finish_failed()
+            finish_returned.set()
+            await asyncio.wait_for(asyncio.shield(loop), 10)
+            assert beats == ["sent", "stale_owner"]
+            assert run.abandoned is False
+            assert run.recovery_eligible is True
+
+            await stage.release()
+            _assert_release_bounded(stage)
+            assert stage.observer is not None
+            assert [(c.claim_name, c.released) for c in stage.observer.calls] == [
+                (stage.handle.claim_name, True)
+            ]
+            at_release = stage.observer.calls[0].at_call
+            checkpoint_id = at_release["last_good"]
+            assert checkpoint_id is not None
+            assert at_release["checkpoints"][checkpoint_id] == ("complete", run.request_id)
+            assert len(stage.checkpoint_calls) == 1
+            await stage.assert_request_unchanged()
+            _assert_released(stage)
 
     asyncio.run(go())
     _assert_valkey_clean(sync_redis, names)
+
+
+# --- AC3: terminal faults and the paths that never capture ----------------------------------

@@ -24,8 +24,8 @@ from _support import (
     wait_for_readyz,
     wait_until,
 )
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.state import MailState as DurableMailState
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.state import MailState as DurableMailState
 
 
 def _env(mail: MailState, ingress: IngressState, port: int, state_path: Path) -> dict[str, str]:
@@ -66,7 +66,7 @@ def test_sigkill_mid_transaction_recovers_wal_without_a_phantom_terminal_state(
 import sys
 import time
 
-from curie_mail_adapter.state import MailState
+from curie_channel_gateway.mail.state import MailState
 
 state = MailState(sys.argv[1], max_pending=20, max_bytes=8 * 1024 * 1024)
 with state.transaction() as connection:

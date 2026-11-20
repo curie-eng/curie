@@ -25,9 +25,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_progress import phase_view, pill_for
+from curie_api.factory_progress import pill_for
 from curie_api.models import ExecutionRequestPhaseReport
 from curie_internal import sandbox_token
+from curie_internal.factory_phase_view import phase_view
 from forge_fakes.github import LABEL, _issue_event, _post
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,
@@ -37,6 +38,14 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
 from test_factory_terminus import _label, _request, _start_running  # noqa: F401  (fixtures)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
+
+ROUND_CAPS_VECTOR = (
+    Path(__file__).resolve().parents[3] / "tests" / "vectors" / "progress-round-caps.json"
+)
+_ROUND_CAPS_TOP_LEVEL_KEYS = frozenset({"comment", "cases"})
+_ROUND_CAPS_CASE_KEYS = frozenset({"name", "declaration", "reports"})
+_ROUND_CAPS_REPORT_KEYS = frozenset({"phase", "round", "accepted"})
+ROUND_CAPS_FIRST_ISSUE = 9800
 
 MODELS = Path(__file__).resolve().parents[1] / "src" / "curie_api" / "models.py"
 WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
@@ -386,7 +395,12 @@ def _fail(client: Any, request_id: uuid.UUID) -> None:
     failed = client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "runner_failed"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "runner_failed",
+            "retry_safety": "uncertain",
+        },
     )
     assert failed.status_code == 200, failed.text
 
@@ -1261,6 +1275,63 @@ def test_a_changed_declaration_is_409(admitted: Any) -> None:  # noqa: F811
     assert response.json()["code"] == "declaration_changed"
     assert len(_reports(request_id)) == 1
     assert _status_row(request_id)["declaration"] == DECLARATION
+
+
+def _round_caps_cases() -> list[dict[str, Any]]:
+    payload = json.loads(ROUND_CAPS_VECTOR.read_text(encoding="utf-8"))
+    assert set(payload) == _ROUND_CAPS_TOP_LEVEL_KEYS, (
+        f"{ROUND_CAPS_VECTOR} has unexpected top-level keys "
+        f"{sorted(set(payload) - _ROUND_CAPS_TOP_LEVEL_KEYS)} and is missing "
+        f"{sorted(_ROUND_CAPS_TOP_LEVEL_KEYS - set(payload))}. A new key is rejected on "
+        "purpose: one this reader cannot see would pass vacuously."
+    )
+    cases = payload["cases"]
+    assert cases
+    for case in cases:
+        assert set(case) == _ROUND_CAPS_CASE_KEYS, (
+            f"case {case.get('name')!r} has unexpected keys "
+            f"{sorted(set(case) - _ROUND_CAPS_CASE_KEYS)} and is missing "
+            f"{sorted(_ROUND_CAPS_CASE_KEYS - set(case))}."
+        )
+        # A request stores at most 200 reports; the vector stays far below it.
+        assert 0 < len(case["reports"]) < 100
+        for entry in case["reports"]:
+            assert set(entry) == _ROUND_CAPS_REPORT_KEYS, (
+                f"a report in case {case['name']!r} has unexpected keys "
+                f"{sorted(set(entry) - _ROUND_CAPS_REPORT_KEYS)} and is missing "
+                f"{sorted(_ROUND_CAPS_REPORT_KEYS - set(entry))}."
+            )
+    return cases
+
+
+@pytest.mark.parametrize("index", range(len(_round_caps_cases())))
+def test_a_round_on_a_shared_phase_is_stored_up_to_the_largest_cap(
+    admitted: Any,  # noqa: F811
+    index: int,
+) -> None:
+    case = _round_caps_cases()[index]
+    client, github, _sink = admitted
+    number = ROUND_CAPS_FIRST_ISSUE + index
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    stored: list[dict[str, Any]] = []
+    for entry in case["reports"]:
+        response = report(
+            client,
+            request_id,
+            entry["phase"],
+            round=entry["round"],
+            declaration=case["declaration"],
+        )
+        want = 201 if entry["accepted"] else 422
+        assert response.status_code == want, (
+            f"case {case['name']!r}, phase {entry['phase']}, round {entry['round']}: "
+            f"{response.status_code} {response.text}"
+        )
+        if entry["accepted"]:
+            stored.append({"phase": entry["phase"], "note": None, "loop_round": entry["round"]})
+    assert _reports(request_id) == stored
 
 
 def test_the_report_after_two_hundred_is_429(admitted: Any) -> None:  # noqa: F811

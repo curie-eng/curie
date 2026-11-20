@@ -15,6 +15,8 @@ order: 11
 > **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 (redis-py) behind the broker port &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
+The managed ElastiCache swap for this seam is [managed-valkey-compat.md](./managed-valkey-compat.md). A redis-compatible store is not only a URL change when the managed service cannot keep AOF fsync.
+
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
 
 ## The black line
@@ -22,7 +24,7 @@ order: 11
 The seam is the Valkey Stream wire contract between the dispatcher (producer) and the
 worker (consumer): a named stream carrying a frozen one-field payload. As of #284 /
 ADR-0027 the stream verbs are drawn behind a thin **broker port** at the two non-sacred
-seams — a `StreamPublisher` `Protocol` on the producer (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`:
+seams — a `StreamPublisher` `Protocol` on the producer (`packages/curie-internal/src/curie_internal/turn_queue.py::StreamPublisher`:
 `xadd` + the `SET NX EX` dedupe-claim + `delete` / `release_event`) and a `StreamBroker` `Protocol` on the consumer
 transport (`apps/worker/src/curie_worker/broker.py::StreamBroker`:
 `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`/`xinfo_consumers`/`xclaim`/`xpending_range`/`xrange`/`xadd`).
@@ -41,14 +43,14 @@ exists (ADR-0007); only the port is extracted.
 A second broker must honor the stream key, the payload encoding, and the Stream verbs:
 
 - **Stream key** — `"curie:runs"`, defaulted identically on both ends:
-  `DispatcherConfig.stream` (`apps/dispatcher/src/curie_dispatcher/config.py::DispatcherConfig`,
+  `DispatcherConfig.stream` (`packages/channel-gateway/src/curie_channel_gateway/slack/config.py::DispatcherConfig`,
   env `CURIE_STREAM`) and `WorkerConfig.stream`
   (`apps/worker/src/curie_worker/config.py::WorkerConfig`).
 - **Payload encoding** — one Stream field, `STREAM_PAYLOAD_FIELD = "payload"`
-  (`apps/dispatcher/src/curie_dispatcher/queue.py::STREAM_PAYLOAD_FIELD`),
+  (`packages/curie-internal/src/curie_internal/turn_queue.py::STREAM_PAYLOAD_FIELD`),
   holding `model_dump_json()`. Produced by `enqueue` via `redis_client.xadd(config.stream, fields)`
-  (`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`) and reconstructed by
-  `from_stream_fields` (`apps/dispatcher/src/curie_dispatcher/queue.py::from_stream_fields`)
+  (`packages/curie-internal/src/curie_internal/turn_queue.py::enqueue`) and reconstructed by
+  `from_stream_fields` (`packages/curie-internal/src/curie_internal/turn_queue.py::from_stream_fields`)
   into a `QueuedTurn`.
 - **Consumer verbs** — the worker reads with `xreadgroup` over a consumer group; the
   sacred subclass supplies the loop spec and handler
@@ -117,12 +119,12 @@ A second broker must honor the stream key, the payload encoding, and the Stream 
   delivery bound without treating idle alone as liveness.
 
 Idempotency lives beside the stream, not in it: `claim_event` does a
-`SET <dedupe_key> 1 NX EX <ttl>` before `XADD` (`apps/dispatcher/src/curie_dispatcher/queue.py::claim_event`).
+`SET <dedupe_key> 1 NX EX <ttl>` before `XADD` (`packages/curie-internal/src/curie_internal/turn_queue.py::claim_event`).
 
 ## Implementations today
 
 One, redis-py against Valkey. The dispatcher `XADD`s
-(`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`); the worker runs
+(`packages/curie-internal/src/curie_internal/turn_queue.py::enqueue`); the worker runs
 a consumer group with `XREADGROUP`/`XACK`, crash-recovery `XAUTOCLAIM`,
 capable-peer prompt reclaim `XINFO CONSUMERS`/`XCLAIM` (#1532), and the
 delivery-cap dead-letter path's `XPENDING`/`XRANGE`/`XADD`. The runs and eval
@@ -168,7 +170,7 @@ The complete runs capable producer set is:
 
 | Producer | Append sites | Purpose |
 |---|---|---|
-| `apps/dispatcher/src/curie_dispatcher/queue.py::enqueue` | Python `xadd` | Dispatcher intake after the event claim and placeholder |
+| `packages/curie-internal/src/curie_internal/turn_queue.py::enqueue` | Python `xadd` | Dispatcher intake after the event claim and placeholder |
 | `apps/api/src/curie_api/delivery.py` | Both `XADD` branches in `_ENQUEUE_SCRIPT` | Owner checked channel, hook, and review intake, with optional metadata |
 | `apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue` | Python `xadd` | Approval resume |
 | `apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd` | Direct Python append, retry append, and Lua `_MARK_AND_XADD` | WorkItem execute, terminate, and reconciliation wakes |
@@ -222,7 +224,7 @@ Drawn only at the **non-sacred** seams; the sacred concurrency kernel
 `apps/worker/src/curie_worker/threadlock.py` / `apps/worker/src/curie_worker/markers.py`)
 is not touched:
 
-- **Producer** — `StreamPublisher` (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`): `xadd`, the
+- **Producer** — `StreamPublisher` (`packages/curie-internal/src/curie_internal/turn_queue.py::StreamPublisher`): `xadd`, the
   `SET NX EX` dedupe-claim, and `delete` (the `release_event` path). `enqueue`/`claim_event`/`release_event` type against it.
 - **Consumer transport** — `StreamBroker` (`apps/worker/src/curie_worker/broker.py::StreamBroker`):
   `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`, plus — since the bounded-delivery

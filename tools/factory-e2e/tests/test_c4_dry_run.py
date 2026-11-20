@@ -2,7 +2,7 @@
 
 Gauntlet finding on released v0.13.0: `curie cluster up --dry-run` printed
 `kubectl label namespace agent-sandbox-system ...` as an unconditional step,
-and `curie factory quickstart --dry-run --context ...` printed an
+and `curie factory quickstart --dry-run --context <context>` printed an
 unconditional `curie cluster up ... --model <default>` with a credential line
 claiming the release had no real model. The live runs did neither: they reused
 an existing unowned controller without stamping its namespace, skipped

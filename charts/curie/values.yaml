@@ -1295,19 +1295,49 @@ codeHostTrust:
     configMapRef:
       name: ""
       key: ca.crt
+# Personal Claude enrollment (#5377). Empty leaves the feature off: no RBAC,
+# no env, and the owner API answers 503 `custody_unconfigured`. Set it to the
+# name of a DEDICATED namespace you create yourself (the chart never creates
+# it). The API gets Secret create, get, list and delete there, and the worker
+# gets Secret get only, both through Roles in that namespace. The namespace must
+# be dedicated because Secret get and list cannot be scoped by label. It must
+# differ from the release namespace (the chart refuses an equal value), and
+# changing it requires every user to reconnect. See docs/operations.md,
+# "Personal Claude enrollment".
+personalClaude:
+  grantNamespace: ""
+# Console origin for the rejected Claude plan direct message (#5720). Empty
+# omits the reconnect button. Set it to the console's absolute http(s) origin;
+# the button goes to <origin>/settings/claude-plan.
+console:
+  origin: ""
 # ---------------------------------------------------------------------------
 # The factory (#4397) as CURIE_FORGES; `curie cluster factory` writes it.
 # A credential names its Secret: existingSecret, existingSecretKey.
 factory:
   enabled: false
+  githubAppClientId: ""
+  githubAppClientSecretExistingSecret: ""
+  githubAppClientSecretExistingSecretKey: clientSecret
   intake: poll  # or webhook
   baseLabelSettleSeconds: 60
+  # Requester coding instructions (ADR 0278): admission pins each requester's
+  # stored document and the worker delivers it to the implementer. false makes
+  # new WorkItems record explicit absence; a pinned WorkItem keeps its pin.
+  requesterCodingInstructions:
+    apply: true
   cardBaseUrl: ""
   ciWaitSeconds: 3600
   codeHosts: []
   trackers: []
   bindings: []
   sandboxEgress: {}
+  # Minimum remaining model credit, in USD, for a sufficient model credit fact.
+  # The worker reads the provider with its own credential and records only the
+  # comparison. Zero still reads the provider and treats an accepted key as
+  # sufficient. A negative value is refused.
+  admission:
+    minModelCreditUsd: 10
   # Per-run Docker daemons (ADR 0217). Read only when a bindings[].repos[]
   # entry with a runner block sets docker.enabled: true and worker.deploy is
   # true; otherwise templates/docker-daemon.yaml renders nothing. See the
@@ -1719,6 +1749,47 @@ api:
     seccompProfile:
       type: RuntimeDefault
 
+channelGateway:
+  # Retained-value upgrades use the same defaults in files/channel-gateway-defaults.yaml.
+  # null deploys automatically when Slack is configured and url is empty.
+  # false requires an external url; true deploys even without Slack.
+  deploy: null
+  replayStorageSize: 1Gi
+  replayStorageClass: ""
+  port: 8081
+  url: ""
+  allowInsecure: false
+  # Optional Secret with ca.crt, tls.crt and tls.key. Otherwise Helm provisions
+  # and preserves a certificate across upgrades using lookup.
+  tlsSecret: ""
+  apiToken: null
+  workerToken: null
+  groupCacheTtlSeconds: 60
+  # Optional Slack user email lookup for an external HTTP identity provider, so
+  # the provider can map Slack senders to directory accounts without its own
+  # Slack token. existingSecret names an operator-supplied Secret whose tokenKey
+  # holds the identity caller credential; give the provider the same value as
+  # CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN. Empty (the default) leaves the lookup
+  # off. timeoutSeconds bounds each Slack users.info call. Restart the gateway
+  # after rotating the Secret.
+  identityLookup:
+    existingSecret: ""
+    tokenKey: token
+    timeoutSeconds: 5
+  readinessProbe:
+    initialDelaySeconds: 1
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 1000m, memory: 512Mi}
+
 dispatcher:
   deploy: true
   # The dispatcher is not a rolling workload. It deploys with strategy Recreate
@@ -1728,7 +1799,8 @@ dispatcher:
   # every rollout, from the old pod exiting until the new pod reconnects, in
   # which Slack retries events it could not deliver instead of splitting them.
   # For the same reason keep replicas at 1: each extra replica is another
-  # client on the same tokens.
+  # client on the same tokens. The chart refuses any value above 1 while the
+  # dispatcher is deployed.
   replicas: 1
   # Optional PodDisruptionBudget (#1574), off by default. The dispatcher is
   # one replica with strategy Recreate by design (see replicas above), so a
@@ -1785,9 +1857,9 @@ dispatcher:
   # Slack credentials. Socket Mode means the process dials out (no ingress), so
   # there is no Service. Left empty the supervisor just backs off and retries, so
   # the pod stays up without them; fill them (or an existingSecret) to connect.
-  # slackBotToken is shared with the worker (it edits the Slack placeholder) and,
-  # when set, with the API, whose approval user-group authorizers look up
-  # usergroup membership themselves (#420, ADR-0034). That lookup needs the
+  # slackBotToken belongs to dispatcher and gateway. The gateway performs
+  # provider reads and worker replies; API and worker hold only caller tokens.
+  # User-group membership lookup needs the
   # `usergroups:read` bot scope, which existing Slack apps get only by
   # reinstalling the app to the workspace. Changing this token requires a pod
   # rollout of the consumers, not just a `helm upgrade`: a secretKeyRef env
@@ -1829,7 +1901,7 @@ dispatcher:
     # entry named `default` with the block's token fields left empty. A list
     # that ends up with no `default` fails the render, because a Slack route
     # that names no identity means `default`. A list entry's tokens render as
-    # CURIE_SLACK_BOT_TOKEN__<n> (worker, API, dispatcher) and
+    # CURIE_SLACK_BOT_TOKEN__<n> (gateway, dispatcher) and
     # CURIE_SLACK_APP_TOKEN__<n> / CURIE_SLACK_SIGNING_SECRET__<n> (dispatcher),
     # where <n> is the entry's position, and CURIE_SLACK_IDENTITIES tells all
     # three which name reads which variable. That declaration is what the API
@@ -2179,6 +2251,12 @@ worker:
     recovery:
       enabled: false
       maxBytes: null
+    # Publication candidates (#5428). On by default. The render turns this off
+    # when agentSandbox.runner.workspace.enabled is false. maxBytes caps all
+    # candidate bytes. Set enabled to false to turn retention off.
+    publicationCandidates:
+      enabled: true
+      maxBytes: 1073741824
   # Inbound channel attachments (#2567). The worker downloads a referenced file
   # with the channel bot token (Slack) or from the adapter that sent it, with
   # that adapter's adapterCredentials secret (any other kind, ADR-0153), parks
@@ -2353,6 +2431,13 @@ worker:
   # bounds an unconfigured agent. Raising these defaults raises rendered
   # termination grace to budget + reserve (10860) for every install.
   deliveryBudgetSeconds: 10800
+  # Optional cron claim lease, rendered as CURIE_HOOK_CLAIM_LEASE_S on the API
+  # and the worker from this one value. Null or omitted leaves the variable
+  # unset, so each process uses its delivery budget. A positive number with no
+  # chart maximum, matching the released worker. The process refuses a lease
+  # shorter than the delivery budget at boot. There is no cross-field check
+  # in the schema.
+  hookClaimLeaseSeconds: null
   # Positive per-request ceiling for runner work within the overall delivery
   # budget. Must be at most 10800 seconds and no greater than
   # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json
@@ -2472,15 +2557,14 @@ worker:
   # these three values only, because the worker refuses any other at startup.
   turnReceipt: "off"
   # No-Slack egress routing. When non-empty, renders SLACK_API_BASE_URL on the
-  # worker Deployment so its Slack sink uses that global base URL instead of real
-  # Slack. Empty (the default) leaves the worker on real Slack. `curie cluster
+  # gateway Deployment as its default provider endpoint. Empty uses real Slack. `curie cluster
   # message` does not change this value: its synthetic turn carries a per-turn
   # reply endpoint for the command's local Slack Web API stub.
   slackApiBaseUrl: ""
   # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
   # D4.4), comma-separated `scheme://host[:port]`. EMPTY (the default) is the
   # production posture: the configured Slack origin (slackApiBaseUrl, or real
-  # Slack) is the only endpoint the worker will send the bot token to, and every
+  # Slack) is the only endpoint the gateway will send the bot token to, and every
   # cross-origin endpoint a turn names is refused before any request.
   #
   # DEV ONLY. `curie cluster message` temporarily adds the exact advertised stub
@@ -2796,10 +2880,16 @@ agentSandbox:
   # volume ceilings (15 + 15 + 4 = 34Gi of upper bounds, not reservations); the
   # 20Gi ephemeral-storage limit is an additional shared bound on all of them,
   # and the scheduler reserves only the 10Gi request. The 8Gi memory request
-  # equals resourceQuota.hard.requestsMemory, so the default quota admits one
-  # factory sandbox at a time and a node needs 8Gi of unrequested memory to
-  # schedule it. Raise resourceQuota.hard.requestsMemory / limitsMemory per
-  # extra concurrent factory sandbox. Existing pods keep their envelope; a new
+  # is under resourceQuota.hard.requestsMemory (10Gi), so the default quota
+  # still admits one factory sandbox (10Gi / 8Gi = 1). Beside that one factory
+  # sandbox, six standard sandboxes fit and a seventh is refused. limits.cpu
+  # binds before requests.memory: limitsCpu stays 8, the factory profile limits
+  # CPU at 2, and the standard profile limits CPU at 1. requests.memory would
+  # allow ten standard sandboxes at 192Mi in the 2Gi remainder. A second
+  # factory sandbox requests 16Gi and is refused by that request quota. A node
+  # still needs 8Gi of unrequested memory to schedule the factory sandbox.
+  # Raise resourceQuota.hard.requestsMemory for another concurrent factory
+  # sandbox. limitsMemory stays 16Gi. Existing pods keep their envelope; a new
   # sandbox picks up a change.
   #
   # apiMemoryLimit is install-wide, not per agent: it is the API container's
@@ -3381,8 +3471,14 @@ resourceQuota:
   #   unless agentSandbox.runner.resources sets the pair. NOTES also reports
   #   each agent whose profile differs (a factory sandbox requests 8Gi).
   #   (a term whose per-sandbox value is unset or 0 is skipped). With the
-  #   shipped defaults: min(50, 4/50m=80, 8Gi/192Mi=42, 8/1=8, 16Gi/768Mi=21)
-  #   = 8, so limitsCpu is the binding term.
+  #   shipped defaults: min(50, 4/50m=80, 10Gi/192Mi=53, 8/1=8, 16Gi/768Mi=21)
+  #   = 8, so limitsCpu is still the binding term for the standard profile.
+  #   Beside one factory sandbox, six standard sandboxes fit and a seventh is
+  #   refused. limits.cpu binds before requests.memory: the factory profile
+  #   uses 2 of limitsCpu 8 and each standard sandbox uses 1. requests.memory
+  #   10Gi would leave room for ten 192Mi standard sandboxes in the 2Gi
+  #   remainder. limitsMemory stays 16Gi. The second factory sandbox is refused
+  #   by the 10Gi request quota (16Gi requested).
   #   what fits     = sum over schedulable nodes of
   #                   floor((allocatable - non-sandbox pod requests) / per-sandbox request),
   #                   taking the smaller of the cpu and memory counts per node
@@ -3409,7 +3505,7 @@ resourceQuota:
   capacityReport: true
   hard:
     requestsCpu: "4"
-    requestsMemory: 8Gi
+    requestsMemory: 10Gi
     limitsCpu: "8"
     limitsMemory: 16Gi
     # Aggregate sandbox pod count, scoped by the same scopeSelector -- closes

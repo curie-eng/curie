@@ -25,6 +25,7 @@ from curie_protected_hooks.worker_verification import Dispatchable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from . import caller_token
 from .behaviorpacks import BehaviorPacks
 from .binding import HttpIdentityBinding, ResolvedDeployment, binding_adapter_for_handle
 from .kernel.routing import _thread_key_for
@@ -153,6 +154,14 @@ WHERE a.id = :agent_id AND c.kind = :kind AND c.address = :address
         """
         return None
 
+    async def connector_requester_identity_for(self, agent_id: uuid.UUID) -> bool:
+        """Never opted in: a protected delivery has no HTTP context to project.
+
+        @spec CONNECTOR-REQUESTER-1.
+        """
+        _ = agent_id
+        return False
+
     async def resolve(
         self, kind: str, adapter: str | None, address: str
     ) -> ResolvedDeployment | None:
@@ -253,9 +262,16 @@ WHERE a.id = :agent_id AND c.kind = :kind AND c.address = :address
         caller_work_item: str | None = None,
         caller_exp_ceiling: int | None = None,
         token_ttl_s: float | None = None,
+        caller_principal: caller_token.CallerPrincipal | None = None,
     ) -> dict[str, str]:
-        """Render a protected boot environment with transcript-only authority."""
+        """Render a protected boot environment with transcript-only authority.
+
+        No caller token is minted here, so a requester principal has nowhere
+        to go and refuses. @spec CONNECTOR-REQUESTER-2.
+        """
         _ = caller_run, caller_work_item, caller_exp_ceiling
+        if caller_principal is not None:
+            raise ValueError("protected caller authority is unavailable")
         profile = self._profile()
         history_key = self._boot_history_key(
             resolved, thread_key, kind=kind, address=address, isolate_memory=isolate_memory
@@ -353,8 +369,13 @@ class ProtectedMediatedBindingResolver(ProtectedBindingResolver):
         caller_work_item: str | None = None,
         caller_exp_ceiling: int | None = None,
         token_ttl_s: float | None = None,
+        caller_principal: caller_token.CallerPrincipal | None = None,
     ) -> dict[str, str]:
-        if any(value is not None for value in (caller_run, caller_work_item, caller_exp_ceiling)):
+        """@spec CONNECTOR-REQUESTER-2: no caller authority, requester included."""
+        if any(
+            value is not None
+            for value in (caller_run, caller_work_item, caller_exp_ceiling, caller_principal)
+        ):
             raise ValueError("protected caller authority is unavailable")
         self._boot_history_key(
             resolved, thread_key, kind=kind, address=address, isolate_memory=isolate_memory

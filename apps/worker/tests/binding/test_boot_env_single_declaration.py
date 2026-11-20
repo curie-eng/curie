@@ -87,14 +87,30 @@ _LANES = (
 # itself under a name the SDK owns.
 _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
     {
+        # The static pool substrate's worker settings: run._static_pool_client
+        # reads the shell inventory, the shell CA and the shell control
+        # credential from the WORKER's env. The control credential is also a
+        # host credential that filter_agent_child_env keeps off every claim.
+        "CURIE_STATIC_SHELLS",
+        "CURIE_AGENT_CREDENTIAL_FILES",
+        "CURIE_STATIC_SHELL_CA_FILE",
+        "CURIE_STATIC_SHELL_CONTROL_TOKEN",
+        # Worker gateway clients read these; the caller token is filtered from claims.
+        "CURIE_CHANNEL_GATEWAY_URL",
+        "CURIE_CHANNEL_GATEWAY_TOKEN",
+        "CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE",
         # The worker service's own settings (WorkerConfig validation_alias), read
         # from the WORKER's env at worker startup. Never a sandbox boot key.
+        # WorkerConfig gates ApprovalCardStore retention in the worker service.
+        "CURIE_APPROVAL_PENDING_RETENTION_ENABLED",
         # The inbound-attachment lane's operator envelope (#2567): the lane's own
         # off switch, the per-file size cap and the reference/retention TTLs,
         # read from the WORKER's env by WorkerConfig at startup and consumed by
         # run.build and AttachmentCoordinator. Never injected into a sandbox
         # claim -- runner-bound refs and attachment-access enablement use the
         # separately declared BootEnv contract.
+        # WorkerConfig reads the operator map; only a bound projection reaches a runner.
+        "CURIE_CONNECTOR_ENDPOINTS",
         "CURIE_ATTACHMENT_ENABLED",
         # ADR 0244: WorkerConfig selects the worker's eager/lazy routing in
         # run.build and Kernel. BindingResolver emits only the separately
@@ -127,6 +143,20 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CONSUMER_HEARTBEAT_TTL_MS",
         "CURIE_CONSUMER_NAME",
         "CURIE_DEAD_LETTER_MAXLEN",
+        # #5414: the factory Slack progress lane's switch and pass interval,
+        # read by WorkerConfig at worker startup and consumed only by
+        # run._build_factory_slack_progress. Never injected into a sandbox.
+        "CURIE_FACTORY_SLACK_PROGRESS_ENABLED",
+        "CURIE_FACTORY_SLACK_INTERVAL_S",
+        # #5720: the console origin for the rejected-plan direct message.
+        # WorkerConfig reads it at startup; the progress lane puts it on the
+        # reconnect button. Never injected into a sandbox.
+        "CURIE_CONSOLE_ORIGIN",
+        # Issue 5581: WorkerConfig reads the minimum at worker startup, and
+        # factory_credit reads the OpenRouter credit API override from the
+        # worker process. Neither name is injected into a sandbox.
+        "CURIE_FACTORY_MIN_MODEL_CREDIT_USD",
+        "CURIE_OPENROUTER_API_URL",
         # Reclaim scan policy for the WORKER's own maintenance tick (#2433):
         # how idle a pending row whose delivery lease has expired must be before
         # the lease-expiry pass may transfer it. Read from the worker's env by
@@ -198,6 +228,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the API reads the same enable switch. Neither reaches the sandbox.
         "CURIE_WORKSPACE_RECOVERY_ENABLED",
         "CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S",
+        # The worker's publication candidate switch and collector interval
+        # (#5428); the API reads the same enable switch. Neither reaches the
+        # sandbox.
+        "CURIE_PUBLICATION_CANDIDATES_ENABLED",
+        "CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S",
         # WorkspaceClaimCoordinator injects these exact-object handoff values
         # into a claim for the workspace-init container
         # to consume. They are substrate-local delivery inputs, not fields read
@@ -270,6 +305,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CALLER_PROXY_UPSTREAM_HOST",
         "CURIE_CALLER_PROXY_PUBLIC_KEYS",
         "CURIE_CALLER_PROXY_ADMITS",
+        # Portable connector task configuration, never runner boot configuration.
+        "CURIE_CONNECTOR_SERVE_CONFIG",
+        "CURIE_CONNECTOR_GRANT_STORE_PASSWORD",
         "CURIE_EVAL_CONSUMER_GROUP",
         "CURIE_EVAL_MAX_CONCURRENT_CLAIMS",
         "CURIE_EVAL_STREAM",
@@ -427,6 +465,16 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
+        # Runner-local model authentication selector (#5373, ADR 0268): read by
+        # the runner's personal_auth policy from its own env. #5373 decides it is
+        # not a BootEnv field; worker emission of a personal boot env is #5378.
+        "CURIE_MODEL_AUTH_MODE",
+        # Worker service config (#5377): the namespace the trusted worker reads
+        # personal custody Secrets from. Never written into a boot env.
+        "CURIE_PERSONAL_GRANT_NAMESPACE",
+        # CLI-owned profile directory. personal_auth points it at a fresh
+        # runner-owned directory for a personal launch; it is never a boot key.
+        "ANTHROPIC_CONFIG_DIR",
         # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
         # sandbox boot fact is instead frozen across both declaration sites by
         # tests/vectors/turn-progress-capability.json.
@@ -447,10 +495,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CALLER_PROXY_GATED_TOOLS",
         "CURIE_CALLER_PROXY_CONNECTOR",
         "CURIE_CALLER_PROXY_GRANT_STORE",
+        "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
         "CURIE_HARNESS",
+        # RunnerConfig reads this local cleanup bound from the runner environment.
+        "CURIE_RUNNER_CLEANUP_TIMEOUT_S",
         # runner-local SDK deny list (#2429); read by the runner from its own env
         # via extraEnv, unset keeps every tool available. Not a boot contract key.
         "CURIE_DISALLOWED_TOOLS",
@@ -479,6 +530,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         #   CURIE_RECLAIM_MIN_IDLE_MS in the code above, worker-side policy
         #   decided before any sandbox exists.
         "CURIE_DELIVERY_BUDGET_S",
+        # WorkerConfig reads this maintenance bound; it never enters a claim.
+        "CURIE_ABANDONED_TURN_GRACE_S",
         # The factory turn budget (#3071): a worker setting whose VALUE the
         # worker writes into a work-item claim under the BootEnv key
         # CURIE_MAX_TURNS. This name itself never enters a sandbox.
@@ -585,6 +638,12 @@ _EXEMPT: dict[tuple[str, str], str] = {
     ("apps/worker/src/curie_worker/run.py", "CURIE_RUNNER_PORT"): "substrate producer",
     (
         "apps/worker/src/curie_worker/sandbox/docker.py",
+        "CURIE_SANDBOX_ID",
+    ): "substrate producer",
+    # The worker-owned names Docker and the static pool both keep off the
+    # claim env; each substrate supplies the sandbox id itself.
+    (
+        "apps/worker/src/curie_worker/sandbox/staging.py",
         "CURIE_SANDBOX_ID",
     ): "substrate producer",
     (

@@ -1,8 +1,14 @@
 """Proof that the factory runner layer installs this repository's toolchains.
 
-Set CURIE_FACTORY_RUNNER_IMAGE to an image reachable by the k8 cluster. Set
-CURIE_FACTORY_RUNNER_PROOF=required when this proof is a required gate; missing
-configuration, a missing image, or an unreachable cluster then fails.
+Set CURIE_FACTORY_RUNNER_IMAGE to an image reachable by the cluster and
+CURIE_FACTORY_KUBE_CONTEXT to its explicit context. Set
+CURIE_FACTORY_TEST_IDENTITY to a caller-chosen identity (lowercase letters,
+digits and hyphens); the proof runs in the namespace
+`toolchain-proof-<identity>`, which it must create itself. A namespace that
+already exists fails the proof and is never adopted or deleted, and teardown
+fails unless the cluster reports the namespace as NotFound. Set
+CURIE_FACTORY_RUNNER_PROOF=required when this proof is a required gate; a missing
+image, or an unreachable cluster then fails.
 """
 
 from __future__ import annotations
@@ -13,17 +19,19 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
-import time
+import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "tools/runner-toolchain-proof"))
+
+import toolchain_proof  # noqa: E402
+
 SKILL = REPO_ROOT / "examples/dark-factory/skills/implement-issue/SKILL.md"
-CONTEXT = "k8"
-NAMESPACE = "test-3499-factory-runner-checks"
 POD = "factory-runner-toolchain"
 IMAGE_ENV = "CURIE_FACTORY_RUNNER_IMAGE"
 PROOF_ENV = "CURIE_FACTORY_RUNNER_PROOF"
@@ -36,19 +44,6 @@ def _unavailable(reason: str) -> None:
     pytest.skip(reason)
 
 
-def _kubectl(
-    *args: str, timeout: int = 180, input_text: str | None = None
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["kubectl", "--context", CONTEXT, *args],
-        input=input_text,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout,
-    )
-
-
 def _assert_ok(result: subprocess.CompletedProcess[str], command: str) -> str:
     assert result.returncode == 0, (
         f"{command} exited {result.returncode}:\n"
@@ -57,7 +52,7 @@ def _assert_ok(result: subprocess.CompletedProcess[str], command: str) -> str:
     return result.stdout.strip()
 
 
-def _pod_manifest(image: str) -> dict[str, object]:
+def _pod_manifest(image: str, namespace: str) -> dict[str, object]:
     security = {
         "allowPrivilegeEscalation": False,
         "readOnlyRootFilesystem": True,
@@ -78,7 +73,7 @@ def _pod_manifest(image: str) -> dict[str, object]:
         "kind": "Pod",
         "metadata": {
             "name": POD,
-            "namespace": NAMESPACE,
+            "namespace": namespace,
             "labels": {"app": POD},
         },
         "spec": {
@@ -133,7 +128,7 @@ def _registry_cidrs() -> list[str]:
     return cidrs
 
 
-def _network_policies(cidrs: list[str]) -> list[dict[str, Any]]:
+def _network_policies(cidrs: list[str], namespace: str) -> list[dict[str, Any]]:
     base = {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -141,7 +136,7 @@ def _network_policies(cidrs: list[str]) -> list[dict[str, Any]]:
     return [
         {
             **base,
-            "metadata": {"name": "default-deny", "namespace": NAMESPACE},
+            "metadata": {"name": "default-deny", "namespace": namespace},
             "spec": {
                 "podSelector": {},
                 "policyTypes": ["Ingress", "Egress"],
@@ -149,7 +144,7 @@ def _network_policies(cidrs: list[str]) -> list[dict[str, Any]]:
         },
         {
             **base,
-            "metadata": {"name": "factory-registry-egress", "namespace": NAMESPACE},
+            "metadata": {"name": "factory-registry-egress", "namespace": namespace},
             "spec": {
                 "podSelector": {"matchLabels": {"app": POD}},
                 "policyTypes": ["Egress"],
@@ -179,75 +174,47 @@ def _network_policies(cidrs: list[str]) -> list[dict[str, Any]]:
     ]
 
 
-def _copy_checkout() -> None:
-    with tempfile.TemporaryDirectory(prefix="curie-factory-proof-") as directory:
-        archive = Path(directory) / "checkout.tar"
-        packed = subprocess.run(
-            [
-                "git",
-                "archive",
-                "--format=tar",
-                "--output",
-                str(archive),
-                "HEAD",
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=300,
-        )
-        _assert_ok(packed, "archive tracked repository checkout")
-        with archive.open("rb") as source:
-            copied = subprocess.run(
-                [
-                    "kubectl",
-                    "--context",
-                    CONTEXT,
-                    "-n",
-                    NAMESPACE,
-                    "exec",
-                    "-i",
-                    POD,
-                    "-c",
-                    "staging",
-                    "--",
-                    "tar",
-                    "--no-overwrite-dir",
-                    "--touch",
-                    "--no-same-permissions",
-                    "-xf",
-                    "-",
-                    "-C",
-                    "/workspace",
-                ],
-                stdin=source,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=600,
-            )
-        _assert_ok(copied, "copy checkout into runner pod")
-
-
-def _exec(script: str, *, timeout: int = 900) -> str:
-    result = _kubectl(
-        "-n", NAMESPACE, "exec", POD, "-c", "runner", "--", "sh", "-ec", script,
+def _exec(owned: toolchain_proof.OwnedNamespace, script: str, *, timeout: int = 900) -> str:
+    result = toolchain_proof.kubectl(
+        owned.context,
+        "-n", owned.name, "exec", POD, "-c", "runner", "--", "sh", "-ec", script,
         timeout=timeout,
     )
     return _assert_ok(result, script)
 
 
-def _delete_namespace() -> None:
-    deleted = _kubectl("delete", "namespace", NAMESPACE, "--wait=false")
-    _assert_ok(deleted, f"delete namespace {NAMESPACE}")
-    deadline = time.monotonic() + 180
-    while time.monotonic() < deadline:
-        remaining = _kubectl("get", "namespace", NAMESPACE, "-o", "name", timeout=30)
-        if remaining.returncode != 0:
-            return
-        time.sleep(2)
-    pytest.fail(f"namespace {NAMESPACE} remained after teardown")
+@pytest.fixture
+def owned_namespace() -> Iterator[toolchain_proof.OwnedNamespace]:
+    image = os.environ.get(IMAGE_ENV, "").strip()
+    if not image:
+        _unavailable(f"set {IMAGE_ENV} to the built factory runner layer image")
+    try:
+        # Hand over only the two proof inputs: a failure traceback or its locals
+        # must never carry the rest of the process environment.
+        target = toolchain_proof.resolve_target(
+            {
+                name: os.environ.get(name, "")
+                for name in (toolchain_proof.CONTEXT_ENV, toolchain_proof.IDENTITY_ENV)
+            }
+        )
+    except toolchain_proof.ProofConfigError as exc:
+        pytest.fail(str(exc))
+    if shutil.which("kubectl") is None or shutil.which("git") is None:
+        _unavailable("kubectl and git are required for the factory runner pod proof")
+    _registry_cidrs()
+    reachable = toolchain_proof.kubectl(target.context, "cluster-info", timeout=30)
+    if reachable.returncode != 0:
+        _unavailable(f"Kubernetes context {target.context} is unavailable: {reachable.stderr}")
+    try:
+        owned = toolchain_proof.create_owned_namespace(target)
+    except (toolchain_proof.NamespaceExists, toolchain_proof.NamespaceProbeError) as exc:
+        pytest.fail(str(exc))
+    # Cleanup runs after the yield, so it is registered before any policy or pod
+    # is created and a CleanupUnverified surfaces as a teardown error.
+    try:
+        yield owned
+    finally:
+        toolchain_proof.delete_owned_namespace(owned)
 
 
 def test_factory_skill_allows_locked_installs_and_reports_service_gaps() -> None:
@@ -309,83 +276,87 @@ def test_factory_skill_budgets_against_the_reported_deadline() -> None:
         assert required in probe
 
 
-def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
-    image = os.environ.get(IMAGE_ENV, "").strip()
-    if not image:
-        _unavailable(f"set {IMAGE_ENV} to the built factory runner layer image")
-    if shutil.which("kubectl") is None or shutil.which("git") is None:
-        _unavailable("kubectl and git are required for the factory runner pod proof")
+def test_factory_runner_pod_resolves_repository_lockfiles(
+    owned_namespace: toolchain_proof.OwnedNamespace,
+) -> None:
+    owned = owned_namespace
+    namespace = owned.name
+    image = os.environ[IMAGE_ENV].strip()
     cidrs = _registry_cidrs()
-    reachable = _kubectl("cluster-info", timeout=30)
-    if reachable.returncode != 0:
-        _unavailable(f"Kubernetes context {CONTEXT} is unavailable: {reachable.stderr}")
 
-    created = _kubectl("create", "namespace", NAMESPACE)
-    _assert_ok(created, f"create namespace {NAMESPACE}")
-    try:
-        for policy in _network_policies(cidrs):
-            _assert_ok(
-                _kubectl(
-                    "-n", NAMESPACE, "create", "-f", "-",
-                    input_text=json.dumps(policy),
-                ),
-                f"create network policy {policy['metadata']['name']}",
-            )
+    for policy in _network_policies(cidrs, namespace):
         _assert_ok(
-            _kubectl(
-                "-n", NAMESPACE, "create", "-f", "-",
-                input_text=json.dumps(_pod_manifest(image)),
+            toolchain_proof.kubectl(
+                owned.context,
+                "-n", namespace, "create", "-f", "-",
+                input_text=json.dumps(policy),
             ),
-            "create factory runner pod",
+            f"create network policy {policy['metadata']['name']}",
         )
+    _assert_ok(
+        toolchain_proof.kubectl(
+            owned.context,
+            "-n", namespace, "create", "-f", "-",
+            input_text=json.dumps(_pod_manifest(image, namespace)),
+        ),
+        "create factory runner pod",
+    )
+    _assert_ok(
+        toolchain_proof.kubectl(
+            owned.context,
+            "-n", namespace, "wait", f"pod/{POD}",
+            "--for=condition=Ready", "--timeout=300s", timeout=330,
+        ),
+        "wait for factory runner pod",
+    )
+    pod = json.loads(
         _assert_ok(
-            _kubectl(
-                "-n", NAMESPACE, "wait", f"pod/{POD}",
-                "--for=condition=Ready", "--timeout=300s", timeout=330,
+            toolchain_proof.kubectl(
+                owned.context, "-n", namespace, "get", "pod", POD, "-o", "json"
             ),
-            "wait for factory runner pod",
+            "inspect factory runner pod",
         )
-        pod = json.loads(
-            _assert_ok(
-                _kubectl("-n", NAMESPACE, "get", "pod", POD, "-o", "json"),
-                "inspect factory runner pod",
-            )
-        )
-        image_ids = [
-            status.get("imageID")
-            for status in pod["status"].get("containerStatuses", [])
-        ]
-        assert len(image_ids) == 2 and all(image_ids), image_ids
-        print(f"factory runner pod image IDs: {image_ids}")
+    )
+    image_ids = [
+        status.get("imageID")
+        for status in pod["status"].get("containerStatuses", [])
+    ]
+    assert len(image_ids) == 2 and all(image_ids), image_ids
+    print(f"factory runner pod image IDs: {image_ids}")
 
-        _copy_checkout()
-        assert _exec("id -u") == "1000"
-        _exec("touch /workspace/.toolchain-write-probe && rm /workspace/.toolchain-write-probe")
-        assert re.match(r"^Python 3\.13\.", _exec("python3 --version"))
-        for command in ("uv --version", "cargo --version", "pnpm --version"):
-            assert _exec(command), command
-        assert re.match(r"^cargo-nextest 0\.9\.146\b", _exec("cargo nextest --version"))
+    toolchain_proof.copy_checkout(owned, POD, "staging", REPO_ROOT)
+    assert _exec(owned, "id -u") == "1000"
+    _exec(
+        owned,
+        "touch /workspace/.toolchain-write-probe && rm /workspace/.toolchain-write-probe",
+    )
+    assert re.match(r"^Python 3\.13\.", _exec(owned, "python3 --version"))
+    for command in ("uv --version", "cargo --version", "pnpm --version"):
+        assert _exec(owned, command), command
+    assert re.match(r"^cargo-nextest 0\.9\.146\b", _exec(owned, "cargo nextest --version"))
 
-        _exec(
-            "cd /workspace && "
-            "UV_PROJECT_ENVIRONMENT=/workspace/.venv "
-            "UV_CACHE_DIR=/workspace/.cache/uv "
-            "UV_PYTHON_DOWNLOADS=never uv sync --frozen"
-        )
-        _exec(
-            "cd /workspace/cli && "
-            "CARGO_HOME=/workspace/.cargo "
-            "CARGO_TARGET_DIR=/workspace/.cargo-target cargo fetch --locked"
-        )
-        _exec(
-            "cd /workspace/cli && "
-            "CARGO_HOME=/workspace/.cargo "
-            "CARGO_TARGET_DIR=/workspace/.cargo-target "
-            "cargo test --no-run --locked",
-            timeout=1800,
-        )
-        _exec(
-            "cd /workspace/apps/ui && CI=true pnpm install --frozen-lockfile"
-        )
-    finally:
-        _delete_namespace()
+    _exec(
+        owned,
+        "cd /workspace && "
+        "UV_PROJECT_ENVIRONMENT=/workspace/.venv "
+        "UV_CACHE_DIR=/workspace/.cache/uv "
+        "UV_PYTHON_DOWNLOADS=never uv sync --frozen",
+    )
+    _exec(
+        owned,
+        "cd /workspace/cli && "
+        "CARGO_HOME=/workspace/.cargo "
+        "CARGO_TARGET_DIR=/workspace/.cargo-target cargo fetch --locked",
+    )
+    _exec(
+        owned,
+        "cd /workspace/cli && "
+        "CARGO_HOME=/workspace/.cargo "
+        "CARGO_TARGET_DIR=/workspace/.cargo-target "
+        "cargo test --no-run --locked",
+        timeout=1800,
+    )
+    _exec(
+        owned,
+        "cd /workspace/apps/ui && CI=true pnpm install --frozen-lockfile",
+    )

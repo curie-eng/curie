@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import queue
-import re
 import shutil
 import signal
 import subprocess
@@ -38,9 +37,10 @@ import anyio
 import anyio.abc
 import anyio.to_thread
 import mcp.types
+from curie_internal.connector_endpoints import ConnectorEndpointBinding
 from mcp.shared.message import SessionMessage
-from plugin_format.connector_render import service_dns
 
+from .connector_endpoints import endpoint_resolver
 from .connectors import declared_connectors
 from .subprocess_env import shell_and_hook_env
 
@@ -49,22 +49,6 @@ logger = logging.getLogger(__name__)
 ROUTE_TOKENS_ENV = "CURIE_CONNECTOR_ROUTE_TOKENS"
 ROUTES_FD_ENV = "CURIE_CONNECTOR_ROUTES_FD"
 _types: Any = mcp.types
-# The ``${NAME}`` and ``${NAME:-default}`` forms the CLI expands in an MCP
-# config, so a caller the runner starts reads its config as the CLI would.
-_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-
-
-def _expand(value: str, env: Mapping[str, str]) -> str:
-    def one(match: re.Match[str]) -> str:
-        name, default = match.group(1), match.group(2)
-        found = env.get(name)
-        if found:
-            return found
-        if default is not None:
-            return default
-        return found if found is not None else match.group(0)
-
-    return _VARIABLE.sub(one, value)
 
 
 def take_route_tokens(*envs: MutableMapping[str, str]) -> dict[str, str]:
@@ -119,17 +103,20 @@ def connector_urls(
     release: str | None,
     agent: str | None,
     namespace: str | None,
+    endpoints: ConnectorEndpointBinding | None = None,
 ) -> dict[str, str]:
-    """Each hosted route connector's base URL: the Service its MCP entry dials.
+    """Each hosted route connector's base URL from the shared endpoint resolver.
 
-    Empty without the connector scope, the same rule ``derive_mcp_servers``
-    applies: there is no Service to point at.
+    Empty without static endpoints or Kubernetes scope, matching the MCP entries.
     """
 
-    if not (release and agent and namespace):
+    resolver = endpoint_resolver(
+        release=release, agent=agent, namespace=namespace, endpoints=endpoints
+    )
+    if resolver is None:
         return {}
     return {
-        name: f"http://{service_dns(release, agent, name, namespace)}:{spec.port}"
+        name: resolver.base_url(name, spec)
         for name, spec in declared_connectors(plugin_dir, agent=agent).items()
         if spec.is_hosted and spec.routes
     }
@@ -166,28 +153,21 @@ def caller_launch(
     the process is not dumpable.
     """
 
-    interpolation = shell_and_hook_env(source_env)
-    configured = entry.get("env")
-    declared: dict[str, str] = {}
-    if isinstance(configured, Mapping):
-        declared = {
-            str(key): _expand(str(value), interpolation) for key, value in configured.items()
-        }
-    env = shell_and_hook_env(source_env, extra=declared)
+    from .mcp_stdio import sanitize_stdio_server
+
+    sanitized = sanitize_stdio_server(entry, source_env)
+    env = shell_and_hook_env(source_env, extra=sanitized["env"])
     env.pop(ROUTE_TOKENS_ENV, None)
     existing = [
         item for item in env.get("LD_PRELOAD", "").split(":") if item and item != lock_library
     ]
     env["LD_PRELOAD"] = ":".join([lock_library, *existing])
-    args = entry.get("args")
-    command = _expand(str(entry["command"]), interpolation)
+    command = sanitized["command"]
     return CallerLaunch(
         # Resolved now, at boot, before any turn's Bash could put an earlier
         # match on PATH.
         command=shutil.which(command, path=env.get("PATH")) or command,
-        args=tuple(_expand(str(arg), interpolation) for arg in args)
-        if isinstance(args, list)
-        else (),
+        args=tuple(sanitized["args"]),
         env=env,
         cwd=cwd,
         routes_document=json.dumps(dict(routes), sort_keys=True, separators=(",", ":")).encode(

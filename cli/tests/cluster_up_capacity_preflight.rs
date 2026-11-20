@@ -189,7 +189,7 @@ impl Fixture {
         fs::write(
             &fixture.kubeconfig,
             format!(
-                "apiVersion: v1\nkind: Config\ncurrent-context: acme-other-context\ncontexts:\n- name: acme-other-context\n  context:\n    cluster: acme-other-cluster\n- name: {CONTEXT}\n  context:\n    cluster: acme-capacity-cluster\nclusters: []\nusers: []\n"
+                "apiVersion: v1\nkind: Config\ncurrent-context: other-context\ncontexts:\n- name: other-context\n  context:\n    cluster: acme-other-cluster\n- name: {CONTEXT}\n  context:\n    cluster: acme-capacity-cluster\nclusters: []\nusers: []\n"
             ),
         )
         .expect("write two-context kubeconfig");
@@ -408,7 +408,7 @@ exit 64
             .env("NO_COLOR", "1")
             .env("TMPDIR", self.temp.path())
             .env("KUBECONFIG", &self.kubeconfig)
-            .env("HELM_KUBECONTEXT", "acme-other-context")
+            .env("HELM_KUBECONTEXT", "other-context")
             .env("CURIE_CONFIG_DIR", self.temp.path().join("config"))
             .env("CURIE_CAPACITY_CALLS", &self.calls)
             .env("CURIE_CAPACITY_UPGRADES", &self.upgrades)
@@ -888,7 +888,7 @@ fn both_capacity_reads_use_the_pinned_context_and_active_pod_selector() {
     assert_eq!(reads.len(), 2, "both capacity reads must execute:\n{calls}");
     for read in &reads {
         assert!(read.contains(&format!("--context {CONTEXT}")), "{read}");
-        assert!(!read.contains("--context acme-other-context"), "{read}");
+        assert!(!read.contains("--context other-context"), "{read}");
         assert!(read.contains("-o json"), "{read}");
     }
     let pods = reads.iter().find(|line| line.contains("get pods")).unwrap();

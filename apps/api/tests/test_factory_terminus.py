@@ -38,10 +38,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
-from curie_api.factory_notices import FINAL_MARKER, cause_text, result_section
+from curie_api.factory_notices import (
+    FINAL_MARKER,
+    STATE_LABELS,
+    cause_text,
+    result_section,
+    status_body,
+)
 from curie_api.forges.registry import forges_registry
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_internal.factory_triage import HandoffOutcome, TriageResult, status_comment_text
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from forge_fakes import factory_wake
 from forge_fakes.github import INSTALLATION_ID, LABEL, REPO, REPO_ID, GitHubAPI, _issue_event, _post
@@ -101,7 +108,11 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "revision_unchanged",
         "execution_deadline",
         "capacity_wait_expired",
+        "retry_condition_expired",
+        "runner_error",
         "owner_lost",
+        "enrollment_fenced",
+        "authentication_required",
         "issue_cancelled",
         "publication_denied",
         "publication_expired",
@@ -113,11 +124,121 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "merge_conflict",
         "pr_closed",
         "ci_fix_unpublished",
+        "tracker_result",
+        "no_tracker_result",
+        "tracker_result_undelivered",
     ],
 )
 def test_every_terminus_cause_has_its_own_plain_sentence(cause: str) -> None:
     assert cause_text(cause) != cause_text("not-a-cause")
     assert cause not in cause_text(cause)
+
+
+def test_tracker_result_causes_have_distinct_sentences_without_em_dashes() -> None:
+    sentences = [
+        cause_text(cause)
+        for cause in ("tracker_result", "no_tracker_result", "tracker_result_undelivered")
+    ]
+    assert len(set(sentences)) == 3
+    assert all("\u2014" not in sentence for sentence in sentences)
+    body = result_section("tracker_result_undelivered", pr_url=None)
+    assert body.splitlines()[0] == f"Could not complete: {sentences[2]}"
+    assert "Cause: tracker_result_undelivered" in body
+
+
+# --- #5586 decision 12: the seven triage endings in the status comment ------------
+
+_TRIAGE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+_TICKET_URL = f"https://github.com/{REPO}/issues/9302"
+_RESULT_COMMENT_URL = f"https://github.com/{REPO}/issues/9301#issuecomment-4401"
+_RUN_URL = f"https://github.com/{REPO}/issues/9302#issuecomment-4402"
+
+
+def _ticket_result() -> TriageResult:
+    return TriageResult("ticket", None, _TRIAGE_REVISION, _TICKET_URL, _RESULT_COMMENT_URL)
+
+
+def _findings_result(reason: str) -> TriageResult:
+    return TriageResult("findings", reason, _TRIAGE_REVISION, None, _RESULT_COMMENT_URL)
+
+
+_ENDINGS = [
+    pytest.param(
+        _ticket_result(),
+        HandoffOutcome(admitted=True, implementation_status_url=_RUN_URL, refusal_reason=None),
+        [f"Ticket published: {_TICKET_URL}.", f"Implementation admitted: {_RUN_URL}"],
+        id="1-ticket-implementation-admitted",
+    ),
+    pytest.param(
+        _ticket_result(),
+        HandoffOutcome(
+            admitted=False,
+            implementation_status_url=None,
+            refusal_reason="the implementation agent has no capacity",
+        ),
+        [
+            f"Ticket published: {_TICKET_URL}.",
+            "Implementation not started: the implementation agent has no capacity.",
+        ],
+        id="2-ticket-implementation-refused",
+    ),
+    pytest.param(
+        _ticket_result(),
+        None,
+        [f"Ticket published: {_TICKET_URL}."],
+        id="ticket-without-handoff",
+    ),
+    pytest.param(
+        _findings_result("not_reproduced"), None, ["not reproduced"], id="3-not-reproduced"
+    ),
+    pytest.param(_findings_result("already_fixed"), None, ["already fixed"], id="4-already-fixed"),
+    pytest.param(
+        _findings_result("product_decision_needed"),
+        None,
+        ["product decision needed"],
+        id="5-product-decision-needed",
+    ),
+    pytest.param(
+        _findings_result("capability_unavailable"),
+        None,
+        ["capability unavailable"],
+        id="6-capability-unavailable",
+    ),
+    pytest.param(
+        _findings_result("budget_exhausted"),
+        None,
+        ["Investigation stopped: budget exhausted; findings delivered."],
+        id="7-budget-exhausted",
+    ),
+]
+
+
+@pytest.mark.parametrize(("result", "handoff", "expected"), _ENDINGS)
+def test_each_triage_ending_renders_its_status_comment(
+    result: TriageResult, handoff: HandoffOutcome | None, expected: list[str]
+) -> None:
+    request_id = uuid.uuid4()
+    body = status_body(
+        request_id=request_id,
+        card_url=None,
+        pill_label="COMPLETED",
+        phase_view=None,
+        result=status_comment_text(result, handoff),
+        base_line=None,
+    )
+    for line in expected:
+        assert line in body, body
+    assert _TRIAGE_REVISION in body
+    # The marked result comment carries the command, observed result, tried and missing.
+    assert _RESULT_COMMENT_URL in body
+    assert FINAL_MARKER in body and marker_for(request_id) in body
+    assert "\u2014" not in body
+    if result.result_kind == "ticket":
+        assert _TICKET_URL in body
+    if handoff is None:
+        assert "Implementation" not in body
+    if result.reason == "budget_exhausted":
+        assert "reproduc" not in body.lower()
 
 
 _MODEL_UNREACHABLE_SENTENCE = (
@@ -330,6 +451,7 @@ def _observe_termination(client: Any, request_id: uuid.UUID) -> None:
         headers=headers,
         json={
             "runtime_epoch": claimed.json()["runtime_epoch"],
+            "expected_request_version": claimed.json()["request_version"],
             "observation": "runtime stopped",
         },
     )
@@ -357,6 +479,12 @@ def _start_running(client: Any, request_id: uuid.UUID) -> int:
                 claim_name="claim-factory",
                 sandbox_name="sbx-factory",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)
@@ -530,14 +658,24 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     refused = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers=headers,
-        json={"runtime_epoch": epoch, "outcome": "completed", "cause": "completed"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "completed",
+            "cause": "completed",
+            "retry_safety": "uncertain",
+        },
     )
     assert refused.status_code == 409, refused.text
     assert _request(number)["status"] == "running"
     failed = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers=headers,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "runner_escalated"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "runner_escalated",
+            "retry_safety": "uncertain",
+        },
     )
     assert failed.status_code == 200, failed.text
     terminal = _request(number)
@@ -691,6 +829,7 @@ def test_an_unadopted_pr_notice_names_the_database_selected_conversation_pr(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "pull_request_not_adopted",
+            "retry_safety": "uncertain",
             "detail": f"Continue this pull request: {worker_url}",
         },
     )
@@ -737,6 +876,7 @@ def test_approval_create_failure_posts_terminal_issue_notice_and_clears_running_
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "approval_create_failed",
+            "retry_safety": "uncertain",
         },
     )
     assert failed.status_code == 200, failed.text
@@ -767,6 +907,7 @@ def test_approval_create_failure_after_first_publication_ends_ci_fix_round(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "approval_create_failed",
+            "retry_safety": "uncertain",
         },
     )
     assert failed.status_code == 200, failed.text
@@ -793,6 +934,7 @@ def test_credit_exhausted_finish_comments_the_redacted_provider_message(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "model_credit_exhausted",
+            "retry_safety": "uncertain",
             "detail": f"model error: unknown: API Error: 402 requires more credits {key}",
         },
     )
@@ -826,7 +968,13 @@ def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
     finished = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause, "detail": detail},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": cause,
+            "retry_safety": "uncertain",
+            "detail": detail,
+        },
     )
     assert finished.status_code == 200, finished.text
     terminal = _request(number)
@@ -868,6 +1016,7 @@ def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any, 
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": cause,
+            "retry_safety": "uncertain",
             "detail": "stopping",
         },
     )
@@ -928,6 +1077,7 @@ def _finish_unpublished(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": cause,
+            "retry_safety": "uncertain",
             "detail": detail,
         },
     )
@@ -1113,6 +1263,7 @@ def test_a_running_cancellation_comments_only_after_the_runtime_is_observed(
         headers=headers,
         json={
             "runtime_epoch": claimed.json()["runtime_epoch"],
+            "expected_request_version": claimed.json()["request_version"],
             "observation": "runtime stopped after the issue was unlabelled",
         },
     )
@@ -1200,7 +1351,7 @@ def test_owner_lost_posts_one_comment(admitted: Any) -> None:
     _reconcile()
     final = _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
     assert "Cause: owner_lost" in final
-    assert "(attempt 2 of 3)" in final
+    assert "admitted automatic retry 1 of 2 as a new run" in final
 
 
 def test_runner_failure_posts_one_comment(admitted: Any) -> None:
@@ -1212,7 +1363,12 @@ def test_runner_failure_posts_one_comment(admitted: Any) -> None:
     failed = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "runner_failed"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "runner_failed",
+            "retry_safety": "uncertain",
+        },
     )
     assert failed.status_code == 200, failed.text
     terminal = _request(number)
@@ -1278,7 +1434,12 @@ def test_failure_and_opened_pull_request_each_post_one_final_comment(
 
 
 def _attach_publication(
-    work_item_id: uuid.UUID, *, status: str, pr: int | None, head_sha: str = HEAD_A
+    work_item_id: uuid.UUID,
+    *,
+    status: str,
+    pr: int | None,
+    head_sha: str = HEAD_A,
+    bind_lineage: bool = True,
 ) -> None:
     async def go() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -1419,7 +1580,7 @@ def _attach_publication(
                         "result": pr_url,
                     },
                 )
-                if pr is not None:
+                if pr is not None and bind_lineage:
                     changed = await conn.execute(
                         text(
                             "UPDATE curie.work_items SET publication_lineage_id = :lineage, "
@@ -1843,7 +2004,7 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     path = f"/repos/{REPO}/issues/{number}/comments"
     assert [posted_path for posted_path, _body in posts] == [path]
     body = _assert_one_final_comment([comment["body"] for comment in sink.lists[path]], revision)
-    assert "Status: SUCCEEDED" in body
+    assert "Status: ANSWERED" in body
     assert (
         "No changes needed: the open pull request already covers this request: "
         f"https://github.com/{REPO}/pull/{pr}"
@@ -1860,6 +2021,109 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     assert len(_posts(sink)) == 1
     assert len(_notices(revision)) == 1
     assert sink.ci_observations == []
+
+
+def _assert_lead_in_unchanged_completion(
+    client: Any,
+    github: GitHubAPI,
+    sink: _CommentServer,
+    detail: str,
+    cause: str,
+) -> None:
+    """Row, comment, and label outcome shared with the first-line no-change test."""
+
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
+    sink.ci_observations.clear()
+    objective = _follow_up_objective(number, 88120)
+    revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
+    _start_running(client, revision)
+
+    finished = _finish_unpublished(client, revision, cause=cause, detail=detail)
+
+    assert finished.status_code == 200, finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[revision]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("completed", "completed")
+    notices = _notices(revision)
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == "completed"
+    assert notices[0]["detail"].strip() == detail.strip()
+    assert (
+        _rows(
+            "SELECT count(*) AS count FROM curie.publications WHERE execution_request_id = :id",
+            {"id": revision},
+        )[0]["count"]
+        == 0
+    )
+
+    _reconcile()
+    posts = _posts(sink)
+    path = f"/repos/{REPO}/issues/{number}/comments"
+    assert [posted_path for posted_path, _body in posts] == [path]
+    body = _assert_one_final_comment([comment["body"] for comment in sink.lists[path]], revision)
+    assert "Status: ANSWERED" in body
+    assert (
+        "No changes needed: the open pull request already covers this request: "
+        f"https://github.com/{REPO}/pull/{pr}"
+    ) in body
+    assert "Agent's last message:" in body
+    for line in detail.strip().splitlines():
+        if line:
+            assert line in body
+    assert "Could not complete:" not in body
+    assert "NEEDS HUMAN" not in body
+    assert "Cause:" not in body
+    assert "curie-factory:pr-open" in sink.issue_labels[number]
+    assert "curie-factory:needs-human" not in sink.issue_labels[number]
+    assert _notices(revision)[0]["posted_at"] is not None
+    assert sink.ci_observations == []
+    _reconcile()
+    assert len(_posts(sink)) == 1
+    assert len(_notices(revision)) == 1
+    assert sink.ci_observations == []
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
+def test_a_lead_in_before_the_no_change_marker_completes(admitted: Any, cause: str) -> None:
+    """#5727 AC1: a later line that starts with the marker completes as unchanged."""
+
+    client, github, sink = admitted
+    detail = (
+        "The recorded decision already covers this request.\n"
+        "\n"
+        "No changes needed: the existing tests already cover this request."
+    )
+    _assert_lead_in_unchanged_completion(client, github, sink, detail, cause)
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
+def test_a_blockquote_no_change_marker_completes(admitted: Any, cause: str) -> None:
+    """#5727 AC3: a blockquote line that starts with the marker completes as unchanged."""
+
+    client, github, sink = admitted
+    detail = (
+        "The recorded decision already covers this request.\n"
+        "\n"
+        "> No changes needed: the existing tests already cover this request."
+    )
+    _assert_lead_in_unchanged_completion(client, github, sink, detail, cause)
+
+
+@pytest.mark.parametrize(
+    "marker_line",
+    [
+        "**No changes needed:** the existing tests already cover this request.",
+        "_No changes needed: the existing tests already cover this request.",
+    ],
+)
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
+def test_a_emphasis_no_change_marker_completes(admitted: Any, cause: str, marker_line: str) -> None:
+    """#5727 AC4: an emphasis line that starts with the marker completes as unchanged."""
+
+    client, github, sink = admitted
+    detail = f"The recorded decision already covers this request.\n\n{marker_line}"
+    _assert_lead_in_unchanged_completion(client, github, sink, detail, cause)
 
 
 @pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
@@ -1889,8 +2153,8 @@ def test_a_review_revision_with_no_changes_completes_in_its_thread(
     path = f"/repos/{REPO}/pulls/{pr}/comments/88121/replies"
     assert [posted_path for posted_path, _body in posts] == [path]
     body = posts[0][1] or ""
-    assert "Status: SUCCEEDED" in body
-    assert "No changes needed: this pull request already covers the requested revision." in body
+    assert "Status: ANSWERED" in body
+    assert "No changes needed: this pull request is unchanged." in body
     assert f"In response to https://github.com/{REPO}/pull/{pr}#discussion_r88121" in body
     assert "Agent's last message:" in body
     assert detail in body
@@ -1963,7 +2227,9 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
             try:
                 async with engine.begin() as conn:
                     assignment = {
-                        "merged": "status = 'merged'",
+                        # The merge write stamps updated_at, as
+                        # mark_publication_lineage_terminal does.
+                        "merged": "status = 'merged', updated_at = now()",
                         "closed": "status = 'closed'",
                         "missing_pr_url": (
                             "pr_number = NULL, pr_url = NULL, code_host_kind = NULL, "
@@ -2001,8 +2267,12 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
     assert "Status: NEEDS HUMAN" in body
     assert "Could not complete:" in body
     assert f"Cause: {cause}" in body
-    assert "curie-factory:needs-human" in sink.issue_labels[number]
-    assert "curie-factory:pr-open" not in sink.issue_labels[number]
+    if case == "merged":
+        assert not set(STATE_LABELS) & sink.issue_labels.get(number, set())
+        assert f"Pull request: https://github.com/{REPO}/pull/{pr} (merged)" in body
+    else:
+        assert "curie-factory:needs-human" in sink.issue_labels[number]
+        assert "curie-factory:pr-open" not in sink.issue_labels[number]
 
 
 @pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
@@ -2032,7 +2302,7 @@ def test_a_relabel_with_no_changes_on_an_adopted_pull_request_completes(
     body = _assert_one_final_comment(
         [comment["body"] for comment in sink.lists[path]], second["id"]
     )
-    assert "Status: SUCCEEDED" in body
+    assert "Status: ANSWERED" in body
     assert (
         "No changes needed: the open pull request already covers this request: "
         f"https://github.com/{REPO}/pull/{number}"
@@ -2070,7 +2340,9 @@ def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, ca
         detail = "Could not complete: the requested change needs a design decision."
     statement = {
         "merged": (
-            "UPDATE curie.thread_publication_lineages SET status = 'merged' WHERE id = "
+            # The merge write stamps updated_at, as mark_publication_lineage_terminal does.
+            "UPDATE curie.thread_publication_lineages SET status = 'merged', updated_at = now() "
+            "WHERE id = "
             "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
         ),
         "closed": (
@@ -2116,7 +2388,11 @@ def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, ca
         [comment["body"] for comment in sink.lists[path]], second["id"]
     )
     assert "Status: NEEDS HUMAN" in body
-    assert "curie-factory:needs-human" in sink.issue_labels[number]
+    if case == "merged":
+        assert not set(STATE_LABELS) & sink.issue_labels.get(number, set())
+        assert f"Pull request: https://github.com/{REPO}/pull/{number} (merged)" in body
+    else:
+        assert "curie-factory:needs-human" in sink.issue_labels[number]
 
 
 def test_a_relabel_revision_on_an_adopted_pull_request_settles_through_the_ci_gate(
@@ -2264,6 +2540,10 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(
                     detail="No changes needed: the request is already covered.",
                     ci_fix_round=None,
                     extra_where=(),
+                    retry_safety=None,
+                    retry_condition=None,
+                    exhausted_volume=None,
+                    finisher="worker",
                 )
                 assert isinstance(result, WorkItemConflict), result
                 assert result.code == "stale_version"
@@ -2478,6 +2758,7 @@ def test_factory_notices_publication_unrecorded_finish_comments_its_details_once
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "publication_unrecorded",
+            "retry_safety": "uncertain",
             "detail": detail,
         },
     )
@@ -2518,6 +2799,7 @@ def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "model_usage_limited",
+            "retry_safety": "uncertain",
             "detail": "You've hit your session limit · resets 3pm (UTC)",
         },
     )
@@ -2549,6 +2831,7 @@ def test_factory_notices_model_unreachable_finish_comments_the_network_remedy(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "model_unreachable",
+            "retry_safety": "uncertain",
             "detail": "model error: server_error: API Error: Connection refused (ECONNREFUSED)",
         },
     )

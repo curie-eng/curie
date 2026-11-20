@@ -22,5 +22,6 @@
     "status": "active"
   },
   "cron_triggers": [],
+  "wake_triggers": [],
   "warnings": []
 }

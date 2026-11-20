@@ -52,6 +52,7 @@ from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 
 from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 # importlib import mode does not add the tests directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -636,7 +637,9 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
 
             async def start_turn(self, *_args: object, **_kwargs: object) -> object:
                 self.starts += 1
-                return SimpleNamespace()
+                # A TurnStream's shape: the kernel records the opened turn's
+                # epoch for lease-loss fencing (ADR 0270 decision 3).
+                return SimpleNamespace(turn_epoch=None, close=lambda: None)
 
         async with make_harness() as h:
             substrate = Substrate()
@@ -784,7 +787,9 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
 
             async def start_turn(self, *_args: object, **_kwargs: object) -> object:
                 self.starts += 1
-                return SimpleNamespace()
+                # A TurnStream's shape: the kernel records the opened turn's
+                # epoch for lease-loss fencing (ADR 0270 decision 3).
+                return SimpleNamespace(turn_epoch=None, close=lambda: None)
 
         async with make_harness() as h:
             substrate = Substrate()
@@ -2383,6 +2388,9 @@ def test_publication_create_stops_retrying_when_its_budget_is_spent() -> None:
 class _FactoryBinding:
     """A workspace-enabled deployment for a factory execute turn."""
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "acme-bot"
+
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
     ) -> HttpIdentityBinding | None:
@@ -2451,7 +2459,7 @@ class _FactoryWorkspace:
         return SimpleNamespace(repo_full_name="acme-corp/widgets", base_sha="a1" * 20)
 
 
-class _FactoryWorkItems:
+class _FactoryWorkItems(AbsentRequesterContext):
     """The WorkItems dispatch double: an acquired execution that records each call."""
 
     def __init__(self) -> None:
@@ -2478,7 +2486,11 @@ class _FactoryWorkItems:
             conversation_id=factory_conversation(wake),
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path="acme-corp/widgets",
+            execution_kind="implementation",
+            recovery_candidate_id=None,
             context=factory_context(uuid.UUID("11111111-1111-4111-8111-111111114180"), wake),
+            resource_gate=None,
+            predecessor_claim_name=None,
         )
 
     async def start(
@@ -2500,7 +2512,9 @@ class _FactoryWorkItems:
         self.calls.append("finish")
         self.finishes.append(kwargs)
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         return "acme widgets issue 123", f"wir.capability-for-{request_id}"
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]  # noqa: ANN204
@@ -3548,6 +3562,9 @@ class GrantBinding:
     mirroring the worker's real derivation from durable approval state.
     """
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "test-agent" if event_id == self.grant_event_id else None
+
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
     ) -> HttpIdentityBinding | None:
@@ -3976,6 +3993,9 @@ def _awaiting_routed_script(summary: str, route: str) -> list:
 
 class RoutedBinding:
     """A minimal binding stand-in: one channel -> one agent with route bindings."""
+
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "test-agent"
 
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
@@ -4406,6 +4426,94 @@ def test_malformed_route_target_escalates_without_creating_an_approval(
         async with make_harness(approvals=approvals, binding=binding) as h:
             h.runner.default_script = _awaiting_routed_script("Anything", "managers")
             ev = _qevent("gate", thread="th-malformed-route")
+            await h.kernel.process_event(ev)
+
+            assert approvals.requests == []
+            assert h.sink.posts == []
+            assert h.sink.last_text is not None
+            assert "managers" in h.sink.last_text
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+_OPERATOR_OWNED_ROUTE_KEYS = {
+    "approver_ticket": {
+        "connector": "example-ticket",
+        "tool": "approve",
+        "key_id": "key-1",
+        "public_key": "AAAA-example-public-key",
+        "ceiling": {
+            "approver_role_version": 1,
+            "approver_role": '{"role":"example-approver"}',
+            "users": ["U0EXAMPLE1"],
+        },
+    },
+    "separation": {"exclude_requester": True},
+}
+
+
+@pytest.mark.parametrize(
+    ("route_binding", "expected_card_channel", "expected_conversation"),
+    [
+        pytest.param(
+            {"resolution": {"kind": "slack", "address": "C0EXAMPLE3"}},
+            "C0EXAMPLE3",
+            None,
+            id="fixed-slack-resolution",
+        ),
+        pytest.param(
+            {"resolution": {"mode": "requesting_surface"}},
+            "C1",
+            "th-operator-keys",
+            id="requesting-surface",
+        ),
+    ],
+)
+def test_operator_owned_route_keys_do_not_change_card_targets(
+    make_harness,
+    route_binding: dict,
+    expected_card_channel: str,
+    expected_conversation: str | None,
+) -> None:
+    """ADR 0271 decision 1: ``approver_ticket`` and ``separation`` ride on a
+    route binding but are not card targets. The parser accepts them without
+    interpreting them, so the card lands exactly where it would without them."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"managers": {**route_binding, **_OPERATOR_OWNED_ROUTE_KEYS}})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Anything", "managers")
+            await h.kernel.process_event(_qevent("gate", thread="th-operator-keys"))
+
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].card_channel == expected_card_channel
+            assert len(h.sink.posts) == 1
+            address, _message, _by, conversation_id, _endpoint = h.sink.posts[0]
+            assert address == expected_card_channel
+            if expected_conversation is not None:
+                assert conversation_id == expected_conversation
+
+    asyncio.run(go())
+
+
+def test_an_unrelated_unknown_route_key_is_still_refused_beside_operator_keys(
+    make_harness,
+) -> None:
+    """Liveness of the refusal: only the two operator-owned keys are new."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        route_binding = {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+            **_OPERATOR_OWNED_ROUTE_KEYS,
+            "surprise": {"x": 1},
+        }
+        binding = RoutedBinding({"managers": route_binding})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Anything", "managers")
+            ev = _qevent("gate", thread="th-unknown-key")
             await h.kernel.process_event(ev)
 
             assert approvals.requests == []
@@ -6022,6 +6130,9 @@ class _WorkspacelessBinding:
     """A deployment with repository workspaces off, as `curie cluster message`
     installs it: a deployment id (so selection runs) and no bound repository."""
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return None
+
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
     ) -> HttpIdentityBinding | None:
@@ -6881,7 +6992,11 @@ def test_production_ttls_reach_workspace_lease_during_streaming_and_pause(
                     "s3_secret_key": os.environ.get("TEST_S3_SECRET_KEY", "rustfssecret"),
                 }
             )
-            monkeypatch.setattr(run, "_sandbox_client", lambda *_args: h.fake_k8s)
+            monkeypatch.setattr(
+                run,
+                "_sandbox_client",
+                lambda config, env, sub_config, *, redis_client=None: h.fake_k8s,
+            )
             runtime = run.build(
                 config,
                 {
@@ -7091,5 +7206,47 @@ def test_approval_api_outage_retries_before_pausing_and_422_escalates(
                     )
                 assert h.runner.opened == ["please deploy"]
                 assert await h.kernel._markers.is_terminal(event.event_id)
+
+    asyncio.run(go())
+
+
+_DEADLINE_VECTORS = json.loads(
+    (Path(__file__).resolve().parents[4] / "tests/vectors/approval-route-deadlines.json")
+    .read_text()
+)
+
+
+@pytest.mark.parametrize(
+    "override,expected",
+    [
+        ({}, 86400),
+        *[({"expires_in_seconds": value}, value) for value in _DEADLINE_VECTORS["valid"]],
+    ],
+)
+def test_session_route_deadline_preserves_default_and_explicit_null(
+    make_harness, override, expected
+):
+    async def go():
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"review": {**_resolution_route(), **override}})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Approve bounded work", "review")
+            await h.kernel.process_event(_qevent("please review"))
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].expires_in_seconds == expected
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("value", _DEADLINE_VECTORS["invalid"])
+def test_malformed_route_deadline_never_creates_approval(make_harness, value):
+    async def go():
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"review": {**_resolution_route(), "expires_in_seconds": value}})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Approve bounded work", "review")
+            await h.kernel.process_event(_qevent("please review"))
+            assert approvals.requests == []
+            assert h.sink.posts == []
 
     asyncio.run(go())

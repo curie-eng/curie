@@ -30,6 +30,7 @@ export interface WiredAction {
   readonly label: string;
   /** Its CLI mapping: a real command, or an explicit no-equivalent marker. */
   readonly mapping: CliMapping;
+  readonly operatorRoute?: string;
 }
 
 // The wired actions, grouped by surface in comments. `deploy`/`status`/`message`
@@ -72,6 +73,24 @@ export const WIRED_ACTIONS = [
   // LoginScreen (#1047): mint the code the console exchanges for its session cookie.
   { id: "console-login-local", label: "Mint a console login code (dev)", mapping: { command: "local.console.login" } },
   { id: "console-login-cluster", label: "Mint a console login code (prod)", mapping: { command: "cluster.console.login" } },
+
+  // Organization sign-in (#5682) is a browser navigation to the API, not a
+  // CliHint. The CLI that drops the cookie copy is #5559, so the gap cites
+  // that issue rather than the parity epic.
+  {
+    id: "console-oidc-sign-in",
+    label: "Sign in with your organization",
+    mapping: { noCliEquivalent: "https://github.com/curie-eng/curie/issues/5559" },
+  },
+
+  // WiredClaudePlan (#5716): each button maps to the CLI verb that does the same
+  // write with the same session. The CLI reads the token from a private file.
+  { id: "claude-plan-enroll", label: "Connect a personal Claude plan", mapping: { command: "cluster.subscription.enroll" } },
+  { id: "claude-plan-replace", label: "Replace the personal Claude plan token", mapping: { command: "cluster.subscription.replace" } },
+  { id: "claude-plan-reconnect", label: "Reconnect a personal Claude plan", mapping: { command: "cluster.subscription.reconnect" } },
+  { id: "claude-plan-disconnect", label: "Disconnect a personal Claude plan", mapping: { command: "cluster.subscription.disconnect" } },
+  { id: "github-account-link", label: "Link your GitHub account", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
+  { id: "account-unlink", label: "Unlink your own account", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE }, operatorRoute: "POST /identity/admin/{tenant_id}/links/{link_id}/revoke" },
 
   // Genuinely-unmapped actions: no dedicated CLI verb exists yet. These render
   // the honest amber glyph linking to the parity epic instead of a command.

@@ -162,6 +162,7 @@ def _payload(
         branch=f"curie/publication-{publication_id.hex}",
         title="Publish cluster proof",
         transport=transport,
+        adoptable_revision_ids=(),
     )
 
 
@@ -1625,6 +1626,7 @@ def _contract_payload(transport: PublicationTransport) -> PublicationPayload:
         branch=f"curie/publication-{TRANSPORT_ID.hex}",
         title="Publish contract proof",
         transport=transport,
+        adoptable_revision_ids=(),
     )
 
 

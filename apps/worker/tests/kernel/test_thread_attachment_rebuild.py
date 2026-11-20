@@ -1176,7 +1176,7 @@ _LEASED = {
 async def _lease(h: Any, event: QueuedTurn) -> Any:
     """A real ADR-0131 delivery lease over a real pending entry for ``event``."""
 
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.delivery_lease import DeliveryLeaseStore
 
     try:

@@ -30,6 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import workitem_dispatch
 from .config import Settings
+from .factory_follow_up import with_pull_request_follow_up_marker
+from .factory_review_context import pull_request_body_context
 from .factory_tracker_intake import take_due
 from .forges.authority import feedback_actionable, feedback_allowlist
 from .forges.config import BindingConfig, TrackerConfig
@@ -43,6 +45,7 @@ from .forges.types import GITHUB, FeedbackKind, PullRequestRef, ReplyTarget, Rev
 from .github_factory import lock_issue
 from .github_factory_events import mentions_login
 from .models import ThreadPublicationLineage, WorkItem
+from .personal_execution import ModelAuthMode
 from .workitem_dispatch import Admission
 
 logger = logging.getLogger(__name__)
@@ -149,25 +152,42 @@ async def _poll_lineage(
         if not await feedback_actionable(code_host, feedback, allowlist):
             continue
         async with sessionmaker() as session:
-            await _admit(session, registry, code_host, lineage.id, feedback)
+            await _admit(
+                session,
+                registry,
+                code_host,
+                lineage.id,
+                feedback,
+                installation_mode=settings.factory_model_auth_mode,
+            )
     await valkey.set(key, page.cursor, ex=_CURSOR_TTL_SECONDS)
 
 
-def _objective(feedback: ReviewFeedback, url: str, code_host: CodeHost) -> str:
+def _objective(
+    feedback: ReviewFeedback,
+    url: str,
+    code_host: CodeHost,
+    publication_context: dict[str, str | bool],
+) -> str:
     # The pull request URL opens the objective for the agent's benefit only;
     # the reply target is stored typed on the request.
-    provenance = {
+    provenance: dict[str, str | bool | None] = {
         "kind": feedback.kind.value,
         "url": url,
         "sender": feedback.author.login,
         "body": feedback.body,
         "head_sha": feedback.head_sha,
     }
-    return (
+    provenance.update(publication_context)
+    return with_pull_request_follow_up_marker(
         f"{url}\n\n"
         f"Human {code_host.kind} review feedback on this work item's pull request follows as "
-        "JSON. Use its body as the reviewer's requested changes and revise the same pull "
-        "request.\n" + json.dumps(provenance, ensure_ascii=False)
+        "JSON. Answer from the pull request body's Decisions section and the current diff "
+        "first. Start the revision pipeline only when the comment asks for a change. "
+        "The feedback may ask a question or request a change. Answer questions directly "
+        "and revise the same pull request when a change is needed. The pull_request_body, when "
+        "present, records the last successfully published description.\n"
+        + json.dumps(provenance, ensure_ascii=False)
     )
 
 
@@ -186,12 +206,18 @@ async def _admit(
     code_host: CodeHost,
     lineage_id: uuid.UUID,
     feedback: ReviewFeedback,
+    *,
+    installation_mode: ModelAuthMode,
 ) -> None:
     """Admit one actionable piece of feedback on the WorkItem owning the lineage.
 
     The WorkItem and lineage are re-read under the issue lock: a cancelled
     WorkItem, a closed lineage, or one the WorkItem no longer owns, or whose
-    pull request is no longer the feedback's, admits nothing.
+    pull request is no longer the feedback's, admits nothing. The facts carry
+    the installation's mode and never an owner, as tracker ingress does: a
+    personal installation refuses a service WorkItem with
+    ``personal_owner_required``, and a personal WorkItem's revision copies its
+    locked owner tuple, since a reviewer is not an owner (#5378).
     """
 
     work_item = await session.scalar(
@@ -224,7 +250,9 @@ async def _admit(
     ):
         await session.rollback()
         return
-    objective = _objective(feedback, lineage.pr_url, code_host)
+    objective = _objective(
+        feedback, lineage.pr_url, code_host, await pull_request_body_context(session, work_item)
+    )
     if len(objective) > _MAX_OBJECTIVE:
         await session.rollback()
         logger.info("review feedback %s on lineage %s is too large", feedback.id, lineage.id)
@@ -247,6 +275,7 @@ async def _admit(
         ),
         reply_target=_reply_target(feedback),
         reply_url=lineage.pr_url,
+        model_auth_mode=installation_mode,
     )
     async with AsyncSession(
         bind=await session.connection(),

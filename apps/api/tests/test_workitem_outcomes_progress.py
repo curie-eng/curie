@@ -4,7 +4,7 @@ Work items are admitted and started through the real dispatch service, then
 the status comment row and phase reports are written as the reconciler and the
 sandbox's ``report_progress`` would leave them. Every assertion reads through
 ``GET /work-items`` and ``GET /work-items/{id}`` and compares against
-``factory_progress.phase_view`` called on the same rows, so the console sees
+``factory_phase_view.phase_view`` called on the same rows, so the console sees
 exactly what the GitHub status card shows.
 """
 
@@ -18,7 +18,6 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
-from curie_api.factory_progress import phase_view
 from curie_api.forges.hosts import github_issue_ref, repository_ref
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
@@ -28,6 +27,7 @@ from curie_api.models import (
     FactoryStatusComment,
 )
 from curie_api.workitem_dispatch import AcquireGrant, acquire, admit, finish, start
+from curie_internal.factory_phase_view import phase_view
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake, no_external_calls
@@ -202,6 +202,12 @@ def _start(request_id: uuid.UUID) -> int:
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         return int(started.runtime_epoch)  # type: ignore[union-attr]
 
@@ -218,6 +224,9 @@ def _fail(request_id: uuid.UUID, epoch: int) -> None:
             cause="deadline_halted",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert getattr(result, "code", None) is None, result
 

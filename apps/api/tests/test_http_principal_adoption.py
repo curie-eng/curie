@@ -761,10 +761,9 @@ def test_persisted_invalid_state_refuses_without_local_fallback(
     run(body)
 
 
-def test_new_service_has_no_production_consumer_transport_or_secret_loader() -> None:
+def test_persistence_service_has_no_transport_or_secret_loader() -> None:
     """@spec HTTP-PRINCIPAL-ADOPTION-V1-1 HTTP-PRINCIPAL-ADOPTION-V1-12."""
     service = api()
-    root = Path(__file__).resolve().parents[3]
     source = Path(service.__file__).read_text()
     tree = ast.parse(source)
     imports = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
@@ -774,15 +773,6 @@ def test_new_service_has_no_production_consumer_transport_or_secret_loader() -> 
     assert not any(
         name.split(".")[0] in {"httpx", "requests", "aiohttp", "socket"} for name in names
     )
-    for path in [
-        *(root / "apps/api/src/curie_api/routers").rglob("*.py"),
-        *(root / "apps/worker/src").rglob("*.py"),
-        *(root / "apps/dispatcher/src").rglob("*.py"),
-    ]:
-        code = path.read_text()
-        assert "apply_http_principal" not in code and "adopt_http_authority" not in code, str(
-            path.relative_to(root)
-        )
     forbidden = {"read_bytes", "read_text", "getenv", "open", "load_secret", "resolve_credential"}
     calls = {
         node.func.id if isinstance(node.func, ast.Name) else node.func.attr

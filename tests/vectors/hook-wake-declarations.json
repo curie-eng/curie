@@ -1,0 +1,1146 @@
+{
+  "contract": "ADR-0274 package 1",
+  "cases": [
+    {
+      "id": "explicit-wake",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": [
+        "queue-ready"
+      ]
+    },
+    {
+      "id": "path-only",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "path": "/inbound"
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "prompt-no-opt-in",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-false",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": false,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "false-path-only",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": false,
+            "path": "/inbound"
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "different-name-path",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "work-queue",
+            "path": "/external/notify",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": [
+        "work-queue"
+      ]
+    },
+    {
+      "id": "multiple-hooks",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          },
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "other-queue",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": [
+        "queue-ready",
+        "other-queue"
+      ]
+    },
+    {
+      "id": "maximum-name",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ]
+    },
+    {
+      "id": "wake-name-missing",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-name-blank",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": " ",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-name-uppercase",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "Queue",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-name-slash",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue/name",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-name-colon",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue:name",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-name-leading-separator",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "_queue",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-name-long",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-name-padded",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": " queue-ready ",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-name-newline",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready\n",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_invalid_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-boolean-null",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": null,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.invalid"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-boolean-string",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": "true",
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.invalid"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-boolean-integer",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": 1,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.invalid"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "prompt-missing",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound"
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_missing_prompt"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "prompt-blank",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": " "
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_missing_prompt"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "prompt-null",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": null
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_missing_prompt"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "path-missing",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.webhook_missing_path"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "path-blank",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": " ",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.webhook_missing_path"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "path-null",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": null,
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.webhook_missing_path"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-target-present",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results.",
+            "target": "C0EXAMPLE1"
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_target_forbidden"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-target-null",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results.",
+            "target": null
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_target_forbidden"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-target-blank",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results.",
+            "target": ""
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_target_forbidden"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "ordinary-target-null",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "path": "/inbound",
+            "target": null
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.target_invalid"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "ordinary-target-blank",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "path": "/inbound",
+            "target": ""
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.target_invalid"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "collision-cron",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "cron",
+            "name": "queue-ready",
+            "schedule": "0 9 * * *",
+            "prompt": "Read scheduled work."
+          },
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.duplicate_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "collision-webhook",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "name": "queue-ready",
+            "path": "/other"
+          },
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.duplicate_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "collision-stripped-control",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "name": "\u001cqueue-ready\u001f",
+            "path": "/other"
+          },
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results."
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.duplicate_name"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "cron-wake-refused",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "cron",
+            "name": "queue-ready",
+            "schedule": "0 9 * * *",
+            "prompt": "Read scheduled work.",
+            "wake": true
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.wake_type_invalid"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "cron-false-keeps-behavior",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "cron",
+            "name": "queue-ready",
+            "schedule": "0 9 * * *",
+            "prompt": "Read scheduled work.",
+            "wake": false
+          }
+        ]
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-secret-ref",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "secrets": [
+              {
+                "name": "CURIE_HOOK_WAKE_KEY",
+                "from_secret": "acme-wake-credential",
+                "key": "key"
+              }
+            ]
+          }
+        }
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-distinct-bearer",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "secrets": [
+              {
+                "name": "CURIE_HOOK_WAKE_KEY",
+                "from_secret": "acme-wake-credential",
+                "key": "key"
+              },
+              "CLIENT_TOKEN"
+            ],
+            "bearer_secret": "CLIENT_TOKEN"
+          }
+        }
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-no-client-auth",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "secrets": [
+              {
+                "name": "CURIE_HOOK_WAKE_KEY",
+                "from_secret": "acme-wake-credential",
+                "key": "key"
+              }
+            ],
+            "no_client_auth": "The service is restricted to cluster callers."
+          }
+        }
+      },
+      "valid": true,
+      "codes": [],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-explicit-bearer",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "secrets": [
+              {
+                "name": "CURIE_HOOK_WAKE_KEY",
+                "from_secret": "acme-wake-credential",
+                "key": "key"
+              }
+            ],
+            "bearer_secret": "CURIE_HOOK_WAKE_KEY"
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_bearer"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-implicit-plain",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "secrets": [
+              "CURIE_HOOK_WAKE_KEY"
+            ]
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-explicit-plain",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "secrets": [
+              "CURIE_HOOK_WAKE_KEY"
+            ],
+            "bearer_secret": "CURIE_HOOK_WAKE_KEY"
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_bearer"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-plain-no-auth",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "secrets": [
+              "CURIE_HOOK_WAKE_KEY"
+            ],
+            "no_client_auth": "Cluster ingress only."
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-file",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "secret_files": {
+              "CURIE_HOOK_WAKE_KEY": "/secrets/key"
+            }
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-config",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "config": [
+              "CURIE_HOOK_WAKE_KEY"
+            ]
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-direct-env",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "env": {
+              "CURIE_HOOK_WAKE_KEY": "example-value"
+            }
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-header",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "headers": {
+              "Authorization": "Bearer ${CURIE_HOOK_WAKE_KEY}"
+            }
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-unhosted-url",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "image": "ghcr.io/acme-corp/queue:1",
+            "unhosted_url": "https://example.com/${CURIE_HOOK_WAKE_KEY}"
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-remote",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "url": "https://example.com/mcp",
+            "secrets": [
+              {
+                "name": "CURIE_HOOK_WAKE_KEY",
+                "from_secret": "acme-wake-credential",
+                "key": "key"
+              }
+            ]
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-key-remote-url",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": []
+      },
+      "connectors": {
+        "connectors": {
+          "queue": {
+            "url": "https://example.com/${CURIE_HOOK_WAKE_KEY}"
+          }
+        }
+      },
+      "valid": false,
+      "codes": [
+        "connectors.wake_key_delivery"
+      ],
+      "declarations_valid": true,
+      "wake_names": []
+    },
+    {
+      "id": "wake-schedule-forbidden",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results.",
+            "schedule": "0 9 * * *"
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.schedule_forbidden"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    },
+    {
+      "id": "wake-timezone-without-schedule",
+      "manifest": {
+        "name": "acme-bot",
+        "triggers": [
+          {
+            "type": "webhook",
+            "wake": true,
+            "name": "queue-ready",
+            "path": "/inbound",
+            "prompt": "Read pending work through connector tools and record results.",
+            "timezone": "UTC"
+          }
+        ]
+      },
+      "valid": false,
+      "codes": [
+        "triggers.timezone_without_schedule"
+      ],
+      "declarations_valid": false,
+      "wake_names": []
+    }
+  ]
+}

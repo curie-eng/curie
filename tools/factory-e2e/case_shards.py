@@ -6,19 +6,7 @@ from pathlib import Path
 from statistics import median
 
 DURATIONS_FILE = Path(__file__).with_name("tests") / "case_durations.json"
-ADMITTED_MODULE = "tools/factory-e2e/tests/test_c4_admitted_agent.py"
-CONTINUATION_GROUP = tuple(
-    f"{ADMITTED_MODULE}::test_continuation_revalidates_current_authority[{change}-{reason}-{phase}]"
-    for change, reason in (
-        ("removed_binding", "factory_binding_missing"),
-        ("binding_tenant", "factory_tenant_mismatch"),
-        ("tracker_surface", "factory_surface_mismatch"),
-    )
-    for phase in ("held", "restarted")
-) + (
-    f"{ADMITTED_MODULE}::test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor",
-)
-CASE_GROUPS = (CONTINUATION_GROUP,)
+CASE_GROUPS = ()
 
 
 def load_durations(path: Path = DURATIONS_FILE) -> dict[str, float]:

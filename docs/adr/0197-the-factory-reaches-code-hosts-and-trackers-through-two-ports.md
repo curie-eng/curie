@@ -4,6 +4,13 @@ Date: 2026-10-04
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Adds optional scoped linked-issue creation and reconciliation and verified
+publication receipts.
+
+The amendment by ADR 0277 recorded above is withdrawn by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md), which supersedes ADR 0277 in full; the withdrawal takes effect in code when its triage removal tickets land. Also partially amended by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md) (back-link added under ADR 0045): the Tracker poll also observes plain human comments on tickets with an outstanding question as answer notices, and the authority that may start a ticket is the authority that may answer its questions.
+
 Accepted 2026-10-05 with explicit maintainer approval from Brian Conn
 (TheConnMan), given after review of the publishing pull request
 ([#3980](https://github.com/curie-eng/curie/pull/3980)), including its

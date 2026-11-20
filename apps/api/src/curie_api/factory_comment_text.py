@@ -7,10 +7,30 @@ comment body passes through before publication.
 from __future__ import annotations
 
 import re
+import unicodedata
 import uuid
 from urllib.parse import urlsplit
 
 from curie_telemetry.redact import redact_text
+
+
+def github_ask_line(mention: str) -> str:
+    """How to ask the factory, for a GitHub tracker. Other forges do not use it."""
+
+    return f"Ask the factory: mention @{mention} on this pull request."
+
+
+def append_github_ask_line(body: str, mention: str) -> str:
+    """Put that line last, dropping any earlier copy of the same line."""
+
+    line = github_ask_line(mention)
+    kept = [part for part in body.splitlines() if part.strip() != line]
+    text = "\n".join(kept).rstrip()
+    text = f"{text}\n\n{line}" if text else line
+    if body.endswith("\n"):
+        text += "\n"
+    return text
+
 
 _FACTORY_URL = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
 _KEY_MANAGEMENT_PATH = re.compile(
@@ -131,3 +151,45 @@ def status_marker(request_id: uuid.UUID) -> str:
 
 def marker_for(request_id: uuid.UUID) -> str:
     return f"<!-- {status_marker(request_id)} -->"
+
+
+def without_controls(text: str) -> str:
+    """The text with no control or invisible format character.
+
+    Drops C0 (newline and tab kept), DEL, C1, every format character
+    (category ``Cf``: the bidi embeddings, overrides and isolates, the
+    marks U+200E/U+200F/U+061C, zero-width joiners and spaces, the BOM, tag
+    characters) and lone surrogates. A line or paragraph separator becomes a
+    newline. A right-to-left override would otherwise reorder the App's own
+    lines a reader sees below the model's text.
+    """
+
+    kept: list[str] = []
+    for char in text.replace("\r\n", "\n"):
+        category = unicodedata.category(char)
+        if char in "\n\t":
+            kept.append(char)
+        elif category in ("Zl", "Zp"):
+            kept.append("\n")
+        elif category not in ("Cc", "Cf", "Cs"):
+            kept.append(char)
+    return "".join(kept)
+
+
+def publishable_model_text(text: str) -> str:
+    """Redacted, with no control character, no HTML comment opener left to
+    carry a marker, and no live mention.
+
+    Controls go first, so a zero-width character cannot split a secret past
+    redaction. The tracker posts this text under the App's identity, so a
+    model-written ``@login`` would notify that account. A U+200B after every
+    ``@`` (added after the strip) keeps the text readable and stops the
+    mention, as `factory_notices` does for the agent's last message. The tracker
+    result and the question comment (#5785) both post model text this way.
+    """
+
+    return (
+        redact_factory_comment(without_controls(text))
+        .replace("<!--", "&lt;!--")
+        .replace("@", "@\u200b")
+    )

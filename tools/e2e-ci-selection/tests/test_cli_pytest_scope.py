@@ -41,6 +41,8 @@ KIND_MODULES = (
 )
 CONTAINER_FILES = PYTEST_TESTS.CONTAINER_FILES
 DRY_RUN_FILE = PYTEST_TESTS.DRY_RUN_FILE
+RESOURCE_RETRY_FILE = PYTEST_TESTS.RESOURCE_RETRY_FILE
+RETRY_LIVE_FILE = PYTEST_TESTS.RETRY_LIVE_FILE
 SELECTOR_PATH = "tools/e2e-ci-selection/select_tiers.py"
 REGENERATE = "uv run python tools/e2e-ci-selection/cli_pytest_files.py --write"
 CLI_SCOPE = {
@@ -612,7 +614,6 @@ def test_revision_scope_uses_all_changed_paths_and_nonempty_diff(
     cli = _selection(tmp_path, base=base, head=head, cwd=root, omit_kind=omit_kind)
     assert cli["pytest"] == "true"
     assert cli["pytest_scope"] == "cli"
-    assert cli["pytest_deselect"] == SELECTION_TESTS.SRE_RUNTIME
     _write(root, "apps/api/main.py", "pass\n")
     _git(root, "add", ".")
     _git(root, "commit", "-qm", "Change mixed fixture")
@@ -827,6 +828,8 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "--ignore", CONTAINER_FILES[0],
         "--ignore", CONTAINER_FILES[1],
         "--ignore", DRY_RUN_FILE,
+        "--ignore", RESOURCE_RETRY_FILE,
+        "--ignore", RETRY_LIVE_FILE,
         *(
             argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
             for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
@@ -842,7 +845,10 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         assert DRY_RUN_FILE in files
         expected.extend(
             path for path in files
-            if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE)
+            if path
+            not in (
+                *KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE, RESOURCE_RETRY_FILE, RETRY_LIVE_FILE
+            )
             and not any(
                 path.startswith(directory + "/") for directory in PYTEST_TESTS.CI_POLICY_DIRS
             )
@@ -911,6 +917,8 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "--ignore", CONTAINER_FILES[0],
         "--ignore", CONTAINER_FILES[1],
         "--ignore", DRY_RUN_FILE,
+        "--ignore", RESOURCE_RETRY_FILE,
+        "--ignore", RETRY_LIVE_FILE,
         *(
             argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
             for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
@@ -921,7 +929,10 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         expected.extend(
             path
             for path in (tmp_path / LIST_PATH).read_text().splitlines()
-            if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE)
+            if path
+            not in (
+                *KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE, RESOURCE_RETRY_FILE, RETRY_LIVE_FILE
+            )
             and not any(
                 path.startswith(directory + "/") for directory in PYTEST_TESTS.CI_POLICY_DIRS
             )

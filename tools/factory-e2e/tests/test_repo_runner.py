@@ -40,7 +40,7 @@ FIXTURES = ROOT / "fixtures" / "repo-runner"
 REPO_X = "acme-corp/repo-x"
 REPO_Y = "acme-corp/repo-y"
 REPO_U = "acme-corp/repo-u"
-CONTEXT = "k8-scratch"
+CONTEXT = "scratch-cluster"
 THREAD_X = "thread-x"
 THREAD_Y = "thread-y"
 THREAD_U = "thread-u"
@@ -280,7 +280,7 @@ def test_module_contract_constants() -> None:
 # --------------------------------------------------------------------------
 
 CONTEXT_REFUSAL = (
-    "repo-runner requires an explicit --context (the throwaway cluster, for example k8-scratch)"
+    "repo-runner requires an explicit --context <context> for a throwaway cluster"
 )
 
 
@@ -1044,8 +1044,8 @@ def test_the_live_unpinned_stale_base_reply_is_a_base_mismatch() -> None:
         f"runner {_digest('6')}, not this installation's unpinned runner image (stale_base); "
         "pin agentSandbox.runner.digest in this installation's release values first, then "
         f"rebuild and rebind it with `curie cluster factory --repo-runner {REPO_X}=<spec> "
-        "--registry <registry> --namespace <namespace> --release <release> --context "
-        "<context>`; use a repository runner spec containing its retained tools, probes and "
+        "--registry <registry> --namespace <namespace> --release <release> --context <context>`; "
+        "use a repository runner spec containing its retained tools, probes and "
         "Dockerfile declaration. An operator has to make that change."
     )
     outcome = _reply_outcome(THREAD_X, reply)

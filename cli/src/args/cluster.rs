@@ -30,6 +30,35 @@ pub(crate) enum ClusterHookAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read or rotate the targetless wake key for one named webhook.
+    #[command(
+        subcommand_precedence_over_arg = true,
+        subcommand_negates_reqs = true,
+        override_usage = "curie cluster hook wake-key [OPTIONS] <AGENT> <NAME>\n       curie cluster hook wake-key rotate [OPTIONS] <AGENT> <NAME>"
+    )]
+    WakeKey {
+        #[command(subcommand)]
+        command: Option<ClusterWakeKeyCommand>,
+        /// Agent name or id.
+        agent: Option<String>,
+        /// Trigger name on the in-force bundle.
+        name: Option<String>,
+        /// Print the route and the word redacted, and exit without making a request.
+        #[arg(long, global = true)]
+        dry_run: bool,
+    },
+}
+
+/// `cluster hook wake-key rotate`.
+#[derive(Subcommand)]
+pub(crate) enum ClusterWakeKeyCommand {
+    /// Rotate the wake key. The new secret is not printed.
+    Rotate {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -54,12 +83,134 @@ pub(crate) enum ClusterConsoleAction {
     },
 }
 
+/// The connection and session flags every `cluster subscription` verb shares.
+/// The caller's Console session cookie is the only credential: there is no
+/// `--api-key`, and the release's platform key is never read.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SubscriptionSession {
+    /// Private file (mode 0600 or stricter) holding only the value of your
+    /// Console session cookie, __Host-curie_console_session.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) session_file: PathBuf,
+    /// Platform API base URL. Omit to reach the release API over loopback. A
+    /// direct URL must use HTTPS unless it is loopback.
+    #[arg(long, env = "CURIE_API_URL")]
+    pub(crate) api_url: Option<String>,
+    /// Kubernetes namespace of the release. Default: curie.
+    #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+    pub(crate) namespace: String,
+    /// Helm release name. Default: curie.
+    #[arg(long, default_value = "curie")]
+    pub(crate) release: String,
+    /// Validate the files and print the request plan without making a request.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+/// The grant file an enroll, replace or reconnect sends.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SubscriptionTokenFile {
+    /// Private file (mode 0600 or stricter) holding only the token printed by
+    /// `claude setup-token`. One trailing newline is ignored.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) token_file: PathBuf,
+}
+
+/// The compare-and-set version a replace, reconnect or disconnect writes at.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SubscriptionExpectedVersion {
+    /// Enrollment version to change, as `status` reports it. Omit to read the
+    /// current version first.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) expected_version: Option<i64>,
+}
+
+/// Subcommands of `curie cluster subscription`.
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ClusterSubscriptionAction {
+    /// Show your personal Claude enrollment: state, generation, version and
+    /// pending teardown.
+    Status {
+        #[command(flatten)]
+        session: SubscriptionSession,
+    },
+    /// Enroll a personal Claude grant for the first time (generation 1).
+    Enroll {
+        #[command(flatten)]
+        session: SubscriptionSession,
+        #[command(flatten)]
+        token: SubscriptionTokenFile,
+    },
+    /// Replace the active grant. Runtimes using the old grant are stopped.
+    Replace {
+        #[command(flatten)]
+        session: SubscriptionSession,
+        #[command(flatten)]
+        token: SubscriptionTokenFile,
+        #[command(flatten)]
+        expected: SubscriptionExpectedVersion,
+    },
+    /// Reconnect a disconnected enrollment with a new grant.
+    Reconnect {
+        #[command(flatten)]
+        session: SubscriptionSession,
+        #[command(flatten)]
+        token: SubscriptionTokenFile,
+        #[command(flatten)]
+        expected: SubscriptionExpectedVersion,
+    },
+    /// Disconnect the active grant and stop its runtimes. This does not revoke
+    /// the grant at the provider.
+    Disconnect {
+        #[command(flatten)]
+        session: SubscriptionSession,
+        #[command(flatten)]
+        expected: SubscriptionExpectedVersion,
+    },
+}
+
+impl ClusterSubscriptionAction {
+    pub(crate) fn session(&self) -> &SubscriptionSession {
+        match self {
+            Self::Status { session }
+            | Self::Enroll { session, .. }
+            | Self::Replace { session, .. }
+            | Self::Reconnect { session, .. }
+            | Self::Disconnect { session, .. } => session,
+        }
+    }
+
+    pub(crate) fn session_mut(&mut self) -> &mut SubscriptionSession {
+        match self {
+            Self::Status { session }
+            | Self::Enroll { session, .. }
+            | Self::Replace { session, .. }
+            | Self::Reconnect { session, .. }
+            | Self::Disconnect { session, .. } => session,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ClusterAction {
     /// Bootstrap access to the Curie Console.
     Console {
         #[command(subcommand)]
         action: ClusterConsoleAction,
+    },
+    /// Enroll, replace, reconnect or disconnect your own personal Claude grant,
+    /// authenticated by your Console session. The token is read from a private
+    /// file and is never printed.
+    Subscription {
+        #[command(subcommand)]
+        action: ClusterSubscriptionAction,
+    },
+    /// Manage your own coding instructions using a Console principal session.
+    /// The content reaches the model provider and must not contain credentials.
+    /// The response reports whether this deployment applies them to factory runs.
+    CodingInstructions {
+        #[command(subcommand)]
+        action: ClusterCodingInstructionsAction,
     },
     /// Report value paths that differ between a release and pending Helm files.
     /// A nonempty report is advisory and exits successfully.
@@ -1057,6 +1208,45 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Adopt, inspect, replace or retire a tenant HTTP identity authority.
+    IdentityAuthority {
+        #[arg(value_parser = ["list", "get", "adopt", "replace", "retire"])]
+        action: String,
+        #[arg(long, value_name = "UUID", required_if_eq_any = [
+            ("action", "get"), ("action", "adopt"), ("action", "replace"), ("action", "retire")
+        ])]
+        tenant: Option<uuid::Uuid>,
+        /// Mutation JSON with request_id and expected versions. Never a literal bearer.
+        #[arg(long, required_if_eq_any = [
+            ("action", "adopt"), ("action", "replace"), ("action", "retire")
+        ])]
+        apply: Option<std::path::PathBuf>,
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Set, inspect or remove issuer group filters for an agent role.
+    RoleFilter {
+        #[arg(value_parser = ["list", "set", "remove"])]
+        action: String,
+        #[arg(long)]
+        tenant: uuid::Uuid,
+        #[arg(long)]
+        agent: uuid::Uuid,
+        #[arg(long, value_parser = ["invocation", "approver"],
+            required_if_eq_any = [("action", "set"), ("action", "remove")])]
+        role: Option<String>,
+        /// Mutation JSON with request_id, expected_version and groups for set.
+        #[arg(long, required_if_eq_any = [("action", "set"), ("action", "remove")])]
+        apply: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Inspect tenant identities or apply IdP configuration, namespace or team JSON.
     /// Writes use the API's expected-version contract; links and people are read-only.
     Directory {
@@ -1163,11 +1353,35 @@ pub(crate) enum ClusterAction {
         #[arg(value_name = "ID")]
         id: Option<String>,
         /// Scope to one agent (name or id).
-        #[arg(long, value_name = "NAME_OR_ID")]
+        #[arg(long, value_name = "NAME_OR_ID", conflicts_with = "rerun")]
         agent: Option<String>,
+        /// Operator retry of the work item's failed request
+        /// (`POST /work-items/{id}/retry`). Requires the ID, --request-id,
+        /// --expected-version and --reason, and --yes for a real call.
+        #[arg(long)]
+        rerun: bool,
+        /// Idempotency key (a UUID) for --rerun; replaying it returns the
+        /// stored result.
+        #[arg(long, value_name = "UUID", requires = "rerun")]
+        request_id: Option<String>,
+        /// The work item version you read (--rerun refuses when it moved).
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "rerun",
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        expected_version: Option<u64>,
+        /// Why the operator reruns it, 1 to 500 characters (--rerun).
+        #[arg(long, value_name = "TEXT", requires = "rerun")]
+        reason: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
+        /// Confirm a real --rerun; without it the call is refused.
+        #[arg(long, requires = "rerun")]
+        yes: bool,
         /// Print what would be requested and exit without making a request.
+        /// With --rerun, ask the API for the exact plan and write nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1329,5 +1543,9 @@ pub(crate) enum ClusterAction {
         clear_routes: bool,
         #[command(flatten)]
         recovery: ApprovalRecoveryArgs,
+        #[command(flatten)]
+        routes_version: ApprovalRoutesVersionArgs,
+        #[command(flatten)]
+        requester: RequesterIdentityArgs,
     },
 }

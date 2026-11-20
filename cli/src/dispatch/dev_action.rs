@@ -77,6 +77,14 @@ pub(super) async fn run(action: DevAction) -> Result<()> {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             commands::dev_script("cli/scripts/oidc-e2e.sh", &args).await
         }
+        DevAction::ApprovalScheduleE2e { args } => {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            commands::dev_script("cli/scripts/approval-schedule-e2e.sh", &args).await
+        }
+        DevAction::IdentityE2e { args } => {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            commands::dev_script("cli/scripts/identity-e2e.sh", &args).await
+        }
         DevAction::GithubStub { args } => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             commands::dev_script("cli/scripts/github-stub.sh", &args).await
@@ -87,14 +95,21 @@ pub(super) async fn run(action: DevAction) -> Result<()> {
             head,
             push,
         } => commands::dev_e2e_ci_selection(&path, base.as_deref(), head.as_deref(), push).await,
-        DevAction::ChartRuntimeE2e { force } => {
-            let args: &[&str] = if force { &["--force"] } else { &[] };
-            commands::dev_script("scripts/chart-runtime-e2e.sh", args).await
+        DevAction::ChartRuntimeE2e { context, force } => {
+            let mut args = vec!["--context", context.as_str()];
+            if force {
+                args.push("--force");
+            }
+            commands::dev_script("scripts/chart-runtime-e2e.sh", &args).await
+        }
+        DevAction::KubeContextCheck { self_test } => {
+            commands::dev_kube_context_check(self_test).await
         }
         DevAction::RecoveryDrill {
             surface,
             scenario,
             bound_seconds,
+            context,
             force,
         } => {
             let bound = bound_seconds.to_string();
@@ -106,6 +121,9 @@ pub(super) async fn run(action: DevAction) -> Result<()> {
                 "--bound-seconds",
                 bound.as_str(),
             ];
+            if let Some(context) = context.as_deref() {
+                args.extend(["--context", context]);
+            }
             if force {
                 args.push("--force");
             }

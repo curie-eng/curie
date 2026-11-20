@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,42 @@ ensure = load_module(SCRIPT, "ensure_release_images")
 generate = load_module(GENERATE, "generate_release_compose")
 
 
+def test_oidc_stack_uses_the_candidate_gateway_on_its_private_network(tmp_path: Path) -> None:
+    driver = load_module(REPO_ROOT / "tools/oidc-e2e/oidc_e2e.py", "oidc_e2e_image_check")
+    settings = driver.Settings(
+        project="acme-oidc",
+        api_port=28400,
+        ui_port=28480,
+        dex_port=25556,
+        image_tag="acme-candidate",
+        ui_image="ghcr.io/curie-eng/curie-ui:acme-candidate",
+        curie_bin=None,
+        workdir=tmp_path,
+    )
+    env = driver.Stack(settings)._env(driver.oidc_on(settings))
+    env["CURIE_LOCAL_GATEWAY_PORT"] = "38081"
+    config = subprocess.run(
+        [
+            "docker", "compose", "--profile", "core",
+            "-f", str(REPO_ROOT / "compose.dev.yaml"),
+            "-f", str(driver.COMPOSE_OVERLAY), "config", "--format", "json",
+        ],
+        env={**os.environ, **env},
+        text=True, capture_output=True, check=True,
+    )
+    services = json.loads(config.stdout)["services"]
+    for name in ("curie-channel-gateway", "curie-gateway-replay-perms"):
+        assert services[name]["image"] == "ghcr.io/curie-eng/curie-dispatcher:acme-candidate"
+    gateway = services["curie-channel-gateway"]
+    assert not gateway.get("network_mode")
+    assert set(gateway["networks"]) == {"default"}
+    assert not gateway.get("ports")
+    assert gateway["environment"]["CURIE_CHANNEL_GATEWAY_PORT"] == "8081"
+    assert services["curie-api"]["environment"]["CURIE_CHANNEL_GATEWAY_URL"] == (
+        "http://curie-channel-gateway:8081"
+    )
+
+
 def generated_compose() -> str:
     return generate.generate(
         (REPO_ROOT / "compose.dev.yaml").read_text(),
@@ -51,13 +88,16 @@ class TestImageListIsDerivedFromCompose:
         assert "curie-api" in names
         assert "curie-worker-local" in names
 
-    def test_full_without_slack_does_not_require_dispatcher(self) -> None:
-        images = ensure.curie_images_for_profiles(
-            generated_compose(), profiles=("full",)
-        )
+    @pytest.mark.parametrize("profile", ["core", "full"])
+    def test_base_profile_requires_gateway_image_without_slack(self, profile: str) -> None:
+        compose = generated_compose()
+        images = ensure.curie_images_for_profiles(compose, profiles=(profile,))
         names = {ensure.image_short_name(image) for image in images}
-        assert "curie-dispatcher" not in names
-        assert "curie-ui" in names
+        assert "curie-dispatcher" in names
+        assert ("curie-ui" in names) == (profile == "full")
+        services = yaml.safe_load(compose)["services"]
+        assert profile in services["curie-channel-gateway"]["profiles"]
+        assert services["curie-dispatcher"]["profiles"] == ["slack"]
 
     def test_every_listed_image_has_a_build_spec(self) -> None:
         images = ensure.required_release_images(

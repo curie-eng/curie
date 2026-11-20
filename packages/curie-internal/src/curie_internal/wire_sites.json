@@ -1,5 +1,9 @@
 {
   "producers": {
+    "apps/api/src/curie_api/approval_reminders.py:enqueue_reminder:1": {
+      "language": "python",
+      "purpose": "payload-less approval reminder side-field on the runs stream"
+    },
     "apps/api/src/curie_api/delivery.py:module:1": {
       "language": "lua",
       "purpose": "Guarded invocation enqueue with sealed context and transport identity"
@@ -52,7 +56,7 @@
       "language": "lua",
       "purpose": "Runs enqueue with a durable wake marker"
     },
-    "apps/dispatcher/src/curie_dispatcher/queue.py:enqueue:1": {
+    "packages/curie-internal/src/curie_internal/turn_queue.py:enqueue:1": {
       "language": "python",
       "purpose": "Runs enqueue after dispatcher placeholder publication"
     },
@@ -134,6 +138,10 @@
       "value": "curie:needs-human",
       "reason": "Accepted legacy factory state label, not a Valkey key"
     },
+    "apps/api/src/curie_api/hook_wake_signing.py:module:1": {
+      "value": "curie:hook-wake:v1",
+      "reason": "Webhook wake delivery reservation namespace, written with SET NX EX and a bounded TTL to dedupe signed deliveries"
+    },
     "apps/api/src/curie_api/identity_fence.py:module:1": {
       "value": "curie:identity:admission-fence",
       "reason": "Admission generation fence brackets identity authority mutations with pending and stable states"
@@ -142,7 +150,7 @@
       "value": "f'curie:publication-labels:{publication.id}'",
       "reason": "Successful per-publication pull request labeling marker with a 30-day TTL"
     },
-    "apps/dispatcher/src/curie_dispatcher/admission.py:module:1": {
+    "packages/channel-gateway/src/curie_channel_gateway/slack/admission.py:module:1": {
       "value": "curie:identity:admission-fence",
       "reason": "Admission cache reads the shared identity generation fence before reusing or storing decisions"
     },
@@ -280,6 +288,10 @@
     },
     "packages/curie-internal/src/curie_internal/keyspace.py:module:18": {
       "value": "curie:work-item:review-feedback",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:19": {
+      "value": "curie:slack-mention-receipt:",
       "reason": "Canonical shared internal wire key declaration"
     },
     "packages/curie-internal/src/curie_internal/keyspace.py:module:2": {

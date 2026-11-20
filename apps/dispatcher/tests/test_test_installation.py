@@ -22,10 +22,10 @@ from typing import Any
 
 import httpx
 import pytest
-from curie_dispatcher import preflight
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import SlackIdentityCredentials
-from curie_dispatcher.preflight import (
+from curie_channel_gateway.slack import preflight
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import SlackIdentityCredentials
+from curie_channel_gateway.slack.preflight import (
     SlackChannelPreflightError,
     check_slack_channel_capabilities,
 )
@@ -138,7 +138,7 @@ def test_a_malformed_driver_refuses_boot(drivers: object, fragment: str) -> None
 def test_run_main_refuses_boot_on_a_published_default_with_the_declaration_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     _set_run_env(monkeypatch)
     monkeypatch.setenv("CURIE_API_KEY", "curie-dev-key")
@@ -330,7 +330,7 @@ def test_run_main_preflight_refuses_the_authorized_identity_as_a_driver(
     driver: dict[str, str],
     refused: bool,
 ) -> None:
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     events: list[str] = []
 

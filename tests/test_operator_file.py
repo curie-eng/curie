@@ -6,6 +6,7 @@ Local temporary files only; Kubernetes Secret-volume custody is not qualified he
 
 from __future__ import annotations
 
+import base64
 import importlib
 import os
 from pathlib import Path
@@ -135,14 +136,14 @@ def test_decodes_only_canonical_32_byte_key_material() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-20: unpadded canonical base64url of 32 bytes."""
     module = api()
     material = bytes(range(32))
-    canonical = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+    canonical = base64.urlsafe_b64encode(material).decode().rstrip("=")
     assert module.decode_key_material(canonical) == material
     for invalid in (
         canonical + "=",
         canonical[:-1] + "9",
         canonical[:-1],
         canonical + "AA",
-        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh+",
+        canonical[:-1] + "+",
         " " + canonical,
         b"x" * 32,
         None,

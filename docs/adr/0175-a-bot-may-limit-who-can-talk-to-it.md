@@ -180,7 +180,7 @@ fixed by editing the list.
 5. `apps/dispatcher`: an admission client and cache; the call in `handlers.py`
    after `relevance.classify` and before `claim_event`; the two drop reasons in
    `relevance.py`.
-6. `apps/mail-adapter/src/curie_mail_adapter/adapter.py`: 403 is final.
+6. `packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py`: 403 is final.
 7. `cli/src/main.rs` and `cli/src/commands.rs`: a `curie` subcommand to set,
    show and clear a list.
 8. `docs/interfaces/channel-ingress/INTERFACE.md` and

@@ -67,6 +67,40 @@ def test_reply_update_edits_placeholder_and_posts_continuations(tmp_path: Path) 
     assert state.continuations("222", "9002") == []
 
 
+def test_wire_13_replace_and_audience_are_refused_before_discord_mutation(
+    tmp_path: Path,
+) -> None:
+    port = FakeDiscord()
+    state = DiscordState(tmp_path / "state.sqlite3")
+    service = DiscordReplyService(port, state)
+    replace = ReplyUpdate(
+        version="1.3",
+        event="reply.update",
+        target=target(),
+        message=OutboundMessage(
+            version="1.0", text="replacement body", header="Replacement heading"
+        ),
+        message_mode="replace",
+    )
+    audience = ReplyPost(
+        version="1.3",
+        event="reply.post",
+        target=target(),
+        message=OutboundMessage(version="1.0", text="only you can see this"),
+        requested_by="U0EXAMPLE1",
+        audience_user="U0EXAMPLE1",
+    )
+
+    with pytest.raises(ValueError, match="reply wire 1.3 replace edit is not supported"):
+        asyncio.run(service.deliver(replace))
+    with pytest.raises(ValueError, match="reply wire 1.3 audience post is not supported"):
+        asyncio.run(service.deliver(audience))
+
+    assert port.edits == []
+    assert port.posts == []
+    assert port.deletes == []
+
+
 def test_verbatim_reply_update_is_refused_before_state_or_discord_mutation(
     tmp_path: Path,
 ) -> None:
@@ -118,18 +152,22 @@ def test_status_is_noop_and_post_uses_text_fallback(tmp_path: Path) -> None:
     state = DiscordState(tmp_path / "state.sqlite3")
     service = DiscordReplyService(port, state)
 
-    status = asyncio.run(service.deliver(
-        TurnStatus(version="1.0", event="turn.status", target=target(), status="working")
-    ))
-    posted = asyncio.run(service.deliver(
-        ReplyPost(
-            version="1.0",
-            event="reply.post",
-            target=target(),
-            message=OutboundMessage(version="1.0", text="approve in the Curie CLI"),
-            requested_by="Ada",
+    status = asyncio.run(
+        service.deliver(
+            TurnStatus(version="1.0", event="turn.status", target=target(), status="working")
         )
-    ))
+    )
+    posted = asyncio.run(
+        service.deliver(
+            ReplyPost(
+                version="1.0",
+                event="reply.post",
+                target=target(),
+                message=OutboundMessage(version="1.0", text="approve in the Curie CLI"),
+                requested_by="Ada",
+            )
+        )
+    )
 
     assert status.ref is None
     assert posted.ref == "posted-1"

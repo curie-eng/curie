@@ -364,6 +364,7 @@ mod tests {
             version: v(),
             message: "boom".into(),
             classification: Some("budget".into()),
+            retry_condition: None,
         };
         // Tool note and side-effect flag are diagnostics -> Note (stderr).
         assert!(matches!(printer.part_for(&note), Some(TurnPart::Note(_))));

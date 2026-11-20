@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 import enum
+import hashlib
+import re
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -101,6 +103,18 @@ class Actor:
 
     def __post_init__(self) -> None:
         _require_text("Actor", id=self.id, login=self.login)
+
+
+@dataclass(frozen=True)
+class TrackerComment:
+    """Comment content and provenance read by a tracker, before facts authorization."""
+
+    id: int
+    issue: TrackerIssueRef
+    body: str
+    actor: Actor | None
+    via_app: bool
+    updated_at: datetime | None
 
 
 class PullRequestState(enum.StrEnum):
@@ -217,6 +231,9 @@ class Commit:
     sha: str
     parents: tuple[str, ...]
     message: str
+    # The commit's tree id. Only the GitHub `read_commit` fills it; every
+    # other adapter, and a GitHub payload without one, leaves it None.
+    tree: str | None = None
 
 
 ReplyKind = Literal["issue", "pull_request", "review_thread"]
@@ -554,14 +571,18 @@ class Disposition(enum.StrEnum):
     ADMIT = "admit"
     CANCEL = "cancel"
     MENTION = "mention"
+    ANSWER = "answer"
 
 
 @dataclass(frozen=True)
 class MarkedNotice:
-    """One marking on a tracker issue: a label applied or removed, or a mention.
+    """One marking on a tracker issue: a label applied or removed, a mention,
+    or an answer (a person's comment on an issue with a factory question,
+    mention or not; never an admission or a cancellation).
 
     ``event_id`` is the tracker's immutable id for the event (a GitHub timeline
-    event id, a webhook delivery id, or a comment id for a mention). ``cursor``
+    event id, a webhook delivery id, or a comment id for a mention or an
+    answer; GitLab namespaces a note as ``note:<id>``). ``cursor``
     is the opaque poll position just after this notice. ``occurred_at`` is when
     the tracker says the event happened, or None when it reported no usable
     time; admission treats None as unknown and decides fail-closed (#4629).
@@ -574,6 +595,21 @@ class MarkedNotice:
     disposition: Disposition
     cursor: str
     occurred_at: datetime | None
+
+
+@dataclass(frozen=True)
+class SourceContent:
+    """An issue's own title and description, as the tracker stores them now
+    (ADR 0277 decision 4, #5586).
+
+    Never comments, labels or rendered markdown: a new comment, including the
+    factory's own status and result comments, leaves it unchanged. A tracker
+    whose description is structured (Jira's document format) carries its
+    canonical JSON text in ``body``.
+    """
+
+    title: str
+    body: str
 
 
 @dataclass(frozen=True)
@@ -623,15 +659,129 @@ class FeedbackPage:
 
 
 @dataclass(frozen=True)
+class EvidenceFile:
+    """One file `CodeHost.store_evidence` hosts: a relative path, its bytes and
+    their lowercase hex sha256. The bytes never appear in a repr."""
+
+    path: str
+    content: bytes = field(repr=False)
+    sha256: str
+
+
+@dataclass(frozen=True)
+class StoredEvidence:
+    """Where `CodeHost.store_evidence` put the files: the ref it created or
+    moved, the commit it names, and each file path's image URL at that commit."""
+
+    ref: str
+    commit_sha: str
+    urls: Mapping[str, str]
+
+
+@dataclass(frozen=True)
 class MarkedComment:
-    """A status comment the adapter's own identity wrote, carrying a marker."""
+    """A status comment the adapter's own identity wrote, carrying a marker.
+
+    ``created_at`` is the comment's creation time on the tracker's own clock,
+    when the tracker reported it; never part of equality.
+    """
 
     id: str
     target: ReplyTarget
     body: str
+    created_at: datetime | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
 class UpsertResult:
     comment: MarkedComment
     written: bool
+
+
+# Linked output issues (ADR 0277, `Tracker.create_linked_issue`).
+#
+# The platform derives one output identity per source execution request and
+# hands it in; the core owns the marker text built from it, and each adapter
+# decides how to embed that marker in an issue body. Every adapter composes
+# the body with `linked_issue_body` and matches with `ends_with_marker`, so the
+# rule below holds on every tracker.
+
+OUTPUT_IDENTITY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+LINKED_ISSUE_MARKER_PREFIX = "curie-linked-issue:"
+
+
+def valid_output_identity(value: str) -> str:
+    """Return ``value``; ValueError unless it fullmatches OUTPUT_IDENTITY_PATTERN.
+
+    The pattern admits no whitespace and no angle bracket, so the marker it
+    builds cannot close an HTML comment early or span two lines.
+    """
+
+    if not isinstance(value, str) or OUTPUT_IDENTITY_PATTERN.fullmatch(value) is None:
+        raise ValueError("an output identity is 1 to 128 of [A-Za-z0-9._:-], starting alphanumeric")
+    return value
+
+
+def linked_issue_marker(output_identity: str) -> str:
+    """The core-owned marker an output issue carries: ``curie-linked-issue:<id>``.
+
+    ValueError for an invalid ``output_identity`` (`valid_output_identity`).
+    """
+
+    return f"{LINKED_ISSUE_MARKER_PREFIX}{valid_output_identity(output_identity)}"
+
+
+def linked_issue_body(body: str, *, related: str, embedded: str) -> str:
+    """The exact body an adapter sends for a linked output issue.
+
+    ``body`` with CRLF folded to LF and trailing newlines dropped, a blank
+    line, the related-source line ``related``, a blank line, then the
+    adapter's embedded marker ``embedded`` as the last line, ending in one
+    newline. The related-source line references the source and never closes
+    it.
+    """
+
+    text = body.replace("\r\n", "\n").rstrip("\n")
+    return f"{text}\n\n{related}\n\n{embedded}\n"
+
+
+def ends_with_marker(body: str | None, embedded: str) -> bool:
+    """True when the last non-empty line of ``body`` is exactly ``embedded``.
+
+    Surrounding whitespace on that line is ignored (a tracker may store CRLF).
+    A marker planted anywhere earlier, for example by model text inside the
+    body, never matches, so one output cannot claim another's issue.
+    """
+
+    if not body:
+        return False
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == embedded
+
+
+def body_sha256(body: str) -> str:
+    """The lowercase hex SHA-256 of ``body`` encoded as UTF-8."""
+
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class LinkedIssue:
+    """What `Tracker.create_linked_issue` created or reconciled to.
+
+    ``issue`` is the output issue in the source's own scope and ``url`` its
+    web link. ``labels`` are its label names as read back now.
+    ``body_sha256`` is the SHA-256 of its body as read back from the tracker
+    now; ``sent_body_sha256`` is the SHA-256 of the exact body this adapter
+    composes for these inputs (`linked_issue_body`). A caller records delivery
+    only when the two are equal. ``created`` is True only when this call's
+    create request was answered as written; a reconciled issue, including
+    one an unanswered create of this same call may have written, is False.
+    """
+
+    issue: TrackerIssueRef
+    url: str
+    labels: frozenset[str]
+    body_sha256: str
+    sent_body_sha256: str
+    created: bool

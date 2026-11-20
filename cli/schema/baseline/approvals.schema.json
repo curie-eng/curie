@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v2.4.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v2.6.json",
   "title": "curie <tier> approvals --json",
-  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority. Administrative recovery (#2753) adds two further shapes: `identity_report`, the installation-wide report of approval identity FACTS (`facts`, a string array per row) plus the `declarations` skeleton, forwarded verbatim from the API so an unknown field still reaches the operator; and `recovered`, one approval administratively rejected under the recovery grant.",
+  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority. Administrative recovery (#2753) adds two further shapes: `identity_report`, the installation-wide report of approval identity FACTS (`facts`, a string array per row) plus the `declarations` skeleton, forwarded verbatim from the API so an unknown field still reaches the operator; and `recovered`, one approval administratively rejected under the recovery grant. The connector requester identity readback (ADR 0270 decision 1) adds one more: the agent's name and id, whether its hosted connector calls carry the verified requester (`connector_requester_identity`), and the version its next compare-and-set write must name (`connector_requester_identity_version`).",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -125,18 +125,52 @@
       "properties": {
         "resolution": {
           "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "type": "string"
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "address": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "address"
+              ]
             },
-            "address": {
-              "type": "string"
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "const": "requesting_surface"
+                }
+              },
+              "required": [
+                "mode"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "ADR 0272: the card is a DM to the one approver the approver_ticket selector picks, through the named Slack identity.",
+              "properties": {
+                "mode": {
+                  "const": "approver_dm"
+                },
+                "identity": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode",
+                "identity"
+              ]
             }
-          },
-          "required": [
-            "kind",
-            "address"
           ]
         },
         "notification": {
@@ -181,6 +215,122 @@
               }
             }
           }
+        },
+        "approver_ticket": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "description": "ADR 0271 approver-ticket selector registered on this route. Absent on a route with none. `ceiling.approver_role` is the server-owned pinned copy of the agent's approver role configuration at `approver_role_version`, opaque to the CLI.",
+          "properties": {
+            "connector": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "key_id": {
+              "type": "string"
+            },
+            "public_key": {
+              "type": "string"
+            },
+            "ceiling": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "approver_role_version": {
+                  "type": "integer"
+                },
+                "users": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "issuer": {
+                        "type": "string"
+                      },
+                      "subject": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "issuer",
+                      "subject"
+                    ]
+                  }
+                },
+                "approver_role": {
+                  "description": "Server-owned pinned approver role configuration, opaque JSON."
+                }
+              },
+              "required": [
+                "approver_role_version"
+              ]
+            }
+          },
+          "required": [
+            "connector",
+            "tool",
+            "key_id",
+            "public_key",
+            "ceiling"
+          ]
+        },
+        "separation": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "description": "ADR 0271 stored separation policy of the route. It may appear with or without an approver_ticket selector.",
+          "properties": {
+            "exclude_requester": {
+              "type": "boolean"
+            },
+            "exempt_group": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": false,
+              "description": "Identity-provider group whose members are exempt from the requester exclusion.",
+              "properties": {
+                "issuer": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "issuer",
+                "id"
+              ]
+            }
+          },
+          "required": [
+            "exclude_requester"
+          ]
+        },
+        "expires_in_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Route deadline in seconds, or null for none (ADR 0273). Absent when the route does not set one."
+        },
+        "remind_every_s": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Reminder interval in seconds, or null for none. Absent when the route does not set one."
         }
       },
       "required": [
@@ -435,6 +585,31 @@
       },
       "required": [
         "recovered"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "connector_requester_identity": {
+          "type": "boolean"
+        },
+        "connector_requester_identity_version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "agent",
+        "agent_id",
+        "connector_requester_identity",
+        "connector_requester_identity_version"
       ]
     }
   ]

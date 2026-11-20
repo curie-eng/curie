@@ -26,13 +26,15 @@ from curie_api.schemas.deployments import WebhookResult
 
 from . import workitem_dispatch
 from .config import Settings
+from .factory_follow_up import with_pull_request_follow_up_marker
 from .factory_reply_target import feedback_url
-from .forges.hosts import factory_code_host_entry, factory_tracker, github_host
+from .factory_review_context import pull_request_body_context
+from .forges.hosts import factory_app_slug, factory_code_host_entry, factory_tracker, github_host
 from .forges.registry import forges_registry
 from .forges.trackers import reply_route
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget
 from .github_factory import lock_issue
-from .github_factory_events import mentions_login
+from .github_factory_events import mentions_factory
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import (
     FeedbackIgnored,
@@ -110,9 +112,7 @@ async def _owner(
     return row[0], row[1]
 
 
-async def factory_owns(
-    session: AsyncSession, settings: Settings, event: str, payload: Any
-) -> bool:
+async def factory_owns(session: AsyncSession, settings: Settings, event: str, payload: Any) -> bool:
     """True when a WorkItem owns the lineage for the payload's pull request."""
 
     claimed = _payload_pull_request(event, payload)
@@ -148,14 +148,21 @@ def _reply_target(feedback: UnverifiedFeedback, work_item: WorkItem) -> ReplyTar
     return ReplyTarget.on_pull_request(pull_request)
 
 
-def _objective(feedback: UnverifiedFeedback, url: str) -> str:
+def _objective(
+    feedback: UnverifiedFeedback, url: str, publication_context: dict[str, str | bool]
+) -> str:
     # The feedback URL opens the objective for the agent's benefit only; the
     # reply target is stored typed on the request.
     provenance = feedback_provenance(feedback)
-    return (
+    provenance.update(publication_context)
+    return with_pull_request_follow_up_marker(
         f"{url}\n\n"
         "Human GitHub review feedback on this work item's pull request follows as JSON. "
-        "Use its body as the reviewer's requested changes and revise the same pull request.\n"
+        "Answer from the pull request body's Decisions section and the current diff first. "
+        "Start the revision pipeline only when the comment asks for a change. "
+        "The feedback may ask a question or request a change. Answer questions directly and "
+        "revise the same pull request when a change is needed. The pull_request_body, when "
+        "present, records the last successfully published description.\n"
         + json.dumps(provenance, ensure_ascii=False)
     )
 
@@ -199,7 +206,11 @@ async def admit_parsed_feedback(
     """
 
     registry = forges_registry(settings)
-    if not mentions_login(feedback.body, factory_tracker(registry).config.mention):
+    if not mentions_factory(
+        feedback.body,
+        factory_tracker(registry).config.mention,
+        await factory_app_slug(registry),
+    ):
         raise FeedbackIgnored("ordinary_comment")
     if not repository_is_allowed(feedback.repo_full_name, settings.github_repo_allowlist):
         raise FeedbackIgnored("repository_not_allowed")
@@ -267,7 +278,7 @@ async def admit_parsed_feedback(
         raise FeedbackIgnored("work_item_cancelled")
     work_item = current_item
     url = _feedback_url(feedback, settings, work_item.repository_path)
-    objective = _objective(feedback, url)
+    objective = _objective(feedback, url, await pull_request_body_context(session, work_item))
     if len(objective) > _MAX_OBJECTIVE:
         raise FeedbackIgnored("feedback_too_large")
     kind, address, conversation = reply_route(
@@ -286,6 +297,11 @@ async def admit_parsed_feedback(
         request_id=uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id),
         reply_target=_reply_target(feedback, work_item),
         reply_url=url,
+        # The installation's mode and never an owner, as tracker ingress does: a
+        # personal installation refuses a service WorkItem, and a personal
+        # WorkItem's revision copies its locked tuple; a reviewer is not an
+        # owner (#5378).
+        model_auth_mode=settings.factory_model_auth_mode,
     )
     # Keep dispatch commits inside savepoints so the caller's issue lock remains
     # held until admission and delivery settlement commit together.

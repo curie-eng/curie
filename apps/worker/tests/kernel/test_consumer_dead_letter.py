@@ -46,9 +46,9 @@ from typing import Any
 import curie_worker.consumer as consumer_module
 import pytest
 from aci_protocol import Final, QueuedTurn, SessionStatus
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.dead_letter_alert import install_dead_letter_alerting
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from pydantic import ValidationError
@@ -129,6 +129,7 @@ def test_permanently_failing_entry_is_dead_lettered_at_the_cap_and_group_progres
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -176,7 +177,7 @@ def test_permanently_failing_entry_is_dead_lettered_at_the_cap_and_group_progres
                 assert dl["dl_dead_lettered_at"]
                 # The original entry fields survive so a human can inspect/replay.
                 # The frozen #7 wire encoding is a single JSON blob under
-                # "payload" (curie_dispatcher.queue.to_stream_fields), not
+                # "payload" (curie_internal.turn_queue.to_stream_fields), not
                 # flat top-level fields, so decode it before asserting.
                 payload = json.loads(dl["payload"])
                 assert payload["event_id"] == "poison"
@@ -246,6 +247,7 @@ def test_transient_failure_reclaims_and_acks_without_dead_lettering(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -306,6 +308,7 @@ def test_unparseable_entry_is_dead_lettered_not_silently_dropped(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -365,6 +368,7 @@ def test_cap_binds_beyond_the_first_pending_page(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -435,6 +439,7 @@ def test_a_failing_dead_letter_does_not_kill_the_rest_of_the_tick(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -543,6 +548,7 @@ def test_graveyard_is_bounded_by_dead_letter_maxlen(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -599,6 +605,7 @@ def test_unparseable_entry_records_its_real_reclaimed_delivery_count(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -656,6 +663,7 @@ def test_unparseable_entry_cannot_clobber_or_forge_its_own_dl_metadata(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -721,6 +729,7 @@ def test_over_cap_entry_whose_message_was_trimmed_is_dead_lettered_and_acked(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -797,6 +806,7 @@ def test_dead_letter_is_logged_loudly_with_the_operational_facts(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -857,6 +867,7 @@ def test_dead_letter_emits_one_retention_independent_critical_alert(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1057,7 +1068,8 @@ def test_a_live_lease_holds_off_the_cap_and_releasing_it_dead_letters_normally(
         ) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1188,7 +1200,8 @@ def test_the_maintenance_scan_refuses_to_dead_letter_once_another_owner_acquires
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1249,7 +1262,8 @@ def test_the_maintenance_scan_dead_letters_normally_when_nobody_owns_the_entry(
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1353,7 +1367,8 @@ def test_a_failed_settle_makes_the_dead_letter_report_failure_not_a_clean_row(
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1451,7 +1466,8 @@ def test_a_failed_settle_after_the_ack_is_warned_about_and_the_turn_still_succee
             h.runner.default_script = [Final(text="answered", status=DONE)]
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1557,7 +1573,8 @@ def test_the_settle_split_survives_on_the_consumer_subclass_itself(
         redis=None,  # type: ignore[arg-type]
         kernel=None,  # type: ignore[arg-type]
         config=config,
-        leases=store,  # type: ignore[arg-type]
+        leases=store,  # type: ignore[arg-type],
+        reminders=refuse_unconfigured_reminder,
     )
     entry_id = "1700000000000-0"
 
@@ -1627,7 +1644,8 @@ def test_the_maintenance_scan_fails_closed_when_lease_liveness_is_unreadable(
             )
             store = DeliveryLeaseStore(unreachable, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1681,7 +1699,8 @@ def test_a_handler_that_lost_its_lease_mid_flight_may_not_dead_letter(
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1743,7 +1762,8 @@ def test_a_handler_holding_a_healthy_lease_dead_letters_normally(
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1808,7 +1828,8 @@ def test_the_graveyard_write_precedes_the_ack_so_a_failed_write_leaves_it_pendin
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             dead = _dead_stream(h.config)

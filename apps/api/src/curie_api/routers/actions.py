@@ -61,6 +61,7 @@ from ..approval_auth import (
     authenticate_principal,
     principal_credentials_presented,
 )
+from ..approval_selection import canonical_route
 from ..approval_teams import approval_team_decision, team_restriction
 from ..approvers import ApproverSet, ApproverSetSelector, IdpTeamApprovers
 from ..auth import CONSOLE_SESSION_COOKIE, require_api_key, verify_internal_worker_token
@@ -320,7 +321,14 @@ async def _route_membership(
     *,
     agent_id: uuid.UUID | None,
 ) -> UndoAuthorization:
-    """The same current IdP authority as the forward approval, plus narrowing."""
+    """The same current IdP authority as the forward approval, plus narrowing.
+
+    A canonical route (ADR 0271: a dynamic approval, or requester exclusion)
+    goes through the shared authorizer even without a team restriction, so its
+    refusal of every principal but the HTTP answer composition holds here too:
+    undo has no canonical identity facts, and a dynamic route's set judges
+    nobody on its own. @spec REQUEST-APPROVAL-5/6.
+    """
     binding = await crud_approvals.get_approval_route_binding(session, approval)
     team = await approval_team_decision(session, approval, principal, agent_id=agent_id)
     selected = approver_sets(approval, binding)
@@ -341,18 +349,20 @@ async def _route_membership(
             binding,
             approval_context(approval),
         )
-    if team.restricted:
-        selected = IdpTeamApprovers(
-            allowed=team.allowed,
-            reason=team.reason,
-            restriction=selected if team_restriction(approval, binding) else None,
-        )
+    if team.restricted or canonical_route(approval, binding):
+        if team.restricted:
+            selected = IdpTeamApprovers(
+                allowed=team.allowed,
+                reason=team.reason,
+                restriction=selected if team_restriction(approval, binding) else None,
+            )
         name, verdict = await authorize_approval(
             approval,
             principal.subject,
             principal.actor_channel,
             approver_set=selected,
             principal_kind=principal.kind,
+            route_binding=binding,
         )
         return UndoAuthorization(
             name, verdict.allowed, verdict.reason, team, binding, approval_context(approval)

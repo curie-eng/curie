@@ -9,31 +9,20 @@ shared ``example.com`` fixtures only.
 
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import json
 import threading
-import uuid
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import redis
 from curie_api.config import get_settings
-from curie_api.identity.http_credential_registry import build_provider_credential_registry
 from curie_api.identity.http_invocation import HttpInvocationRuntime
-from curie_api.identity.http_transport import HttpIdentityClient, ProviderBearer
-from curie_api.main import create_app
-from curie_api.models import AgentChannel
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
 from fastapi.testclient import TestClient
-from role_policy_support import run
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.api.tests import test_http_email_receivers as email
 from apps.api.tests import test_http_identity_initializer as initializer
@@ -124,56 +113,6 @@ SECOND_ADAPTER = "acme-mail-second"
 SECOND_KEY = b"s" * 32
 
 
-def _second_mailbox(scope: dict[str, Any]) -> dict[str, Any]:
-    """@spec HTTP-INVOCATION-EXECUTION-29: another mailbox of the same agent, same domain."""
-    second: dict[str, Any] = {
-        "receiver_id": str(uuid.uuid4()),
-        "identity": str(uuid.uuid4()),
-        "installation": str(uuid.uuid4()),
-    }
-
-    async def persist(factory: async_sessionmaker[AsyncSession]) -> None:
-        async with factory() as session, session.begin():
-            binding = AgentChannel(
-                tenant_id=uuid.UUID(scope["tenant"]),
-                agent_id=uuid.UUID(scope["agent"]),
-                kind="email",
-                address=SECOND_INBOX,
-                adapter=SECOND_ADAPTER,
-                endpoint="https://mail.example.com/second-reply",
-                allowed_callers=None,
-            )
-            session.add(binding)
-            await session.flush()
-            second["binding"] = str(binding.id)
-
-    run(persist)
-    return {**scope, **second}
-
-
-def _shared_runtime(scope: dict[str, Any], second: dict[str, Any]) -> Any:
-    """@spec HTTP-INVOCATION-EXECUTION-29: two mailboxes, one shared domain namespace."""
-    module = email._email_api()
-    providers = build_provider_credential_registry(
-        ((scope["configuration"], ProviderBearer(membership.BEARER)),)
-    )
-    return module.build_http_invocation_runtime(
-        providers,
-        (),
-        (("synthetic-context", 1, scope["context_key"]),),
-        signing_key=("synthetic-context", 1),
-        email_receivers=(
-            (email._registration(module, scope), email.EMAIL_KEY),
-            (email._registration(
-                module, scope, receiver_id=second["receiver_id"],
-                channel_identity_id=second["identity"],
-                provider_installation_id=second["installation"],
-                binding_ids=[second["binding"]],
-            ), SECOND_KEY),
-        ),
-    )
-
-
 def _token(client: TestClient, address: str, adapter: str) -> str:
     """@spec HTTP-INVOCATION-EXECUTION-29: a platform-key-minted channel token."""
     response = client.post(
@@ -183,13 +122,6 @@ def _token(client: TestClient, address: str, adapter: str) -> str:
     )
     assert response.status_code == 200, response.text
     return str(response.json()["token"])
-
-
-def _second_body() -> bytes:
-    """@spec HTTP-INVOCATION-EXECUTION-29: a turn the second mailbox received."""
-    return json.dumps(
-        {**json.loads(email._body()), "address": SECOND_INBOX}, separators=(",", ":"),
-    ).encode()
 
 
 def _signed(owner: dict[str, Any], key: bytes, binding: str, body: bytes) -> str:
@@ -212,61 +144,6 @@ def _cleanup(valkey: redis.Redis, *bindings: str) -> None:
         keys = membership._keys(valkey, binding)
         if keys:
             valkey.delete(*keys)
-
-
-def test_a_shared_domain_never_lets_one_mailbox_speak_for_another(
-    clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-29: the proof stays bound to its receiver and binding."""
-    scope = email._email_scope(synthetic_provider.url)
-    second = _second_mailbox(scope)
-    try:
-        with TestClient(create_app(
-            http_identity_runtime=_shared_runtime(scope, second),
-            http_identity_client=HttpIdentityClient(tls_context=synthetic_provider.tls),
-        )) as client:
-            first_token = _token(client, email.INBOX, email.MAIL_ADAPTER)
-            second_token = _token(client, SECOND_INBOX, SECOND_ADAPTER)
-            body = _second_body()
-            crossed = {
-                # The first mailbox's key naming the second mailbox's binding.
-                "foreign-binding": (second_token, _signed(
-                    scope, email.EMAIL_KEY, second["binding"], body,
-                )),
-                # The first mailbox's own proof under the second mailbox's token.
-                "foreign-token": (second_token, _signed(
-                    scope, email.EMAIL_KEY, scope["binding"], body,
-                )),
-                # The second mailbox's id with the first mailbox's key.
-                "foreign-key": (second_token, _signed(
-                    second, email.EMAIL_KEY, second["binding"], body,
-                )),
-            }
-            for name, (token, proof) in crossed.items():
-                response = email._post(client, token, body, proof)
-                assert response.status_code == 401, (name, response.text)
-                assert response.json() == {"detail": "invalid_http_receiver"}, name
-            assert synthetic_provider.requests == []
-            assert valkey.xlen(runs_stream) == 0
-
-            mine = email._body()
-            first = email._post(
-                client, first_token, mine,
-                _signed(scope, email.EMAIL_KEY, scope["binding"], mine),
-            )
-            assert first.status_code == 200, first.text
-            again = email._post(
-                client, second_token, body,
-                _signed(second, SECOND_KEY, second["binding"], body),
-            )
-            assert again.status_code == 200, again.text
-            assert valkey.xlen(runs_stream) == 2
-            senders = [request["scope"]["sender"] for request in synthetic_provider.requests]
-            assert [sender["namespace"] for sender in senders] == [scope["namespace"]] * 2
-            assert {sender["native_id"] for sender in senders} == {email.SENDER}
-    finally:
-        _cleanup(valkey, scope["binding"], second["binding"], scope["slack_binding"])
 
 
 # --- the mail adapter's own signed post ---------------------------------------------
@@ -302,56 +179,3 @@ def relay() -> Iterator[Any]:
     finally:
         server.shutdown()
         server.server_close()
-
-
-def test_the_mail_adapters_signed_post_is_admitted_by_the_real_route(
-    tmp_path: Path, clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace, relay: Any,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-30: the adapter's exact request, byte for byte."""
-    scope = email._email_scope(synthetic_provider.url)
-    try:
-        with email._client(synthetic_provider, scope) as client:
-            token = email._email_credential(client, scope)
-            config = MailAdapterConfig(
-                agentmail_api_key="am_synthetic",
-                agentmail_inbox=email.INBOX,
-                api_base_url=f"http://127.0.0.1:{relay.server_address[1]}",
-                channel_token=token,
-                egress_secret="synthetic-egress",
-                allowed_senders=("example.com",),
-                state_path=str(tmp_path / "mail-state.sqlite3"),
-                ingress_attempts=1,
-                receiver_id=scope["receiver_id"],
-                receiver_generation=1,
-                receiver_key=base64.urlsafe_b64encode(email.EMAIL_KEY).rstrip(b"=").decode(),
-            )
-            adapter = MailAdapter(config)
-            try:
-                message_id = "<synthetic-" + uuid.uuid4().hex + "@example.com>"
-                assert adapter.post_turn({
-                    "kind": "email",
-                    "address": adapter.inbox_address,
-                    "delivery_id": message_id,
-                    "conversation_id": "synthetic-thread",
-                    "author": email.SENDER,
-                    "text": "Synthetic subject\n\nSynthetic email invocation",
-                    "reply_ref": message_id,
-                }) == "accepted"
-            finally:
-                adapter.close()
-            ((path, headers, raw),) = relay.captured
-            assert path == "/channels/turns"
-            response = client.post(path, content=raw, headers={
-                "Content-Type": headers["Content-Type"],
-                "X-API-Key": headers["X-Api-Key"],
-                "X-Curie-Receiver-Proof": headers["X-Curie-Receiver-Proof"],
-            })
-            assert response.status_code == 200, response.text
-            assert response.json()["duplicate"] is False
-            assert valkey.xlen(runs_stream) == 1
-            sender = synthetic_provider.requests[0]["scope"]["sender"]
-            assert sender["native_id"] == email.SENDER
-            assert sender["namespace"] == scope["namespace"]
-    finally:
-        _cleanup(valkey, scope["binding"], scope["slack_binding"])

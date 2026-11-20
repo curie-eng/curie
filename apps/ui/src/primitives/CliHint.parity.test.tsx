@@ -18,6 +18,10 @@ const EXPECTED_COMMAND_IDS = [
   "cluster.observability.runs",
   "cluster.reset-thread",
   "cluster.status",
+  "cluster.subscription.disconnect",
+  "cluster.subscription.enroll",
+  "cluster.subscription.reconnect",
+  "cluster.subscription.replace",
   "cluster.work-items",
   "init",
   "local.console.login",
@@ -32,6 +36,7 @@ const EXPECTED_COMMAND_IDS = [
 const EXPECTED_NO_CLI_ACTION_IDS = [
   "behavior-packs-edit",
   "eval-matrix",
+  "github-account-link",
   "memory-delete",
   "memory-edit",
 ] as const satisfies readonly WiredActionId[];
@@ -308,6 +313,14 @@ describe("console/CLI parity registry (#280)", () => {
         `${discovered.location} must map ${discovered.id} to PARITY_TRACKING_ISSUE`,
       ).toBe(PARITY_TRACKING_ISSUE);
     }
+  });
+
+  it("records organization sign-in as a console gap tracked by issue 5559", () => {
+    const action = WIRED_ACTIONS.find((candidate) => candidate.id === "console-oidc-sign-in");
+    expect(action?.label).toBe("Sign in with your organization");
+    expect(action && "noCliEquivalent" in action.mapping ? action.mapping.noCliEquivalent : undefined).toBe(
+      "https://github.com/curie-eng/curie/issues/5559",
+    );
   });
 
   it("removes the issue scoped unrendered registry entries", () => {

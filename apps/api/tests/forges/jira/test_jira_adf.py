@@ -22,7 +22,7 @@ import pytest
 from forge_fakes.jira import JiraFake, JiraIssue, jira_tracker, ms_of, payload
 
 GOLDENS = Path(__file__).resolve().parent / "goldens"
-LATER = "_Later comments were not read._"
+EARLIER = "_Earlier comments were not read._"
 
 
 @pytest.fixture
@@ -43,7 +43,7 @@ def _recorded(fake: JiraFake) -> JiraIssue:
 
 
 @pytest.mark.anyio
-async def test_jira_adf_recorded_description_and_comments_match_the_golden() -> None:
+async def test_jira_adf_read_ticket_recorded_description_and_comments_match_the_golden() -> None:
     fake = JiraFake()
     issue = _recorded(fake)
     tracker = jira_tracker(fake)
@@ -52,6 +52,7 @@ async def test_jira_adf_recorded_description_and_comments_match_the_golden() -> 
 
     golden = (GOLDENS / "read_ticket.md").read_text()
     assert markdown.rstrip("\n") == golden.rstrip("\n")
+    assert EARLIER not in markdown
     assert fake.writes == 0
 
 
@@ -71,11 +72,13 @@ async def test_jira_adf_comments_are_read_oldest_first_across_pages() -> None:
     order = [line for line in markdown.splitlines() if line.startswith("Comment ")]
     assert order == [f"Comment {minute}" for minute in range(5)]
     assert markdown.startswith("# Ordered\n\nBody.")
-    assert LATER not in markdown
+    assert EARLIER not in markdown
 
 
 @pytest.mark.anyio
-async def test_jira_adf_reading_stops_at_100_comments_with_a_note() -> None:
+async def test_jira_adf_read_ticket_keeps_the_newest_100_comments_with_a_note() -> None:
+    """Past 100 comments the oldest is the one left out (#5789 decision 7)."""
+
     fake = JiraFake()
     reader = fake.add_user("712020:00000000-0000-4000-8000-000000000101", "Human 1")
     issue = fake.seed_issue("Busy ticket", "Body.")
@@ -86,10 +89,11 @@ async def test_jira_adf_reading_stops_at_100_comments_with_a_note() -> None:
     markdown = await tracker.read_ticket(fake.ref(issue))
 
     assert markdown.count("## Comment by Human 1 at ") == 100
-    assert "Comment number 000" in markdown
-    assert "Comment number 099" in markdown
-    assert "Comment number 100" not in markdown
-    assert markdown.rstrip("\n").endswith(LATER)
+    assert "Comment number 000" not in markdown
+    assert "Comment number 001" in markdown
+    assert "Comment number 100" in markdown
+    assert markdown.startswith(f"# Busy ticket\n\nBody.\n\n{EARLIER}\n\n## Comment by Human 1")
+    assert markdown.rstrip("\n").endswith("Comment number 100")
 
 
 @pytest.mark.anyio

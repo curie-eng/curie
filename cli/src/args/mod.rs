@@ -14,11 +14,13 @@ use curie::message;
 use curie::ui::ColorFlag;
 
 mod cluster;
+mod coding_instructions;
 mod dev;
 mod local;
 mod skill;
 
 pub(crate) use cluster::*;
+pub(crate) use coding_instructions::*;
 pub(crate) use dev::*;
 pub(crate) use local::*;
 pub(crate) use skill::*;
@@ -64,6 +66,70 @@ pub(crate) struct ApprovalRecoveryArgs {
     /// server as one act; the CLI never generates or decorates it.
     #[arg(long = "recovery-key", value_name = "KEY")]
     pub(crate) recovery_key: Option<String>,
+}
+
+/// The connector requester identity flag on `<tier> approvals` (ADR 0270
+/// decision 1). A separate object from gates, routes and pending records, so it
+/// combines with none of their flags.
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct RequesterIdentityArgs {
+    /// Show or set whether this agent's hosted connector calls carry the
+    /// verified human requester. `on` requires the tenant's HTTP identity
+    /// selection and an operator receiver registration listing one of the
+    /// agent's bindings. Experimental in this release: keep it off outside
+    /// test installs. When on, the agent's hosted connector caller tokens
+    /// carry the verified human requester. On a cluster install the connector
+    /// proxy verifies it and passes it to hosted connectors as
+    /// `X-Curie-Principal`; the local tier runs no caller proxy, so its
+    /// connectors never receive the requester. The worker replaces a sandbox
+    /// before serving a different requester, and a different person's message
+    /// that arrives during a live turn waits for that turn to end, for up to
+    /// the capacity wait budget (24 hours by default); a message still waiting
+    /// then ends without running. A person's turn runs for at
+    /// most the one-hour life of their connector credential, less the boot
+    /// grace and the sandbox claim time; a turn still working then is stopped
+    /// and reported as `requester-window`. Precondition: the api, the
+    /// worker and the agent's connector proxies must all run this release
+    /// (redeploy the agent if its connector proxies predate it); a partial
+    /// rollout refuses the agent's HTTP turns or connector calls.
+    #[arg(
+        long = "requester-identity",
+        value_name = "MODE",
+        value_enum,
+        conflicts_with_all = [
+            "gate", "clear", "list", "resolve", "reject", "note",
+            "mint_operator_principal", "mint_remediation_principal", "mint_console_login_code",
+            "route_resolution", "route_approvers", "routes_from", "list_routes", "clear_routes",
+            "report_identity", "recover", "reason", "recovery_key", "routes_expected_version",
+        ]
+    )]
+    pub(crate) requester_identity: Option<commands::RequesterIdentityMode>,
+    /// The connector requester identity version an on/off write compares
+    /// against, as `--requester-identity show` reports it. Omit to use the
+    /// version read from the agent just before the write.
+    #[arg(
+        long = "expected-version",
+        value_name = "N",
+        requires = "requester_identity",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) expected_version: Option<u64>,
+}
+
+/// The route-write compare-and-set version on `<tier> approvals` (ADR 0271).
+/// Valid only beside a route write flag; the command refuses it otherwise.
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct ApprovalRoutesVersionArgs {
+    /// The connector requester identity version a route write compares
+    /// against, as `--requester-identity show` reports it. Omit to use the
+    /// version read from the agent in the same command. Only valid with
+    /// --route-resolution, --route-approvers, --routes-from or --clear-routes.
+    #[arg(
+        long = "routes-expected-version",
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) routes_expected_version: Option<u64>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1004,6 +1070,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Migrate a protected worker process.json from v1 to v2 offline.
+    MigrateProtectedProcess {
+        /// Directory containing the stopped worker's process.json.
+        #[arg(long)]
+        runtime_dir: PathBuf,
+        /// Private v2 channel_gateway JSON object.
+        #[arg(long)]
+        gateway_config: PathBuf,
+    },
     /// Scaffold a keyless first reply, using a saved or environment model credential when available.
     Try {
         /// Keep the standard scaffold in ./curie-demo for normal skill commands.
@@ -1410,6 +1485,19 @@ pub(crate) enum AgentSkillsAction {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // Clap owns the existing wide quickstart arguments; the small skills verb shares this command group.
 pub(crate) enum FactoryAction {
+    /// Read the factory pull requests that record why a GitHub issue changed.
+    ///
+    /// ISSUE is owner/repo#number or a github.com issue URL. Login is GH_TOKEN,
+    /// then GITHUB_TOKEN, then `gh auth token`. This command never reads the
+    /// Curie platform key.
+    Explain {
+        /// GitHub issue, as owner/repo#number or a github.com issue URL.
+        reference: String,
+        /// GitHub API root. Any host other than api.github.com is passed to
+        /// `gh auth token --hostname`.
+        #[arg(long, default_value = "https://api.github.com")]
+        api_url: String,
+    },
     /// Install the local Software Factory preparation, review, and admin skills.
     Skills {
         #[command(subcommand)]
@@ -1555,6 +1643,23 @@ pub(crate) enum ExampleAction {
     DarkFactory {
         #[command(subcommand)]
         action: DarkFactoryAction,
+    },
+    /// Work with the factory-triage example bundle.
+    FactoryTriage {
+        #[command(subcommand)]
+        action: FactoryTriageAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum FactoryTriageAction {
+    /// Render an offline investigation bundle into a new or empty directory.
+    Render {
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// Another agent's implementation trigger label on the same repository.
+        #[arg(long, value_name = "LABEL")]
+        implementation_label: String,
     },
 }
 

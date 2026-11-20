@@ -16,10 +16,10 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.http_receiver import HttpReceiverRuntime
-from curie_dispatcher.identities import SlackIdentityCredentials
-from curie_dispatcher.preflight import PreflightedIdentity
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.http_receiver import HttpReceiverRuntime
+from curie_channel_gateway.slack.identities import SlackIdentityCredentials
+from curie_channel_gateway.slack.preflight import PreflightedIdentity
 from slack_sdk.web import WebClient
 
 from .conftest import _set_run_env, _TestTelemetry
@@ -38,7 +38,7 @@ BOT = "U0EXAMPLEBOT"
 
 def api() -> Any:
     """@spec HTTP-INVOCATION-EXECUTION-20: fail during execution, never collection."""
-    name = "curie_dispatcher.http_receiver_initializer"
+    name = "curie_channel_gateway.slack.http_receiver_initializer"
     try:
         module = importlib.import_module(name)
     except ModuleNotFoundError as exc:
@@ -235,7 +235,7 @@ def _run_main(
     monkeypatch: pytest.MonkeyPatch, directory: Path | None, auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-20: run main with recorded Slack/API seams."""
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     _set_run_env(monkeypatch)
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-default")

@@ -1,0 +1,6 @@
+dispatcher:
+  slack:
+    appTokenExistingSecret: acme-slack
+    appTokenExistingSecretKey: app
+    botTokenExistingSecret: acme-slack
+    botTokenExistingSecretKey: bot

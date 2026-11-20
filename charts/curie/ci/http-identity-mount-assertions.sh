@@ -11,7 +11,10 @@ import tempfile
 import yaml
 
 chart = pathlib.Path(sys.argv[1])
-base = {"dispatcher": {"slack": {"appToken": "xapp-example", "botToken": "xoxb-example"}}}
+base = {
+    "dispatcher": {"slack": {"appToken": "xapp-example", "botToken": "xoxb-example"}},
+    "channelGateway": {"tlsSecret": "acme-gateway-tls"},
+}
 API_SECRET = "acme-api-http-identity"
 RECEIVER_SECRET = "acme-dispatcher-http-receiver"
 API_DIR = "/var/run/curie/http-identity"

@@ -54,6 +54,11 @@
       "omissions": []
     },
     {
+      "struct": "WorkItemRetry",
+      "schema": "WorkItemRetryOut",
+      "omissions": []
+    },
+    {
       "struct": "WorkItemOutcome",
       "schema": "WorkItemOutcomeOut",
       "omissions": [
@@ -64,6 +69,26 @@
         {
           "field": "title",
           "why": "The console Factory view reads the issue title; the work-items verbs identify an item by repo and issue number, and #4102 keeps their --json output unchanged."
+        },
+        {
+          "field": "coding_instructions",
+          "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. Admission selection metadata is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "memory_rules",
+          "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. The learned rules pinned at admission (#5798) are exposed by the API and are outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "requester_principal_id",
+          "why": "cli/src/commands/work.rs reads requester display text and execution ownership. It does not consume the admission requester reference exposed by the API."
+        },
+        {
+          "field": "automatic_retries_used",
+          "why": "cli/src/commands/work.rs renders state, cause and publication. The WorkItem's used automatic retry allowance (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "automatic_retry_limit",
+          "why": "cli/src/commands/work.rs renders state, cause and publication. The automatic retry limit (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
         }
       ]
     },
@@ -98,12 +123,53 @@
       "omissions": []
     },
     {
+      "struct": "WorkItemCiObservation",
+      "schema": "WorkItemCiObservationOut",
+      "omissions": []
+    },
+    {
       "struct": "WorkItemRequest",
       "schema": "WorkItemRequestOut",
       "omissions": [
         {
           "field": "last_start_failure_detail",
           "why": "The CLI renders the previous start failure through the item's actionable_cause; no CLI path reads the raw request field."
+        },
+        {
+          "field": "coding_instructions_selection_id",
+          "why": "cli/src/commands/work.rs reports request lifecycle and deferral facts. The admission selection reference is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "coding_instructions_evidence",
+          "why": "cli/src/commands/work.rs does not apply or acknowledge coding instructions. Per-request selection evidence is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "memory_rules_evidence",
+          "why": "cli/src/commands/work.rs does not apply or acknowledge learned rules. Per-request learned rules evidence (#5798) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "retry_of_request_id",
+          "why": "cli/src/commands/work.rs renders request lifecycle and deferral facts. Automatic retry lineage (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "retry_kind",
+          "why": "cli/src/commands/work.rs renders the item's actionable_cause, which already says when a request is an automatic retry. The retry kind (ADR 0269) is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "dispatch_not_before",
+          "why": "The CLI renders a scheduled or blocked retry through the item's actionable_cause; no CLI path reads the raw dispatch time."
+        },
+        {
+          "field": "blocked_on",
+          "why": "The CLI renders a blocked retry's named condition through the item's actionable_cause; no CLI path reads the raw condition field."
+        },
+        {
+          "field": "retry_safety",
+          "why": "cli/src/commands/work.rs does not decide retries. The worker's side effect fact (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "resource_gate",
+          "why": "The CLI renders a blocked retry's named condition through the item's actionable_cause; the raised limit a resource gated retry waits for (#5427) is outside the versioned work-items/v2.2 JSON projection."
         }
       ]
     },
@@ -126,6 +192,10 @@
         {
           "field": "created_at",
           "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/channel only."
+        },
+        {
+          "field": "factory_slack_channel",
+          "why": "No CLI verb reads an agent's factory Slack progress channel; it is set through the agent API PATCH, so no agent response consumer reads it."
         }
       ]
     },
@@ -160,6 +230,56 @@
       "omissions": []
     },
     {
+      "struct": "ApproverTicketResponse",
+      "schema": "ApproverTicketOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverCeilingResponse",
+      "schema": "ApproverTicketCeilingOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverUserResponse",
+      "schema": "ApproverTicketCeilingUserOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalSeparationResponse",
+      "schema": "ApprovalSeparationOut",
+      "omissions": []
+    },
+    {
+      "struct": "ExemptGroupResponse",
+      "schema": "ApprovalExemptGroupOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverTicketWrite",
+      "schema": "ApproverTicketRegistration",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverCeilingWrite",
+      "schema": "ApproverTicketCeiling",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverUserWrite",
+      "schema": "ApproverTicketCeilingUser",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalSeparationWrite",
+      "schema": "ApprovalSeparation",
+      "omissions": []
+    },
+    {
+      "struct": "ExemptGroupWrite",
+      "schema": "ApprovalExemptGroup",
+      "omissions": []
+    },
+    {
       "struct": "ApprovalResolutionTargetResponse",
       "schema": "ApprovalTargetOut",
       "omissions": []
@@ -167,6 +287,11 @@
     {
       "struct": "RequestingSurfaceTargetResponse",
       "schema": "ApprovalRequestingSurfaceTargetOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverDmTargetResponse",
+      "schema": "ApprovalApproverDmTargetOut",
       "omissions": []
     },
     {
@@ -192,6 +317,11 @@
     {
       "struct": "RequestingSurfaceTargetWrite",
       "schema": "ApprovalRequestingSurfaceTarget",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverDmTargetWrite",
+      "schema": "ApprovalApproverDmTarget",
       "omissions": []
     },
     {
@@ -524,6 +654,31 @@
       "struct": "RemediationVerifierRunOut",
       "schema": "RemediationVerifierRunOut",
       "omissions": []
+    },
+    {
+      "struct": "HookWakeSecret",
+      "schema": "HookWakeSecretOut",
+      "omissions": []
+    },
+    {
+      "struct": "HookWakeRotation",
+      "schema": "HookWakeRotationOut",
+      "omissions": []
+    },
+    {
+      "struct": "PersonalEnrollmentStatus",
+      "schema": "PersonalEnrollmentOut",
+      "omissions": []
+    },
+    {
+      "struct": "PersonalEnrollmentTeardown",
+      "schema": "PersonalEnrollmentTeardownOut",
+      "omissions": []
+    },
+    {
+      "struct": "CodingInstructionsStatus",
+      "schema": "CodingInstructionsOut",
+      "omissions": []
     }
   ],
   "non_mirrors": [
@@ -546,6 +701,11 @@
   ],
   "_requests_comment": "Typed request bodies (#3834). Every platform JSON send in cli/src/api.rs is a .json::<T>(..) call on self.http.<method>(format!(\"{}<path>\", self.base_url, ..)). request_mirrors maps each body struct (cli/src/api_requests.rs, or a shared Serialize DTO in cli/src/api.rs) to its OpenAPI request schema, with justified omissions just like mirrors. requests binds each sending fn to the struct, method and OpenAPI path it sends; the gate checks the method and path against the source and the operation's requestBody schema against the mirror. Check with: curie dev field-parity",
   "request_mirrors": [
+    {
+      "struct": "WorkItemRetryRequest",
+      "schema": "WorkItemRetryIn",
+      "omissions": []
+    },
     {
       "struct": "AgentCreate",
       "schema": "AgentCreate",
@@ -617,6 +777,10 @@
       "struct": "AgentUpdate",
       "schema": "AgentUpdate",
       "omissions": [
+        {
+          "field": "factory_slack_channel",
+          "why": "The factory Slack progress channel is set through the agent API PATCH directly; no CLI verb sends it."
+        },
         {
           "field": "deploy_notifications",
           "why": "No CLI verb toggles deploy notices; the opt-in is set through the agent API directly, so a CLI PATCH never carries it."
@@ -770,9 +934,56 @@
       "struct": "DirectoryTeamIn",
       "schema": "DirectoryTeamIn",
       "omissions": []
+    },
+    {
+      "struct": "AuthoritySelectionMutation",
+      "schema": "AuthoritySelectionMutation"
+    },
+    {
+      "struct": "AuthorityMutation",
+      "schema": "AuthorityMutation"
+    },
+    {
+      "struct": "OperatorMutation",
+      "schema": "OperatorMutation"
+    },
+    {
+      "struct": "GroupFilterMutation",
+      "schema": "GroupFilterMutation"
+    },
+    {
+      "struct": "HttpSelectionV1",
+      "schema": "HttpSelectionV1",
+      "omissions": []
+    },
+    {
+      "struct": "CredentialReferenceV1",
+      "schema": "CredentialReferenceV1",
+      "omissions": []
+    },
+    {
+      "struct": "GroupV1",
+      "schema": "GroupV1",
+      "omissions": []
+    },
+    {
+      "struct": "PersonalEnrollmentWrite",
+      "schema": "PersonalEnrollmentWrite",
+      "omissions": []
+    },
+    {
+      "struct": "CodingInstructionsWrite",
+      "schema": "CodingInstructionsWrite",
+      "omissions": []
     }
   ],
   "requests": [
+    {
+      "function": "retry_work_item",
+      "struct": "WorkItemRetryRequest",
+      "method": "post",
+      "path": "/work-items/{work_item_id}/retry"
+    },
     {
       "function": "create_agent",
       "struct": "AgentCreate",
@@ -906,6 +1117,12 @@
       "path": "/agents/{agent_id}"
     },
     {
+      "function": "set_connector_requester_identity",
+      "struct": "AgentUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}"
+    },
+    {
       "function": "trigger_eval",
       "struct": "EvalTriggerRequest",
       "method": "post",
@@ -970,6 +1187,48 @@
       "struct": "DirectoryTeamIn",
       "method": "post",
       "path": "/directory/teams"
+    },
+    {
+      "function": "adopt_http_authority",
+      "struct": "AuthoritySelectionMutation",
+      "method": "put",
+      "path": "/identity/authorities/{tenant_id}"
+    },
+    {
+      "function": "replace_http_authority",
+      "struct": "AuthoritySelectionMutation",
+      "method": "post",
+      "path": "/identity/authorities/{tenant_id}/replace"
+    },
+    {
+      "function": "retire_http_authority",
+      "struct": "AuthorityMutation",
+      "method": "post",
+      "path": "/identity/authorities/{tenant_id}/retire"
+    },
+    {
+      "function": "set_http_role_filter",
+      "struct": "GroupFilterMutation",
+      "method": "put",
+      "path": "/identity/roles/{tenant_id}/{agent_id}/{role}"
+    },
+    {
+      "function": "remove_http_role_filter",
+      "struct": "OperatorMutation",
+      "method": "delete",
+      "path": "/identity/roles/{tenant_id}/{agent_id}/{role}"
+    },
+    {
+      "function": "put_personal_enrollment",
+      "struct": "PersonalEnrollmentWrite",
+      "method": "put",
+      "path": "/personal-claude/enrollment"
+    },
+    {
+      "function": "put_coding_instructions",
+      "struct": "CodingInstructionsWrite",
+      "method": "put",
+      "path": "/coding-instructions"
     }
   ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",
@@ -998,7 +1257,9 @@
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
-        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."}
+        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."},
+        {"field": "connector_requester_identity", "why": "The connector requester identity flag belongs to approvals --requester-identity."},
+        {"field": "connector_requester_identity_version", "why": "The connector requester identity flag belongs to approvals --requester-identity."}
       ]
     },
     {
@@ -1110,6 +1371,14 @@
         {
           "field": "source_bindings",
           "why": "Hook configuration has its own operator command. The overrides command changes model behavior only."
+        },
+        {
+          "field": "connector_requester_identity",
+          "why": "The connector requester identity flag has its own verb, approvals --requester-identity (ADR 0270 decision 1). Emitting it from overrides would imply that verb can change it."
+        },
+        {
+          "field": "connector_requester_identity_version",
+          "why": "The connector requester identity flag has its own verb, approvals --requester-identity (ADR 0270 decision 1). Emitting it from overrides would imply that verb can change it."
         }
       ]
     },

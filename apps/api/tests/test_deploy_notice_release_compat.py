@@ -46,14 +46,45 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # and the feature train schema. The released v0.13.0 window stays at that
     # join while the candidate advances to team sync state (0120) and agent access
     # policies (0121), directory authority (0122), attachment catalogs (0130),
-    # and the stable twelve-hour execution deadline (0140), joined by 0145.
+    # and the stable twelve-hour execution deadline (0140), joined by 0145,
+    # publication UI evidence (0146), and deleted issue cancellation (0147),
+    # joined by 0148.
     released_0130 = {"schema_min": "0108", "schema_head": "0108"}
     # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require 0133.
     # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
     # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK.
     # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
     # Workspace recovery reads require the 0141 outcome ledger.
-    candidate = {"schema_min": "0147", "schema_head": "0147"}
+    # 0149 stores webhook provenance and a wake-key generation.
+    # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
+    # Approval ORM reads require the 0153 dynamic approval selection columns,
+    # and dynamic approval answers require the 0156 answer gate. The factory
+    # Slack progress loop reads the 0157 tables, and the code host link route
+    # writes the github_host kind 0158 allows. Owner tuple reads require 0159,
+    # personal custody reads and enrollment fences require 0160, agent
+    # version reads select the 0162 result policy columns, factory CI
+    # observations require the 0163 table, cached facts and request
+    # delivery require the 0164 tables, and Slack kickoff thread origin
+    # reads require 0166.
+    # Owner coding profiles and tenant policies require 0165, which stays below
+    # this floor. Execution request reads select the 0167 completion contract
+    # columns. Intake notice storage requires 0168, which stays below this floor.
+    # Requester selection columns require 0169, which stays below this floor.
+    # Refusal posts require 0170, which stays below this floor.
+    # Triage handoff storage requires 0171, which stays below this floor.
+    # Factory retry allowance columns require 0172, which stays below this floor.
+    # Factory resource gate columns require 0174, which stays below this floor.
+    # Publication recovery requests require 0175, which stays below this floor.
+    # Operator retry records require 0176.
+    # Enrollment inactive intake notices require 0177.
+    # The factory Slack progress card requires 0178.
+    # GitHub account link states and display labels require 0179.
+    # Slack account display labels require 0180.
+    # Guarded automatic retry dispatch times require 0182.
+    # Grant notices require 0183.
+    # Factory question rounds require 0184.
+    # Learned memory rules require 0185.
+    candidate = {"schema_min": "0185", "schema_head": "0185"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -61,11 +92,72 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-30:] == [
-        "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
-        "0105", "0107", "0108", "0120", "0121", "0122", "0123", "0130", "0131",
-        "0136", "0132", "0133", "0137", "0138", "0139", "0140", "0141", "0143",
-        "0144", "0145", "0147",
+    assert catalog["revisions"][-65:] == [
+        "0095",
+        "0096",
+        "0097",
+        "0098",
+        "0099",
+        "0100",
+        "0101",
+        "0102",
+        "0103",
+        "0105",
+        "0107",
+        "0108",
+        "0120",
+        "0121",
+        "0122",
+        "0123",
+        "0130",
+        "0131",
+        "0136",
+        "0132",
+        "0133",
+        "0137",
+        "0138",
+        "0139",
+        "0140",
+        "0141",
+        "0143",
+        "0144",
+        "0145",
+        "0146",
+        "0147",
+        "0148",
+        "0149",
+        "0151",
+        "0152",
+        "0153",
+        "0154",
+        "0156",
+        "0157",
+        "0158",
+        "0159",
+        "0160",
+        "0162",
+        "0163",
+        "0164",
+        "0165",
+        "0166",
+        "0167",
+        "0168",
+        "0169",
+        "0170",
+        "0171",
+        "0172",
+        "0173",
+        "0174",
+        "0175",
+        "0176",
+        "0177",
+        "0178",
+        "0179",
+        "0180",
+        "0182",
+        "0183",
+        "0184",
+        "0185",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

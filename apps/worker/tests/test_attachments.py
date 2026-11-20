@@ -38,6 +38,7 @@ from typing import Any
 
 import pytest
 from aci_protocol import Attachment, ReplyHandle
+from curie_channel_gateway.slack import files as slack_files
 
 # importlib import mode does not add this test directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -658,18 +659,18 @@ def test_the_slack_file_client_sends_the_bot_token_and_never_leaks_it_onward(
                 b'"url_private_download":'
                 b'"https://files.slack.com/files-pri/T1-F1/download/report.csv"}}'
             )
-            return attachments.SlackFileResponse(
+            return slack_files.FileResponse(
                 status=200,
                 headers={"Content-Type": "application/json"},
                 chunks=iter([body]),
             )
-        return attachments.SlackFileResponse(
+        return slack_files.FileResponse(
             status=200,
             headers={"Content-Type": "text/csv"},
             chunks=iter([payload]),
         )
 
-    client = attachments.SlackFileClient(token=token, transport=transport)
+    client = slack_files.SlackFileClient(token=token, transport=transport)
     coordinator, objects = _coordinator(attachments, client)
 
     prepared = _resolve(coordinator, [_ref("F1", "report.csv")])
@@ -723,25 +724,25 @@ def test_a_pdfs_url_private_302_is_bypassed_by_downloading_url_private_download(
                     },
                 }
             ).encode()
-            return attachments.SlackFileResponse(
+            return slack_files.FileResponse(
                 status=200,
                 headers={"Content-Type": "application/json"},
                 chunks=iter([body]),
             )
         if request["url"] == private_url:
-            return attachments.SlackFileResponse(
+            return slack_files.FileResponse(
                 status=302,
                 headers={"Content-Type": "text/html", "Location": "https://slack-files.com/x"},
                 chunks=iter([b"<html>redirecting</html>"]),
             )
         assert request["url"] == download_url
-        return attachments.SlackFileResponse(
+        return slack_files.FileResponse(
             status=200,
             headers={"Content-Type": "application/pdf"},
             chunks=iter([pdf_bytes]),
         )
 
-    client = attachments.SlackFileClient(token=token, transport=transport)
+    client = slack_files.SlackFileClient(token=token, transport=transport)
     coordinator, objects = _coordinator(attachments, client)
 
     prepared = _resolve(coordinator, [_ref("F1", "incident.pdf", mime_type="application/pdf")])
@@ -788,24 +789,24 @@ def test_a_download_url_that_itself_redirects_still_refuses_rather_than_followin
                     },
                 }
             ).encode()
-            return attachments.SlackFileResponse(
+            return slack_files.FileResponse(
                 status=200,
                 headers={"Content-Type": "application/json"},
                 chunks=iter([body]),
             )
-        return attachments.SlackFileResponse(
+        return slack_files.FileResponse(
             status=302,
             headers={"Content-Type": "text/html", "Location": redirect_target},
             chunks=iter([b"<html>redirecting</html>"]),
         )
 
-    client = attachments.SlackFileClient(token=token, transport=transport)
+    client = slack_files.SlackFileClient(token=token, transport=transport)
     coordinator, _objects = _coordinator(attachments, client)
 
     with pytest.raises(attachments.AttachmentFetchError) as refusal:
         _resolve(coordinator, [_ref("F1", "report.csv")])
 
-    assert isinstance(refusal.value.__cause__, attachments.SlackFileError)
+    assert isinstance(refusal.value.__cause__, slack_files.SlackFileError)
     assert "302" in str(refusal.value.__cause__)
     assert all(call["url"] != redirect_target for call in calls), (
         "the client must never issue a request to the redirect target"
@@ -876,7 +877,7 @@ def test_the_real_slack_transport_surfaces_a_redirect_instead_of_following_it(
     serving = threading.Thread(target=server.serve_forever, daemon=True)
     serving.start()
     try:
-        response = attachments._slack_transport(
+        response = attachments._file_transport(
             method="GET",
             url=f"http://127.0.0.1:{port}{source_path}",
             headers={"Authorization": f"Bearer {token}"},
@@ -926,19 +927,19 @@ def test_a_files_info_payload_missing_url_private_download_names_the_field(
                 },
             }
         ).encode()
-        return attachments.SlackFileResponse(
+        return slack_files.FileResponse(
             status=200,
             headers={"Content-Type": "application/json"},
             chunks=iter([body]),
         )
 
-    client = attachments.SlackFileClient(token=token, transport=transport)
+    client = slack_files.SlackFileClient(token=token, transport=transport)
     coordinator, objects = _coordinator(attachments, client)
 
     with pytest.raises(attachments.AttachmentFetchError) as refusal:
         _resolve(coordinator, [_ref("F1", "report.csv")])
 
-    assert isinstance(refusal.value.__cause__, attachments.SlackFileError)
+    assert isinstance(refusal.value.__cause__, slack_files.SlackFileError)
     assert "url_private_download" in str(refusal.value.__cause__)
     assert objects.objects == {}
 
@@ -956,19 +957,19 @@ def test_a_malformed_files_info_payload_is_an_unusable_envelope(
     token = "xoxb-not-a-real-bot-token"
 
     def transport(**request: Any) -> Any:
-        return attachments.SlackFileResponse(
+        return slack_files.FileResponse(
             status=200,
             headers={"Content-Type": "application/json"},
             chunks=iter([b"not json"]),
         )
 
-    client = attachments.SlackFileClient(token=token, transport=transport)
+    client = slack_files.SlackFileClient(token=token, transport=transport)
     coordinator, objects = _coordinator(attachments, client)
 
     with pytest.raises(attachments.AttachmentFetchError) as refusal:
         _resolve(coordinator, [_ref("F1", "report.csv")])
 
-    assert isinstance(refusal.value.__cause__, attachments.SlackFileError)
+    assert isinstance(refusal.value.__cause__, slack_files.SlackFileError)
     assert "unusable envelope" in str(refusal.value.__cause__)
     assert objects.objects == {}
 
@@ -1146,7 +1147,7 @@ class _RecordingTransport:
 
     def __call__(self, **request: Any) -> Any:
         self.calls.append(request)
-        return self._module.SlackFileResponse(
+        return slack_files.FileResponse(
             status=self._status,
             headers={"Content-Type": "application/octet-stream"},
             chunks=iter(self._chunks),

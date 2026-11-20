@@ -319,6 +319,12 @@ def _start(client: TestClient, request_id: uuid.UUID, *, generation: int = 1) ->
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         return int(started.runtime_epoch)
 
@@ -335,6 +341,9 @@ def _finish(request_id: uuid.UUID, epoch: int, outcome: str, cause: str) -> None
             cause=cause,
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert getattr(result, "code", None) is None, result
 
@@ -523,7 +532,11 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
 async def _first_parent_proof(
     session: AsyncSession, publication_id: str, head_sha: str, *, parent_sha: str | None = None
 ) -> Any:
-    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+    from curie_api.publication_verification import (
+        publication_base_ref,
+        publication_revision_ids,
+        verify_publication_commit,
+    )
 
     publication = await crud_publication_queries.get_publication(session, uuid.UUID(publication_id))
     assert publication is not None
@@ -565,7 +578,12 @@ async def _first_parent_proof(
     repository = RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
     base_branch = await publication_base_ref(session, code_host, publication, repository)
     return await verify_publication_commit(
-        code_host, repository, publication, commit_sha=head_sha, base_branch=base_branch
+        code_host,
+        repository,
+        publication,
+        commit_sha=head_sha,
+        base_branch=base_branch,
+        revision_ids=publication_revision_ids(publication),
     )
 
 
@@ -764,6 +782,7 @@ def test_cancelled_after_termination_is_recorded(
             session,
             facts.request_id,
             runtime_epoch=claim.runtime_epoch,
+            expected_request_version=claim.request_version,
             observation=TERMINATION_OBSERVATION,
         )
 
@@ -1084,6 +1103,9 @@ def test_completion_without_a_pull_request_stays_running(
             cause="completed",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert getattr(result, "code", None) is not None, result
 
@@ -1278,6 +1300,8 @@ def test_pr_opened_after_execution_deadline_binds_and_completes(
             request_id=seeded.request_id,
             expected_work_item_version=work_item_version,
             expected_request_version=request_version,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(result, workitems.WorkItemOutcome), result
 
@@ -1545,6 +1569,13 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         cancelled_at=None,
         created_at=now,
         updated_at=now,
+        model_auth_mode="service",
+        coding_instructions_state="absent",
+        memory_rules_state="absent",
+        memory_rules_count=0,
+        coding_instructions_absence_reason="historical",
+        # The database default an inserted row would carry.
+        automatic_retries_used=0,
     )
     request = ExecutionRequest(
         id=uuid.uuid4(),
@@ -1563,6 +1594,12 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         last_start_failure_detail=None,
         objective=OBJECTIVE,
         requester=REQUESTER,
+        model_auth_mode="service",
+        coding_instructions_evidence="none",
+        memory_rules_evidence="none",
+        # The database defaults an inserted row would carry.
+        dispatch_not_before=now,
+        owner_lost_retry=False,
     )
     outcome = derive_outcome(
         item,
@@ -1602,6 +1639,13 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         cancelled_at=None,
         created_at=now,
         updated_at=now,
+        model_auth_mode="service",
+        coding_instructions_state="absent",
+        memory_rules_state="absent",
+        memory_rules_count=0,
+        coding_instructions_absence_reason="historical",
+        # The database default an inserted row would carry.
+        automatic_retries_used=0,
     )
     request = ExecutionRequest(
         id=uuid.uuid4(),
@@ -1619,6 +1663,12 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         last_deferral_reason=None,
         objective=f"{PR_URL}#issuecomment-1\nRevise after review feedback",
         requester=REQUESTER,
+        model_auth_mode="service",
+        coding_instructions_evidence="none",
+        memory_rules_evidence="none",
+        # The database defaults an inserted row would carry.
+        dispatch_not_before=now,
+        owner_lost_retry=False,
     )
 
     outcome = derive_outcome(
@@ -1953,7 +2003,7 @@ def _runs(
 ) -> Callable[[httpx.Request], httpx.Response]:
     def handle(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith(f"/commits/{HEAD_SHA}/status"):
-            return httpx.Response(200, json={"state": "pending", "statuses": []})
+            return httpx.Response(200, json={"state": "pending", "statuses": [], "total_count": 0})
         return httpx.Response(
             200,
             json={
@@ -2087,6 +2137,7 @@ def _terminate(request_id: uuid.UUID) -> None:
             session,
             request_id,
             runtime_epoch=claim.runtime_epoch,
+            expected_request_version=claim.request_version,
             observation=OWNER_OBSERVATION,
         )
         assert getattr(recorded, "code", None) is None, recorded

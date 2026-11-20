@@ -101,6 +101,37 @@ def _semantic_version_key(version: str) -> tuple[int, int, int, int, int] | None
     return int(major), int(minor), int(patch), int(rc is None), int(rc or 0)
 
 
+def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
+    """Run git inside ``repo_root`` without climbing into a parent repository."""
+    env = dict(os.environ)
+    # A non-git repo root must not resolve an enclosing repository.
+    env["GIT_CEILING_DIRECTORIES"] = str(repo_root.parent)
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+    except OSError:
+        return None
+
+
+def _catalog_window(text: str, app_version: str) -> dict | None:
+    try:
+        payload: object = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    windows = payload.get("windows")
+    if not isinstance(windows, dict):
+        return None
+    window = windows.get(app_version)
+    return window if isinstance(window, dict) else None
+
+
 def _released_window(repo_root: Path, app_version: str) -> dict | None:
     """Return ``windows[app_version]`` as recorded at the ``v<app_version>`` tag.
 
@@ -109,38 +140,107 @@ def _released_window(repo_root: Path, app_version: str) -> dict | None:
     tag is not readable, which happens between the release commit that
     registers the atlas and the tag push, or in a clone without tags.
     """
-    env = dict(os.environ)
-    # A non-git repo root must not resolve an enclosing repository.
-    env["GIT_CEILING_DIRECTORIES"] = str(repo_root.parent)
-    try:
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "show",
-                f"refs/tags/v{app_version}:cli/src/application_schema_windows.json",
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
-    except OSError:
+    result = _git(
+        repo_root,
+        "show",
+        f"refs/tags/v{app_version}:cli/src/application_schema_windows.json",
+    )
+    if result is None or result.returncode != 0:
         return None
-    if result.returncode != 0:
+    return _catalog_window(result.stdout, app_version)
+
+
+def _history_readable(repo_root: Path) -> bool:
+    """False for a non-git root or a shallow clone, whose log cannot be trusted."""
+    inside = _git(repo_root, "rev-parse", "--is-inside-work-tree")
+    if inside is None or inside.returncode != 0 or inside.stdout.strip() != "true":
+        return False
+    shallow = _git(repo_root, "rev-parse", "--is-shallow-repository")
+    if shallow is None or shallow.returncode != 0:
+        return False
+    return shallow.stdout.strip() == "false"
+
+
+def _atlas_ids(repo_root: Path, rev: str) -> set[str] | None:
+    """Atlas version ids at ``rev``.
+
+    An empty set means the manifest is absent. None means it cannot be read.
+    """
+    spec = f"{rev}:docs/architecture-atlas/versions.json"
+    present = _git(repo_root, "cat-file", "-e", spec)
+    if present is None:
+        return None
+    if present.returncode != 0:
+        # A missing path is an empty manifest. Any other git failure is unreadable.
+        if "does not exist" in present.stderr or "not in" in present.stderr:
+            return set()
+        return None
+    shown = _git(repo_root, "show", spec)
+    if shown is None or shown.returncode != 0:
         return None
     try:
-        tagged: object = json.loads(result.stdout)
+        payload: object = json.loads(shown.stdout)
     except json.JSONDecodeError:
         return None
-    if not isinstance(tagged, dict):
+    if not isinstance(payload, dict):
         return None
-    tagged_windows = tagged.get("windows")
-    if not isinstance(tagged_windows, dict):
+    versions = payload.get("versions")
+    if not isinstance(versions, list):
         return None
-    window = tagged_windows.get(app_version)
-    return window if isinstance(window, dict) else None
+    ids: set[str] = set()
+    for item in versions:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            return None
+        ids.add(item["id"])
+    return ids
+
+
+def _commit_adds_version(repo_root: Path, commit: str, version_id: str) -> bool:
+    child = _atlas_ids(repo_root, commit)
+    if child is None or version_id not in child:
+        return False
+    parent = _git(repo_root, "rev-parse", "--verify", "--quiet", f"{commit}^")
+    if parent is None or parent.returncode != 0 or not parent.stdout.strip():
+        return True
+    parent_ids = _atlas_ids(repo_root, parent.stdout.strip())
+    if parent_ids is None:
+        return False
+    return version_id not in parent_ids
+
+
+def _registered_window(repo_root: Path, app_version: str) -> dict | None:
+    """Return the window frozen when ``v<app_version>`` was added to the atlas.
+
+    The registration commit is the oldest commit on HEAD that added that id to
+    ``docs/architecture-atlas/versions.json``. None means that commit cannot be
+    read, including a non-git root and a shallow clone.
+    """
+    if not _history_readable(repo_root):
+        return None
+    version_id = f"v{app_version}"
+    log = _git(
+        repo_root,
+        "log",
+        "--reverse",
+        f"-S{version_id}",
+        "--format=%H",
+        "--",
+        "docs/architecture-atlas/versions.json",
+    )
+    if log is None or log.returncode != 0:
+        return None
+    for commit in log.stdout.split():
+        if not _commit_adds_version(repo_root, commit, version_id):
+            continue
+        shown = _git(
+            repo_root,
+            "show",
+            f"{commit}:cli/src/application_schema_windows.json",
+        )
+        if shown is None or shown.returncode != 0:
+            return None
+        return _catalog_window(shown.stdout, app_version)
+    return None
 
 
 def main() -> int:
@@ -312,14 +412,24 @@ def main() -> int:
                 "release tag; a released window is immutable, so move only "
                 "the candidate"
             )
-    elif released and not matches_candidate:
-        # The release commit registers the atlas before the tag is pushed,
-        # and the window still equals the candidate in that interval.
-        return _fail(
-            f"windows[{app_version!r}] differs from candidate and the "
-            f"v{app_version} release tag is not readable; "
-            "run git fetch --tags origin"
-        )
+    elif released:
+        # The atlas names this version before its tag is pushed. Freeze the
+        # window at the commit that added the atlas id. When that commit
+        # cannot be read, keep the candidate-equality rule.
+        registered_window = _registered_window(repo_root, app_version)
+        if registered_window is not None:
+            if chart_window != registered_window:
+                return _fail(
+                    f"windows[{app_version!r}] differs from the window recorded "
+                    f"when v{app_version} was registered; a released window is "
+                    "immutable, so move only the candidate"
+                )
+        elif not matches_candidate:
+            return _fail(
+                f"windows[{app_version!r}] differs from candidate and the "
+                f"v{app_version} release tag is not readable; "
+                "run git fetch --tags origin"
+            )
     elif not matches_candidate:
         return _fail(
             f"windows[{app_version!r}] differs from candidate; "

@@ -67,10 +67,11 @@ FACTORY_PREFIXES = (
     "tools/model-script",
     "tools/github-stub",
 )
-# The kind approval resume scenario (#4016) runs only when a worker or approval
-# path changes. Prefixes without a .py suffix match by raw string prefix, so
+# The kind approval resume scenario (#4016) covers worker, approval and shared
+# setup paths. Prefixes without a .py suffix match by raw string prefix, so
 # "curie_api/approval" covers every approval*.py module.
 APPROVAL_RESUME_PREFIXES = (
+    ".github/scripts",
     "apps/worker/src/curie_worker",
     "apps/api/src/curie_api/resumequeue.py",
     "apps/api/src/curie_api/resumereconciler.py",
@@ -97,7 +98,7 @@ WORKFLOW_HEADER = "<header>"
 NON_PYTEST_REGISTRY_SECTIONS = ("chart_scenarios", "ci_policy_tests")
 PYTEST_SHARDS = 6
 CHART_JOB = "e2e-cluster-chart-regressions"
-CHART_LEGS = ("chart", "upgrade", "workload")
+CHART_LEGS = ("chart", "upgrade", "workload-1", "workload-2")
 SCENARIO_SCRIPT = re.compile(r"^(?:charts/curie/ci|scripts)/[^\s]+\.sh(?:$|[;|&])")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CARGO_MANIFEST = "cli/Cargo.toml"
@@ -256,7 +257,7 @@ def _chart_registry(value: object) -> ChartScenarios:
             raise RegistryError(f"{label}.step must be a nonempty string")
         leg = entry["leg"]
         if not isinstance(leg, str) or leg not in CHART_LEGS:
-            raise RegistryError(f"{label}.leg must be one of chart, upgrade, workload")
+            raise RegistryError(f"{label}.leg must be one of {', '.join(CHART_LEGS)}")
         if step in step_names:
             raise RegistryError(f"duplicate chart scenario step: {step}")
         step_names.add(step)
@@ -417,6 +418,20 @@ def _needs_images(paths: list[str]) -> bool:
         if path in IMAGE_LOCKFILES or name in IMAGE_LOCKFILES:
             return True
         if "Dockerfile" in name or name.endswith(".dockerfile"):
+            return True
+        # The shell supervisor is proven only inside the shell image.
+        if path.startswith((
+            "packages/shell-supervisor/",
+            "runner/src/curie_runner/",
+            "apps/worker/src/curie_worker/kernel/",
+            "apps/worker/src/curie_worker/sandbox/",
+        )) or path in {
+            "apps/worker/src/curie_worker/markers.py",
+            "apps/worker/src/curie_worker/delivery_lease.py",
+            "apps/worker/src/curie_worker/stream_consumer.py",
+            "apps/worker/src/curie_worker/runner_client.py",
+            "apps/worker/src/curie_worker/threadlock.py",
+        }:
             return True
     return False
 

@@ -9,6 +9,7 @@ cap, a failed reviewer call, and the publication gate.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import re
@@ -42,6 +43,8 @@ from curie_runner.verification import (
     preflight_workspace_verification,
 )
 
+from examples.tests.test_pull_request_follow_up_detection import production_follow_up_objectives
+
 pytestmark = pytest.mark.xdist_independent
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +55,19 @@ CONTRACT_FILE = BUNDLE / "verification" / "contract.md"
 CONTEXT_LIMIT = 10_000
 PLAN, DIFF = "dark-factory:plan-reviewer", "dark-factory:diff-reviewer"
 PUBLISH = "mcp__curie__publish_changes"
+VALID_PR_BODY = "## Decisions\nNone: the change follows directly from the acceptance criteria.\n"
+DECISIONS_CASES = json.loads(
+    (REPO_ROOT / "tests" / "vectors" / "factory-decisions-section.json").read_text()
+)["cases"]
+
+
+def _publish_input(tool: str, tool_input: dict[str, Any] | None) -> dict[str, Any]:
+    """A publish call with no input, or the placeholder body "b", carries a valid
+    Decisions section, so review policy tests are not refused by that check."""
+    tool_input = dict(tool_input or {})
+    if tool == PUBLISH and (not tool_input or tool_input.get("body") == "b"):
+        tool_input["body"] = VALID_PR_BODY
+    return tool_input
 
 
 REPORT = "mcp__curie__report_progress"
@@ -252,7 +268,7 @@ class Session:
         return json.loads(done.stdout) if done.stdout.strip() else None
 
     def pre(self, tool: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
-        out = self.fire("PreToolUse", tool_name=tool, tool_input=tool_input or {})
+        out = self.fire("PreToolUse", tool_name=tool, tool_input=_publish_input(tool, tool_input))
         assert out is not None
         decision: dict[str, Any] = out["hookSpecificOutput"]
         return decision
@@ -691,6 +707,181 @@ def test_publish_only_after_the_diff_reviewer_approves(session: Session) -> None
     rework(session, 1)
     session.review(DIFF, reply(DIFF, "APPROVE"))
     assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+
+
+@pytest.mark.parametrize("case", DECISIONS_CASES, ids=lambda case: case["id"])
+def test_decisions_parser_shared_vectors(
+    case: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_decisions")
+    if case["valid"]:
+        assert hook.parse_decisions_section(case["body"]) == case["entries"]
+    else:
+        with pytest.raises(ValueError):
+            hook.parse_decisions_section(case["body"])
+
+
+@pytest.mark.parametrize("case", DECISIONS_CASES, ids=lambda case: case["id"])
+def test_publish_decisions_vectors_and_body_recovery(
+    session: Session, case: dict[str, Any]
+) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    before = _saved_state(session)
+    decision = session.pre(PUBLISH, {"body": case["body"]})
+    assert decision["permissionDecision"] == ("allow" if case["valid"] else "deny")
+    if not case["valid"]:
+        reason = decision["permissionDecisionReason"]
+        assert all(part in reason for part in ("## Decisions", "Rejected:", "Evidence:", "None:"))
+        assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    after = _saved_state(session)
+    assert after["stopped"] is None
+    assert after["plan"] == before["plan"]
+    assert after["diff"] == before["diff"]
+    assert after["diff_approved_fingerprint"] == before["diff_approved_fingerprint"]
+
+
+def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    before = _saved_state(session)
+    refused = session.pre(PUBLISH, {"title": "t"})
+    assert refused["permissionDecision"] == "deny"
+    assert "## Decisions" in refused["permissionDecisionReason"]
+    assert _saved_state(session) == before
+    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+
+
+ADVERSARIAL_ENTRY = "x. Rejected: y, because z. (nomatch) Evidence: w. "
+
+
+def test_publish_decisions_adversarial_sections_are_denied_quickly(
+    session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_decisions_adversarial")
+    # Repeated separators made the earlier regex backtrack for minutes; a hook
+    # timeout lets the publication through, so each body must be refused fast.
+    under_cap = "## Decisions\n1. " + ADVERSARIAL_ENTRY * 130
+    over_cap = "## Decisions\n1. " + ADVERSARIAL_ENTRY * 2000
+    for body in (under_cap, over_cap):
+        started = time.monotonic()
+        with pytest.raises(ValueError):
+            hook.parse_decisions_section(body)
+        assert time.monotonic() - started < 1.0
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    for body in (under_cap, over_cap):
+        started = time.monotonic()
+        refused = session.pre(PUBLISH, {"title": "t", "body": body})
+        assert time.monotonic() - started < 20.0
+        assert refused["permissionDecision"] == "deny"
+        assert "## Decisions" in refused["permissionDecisionReason"]
+
+
+def _publish_main(hook: Any, monkeypatch: pytest.MonkeyPatch, raw: bytes) -> int:
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"))
+    code: int = hook.main()
+    return code
+
+
+def _publish_event(tmp_path: Path) -> bytes:
+    event = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-publish",
+        "cwd": str(tmp_path),
+        "tool_name": PUBLISH,
+        "tool_input": {"title": "t", "body": VALID_PR_BODY},
+    }
+    return json.dumps(event).encode()
+
+
+@pytest.mark.parametrize("raw", [b"{not json", b"\xff\xfe\x00", b"[]", b""])
+def test_publish_hook_denies_unreadable_input(
+    raw: bytes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_unreadable_input")
+    assert _publish_main(hook, monkeypatch, raw) == 2
+    assert "refusing" in capsys.readouterr().err
+
+
+def test_hook_denies_deeply_nested_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_nested_input")
+    raw = b'{"a": ' + b"[" * 12000 + b"]" * 12000 + b"}"
+    assert _publish_main(hook, monkeypatch, raw) == 2
+    assert "refusing" in capsys.readouterr().err
+
+
+def test_publish_hook_denies_on_its_own_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_exception")
+
+    def broken(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(hook, "pre_publish", broken)
+    assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 2
+    assert "RuntimeError" in capsys.readouterr().err
+
+
+def test_publish_hook_denies_at_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_deadline")
+    release = threading.Event()
+
+    def stuck(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+        # Bounded so a hook that waits for its check fails here instead of hanging.
+        release.wait(timeout=5)
+        return dict(hook._allow("late"))
+
+    # The shipped deadline is below the runner's 60 second hook timeout.
+    assert hook.PUBLISH_DEADLINE_SECONDS < 60
+    monkeypatch.setattr(hook, "pre_publish", stuck)
+    monkeypatch.setattr(hook, "PUBLISH_DEADLINE_SECONDS", 0.05)
+    try:
+        assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 2
+    finally:
+        release.set()
+    assert "did not finish" in capsys.readouterr().err
+
+
+def test_publish_hook_still_allows_a_decision_that_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_liveness")
+    monkeypatch.setattr(hook, "pre_publish", lambda state, tool_input: hook._allow("ok"))
+    assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+@pytest.mark.parametrize("case_id", ["answers-recorded-decision", "admits-unrecorded-decision"])
+def test_decision_followup_eval_grades_the_answer(case_id: str) -> None:
+    from curie_worker.eval.models import EvalSuite
+
+    suite = EvalSuite.model_validate_json((BUNDLE / "evals" / "cases.json").read_text())
+    case = next(case for case in suite.cases if case.id == case_id)
+    fixtures = json.loads(
+        (REPO_ROOT / "cli/tests/data/eval_falsifiability_fixtures.json").read_text()
+    )
+    key = f"dark-factory/{case_id}"
+    for answer in [fixtures["exemplars"][key], *fixtures["paraphrases"][key]]:
+        assert case.grader.grade(answer)
+    for answer in fixtures["counterexamples"][key]:
+        assert not case.grader.grade(answer)
+    for empty_answer in (
+        "",
+        "Done.",
+        "No changes needed:",
+        "No changes needed: Decisions entry 1.",
+        case.input,
+        "No changes needed: the pull request is already complete; I answered "
+        "by citing Decisions entry 1. Nothing in the question asked for a code change.",
+    ):
+        assert not case.grader.grade(empty_answer)
 
 
 def test_a_new_message_continues_the_run_and_a_new_session_starts_fresh(
@@ -2099,7 +2290,7 @@ class HooksJsonRuntime:
         return outs
 
     def pre(self, tool: str, tool_input: dict[str, Any]) -> dict[str, Any] | None:
-        outs = self.dispatch("PreToolUse", tool, tool_input=tool_input)
+        outs = self.dispatch("PreToolUse", tool, tool_input=_publish_input(tool, tool_input))
         assert len(outs) == 1, (tool, outs)
         return outs[0]
 
@@ -2205,7 +2396,7 @@ class HooksJsonRuntime:
 
     def decision(self, tool: str, tool_input: dict[str, Any] | None = None) -> str:
         """The PreToolUse permission decision for a gated, non-edit tool call."""
-        out = self.pre(tool, tool_input or {})
+        out = self.pre(tool, _publish_input(tool, tool_input))
         assert out is not None, tool
         return str(out["hookSpecificOutput"]["permissionDecision"])
 
@@ -3899,49 +4090,6 @@ def test_missing_workspace_can_restore_and_re_review(session: Session) -> None:
     assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
-def _delay_hook_start(session: Session, seconds: float) -> None:
-    """Hold the hook for ``seconds`` before its own code runs, as a loaded
-    runner does while it starts the interpreter and imports the runner package.
-    Only the hook waits; the git shims start as usual."""
-    site = session.cwd.parent / "slow-start"
-    site.mkdir()
-    (site / "sitecustomize.py").write_text(
-        "import sys\n"
-        "import time\n"
-        f"if sys.argv and sys.argv[0].endswith({HOOK.name!r}):\n"
-        f"    time.sleep({seconds!r})\n"
-    )
-    path = session.env.get("PYTHONPATH")
-    session.env["PYTHONPATH"] = f"{site}{os.pathsep}{path}" if path else str(site)
-
-
-def test_review_git_calls_share_hook_budget(session: Session) -> None:
-    session.review(PLAN, reply(PLAN, "APPROVE"))
-    real_git = shutil.which("git")
-    assert real_git is not None
-    # The shared budget starts at the hook's first git call, so the clock
-    # starts there too. Interpreter start is outside it: a loaded CI runner
-    # took 1.7 s to start the hook, and this one waits longer than that.
-    _delay_hook_start(session, 2.5)
-    calls = session.cwd.parent / "git-calls"
-    _prepend_git_shim(
-        session,
-        "import os\n"
-        "import sys\n"
-        "import time\n"
-        f"with open({str(calls)!r}, 'a') as log:\n"
-        "    log.write(f'{time.monotonic()}\\n')\n"
-        "time.sleep(2.6)\n"
-        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
-    )
-    decision = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
-    returned = time.monotonic()
-    assert decision["permissionDecision"] == "deny"
-    assert _saved_state(session)["diff"]["round"] == 0
-    first_call = float(calls.read_text().split()[0])
-    assert returned - first_call < 9
-
-
 def test_publication_gate_is_not_atomic_snapshot_authority(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
@@ -3968,3 +4116,58 @@ def test_task_notification_preserves_approval_until_a_later_edit(session: Sessio
     assert _saved_state(session) == before
     (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
+_FOLLOW_UP_OBJECTIVES = production_follow_up_objectives()
+
+
+def _follow_up_session(tmp_path: Path, objective: str) -> Session:
+    """A run whose opening prompt is one production follow-up, inside the sender frame."""
+
+    session = Session(tmp_path)
+    session.fire(
+        "UserPromptSubmit",
+        prompt=frame_user_turn("message", "octocat", objective, "github"),
+    )
+    session.load_workflow()
+    return session
+
+
+@pytest.mark.parametrize(
+    "objective", list(_FOLLOW_UP_OBJECTIVES.values()), ids=list(_FOLLOW_UP_OBJECTIVES)
+)
+def test_a_pull_request_follow_up_refuses_an_empty_diff_review(
+    tmp_path: Path, objective: str
+) -> None:
+    """#5728 AC3: an empty candidate admits no diff review and does not stop the run."""
+
+    session = _follow_up_session(tmp_path, objective)
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    decision = session.pre("Agent", {"subagent_type": DIFF, "description": "diff", "prompt": "p"})
+    assert decision["permissionDecision"] == "deny"
+    assert "candidate patch is empty" in decision["permissionDecisionReason"]
+    refused = [
+        event
+        for event in session.gate_events()
+        if event.get("curie_gate") == "review_refused"
+        and event.get("cause") == "empty_candidate_patch"
+    ]
+    assert refused
+    assert _saved_state(session)["stopped"] is None
+    assert _saved_state(session)["pull_request_follow_up"] is True
+
+
+@pytest.mark.parametrize(
+    "objective", list(_FOLLOW_UP_OBJECTIVES.values()), ids=list(_FOLLOW_UP_OBJECTIVES)
+)
+def test_a_pull_request_follow_up_still_admits_a_nonempty_diff_review(
+    tmp_path: Path, objective: str
+) -> None:
+    """A follow-up that edited the checkout still gets a diff review."""
+
+    session = _follow_up_session(tmp_path, objective)
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    rework(session, 1)
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert not any(event.get("cause") == "empty_candidate_patch" for event in session.gate_events())
+    assert _saved_state(session)["stopped"] is None

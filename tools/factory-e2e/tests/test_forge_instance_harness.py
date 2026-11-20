@@ -502,7 +502,7 @@ def test_helm_label_skips_option_values_and_shortens_paths(
                 "--kubeconfig",
                 "/k",
                 "--context",
-                "c",
+                "fixture-context",
                 "--namespace",
                 "n",
                 "exec",

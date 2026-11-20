@@ -26,7 +26,7 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     api = REPO / "apps/api/src/curie_api"
     window = json.loads((api / "schema_compat.json").read_text())
     kinds = json.loads((api / "revision_kinds.json").read_text())
-    assert window == {"schema_min": "0147", "schema_head": "0147"}
+    assert window == {"schema_min": "0185", "schema_head": "0185"}
     assert metadata["schema_min"] == window["schema_min"]
     assert metadata["schema_head"] == window["schema_head"]
     graph = ScriptDirectory(str(REPO / "apps/api/alembic"))
@@ -36,6 +36,55 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     assert revisions["0143"]["parents"] == ["0141"]
     assert revisions["0144"]["parents"] == ["0143"]
     assert revisions["0145"]["parents"] == ["0140", "0144"]
+    assert revisions["0146"]["parents"] == ["0145"]
+    assert revisions["0157"]["parents"] == ["0156"]
+    assert revisions["0158"]["parents"] == ["0157"]
+    assert revisions["0159"]["parents"] == ["0158"]
+    assert revisions["0160"]["parents"] == ["0159"]
+    assert revisions["0162"]["parents"] == ["0160"]
+    assert revisions["0163"]["parents"] == ["0162"]
+    assert revisions["0164"]["parents"] == ["0163"]
+    assert revisions["0164"]["kind"] == "expand"
+    assert revisions["0165"]["parents"] == ["0164"]
+    assert revisions["0165"]["kind"] == "expand"
+    assert revisions["0166"]["parents"] == ["0165"]
+    assert revisions["0166"]["kind"] == "expand"
+    assert revisions["0167"]["parents"] == ["0166"]
+    assert revisions["0167"]["kind"] == "expand"
+    assert revisions["0168"]["parents"] == ["0167"]
+    assert revisions["0168"]["kind"] == "expand"
+    assert revisions["0169"]["parents"] == ["0168"]
+    assert revisions["0169"]["kind"] == "expand"
+    assert revisions["0170"]["parents"] == ["0169"]
+    assert revisions["0170"]["kind"] == "expand"
+    assert revisions["0171"]["parents"] == ["0170"]
+    assert revisions["0171"]["kind"] == "expand"
+    assert revisions["0172"]["parents"] == ["0171"]
+    assert revisions["0172"]["kind"] == "expand"
+    assert revisions["0173"]["parents"] == ["0172"]
+    assert revisions["0173"]["kind"] == "expand"
+    assert revisions["0174"]["parents"] == ["0173"]
+    assert revisions["0174"]["kind"] == "expand"
+    assert revisions["0175"]["parents"] == ["0174"]
+    assert revisions["0175"]["kind"] == "expand"
+    assert revisions["0176"]["parents"] == ["0175"]
+    assert revisions["0176"]["kind"] == "expand"
+    assert revisions["0177"]["parents"] == ["0176"]
+    assert revisions["0177"]["kind"] == "expand"
+    assert revisions["0178"]["parents"] == ["0177"]
+    assert revisions["0178"]["kind"] == "expand"
+    assert revisions["0179"]["parents"] == ["0178"]
+    assert revisions["0179"]["kind"] == "expand"
+    assert revisions["0180"]["parents"] == ["0179"]
+    assert revisions["0180"]["kind"] == "expand"
+    assert revisions["0182"]["parents"] == ["0180"]
+    assert revisions["0182"]["kind"] == "expand"
+    assert revisions["0183"]["parents"] == ["0182"]
+    assert revisions["0183"]["kind"] == "expand"
+    assert revisions["0184"]["parents"] == ["0183"]
+    assert revisions["0184"]["kind"] == "expand"
+    assert revisions["0185"]["parents"] == ["0184"]
+    assert revisions["0185"]["kind"] == "expand"
     for revision in graph.walk_revisions():
         parent = revision.down_revision
         parents = list(parent) if isinstance(parent, (list, tuple)) else [parent] if parent else []

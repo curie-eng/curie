@@ -30,7 +30,7 @@ async def resolve_binding(
     Two agents may serve one repository under different labels (#4361 decision
     8), so the label picks the surface. No surface for the label refuses
     ``binding_missing``; two surfaces resolving to one label (the tracker label
-    was changed to equal an explicit one) also refuse ``binding_missing`` and
+    was changed to equal an explicit one) refuse ``binding_ambiguous`` and
     log both agents, never picking one.
     """
 
@@ -47,5 +47,5 @@ async def resolve_binding(
             notice.label,
             ", ".join(str(row.agent_id) for row in matches),
         )
-        raise FactoryRefused("binding_missing")
+        raise FactoryRefused("binding_ambiguous")
     return matches[0]

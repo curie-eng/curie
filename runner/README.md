@@ -187,10 +187,27 @@ result the model can correct, still without failing the turn. The call is
 platform-owned and idempotent (`PLATFORM_IDEMPOTENT_TOOLS`), so it raises no
 `side_effect_flag` and never lands on the turn's receipt.
 
-The fake model is unconditionally network-free, including when progress headers
-are present. `[fake:progress-demo]` remains a deterministic long-running turn
-for steering tests, but it does not call the ingress. API/worker integration
+The fake model is network-free, including when progress headers are present.
+`[fake:progress-demo]` remains a deterministic long-running turn
+for steering tests, but it does not call the ingress. The one exception is
+`[fake:connector-call]` (ADR 0270 evidence): it dials each hosted connector the
+caller proxy fronts with one `initialize` and one `tools/list`, and answers one
+`connector-call` line per connector that names the outcome and a sha256 prefix
+of the caller token, never the token. API/worker integration
 tests and live-provider tests exercise the real progress handler instead.
+
+Two directives exhaust a runner resource offline (#5427), with no tool call and
+so no `side_effect_flag`. `[fake:hold-memory <MiB>]` allocates that many MiB in
+the runner process, touching every page, holds it a few seconds, releases it
+and answers `all done`. `[fake:fill-scratch <MiB>]` writes that many MiB of
+zeros in 1 MiB chunks to one file in the temporary directory (the sandbox's
+`/tmp` scratch volume), holds it long
+enough for a kubelet eviction pass to measure it, deletes it and answers
+`all done`. Both take 1 to 16384 MiB; anything else gets the default turn.
+Under a smaller runner limit the kernel or the kubelet ends the runner first.
+A factory turn's text is only the issue link, so the fake also reads a
+standing directive from `FAKE_MODEL_DIRECTIVE` and treats it as part of every
+turn's words; a test sets it per agent through `agentSandbox.runnerEnv`.
 
 ## Per-turn tool access
 
@@ -443,14 +460,100 @@ resources and fake provider credentials, with no real model or approval action.
   expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
   boot and drops `NAME` from the process environment (and from
   `CURIE_CONNECTOR_SECRET_KEYS`) before the session accepts turns, so `Bash`
-  cannot read the PAT. #2635 keeps that in-memory catalog off the claude CLI
-  argv by writing `--mcp-config` JSON to a 0600 tempfile; same-uid `Bash` can
-  still cat the file, and that is accepted. The on-disk catalog keeps the
+  cannot read the PAT. #2635 keeps the CLI's MCP configuration off the claude
+  CLI argv by writing `--mcp-config` JSON to a 0600 tempfile, which same-uid
+  `Bash` can read. So no runner-materialized hosted header reaches that file
+  (#5378): every derived entry whose `Authorization` Bearer or `X-Curie-Caller`
+  the runner expanded, or that carries a resumed turn's
+  `X-Curie-Connector-Grant`, is mounted on the CLI as an in-process SDK MCP
+  server under the same name (`mcp_header_channel.py`). That relay holds the
+  headers only in the runner process, which is not dumpable, and forwards the
+  CLI's MCP messages to that one connector over the client the capability probe
+  uses (`CURIE_CONNECTOR_CA_FILE` trust, no proxy env). The file names the
+  server and nothing else. Tool names, schemas, results, approvals and
+  side-effect classification are unchanged; a dropped connector session is
+  dialed again on the next call. `CURIE_CONNECTOR_TOOL_GRANT` leaves the
+  process environment once a relay holds the grant; the turn-start re-probe
+  keeps the value for its own client. The CLI transport refuses
+  to start when its command line, configuration or environment would carry a
+  relay-held value. Bundle servers and remote connector headers the CLI expands
+  from `${VAR}` keep their existing delivery. The on-disk catalog keeps the
   placeholder. Residual:
   kubelet / `docker -e` still injects the value onto the container until the
   runner process unsets it. ADR-0009 `--secret` names that are not a hosted
   Bearer stay in the environment, because stdio / remote MCP clients still
   expand `${VAR}` there.
+
+## Personal subscription mode
+
+`CURIE_MODEL_AUTH_MODE` selects who authenticates model work (#5373, ADR 0268
+section 1). Unset or `service` is the default and keeps every existing path:
+`CURIE_CREDENTIALS` mapping, provider base URLs, OpenRouter routing and the
+credential-prefix reviewer default. `personal` makes the owner's
+`CLAUDE_CODE_OAUTH_TOKEN` the only model grant. Any other value, including the
+empty string or a different case, is refused at boot and at connect. When the
+inherited env and the explicit SDK env disagree, personal wins.
+
+In personal mode the policy in `personal_auth.py` does the following before the
+CLI starts:
+
+1. `resolve_sdk_env` returns no override and maps nothing, so `CURIE_CREDENTIALS`
+   and a `CURIE_MODEL_ENV_KEY` target are never used as the grant.
+2. An absent, empty or blank grant raises `AuthenticationRequiredError`, whose
+   message starts `authentication required`, even when a working service
+   credential or a saved login is present.
+3. Every competing source is removed from the CLI parent env and from the SDK
+   options env (`is_competing_auth_key`). The `CLAUDE_*` and `ANTHROPIC_*`
+   namespaces, leading underscores ignored, fail closed against a keep-list:
+   model selection, the runner-owned `CLAUDE_CODE_SHELL`,
+   `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, and
+   the installation's `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Every other
+   name there goes, including `CLAUDE_SECURESTORAGE_CONFIG_DIR` (it would keep
+   a stored session live) and subagent model forcing
+   (`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`,
+   `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`), so reviewer roles keep the
+   configured reviewer model. Outside the namespaces, cloud selectors and
+   settings (`AWS_*`, `AZURE_*`, Vertex and Google credential discovery),
+   `CURIE_CREDENTIALS`, `CURIE_MODEL_BASE_URL` and the CLI's OAuth switches go.
+   Installation transport (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`,
+   `NODE_EXTRA_CA_CERTS`) and every other name stay.
+4. `CLAUDE_CONFIG_DIR` and `ANTHROPIC_CONFIG_DIR` point at fresh 0700
+   directories the runner creates per connect and removes on close, so a saved
+   login, a signed-in gateway session, user settings with `apiKeyHelper` and
+   named profiles are excluded.
+5. Workspace `.claude/settings.json` or `.claude/settings.local.json` that sets a
+   credential helper, a forced login, `modelOverrides`, `availableModels`,
+   `fallbackModel`, any `CLAUDE_*` or `ANTHROPIC_*` `env` name (no keep-list,
+   since the workspace is agent writable), or a competing or transport `env`
+   key refuses the launch (`PersonalLaunchRefusedError`). Env names are
+   compared case-insensitively.
+6. Managed policy under `/etc/claude-code` (`managed-settings.json`, then
+   `managed-settings.d/*.json`) that forces gateway login, names a credential
+   helper, `policyHelper` or `policyHelpers`, puts a competing variable, any
+   `ANTHROPIC_*` name or an unlisted `CLAUDE_*` name in `env`, or cannot be
+   read or parsed refuses the launch. Keep-list `CLAUDE_*` names and transport are allowed. A managed
+   `availableModels` must be a list of strings that names both the implementer
+   model (the session `model`) and the reviewer model; otherwise, or when the
+   session has no explicit implementer model, the launch is refused, because
+   the CLI would silently move a role outside the list onto the parent model.
+   Managed `modelOverrides` and `deniedModels` must be absent or empty and
+   `fallbackModel` absent, since the CLI applies each after the guard and any
+   of them can move a role off its configured model. The runner never edits or
+   bypasses it. The pinned CLI 2.1.301 does
+   not read `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, so step 3 removes it and the
+   guard reads only `/etc/claude-code`.
+
+Personal mode also needs an explicit Claude reviewer model in
+`CURIE_REVIEWER_MODEL` (a `claude-*` ID). It is required, sets
+`ANTHROPIC_DEFAULT_OPUS_MODEL` for the factory reviewer roles, and no default
+is derived from the credential. The `--bare` flag is never passed and the
+setting sources stay `user`, `project`, `local` (ADR 0189).
+
+Out of scope here: worker emission of the personal boot env (#5378) and
+containment of the grant inside the sandbox (#5374). Known residual: the CLI
+reloads project and local settings during a session, and the guard inspects
+them only at launch, so a `.claude/settings.local.json` written mid-session is
+not re-inspected. That channel belongs to #5374.
 
 ## Build and smoke
 

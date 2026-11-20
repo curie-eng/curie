@@ -32,6 +32,13 @@ No tracker connection is needed for drafting or installation. Readiness remains
 unvalidated. Connected validation and validated handoff remain #4488 and #4490.
 See the factory bundle README for rendering and provider-specific installation.
 
+On a GitHub ticket the skill posts one marked facts request, classifies the
+answer locally, and applies the trigger label once only when that answer is
+clear. It reports five dimensions separately: publication, facts, selection,
+factory, and deployment validation. Deployment validation stays unvalidated.
+The skill reports factory admission only from the factory's own acknowledgement
+comment. A visible label is not admission.
+
 Publication behavior replay scenarios live in [evals/README.md](evals/README.md).
 They use synthetic tracker state to exercise approval, publication, selection and
 recovery without writing real issues. These are opt-in host-agent evaluations,

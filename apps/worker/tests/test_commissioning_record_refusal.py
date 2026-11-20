@@ -334,17 +334,17 @@ def test_worker_composition_refuses_commissioning_files_and_records(
                 "ca.pem": owned_worker.broker.ca_pem.encode("ascii"),
                 "process.json": canonical(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "database_url": "postgresql+asyncpg://synthetic@127.0.0.1:1/synthetic",
                         "db_schema": "synthetic",
                         "api_base_url": "https://api.example.com",
                         "internal_worker_token": "synthetic-worker-token",
                         "adapter_credentials": {},
-                        "slack": {
-                            "token": "synthetic-slack-token",
-                            "base_url": "",
-                            "identity_tokens": {},
-                            "trusted_origins": [],
+                        "channel_gateway": {
+                            "url": "",
+                            "token": "",
+                            "allow_insecure_http": False,
+                            "identities": [],
                         },
                         "launch_tls": dataclasses.asdict(client._tls),
                     }

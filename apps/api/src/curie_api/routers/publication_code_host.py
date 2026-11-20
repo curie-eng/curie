@@ -44,6 +44,7 @@ from curie_api.publication_pulls import (
 from curie_api.publication_verification import (
     forge_failure,
     publication_base_ref,
+    publication_revision_ids,
     verify_publication_commit,
 )
 from curie_api.schemas.publications import (
@@ -161,6 +162,12 @@ async def read_publication_branch_head(
         base_branch = await publication_base_ref(session, code_host, publication, repository)
         head = await code_host.branch_head(repository, lineage.branch)
     except ForgeError as exc:
+        logger.warning(
+            "Publication branch lookup failed publication_id=%s error=%s reason=%s",
+            publication.id,
+            type(exc).__name__,
+            str(exc) or type(exc).__name__,
+        )
         raise forge_failure(exc) from None
     return PublicationBranchHeadOut(head_sha=head, base_branch=base_branch)
 
@@ -173,11 +180,17 @@ async def verify_publication_revision(
     session: SessionDep,
     response: Response,
 ) -> PublicationRevisionOut:
-    """Prove the marked revision and its authoritative publication parent."""
+    """Prove the marked revision and its authoritative publication parent.
+
+    The named revision is the publication's own, or for a publication recovery
+    one of the earlier failed revisions it may adopt (#5429). Only that one
+    revision's marker is accepted, so a caller proving its own push never
+    accepts a predecessor's commit by accident.
+    """
 
     response.headers["Cache-Control"] = "no-store"
     publication, lineage = await _stored(session, publication_id)
-    if data.revision_id != publication.id or data.expected_parent != (
+    if data.revision_id not in publication_revision_ids(publication) or data.expected_parent != (
         publication.expected_prior_head
     ):
         _refuse("revision_mismatch", "the verification names another publication revision")
@@ -190,6 +203,7 @@ async def verify_publication_revision(
             publication,
             commit_sha=data.commit_sha,
             base_branch=base_branch,
+            revision_ids=frozenset({data.revision_id}),
         )
     except PullRequestRefused as refused:
         _refuse(refused.code, refused.message)
@@ -339,6 +353,7 @@ async def recover_publication_pull_request(
                 publication,
                 commit_sha=data.expected_head_sha,
                 base_branch=base_branch,
+                revision_ids=publication_revision_ids(publication),
             )
         contract = PullRequestContract(
             branch=lineage.branch,

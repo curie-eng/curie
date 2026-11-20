@@ -4,6 +4,14 @@ Date: 2026-08-06
 
 Status: Accepted
 
+**Partially amended by [ADR 0274](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0274 adds this opt-in mapping to the Declaration and Triggers sections.
+Approval-card authorization is superseded for this class by targetless refusal.
+Per-hook serialization and rejection of buffered fires remain; this class
+returns `coalesced` without recording a skipped run. Cron keeps its existing
+schedule and overlap rules.
+
 Partially superseded by [ADR 0190](0190-automated-hook-sources-cannot-widen-their-tool-access.md)
 for ordinary-tool authorization of operator-restricted hooks only.
 

@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from curie_internal import sandbox_token
+from curie_internal.factory_phase_view import phase_view
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
@@ -27,12 +28,11 @@ from sqlalchemy import select
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card
-from ..factory_notices import cause_text
+from ..factory_notices import cause_text, retry_successor
 from ..factory_progress import (
     PROGRESS_SCOPE,
     ProgressReport,
     VerificationObservation,
-    phase_view,
     record_report,
     record_verification,
 )
@@ -44,11 +44,6 @@ from ..models import (
     Publication,
     ThreadPublicationLineage,
     WorkItem,
-)
-from ..workitems.lifecycle import (
-    OWNER_LOST_RETRY_LIMIT,
-    owner_lost_streak,
-    owner_lost_successor_admitted,
 )
 
 router = APIRouter(tags=["factory-status"])
@@ -188,14 +183,8 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             )
         )
     terminal = request.terminal_cause if request.terminal_at is not None else None
-    retrying = (
-        request.status == "failed"
-        and terminal == "owner_lost"
-        and 1
-        <= await owner_lost_streak(session, work_item.id, through_sequence=request.sequence)
-        < OWNER_LOST_RETRY_LIMIT
-        and await owner_lost_successor_admitted(session, request)
-    )
+    # Any automatic successor, owner loss or ordinary failure (ADR 0269).
+    retrying = await retry_successor(session, request) is not None
     body = render_card(
         CardInput(
             repo=work_item.repository_path,

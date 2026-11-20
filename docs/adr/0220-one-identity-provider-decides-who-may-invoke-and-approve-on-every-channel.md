@@ -4,6 +4,23 @@ Date: 2026-10-13
 
 Status: Accepted
 
+**Partially amended by [ADR 0281](0281-personal-mode-refusals-offer-self-service-account-linking.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0281 amends section 3's issuance scope by letting a personal-mode tenant
+without a directory-synced identity provider issue a connect token, with the
+Console OIDC issuer as its issuer.
+
+**Partially amended by [ADR 0272](0272-approver-dm-delivery-uses-one-selected-recipient.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0272 amends decision 10's card-location clause by adding one selected
+approver's DM.
+
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 amends decision 10 by defaulting dynamic routes to canonical
+separation, with an audited operator opt-out and narrow current-group
+exemptions.
+
 Partially superseded by [ADR 0246](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md):
 the projection-only choice, HTTP link/connect source, expressly migrated raw-grant
 and role-policy clauses, and migrated enqueue cache authority enumerated there.

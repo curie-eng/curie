@@ -607,9 +607,9 @@ tests:
   - name: sustained low memory headroom fires
     interval: 5m
     input_series:
-      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101"}'
         values: '8+0x6'
-      - series: 'node_memory_MemTotal_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+      - series: 'node_memory_MemTotal_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101"}'
         values: '100+0x6'
     alert_rule_test:
       - eval_time: 20m
@@ -618,7 +618,7 @@ tests:
           - exp_labels:
               component: curie-node
               curie_source: curie-sre-bot
-              instance: k8:9101
+              instance: node.example.com:9101
               severity: page
             exp_annotations:
               summary: Node memory headroom is below 10 percent
@@ -629,9 +629,9 @@ tests:
   - name: ordinary memory usage stays quiet
     interval: 5m
     input_series:
-      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101"}'
         values: '30+0x6'
-      - series: 'node_memory_MemTotal_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+      - series: 'node_memory_MemTotal_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101"}'
         values: '100+0x6'
     alert_rule_test:
       - eval_time: 20m
@@ -641,9 +641,9 @@ tests:
   - name: root disk pressure fires
     interval: 5m
     input_series:
-      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '10+0x6'
-      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '100+0x6'
     alert_rule_test:
       - eval_time: 20m
@@ -653,7 +653,7 @@ tests:
               component: curie-node
               curie_source: curie-sre-bot
               fstype: ext4
-              instance: k8:9101
+              instance: node.example.com:9101
               mountpoint: /
               severity: page
             exp_annotations:
@@ -665,9 +665,9 @@ tests:
   - name: healthy root disk stays quiet
     interval: 5m
     input_series:
-      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '40+0x6'
-      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '100+0x6'
     alert_rule_test:
       - eval_time: 20m
@@ -680,13 +680,13 @@ tests:
   - name: root inode exhaustion fires while bytes are healthy
     interval: 5m
     input_series:
-      - series: 'node_filesystem_files_free{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_files_free{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '4+0x6'
-      - series: 'node_filesystem_files{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_files{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '100+0x6'
-      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '16+0x6'
-      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '100+0x6'
     alert_rule_test:
       - eval_time: 20m
@@ -696,7 +696,7 @@ tests:
               component: curie-node
               curie_source: curie-sre-bot
               fstype: ext4
-              instance: k8:9101
+              instance: node.example.com:9101
               mountpoint: /
               severity: page
             exp_annotations:
@@ -710,9 +710,9 @@ tests:
   - name: healthy root inodes stay quiet
     interval: 5m
     input_series:
-      - series: 'node_filesystem_files_free{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_files_free{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '84+0x6'
-      - series: 'node_filesystem_files{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+      - series: 'node_filesystem_files{curie_source="curie-sre-bot",instance="node.example.com:9101",mountpoint="/",fstype="ext4"}'
         values: '100+0x6'
     alert_rule_test:
       - eval_time: 20m
@@ -722,9 +722,9 @@ tests:
   - name: duplicate node exporter fires
     interval: 5m
     input_series:
-      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9100"}'
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="node.example.com:9100"}'
         values: '30+0x6'
-      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101"}'
         values: '30+0x6'
     alert_rule_test:
       - eval_time: 20m
@@ -743,7 +743,7 @@ tests:
   - name: single intended node exporter stays quiet
     interval: 5m
     input_series:
-      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="node.example.com:9101"}'
         values: '30+0x6'
     alert_rule_test:
       - eval_time: 20m

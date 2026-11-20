@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .factory_progress import PhaseView, StageSlot, pill_for
+from curie_internal.factory_phase_view import PhaseView, StageSlot
+
+from .factory_progress import pill_for
 
 WIDTH, HEIGHT = 878, 300
 _TITLE_MAX = 85
@@ -25,6 +27,15 @@ _CAUSE_MAX = 105
 _STAGE_LEFT = 85
 _STAGE_RIGHT = WIDTH - 85
 _STAGE_Y = 216
+# A row whose labels wrap onto two lines sits higher, so the round labels
+# under the second line stay clear of the footer.
+_WRAPPED_STAGE_Y = 204
+_STAGE_LABEL_MAX = 20
+# Average advance of a 13 px semibold label character, and the clear space
+# kept between two neighbouring stage labels.
+_LABEL_CHAR_PX = 7.5
+_LABEL_GAP_PX = 8
+_LABEL_LINE_PX = 15
 _LEGACY_Y = (150, 190, 230)
 
 _STYLE = """
@@ -44,7 +55,8 @@ _STYLE = """
 .loop-arc.pending { stroke: #8c959f; }
 .loop-arc.live { stroke: #2f81f7; }
 .loop-arc.approved { stroke: #1a7f37; }
-.loop-badge { font-weight: 700; text-anchor: middle; }
+.loop-badge, .badge-halo { font-weight: 700; text-anchor: middle; }
+.badge-halo { fill: #ffffff; stroke: #ffffff; stroke-width: 4px; stroke-linejoin: round; }
 .loop-badge.pending { fill: #8c959f; }
 .loop-badge.live { fill: #2f81f7; }
 .loop-badge.approved { fill: #1a7f37; }
@@ -69,6 +81,7 @@ text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Ar
   .pending .label { fill: #8d96a0; }
   .icon-pending { stroke: #6e7681; }
   .track { stroke: #30363d; }
+  .badge-halo { fill: #0d1117; stroke: #0d1117; }
 }
 """
 
@@ -88,6 +101,7 @@ class CardInput:
     note: str | None
     phase_view: PhaseView
     cause_text: str | None
+    # This failed request's settlement admitted an automatic successor (ADR 0269).
     retrying: bool = False
 
 
@@ -106,10 +120,13 @@ def _elapsed(card: CardInput) -> str:
     return f"{seconds // 60}m {seconds % 60:02d}s"
 
 
-def _stage_xy(index: int, count: int, staged: bool) -> tuple[int, int]:
+def _stage_step(count: int) -> float:
+    return (_STAGE_RIGHT - _STAGE_LEFT) / max(1, count - 1)
+
+
+def _stage_xy(index: int, count: int, staged: bool, row_y: int = _STAGE_Y) -> tuple[int, int]:
     if staged:
-        step = (_STAGE_RIGHT - _STAGE_LEFT) / max(1, count - 1)
-        return round(_STAGE_LEFT + index * step), _STAGE_Y
+        return round(_STAGE_LEFT + index * _stage_step(count)), row_y
     columns = max(3, -(-count // 3))
     return 48 + (index // 3) * ((WIDTH - 80) // columns), _LEGACY_Y[index % 3]
 
@@ -136,18 +153,52 @@ def _icon(state: str, x: int, y: int) -> str:
     return f'<circle class="icon-pending" cx="{cx}" cy="{cy}" r="7"/>'
 
 
-def _stage(index: int, count: int, slot: StageSlot, staged: bool) -> str:
-    x, y = _stage_xy(index, count, staged)
+def _label_lines(label: str, count: int) -> list[str]:
+    """A staged label on one line, or split at a word when it is too wide.
+
+    The split falls at the word boundary that keeps the longer line shortest,
+    so neighbouring labels of a seven stage row do not run into each other.
+    """
+
+    width = _stage_step(count) - _LABEL_GAP_PX
+    words = label.split()
+    if count < 2 or len(label) * _LABEL_CHAR_PX <= width or len(words) < 2:
+        return [label]
+    split = min(
+        range(1, len(words)),
+        key=lambda i: max(len(" ".join(words[:i])), len(" ".join(words[i:]))),
+    )
+    return [" ".join(words[:split]), " ".join(words[split:])]
+
+
+def _row_y(view: PhaseView) -> int:
+    count = len(view.stages)
+    wraps = view.staged and any(len(_label_lines(slot.label, count)) > 1 for slot in view.stages)
+    return _WRAPPED_STAGE_Y if wraps else _STAGE_Y
+
+
+def _stage(index: int, count: int, slot: StageSlot, staged: bool, row_y: int = _STAGE_Y) -> str:
+    x, y = _stage_xy(index, count, staged, row_y)
     phase_attr = "" if staged else f' data-phase="{_text(slot.id)}"'
+    lines = _label_lines(slot.label, count) if staged else [slot.label]
+    if len(lines) == 1:
+        label = _text(slot.label, _STAGE_LABEL_MAX if staged else 40)
+    else:
+        label = "".join(
+            f'<tspan x="{x}" y="{y + 28 + i * _LABEL_LINE_PX}">'
+            f"{_text(line, _STAGE_LABEL_MAX)}</tspan>"
+            for i, line in enumerate(lines)
+        )
     parts = [
         f'<g data-stage="{_text(slot.id)}"{phase_attr} class="stage slot {slot.state}">',
         _icon(slot.state, x, y),
-        f'<text class="label fg" x="{x}" y="{y + 28}">'
-        f"{_text(slot.label, 20 if staged else 40)}</text>",
+        f'<text class="label fg" x="{x}" y="{y + 28}">{label}</text>',
     ]
     if slot.round_label:
+        # Every round label of a wrapped row sits under the second label line.
+        round_y = y + 46 + (_LABEL_LINE_PX if row_y == _WRAPPED_STAGE_Y else 0)
         parts.append(
-            f'<text class="round-label muted" x="{x}" y="{y + 46}">'
+            f'<text class="round-label muted" x="{x}" y="{round_y}">'
             f"{_text(slot.round_label)}</text>"
         )
     parts.append("</g>")
@@ -158,12 +209,14 @@ def _arcs(view: PhaseView) -> list[str]:
     if not view.staged:
         return []
     index = {slot.id: i for i, slot in enumerate(view.stages)}
+    row_y = _row_y(view)
     out: list[str] = []
+    badges: list[str] = []
     for loop in view.loops:
         if loop.kickbacks < 1 or loop.stage_start not in index or loop.stage_review not in index:
             continue
-        rx, ry = _stage_xy(index[loop.stage_review], len(index), True)
-        sx, sy = _stage_xy(index[loop.stage_start], len(index), True)
+        rx, ry = _stage_xy(index[loop.stage_review], len(index), True, row_y)
+        sx, sy = _stage_xy(index[loop.stage_start], len(index), True, row_y)
         top = 126 if loop.review == "wait_ci" else 157
         arc_id = "wait_ci" if loop.review == "wait_ci" else loop.start
         arc_state = "live" if loop.active else "approved" if loop.approved else "pending"
@@ -175,11 +228,13 @@ def _arcs(view: PhaseView) -> list[str]:
         )
         bx = (rx + sx) / 2
         by = top - 5
-        out.append(
+        badges.append(
+            f'<text class="badge-halo" x="{bx:.1f}" y="{by}">{loop.kickbacks}</text>'
             f'<text class="loop-badge {arc_state}" data-loop="{arc_id}" '
             f'x="{bx:.1f}" y="{by}">{loop.kickbacks}</text>'
         )
-    return out
+    # Badges follow every arc on a halo, so an outer arc never crosses an inner badge.
+    return out + badges
 
 
 def render_card(card: CardInput) -> str:
@@ -243,14 +298,15 @@ def render_card(card: CardInput) -> str:
             f'<text class="review-meta muted" x="{WIDTH - 24}" y="91" text-anchor="end">'
             f'{_text(review_text, 52)}</text>'
         )
+    row_y = _row_y(card.phase_view)
     if card.phase_view.staged and card.phase_view.stages:
         start_x, _ = _stage_xy(0, len(card.phase_view.stages), True)
         end_x, _ = _stage_xy(len(card.phase_view.stages) - 1, len(card.phase_view.stages), True)
-        parts.append(f'<path class="track" d="M{start_x} {_STAGE_Y} L{end_x} {_STAGE_Y}"/>')
+        parts.append(f'<path class="track" d="M{start_x} {row_y} L{end_x} {row_y}"/>')
     parts.extend(_arcs(card.phase_view))
     count = len(card.phase_view.stages)
     parts.extend(
-        _stage(i, count, slot, card.phase_view.staged)
+        _stage(i, count, slot, card.phase_view.staged, row_y)
         for i, slot in enumerate(card.phase_view.stages)
     )
     stamp = card.now.astimezone(UTC).strftime("%H:%M:%S")

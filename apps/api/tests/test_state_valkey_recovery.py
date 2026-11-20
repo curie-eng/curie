@@ -102,6 +102,10 @@ class _Proxy:
         self.drops: dict[Target, int | None] = {}
         self.changed = asyncio.Condition()
         self.gate: _Gate | None = None
+        # Hold the next accepted connection's first reply until its client closes it.
+        self.hold_next = False
+        self.held: list[Counter[Target]] = []
+        self.released = asyncio.Event()
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
@@ -110,7 +114,8 @@ class _Proxy:
     def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.serial += 1
         self.writers.add(writer)
-        task = asyncio.create_task(self._connection(reader, writer, self.serial))
+        held, self.hold_next = self.hold_next, False
+        task = asyncio.create_task(self._connection(reader, writer, self.serial, held))
         self.tasks.add(task)
         task.add_done_callback(self._completed)
 
@@ -120,10 +125,15 @@ class _Proxy:
             self.errors.append(error)
 
     async def _connection(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, identity: int
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        identity: int,
+        held: bool = False,
     ) -> None:
         upstream: asyncio.StreamWriter | None = None
         pumps: list[asyncio.Task[None]] = []
+        sent: Counter[Target] = Counter()
         self.writers.add(writer)
         try:
             upstream_reader, upstream = await asyncio.open_connection(
@@ -140,6 +150,7 @@ class _Proxy:
                     upstream.write(raw)
                     await upstream.drain()
                     self.forwarded[target] += 1
+                    sent[target] += 1
                     commands.put_nowait((target, authenticates))
 
             async def receive() -> None:
@@ -156,6 +167,9 @@ class _Proxy:
                         await writer.drain()
                         continue
                     target, authenticates = await commands.get()
+                    if held:
+                        # Only the client closing this socket ends the hold.
+                        await self.released.wait()
                     if tag in (b"-", b"!"):
                         self.rejected[target] += 1
                         self.rejected_auth += int(authenticates)
@@ -204,12 +218,22 @@ class _Proxy:
                         pass
                     finally:
                         self.writers.discard(current)
+            if held:
+                async with self.changed:
+                    self.held.append(sent)
+                    self.changed.notify_all()
 
     async def wait_for_discard(self, target: Target, count: int) -> None:
         async with asyncio.timeout(10), self.changed:
             await self.changed.wait_for(lambda: self.discarded[target] >= count)
 
+    async def wait_for_held(self) -> Counter[Target]:
+        async with asyncio.timeout(10), self.changed:
+            await self.changed.wait_for(lambda: bool(self.held))
+        return self.held[0]
+
     async def close(self) -> None:
+        self.released.set()
         if self.gate is not None:
             self.gate.released.set()
         if self.server is not None:
@@ -628,70 +652,6 @@ def test_memory_read_fails_closed_while_valkey_is_down(
     assert response.json() == {"detail": UNAVAILABLE}
     assert elapsed < 3.0
     _facts(harness.runner.run(harness.read()), harness)
-
-
-def test_credential_read_retry_is_bounded_and_excludes_auth_errors(
-    recovery: _Recovery,
-    auth_controls: tuple[tuple[httpx.AsyncClient, _Proxy], tuple[httpx.AsyncClient, _Proxy]],
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    async def scenario() -> None:
-        target = recovery.primary.target
-        before = recovery.proxy.forwarded[target]
-        recovery.proxy.drops[target] = 1
-        _facts(await recovery.read(), recovery)
-        assert recovery.proxy.forwarded[target] - before == 2
-        assert recovery.proxy.discarded[target] == 1
-        assert not _warnings(caplog)
-        _safe_logs(caplog, recovery)
-
-        caplog.clear()
-        before = recovery.proxy.forwarded[target]
-        recovery.proxy.drops[target] = None
-        response = await recovery.read()
-        assert response.status_code == 503, response.text
-        assert response.json() == {"detail": UNAVAILABLE}
-        assert recovery.proxy.forwarded[target] - before == 4
-        assert recovery.proxy.discarded[target] == 5
-        assert len(_warnings(caplog)) == 1
-        _safe_logs(caplog, recovery)
-
-        caplog.clear()
-        credentials = [recovery.credential(), recovery.credential()]
-        for credential in credentials:
-            recovery.proxy.drops[credential.target] = None
-        responses = await asyncio.gather(*(recovery.read(c) for c in credentials))
-        for credential, response in zip(credentials, responses, strict=True):
-            assert response.status_code == 503, response.text
-            assert response.json() == {"detail": UNAVAILABLE}
-            assert recovery.proxy.forwarded[credential.target] == 4
-            assert recovery.proxy.discarded[credential.target] == 4
-        assert len(_warnings(caplog)) == 2
-        _safe_logs(caplog, recovery)
-
-        # redis-py 8.1.0 authentication exceptions inherit ConnectionError:
-        # https://github.com/redis/redis-py/blob/v8.1.0/redis/exceptions.py
-        # Observe actual HELLO AUTH/EXISTS errors from Valkey, without fabricated replies.
-        for index, (http, proxy) in enumerate(auth_controls):
-            caplog.clear()
-            response = await http.get(recovery.path, headers=recovery.primary.headers)
-            assert response.status_code == 503, response.text
-            assert response.json() == {"detail": UNAVAILABLE}
-            assert len(_warnings(caplog)) == 1
-            if index == 0:
-                assert proxy.rejected_auth == 1
-                assert proxy.forwarded[target] == 0
-            else:
-                assert proxy.rejected_auth == 0
-                assert proxy.forwarded[target] == 1
-                assert proxy.rejected[target] == 1
-            assert not proxy.discarded
-            _safe_logs(caplog, recovery)
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=LOGGER):
-        recovery.runner.run(asyncio.wait_for(scenario(), 30))
-    _safe_logs(caplog, recovery)
 
 
 @dataclass

@@ -54,6 +54,73 @@ def _selection_fingerprint(choice: factory_base.BaseChoice | factory_base.BaseRe
     return hashlib.sha256(intent.encode()).hexdigest()
 
 
+async def base_selection_unchanged(
+    session: AsyncSession,
+    item: WorkItem,
+    *,
+    labels: set[str],
+    default_branch: str | None,
+    settings: Settings,
+) -> bool:
+    if (
+        item.readmit_request_id is not None
+        or item.readmit_base_settle_until is not None
+        or item.base_requested_branch is not None
+        or item.base_requested_source is not None
+        or item.base_label_ignored is not None
+    ):
+        return False
+    policy = work_item_policy(forges_registry(settings), item.tracker_issue, item.repository)
+    try:
+        choice = factory_base.choose_base(labels, factory_base.bases_for(policy), default_branch)
+    except FeedbackUnavailable:
+        return False
+    if isinstance(choice, factory_base.BaseRefusal):
+        return False
+    if item.base_branch is None:
+        return (
+            item.publication_lineage_id is None
+            and item.base_source is None
+            and item.base_commit is None
+            and item.base_resolved_request_id is None
+            and item.base_selection_fingerprint == _selection_fingerprint(choice)
+        )
+    unchanged = (
+        item.base_selection_fingerprint is None
+        and item.base_branch == choice.branch
+        and item.base_source == choice.source
+        and item.base_commit is not None
+        and item.base_resolved_request_id is not None
+    )
+    if not unchanged or item.publication_lineage_id is None:
+        return unchanged
+    blocked = await session.scalar(
+        select(
+            exists().where(
+                FactoryBaseTransition.work_item_id == item.id,
+                or_(
+                    and_(
+                        FactoryBaseTransition.phase.in_(("conflict", "refused")),
+                        FactoryBaseTransition.request_id.in_(
+                            select(ExecutionRequest.id).where(
+                                ExecutionRequest.work_item_id == item.id,
+                                ExecutionRequest.status.in_(
+                                    ("waiting", "running", "cancellation_requested")
+                                ),
+                            )
+                        ),
+                    ),
+                    and_(
+                        transition_blocks(),
+                        FactoryBaseTransition.target_base_ref != choice.branch,
+                    ),
+                ),
+            )
+        )
+    )
+    return blocked is False
+
+
 async def initialize_base_selection(
     session: AsyncSession,
     *,

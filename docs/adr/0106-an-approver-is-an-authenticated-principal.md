@@ -4,6 +4,12 @@ Date: 2026-08-14
 
 Status: Accepted
 
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 realizes the distinct separation policy reserved here. Dynamic routes
+default to canonical separation, with an audited operator opt-out and narrow
+current-group exemptions, leaving ordinary self-confirmations unchanged.
+
 Amended by [ADR 0202](0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md): one new principal kind, `test_driver`, which only an
 explicit approver list accepts.
 
@@ -68,7 +74,7 @@ not only stored, it is model visible.
 
 Only one of the three callers has any authentication behind the name at all.
 The dispatcher runs in Socket Mode, where interactions arrive over Slack's own
-authenticated websocket (`apps/dispatcher/src/curie_dispatcher/app.py:24-27`),
+authenticated websocket (`packages/channel-gateway/src/curie_channel_gateway/slack/app.py:24-27`),
 so Slack really did authenticate the click and the dispatcher really is relaying
 a proven user id. But the API cannot tell that relayed id apart from a typed
 one, because both arrive as the same field on the same credential. **The one

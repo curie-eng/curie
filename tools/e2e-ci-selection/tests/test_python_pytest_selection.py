@@ -31,9 +31,6 @@ ADMITTED_AGENT_RUNTIMES = (ADMITTED_AGENT_RUNTIME, DYNAMIC_BASE_RUNTIME)
 SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
 ADMITTED_AGENT_JOB = "factory-admitted-agent"
 ADMITTED_AGENT_SHARDS = [1, 2, 3, 4, 5, 6, 7]
-RELABEL_REGRESSION = (
-    "test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor"
-)
 
 
 def _invoke_selector(
@@ -110,9 +107,12 @@ CONTAINER_FILES = (
 )
 DRY_RUN_JOB = "python-dry-run-fixture"
 DRY_RUN_FILE = "tools/factory-e2e/tests/test_c4_dry_run.py"
+RESOURCE_RETRY_FILE = "tools/factory-e2e/tests/test_factory_resource_retry.py"
+RETRY_LIVE_FILE = "tools/factory-e2e/tests/test_factory_retry_live.py"
 SHARD_NEIGHBOR = "tools/factory-e2e/tests/test_c4_reinstall_publication.py"
 PRIVATE_IMPORT_STEP = "API private import boundaries"
 ALWAYS_RUN_PYTHON_STEPS = (
+    "Explicit kube-context policy",
     "Alembic revision gate",
     "Ruff",
     "Mypy",
@@ -154,7 +154,10 @@ PYTEST_AGGREGATE_EXPRESSIONS = {
     "container_result": "${{ needs.python-container-fixtures.result }}",
     "ci_policy_selected": "${{ needs.changes.outputs.ci_policy }}",
     "ci_policy_result": "${{ needs.ci-policy.result }}",
+    "ci_policy_files": "${{ needs.changes.outputs.ci_policy_files }}",
     "dry_run_result": "${{ needs.python-dry-run-fixture.result }}",
+    "event_name": "${{ github.event_name }}",
+    "deep": "${{ needs.changes.outputs.deep }}",
 }
 PYTEST_STEP_EXPRESSIONS = {
     "shard": "${{ matrix.shard }}",
@@ -228,7 +231,9 @@ def _needs(job: dict[str, Any]) -> list[str]:
     return [needs] if isinstance(needs, str) else list(needs)
 
 
-SHARDS_SELECTED = "${{ needs.changes.outputs.pytest == 'true' }}"
+SHARDS_SELECTED = (
+    "${{ needs.changes.outputs.pytest == 'true' && needs.changes.outputs.deep == 'true' }}"
+)
 PYTEST_NOT_SELECTED = "steps.python-runtime.outputs.pytest == 'false'"
 DECISION_STEP = "Decide whether compose and pytest are needed"
 
@@ -353,7 +358,8 @@ def test_docs_only_path_runs_impact_readers(tmp_path: Path, path: str) -> None:
         "packages/aci-protocol/src/aci_protocol/wire.py",
         "apps/api/src/curie_api/main.py",
         "apps/worker/src/curie_worker/binding.py",
-        "apps/dispatcher/src/curie_dispatcher/app.py",
+        "packages/channel-gateway/src/curie_channel_gateway/slack/valkey.py",
+        "packages/channel-gateway/src/curie_channel_gateway/slack/app.py",
         "runner/src/curie_runner/session.py",
         "examples/tests/test_example.py",
         "cli/src/main.rs",
@@ -593,6 +599,7 @@ def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
         "Lockfile is up to date",
         "Sync workspace",
         PRIVATE_IMPORT_STEP,
+        "Explicit kube-context policy",
         "CLI pytest file list",
         *MOVED_STATIC_STEPS[1:4],
         # ADR 0232 (#4610) added this gate after the move.
@@ -756,7 +763,10 @@ def _without_runtime_exclusion(arguments: list[str], runtime: str) -> list[str]:
 def _without_owned_runtime_exclusions(arguments: list[str]) -> list[str]:
     expected = {
         *(("--deselect", runtime) for runtime in ADMITTED_AGENT_RUNTIMES),
-        *(("--ignore", runtime) for runtime in (*CONTAINER_FILES, DRY_RUN_FILE)),
+        *(
+            ("--ignore", runtime)
+            for runtime in (*CONTAINER_FILES, DRY_RUN_FILE, RESOURCE_RETRY_FILE, RETRY_LIVE_FILE)
+        ),
     }
     remaining = []
     excluded = []
@@ -934,11 +944,13 @@ def _without_shard_report_arguments(argv: list[str], *, tiers: str | None = None
     return remaining
 
 
-def _selection_expression(expression: str, selected: str, deselect: str) -> bool:
+def _selection_expression(
+    expression: str, selected: str, deselect: str, deep: str = "true",
+) -> bool:
     """Evaluate the Boolean and string operations used by the actual job expressions."""
     # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions
     source = expression.removeprefix("${{").removesuffix("}}").strip()
-    for name, value in (("pytest_deselect", deselect), ("pytest", selected)):
+    for name, value in (("pytest_deselect", deselect), ("pytest", selected), ("deep", deep)):
         source = source.replace(f"needs.changes.outputs.{name}", repr(value))
     source = re.sub(r"!(?!=)", "not ", source).replace("&&", " and ").replace("||", " or ")
 
@@ -983,6 +995,7 @@ CONTAINER_SELECTION_CASES = (
 def test_container_job_has_its_own_setup_without_a_shared_stack() -> None:
     job = _python_job(CONTAINER_JOB)
     assert job["name"] == "Python container fixtures (pytest)"
+    assert job["if"] == SHARDS_SELECTED
     assert _needs(job) == ["changes"]
     assert not job.get("continue-on-error", False)
     assert any(_string(step, "uses") == "actions/checkout@v7" for step in job["steps"])
@@ -1008,25 +1021,18 @@ def test_container_job_has_its_own_setup_without_a_shared_stack() -> None:
 
 @pytest.mark.parametrize(("deselect", "files"), CONTAINER_SELECTION_CASES)
 @pytest.mark.parametrize("selected", ["true", "false"])
-def test_container_job_and_aggregate_use_complete_deselect_tokens(
+def test_container_step_uses_complete_deselect_tokens(
     deselect: str, files: tuple[str, ...], selected: str
 ) -> None:
-    expressions = (
-        _python_job(CONTAINER_JOB)["if"],
-        _named_steps()["Require pytest outcome to match selection"]["env"]["CONTAINER_SELECTED"],
-    )
+    expressions = (_named_steps(CONTAINER_JOB)["Pytest"]["if"],)
     for expression in expressions:
         assert _selection_expression(expression, selected, deselect) == (
             selected == "true" and bool(files)
         )
 
 
-@pytest.mark.parametrize("copy", ["job", "aggregate"])
-def test_container_selection_guard_rejects_substring_membership(copy: str) -> None:
-    expression = (
-        _python_job(CONTAINER_JOB)["if"] if copy == "job" else
-        _named_steps()["Require pytest outcome to match selection"]["env"]["CONTAINER_SELECTED"]
-    )
+def test_container_selection_guard_rejects_substring_membership() -> None:
+    expression = _named_steps(CONTAINER_JOB)["Pytest"]["if"]
     assert _selection_expression(expression, "true", ",".join(CONTAINER_FILES)) is False
     mutated = re.sub(
         r"format\(\s*',\{0\},'\s*,\s*needs\.changes\.outputs\.pytest_deselect\s*\)",
@@ -1109,13 +1115,17 @@ def test_container_caller_follows_real_selection_for_pr_push_and_dispatch(
     assert completed.returncode == 0, completed.stderr
     selection = _outputs(output)
     assert selection["pytest_scope"] == scope
+    assert _selection_expression(
+        _named_steps(CONTAINER_JOB)["Pytest"]["if"],
+        selection["pytest"], selection["pytest_deselect"],
+    ) == bool(files)
     for expression in (
         _python_job(CONTAINER_JOB)["if"],
         _named_steps()["Require pytest outcome to match selection"]["env"]["CONTAINER_SELECTED"],
     ):
         assert _selection_expression(
             expression, selection["pytest"], selection["pytest_deselect"]
-        ) == bool(files)
+        ) == (selection["pytest"] == "true")
     if files:
         caller = tmp_path / "caller"
         caller.mkdir()
@@ -1128,16 +1138,50 @@ def test_container_caller_follows_real_selection_for_pr_push_and_dispatch(
         assert [path for path in argv if path in CONTAINER_FILES] == list(files)
 
 
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_commissioning_crash_case_is_required_without_a_shard_budget(
+    tmp_path: Path, exit_code: int
+) -> None:
+    step = _named_steps(CONTAINER_JOB)["Protected commissioning crash recovery"]
+    assert "if" not in step and not step.get("continue-on-error", False)
+    result, argv = _record_uv_step(tmp_path, step, environment={}, exit_code=exit_code)
+    assert result.returncode == exit_code
+    assert argv == [
+        "run", "python", "-m", "pytest", "-q", "-n", "0", "--durations=25",
+        "cli/tests/local/test_commissioning_claim_execution.py",
+    ]
+
+
+def test_commissioning_crash_step_collects_without_pythonpath() -> None:
+    step = _named_steps(CONTAINER_JOB)["Protected commissioning crash recovery"]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [*shlex.split(_string(step, "run")), "--collect-only"],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "cli/tests/local/test_commissioning_claim_execution.py::"
+        "test_a_hard_killed_executor_is_not_replayed_by_a_fresh_os_process"
+    ) in result.stdout
+
+
 def test_dry_run_job_matches_container_setup_and_runs_only_its_file() -> None:
     job = _python_job(DRY_RUN_JOB)
     assert job["name"] == "Python dry run fixture (pytest)"
+    assert "needs.changes.outputs.deep == 'true'" in job["if"]
     assert _needs(job) == ["changes"]
     assert "python-dry-run-fixture" in _needs(_python_job())
     named = _named_steps(DRY_RUN_JOB)
     container = _named_steps(CONTAINER_JOB)
     for name, step in container.items():
         if name == "Pytest":
-            continue
+            break
         assert named[name] == step, name
     pytest_step = named["Pytest"]
     assert pytest_step["env"] == {
@@ -1159,6 +1203,7 @@ def test_dry_run_selection_rejects_a_substring_deselect_token(copy: str) -> None
         _named_steps()["Require pytest outcome to match selection"]["env"]["DRY_RUN_SELECTED"]
     )
     assert _selection_expression(expression, "true", "") is True
+    assert _selection_expression(expression, "true", "", deep="false") is (copy != "job")
     assert _selection_expression(expression, "true", DRY_RUN_FILE) is False
     for near in (DRY_RUN_FILE + "::test_x", "prefix/" + DRY_RUN_FILE):
         assert _selection_expression(expression, "true", near) is True
@@ -1331,17 +1376,6 @@ def test_admitted_agent_shards_partition_the_module_in_collection_order(tmp_path
     assert len(flattened) == len(whole)
     assert set(flattened) == set(whole)
     assert all(shard == [case for case in whole if case in shard] for shard in shards)
-    prefix = (
-        f"{ADMITTED_AGENT_RUNTIME}::test_continuation_revalidates_current_authority["
-    )
-    continuations = [case for case in whole if case.startswith(prefix)]
-    assert len(continuations) == 6
-    relabel = f"{ADMITTED_AGENT_RUNTIME}::{RELABEL_REGRESSION}"
-    assert whole[whole.index(relabel) - 6 : whole.index(relabel)] == continuations
-    [owner] = [shard for shard in shards if relabel in shard]
-    position = owner.index(relabel)
-    assert position >= 6
-    assert owner[position - 6:position] == continuations
 
 
 @pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
@@ -1445,6 +1479,8 @@ def _assert_owned_kind_modules_excluded(argv: list[str]) -> None:
         "tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "tools/factory-e2e/tests/test_c4_cluster_up.py",
         "tools/factory-e2e/tests/test_c4_forge_instances.py",
+        RESOURCE_RETRY_FILE,
+        RETRY_LIVE_FILE,
         *CONTAINER_FILES,
         DRY_RUN_FILE,
     ):
@@ -1527,6 +1563,9 @@ def _run_pytest_aggregate(
     scope: str = "full",
     plan: tuple[object, object, object] = FULL_PLAN,
     targets: str = "",
+    event_name: str = "merge_group",
+    deep: str = "true",
+    ci_policy_files: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """Record each shard, then run the required job's real aggregate step.
 
@@ -1537,6 +1576,8 @@ def _run_pytest_aggregate(
     the shard ``plan`` (shards, storage shards, full shards) and the
     ``targets`` digest, come only from ``changes``. Container selection is
     evaluated from the real aggregate expression, independently of its result.
+    The default event is a merge group with ``deep`` true, so existing callers
+    keep the queue's rules. An unlabeled pull request passes ``deep`` false.
     """
     step = _named_steps()["Require pytest outcome to match selection"]
     assert _string(step, "if") == "success()"
@@ -1564,6 +1605,9 @@ def _run_pytest_aggregate(
         "container_result": container_result,
         "ci_policy_selected": ci_policy_selected,
         "ci_policy_result": ci_policy_result,
+        "ci_policy_files": ci_policy_files,
+        "event_name": event_name,
+        "deep": deep,
         "dry_run_result": "placeholder",
     }
     literals = {k: v for k, v in step["env"].items() if "${{" not in v}
@@ -1580,6 +1624,9 @@ def _run_pytest_aggregate(
         if dry_run_result is None
         else dry_run_result
     )
+    summary = tmp_path / "github-step-summary"
+    summary.write_text("")
+    environment["GITHUB_STEP_SUMMARY"] = str(summary)
     return _run_bash(_string(step, "run"), environment, tmp_path)
 
 
@@ -1612,7 +1659,9 @@ def test_ci_policy_job_runs_after_changes_without_services() -> None:
     job = _python_job("ci-policy")
     assert job["name"] == "CI policy (workflow meta-tests)"
     assert job["needs"] == ["changes"]
-    assert job["if"] == "${{ needs.changes.outputs.ci_policy == 'true' }}"
+    assert job["if"] == (
+        "${{ needs.changes.outputs.ci_policy == 'true' && needs.changes.outputs.deep == 'true' }}"
+    )
     assert "services" not in job
     assert not job.get("continue-on-error", False)
     steps = job["steps"]
@@ -1847,7 +1896,7 @@ def test_ci_policy_aggregate_mutation_exposes_bypassed_result_check(
     ("true", "", True),
     ("true", CONTAINER_FILES[0], True),
     ("true", CONTAINER_FILES[1], True),
-    ("true", ",".join(CONTAINER_FILES), False),
+    ("true", ",".join(CONTAINER_FILES), True),
     ("false", "", False),
 ])
 @pytest.mark.parametrize("container_result", ["success", "skipped", "failure", "cancelled", ""])
@@ -2182,9 +2231,215 @@ def test_pytest_aggregator_rejects_selected_with_shards_skipped(tmp_path: Path) 
 
 
 def test_shard_download_runs_only_when_pytest_was_selected() -> None:
-    """#3858: an unselected run has no shard artifacts to download."""
+    """#3858, #5574: an unselected or deferred run has no shard artifacts."""
     download = _named_steps()["Download shard results"]
-    assert _string(download, "if") == "needs.changes.outputs.pytest == 'true'"
+    assert _string(download, "if") == (
+        "needs.changes.outputs.pytest == 'true' && needs.changes.outputs.deep == 'true'"
+    )
+
+
+DEFERRED_PREFIX = "Deferred to the merge queue: "
+PYTEST_DEFERRED = DEFERRED_PREFIX + "Python pytest (shard n/6)"
+CONTAINER_DEFERRED = DEFERRED_PREFIX + "Python container fixtures (pytest)"
+DRY_RUN_DEFERRED = DEFERRED_PREFIX + "Python dry run fixture (pytest)"
+POLICY_FILES = "tools/ci-workflow-paths/tests/test_workflow_paths.py"
+POLICY_DEFERRED = (
+    DEFERRED_PREFIX + "CI policy (workflow meta-tests): " + POLICY_FILES
+)
+
+
+def _deferred_lines(tmp_path: Path) -> list[str]:
+    summary = tmp_path / "github-step-summary"
+    if not summary.exists():
+        return []
+    return [
+        line for line in summary.read_text().splitlines() if line.startswith(DEFERRED_PREFIX)
+    ]
+
+
+def _unlabeled(tmp_path: Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    """An unlabeled pull request: deep is false and the four jobs were skipped."""
+    arguments: dict[str, object] = {
+        "event_name": "pull_request",
+        "deep": "false",
+        "selected": "true",
+        "container_result": "skipped",
+        "ci_policy_selected": "true",
+        "ci_policy_result": "skipped",
+        "ci_policy_files": POLICY_FILES,
+        "dry_run_result": "skipped",
+        "shards_result": "skipped",
+        "results_dir": False,
+    }
+    arguments.update(kwargs)
+    return _run_pytest_aggregate(tmp_path, **arguments)  # type: ignore[arg-type]
+
+
+def test_unlabeled_pull_request_defers_each_selected_python_and_policy_job(
+    tmp_path: Path,
+) -> None:
+    result = _unlabeled(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = [PYTEST_DEFERRED, CONTAINER_DEFERRED, DRY_RUN_DEFERRED, POLICY_DEFERRED]
+    assert _deferred_lines(tmp_path) == lines
+    for line in lines:
+        assert line in result.stdout
+
+
+def test_unlabeled_pull_request_with_nothing_selected_prints_no_deferral(
+    tmp_path: Path,
+) -> None:
+    result = _unlabeled(
+        tmp_path,
+        selected="false",
+        ci_policy_selected="false",
+        ci_policy_files="",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    combined = result.stdout + result.stderr + (tmp_path / "github-step-summary").read_text()
+    assert "deferred" not in combined.lower()
+    assert _deferred_lines(tmp_path) == []
+
+
+def test_unlabeled_pull_request_omits_a_deselected_dry_run(tmp_path: Path) -> None:
+    result = _unlabeled(
+        tmp_path,
+        deselect=DRY_RUN_FILE,
+        ci_policy_selected="false",
+        ci_policy_files="",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _deferred_lines(tmp_path) == [PYTEST_DEFERRED, CONTAINER_DEFERRED]
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+@pytest.mark.parametrize(
+    "field",
+    ["shards_result", "container_result", "dry_run_result", "ci_policy_result"],
+)
+def test_unlabeled_pull_request_rejects_a_deferred_job_that_ran(
+    tmp_path: Path, field: str, outcome: str,
+) -> None:
+    result = _unlabeled(tmp_path, **{field: outcome})
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert _deferred_lines(tmp_path) == []
+
+
+def test_unlabeled_pull_request_rejects_a_stray_shard_record(tmp_path: Path) -> None:
+    result = _unlabeled(
+        tmp_path,
+        results_dir=True,
+        shards={1: ("true", "skipped", "skipped", "", "full", "6", "none", "")},
+    )
+    assert result.returncode != 0
+    assert "record" in (result.stdout + result.stderr).lower()
+
+
+def test_unlabeled_pull_request_rejects_a_stray_record_when_nothing_is_selected(
+    tmp_path: Path,
+) -> None:
+    result = _unlabeled(
+        tmp_path,
+        selected="false",
+        ci_policy_selected="false",
+        ci_policy_files="",
+        results_dir=True,
+        shards={1: ("false", "skipped", "skipped", "", "full", "6", "none", "")},
+    )
+    assert result.returncode != 0
+    assert "record" in (result.stdout + result.stderr).lower()
+
+
+@pytest.mark.parametrize("event_name", ["pull_request", "merge_group", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("deep", ["", "TRUE", "yes", "1"])
+def test_aggregate_rejects_a_deep_output_that_is_not_exactly_true_or_false(
+    tmp_path: Path, event_name: str, deep: str,
+) -> None:
+    result = _run_pytest_aggregate(
+        tmp_path,
+        event_name=event_name,
+        deep=deep,
+        selected="false",
+        container_result="skipped",
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        shards_result="skipped",
+        results_dir=False,
+    )
+    assert result.returncode != 0
+    assert "deep" in (result.stdout + result.stderr).lower()
+
+
+@pytest.mark.parametrize("event_name", ["merge_group", "push", "workflow_dispatch"])
+def test_off_pull_request_cannot_defer_python_or_policy(
+    tmp_path: Path, event_name: str,
+) -> None:
+    """Removing the off-pull-request rule makes this skip case pass."""
+    result = _unlabeled(tmp_path, event_name=event_name)
+    assert result.returncode != 0
+    assert "deep" in (result.stdout + result.stderr).lower()
+    assert _deferred_lines(tmp_path) == []
+
+
+def _queue_success(tmp_path: Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    arguments: dict[str, object] = {
+        "event_name": "merge_group",
+        "deep": "true",
+        "selected": "true",
+        "container_result": "success",
+        "ci_policy_selected": "true",
+        "ci_policy_result": "success",
+        "ci_policy_files": POLICY_FILES,
+        "dry_run_result": "success",
+        "shards": _all_shards("true", "success"),
+        "shards_result": "success",
+    }
+    arguments.update(kwargs)
+    return _run_pytest_aggregate(tmp_path, **arguments)  # type: ignore[arg-type]
+
+
+def test_merge_group_accepts_selected_python_and_policy_success(tmp_path: Path) -> None:
+    result = _queue_success(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _deferred_lines(tmp_path) == []
+
+
+def test_labeled_pull_request_keeps_the_selected_success_rules(tmp_path: Path) -> None:
+    result = _queue_success(tmp_path, event_name="pull_request")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _deferred_lines(tmp_path) == []
+
+
+@pytest.mark.parametrize("outcome", ["skipped", "failure", "cancelled"])
+@pytest.mark.parametrize(
+    "field",
+    ["shards_result", "container_result", "dry_run_result", "ci_policy_result"],
+)
+def test_merge_group_rejects_a_selected_job_that_did_not_succeed(
+    tmp_path: Path, field: str, outcome: str,
+) -> None:
+    result = _queue_success(tmp_path, **{field: outcome})
+    assert result.returncode != 0, result.stdout + result.stderr
+
+
+def test_merge_group_rejects_a_selected_shard_that_left_no_record(tmp_path: Path) -> None:
+    records = _all_shards("true", "success")
+    del records[4]
+    result = _queue_success(tmp_path, shards=records)
+    assert result.returncode != 0
+    assert "no result" in (result.stdout + result.stderr).lower()
+
+
+@pytest.mark.parametrize("static_result", ["failure", "skipped", "cancelled"])
+def test_unlabeled_deferral_does_not_waive_a_missed_static_gate(
+    tmp_path: Path, static_result: str,
+) -> None:
+    step = _named_steps()[STATIC_REQUIREMENT_STEP]
+    assert "DEEP" not in step.get("env", {})
+    assert "DEEP" not in _string(step, "run")
+    result = _run_bash(_string(step, "run"), {"STATIC_RESULT": static_result}, tmp_path)
+    assert result.returncode != 0
+    assert static_result in result.stdout + result.stderr
 
 
 def test_release_tests_run_in_the_static_job_when_pytest_is_skipped() -> None:

@@ -40,19 +40,20 @@ _TURN_OUTCOMES: Final = [
 ]
 
 
-# Distinct agent names admitted on ``curie.agent.turn.completed`` in one
-# process. Names past the ceiling, and names that are not a short slug, share
-# the reserved ``other`` series. ``unbound`` is the series for a terminal turn
-# that never resolved an agent. Neither reserved value consumes a ceiling slot.
+# Agent-labeled metrics share one process-local admission ceiling. Invalid
+# names and overflow share ``other``; missing agents use ``unbound``. Neither
+# reserved label consumes a ceiling slot.
 _AGENT_LABEL_CEILING: Final = 32
 _AGENT_LABEL_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 _BOUNDED_SEEN: dict[tuple[str, str], dict[str, None]] = {}
+_AGENT_METRIC_LABELS: set[str] = set()
 
 
 def reset_bounded_labels() -> None:
     """Drop process-local bounded-label admissions. Tests only."""
 
     _BOUNDED_SEEN.clear()
+    _AGENT_METRIC_LABELS.clear()
 
 
 def _bounded_agent_label() -> dict[str, Any]:
@@ -107,9 +108,12 @@ _TURN_COMPLETED_ATTRIBUTES = {
     "source": _TURN_SOURCES,
     "outcome": _TURN_OUTCOMES,
 }
-# One agent dimension, on its own instrument, so the fleet-wide turn counter
-# stays unlabeled. The ceiling is the cardinality contract (#2952).
-_AGENT_TURN_ATTRIBUTES = {
+_TURN_DURATION_ATTRIBUTES = {
+    **_TURN_COMPLETED_ATTRIBUTES,
+    "agent": _bounded_agent_label(),
+}
+# The fleet-wide turn counter stays unlabeled (#2952).
+_AGENT_TURN_ATTRIBUTES: dict[str, Any] = {
     "service.name": ["curie-worker"],
     "source": ["worker"],
     "outcome": _TURN_OUTCOMES,
@@ -191,7 +195,17 @@ _ATTACHMENT_LEDGER_ATTRIBUTES = {
 _THREAD_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "source": ["worker"],
-    "outcome": ["acquired", "contended", "timeout", "start", "steer", "finish-race", "observed"],
+    "outcome": [
+        "acquired",
+        "contended",
+        "timeout",
+        "start",
+        "steer",
+        "finish-race",
+        "observed",
+        # #5429: a publication recovery route boots its runtime and opens no turn.
+        "publication-recovery",
+    ],
 }
 _SANDBOX_ATTRIBUTES = {
     "service.name": ["curie-worker"],
@@ -251,7 +265,10 @@ _RUNNER_RPC_ATTRIBUTES = {
 }
 _APPROVAL_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-worker"],
-    "operation": ["request", "resolve", "expire", "suspend", "resume", "observe"],
+    "agent": _bounded_agent_label(),
+    # ``dm_delivery``: an approver DM card that was not posted or not registered
+    # (ADR 0272); it records only ``failure``.
+    "operation": ["request", "resolve", "expire", "suspend", "resume", "observe", "dm_delivery"],
     "outcome": [
         "requested",
         "resolved",
@@ -265,6 +282,7 @@ _APPROVAL_ATTRIBUTES = {
 }
 _APPROVAL_PENDING_ATTRIBUTES = {
     "service.name": ["curie-api"],
+    "agent": _bounded_agent_label(),
     "operation": ["observe"],
     "outcome": ["pending"],
 }
@@ -356,6 +374,8 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+    "/agents/{agent_id}/hooks/{hook}/wake-secret",
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
@@ -391,6 +411,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/identity/turn-authority/check",
     # @spec HTTP-APPROVAL-CONTINUITY-3
     "/v1/internal/identity/approvals",
+    # @spec APPROVER-DM-2
+    "/v1/internal/identity/approvals/{approval_id}/card",
     # @spec HTTP-APPROVAL-CONTINUITY-12
     "/v1/internal/identity/approval-grant/check",
     # @spec HTTP-INVOCATION-EXECUTION-22
@@ -399,6 +421,7 @@ _HTTP_OPERATIONS = [
     "/channels/admission",
     "/channels/token",
     "/channels/turns",
+    "/channels/turns/admission",
     "/cluster-message-replies/{reply_ref}",
     "/config",
     "/connector-capabilities/probes",
@@ -409,6 +432,10 @@ _HTTP_OPERATIONS = [
     "/console/oidc/login",
     "/console/principal",
     "/console/session",
+    "/console/sign-in-methods",
+    # Owner personal Claude enrollment (#5377).
+    "/personal-claude/enrollment",
+    "/coding-instructions",
     "/deploy-targets/list",
     "/deploy-targets/resolve",
     "/deployments",
@@ -422,6 +449,7 @@ _HTTP_OPERATIONS = [
     "/ready",
     "/hooks/{agent_id}/{hook}",
     "/hooks/{agent_id}/{hook}/support",
+    "/hooks/{agent_id}/{hook}/wake",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
     "/langfuse/traces/{trace_id}/eval-case",
@@ -442,6 +470,16 @@ _HTTP_OPERATIONS = [
     "/identity/resolve",
     "/identity/slack-reports",
     "/identity/admin/{tenant_id}/{resource}",
+    "/identity/admin/{tenant_id}/coding-instructions-policy",
+    # Operator code host links and link revocation (#5414).
+    "/identity/admin/{tenant_id}/code-host-links",
+    "/identity/admin/{tenant_id}/links/{link_id}/revoke",
+    "/identity/authorities",
+    "/identity/authorities/{tenant_id}",
+    "/identity/authorities/{tenant_id}/replace",
+    "/identity/authorities/{tenant_id}/retire",
+    "/identity/roles/{tenant_id}/{agent_id}",
+    "/identity/roles/{tenant_id}/{agent_id}/{role}",
     "/directory/binding",
     "/directory/config/{tenant_id}",
     "/directory/credentials",
@@ -452,6 +490,10 @@ _HTTP_OPERATIONS = [
     "/directory/people",
     "/directory/people/status",
     "/directory/namespaces",
+    "/identity/me/links",
+    "/identity/me/links/{link_id}",
+    "/identity/me/github-link",
+    "/identity/me/github-link/callback",
     "/identity/connect/{token}",
     "/identity/connect/{token}/confirm",
     # Team directory sync status (#4584, ADR 0220).
@@ -478,6 +520,9 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publications/{publication_id}/pull-request/metadata",
     "/v1/internal/publications/{publication_id}/branch-head",
     "/v1/internal/publications/{publication_id}/revision-commit",
+    "/v1/internal/publications/{publication_id}/ui-evidence",
+    "/v1/internal/publications/{publication_id}/ui-evidence/images/{ordinal}",
+    "/v1/internal/publications/{publication_id}/ui-evidence/seal",
     "/v1/internal/workspace-recovery/context",
     "/v1/internal/workspace-recovery/outcome",
     "/v1/internal/workspace-recovery/reserve",
@@ -487,11 +532,25 @@ _HTTP_OPERATIONS = [
     "/v1/internal/workspace-recovery/release-reader",
     "/v1/internal/workspace-recovery/claim-collection",
     "/v1/internal/workspace-recovery/finalize-collection",
+    # Publication candidate retention (#5428).
+    "/v1/internal/publication-candidates/context",
+    "/v1/internal/publication-candidates/outcome",
+    "/v1/internal/publication-candidates/reserve",
+    "/v1/internal/publication-candidates/complete",
+    "/v1/internal/publication-candidates/fail",
+    "/v1/internal/publication-candidates/acquire-reader",
+    "/v1/internal/publication-candidates/release-reader",
+    "/v1/internal/publication-candidates/claim-collection",
+    "/v1/internal/publication-candidates/finalize-collection",
+    "/v1/internal/publication-candidates/recovery",
     "/v1/internal/workspaces/{deployment_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/selection",
     "/v1/internal/work-items/admissions",
     "/v1/internal/work-items/requests/{request_id}",
     "/v1/internal/work-items/{work_item_id}/cancel",
+    # Personal execution owner context and revalidation (#5376).
+    "/v1/internal/work-items/{work_item_id}/personal-context",
+    "/v1/internal/work-items/{work_item_id}/personal-context/revalidate",
     "/v1/internal/work-items/requests/{request_id}/acquire",
     "/v1/internal/work-items/requests/{request_id}/defer",
     "/v1/internal/work-items/requests/{request_id}/start",
@@ -504,6 +563,15 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/internal/work-items/issue-read/context",
+    # Requester coding instructions delivery and acknowledgment (#5592).
+    "/v1/internal/work-items/requests/{request_id}/requester-context",
+    "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
+    # Learned rules delivery and acknowledgment (#5798).
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context",
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
+    # Factory Slack run steering (#5414) and kickoff (#5380).
+    "/v1/internal/factory-slack/steer",
+    "/v1/internal/factory-slack/kickoff",
     "/v1/internal/channel-read/context",
     # The thread attachment ledger (ADR 0205).
     "/v1/internal/thread-attachments/query",
@@ -518,15 +586,21 @@ _HTTP_OPERATIONS = [
     "/v1/factory/cards/{token}.svg",
     # Forge credential health (#4630).
     "/forges/credentials/health",
+    "/factory/facts",
     "/remediation-nominations",
     "/remediation-nominations/{nomination_id}",
     "/schedules",
     "/schedules/{agent}/{name}/pause",
     "/schedules/{agent}/{name}/resume",
     "/work-items",
+    "/work-items/completion-contract",
     "/work-items/issue-read",
+    "/work-items/questions",
+    "/work-items/tracker-result",
     "/work-items/{work_item_id}",
     "/work-items/{work_item_id}/usage",
+    "/work-items/{work_item_id}/retry",
+    "/work-items/{work_item_id}/publication-candidates",
     "/work-items/{work_item_id}/recovery",
     "/work-items/{work_item_id}/recovery/{checkpoint_id}",
     "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
@@ -632,16 +706,22 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
     "step": [
         "settle_publications",
         "expire_waiting",
+        "release_provider_gates",
         "request_deadline_cancellations",
         "request_owner_lost_cancellations",
         "publish_terminate_wakes",
         "settle_overdue_cancellations",
+        "redrive_question_rounds",
         "readmit_pending",
+        "drain_answer_retries",
         "reconcile_missed_labels",
         "poll_trackers",
         "sync_status_comments",
         "redispatch_lapsed_acquisitions",
         "reconcile_base_transitions",
+        "expire_tracker_results",
+        "deliver_tracker_results",
+        "hand_off_triage_tickets",
         "publish_execute_wakes",
     ],
 }
@@ -742,6 +822,24 @@ _REMEDIATION_LIFECYCLE_ATTRIBUTES = {
 
 
 _METRICS: dict[str, dict[str, Any]] = {
+    "curie.factory.intake.label_pass.age_seconds": _definition(
+        "gauge",
+        "s",
+        "Age of the last clean repository label pass.",
+        False,
+        {
+            "repository": {
+                "kind": "bounded",
+                "ceiling": 20,
+                "reserved": ["other"],
+                "overflow": "other",
+                "pattern": r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+            }
+        },
+    ),
+    "curie.factory.intake.notice.oldest_owed_age_seconds": _definition(
+        "gauge", "s", "Age of the oldest refused trigger-label notice awaiting delivery.", False, {}
+    ),
     "curie.turn.accepted": _definition(
         "counter", "{turn}", "Turns accepted for processing.", True, _TURN_ATTRIBUTES
     ),
@@ -756,13 +854,14 @@ _METRICS: dict[str, dict[str, Any]] = {
         _TURN_REFUSED_ATTRIBUTES,
     ),
     "curie.turn.duration": _definition(
-        "histogram", "s", "End to end turn duration.", False, _TURN_COMPLETED_ATTRIBUTES
+        "histogram", "s", "End to end turn duration.", False, _TURN_DURATION_ATTRIBUTES
     ),
     "curie.agent.turn.completed": _definition(
         "counter",
         "{turn}",
-        "Terminal turns for one agent. Each process admits at most 32 distinct "
-        "slugs; further slugs, non-slugs, and the reserved names other and unbound "
+        "Terminal turns for one agent. Agent-labeled metrics in each process share "
+        "at most 32 distinct slugs; further slugs, non-slugs, and the reserved "
+        "names other and unbound "
         "share other. A turn with no resolved agent is unbound. The cap is per "
         "process, so a fleet query can still fold a slug into other on one worker.",
         True,
@@ -1088,19 +1187,41 @@ def _admit_bounded(metric: str, key: str, spec: Mapping[str, Any], value: str) -
     """Map one label onto the declared ceiling without raising."""
 
     overflow = str(spec["overflow"])
-    reserved = spec["reserved"]
-    if value in reserved:
-        return value
+    admission_key = ("agent", key) if key == "agent" else (metric, key)
+    seen = _BOUNDED_SEEN.setdefault(admission_key, {})
     pattern = re.compile(str(spec.get("pattern") or _AGENT_LABEL_RE.pattern))
-    if pattern.fullmatch(value) is None:
-        return overflow
-    seen = _BOUNDED_SEEN.setdefault((metric, key), {})
-    if value in seen:
-        return value
-    if len(seen) >= int(spec["ceiling"]):
-        return overflow
-    seen[value] = None
-    return value
+    if value in spec["reserved"]:
+        normalized = value
+    elif pattern.fullmatch(value) is None:
+        normalized = overflow
+    elif value not in seen and len(seen) >= int(spec["ceiling"]):
+        normalized = overflow
+    else:
+        seen[value] = None
+        normalized = value
+    if key == "agent":
+        _AGENT_METRIC_LABELS.add(normalized)
+    return normalized
+
+
+def agent_metric_label(agent_name: str | None) -> str:
+    """Normalize an agent name into the shared process-local metric domain."""
+
+    if not agent_name:
+        label = "unbound"
+    elif agent_name in {"other", "unbound"}:
+        label = "other"
+    else:
+        label = agent_name
+    return _admit_bounded(
+        "curie.agent.turn.completed", "agent", _AGENT_TURN_ATTRIBUTES["agent"], label
+    )
+
+
+def observed_agent_metric_labels() -> frozenset[str]:
+    """Labels used in this process, including reserved and overflow labels."""
+
+    return frozenset(_AGENT_METRIC_LABELS)
 
 
 def record_metric(

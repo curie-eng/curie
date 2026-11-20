@@ -133,13 +133,14 @@
 {{- end -}}
 
 {{/* The Slack env entries for one workload: dict "root" "workload". The
-     dispatcher gets all three tokens per identity; the worker and API get only
-     bot tokens. */}}
+     dispatcher gets all three credentials; the gateway gets bot tokens.
+     API and worker receive declarations only. */}}
 {{- define "curie.env.slack" -}}
 {{- $root := .root -}}
 {{- $dispatcher := eq .workload "dispatcher" -}}
 {{- $ids := include "curie.slack.identities" $root | fromJson -}}
 {{- range $item := $ids.items }}
+{{- if or $dispatcher (eq $.workload "gateway") }}
 {{- if $dispatcher }}
 - name: {{ $item.appEnv }}
   valueFrom:
@@ -150,6 +151,7 @@
   valueFrom:
     secretKeyRef:
       {{- include "curie.secretRef" (dict "root" $root "existingSecret" $item.botSecret "existingSecretKey" $item.botKey "defaultKey" "slackBotToken") | nindent 6 }}
+{{- end }}
 {{- if and $dispatcher $item.signingEnv }}
 - name: {{ $item.signingEnv }}
   valueFrom:

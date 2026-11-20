@@ -4,6 +4,8 @@ Date: 2026-11-02
 
 Status: Accepted
 
+Superseded in part by [ADR 0267](0267-an-email-reply-answers-an-approval-under-the-http-approver-role.md): decision 6's sentence "Approval answers by email reply are not added." An email turn may raise an approval, and an email reply answers it through a signed email approval answer proof under the agent's approver role.
+
 Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
 approval by Junwon Jung (jw3329), including merging alongside its realizing
 code path in one combined pull request. The realizing code path is

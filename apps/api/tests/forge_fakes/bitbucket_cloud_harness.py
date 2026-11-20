@@ -125,6 +125,9 @@ class BitbucketCloudHarness:
     def close_pull_request(self, pull_request: PullRequestRef, *, merged: bool) -> None:
         self.fake.set_state(int(pull_request.number), "MERGED" if merged else "DECLINED")
 
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        return self._tracker.comment(issue, actor, body)
+
     def add_foreign_comment(
         self, target: ReplyTarget, author: Actor, marker: str, body: str
     ) -> None:
@@ -154,3 +157,15 @@ class BitbucketCloudHarness:
 
     def write_count(self) -> int:
         return self._ledger.writes + self.fake.writes
+
+    # UI evidence hosting is declared unsupported on this host, and its commit
+    # read reports no tree, so there is nothing to observe from outside.
+
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return None
+
+    def evidence_ref(self, key: str) -> str | None:
+        return None
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        return None

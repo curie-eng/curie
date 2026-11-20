@@ -6,11 +6,12 @@
 ``extensions.agents.x-k8s.io`` for ``SandboxClaim``) via the official client's
 CustomObjectsApi. Unit tests use an in-memory fake of the protocol (the K8s
 control plane is an external service); the real implementation is exercised by
-the k8scratch e2e test.
+the env-gated cluster e2e tests.
 """
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import json
 import logging
@@ -19,6 +20,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -40,17 +42,46 @@ from ..workspace import (
 )
 from .claim_tokens import (
     CLAIM_LABEL,
+    MODEL_AUTH_MODE_ENV,
     ClaimObjectNames,
     claim_object_names,
     claim_template_spec,
     executor_withheld_names,
+    personal_withheld_names,
     split_claim_tokens,
 )
-from .quota import ADMISSION_DIMENSIONS, quota_has_live_headroom, quota_rejection_is_valid
-from .resources import claim_resources_spec, pod_resources, prepare_resources_claim
+from .quota import (
+    ADMISSION_DIMENSIONS,
+    quantity_bytes,
+    quota_has_live_headroom,
+    quota_rejection_is_valid,
+)
+from .resources import (
+    RUNNER_CONTAINER,
+    claim_resources_spec,
+    emptydir_size_limits,
+    pod_ephemeral_storage_limit,
+    pod_resources,
+    prepare_resources_claim,
+    runner_ephemeral_storage_limit,
+    runner_memory_limit,
+    spec_limits,
+)
+from .tool_probe import (
+    PROBE_PREFIX,
+    ProbeResult,
+    ProbeSelection,
+    parse_probe,
+    probe_template,
+    reported_digest,
+)
+from .tool_probe import (
+    digest as probe_digest,
+)
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    MODEL_AUTH_MODE_LABEL,
     CapacityInventory,
     CapacityPod,
     ClaimNameConflict,
@@ -58,11 +89,14 @@ from .types import (
     ClaimView,
     DaemonObjectKind,
     DaemonObjectView,
+    DeliveredLimits,
     KubeTransientError,
     ListableDaemonKind,
     OperatingMode,
     QuotaRejection,
     QuotaStatus,
+    RecordedPod,
+    ResourceExhaustion,
     SandboxError,
     SandboxTermination,
     SandboxView,
@@ -308,6 +342,8 @@ def _sandbox_view(obj: dict[str, Any]) -> SandboxView:
         ready=_conditions_ready(status),
         service_fqdn=status.get("serviceFQDN") or None,
         operating_mode=str((obj.get("spec") or {}).get("operatingMode", "Running")),
+        # The in-cluster headless Service: plain HTTP at the root.
+        transport="http",
     )
 
 
@@ -513,6 +549,178 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
     return None
 
 
+# The kubelet's own eviction sentences (pkg/kubelet/eviction), matched whole.
+# Anything else, including node pressure, names no exhausted limit.
+_QUANTITY_TEXT = r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+|[KMGTPE]i|[numkMGTPE])?"
+_EMPTYDIR_EVICTION = re.compile(
+    rf'Usage of EmptyDir volume "([a-z0-9](?:[a-z0-9.-]{{0,61}}[a-z0-9])?)" '
+    rf'exceeds the limit "({_QUANTITY_TEXT})"\. ?'
+)
+_POD_STORAGE_EVICTION = re.compile(
+    rf"Pod ephemeral local storage usage exceeds the total limit of containers "
+    rf"({_QUANTITY_TEXT})\. ?"
+)
+_CONTAINER_STORAGE_EVICTION = re.compile(
+    rf"Container ([a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?) exceeded its local ephemeral "
+    rf'storage limit "({_QUANTITY_TEXT})"\. ?'
+)
+# DisruptionTarget reasons that name a disruption outside the sandbox: the
+# taint manager, pod garbage collection and an Eviction API call (a node
+# drain). Neither this worker nor the chart evicts sandbox pods through the
+# Eviction API; pressure retirement deletes the claim. TerminationByKubelet
+# (node pressure) and PreemptionByScheduler are deliberately absent.
+_EXTERNAL_DISRUPTION_REASONS = frozenset(
+    {"DeletionByTaintManager", "DeletionByPodGC", "EvictionByEvictionAPI"}
+)
+
+
+def _wire(value: Any) -> Any:
+    """A Kubernetes client model as its camelCase wire dict.
+
+    Raises TypeError for anything that is not a client model, plain JSON data
+    or a list or dict of those, so an unknown object never reads as a spec.
+    """
+
+    if value is None or isinstance(value, str | int | float):
+        return value
+    if isinstance(value, list):
+        return [_wire(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _wire(item) for key, item in value.items()}
+    attribute_map = getattr(value, "attribute_map", None)
+    openapi_types = getattr(value, "openapi_types", None)
+    if not isinstance(attribute_map, dict) or not isinstance(openapi_types, dict):
+        raise TypeError(f"{type(value).__name__} is not a Kubernetes model")
+    return {
+        attribute_map[name]: _wire(getattr(value, name))
+        for name in openapi_types
+        if getattr(value, name) is not None
+    }
+
+
+def _pod_spec(pod: Any) -> dict[str, Any] | None:
+    """The wire spec of a pod read from the API, or None when it has none."""
+
+    try:
+        spec = _wire(getattr(pod, "spec", None))
+    except (TypeError, KeyError):
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
+def _storage_exhaustion(spec: dict[str, Any], message: object) -> ResourceExhaustion | None:
+    """The storage limit an Evicted pod's own status message names, checked against its spec.
+
+    The message limit must equal the spec limit as a quantity, so a message
+    for another limit, a volume the spec does not declare, or a total that
+    differs from the containers' sum names nothing.
+    """
+
+    if not isinstance(message, str):
+        return None
+    scratch = _EMPTYDIR_EVICTION.fullmatch(message)
+    if scratch is not None:
+        volume, text = scratch.groups()
+        declared = emptydir_size_limits(spec).get(volume)
+        stated = quantity_bytes(text)
+        if declared is None or stated != declared:
+            return None
+        return ResourceExhaustion("scratch", volume, declared)
+    total = pod_ephemeral_storage_limit(spec)
+    if total is None:
+        return None
+    pod_level = _POD_STORAGE_EVICTION.fullmatch(message)
+    if pod_level is not None:
+        if quantity_bytes(pod_level.group(1)) != total:
+            return None
+        return ResourceExhaustion("ephemeral_storage", None, total)
+    container_level = _CONTAINER_STORAGE_EVICTION.fullmatch(message)
+    if container_level is not None:
+        container, text = container_level.groups()
+        own = runner_ephemeral_storage_limit(spec)
+        if container != RUNNER_CONTAINER or own is None or quantity_bytes(text) != own:
+            return None
+        return ResourceExhaustion("ephemeral_storage", None, total)
+    return None
+
+
+def _pod_exhaustion(pod: Any, reason: str) -> ResourceExhaustion | None:
+    """Positive identification of what ended the runner, from one readable pod.
+
+    ``reason`` is that same pod's status termination reason. OOMKilled comes
+    only from the runner container's own terminated state, Evicted only from
+    the pod's own status message, and a node disruption only from an
+    allowlisted DisruptionTarget condition. Events never identify anything.
+    """
+
+    spec = _pod_spec(pod)
+    if spec is None:
+        return None
+    status = getattr(pod, "status", None)
+    if reason == "OOMKilled":
+        limit = runner_memory_limit(spec)
+        return None if limit is None else ResourceExhaustion("memory", None, limit)
+    if reason == "Evicted":
+        return _storage_exhaustion(spec, getattr(status, "message", None))
+    for condition in getattr(status, "conditions", None) or []:
+        if (
+            getattr(condition, "type", None) == "DisruptionTarget"
+            and getattr(condition, "status", None) == "True"
+            and getattr(condition, "reason", None) in _EXTERNAL_DISRUPTION_REASONS
+        ):
+            return ResourceExhaustion("node_disruption", None, None)
+    return None
+
+
+def _event_time(event: Any) -> object:
+    return (
+        getattr(getattr(event, "series", None), "last_observed_time", None)
+        or getattr(event, "last_timestamp", None)
+        or getattr(event, "event_time", None)
+        or getattr(getattr(event, "metadata", None), "creation_timestamp", None)
+    )
+
+
+def _bound_storage_eviction(
+    events: Any,
+    *,
+    pod_name: str,
+    recorded: RecordedPod | None,
+    since: datetime,
+    pod: Any = None,
+) -> SandboxTermination | None:
+    """A storage eviction named by the kubelet's own event for the recorded pod.
+
+    The sandbox controller replaces an evicted pod within seconds, so its own
+    status is often gone by the time a dropped stream is diagnosed. The event
+    is accepted only because it is bound to the UID and the limit this worker
+    recorded at start: the reason is exactly Evicted, the involved object is
+    the recorded pod, and the message is the kubelet's sentence in full,
+    stating the limit the recorded spec declares. Anything else names nothing.
+    """
+
+    if recorded is None or not isinstance(recorded.uid, str) or not recorded.uid:
+        return None
+    spec = dict(recorded.spec)
+    for event in getattr(events, "items", None) or []:
+        involved = getattr(event, "involved_object", None)
+        if (
+            getattr(event, "reason", None) != "Evicted"
+            or getattr(involved, "kind", None) != "Pod"
+            or getattr(involved, "name", None) != pod_name
+            or getattr(involved, "uid", None) != recorded.uid
+            or not _recent(_event_time(event), since=since)
+        ):
+            continue
+        message = getattr(event, "message", None)
+        exhaustion = _storage_exhaustion(spec, message)
+        if exhaustion is not None:
+            return SandboxTermination(
+                "Evicted", _safe_pod_message(message, pod), exhaustion=exhaustion
+            )
+    return None
+
+
 def _event_termination(
     events: Any,
     *,
@@ -533,13 +741,7 @@ def _event_termination(
             or (pod_uid is not None and getattr(involved, "uid", None) != pod_uid)
         ):
             continue
-        event_time = (
-            getattr(getattr(event, "series", None), "last_observed_time", None)
-            or getattr(event, "last_timestamp", None)
-            or getattr(event, "event_time", None)
-            or getattr(getattr(event, "metadata", None), "creation_timestamp", None)
-        )
-        if not _recent(event_time, since=since):
+        if not _recent(_event_time(event), since=since):
             continue
         reason = getattr(event, "reason", None)
         if reason in {"Evicted", "OOMKilled", "OOMKilling"}:
@@ -615,6 +817,19 @@ def _daemon_view(kind: DaemonObjectKind, obj: Any) -> DaemonObjectView:
 # threads behind repeated pings (each one fails closed instead).
 _PORT_FORWARDS = threading.BoundedSemaphore(8)
 
+# The capacity inventory's three LISTs run here (#5630): three for each of up to
+# 16 inventories in flight at once, the default per-worker turn concurrency
+# (CURIE_WORKER_MAX_CONCURRENCY). One bounded pool for the process, not one per
+# call: threads start lazily and are reused, so ticks do not grow them. A LIST
+# still queued when its call ends is cancelled and never issues a request. A
+# LIST already reading cannot be interrupted; it finishes in the background on
+# its pool thread within the SDK's own timeouts, its result or error is
+# discarded, and nothing retries it.
+_INVENTORY_LIST_THREADS = 48
+_INVENTORY_POOL = ThreadPoolExecutor(
+    max_workers=_INVENTORY_LIST_THREADS, thread_name_prefix="capacity-inventory"
+)
+
 
 def _owner_ref(api_version: str, kind: str, name: str, uid: str) -> dict[str, str]:
     """An ownerReference with no ``controller`` or ``blockOwnerDeletion``."""
@@ -647,6 +862,175 @@ class KubernetesSandboxClient:
         self._networking_api = k8s_client.NetworkingV1Api(api_client)
         self._node_api = k8s_client.NodeV1Api(api_client)
         self._namespace = namespace
+        self._tool_probe_sandboxes: dict[str, str] = {}
+
+    def inspect_tool_probe(self, pool: str, *, deadline: float) -> ProbeSelection:
+        template = self._pool_template_name(pool, request_timeout_seconds=_claim_timeout(deadline))
+        spec = self._source_template_spec(
+            template, request_timeout_seconds=_claim_timeout(deadline)
+        )
+        return ProbeSelection(
+            pool, template, spec, probe_digest([pool, template, spec]), frozenset()
+        )
+
+    def create_tool_probe(self, name: str, selection: ProbeSelection, *, deadline: float) -> None:
+        """Create a cold claim from the selected image, with no runtime credentials."""
+        spec = probe_template(selection, name)
+        names = claim_object_names(name)
+        labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: name}
+        created = cast(
+            dict[str, Any],
+            self._api.create_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxtemplates",
+                _extension_body(
+                    "SandboxTemplate", {"name": names.template, "labels": labels}, spec
+                ),
+                _request_timeout=_claim_timeout(deadline),
+            ),
+        )
+        owner = _owner_ref(
+            f"{EXT_GROUP}/{EXT_VERSION}",
+            "SandboxTemplate",
+            names.template,
+            created["metadata"]["uid"],
+        )
+        self._api.create_namespaced_custom_object(
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            "sandboxwarmpools",
+            _extension_body(
+                "SandboxWarmPool",
+                {"name": names.pool, "labels": labels, "ownerReferences": [owner]},
+                {"replicas": 0, "sandboxTemplateRef": {"name": names.template}},
+            ),
+            _request_timeout=_claim_timeout(deadline),
+        )
+        self.create_claim(name, pool=names.pool, env={}, labels=labels, deadline=deadline)
+        claim = self._get(
+            EXT_GROUP,
+            EXT_VERSION,
+            "sandboxclaims",
+            name,
+            request_timeout_seconds=_claim_timeout(deadline),
+        )
+        if claim is None:
+            raise ValueError("observation claim disappeared")
+        self._api.patch_namespaced_custom_object(
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            "sandboxtemplates",
+            names.template,
+            {
+                "metadata": {
+                    "ownerReferences": [
+                        _owner_ref(
+                            f"{EXT_GROUP}/{EXT_VERSION}",
+                            "SandboxClaim",
+                            name,
+                            claim["metadata"]["uid"],
+                        )
+                    ]
+                }
+            },
+            _request_timeout=_claim_timeout(deadline),
+        )
+
+    def read_tool_probe(self, sandbox: str, *, deadline: float) -> ProbeResult | None:
+        """Read only the fixed result and the cluster-reported container identity."""
+        pod = self._core_api.read_namespaced_pod(
+            sandbox, self._namespace, _request_timeout=_claim_timeout(deadline)
+        )
+        status, spec = pod.status, pod.spec
+        if status is None or spec is None:
+            return None
+        container = next((c for c in status.container_statuses or [] if c.name == "runner"), None)
+        if container is None or container.state is None or container.state.terminated is None:
+            return None
+        if container.state.terminated.exit_code != 0:
+            raise ValueError("tool observation failed")
+        runner = next(c for c in spec.containers if c.name == "runner")
+        security = runner.security_context
+        user_id = None if security is None else security.run_as_user
+        if user_id is None and spec.security_context is not None:
+            user_id = spec.security_context.run_as_user
+        if type(user_id) is not int:
+            raise ValueError("sandbox user identity unavailable")
+        output = self._core_api.read_namespaced_pod_log(
+            sandbox,
+            self._namespace,
+            container="runner",
+            limit_bytes=4096,
+            _request_timeout=_claim_timeout(deadline),
+        )
+        if not isinstance(container.image_id, str):
+            raise ValueError("runner image identity unavailable")
+        present, platform = parse_probe(output)
+        return ProbeResult(present, reported_digest(container.image_id), platform, user_id)
+
+    def delete_tool_probe(self, name: str, *, deadline: float) -> bool:
+        if not name.startswith(PROBE_PREFIX):
+            raise ValueError("invalid observation claim")
+        claim = self.get_claim(name, request_timeout_seconds=_claim_timeout(deadline))
+        if claim is not None and claim.sandbox_name is not None:
+            self._tool_probe_sandboxes[name] = claim.sandbox_name
+        sandbox = self._tool_probe_sandboxes.get(name)
+        try:
+            self._api.delete_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxclaims",
+                name,
+                body=k8s_client.V1DeleteOptions(propagation_policy="Foreground"),
+                _request_timeout=_claim_timeout(deadline),
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status != 404:
+                raise
+        self._rollback_delete("sandboxtemplates", claim_object_names(name).template)
+        while True:
+            claim = self.get_claim(name, request_timeout_seconds=_claim_timeout(deadline))
+            pod: Any = None
+            if sandbox is not None:
+                pod = self._get(
+                    CORE_GROUP,
+                    CORE_VERSION,
+                    "sandboxes",
+                    sandbox,
+                    request_timeout_seconds=_claim_timeout(deadline),
+                )
+                if pod is None:
+                    try:
+                        pod = self._core_api.read_namespaced_pod(
+                            sandbox, self._namespace, _request_timeout=_claim_timeout(deadline)
+                        )
+                    except k8s_client.ApiException as exc:
+                        if exc.status != 404:
+                            raise
+            names = claim_object_names(name)
+            template = self._get(
+                EXT_GROUP,
+                EXT_VERSION,
+                "sandboxtemplates",
+                names.template,
+                request_timeout_seconds=_claim_timeout(deadline),
+            )
+            pool = self._get(
+                EXT_GROUP,
+                EXT_VERSION,
+                "sandboxwarmpools",
+                names.pool,
+                request_timeout_seconds=_claim_timeout(deadline),
+            )
+            if claim is None and pod is None and template is None and pool is None:
+                self._tool_probe_sandboxes.pop(name, None)
+                return True
+            time.sleep(min(0.2, _claim_timeout(deadline)))
 
     def _resources_pool(
         self,
@@ -735,8 +1119,9 @@ class KubernetesSandboxClient:
         executor_secret_names: frozenset[str] | None = None,
         executor_withheld: frozenset[str] = frozenset(),
         tool_daemon: ToolDaemonMount | None = None,
-    ) -> ClaimObjectNames:
-        """Write the per-claim template, token Secret and pool; return their names.
+        personal_mode: bool = False,
+    ) -> tuple[ClaimObjectNames, frozenset[str]]:
+        """Write the claim objects; return names and personal credential names.
 
         The source template is the one ``pool``'s ``sandboxTemplateRef`` names,
         so per-agent connector ``secretKeyRef`` entries (#1488) survive the copy.
@@ -753,6 +1138,9 @@ class KubernetesSandboxClient:
         source_spec = self._source_template_spec(
             source_name, request_timeout_seconds=_claim_timeout(deadline)
         )
+        personal_withheld = (
+            personal_withheld_names(source_spec) if personal_mode else frozenset()
+        )
         spec = claim_template_spec(
             source_spec,
             secret_name=names.secret,
@@ -762,6 +1150,7 @@ class KubernetesSandboxClient:
             executor_secret_names=executor_secret_names,
             executor_withheld=executor_withheld,
             tool_daemon=tool_daemon,
+            personal_mode=personal_mode,
         )
         labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: claim}
         try:
@@ -824,7 +1213,7 @@ class KubernetesSandboxClient:
         except Exception:
             self._rollback_delete("sandboxtemplates", names.template)
             raise
-        return names
+        return names, personal_withheld
 
     def _pool_template_name(self, pool: str, *, request_timeout_seconds: float) -> str:
         """The template ``pool``'s ``sandboxTemplateRef`` names; a missing pool refuses."""
@@ -884,6 +1273,31 @@ class KubernetesSandboxClient:
             pod["overhead"] = runtime_class_overheads[runtime_class]
         return pod
 
+    def _claim_pod_spec(
+        self,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+        *,
+        request_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """The pod spec the next claim from ``pool`` would run, read only.
+
+        The source template ``pool`` names plus the override, as the claim
+        resolves it. Raises when the template does not resolve.
+        """
+
+        source = self._source_template_spec(
+            self._pool_template_name(pool, request_timeout_seconds=request_timeout_seconds),
+            request_timeout_seconds=request_timeout_seconds,
+        )
+        if runner_resources is not None:
+            if not agent_name:
+                raise ValueError("runner resources require an agent name")
+            source = claim_resources_spec(source, runner_resources)
+        spec: dict[str, Any] = source["podTemplate"]["spec"]
+        return spec
+
     def claim_resources(
         self,
         *,
@@ -894,18 +1308,46 @@ class KubernetesSandboxClient:
     ) -> dict[str, str]:
         del executor_secret_names
         timeout = 1.0
-        source = self._source_template_spec(
-            self._pool_template_name(pool, request_timeout_seconds=timeout),
-            request_timeout_seconds=timeout,
+        return pod_resources(
+            self._capacity_pod_spec(
+                self._claim_pod_spec(
+                    pool, runner_resources, agent_name, request_timeout_seconds=timeout
+                ),
+                runtime_class_overheads={},
+                request_timeout_seconds=timeout,
+            )
         )
-        if runner_resources is not None:
-            if not agent_name:
-                raise ValueError("runner resources require an agent name")
-            source = claim_resources_spec(source, runner_resources)
-        return pod_resources(self._capacity_pod_spec(
-            source["podTemplate"]["spec"], runtime_class_overheads={},
-            request_timeout_seconds=timeout,
-        ))
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        return spec_limits(
+            self._claim_pod_spec(pool, runner_resources, agent_name, request_timeout_seconds=1.0)
+        )
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        """The limits in the pod's own spec, which a warm pod may hold apart from its template."""
+
+        try:
+            pod = self._core_api.read_namespaced_pod(
+                name,
+                self._namespace,
+                _request_timeout=request_timeout_seconds,
+            )
+        except Exception:  # noqa: BLE001 - an unread pod is an unobserved limit
+            return None
+        spec = _pod_spec(pod)
+        if spec is None:
+            return None
+        limits = spec_limits(spec)
+        uid = getattr(getattr(pod, "metadata", None), "uid", None)
+        if isinstance(uid, str) and uid:
+            limits = replace(limits, recorded=RecordedPod(uid=uid, spec=spec))
+        return limits
 
     def capacity_inventory(
         self,
@@ -923,23 +1365,81 @@ class KubernetesSandboxClient:
                 raise TimeoutError("sandbox capacity inventory deadline expired")
             return remaining
 
-        claims = cast(
-            dict[str, Any],
-            self._api.list_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
-                _request_timeout=budget(),
-            ),
-        )["items"]
-        sandboxes = cast(
-            dict[str, Any],
-            self._api.list_namespaced_custom_object(
-                CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
-                _request_timeout=budget(),
-            ),
-        )["items"]
-        pods = self._core_api.list_namespaced_pod(
-            self._namespace, _request_timeout=budget()
-        ).items
+        def list_claims() -> list[dict[str, Any]]:
+            return cast(
+                dict[str, list[dict[str, Any]]],
+                self._api.list_namespaced_custom_object(
+                    EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
+                    _request_timeout=budget(),
+                ),
+            )["items"]
+
+        def list_sandboxes() -> list[dict[str, Any]]:
+            return cast(
+                dict[str, list[dict[str, Any]]],
+                self._api.list_namespaced_custom_object(
+                    CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
+                    _request_timeout=budget(),
+                ),
+            )["items"]
+
+        def list_pods() -> list[k8s_client.V1Pod]:
+            try:
+                return self._core_api.list_namespaced_pod(
+                    self._namespace, _request_timeout=budget()
+                ).items
+            except k8s_client.ApiException as exc:
+                if exc.status in _TRANSIENT_STATUSES:
+                    raise KubeTransientError(f"kube API {exc.status} listing pods") from exc
+                raise
+
+        # The three LISTs run concurrently (#5630): issued one after another,
+        # three healthy reads were summed against the one total budget, so
+        # ordinary API latency failed admission and maintenance. The bound is
+        # unchanged (#5296 Decision 3): each LIST still gets the budget
+        # remaining when it is issued, and an expired budget raises before any
+        # request. The call returns or raises at the first deciding outcome or
+        # the deadline, whichever comes first, never later than the sequential
+        # code would for the same fault. Results are taken in the fixed order
+        # claims, sandboxes, Pods: the first failure whose earlier siblings all
+        # succeeded is raised as-is, and a later LIST's failure never preempts
+        # an earlier one still in flight. Past the deadline the call raises the
+        # same TimeoutError an exhausted budget always has. There is no partial
+        # inventory and no retry. On the way out every LIST is cancelled, so
+        # one still queued never issues a request; one already reading cannot
+        # be interrupted, finishes in the background on its pool thread within
+        # the SDK's own timeouts, and its result or error is discarded. Each
+        # LIST runs in its own copy of the caller's context, as
+        # ``asyncio.to_thread`` would, so context variables set by the caller
+        # (the delivery lease, the active span) stay visible to it.
+        claims_listed = _INVENTORY_POOL.submit(contextvars.copy_context().run, list_claims)
+        sandboxes_listed = _INVENTORY_POOL.submit(
+            contextvars.copy_context().run, list_sandboxes
+        )
+        pods_listed = _INVENTORY_POOL.submit(contextvars.copy_context().run, list_pods)
+        listed: tuple[Future[Any], ...] = (claims_listed, sandboxes_listed, pods_listed)
+        try:
+            while True:
+                for future in listed:
+                    if not future.done():
+                        break
+                    future.result()
+                else:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("sandbox capacity inventory deadline expired")
+                wait(
+                    [future for future in listed if not future.done()],
+                    timeout=remaining,
+                    return_when=FIRST_COMPLETED,
+                )
+        finally:
+            for future in listed:
+                future.cancel()
+        claims = claims_listed.result()
+        sandboxes = sandboxes_listed.result()
+        pods = pods_listed.result()
         footprints: dict[str, dict[str, str]] = {}
         claim_names: set[str] = set()
         runtime_class_overheads: dict[str, dict[str, str]] = {}
@@ -1112,25 +1612,37 @@ class KubernetesSandboxClient:
         _claim_timeout(deadline)  # a spent deadline refuses before any write
         env = filter_agent_child_env(env)
         executor = executor_secret_names is not None
+        personal_mode = not executor and env.get(MODEL_AUTH_MODE_ENV) == "personal"
+        if (labels or {}).get(MODEL_AUTH_MODE_LABEL) == "personal" and not personal_mode:
+            # #5378: a claim recorded as one owner's personal runtime boots only
+            # from the stripped personal template, never the service pool's.
+            raise ValueError("a personal-provenance claim must carry the personal mode env")
         withheld: frozenset[str] = frozenset()
+        if executor or personal_mode:
+            withheld = executor_withheld_names(env)
+        tokens, env = split_claim_tokens(env)
         if executor:
+            tokens = {k: v for k, v in tokens.items() if k not in withheld}
+        if executor or personal_mode:
             # @spec ACTION-EXECUTOR-5: no model credential, its env-key
             # declaration, or a name that declaration points at reaches an
             # executor runner, by claim or template.
-            withheld = executor_withheld_names(env)
             env = {k: v for k, v in env.items() if k not in withheld}
+        if personal_mode:
+            env.pop(MODEL_AUTH_MODE_ENV, None)
         # Scoped tokens never ride the value-only claim (#3842): they go to a
         # per-claim Secret read by a per-claim template copy, which also
         # carries any runner resources override. A token-free claim keeps the
         # chart pool or the per-agent resources pool. An executor claim always
         # takes the per-claim path: claim env cannot remove what the pool
         # template carries, so only its own stripped copy can (ACTION-EXECUTOR-5).
+        # Personal mode always takes a stripped copy, even without a grant, so
+        # the runner cannot inherit the installation's model credential.
         # A Docker-enabled claim takes it too: its daemon client files ride the
         # per-claim Secret, mounted read-only on the runner (ADR 0217).
-        tokens, env = split_claim_tokens(env)
         claim_template: str | None = None
-        if tokens or executor or tool_daemon is not None:
-            claim_names = self._claim_scoped_pool(
+        if tokens or executor or personal_mode or tool_daemon is not None:
+            claim_names, personal_withheld = self._claim_scoped_pool(
                 name,
                 pool,
                 tokens,
@@ -1139,7 +1651,10 @@ class KubernetesSandboxClient:
                 executor_secret_names,
                 withheld,
                 tool_daemon,
+                personal_mode=personal_mode,
             )
+            if personal_mode:
+                env = {k: v for k, v in env.items() if k not in personal_withheld}
             pool = claim_names.pool
             claim_template = claim_names.template
         elif runner_resources is not None:
@@ -1294,7 +1809,12 @@ class KubernetesSandboxClient:
             if exc.status != 404:
                 raise
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self, *, label_selector: str, request_timeout_seconds: float | None = None
+    ) -> list[ClaimView]:
+        bound: dict[str, Any] = (
+            {} if request_timeout_seconds is None else {"_request_timeout": request_timeout_seconds}
+        )
         result = cast(
             dict[str, Any],
             self._api.list_namespaced_custom_object(
@@ -1303,6 +1823,7 @@ class KubernetesSandboxClient:
                 self._namespace,
                 "sandboxclaims",
                 label_selector=label_selector,
+                **bound,
             ),
         )
         return [_claim_view(item) for item in result.get("items", [])]
@@ -1498,7 +2019,12 @@ class KubernetesSandboxClient:
         return None
 
     def pod_termination(
-        self, name: str, *, since: datetime, request_timeout_seconds: float
+        self,
+        name: str,
+        *,
+        since: datetime,
+        request_timeout_seconds: float,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
         """Read exact pod state and a bounded set of its events within one budget."""
 
@@ -1517,16 +2043,26 @@ class KubernetesSandboxClient:
             pod_missing = exc.status == 404
         except Exception:  # noqa: BLE001 - diagnosis is best effort
             pass
-        # since is taken after the original pod was serving, and creation
-        # timestamps truncate to the second, so a pod created at or after it is
-        # a controller replacement. Its status and events describe another pod.
-        if pod is not None and _recent(
-            getattr(getattr(pod, "metadata", None), "creation_timestamp", None), since=since
-        ):
-            return SandboxTermination("Deleted", "replaced by a new pod with the same name")
-        status_termination = _pod_termination(pod, since=since) if pod is not None else None
-        pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
-        event_termination: SandboxTermination | None = None
+        # The recorded pod's own Evicted events, read first: once the pod is
+        # gone or replaced they are the only evidence that names a limit.
+        evictions: Any = None
+        if recorded is not None and recorded.uid and time.monotonic() < deadline:
+            # A name's events list oldest first and a replacement shares the
+            # name, so the kubelet's Evicted event can sit past any first page
+            # of the generic list below. This list holds only that event.
+            try:
+                evictions = self._core_api.list_namespaced_event(
+                    self._namespace,
+                    field_selector=(
+                        f"involvedObject.kind=Pod,involvedObject.name={name},"
+                        f"involvedObject.uid={recorded.uid},reason=Evicted"
+                    ),
+                    limit=10,
+                    _request_timeout=max(0.001, deadline - time.monotonic()),
+                )
+            except Exception:  # noqa: BLE001 - an unread event is no evidence
+                evictions = None
+        events: Any = None
         if time.monotonic() < deadline:
             try:
                 events = self._core_api.list_namespaced_event(
@@ -1535,11 +2071,63 @@ class KubernetesSandboxClient:
                     limit=20,
                     _request_timeout=max(0.001, deadline - time.monotonic()),
                 )
-                event_termination = _event_termination(
-                    events, pod_name=name, pod_uid=pod_uid, since=since, pod=pod
-                )
             except Exception:  # noqa: BLE001 - pod state still provides evidence
-                pass
+                events = None
+        # since is taken after the original pod was serving, and creation
+        # timestamps truncate to the second, so a pod created at or after it is
+        # a controller replacement. Its status and events describe another pod;
+        # only an eviction event bound to the recorded pod still names a limit.
+        if pod is not None and _recent(
+            getattr(getattr(pod, "metadata", None), "creation_timestamp", None), since=since
+        ):
+            bound = _bound_storage_eviction(
+                evictions, pod_name=name, recorded=recorded, since=since
+            )
+            if bound is not None:
+                return bound
+            return SandboxTermination("Deleted", "replaced by a new pod with the same name")
+        result = self._status_or_event_termination(
+            pod, events, name=name, since=since, pod_missing=pod_missing
+        )
+        # A pod status that itself identified something always wins. Otherwise
+        # an Evicted event bound to the UID and limit this worker recorded at
+        # start identifies the storage exhaustion the vanished, unreadable or
+        # not yet terminal pod no longer shows.
+        if result is None or (
+            result.reason in {"Evicted", "Deleted"} and result.exhaustion is None
+        ):
+            pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
+            bound = _bound_storage_eviction(
+                evictions,
+                pod_name=name,
+                recorded=recorded,
+                since=since,
+                pod=pod if recorded is not None and pod_uid == recorded.uid else None,
+            )
+            if bound is not None:
+                if result is not None and result.exit_code is not None:
+                    return replace(bound, exit_code=result.exit_code)
+                return bound
+        return result
+
+    @staticmethod
+    def _status_or_event_termination(
+        pod: Any, events: Any, *, name: str, since: datetime, pod_missing: bool
+    ) -> SandboxTermination | None:
+        """The pod's own status, with its events supplying only a reason and text."""
+
+        status_termination = _pod_termination(pod, since=since) if pod is not None else None
+        if status_termination is not None:
+            status_termination = replace(
+                status_termination,
+                exhaustion=_pod_exhaustion(pod, status_termination.reason),
+            )
+        pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
+        event_termination = (
+            None
+            if events is None
+            else _event_termination(events, pod_name=name, pod_uid=pod_uid, since=since, pod=pod)
+        )
         if status_termination is not None and status_termination.reason not in {
             "Failed",
             "Terminated",
@@ -1550,7 +2138,15 @@ class KubernetesSandboxClient:
             event_termination.reason == "Evicted" or pod is None or status_termination is not None
         ):
             if status_termination is not None and status_termination.exit_code is not None:
-                return replace(event_termination, exit_code=status_termination.exit_code)
+                # Only the pod's own status identifies an exhaustion; the
+                # event chosen for its text never does.
+                return replace(
+                    event_termination,
+                    exit_code=status_termination.exit_code,
+                    exhaustion=status_termination.exhaustion,
+                )
+            if status_termination is not None:
+                return replace(event_termination, exhaustion=status_termination.exhaustion)
             return event_termination
         if pod_missing:
             return SandboxTermination("Deleted")

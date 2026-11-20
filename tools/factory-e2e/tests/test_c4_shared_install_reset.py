@@ -225,7 +225,7 @@ def test_failed_psql_command_shows_only_its_sqlstate(
     run = AdmittedKind(tmp_path / "install", Path(sys.executable))
     run.root.mkdir()
     with pytest.raises(RuntimeError) as failure:
-        run.command(str(kubectl), "--context", "kind-acme", *argv)
+        run.command(str(kubectl), "--context", "kind-ci-fixture", *argv)
     assert str(failure.value) == (
         f"candidate infrastructure command kubectl --context failed{category}; "
         "redacted details retained in the private fixture diagnostics database"

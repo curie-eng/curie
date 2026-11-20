@@ -24,6 +24,7 @@ services:
       - "127.0.0.1:${OIDC_E2E_API_PORT}:8000"
       - "127.0.0.1:${OIDC_E2E_DEX_PORT}:${OIDC_E2E_DEX_PORT}"
     environment:
+      CURIE_CHANNEL_GATEWAY_URL: http://curie-channel-gateway:8081
       CURIE_OIDC_ISSUER: ${CURIE_OIDC_ISSUER}
       CURIE_OIDC_AUDIENCE: ${CURIE_OIDC_AUDIENCE}
       CURIE_OIDC_JWKS_URL: ${CURIE_OIDC_JWKS_URL}
@@ -38,6 +39,13 @@ services:
     ports: !override
       - "127.0.0.1:${OIDC_E2E_UI_PORT}:8080"
 
+  curie-channel-gateway:
+    network_mode: !reset null
+    networks:
+      default: {}
+    environment:
+      CURIE_CHANNEL_GATEWAY_PORT: "8081"
+
   dex:
     profiles: ["core"]
     image: ${OIDC_E2E_DEX_IMAGE}
@@ -45,7 +53,7 @@ services:
     network_mode: "service:curie-api"
     depends_on: [curie-api]
     volumes:
-      - ${OIDC_E2E_DEX_CONFIG}:/etc/dex/config.yaml:ro
+      - dex-config:/etc/dex
 
   postgres:
     ports: !reset []
@@ -53,3 +61,6 @@ services:
     ports: !reset []
   rustfs:
     ports: !reset []
+
+volumes:
+  dex-config:

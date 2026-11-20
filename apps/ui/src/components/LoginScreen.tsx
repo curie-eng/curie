@@ -1,7 +1,8 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { C, R } from "../tokens";
 import { Button, Card, CliHint, cliCommand } from "../primitives";
-import { ApiError, exchangeConsoleLoginCode, type ConsoleSession } from "../api/client";
+import { API_PREFIX } from "../api/config";
+import { ApiError, exchangeConsoleLoginCode, getConsoleSignInMethods, type ConsoleSession } from "../api/client";
 
 // The console's only way in (#1047, ADR-0083). The browser never handles the
 // platform key: an operator mints a single-use login code with the CLI and
@@ -46,6 +47,16 @@ function HintRow({ label, command, children }: { label: string; command: string;
   );
 }
 
+// Same-origin /api so the OIDC cookies land on the console host. return_to is
+// attached only for the two paths the API will honor.
+export function organizationSignInHref(pathname: string): string {
+  const href = `${API_PREFIX}/console/oidc/login`;
+  if (pathname === "/" || pathname === "/settings/claude-plan") {
+    return `${href}?return_to=${encodeURIComponent(pathname)}`;
+  }
+  return href;
+}
+
 function describeFailure(e: unknown): string {
   if (e instanceof ApiError) {
     if (e.status === 401) return e.message;
@@ -66,6 +77,21 @@ export function LoginScreen({
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [oidc, setOidc] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    getConsoleSignInMethods()
+      .then((methods) => {
+        if (live) setOidc(methods.oidc === true);
+      })
+      .catch(() => {
+        if (live) setOidc(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const submit = async () => {
     const trimmed = code.trim();
@@ -127,6 +153,22 @@ export function LoginScreen({
             <CliHint command={cliCommand("cluster.console.login", { subject: EXAMPLE_SUBJECT })} />
           </HintRow>
         </div>
+
+        {oidc ? (
+          <a
+            href={organizationSignInHref(window.location.pathname)}
+            data-testid="console-oidc-sign-in"
+            style={{
+              display: "block",
+              marginBottom: 14,
+              color: C.link,
+              fontSize: 13.5,
+              fontWeight: 500,
+            }}
+          >
+            Sign in with your organization
+          </a>
+        ) : null}
 
         <form onSubmit={onSubmit} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <input

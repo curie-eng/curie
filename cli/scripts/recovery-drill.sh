@@ -13,7 +13,7 @@
 # Never mutates shared controllers, live credentials, or human messages.
 #
 # Usage:
-#   curie dev recovery-drill [--surface local|cluster] [--scenario all|...] \
+#   curie dev recovery-drill [--surface local|cluster] [--context <context>] [--scenario all|...] \
 #     [--bound-seconds 120] [--force] [--json]
 #   bash cli/scripts/recovery-drill.sh --self-test
 set -euo pipefail
@@ -22,6 +22,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # util-linux flock, with its exit statuses, on hosts that ship none (a stock Mac).
 GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
 SURFACE="local"
+KUBE_CONTEXT="${CURIE_E2E_KUBE_CONTEXT:-}"
 SCENARIO="all"
 BOUND_SECONDS=120
 FORCE=0
@@ -55,7 +56,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: recovery-drill.sh [--surface local|cluster] [--scenario all|worker-death|runner-death|timeout-follow-up|valkey-outage|api-restart] [--bound-seconds N] [--force] [--json] [--self-test]
+usage: recovery-drill.sh [--surface local|cluster] [--context <context>] [--scenario all|worker-death|runner-death|timeout-follow-up|valkey-outage|api-restart] [--bound-seconds N] [--force] [--json] [--self-test]
 EOF
 }
 
@@ -92,6 +93,9 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --surface) SURFACE="${2:-}"; shift 2 ;;
+            --context)
+                [[ $# -ge 2 && -n "$2" ]] || die "context flag needs a value"
+                KUBE_CONTEXT="$2"; shift 2 ;;
             --scenario) SCENARIO="${2:-}"; shift 2 ;;
             --bound-seconds) BOUND_SECONDS="${2:-}"; shift 2 ;;
             --force) FORCE=1; shift ;;
@@ -630,9 +634,10 @@ run_cluster() {
     [[ -n "$rel" ]] || die "cluster surface requires CURIE_E2E_RELEASE (task-owned, never curie)"
     refuse_soak "$ns" "$rel"
     if [[ "$FORCE" != "1" ]]; then
-        local ctx
-        ctx="$(kubectl config current-context 2>/dev/null || true)"
-        [[ "$ctx" == "k8scratch" ]] || die "cluster surface refuses kube context '$ctx' (want k8scratch). Pass --force to override."
+        case "$KUBE_CONTEXT" in
+            kind-*|k3d-*|minikube|minikube-*) ;;
+            *) die "cluster surface requires a disposable kind/k3d/minikube context; pass --force for another disposable cluster" ;;
+        esac
     fi
     die "cluster surface is wired to refuse soak ownership; a full Helm install is not started from this drill. Point CURIE_E2E_NAMESPACE/RELEASE at an already-running task-owned install and re-run, or use --surface local."
 }
@@ -647,6 +652,7 @@ main() {
     # `cargo test` can prove the guard without putting `curie` on PATH.
     if [[ "$SURFACE" == "cluster" ]]; then
         refuse_soak "${CURIE_E2E_NAMESPACE:-}" "${CURIE_E2E_RELEASE:-}"
+        [[ -n "$KUBE_CONTEXT" ]] || die "cluster surface requires the context flag or CURIE_E2E_KUBE_CONTEXT"
     fi
     candidate_identity
     resolve_bin

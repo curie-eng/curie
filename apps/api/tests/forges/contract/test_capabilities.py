@@ -3,7 +3,9 @@ raise, and the caller's fallback answers in their place."""
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -18,6 +20,8 @@ from curie_api.forges.capabilities import (
 from curie_api.forges.errors import Unsupported
 from curie_api.forges.types import (
     CheckState,
+    CredentialScope,
+    EvidenceFile,
     RerunOutcome,
     RerunRecord,
     RollupState,
@@ -34,17 +38,50 @@ async def _optional_calls(harness: AdapterHarness) -> dict[Operation, Call]:
     harness.report_checks(pull.head_sha, {"unit": CheckState.FAILURE})
     tracker, code_host, repository = harness.tracker, harness.code_host, harness.repository
     jobs = failed_native_jobs((await code_host.observe_ci(repository, pull.head_sha)).checks)
+
+    async def facts_exchange() -> bool:
+        facts = tracker.facts
+        if facts is None:
+            raise Unsupported(Operation.FACTS_EXCHANGE)
+        return await facts.facts_issue_is_plain(issue)
+
     return {
+        Operation.FACTS_EXCHANGE: facts_exchange,
         Operation.LINK_PULL_REQUEST: lambda: tracker.link_pull_request(issue, pull),
         Operation.DEPENDENCIES: lambda: tracker.dependencies(issue),
         Operation.GROUP_MEMBERSHIP: lambda: tracker.in_group(harness.writer, "starters"),
+        Operation.CREATE_LINKED_ISSUE: lambda: tracker.create_linked_issue(
+            issue,
+            output_identity="capabilities-output",
+            title="Found while triaging",
+            body="Steps to reproduce.",
+            labels=("factory",),
+        ),
+        Operation.CURRENT_INSTALLATION_CREDENTIAL: lambda: (
+            code_host.current_installation_credential(repository)
+        ),
         Operation.CI_DIAGNOSTICS: lambda: code_host.ci_diagnostics(
             repository, pull.head_sha, base_ref=None
         ),
         Operation.RERUN_FAILED: lambda: code_host.rerun_failed(repository, jobs),
         Operation.USER_CAN_WRITE: lambda: code_host.user_can_write(repository, harness.writer),
+        Operation.ACCOUNT_LOGIN: lambda: code_host.account_login(repository, harness.writer.id),
         Operation.REQUIRED_CHECKS: lambda: code_host.required_checks(repository, "main"),
+        Operation.STORE_EVIDENCE: lambda: code_host.store_evidence(
+            repository,
+            key="capabilities",
+            files=[EvidenceFile("before/0000.png", _IMAGE, hashlib.sha256(_IMAGE).hexdigest())],
+            message="Curie UI evidence for publication capabilities\n",
+            stamp=datetime(2026, 11, 3, tzinfo=UTC),
+        ),
+        Operation.DELETE_EVIDENCE: lambda: code_host.delete_evidence(
+            repository, key="capabilities"
+        ),
     }
+
+
+# Bytes only: the port stores what it is given, and validation is the runner's.
+_IMAGE = b"\x89PNG\r\n\x1a\ncapabilities"
 
 
 def _declared(harness: AdapterHarness, operation: Operation) -> Support:
@@ -80,6 +117,24 @@ async def test_no_op_operations_write_nothing_and_unsupported_ones_raise(
             await call()
             continue
         assert harness.write_count() == before, operation
+
+
+@pytest.mark.anyio
+async def test_current_installation_credential_is_a_write_credential_without_forge_writes(
+    harness: AdapterHarness,
+) -> None:
+    operation = Operation.CURRENT_INSTALLATION_CREDENTIAL
+    before = harness.write_count()
+    if supports(harness.code_host.capabilities, operation):
+        credential = await harness.code_host.current_installation_credential(harness.repository)
+        assert credential.scope is CredentialScope.PUSH
+        assert credential.secret
+        assert credential.origin
+    else:
+        with pytest.raises(Unsupported) as refused:
+            await harness.code_host.current_installation_credential(harness.repository)
+        assert refused.value.operation is operation
+    assert harness.write_count() == before
 
 
 @pytest.mark.anyio

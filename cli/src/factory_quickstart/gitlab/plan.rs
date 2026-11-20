@@ -298,14 +298,14 @@ fn describe(plan: &GitlabPlan) -> Vec<String> {
             plan.label.as_deref(),
         ),
     ));
+    for (args, _) in settings(plan) {
+        lines.push(format!("curie {}", args.join(" ")));
+    }
     for args in deploy_argvs(plan, &bundle_path(plan)) {
         lines.push(format!("curie {}", args.join(" ")));
     }
     if plan.label.is_none() {
         lines.push(keep_surface_plan_line("gitlab", &plan.facts.path));
-    }
-    for (args, _) in settings(plan) {
-        lines.push(format!("curie {}", args.join(" ")));
     }
     lines
 }
@@ -588,7 +588,7 @@ async fn execute_gitlab(
         Ok(chart)
     })
     .await?;
-    let credit_remaining_usd = check_credit(release_has_real_model).await;
+    let credit_remaining_usd = check_credit(opts, release_has_real_model).await;
     let held = ensure_factory_agent(
         &common,
         &plan.agent,
@@ -604,6 +604,10 @@ async fn execute_gitlab(
     .await?;
     // A label-less rerun keeps the surface the agent already holds (#4620).
     let kept = surface_to_keep(&held, "gitlab", &plan.facts.path, plan.label.as_deref());
+    // Publication policy must be `auto` before a tracker-result upload.
+    for (args, step) in settings(plan) {
+        run_self(&args, step, None, None).await?;
+    }
     for (index, args) in deploy_argvs(plan, &dir).into_iter().enumerate() {
         if index > 0 && kept.is_some() {
             crate::ui::ui().note(&kept_surface_line(&plan.agent, "gitlab", &plan.facts.path));
@@ -615,9 +619,6 @@ async fn execute_gitlab(
             _ => "Binding the GitLab project".to_string(),
         };
         run_self(&args, &step, None, None).await?;
-    }
-    for (args, step) in settings(plan) {
-        run_self(&args, step, None, None).await?;
     }
     Ok(QuickstartOutput::AgentAdded {
         context: plan.install.context.clone(),

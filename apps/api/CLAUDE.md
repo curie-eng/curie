@@ -91,7 +91,20 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   (`Tracker.read_ticket`; a GitHub issue with an App installation token
   freshly minted only for the recorded installation) and returns it as
   markdown with its link. It stores nothing.
-  State and other scoped credentials do not authorize it, and `wir`
+  The same capability authorizes exactly two sibling routes (ADR 0277,
+  #5586), each repeating the issue check before and after any tracker call.
+  `POST /work-items/completion-contract` answers the execution's completion
+  contract; for a `tracker_result` request the first call reads the source
+  issue's title and body, mints the request's one grant
+  (`factory_tracker_result_grants`) and reserves its one model session
+  (`execution_requests.model_session_reserved_at`), and every later call is
+  409 `session_already_started`. `POST /work-items/tracker-result` seals the
+  request's one result under that grant's fences
+  (`factory_tracker_result_delivery`) and attempts its delivery once; it
+  refuses an implementation request (`not_tracker_result`), a second result
+  (`result_already_submitted`) and a source whose title or body changed
+  (`source_fingerprint_changed`), writing nothing.
+  State and other scoped credentials do not authorize these routes, and `wir`
   authorizes no other route.
 - **Channel read is a scoped credential exception (ADR 0100, #2877).**
   `POST /channel-read` accepts only the API issued `chr` capability in
@@ -108,7 +121,7 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   stored bundle manifest, cached by digest), the binding and provider membership.
   Authorization is surface neutral; a kind is readable only through a
   `channel_read/readers.py` reader that advertises `history-read`, and Slack
-  reads live only in `channel_read/slack_reads.py`. A turn may spend
+  reads live only in `packages/channel-gateway/src/curie_channel_gateway/slack/reads.py`. A turn may spend
   8 pages, a window is at most 7 days, and `limit` defaults to 50 with a 100
   maximum. Refusals are named `channel_read.*` codes; a 429 carries
   `Retry-After`. It stores no message body. State, issue read
@@ -122,7 +135,7 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   download or edit, charges one page per successful operation, and edits only
   a table cell a read recorded in the same logical turn
   (`channel_read/canvas_sections.py`). Slack canvas calls live only in
-  `channel_read/slack_canvas.py`. Each edit is written to
+  `packages/channel-gateway/src/curie_channel_gateway/slack/canvas.py`. Each edit is written to
   `channel_canvas_edits` (attempted, then applied or failed; an unconfirmed
   outcome stays attempted) before and after the Slack call. Retrieved canvas
   content is not stored.
@@ -200,7 +213,10 @@ compose DB once your revision is merged to main.
 
 `Settings` (`config.py`, env-driven) covers the Postgres DSN, the bundle
 store (RustFS/S3 endpoint + bucket), the Langfuse public API base + keys, the
-GitHub webhook secret, `api_key`, `kube_config_path` (empty = no cluster
+Langfuse read API generation (`LANGFUSE_API_VERSION`: `v3`, the default, calls the
+legacy traces/observations/metrics endpoints the compose and chart pin serve;
+`v4` calls Observations API v2 and Metrics API v2, the only read path on
+Langfuse Cloud from 2026-11-16), the GitHub webhook secret, `api_key`, `kube_config_path` (empty = no cluster
 configured, the 503 case above), and `metrics_default_window_hours`.
 
 ## Verify

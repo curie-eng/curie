@@ -142,14 +142,14 @@ def test_real_ci_registers_its_calico_runtime_assertions() -> None:
         [
             "charts/curie/ci/runtime/publication-job-assertions.sh",
             "charts/curie/ci/runtime/connector-readiness-runtime.sh",
+            "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
         ],
     )
 
 
-def test_real_ci_does_not_register_an_assertion_the_parity_ladder_only_covers() -> None:
-    # The general cluster ladder runs on every chart change; it is not proof.
+def test_real_ci_rejects_an_unregistered_runtime_assertion() -> None:
     with pytest.raises(gate.GateError, match="unregistered"):
-        gate.check_registration(CI, ["charts/curie/ci/runtime/metrics-alerts-runtime.sh"])
+        gate.check_registration(CI, [gate.NEGATIVE_UNREGISTERED])
 
 
 def _repo(tmp_path: Path, body: str, script: str = SCRIPT) -> Path:
@@ -344,7 +344,7 @@ def test_self_test_passes_on_the_real_workflow() -> None:
 def test_self_test_refuses_an_unregistered_anchor() -> None:
     # A control anchored on an unregistered script would prove nothing.
     with pytest.raises(gate.GateError, match="unregistered"):
-        gate.self_test(CI, "charts/curie/ci/runtime/metrics-alerts-runtime.sh")
+        gate.self_test(CI, gate.NEGATIVE_UNREGISTERED)
 
 
 CHART_JOB = "e2e-cluster-chart-regressions"
@@ -360,6 +360,7 @@ CHART_RUNTIME_SCRIPTS = [
     "charts/curie/ci/runtime/e2e-connector-identity-runtime.sh",
     "charts/curie/ci/runtime/runner-resources-assertions.sh",
     "charts/curie/ci/runtime/connector-readiness-runtime.sh",
+    "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
     "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
     "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
 ]
@@ -509,10 +510,10 @@ def test_chart_legs_upload_distinct_receipts_the_required_verdict_merges() -> No
     assert download["merge-multiple"] is True
     names = {
         name.replace("${{ github.job }}", CHART_JOB).replace("${{ matrix.leg }}", leg)
-        for leg in ("chart", "upgrade", "workload")
+        for leg in ("chart", "upgrade", "workload-1", "workload-2")
     }
     # Legs that share one artifact name would collide; each leg needs its own.
-    assert len(names) == 3
+    assert len(names) == 4
     for artifact in names:
         assert "${{" not in artifact
         assert fnmatch.fnmatchcase(artifact, download["pattern"]), artifact
@@ -588,6 +589,27 @@ def test_workload_fixture_up_registers_as_a_dedicated_receipted_step(tmp_path: P
     gate.check_registration(_workload_fixture_workflow(tmp_path), [WORKLOAD_INSTALL])
 
 
+@pytest.mark.parametrize("mutation", ["conditional", "nonfatal", "wrong-command"])
+def test_workload_registration_refuses_an_unproved_calico_setup(
+    tmp_path: Path, mutation: str
+) -> None:
+    workflow = _workload_fixture_workflow(tmp_path)
+    document = yaml.safe_load(workflow.read_text())
+    step = next(
+        step for step in document["jobs"][CHART_JOB]["steps"]
+        if step.get("name") == "Install Calico so NetworkPolicy is actually enforced"
+    )
+    if mutation == "conditional":
+        step["if"] = "false"
+    elif mutation == "nonfatal":
+        step["continue-on-error"] = True
+    else:
+        step["run"] = "true"
+    workflow.write_text(yaml.safe_dump(document, sort_keys=False))
+    with pytest.raises(gate.GateError, match="does not install Calico"):
+        gate.check_registration(workflow, [WORKLOAD_INSTALL])
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["down", "missing-action", "extra-argument", "other-command", "suppressed",
@@ -618,7 +640,7 @@ def test_workload_fixture_registration_requires_unconditional_canonical_up(
     elif mutation == "conditional-step":
         step["if"] += " && false"
     elif mutation == "wrong-leg":
-        step["if"] = step["if"].replace("'workload'", "'chart'")
+        step["if"] = step["if"].replace("'workload-1'", "'chart'")
     elif mutation == "continue-on-error":
         step["continue-on-error"] = True
     elif mutation == "unwrapped":

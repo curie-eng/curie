@@ -223,7 +223,12 @@ def issue_case(
         if request.url.path == f"{issue_path}/comments":
             page = int(request.url.params["page"])
             batch = [COMMENTS[page - 1]] if page <= len(COMMENTS) else []
-            headers = {"link": f'<{request.url}>; rel="next"'} if page < len(COMMENTS) else {}
+            last = request.url.copy_set_param("page", str(len(COMMENTS)))
+            headers = (
+                {"link": f'<{request.url}>; rel="next", <{last}>; rel="last"'}
+                if page < len(COMMENTS)
+                else {}
+            )
             return httpx.Response(200, json=batch, headers=headers)
         return httpx.Response(404, json={"message": "Not Found"})
 
@@ -336,7 +341,10 @@ def _replace_execution(case: dict[str, Any], **shape: Any) -> None:
 def _mint(case: dict[str, Any], request_id: uuid.UUID | None = None) -> dict[str, Any]:
     response = case["client"].post(
         MINT_URL,
-        json={"execution_request_id": str(request_id or case["request_id"])},
+        json={
+            "execution_request_id": str(request_id or case["request_id"]),
+            "publication_recovery": False,
+        },
         headers=WORKER_HEADERS,
     )
     assert response.status_code == 200, response.text
@@ -447,6 +455,12 @@ def test_issue_read_reports_the_stored_execution_deadline_and_configured_duratio
             "claim_name": "fixture-claim",
             "sandbox_name": "fixture-sandbox",
             "context": acquire.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text
@@ -696,10 +710,10 @@ def test_mint_requires_the_worker_credential_and_a_live_execution(
     issue_case: dict[str, Any], auth_headers: dict[str, str]
 ) -> None:
     case = issue_case
-    body = {"execution_request_id": str(case["request_id"])}
+    body = {"execution_request_id": str(case["request_id"]), "publication_recovery": False}
     assert case["client"].post(MINT_URL, json=body).status_code == 401
     assert case["client"].post(MINT_URL, json=body, headers=auth_headers).status_code == 401
-    unknown = {"execution_request_id": str(uuid.uuid4())}
+    unknown = {"execution_request_id": str(uuid.uuid4()), "publication_recovery": False}
     assert case["client"].post(MINT_URL, json=unknown, headers=WORKER_HEADERS).status_code == 409
     # Minting at sandbox boot precedes the start grant.
     _, waiting = _insert_execution(

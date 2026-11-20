@@ -1,25 +1,15 @@
-"""User-group approvers resolve with the approval's own Slack identity.
-
-ADR-0168 decision 5: `usergroups:read` is granted per Slack app, and each bot
-is its own app. Slack is the one faked collaborator, behind a real
-`SlackUserGroupClient` over `httpx.MockTransport`, so the token is read off the
-request that left the process.
-"""
-
-from __future__ import annotations
+"""Approval identity routing traverses the real authenticated gateway."""
 
 import asyncio
 import json
-import logging
-from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 
 import httpx
 import pytest
-from curie_api.approvers import ApproverSet, MembershipVerdict
 from curie_api.config import Settings
-from curie_api.identities import slack_bot_tokens
 from curie_api.models import Approval
 from curie_api.slack_approvers import approval_token_identity, build_approver_set_selector
+from curie_test_support.channel_gateway import API_TOKEN, slack_gateway
 
 _GROUP = "S0MGRS001"
 _APPROVER = "U0APPROV1"
@@ -44,37 +34,6 @@ _DECLARED = json.dumps(
     ]
 )
 
-
-class _RecordingEnv(Mapping[str, str]):
-    """An environment that remembers every name it was asked for."""
-
-    def __init__(self, values: Mapping[str, str]) -> None:
-        self._values = dict(values)
-        self.read: list[str] = []
-
-    def __getitem__(self, key: str) -> str:
-        self.read.append(key)
-        return self._values[key]
-
-    def get(self, key: str, default: object = None) -> object:  # type: ignore[override]
-        self.read.append(key)
-        return self._values.get(key, default)
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._values)
-
-    def __len__(self) -> int:
-        return len(self._values)
-
-
-def _settings(*, default_token: str = _DEFAULT_TOKEN, declared: str | None = None) -> Settings:
-    # The chart's reserved name, not the field name: the API reads only it.
-    values: dict[str, object] = {"slack_bot_token": default_token}
-    if declared is not None:
-        values["CURIE_SLACK_IDENTITIES"] = declared
-    return Settings(**values)  # type: ignore[arg-type]
-
-
 def _approval(
     *, kind: str | None = "slack", adapter: str | None = None, endpoint: str | None = None
 ) -> Approval:
@@ -91,44 +50,6 @@ def _approval(
         route="managers",
         card_channel=_CARD_CHANNEL,
     )
-
-
-def _http(calls: list[httpx.Request]) -> httpx.AsyncClient:
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        return httpx.Response(200, json={"ok": True, "users": [_APPROVER]})
-
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-
-def _contains(approver_set: ApproverSet) -> MembershipVerdict:
-    return asyncio.run(approver_set.contains(_APPROVER, _CARD_CHANNEL))
-
-
-def _tokens(calls: list[httpx.Request]) -> list[str]:
-    return [request.headers["Authorization"] for request in calls]
-
-
-def test_a_stock_install_holds_the_default_token_alone_and_reads_no_env() -> None:
-    env = _RecordingEnv({"CURIE_SLACK_BOT_TOKEN__1": "xoxb-stray"})
-
-    assert slack_bot_tokens(_settings(), environ=env) == {"default": _DEFAULT_TOKEN}
-    assert slack_bot_tokens(_settings(default_token=""), environ=env) == {}
-    assert env.read == []
-
-
-def test_a_declared_identity_with_a_blank_token_is_named_and_left_out(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    env = _RecordingEnv({"CURIE_SLACK_BOT_TOKEN__1": ""})
-
-    with caplog.at_level(logging.ERROR, logger="curie_api.identities"):
-        tokens = slack_bot_tokens(_settings(declared=_DECLARED), environ=env)
-
-    assert tokens == {"default": _DEFAULT_TOKEN}
-    text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "ops-bot" in text and "CURIE_SLACK_BOT_TOKEN__1" in text
-    assert _DEFAULT_TOKEN not in text
 
 
 @pytest.mark.parametrize(
@@ -156,77 +77,75 @@ def test_an_approval_resolves_through_its_route_identity(
     )
 
 
-def test_each_identitys_approval_asks_slack_with_its_own_token_and_cache() -> None:
-    calls: list[httpx.Request] = []
-    select = build_approver_set_selector(
-        _http(calls),
-        _settings(declared=_DECLARED),
-        environ={"CURIE_SLACK_BOT_TOKEN__1": _OPS_TOKEN},
-    )
+@contextmanager
+def selection(tokens, *, declared=_DECLARED, configured=True):
+    calls = []
 
-    assert _contains(select(_approval(adapter="ops-bot"), _BINDING)).member
-    assert _tokens(calls) == [f"Bearer {_OPS_TOKEN}"]
-    # A second group lookup under default is its own client and its own cache:
-    # the ops-bot answer above must not stand in for it.
-    assert _contains(select(_approval(adapter=None), _BINDING)).member
-    assert _tokens(calls) == [f"Bearer {_OPS_TOKEN}", f"Bearer {_DEFAULT_TOKEN}"]
-    # And each cache still serves its own identity.
-    assert _contains(select(_approval(adapter="ops-bot"), _BINDING)).member
-    assert len(calls) == 2
+    def provider(request):
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True, "users": [_APPROVER]})
 
-
-def test_an_identity_with_no_token_fails_closed_and_never_borrows_default() -> None:
-    calls: list[httpx.Request] = []
-    select = build_approver_set_selector(
-        _http(calls), _settings(declared=_DECLARED), environ={}
-    )
-
-    verdict = _contains(select(_approval(adapter="ops-bot"), _BINDING))
-
-    assert not verdict.member and verdict.undetermined
-    assert verdict.evidence is not None and "'ops-bot'" in verdict.evidence["error"]
-    assert calls == []
+    with slack_gateway(provider, tokens) as url:
+        settings = Settings(
+            CURIE_CHANNEL_GATEWAY_URL=url if configured else "",
+            CURIE_CHANNEL_GATEWAY_TOKEN=API_TOKEN if configured else "",
+            CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=True,
+            CURIE_SLACK_IDENTITIES=declared,
+        )
+        yield settings, calls
 
 
-def test_an_approval_naming_an_undeclared_identity_fails_closed() -> None:
-    """A stored Slack `reply_adapter` is an identity. One this installation does
-    not declare -- custom-transport history the upgrade leaves as stored, whose
-    adapter was a credential slug -- has no token to resolve with, so it fails
-    closed rather than borrowing default's."""
+def test_each_identitys_approval_asks_slack_with_its_own_token_and_cache():
+    with selection({"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN}) as (settings, calls):
 
-    calls: list[httpx.Request] = []
-    select = build_approver_set_selector(
-        _http(calls),
-        _settings(declared=_DECLARED),
-        environ={"CURIE_SLACK_BOT_TOKEN__1": _OPS_TOKEN},
-    )
+        async def scenario():
+            async with httpx.AsyncClient() as http:
+                select = build_approver_set_selector(http, settings)
+                for identity in ("ops-bot", None, "ops-bot"):
+                    assert (
+                        await select(_approval(adapter=identity), _BINDING).contains(
+                            _APPROVER, None
+                        )
+                    ).member
 
-    verdict = _contains(select(_approval(adapter="agentmail-sandbox"), _BINDING))
-
-    assert not verdict.member and verdict.undetermined
-    assert verdict.evidence is not None and "'agentmail-sandbox'" in verdict.evidence["error"]
-    assert calls == []
-
-
-def test_a_stock_install_builds_the_one_client_it_always_built() -> None:
-    env = _RecordingEnv({})
-    calls: list[httpx.Request] = []
-    select = build_approver_set_selector(_http(calls), _settings(), environ=env)
-
-    assert _contains(select(_approval(), _BINDING)).member
-    assert _tokens(calls) == [f"Bearer {_DEFAULT_TOKEN}"]
-    assert env.read == []
+        asyncio.run(scenario())
+        assert [r.headers["Authorization"] for r in calls] == [
+            f"Bearer {_OPS_TOKEN}",
+            f"Bearer {_DEFAULT_TOKEN}",
+        ]
 
 
-def test_a_slack_free_install_keeps_its_historical_refusal() -> None:
-    calls: list[httpx.Request] = []
-    select = build_approver_set_selector(
-        _http(calls), _settings(default_token=""), environ=_RecordingEnv({})
-    )
+@pytest.mark.parametrize(
+    "identity,tokens",
+    [
+        ("ops-bot", {"default": _DEFAULT_TOKEN}),
+        ("unknown", {"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN}),
+    ],
+)
+def test_unavailable_identity_fails_closed_without_borrowing_default(identity, tokens):
+    with selection(tokens) as (settings, calls):
 
-    verdict = _contains(select(_approval(), _BINDING))
+        async def scenario():
+            async with httpx.AsyncClient() as http:
+                select = build_approver_set_selector(http, settings)
+                verdict = await select(_approval(adapter=identity), _BINDING).contains(
+                    _APPROVER, None
+                )
+                assert not verdict.member and verdict.undetermined
 
-    assert verdict.undetermined
-    assert verdict.evidence is not None
-    assert verdict.evidence["error"] == "no Slack bot token is configured for the API"
-    assert calls == []
+        asyncio.run(scenario())
+        assert not calls
+
+
+def test_a_slack_free_install_fails_closed():
+    with selection({}, configured=False) as (settings, calls):
+
+        async def scenario():
+            async with httpx.AsyncClient() as http:
+                verdict = await build_approver_set_selector(http, settings)(
+                    _approval(), _BINDING
+                ).contains(_APPROVER, None)
+                assert not verdict.member and verdict.undetermined
+
+        asyncio.run(scenario())
+        assert not calls

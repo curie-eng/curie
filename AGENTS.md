@@ -189,10 +189,14 @@ delivery cap is a bug.
 
 ### CI gates
 
-Pull requests run the fast tiers and defer the kind, upgrade and convergence
-tiers to the merge queue, which runs them on the exact merge combination before
-anything lands; add the `ci:deep` label (then push) to run the deep tiers on the
-pull request too.
+Pull requests run the static Python gates and defer the Python pytest shards,
+the container and dry run fixtures, the CI policy tests, and the kind, upgrade
+and convergence tiers to the merge queue, which runs them on the exact merge
+combination before anything lands. Add the `ci:deep` label and then push, or
+close and reopen the pull request, to run all of them on the pull request. A
+pull request with a broad Python change should carry the label before it is
+queued. A pull request targeting a task branch never enters a merge queue, so
+these deferred jobs run there only with the `ci:deep` label.
 
 ## Test policy
 
@@ -624,8 +628,9 @@ required live surface outside that run still needs a run URL or waiver. Run
   referencing AI.** This applies to the PR body as much as to the commits: many
   assistants append a "Generated with" footer to a PR description by default, and
   that footer is a claim of authorship on the artifact a reviewer reads first.
-  Strip it. CI enforces both surfaces on every PR (issue #962); check before
-  pushing with:
+  Strip it. CI runs both checks on every PR and reports the result, but
+  neither is a required status check, so a red result does not block a merge.
+  Check before pushing with:
 
   ```bash
   scripts/check-commit-messages.sh origin/<base>..HEAD
@@ -642,11 +647,10 @@ required live surface outside that run still needs a run URL or waiver. Run
   assistant, the robot-emoji "Generated with" footer, or an attribution phrase next
   to a bare assistant name. Technical references (`CLAUDE.md`, `claude_agent_sdk`,
   `claude-sonnet-5`, `harness.claude`) are deliberately fine, and the script's
-  `--self-test` pins both halves so the distinction cannot silently rot. Scanning
-  the last 150 merged PR bodies flags exactly one, and it is a real footer, so the
-  body half is not a broad net either. A commit range the script cannot resolve is
-  a hard failure naming the range, not a silent pass. It checks only the PR's own
-  commits, so pre-gate history is not retroactively enforced.
+  `--self-test` pins both halves so the distinction cannot silently rot. A commit
+  range the script cannot resolve is a hard failure naming the range, not a
+  silent pass. It checks only the PR's own commits, so pre-gate history is not
+  retroactively enforced.
 2. No dashes/emdashes in prose content; no emojis in code or docs.
 
 ## Ticket implementation

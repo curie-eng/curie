@@ -64,6 +64,7 @@ from redis.asyncio import Redis
 from .. import caller_token
 from ..binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
+    apply_connector_endpoints,
     apply_model_env,
     inject_connector_secrets,
 )
@@ -538,6 +539,14 @@ class EvalStreamConsumer(StreamConsumer):
 
     async def _run_and_report(self, item: EvalJob, stream_id: str) -> EvalRunResult:
         repo = await self._repo_lookup.repo_full_name(item.agent_id)
+        if self._config.factory_model_auth_mode == "personal":
+            # #5378, ADR 0268 decision 1: an eval runs as no owner, so a
+            # personal installation refuses it before any bundle read or
+            # claim. A decision, not a fault: INFO, a failed report, an ack.
+            logger.info("eval %s @ %s refused: personal_owner_required", item.suite, item.sha)
+            refused = EvalRunResult(version=item.sha, suite=item.suite, results=[])
+            await self._report(item, repo, refused, stream_id=stream_id)
+            return refused
         loaded = await self._load_suite(item)
         if loaded is None:
             return await self._report_failed(
@@ -745,7 +754,7 @@ class EvalStreamConsumer(StreamConsumer):
                 )
         except AdmissionUnavailableError:
             raise
-        except SandboxError:
+        except (SandboxError, ValueError):
             logger.exception("could not provision a runner for eval %s", item.sha)
             return None, None, None
         return handle.base_url, release_key, handle.token or None
@@ -795,8 +804,10 @@ class EvalStreamConsumer(StreamConsumer):
         token = None
         if (
             agent_name
-            and self._config.connector_release
-            and self._config.connector_namespace
+            and (
+                self._config.connector_endpoints is not None
+                or (self._config.connector_release and self._config.connector_namespace)
+            )
             and self._config.connector_caller_signing_key.strip()
         ):
             token = caller_token.mint(
@@ -818,6 +829,9 @@ class EvalStreamConsumer(StreamConsumer):
             connector_agent=agent_name,
             connector_caller_token=token,
             approval_required_tools=required_tools,
+        )
+        apply_connector_endpoints(
+            env, self._config, agent_name=agent_name, caller_token=token
         )
         # Eval conversations stay isolated from ambient durable state. Use the
         # shared scope renderer without adding the binding lane's state refs.

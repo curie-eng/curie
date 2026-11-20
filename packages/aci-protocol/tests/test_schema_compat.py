@@ -10,12 +10,15 @@ caught separately by the wire-lock gate in ``tests/test_wire_lock.py``.
 
 The generated TypeScript compiles under tsc in CI (it needs a Node toolchain, so
 it is not regenerated here); its input is the same committed schema this gate
-pins, so a drifted schema is caught here before TypeScript can diverge.
+pins, so a drifted schema is caught here before TypeScript can diverge. The
+TypeScript retry-condition vectors are rendered in Python from the shared
+vector, so their drift is checked here directly.
 """
 
 from aci_protocol.env_example_export import env_example_path, render_env_example
 from aci_protocol.rust_export import crate_dir, render_rust
 from aci_protocol.schema_export import build_schema, render_schema, schema_path
+from aci_protocol.ts_vector_export import render_ts_vectors, ts_path
 
 
 def test_committed_json_schema_is_current() -> None:
@@ -29,6 +32,14 @@ def test_committed_rust_is_current() -> None:
     committed = (crate_dir() / "src" / "lib.rs").read_text(encoding="utf-8")
     assert render_rust() == committed, (
         "generated Rust is stale; run scripts/check-contracts.sh and commit"
+    )
+
+
+def test_committed_ts_retry_condition_vectors_are_current() -> None:
+    committed = ts_path().read_text(encoding="utf-8")
+    assert render_ts_vectors() == committed, (
+        "generated TypeScript retry-condition vectors are stale; run "
+        "scripts/check-contracts.sh and commit"
     )
 
 
@@ -67,7 +78,7 @@ def test_reply_placeholders_are_required_nullable_strings() -> None:
 
 def test_publication_context_is_an_optional_event_field_with_required_contents() -> None:
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.25"
+    assert schema["protocolVersion"] == "0.5.26"
 
     definitions = schema["$defs"]
     event = definitions["Event"]

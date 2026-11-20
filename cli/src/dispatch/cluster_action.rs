@@ -13,6 +13,40 @@ fn pin_context(context: Option<&str>) -> Result<Option<curie::kube_context::Kube
     Ok(target)
 }
 
+/// Map a parsed `cluster subscription` leaf onto the handler's options.
+fn subscription_opts(action: ClusterSubscriptionAction) -> commands::SubscriptionOpts {
+    use commands::SubscriptionVerb as Verb;
+    let (verb, session, token, expected) = match action {
+        ClusterSubscriptionAction::Status { session } => (Verb::Status, session, None, None),
+        ClusterSubscriptionAction::Enroll { session, token } => {
+            (Verb::Enroll, session, Some(token), None)
+        }
+        ClusterSubscriptionAction::Replace {
+            session,
+            token,
+            expected,
+        } => (Verb::Replace, session, Some(token), Some(expected)),
+        ClusterSubscriptionAction::Reconnect {
+            session,
+            token,
+            expected,
+        } => (Verb::Reconnect, session, Some(token), Some(expected)),
+        ClusterSubscriptionAction::Disconnect { session, expected } => {
+            (Verb::Disconnect, session, None, Some(expected))
+        }
+    };
+    commands::SubscriptionOpts {
+        verb,
+        session_file: session.session_file,
+        token_file: token.map(|token| token.token_file),
+        expected_version: expected.and_then(|expected| expected.expected_version),
+        api_url: session.api_url,
+        namespace: session.namespace,
+        release: session.release,
+        dry_run: session.dry_run,
+    }
+}
+
 /// Run one parsed `cluster` subcommand.
 pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Result<()> {
     let target = if matches!(&action, ClusterAction::Message { .. }) {
@@ -1107,6 +1141,10 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     .await?;
             emit(commands::console_login(&api_url, &api_key, &subject, dry_run).await?)
         }
+        ClusterAction::CodingInstructions { action } => coding_instructions::run(action).await,
+        ClusterAction::Subscription { action } => {
+            emit(commands::subscription(subscription_opts(action)).await?)
+        }
         ClusterAction::Resume {
             agent,
             conn,
@@ -1261,6 +1299,46 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 )
                 .await?,
             )
+        }
+        ClusterAction::IdentityAuthority {
+            action,
+            tenant,
+            apply,
+            after,
+            conn,
+            dry_run,
+        } => {
+            let (method, path) = commands::authority_target(&action, tenant, after)?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run && !matches!(action.as_str(), "adopt" | "replace"),
+            )
+            .await?;
+            emit(commands::identity_operator(api_url, api_key, method, path, apply, dry_run).await?)
+        }
+        ClusterAction::RoleFilter {
+            action,
+            tenant,
+            agent,
+            role,
+            apply,
+            conn,
+            dry_run,
+        } => {
+            let (method, path) =
+                commands::role_filter_target(&action, tenant, agent, role.as_deref())?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(commands::identity_operator(api_url, api_key, method, path, apply, dry_run).await?)
         }
         ClusterAction::Directory {
             tenant,
@@ -1463,12 +1541,38 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         ClusterAction::WorkItems {
             id,
             agent,
+            rerun,
+            request_id,
+            expected_version,
+            reason,
             conn,
+            yes,
             dry_run,
         } => {
             // Validate before any network access, through the centralized
             // structured error path (cli/CLAUDE.md error contract).
             let id = commands::validated_work_item_id(id)?;
+            if rerun {
+                let retry = commands::validated_work_item_retry(
+                    id,
+                    request_id,
+                    expected_version,
+                    reason,
+                    yes,
+                    dry_run,
+                )?;
+                // A rerun dry run asks the API for the plan, so it resolves
+                // the connection exactly like a real call.
+                let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                    conn.api_url,
+                    conn.api_key,
+                    &conn.namespace,
+                    &conn.release,
+                    false,
+                )
+                .await?;
+                return emit(commands::work_item_retry(api_url, api_key, retry).await?);
+            }
             // `_cluster_api_pf` is the port-forward guard; it must live for
             // the whole call.
             let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
@@ -1521,7 +1625,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         ClusterAction::Hook { action, conn } => {
             let dry_run = match &action {
                 ClusterHookAction::Fire { dry_run, .. }
-                | ClusterHookAction::Record { dry_run, .. } => *dry_run,
+                | ClusterHookAction::Record { dry_run, .. }
+                | ClusterHookAction::WakeKey { dry_run, .. } => *dry_run,
             };
             let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
                 conn.api_url,
@@ -1565,6 +1670,31 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     })
                     .await?,
                 ),
+                ClusterHookAction::WakeKey {
+                    command,
+                    agent,
+                    name,
+                    dry_run,
+                } => {
+                    let (agent, name, rotate) = match command {
+                        Some(ClusterWakeKeyCommand::Rotate { agent, name }) => (agent, name, true),
+                        None => {
+                            let (agent, name) = commands::require_wake_key_target(agent, name)?;
+                            (agent, name, false)
+                        }
+                    };
+                    emit(
+                        commands::hook_wake_key(commands::HookWakeKeyOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            name,
+                            rotate,
+                            dry_run,
+                        })
+                        .await?,
+                    )
+                }
             }
         }
         ClusterAction::Delete {
@@ -1817,6 +1947,15 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     reason,
                     recovery_key,
                 },
+            routes_version:
+                ApprovalRoutesVersionArgs {
+                    routes_expected_version,
+                },
+            requester:
+                RequesterIdentityArgs {
+                    requester_identity,
+                    expected_version,
+                },
         } => {
             let ClusterAgentTarget {
                 agent,
@@ -1831,6 +1970,23 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 dry_run,
             )
             .await?;
+            // ADR 0270 decision 1: its own object, so clap has already refused
+            // every gate, route, pending-record and recovery flag beside it.
+            if let Some(mode) = requester_identity {
+                return emit_boxed(
+                    commands::approvals_requester_identity(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        mode,
+                        expected_version,
+                    )
+                    .await?,
+                );
+            }
             emit(
                 commands::approvals(
                     AgentActionOpts {
@@ -1854,6 +2010,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         routes_from,
                         list_routes,
                         clear_routes,
+                        routes_expected_version,
                         report_identity,
                         recover,
                         reason,

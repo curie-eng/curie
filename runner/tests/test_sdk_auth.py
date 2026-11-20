@@ -745,3 +745,97 @@ def test_resolve_sdk_env_refuses_state_token_on_the_plain_path_too() -> None:
         resolve_sdk_env(env)
     assert API_KEY_ENV not in env
     assert OAUTH_TOKEN_ENV not in env
+
+
+# --- CURIE_MODEL_AUTH_MODE (#5373, ADR 0268). Personal mode never maps a service
+# credential or an endpoint override: the owner's CLAUDE_CODE_OAUTH_TOKEN is the
+# only grant, so resolve_sdk_env returns None and leaves the boot env as it was.
+# Service mode, selected by omission or by "service", keeps every rule above.
+# The names are imported inside each case so the cases above keep collecting
+# without the personal module.
+
+PERSONAL_BOOT_ENVS = {
+    "oauth-reference": {CREDENTIALS_ENV: "sk-ant-oat01-PLACEHOLDER-service"},
+    "api-key-reference": {CREDENTIALS_ENV: "sk-ant-api03-PLACEHOLDER-service"},
+    "openrouter-reference": {CREDENTIALS_ENV: "sk-or-PLACEHOLDER"},
+    "anthropic-base-url": {BASE_URL_ENV: "https://alt-base.example.com"},
+    "curie-base-url-and-provider-key": {
+        MODEL_BASE_URL_ENV: ZHIPU_BASE_URL,
+        CREDENTIALS_ENV: "PLACEHOLDER-zhipu-key",
+    },
+    "declared-env-key-target": {
+        MODEL_ENV_KEY_ENV: f'["{MY_CRED_KEY}"]',
+        MY_CRED_KEY: "sk-ant-api03-PLACEHOLDER-env-key",
+    },
+}
+
+
+@pytest.mark.parametrize("boot", list(PERSONAL_BOOT_ENVS))
+def test_personal_mode_maps_no_service_credential_and_no_override(boot: str) -> None:
+    from curie_runner.personal_auth import AUTH_MODE_ENV
+
+    env = {AUTH_MODE_ENV: "personal", **PERSONAL_BOOT_ENVS[boot]}
+    before = dict(env)
+
+    assert resolve_sdk_env(env) is None
+    assert env == before, "personal mode changed the boot env"
+    assert OAUTH_TOKEN_ENV not in env
+    assert API_KEY_ENV not in env
+
+
+def test_personal_mode_keeps_an_inherited_owner_grant_untouched() -> None:
+    from curie_runner.personal_auth import AUTH_MODE_ENV
+
+    env = {
+        AUTH_MODE_ENV: "personal",
+        OAUTH_TOKEN_ENV: "sk-ant-oat01-PLACEHOLDER-owner",
+        CREDENTIALS_ENV: "sk-ant-api03-PLACEHOLDER-service",
+    }
+    before = dict(env)
+
+    assert resolve_sdk_env(env) is None
+    assert env == before
+
+
+@pytest.mark.parametrize("mode", ["Personal", "personal ", "", "oauth", "SERVICE"])
+def test_an_invalid_auth_mode_is_refused_before_any_mapping(mode: str) -> None:
+    from curie_runner.personal_auth import AUTH_MODE_ENV, InvalidAuthModeError
+
+    env = {AUTH_MODE_ENV: mode, CREDENTIALS_ENV: "sk-ant-oat01-PLACEHOLDER-service"}
+    before = dict(env)
+
+    with pytest.raises(InvalidAuthModeError):
+        resolve_sdk_env(env)
+    assert env == before
+
+
+def test_personal_mode_still_refuses_an_undialable_backend_first() -> None:
+    # The wire-protocol gate stays the first decision in every mode.
+    from curie_runner.personal_auth import AUTH_MODE_ENV
+
+    with pytest.raises(UnsupportedApiBackendError):
+        resolve_sdk_env({AUTH_MODE_ENV: "personal", API_BACKEND_ENV: "chat_completions"})
+
+
+SERVICE_BOOT_ENVS = {
+    **PERSONAL_BOOT_ENVS,
+    "explicit-sdk-credential": {
+        OAUTH_TOKEN_ENV: "sk-ant-oat01-PLACEHOLDER-explicit",
+        CREDENTIALS_ENV: "sk-ant-api03-PLACEHOLDER-service",
+    },
+    "nothing": {},
+}
+
+
+@pytest.mark.parametrize("boot", list(SERVICE_BOOT_ENVS))
+def test_service_mode_by_name_resolves_exactly_as_mode_absent(boot: str) -> None:
+    # The existing service rules above run with the mode absent. Naming the mode
+    # "service" must give the same override and the same in-place mapping.
+    from curie_runner.personal_auth import AUTH_MODE_ENV
+
+    absent = dict(SERVICE_BOOT_ENVS[boot])
+    named = {AUTH_MODE_ENV: "service", **SERVICE_BOOT_ENVS[boot]}
+
+    assert resolve_sdk_env(named) == resolve_sdk_env(absent)
+    named.pop(AUTH_MODE_ENV)
+    assert named == absent

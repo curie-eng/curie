@@ -79,8 +79,8 @@ from typing import Any
 import aiohttp
 import pytest
 from aci_protocol import Final, SessionStatus, TextDelta
-from curie_dispatcher.queue import to_stream_fields
-from curie_worker.consumer import Consumer
+from curie_internal.turn_queue import to_stream_fields
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 
 from .conftest import _ProcessEventSpy
@@ -298,8 +298,12 @@ def test_a_long_delivery_survives_both_old_clocks_and_settles_exactly_once(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "replica-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "replica-b"})
-            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store)
-            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store)
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             dispatch_a = _DispatchSpy(consumer_a)
             dispatch_b = _DispatchSpy(consumer_b)
             spy = _ProcessEventSpy(h.kernel)
@@ -644,10 +648,12 @@ def test_control_without_heartbeat_renewal_a_second_replica_does_take_the_turn(
             )
             store_b = DeliveryLeaseStore(h.async_redis, cfg_b)
             consumer_a = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store_a
+                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store_a,
+                reminders=refuse_unconfigured_reminder,
             )
             consumer_b = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store_b
+                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store_b,
+                reminders=refuse_unconfigured_reminder,
             )
             dispatch_b = _DispatchSpy(consumer_b)
             spy = _ProcessEventSpy(h.kernel)

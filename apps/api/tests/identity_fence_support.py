@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from curie_api import identity_fence
-from curie_dispatcher import admission
+from curie_channel_gateway.slack import admission
 from fastapi import FastAPI
 
 

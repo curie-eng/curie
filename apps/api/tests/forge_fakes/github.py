@@ -2,20 +2,26 @@
 
 Payload shapes follow GitHub's webhook catalog:
 https://docs.github.com/en/webhooks/webhook-events-and-payloads
+
+Combined status responses follow GitHub's REST documentation:
+https://docs.github.com/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import itertools
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 from curie_api.config import get_settings
@@ -38,6 +44,26 @@ SENDER_ID = 6601
 SENDER = "octocat"
 LABEL = "factory"
 MENTION = "curie"
+
+LABEL_ACTOR_PERMISSIONS = ["write", "maintain", "admin", "read", "triage", "none"]
+LABEL_ACTOR_REFUSALS = [
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, {"id": 51}, "actor_own_app"),
+    ({"id": 42, "login": "fixture[bot]", "type": "Bot"}, None, "actor_bot"),
+    ({"id": 42, "login": "fixture[bot]", "type": "Bot"}, {"id": 52}, "actor_bot"),
+    ({"id": 42, "login": "ghost", "type": "User"}, None, "actor_unverifiable"),
+    (None, None, "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, "invalid", "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, [], "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, {}, "actor_unverifiable"),
+    ({"login": "fixture[bot]", "type": "Bot"}, None, "actor_unverifiable"),
+    ({"id": 42, "login": "ghost", "type": "Bot"}, None, "actor_unverifiable"),
+    ({"id": True, "login": SENDER, "type": "User"}, None, "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": "", "type": "User"}, None, "actor_unverifiable"),
+]
+
+LABEL_ACTOR_REFUSAL_IDS = [
+    f"label_{reason}-{index}" for index, (_, _, reason) in enumerate(LABEL_ACTOR_REFUSALS)
+]
 
 BASE_SHA = "0" * 39 + "1"
 
@@ -242,6 +268,69 @@ def fake_installation_tokens(monkeypatch: Any, credentials: Any = None) -> None:
     monkeypatch.setattr(GitHubCredentials, "app_slug", lambda _self: APP_SLUG)
 
 
+# The repository-wide listings a poll pass reads, answered empty when
+# ``GitHubAPI.answer_listings`` is set.
+_POLL_LISTINGS = frozenset(
+    {f"/repos/{REPO}/issues", f"/repos/{REPO}/issues/comments", f"/repos/{REPO}/pulls/comments"}
+)
+
+
+@dataclass
+class PlantedIssue:
+    """One issue's own answers (#5380), in place of the shared ``issue_state``
+    and ``labels``.
+
+    GET an issue (https://docs.github.com/en/rest/issues/issues#get-an-issue)
+    answers ``number``, ``state`` and ``labels``; every pull request is also an
+    issue, and its issue payload carries a ``pull_request`` key. An issue the
+    installation cannot see answers 404 with GitHub's ``message``. ``events``,
+    when set, is the issue's event list
+    (https://docs.github.com/en/rest/issues/events#list-issue-events).
+    """
+
+    state: str = "open"
+    labels: tuple[str, ...] = ()
+    pull_request: bool = False
+    missing: bool = False
+    events: list[dict[str, Any]] | None = None
+
+
+def issue_event(event: str, *, event_id: int, label: str | None = None) -> dict[str, Any]:
+    """One human event on an issue, in the list-issue-events shape
+    (https://docs.github.com/en/rest/issues/events#list-issue-events)."""
+
+    found: dict[str, Any] = {
+        "id": event_id,
+        "event": event,
+        "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+        "created_at": "2026-09-01T00:00:00Z",
+    }
+    if label is not None:
+        found["label"] = {"name": label}
+    return found
+
+
+def listed_publication(number: int, *, pull: int, state: str = "open") -> dict[str, Any]:
+    """A factory publication of issue ``number`` as the repository's pull request
+    listing returns it (https://docs.github.com/en/rest/pulls/pulls#list-pull-requests):
+    opened by the App's bot user from a publication branch of the repository
+    itself, closing the issue."""
+
+    repo = {"id": REPO_ID, "full_name": REPO}
+    return {
+        "number": pull,
+        "state": state,
+        "html_url": f"https://github.com/{REPO}/pull/{pull}",
+        "node_id": f"PR_acme_{pull}",
+        "user": dict(APP_BOT_USER),
+        "body": f"Closes #{number}",
+        "merged_at": None,
+        "closed_at": None if state == "open" else "2026-09-02T00:00:00Z",
+        "head": {"sha": BASE_SHA, "ref": f"curie/publication-{pull:032x}", "repo": dict(repo)},
+        "base": {"ref": "main", "repo": dict(repo)},
+    }
+
+
 class GitHubAPI:
     """In-process stand-in for the GitHub REST reads the intake verifier makes."""
 
@@ -251,6 +340,10 @@ class GitHubAPI:
         self.permission = "write"
         self.permission_requests: list[httpx.Request] = []
         self.permission_user_id = SENDER_ID
+        self.label_actor: Any = {"id": SENDER_ID, "login": SENDER, "type": "User"}
+        self.label_app: Any = None
+        self.permission_status = 200
+        self.role_name = "write"
         self.comment_body: str | None = None
         self.comment_app: dict[str, Any] | None = None
         self.repository_id = REPO_ID
@@ -263,6 +356,21 @@ class GitHubAPI:
         # Issue number -> its comments, for the marked label refusal comment.
         self.issue_comments: dict[int, list[dict[str, Any]]] = {}
         self._comment_ids = itertools.count(9000)
+        # Additive answers (#5380); each default leaves the answers above as
+        # they were. Issues with their own answers, by number.
+        self.planted_issues: dict[int, PlantedIssue] = {}
+        # Branches GET a reference answers 404 for
+        # (https://docs.github.com/en/rest/git/refs#get-a-reference).
+        self.missing_branches: set[str] = set()
+        # What the repository's pull request listing returns.
+        self.listed_pulls: list[dict[str, Any]] = []
+        # Answer the repository-wide listings a poll pass reads (open issues
+        # by label, issue comments and review comments since a time) with one
+        # empty page:
+        # https://docs.github.com/en/rest/issues/issues#list-repository-issues,
+        # https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository,
+        # https://docs.github.com/en/rest/pulls/comments#list-review-comments-in-a-repository.
+        self.answer_listings = False
 
     def advance_label_event(self, number: int) -> None:
         """Record a newer labeled timeline event. A relabel webhook reads it."""
@@ -279,17 +387,32 @@ class GitHubAPI:
                 200,
                 json={"id": self.repository_id, "full_name": REPO, "default_branch": "main"},
             )
+        if self.answer_listings and request.method == "GET" and path in _POLL_LISTINGS:
+            return httpx.Response(200, json=[])
         if path == f"/repos/{REPO}/pulls" and request.method == "GET":
             # The repository-wide listing rediscovery reads (#4629): no factory
-            # publication exists in this stand-in.
-            return httpx.Response(200, json=[])
+            # publication exists in this stand-in unless one is listed.
+            return httpx.Response(200, json=list(self.listed_pulls))
         if path.startswith(f"/repos/{REPO}/git/ref/heads/"):
             # Admission resolves the base and reads its commit through the
             # code host (#3095).
             # https://docs.github.com/en/rest/git/refs#get-a-reference
             name = path.removeprefix(f"/repos/{REPO}/git/ref/heads/")
+            if name in self.missing_branches:
+                return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(
                 200, json={"ref": f"refs/heads/{name}", "object": {"sha": BASE_SHA}}
+            )
+        if path.startswith(f"/repos/{REPO}/git/matching-refs/heads/"):
+            # The code host reads this listing after a 404 on the reference;
+            # GitHub answers 200 with an empty array when no branch matches
+            # (https://docs.github.com/en/rest/git/refs#list-matching-references).
+            name = path.removeprefix(f"/repos/{REPO}/git/matching-refs/heads/")
+            if name in self.missing_branches:
+                return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=[{"ref": f"refs/heads/{name}", "object": {"sha": BASE_SHA, "type": "commit"}}],
             )
         if path.startswith(f"/repos/{REPO}/issues/comments/"):
             comment_id = int(path.rsplit("/", 1)[1])
@@ -322,6 +445,9 @@ class GitHubAPI:
             return httpx.Response(200, json=listed)
         if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
             number = int(path.split("/")[-2])
+            planted = self.planted_issues.get(number)
+            if planted is not None and planted.events is not None:
+                return httpx.Response(200, json=list(planted.events))
             event_id = self.label_event_ids.get(number, self.label_event_base + number)
             return httpx.Response(
                 200,
@@ -330,13 +456,17 @@ class GitHubAPI:
                         "id": event_id,
                         "event": "labeled",
                         "label": {"name": LABEL},
-                        "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+                        "actor": self.label_actor,
+                        "performed_via_github_app": self.label_app,
                         "created_at": "2026-09-01T00:00:00Z",
                     }
                 ],
             )
         if path.startswith(f"/repos/{REPO}/issues/"):
             number = int(path.rsplit("/", 1)[1])
+            planted = self.planted_issues.get(number)
+            if planted is not None:
+                return self._planted_issue(number, planted)
             return httpx.Response(
                 200,
                 json={
@@ -348,13 +478,213 @@ class GitHubAPI:
         if path == f"/repos/{REPO}/collaborators/{SENDER}/permission":
             self.permission_requests.append(request)
             return httpx.Response(
-                200,
+                self.permission_status,
                 json={
                     "permission": self.permission,
+                    "role_name": self.role_name,
                     "user": {"id": self.permission_user_id, "login": SENDER},
                 },
             )
         return httpx.Response(404, json={"message": "missing fixture"})
+
+    def _planted_issue(self, number: int, planted: PlantedIssue) -> httpx.Response:
+        # https://docs.github.com/en/rest/issues/issues#get-an-issue
+        if planted.missing:
+            return httpx.Response(404, json={"message": "Not Found"})
+        issue: dict[str, Any] = {
+            "number": number,
+            "state": planted.state,
+            "labels": [{"name": name} for name in planted.labels],
+        }
+        if planted.pull_request:
+            issue["pull_request"] = {"url": f"https://api.github.com/repos/{REPO}/pulls/{number}"}
+        return httpx.Response(200, json=issue)
+
+
+def github_time(moment: datetime) -> str:
+    """A GitHub REST timestamp: ISO 8601 in UTC to the whole second, ``Z``
+    suffixed, as every comment's ``created_at`` and ``updated_at`` are
+    (https://docs.github.com/en/rest/issues/comments#get-an-issue-comment)."""
+
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _at(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _since(value: str | None) -> datetime | None:
+    return _at(value) if value else None
+
+
+def _page_of(request: httpx.Request, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    params = request.url.params
+    per_page = int(params.get("per_page", "30"))
+    page = int(params.get("page", "1"))
+    return items[(page - 1) * per_page : page * per_page]
+
+
+class IssueCommentsAPI(GitHubAPI):
+    """`GitHubAPI` that keeps issue comments the way GitHub does (#5787).
+
+    Every default of `GitHubAPI` stays as it is; this subclass adds a comment
+    store the factory's question write, the answer intake and a poll pass all
+    read and write:
+
+    1. One id sequence for every comment, increasing, so a later comment has a
+       larger numeric ``id``, and ``created_at`` / ``updated_at`` in GitHub's
+       whole-second ``Z`` form from a clock the test moves (``tick``).
+    2. Create, list, read by id and edit, with each comment's ``user`` (whose
+       ``type`` is ``User`` or ``Bot``), ``performed_via_github_app`` (the App a
+       person or bot acted through, or null) and ``issue_url``:
+       https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+       https://docs.github.com/en/rest/issues/comments#list-issue-comments
+       https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
+       https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
+       A comment the installation token writes is authored by the App's bot
+       user and carries ``performed_via_github_app`` with the App's id.
+    3. The repository-wide listing a poll pass reads, filtered by ``since`` on
+       ``updated_at`` (an edit only moves ``updated_at``) and sorted by
+       creation, oldest first:
+       https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository
+    4. Permission answers per login, with the user's immutable id. GitHub's
+       legacy ``permission`` field folds ``maintain`` into ``write`` and
+       ``triage`` into ``read``; ``role_name`` keeps the role:
+       https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+    5. ``store_then_fail``: the next comment create is stored, then answered
+       with that status, as when GitHub's response is lost after the write.
+    6. ``after_listing``: a step `handle_async` runs once, after the next
+       repository-wide listing is answered and before the caller reads it, so
+       a test can make something happen in the middle of a poll pass.
+
+    Issue state and labels per issue come from `GitHubAPI.planted_issues`.
+    The repository issue and review comment listings answer empty
+    (``answer_listings``).
+    """
+
+    def __init__(self, *, api: str = GITHUB_API) -> None:
+        super().__init__()
+        self.api = api.rstrip("/")
+        self.clock = datetime.now(UTC).replace(microsecond=0)
+        self.stored: dict[int, dict[str, Any]] = {}
+        self.collaborators: dict[str, tuple[int, str]] = {}
+        self.store_then_fail: int | None = None
+        self.after_listing: Callable[[], Awaitable[None]] | None = None
+        self.answer_listings = True
+
+    def tick(self, seconds: int = 1) -> None:
+        self.clock += timedelta(seconds=seconds)
+
+    def grant(self, user: dict[str, Any], role: str) -> None:
+        """``user``'s role on the repository: admin, maintain, write, triage, read or none."""
+
+        self.collaborators[user["login"]] = (user["id"], role)
+
+    def add_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        user: dict[str, Any],
+        app: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A comment created on issue ``number`` now, by ``user`` acting
+        through ``app`` (None when not through an App)."""
+
+        comment_id = next(self._comment_ids)
+        stamp = github_time(self.clock)
+        comment = {
+            "id": comment_id,
+            "body": body,
+            "user": dict(user),
+            "performed_via_github_app": None if app is None else dict(app),
+            "issue_url": f"{self.api}/repos/{REPO}/issues/{number}",
+            "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
+            "author_association": "NONE",
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+        self.stored[comment_id] = comment
+        return comment
+
+    def edit_comment(self, comment_id: int, body: str) -> dict[str, Any]:
+        comment = self.stored[comment_id]
+        comment["body"] = body
+        comment["updated_at"] = github_time(self.clock)
+        return comment
+
+    def on_issue(self, number: int) -> list[dict[str, Any]]:
+        url = f"{self.api}/repos/{REPO}/issues/{number}"
+        return [
+            self.stored[key] for key in sorted(self.stored) if self.stored[key]["issue_url"] == url
+        ]
+
+    async def handle_async(self, request: httpx.Request) -> httpx.Response:
+        """`handle` for an async client, running ``after_listing`` once."""
+
+        response = self.handle(request)
+        step = self.after_listing
+        if (
+            step is not None
+            and request.method == "GET"
+            and request.url.path == f"/repos/{REPO}/issues/comments"
+        ):
+            self.after_listing = None
+            await step()
+        return response
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        root = re.escape(f"/repos/{REPO}")
+        if path == f"/repos/{REPO}/issues/comments" and request.method == "GET":
+            since = _since(request.url.params.get("since"))
+            listed = sorted(
+                (
+                    comment
+                    for comment in self.stored.values()
+                    if since is None or _at(comment["updated_at"]) >= since
+                ),
+                key=lambda comment: (comment["created_at"], comment["id"]),
+            )
+            return httpx.Response(200, json=_page_of(request, listed))
+        single = re.fullmatch(rf"{root}/issues/comments/(\d+)", path)
+        if single is not None:
+            found = self.stored.get(int(single.group(1)))
+            if found is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            if request.method == "PATCH":
+                found = self.edit_comment(found["id"], json.loads(request.content)["body"])
+            return httpx.Response(200, json=found)
+        thread = re.fullmatch(rf"{root}/issues/(\d+)/comments", path)
+        if thread is not None:
+            number = int(thread.group(1))
+            if request.method == "POST":
+                created = self.add_comment(
+                    number,
+                    json.loads(request.content)["body"],
+                    user=APP_BOT_USER,
+                    app={"id": int(APP_ID), "slug": APP_SLUG},
+                )
+                if self.store_then_fail is not None:
+                    status, self.store_then_fail = self.store_then_fail, None
+                    return httpx.Response(status, json={"message": "Server Error"})
+                return httpx.Response(201, json=created)
+            return httpx.Response(200, json=_page_of(request, self.on_issue(number)))
+        permission = re.fullmatch(rf"{root}/collaborators/([^/]+)/permission", path)
+        if permission is not None and unquote(permission.group(1)) in self.collaborators:
+            login = unquote(permission.group(1))
+            user_id, role = self.collaborators[login]
+            legacy = {"maintain": "write", "triage": "read"}.get(role, role)
+            self.permission_requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "permission": legacy,
+                    "role_name": role,
+                    "user": {"id": user_id, "login": login, "type": "User"},
+                },
+            )
+        return super().handle(request)
 
 
 class _Credentials:
@@ -476,10 +806,43 @@ def _comment_event(number: int, body: str, comment_id: int) -> dict[str, Any]:
 # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
 # https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
 # https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
+# https://docs.github.com/en/rest/git/blobs#create-a-blob
+# https://docs.github.com/en/rest/git/trees#create-a-tree
+# https://docs.github.com/en/rest/git/commits#create-a-commit
+# https://docs.github.com/en/rest/git/refs#create-a-reference
+# https://docs.github.com/en/rest/issues/issues#list-repository-issues
+# https://docs.github.com/en/rest/issues/issues#create-an-issue
+# https://docs.github.com/en/rest/issues/issues#get-an-issue
+#
+# Issues follow the REST issue object: ``number``, ``title``, ``body``,
+# ``state``, ``labels`` as objects with a ``name``, ``user`` with ``id``,
+# ``login`` and ``type``, and ``html_url``. A pull request is an issue too: the
+# repository issue listing returns it with a ``pull_request`` key, and its
+# ``creator`` filter matches the opening account's login. An issue the
+# adapter's installation token creates is authored by ``bot_user`` with
+# ``performed_via_github_app``.
+#
+# The Git Data API shapes below (blobs, trees, parentless commits, and refs
+# outside refs/heads) replay what was observed against api.github.com with a
+# GitHub App installation token, 2026-11-03:
+#   POST git/blobs {content, encoding: "base64"} -> 201 {sha, url}
+#   POST git/trees {tree: [{path, mode: "100644", type: "blob", sha}]}
+#       -> 201 {sha, url, tree: [...]}
+#   POST git/commits {message, tree, parents: [], author, committer}
+#       -> 201 {sha, tree: {sha}, parents: []}
+#   POST git/refs {ref, sha} -> 201 {ref, object: {sha, type: "commit"}},
+#       422 {"message": "Reference already exists"} when present
+#   PATCH git/refs/<name> {sha, force} -> 200
+#   DELETE git/refs/<name> -> 204, 422 {"message": "Reference does not exist"}
+#       when absent
+#   GET https://github.com/<repo>/raw/<commit sha>/<path> -> 200 image/png
+# Object ids are content addressed exactly as git computes them, so replaying
+# the same blobs, tree and dated commit yields the same SHAs.
 
 CONTRACT_APP_ID = 51
 CONTRACT_BOT = {"id": 1000, "login": "curie-factory", "type": "Bot"}
 _LISTINGS = (
+    re.compile(rf"^/repos/{REPO}/issues$"),
     re.compile(rf"^/repos/{REPO}/issues/events$"),
     re.compile(rf"^/repos/{REPO}/issues/comments$"),
     re.compile(rf"^/repos/{REPO}/issues/\d+/events$"),
@@ -498,12 +861,69 @@ _RUN_STATES = {
 _STATUS_STATES = {"success": "success", "failure": "failure", "cancelled": "error"}
 
 
+def git_object_sha(kind: str, payload: bytes) -> str:
+    """The git object id of ``payload`` stored as a ``kind`` object."""
+
+    return hashlib.sha1(f"{kind} {len(payload)}\0".encode() + payload).hexdigest()
+
+
+def git_blob_sha(content: bytes) -> str:
+    """The git blob id of ``content``: sha1 of ``"blob <len>\\0"`` and the bytes."""
+
+    return git_object_sha("blob", content)
+
+
+def _git_tree_payload(entries: list[dict[str, str]]) -> bytes:
+    # Git sorts tree entries by name, a directory as if its name ended in "/".
+    def key(entry: dict[str, str]) -> bytes:
+        name = entry["name"].encode()
+        return name + b"/" if entry["type"] == "tree" else name
+
+    payload = b""
+    for entry in sorted(entries, key=key):
+        mode = "40000" if entry["type"] == "tree" else entry["mode"]
+        payload += f"{mode} {entry['name']}".encode() + b"\0" + bytes.fromhex(entry["sha"])
+    return payload
+
+
+def _git_signature(person: dict[str, Any]) -> str:
+    stamp = datetime.fromisoformat(str(person["date"]).replace("Z", "+00:00"))
+    offset = stamp.utcoffset() or timedelta(0)
+    minutes = int(offset.total_seconds() // 60)
+    sign = "-" if minutes < 0 else "+"
+    zone = f"{sign}{abs(minutes) // 60:02d}{abs(minutes) % 60:02d}"
+    return f"{person['name']} <{person['email']}> {int(stamp.timestamp())} {zone}"
+
+
+def git_commit_sha(
+    *,
+    tree: str,
+    parents: list[str],
+    message: str,
+    author: dict[str, Any],
+    committer: dict[str, Any],
+) -> str:
+    """The git commit id of a commit object with these fields."""
+
+    lines = [f"tree {tree}"]
+    lines += [f"parent {parent}" for parent in parents]
+    lines += [f"author {_git_signature(author)}", f"committer {_git_signature(committer)}"]
+    return git_object_sha("commit", ("\n".join(lines) + "\n\n" + message).encode())
+
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
 def _stamp(second: int) -> str:
     return (
         (datetime(2026, 9, 1, tzinfo=UTC) + timedelta(seconds=second))
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def _person() -> dict[str, Any]:
+    return {"id": SENDER_ID, "login": SENDER, "type": "User"}
 
 
 class GitHubRepositoryFake:
@@ -516,6 +936,13 @@ class GitHubRepositoryFake:
         self.review_comments: list[dict[str, Any]] = []
         self.reviews: list[dict[str, Any]] = []
         self.permissions: dict[str, tuple[int, str]] = {}
+        # Requested account id -> the `GET /user/{account_id}` payload (#5414).
+        # https://docs.github.com/en/rest/users/users#get-a-user-using-their-id
+        self.accounts: dict[str, dict[str, Any]] = {}
+        # The immutable id GitHub reports for this repository on both pull
+        # request sides (``head.repo.id``, ``base.repo.id``).
+        # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+        self.repository_id = REPO_ID
         self.branches: dict[str, str] = {}
         self.commits: dict[str, dict[str, Any]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
@@ -523,6 +950,33 @@ class GitHubRepositoryFake:
         self.statuses: dict[str, dict[str, dict[str, Any]]] = {}
         self.default_branch = "main"
         self.writes = 0
+        # Git Data API state: blob id -> bytes, tree id -> its entries
+        # ({name, mode, type, sha}), and every ref outside refs/heads (the UI
+        # evidence refs, ``refs/curie/ui-evidence/<key>``) -> commit id.
+        self.blobs: dict[str, bytes] = {}
+        self.trees: dict[str, list[dict[str, str]]] = {}
+        self.evidence_refs: dict[str, str] = {}
+        self.raw_requests: list[httpx.Request] = []
+        self._write_faults: list[list[Any]] = []
+        # Writes applied whose answer is then lost: [pattern, status, count].
+        self._lost_writes: list[list[Any]] = []
+        # Every request the fake answered, in order.
+        self.http_requests: list[httpx.Request] = []
+        # The JSON body of every `POST /repos/{REPO}/issues`, in order.
+        self.issue_posts: list[dict[str, Any]] = []
+        # Who an issue or pull request the adapter's token opens is authored by.
+        self.bot_user: dict[str, Any] = dict(CONTRACT_BOT)
+        # False models a listing that ignores ``creator``, so an adapter's own
+        # owner check is all that keeps another account's issue out.
+        self.honour_creator = True
+        # Listing lag: issue numbers absent from the repository issue listing,
+        # yet readable directly, as a fresh issue is for a few seconds on
+        # GitHub. While ``hide_new_from_listing`` is set every issue the
+        # adapter creates starts hidden.
+        self.hidden_from_listing: set[int] = set()
+        self.hide_new_from_listing = False
+        # Reads that answer an injected status: [pattern, status, count].
+        self._read_faults: list[list[Any]] = []
         self.label_requests: list[httpx.Request] = []
         self._event_ids = itertools.count(70001)
         self._comment_ids = itertools.count(80001)
@@ -543,7 +997,9 @@ class GitHubRepositoryFake:
     def _number(self) -> int:
         return len(self.issues) + 1
 
-    def seed_issue(self, title: str, body: str) -> int:
+    def seed_issue(self, title: str, body: str, *, user: dict[str, Any] | None = None) -> int:
+        """An issue opened from outside the adapters, by ``user`` (a person by default)."""
+
         number = self._number()
         self.issues[number] = {
             "number": number,
@@ -551,11 +1007,33 @@ class GitHubRepositoryFake:
             "body": body,
             "state": "open",
             "labels": [],
-            "user": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+            "user": dict(user) if user is not None else _person(),
+            "html_url": f"https://github.com/{REPO}/issues/{number}",
+            "performed_via_github_app": None,
         }
         return number
 
-    def label_event(self, number: int, kind: str, label: str, actor: dict[str, Any]) -> None:
+    def _pull_issue(self, number: int) -> dict[str, Any]:
+        """The issue side of pull request ``number``, as the issue listing shows it."""
+
+        return {
+            "number": number,
+            "state": "open",
+            "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/{number}"},
+            "labels": [],
+            "user": dict(self.bot_user),
+            "html_url": f"https://github.com/{REPO}/pull/{number}",
+        }
+
+    def label_event(
+        self,
+        number: int,
+        kind: str,
+        label: str,
+        actor: dict[str, Any],
+        *,
+        performed_via_github_app: dict[str, Any] | None = None,
+    ) -> None:
         names = [entry["name"] for entry in self.issues[number]["labels"]]
         if kind == "labeled" and label not in names:
             names.append(label)
@@ -568,7 +1046,7 @@ class GitHubRepositoryFake:
                 "event": kind,
                 "label": {"name": label},
                 "actor": actor,
-                "performed_via_github_app": None,
+                "performed_via_github_app": performed_via_github_app,
                 "issue": {"number": number},
                 "created_at": "2026-09-01T00:00:00Z",
             }
@@ -631,18 +1109,114 @@ class GitHubRepositoryFake:
         self.reviews.append(review)
         return review
 
-    def push_head(self, branch: str) -> str:
-        """A new commit on ``branch``; returns its sha."""
+    def push_head(self, branch: str, *, tree: str | None = None, message: str | None = None) -> str:
+        """A new commit on ``branch``; returns its sha.
+
+        ``tree`` is the commit's tree id. Without it the commit payload carries
+        no ``tree`` field at all, a shape readers must still accept.
+        """
 
         sha = f"{next(self._shas):040x}"
         parent = self.branches.get(branch)
-        self.commits[sha] = {
-            "sha": sha,
-            "message": f"change {sha[-4:]}",
-            "parents": [{"sha": parent}] if parent else [],
-        }
+        self.seed_commit(
+            sha,
+            parents=[parent] if parent else [],
+            message=message if message is not None else f"change {sha[-4:]}",
+            tree=tree,
+        )
         self.branches[branch] = sha
         return sha
+
+    def seed_commit(
+        self, sha: str, *, parents: list[str], message: str, tree: str | None = None
+    ) -> None:
+        """A commit with an exact id, as a push from outside the adapters lands
+        it. ``tree`` None leaves the ``tree`` field out of the commit payload."""
+
+        commit: dict[str, Any] = {
+            "sha": sha,
+            "message": message,
+            "parents": [{"sha": parent} for parent in parents],
+        }
+        if tree is not None:
+            commit["tree"] = {"sha": tree}
+        self.commits[sha] = commit
+
+    def seed_pull(self, head: str, base: str, *, title: str = "Change", body: str = "") -> int:
+        """An open pull request from ``head`` into ``base``, opened from outside
+        the adapters (the publication push Job's half); returns its number."""
+
+        number = self._number()
+        self.issues[number] = self._pull_issue(number)
+        self.pulls[number] = {
+            "head": head,
+            "base": base,
+            "title": title,
+            "body": body,
+            "draft": False,
+            "state": "open",
+            "merged_at": None,
+        }
+        return number
+
+    def fail_writes(self, pattern: str, status: int, count: int = 1) -> None:
+        """The next ``count`` writes whose ``"<METHOD> <path>"`` matches the
+        regular expression ``pattern`` answer ``status`` without changing state.
+        Each refused write still counts in ``writes``: it reached GitHub."""
+
+        self._write_faults.append([re.compile(pattern), status, count])
+
+    def lose_write_responses(
+        self, pattern: str, count: int = 1, *, status: int | None = 502
+    ) -> None:
+        """The next ``count`` writes whose ``"<METHOD> <path>"`` matches
+        ``pattern`` are applied, then their answer is lost: ``status`` with a
+        body that is not JSON (502 a server error, 201 an unreadable success),
+        or a transport error when ``status`` is None."""
+
+        self._lost_writes.append([re.compile(pattern), status, count])
+
+    def fail_reads(self, pattern: str, status: int, count: int = 1) -> None:
+        """The next ``count`` GET requests whose ``"GET <path>"`` matches
+        ``pattern`` answer ``status`` (``{"message": "injected"}``)."""
+
+        self._read_faults.append([re.compile(pattern), status, count])
+
+    def _lost_answer(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        subject = f"{request.method} {path}"
+        for fault in self._lost_writes:
+            pattern, status, remaining = fault
+            if remaining > 0 and pattern.search(subject):
+                fault[2] = remaining - 1
+                if status is None:
+                    raise httpx.ReadError("connection lost", request=request)
+                return httpx.Response(status, content=b"<html>lost</html>")
+        return None
+
+    def raw(self, commit_sha: str, path: str) -> bytes | None:
+        """The bytes ``path`` names in ``commit_sha``'s tree, or None."""
+
+        commit = self.commits.get(commit_sha)
+        tree = (commit or {}).get("tree", {}).get("sha")
+        parts = path.split("/")
+        for depth, name in enumerate(parts):
+            entries = self.trees.get(tree or "")
+            if entries is None:
+                return None
+            found = next((entry for entry in entries if entry["name"] == name), None)
+            if found is None:
+                return None
+            if depth == len(parts) - 1:
+                return self.blobs.get(found["sha"]) if found["type"] == "blob" else None
+            if found["type"] != "tree":
+                return None
+            tree = found["sha"]
+        return None
+
+    def evidence_ref(self, key: str) -> str | None:
+        """The commit ``refs/curie/ui-evidence/<key>`` points to, or None."""
+
+        return self.evidence_refs.get(f"refs/curie/ui-evidence/{key}")
 
     def report_check(self, sha: str, key: str, state: str) -> None:
         """A GitHub Actions check run named ``key``, or a commit status for a
@@ -716,10 +1290,12 @@ class GitHubRepositoryFake:
 
     def _pull_payload(self, number: int) -> dict[str, Any]:
         pull = self.pulls[number]
-        side = {"repo": {"full_name": REPO}}
+        side = {"repo": {"id": self.repository_id, "full_name": REPO}}
         return {
             "number": number,
+            "node_id": f"PR_fixture_{number}",
             "html_url": f"https://github.com/{REPO}/pull/{number}",
+            "merged": pull["merged_at"] is not None,
             # The App's installation token opened it.
             "user": dict(APP_BOT_USER),
             "state": pull["state"],
@@ -756,14 +1332,64 @@ class GitHubRepositoryFake:
         return httpx.Response(200, json={"status": status})
 
     def handle(self, request: httpx.Request) -> httpx.Response:
+        self.http_requests.append(request)
         path = request.url.path
-        if self._listing_fails(path):
+        if request.url.host == "github.com":
+            return self._raw(request, path)
+        # Creating an issue shares the issue listing's path but is no listing.
+        creates_issue = request.method == "POST" and path == f"/repos/{REPO}/issues"
+        if not creates_issue and self._listing_fails(path):
             return httpx.Response(502, json={"message": "injected"})
         if request.method != "GET":
-            return self._write(request, path)
+            answer = self._write(request, path)
+            return self._lost_answer(request, path) or answer
+        injected = self._injected_read(request, path)
+        if injected is not None:
+            return injected
         return self._read(request, path) or self._read_code(request, path)
 
+    def _injected_read(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        subject = f"GET {path}"
+        for fault in self._read_faults:
+            pattern, status, remaining = fault
+            if remaining > 0 and pattern.search(subject):
+                fault[2] = remaining - 1
+                return httpx.Response(status, json={"message": "injected"})
+        return None
+
+    def _issue_listing(self, request: httpx.Request) -> httpx.Response:
+        """List repository issues, pull requests included, oldest or newest first.
+
+        https://docs.github.com/en/rest/issues/issues#list-repository-issues
+        Honours ``creator`` (a login), ``state`` (open by default) and
+        ``direction`` (desc by default) over ``sort=created``, then pages.
+        """
+
+        params = request.url.params
+        state = params.get("state", "open")
+        creator = params.get("creator")
+        listed = [
+            issue
+            for _, issue in sorted(self.issues.items(), reverse=params.get("direction") != "asc")
+            if (state == "all" or issue.get("state") == state)
+            and issue["number"] not in self.hidden_from_listing
+            and (
+                creator is None
+                or not self.honour_creator
+                or issue.get("user", {}).get("login", "").casefold() == creator.casefold()
+            )
+        ]
+        return self._page(request, listed)
+
     def _read(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        account = re.fullmatch(r"/user/(\d+)", path)
+        if account:
+            payload = self.accounts.get(account[1])
+            if payload is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json=payload)
+        if path == f"/repos/{REPO}/issues":
+            return self._issue_listing(request)
         if path == f"/repos/{REPO}/issues/events":
             return self._page(request, sorted(self.events, key=lambda e: -e["id"]))
         if path == f"/repos/{REPO}/issues/comments":
@@ -821,6 +1447,14 @@ class GitHubRepositoryFake:
             if commit is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json=commit)
+        matched = re.fullmatch(rf"{repo}/git/refs?/(.+)", path)
+        if matched and not matched[1].startswith("heads/"):
+            # https://docs.github.com/en/rest/git/refs#get-a-reference
+            ref = f"refs/{unquote(matched[1])}"
+            sha = self.evidence_refs.get(ref)
+            if sha is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json=self._ref_payload(ref, sha))
         matched = re.fullmatch(rf"{repo}/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)", path)
         if matched:
             return self._compare(matched[1], matched[2])
@@ -855,7 +1489,8 @@ class GitHubRepositoryFake:
             if matched[2] == "status":
                 statuses = list(self.statuses.get(matched[1], {}).values())
                 return httpx.Response(
-                    200, json={"state": "pending", "statuses": statuses, "total_count": 0}
+                    200,
+                    json={"state": "pending", "statuses": statuses, "total_count": len(statuses)},
                 )
             runs = [self._visible(run) for run in self.check_runs.get(matched[1], {}).values()]
             return httpx.Response(200, json={"total_count": len(runs), "check_runs": runs})
@@ -875,9 +1510,35 @@ class GitHubRepositoryFake:
         # No job log is kept, so diagnostics report it unavailable.
         return httpx.Response(404, json={"message": "missing fixture"})
 
+    def _raw(self, request: httpx.Request, path: str) -> httpx.Response:
+        # GET https://github.com/<owner>/<repo>/raw/<commit sha>/<path>
+        self.raw_requests.append(request)
+        matched = re.fullmatch(rf"/{REPO}/raw/([0-9a-f]{{40}})/(.+)", path)
+        content = None
+        if request.method == "GET" and matched:
+            content = self.raw(matched[1], unquote(matched[2]))
+        if content is None:
+            return httpx.Response(404, text="Not Found")
+        kind = "image/png" if content.startswith(_PNG_SIGNATURE) else "application/octet-stream"
+        return httpx.Response(200, content=content, headers={"Content-Type": kind})
+
+    def _injected_failure(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        subject = f"{request.method} {path}"
+        for fault in self._write_faults:
+            pattern, status, remaining = fault
+            if remaining > 0 and pattern.search(subject):
+                fault[2] = remaining - 1
+                return httpx.Response(status, json={"message": "injected"})
+        return None
+
     def _write(self, request: httpx.Request, path: str) -> httpx.Response:
         self.writes += 1
+        injected = self._injected_failure(request, path)
+        if injected is not None:
+            return injected
         body = json.loads(request.content) if request.content else {}
+        if request.method == "POST" and path == f"/repos/{REPO}/issues":
+            return self._create_issue(body)
         matched = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments", path)
         if request.method == "POST" and matched:
             comment = self.add_comment(int(matched[1]), CONTRACT_BOT, body["body"], app=True)
@@ -907,6 +1568,30 @@ class GitHubRepositoryFake:
             return httpx.Response(200, json=issue["labels"])
         return self._write_code(request, path, body)
 
+    def _create_issue(self, body: dict[str, Any]) -> httpx.Response:
+        """Create an issue as the installation token's bot user.
+
+        https://docs.github.com/en/rest/issues/issues#create-an-issue
+        201 with the full issue object.
+        """
+
+        self.issue_posts.append(body)
+        number = self._number()
+        issue = {
+            "number": number,
+            "title": body["title"],
+            "body": body.get("body"),
+            "state": "open",
+            "labels": [{"name": name} for name in body.get("labels", [])],
+            "user": dict(self.bot_user),
+            "html_url": f"https://github.com/{REPO}/issues/{number}",
+            "performed_via_github_app": {"id": CONTRACT_APP_ID},
+        }
+        self.issues[number] = issue
+        if self.hide_new_from_listing:
+            self.hidden_from_listing.add(number)
+        return httpx.Response(201, json=issue)
+
     def _write_code(
         self, request: httpx.Request, path: str, body: dict[str, Any]
     ) -> httpx.Response:
@@ -915,12 +1600,7 @@ class GitHubRepositoryFake:
             if body["head"] not in self.branches or body["base"] not in self.branches:
                 return httpx.Response(422, json={"message": "Validation Failed"})
             number = self._number()
-            self.issues[number] = {
-                "number": number,
-                "state": "open",
-                "pull_request": {},
-                "labels": [],
-            }
+            self.issues[number] = self._pull_issue(number)
             self.pulls[number] = {
                 "head": body["head"],
                 "base": body["base"],
@@ -942,6 +1622,9 @@ class GitHubRepositoryFake:
                 int(matched[1]), CONTRACT_BOT, body["body"], app=True, in_reply_to=int(matched[2])
             )
             return httpx.Response(201, json={"id": reply["id"]})
+        evidence = self._write_git_data(request, path, body)
+        if evidence is not None:
+            return evidence
         matched = re.fullmatch(rf"{repo}/actions/runs/(\d+)/rerun-failed-jobs", path)
         if request.method == "POST" and matched:
             for runs in self.check_runs.values():
@@ -953,3 +1636,158 @@ class GitHubRepositoryFake:
                         run.update(status="queued", conclusion=None)
             return httpx.Response(201)
         return httpx.Response(404, json={"message": "missing fixture"})
+
+    # Git Data API ---------------------------------------------------------
+
+    @staticmethod
+    def _ref_payload(ref: str, sha: str) -> dict[str, Any]:
+        return {
+            "ref": ref,
+            "url": f"{GITHUB_API}/repos/{REPO}/git/{ref}",
+            "object": {
+                "sha": sha,
+                "type": "commit",
+                "url": f"{GITHUB_API}/repos/{REPO}/git/commits/{sha}",
+            },
+        }
+
+    def _store_tree(self, entries: list[dict[str, str]]) -> str:
+        sha = git_object_sha("tree", _git_tree_payload(entries))
+        self.trees[sha] = entries
+        return sha
+
+    def _build_tree(self, blobs: dict[str, str]) -> str:
+        """Nested git trees for ``path -> blob id``, as GitHub builds them from
+        slash separated paths; returns the root tree id."""
+
+        files: dict[str, str] = {}
+        directories: dict[str, dict[str, str]] = {}
+        for path, sha in blobs.items():
+            head, _, rest = path.partition("/")
+            if rest:
+                directories.setdefault(head, {})[rest] = sha
+            else:
+                files[head] = sha
+        entries = [
+            {"name": name, "mode": "100644", "type": "blob", "sha": sha}
+            for name, sha in files.items()
+        ]
+        entries += [
+            {"name": name, "mode": "040000", "type": "tree", "sha": self._build_tree(inner)}
+            for name, inner in directories.items()
+        ]
+        return self._store_tree(entries)
+
+    def _write_git_data(
+        self, request: httpx.Request, path: str, body: dict[str, Any]
+    ) -> httpx.Response | None:
+        repo = f"/repos/{REPO}"
+        api = f"{GITHUB_API}{repo}"
+        invalid = httpx.Response(422, json={"message": "Validation Failed"})
+        if request.method == "POST" and path == f"{repo}/git/blobs":
+            encoding = body.get("encoding", "utf-8")
+            if encoding == "base64":
+                content = base64.b64decode(body["content"])
+            elif encoding == "utf-8":
+                content = str(body["content"]).encode()
+            else:
+                return invalid
+            sha = git_blob_sha(content)
+            self.blobs[sha] = content
+            return httpx.Response(201, json={"sha": sha, "url": f"{api}/git/blobs/{sha}"})
+        if request.method == "POST" and path == f"{repo}/git/trees":
+            blobs: dict[str, str] = {}
+            for entry in body.get("tree", []):
+                if (
+                    entry.get("type") != "blob"
+                    or entry.get("mode") != "100644"
+                    or entry.get("sha") not in self.blobs
+                ):
+                    return invalid
+                blobs[str(entry["path"])] = str(entry["sha"])
+            if not blobs or "base_tree" in body:
+                return invalid
+            sha = self._build_tree(blobs)
+            listed = [
+                {
+                    "path": entry["name"],
+                    "mode": entry["mode"],
+                    "type": entry["type"],
+                    "sha": entry["sha"],
+                    "url": f"{api}/git/{entry['type']}s/{entry['sha']}",
+                }
+                for entry in self.trees[sha]
+            ]
+            payload = {"sha": sha, "url": f"{api}/git/trees/{sha}", "tree": listed}
+            return httpx.Response(201, json={**payload, "truncated": False})
+        if request.method == "POST" and path == f"{repo}/git/commits":
+            tree, parents = body.get("tree"), list(body.get("parents", []))
+            if tree not in self.trees or any(parent not in self.commits for parent in parents):
+                return invalid
+            when = _stamp(0)
+            author = dict(body.get("author") or {"name": APP_SLUG, "email": "", "date": when})
+            committer = dict(body.get("committer") or author)
+            sha = git_commit_sha(
+                tree=tree,
+                parents=parents,
+                message=str(body["message"]),
+                author=author,
+                committer=committer,
+            )
+            self.seed_commit(sha, parents=parents, message=str(body["message"]), tree=tree)
+            return httpx.Response(
+                201,
+                json={
+                    "sha": sha,
+                    "url": f"{api}/git/commits/{sha}",
+                    "html_url": f"https://github.com/{REPO}/commit/{sha}",
+                    "message": body["message"],
+                    "author": author,
+                    "committer": committer,
+                    "tree": {"sha": tree, "url": f"{api}/git/trees/{tree}"},
+                    "parents": [
+                        {"sha": parent, "url": f"{api}/git/commits/{parent}"} for parent in parents
+                    ],
+                },
+            )
+        if request.method == "POST" and path == f"{repo}/git/refs":
+            ref, sha = str(body.get("ref", "")), body.get("sha")
+            if not ref.startswith("refs/") or ref.count("/") < 2 or sha not in self.commits:
+                return invalid
+            if ref.startswith("refs/heads/"):
+                if ref.removeprefix("refs/heads/") in self.branches:
+                    return httpx.Response(422, json={"message": "Reference already exists"})
+                self.branches[ref.removeprefix("refs/heads/")] = sha
+            else:
+                if ref in self.evidence_refs:
+                    return httpx.Response(422, json={"message": "Reference already exists"})
+                self.evidence_refs[ref] = sha
+            return httpx.Response(201, json=self._ref_payload(ref, sha))
+        matched = re.fullmatch(rf"{repo}/git/refs/(.+)", path)
+        if matched and request.method in {"PATCH", "DELETE"}:
+            ref = f"refs/{unquote(matched[1])}"
+            branch = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else None
+            present = branch in self.branches if branch is not None else ref in self.evidence_refs
+            if not present:
+                return httpx.Response(422, json={"message": "Reference does not exist"})
+            if request.method == "DELETE":
+                if branch is not None:
+                    del self.branches[branch]
+                else:
+                    del self.evidence_refs[ref]
+                return httpx.Response(204)
+            sha = body.get("sha")
+            if sha not in self.commits:
+                return invalid
+            if branch is not None:
+                self.branches[branch] = sha
+            else:
+                self.evidence_refs[ref] = sha
+            return httpx.Response(200, json=self._ref_payload(ref, sha))
+        return None
+
+
+def evidence_raw_url(commit_sha: str, path: str) -> str:
+    """The raw URL GitHub serves ``path`` at ``commit_sha`` under."""
+
+    return f"https://github.com/{REPO}/raw/{commit_sha}/{quote(path)}"

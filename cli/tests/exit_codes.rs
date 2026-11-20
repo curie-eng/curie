@@ -503,10 +503,17 @@ fn streamed_skill_success_and_incomplete_stream_preserve_the_output_contract() {
 
 fn run_seal(connector: &str, json: bool) -> Output {
     let keypair = curie::sealing::generate_keypair();
+    run_seal_with(connector, json, false, &keypair.public_key)
+}
+
+fn run_seal_with(connector: &str, json: bool, quiet: bool, public_key: &str) -> Output {
     let connector_arg = format!("--connector={connector}");
     let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
     if json {
         command.arg("--json");
+    }
+    if quiet {
+        command.arg("--quiet");
     }
     command
         .args([
@@ -514,7 +521,7 @@ fn run_seal(connector: &str, json: bool) -> Output {
             &connector_arg,
             "GRAFANA_TOKEN",
             "--public-key",
-            &keypair.public_key,
+            public_key,
             "--from-env",
             "CURIE_TEST_SEAL_VALUE",
         ])
@@ -1460,7 +1467,95 @@ fn seal_human_output_warns_before_pasting_rejected_sealed_secrets() {
         "JSON seal must retain its exact machine readable shape"
     );
     assert!(
-        !json_stdout.contains("#1434") && !json_stderr.contains("#1434"),
-        "the human warning must not appear in JSON mode:\nstdout: {json_stdout}\nstderr: {json_stderr}"
+        !json_stdout.contains("#1434"),
+        "the warning belongs on stderr, never in the JSON payload:\nstdout: {json_stdout}"
     );
+    assert_eq!(
+        json_stderr.matches("#1434").count(),
+        1,
+        "JSON seal must warn once on stderr that connector validation rejects sealed_secrets until #1434 lands:\n{json_stderr}"
+    );
+    assert!(
+        json_stderr.contains("connector validation") && json_stderr.contains("sealed_secrets"),
+        "JSON seal warning must name the rejection:\n{json_stderr}"
+    );
+    assert_eq!(
+        human_output.matches("#1434").count(),
+        1,
+        "human seal must keep exactly one warning:\n{human_output}"
+    );
+    for (name, text) in [
+        ("human stdout", &human_stdout),
+        ("human stderr", &human_stderr),
+        ("JSON stdout", &json_stdout),
+        ("JSON stderr", &json_stderr),
+    ] {
+        assert!(
+            !text.contains(SEAL_VALUE),
+            "{name} must not expose the plaintext:\n{text}"
+        );
+    }
+
+    // Quiet keeps the JSON payload and suppresses the note.
+    let keypair = curie::sealing::generate_keypair();
+    let quiet = run_seal_with("grafana", true, true, &keypair.public_key);
+    let quiet_stdout = String::from_utf8_lossy(&quiet.stdout);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert_eq!(
+        quiet.status.code(),
+        Some(ExitClass::Success.code()),
+        "quiet JSON seal must succeed\nstdout: {quiet_stdout}\nstderr: {quiet_stderr}"
+    );
+    let quiet_payload: serde_json::Value = serde_json::from_slice(&quiet.stdout)
+        .unwrap_or_else(|err| panic!("quiet JSON seal must emit JSON: {err}; {quiet_stdout}"));
+    assert_eq!(
+        quiet_payload
+            .as_object()
+            .expect("quiet JSON seal must emit an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["connector", "env_name", "sealed", "public_key", "yaml"]
+            .into_iter()
+            .collect(),
+    );
+    assert!(
+        !quiet_stderr.contains("#1434"),
+        "--quiet must suppress the note:\n{quiet_stderr}"
+    );
+
+    // Failing inputs keep their failure class and never claim success.
+    let failures = [
+        (
+            run_seal_with("Grafana", true, false, &keypair.public_key),
+            "invalid connector name",
+        ),
+        (
+            run_seal_with("grafana", true, false, "not-a-public-key"),
+            "malformed public key",
+        ),
+    ];
+    for (output, label) in failures {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(
+            output.status.code(),
+            Some(ExitClass::Success.code()),
+            "{label} must fail\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|err| panic!("{label} must emit a JSON error: {err}; {stdout}"));
+        assert!(
+            payload["error"].as_str().is_some() && payload.get("sealed").is_none(),
+            "{label} must emit the error envelope and no sealed value: {payload}"
+        );
+        assert!(
+            !stderr.contains("#1434"),
+            "{label} must not emit the success note:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains(SEAL_VALUE) && !stderr.contains(SEAL_VALUE),
+            "{label} must not expose the plaintext"
+        );
+    }
 }

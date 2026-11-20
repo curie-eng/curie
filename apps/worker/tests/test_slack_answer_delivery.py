@@ -11,13 +11,13 @@ import asyncio
 
 import pytest
 from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyTarget, ReplyUpdate
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter
 
 
 @pytest.fixture(autouse=True)
 def _instant_synthetic_slack_delays(monkeypatch):
-    from curie_worker import slack_sink
+    from curie_channel_gateway.slack import slack_sink
 
     async def sleep(_delay):
         return None
@@ -225,7 +225,7 @@ def test_hook_answer_continuations_use_existing_message_as_the_thread_root():
 
 @pytest.mark.parametrize("header_name", ["Retry-After", "retry-after"])
 def test_continuations_honor_retry_after_and_preserve_all_content(monkeypatch, header_name):
-    from curie_worker import slack_sink
+    from curie_channel_gateway.slack import slack_sink
     from slack_sdk.errors import SlackApiError
 
     delays = []
@@ -271,7 +271,7 @@ def test_continuations_honor_retry_after_and_preserve_all_content(monkeypatch, h
     ids=["flag", "oversized-cluster"],
 )
 def test_unicode_boundaries_are_lossless_even_for_oversized_clusters(text):
-    from curie_worker.slack_text import split_answer
+    from curie_channel_gateway.slack.slack_text import split_answer
 
     parts = split_answer(text)
     assert "".join(part.content for part in parts) == text

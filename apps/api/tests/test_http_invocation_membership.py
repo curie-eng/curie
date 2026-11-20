@@ -23,7 +23,6 @@ from typing import Any
 
 import pytest
 import redis
-from aci_protocol import QueuedTurn
 from curie_api import agent_role_policy, channel_token, principal_authority
 from curie_api.config import get_settings
 from curie_api.identity.http_credential_registry import build_provider_credential_registry
@@ -37,16 +36,15 @@ from curie_api.models import (
     AgentChannel,
     ChannelIdentity,
     IdentityNamespace,
-    Principal,
     ProviderInstallation,
 )
 from curie_api.schemas.http_identity import LookupRequestV1, NamespaceV1
 from curie_internal import identity_context as codec
+from curie_internal.identity_authority import IDENTITY_CALLER_WAIT_SECONDS
 from curie_internal.keyspace import CHANNEL_KEY_PREFIX
 from fastapi.testclient import TestClient
 from principal_adoption_support import ISSUER, VECTORS, selection
 from role_policy_support import change, run, seed
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 ACCOUNT = "T0EXAMPLE1"
@@ -57,6 +55,13 @@ GROUP = "SyntheticRequiredGroup"
 # @spec HTTP-INVOCATION-EXECUTION-21: synthetic Grid organisation and workspace.
 GRID_ORG = "E0EXAMPLEORG"
 GRID_WORKSPACE = "T0EXAMPLEHOME"
+# @spec HTTP-INVOCATION-EXECUTION-4: the API revalidates these facts against the wall
+# clock after its writer phase, anywhere inside the composition budget, and the
+# sealed delivery window inherits them. A window shorter than the caller wait lets
+# runner scheduling stalls, not the code under test, turn an in-time turn into
+# identity_authority_unavailable. Freshness expiry tests set their own limits.
+FIXTURE_IDENTITY_AGE_MS = int(IDENTITY_CALLER_WAIT_SECONDS * 2000)
+FIXTURE_MEMBERSHIP_AGE_MS = int(IDENTITY_CALLER_WAIT_SECONDS * 3000)
 
 
 def _transport_harness() -> ModuleType:
@@ -190,7 +195,7 @@ def _runtime_api() -> ModuleType:
     return module
 
 
-def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
+def _scope(endpoint: str, *, grid: bool = False, adopt_identity: bool = True) -> dict[str, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-4/5/15/21: real adopted scope, no legacy projections."""
     account = GRID_WORKSPACE if grid else ACCOUNT
     kind, key = ("slack_enterprise", GRID_ORG) if grid else ("slack_workspace", ACCOUNT)
@@ -206,13 +211,22 @@ def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
         """@spec HTTP-INVOCATION-EXECUTION-4/5/15."""
         tenant, agent = await seed(factory)
         async with factory() as session, session.begin():
-            adopted = await principal_authority.adopt_http_authority(
-                session,
-                tenant_id=tenant,
-                expected_version=0,
-                expected_lifecycle_generation=0,
-                selection=selection(lookup_url=endpoint),
+            from curie_api.schemas.http_authority import AuthorityConfigV1
+
+            configuration = AuthorityConfigV1(
+                schema_version=1, tenant_id=str(tenant), version=1,
+                selection=selection(
+                    lookup_url=endpoint,
+                    max_identity_age_ms=FIXTURE_IDENTITY_AGE_MS,
+                    max_membership_age_ms=FIXTURE_MEMBERSHIP_AGE_MS,
+                ),
             )
+            if adopt_identity:
+                adopted = await principal_authority.adopt_http_authority(
+                    session, tenant_id=tenant, expected_version=0,
+                    expected_lifecycle_generation=0, selection=configuration.selection,
+                )
+                configuration = adopted.configuration
             installation = ProviderInstallation(
                 tenant_id=tenant,
                 provider="slack",
@@ -258,8 +272,10 @@ def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
                 installation=str(installation.id),
                 adapter=identity.name,
                 namespace=NamespaceV1(id=str(namespace.id), authority="", kind=kind, key=key),
-                configuration=adopted.configuration,
+                configuration=configuration,
             )
+        if not adopt_identity:
+            return
         async with factory() as session, session.begin():
             result = await agent_role_policy.apply_role_change(
                 session,
@@ -438,106 +454,6 @@ def test_owned_tls_source_echoes_fresh_request_scope(synthetic_provider: SimpleN
     asyncio.run(exchange())
 
 
-def test_current_http_member_queues_one_context_and_nonmember_writes_no_delivery_state(
-    clean_db: None,
-    valkey: redis.Redis,
-    runs_stream: str,
-    synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4/5/6/7/15: same receiver, credential and current group."""
-    provider = synthetic_provider
-    scope = _scope(provider.url)
-    module = _runtime_api()
-    identity_client = HttpIdentityClient(tls_context=provider.tls)
-    try:
-        with TestClient(
-            create_app(
-                http_identity_runtime=_runtime(module, scope), http_identity_client=identity_client
-            )
-        ) as client:
-            token = _credential(client, scope)
-            body, proof = _submission(scope)
-            assert _keys(valkey, scope["binding"]) == set() and valkey.xlen(runs_stream) == 0
-            accepted = _post(client, token, body, proof)
-            assert accepted.status_code == 200, accepted.text
-            entries = valkey.xrange(runs_stream)
-            assert len(entries) == 1
-            stream_id, fields = entries[0]
-            assert accepted.json()["stream_id"] == stream_id
-            assert set(fields) == {"payload", "curie_identity_context_v1"}
-            payload = fields["payload"]
-            turn = QueuedTurn.model_validate_json(payload)
-            ring = codec.build_identity_keyring(
-                "context", (("synthetic-context", 1, scope["context_key"]),)
-            )
-            context = codec.open_invocation_context(fields["curie_identity_context_v1"], ring)
-            assert isinstance(context, codec.InvocationContextV1)
-            assert context.payload_sha256 == hashlib.sha256(payload.encode()).hexdigest()
-            assert context.event_id == context.original_event_id == turn.event_id
-            assert context.scope.model_dump() == {
-                "tenant_id": scope["tenant"],
-                "agent_id": scope["agent"],
-                "binding_id": scope["binding"],
-                "binding_generation": scope["generation"],
-                "channel_identity_id": scope["identity"],
-                "provider_installation_id": scope["installation"],
-                "provider": "slack",
-                "native_id": SENDER,
-                "namespace": scope["namespace"].model_dump(),
-            }
-            assert context.receiver_id == scope["receiver_id"] and context.independent_human is True
-            assert context.provider_version == scope["configuration"].version
-            assert context.role_policy_version == scope["role_version"]
-            assert context.canonical.subject == SUBJECT and context.canonical.issuer == ISSUER
-            assert turn.author == SENDER and turn.reply_handle.placeholder is None
-            assert turn.author_principal is not None and context.principal is not None
-            assert turn.author_principal.model_dump() == context.principal.model_dump()
-            with pytest.raises((AttributeError, TypeError, ValueError)):
-                context.principal.principal_id = str(uuid.uuid4())
-
-            async def original_association(factory: async_sessionmaker[AsyncSession]) -> None:
-                """@spec HTTP-INVOCATION-EXECUTION-4/5/6: inspect durable provenance."""
-                async with factory() as session:
-                    row = await session.scalar(
-                        select(Principal).where(
-                            Principal.tenant_id == uuid.UUID(scope["tenant"]),
-                            Principal.idp_issuer == ISSUER,
-                            Principal.idp_subject == SUBJECT,
-                        )
-                    )
-                    assert row is not None and row.type == "human" and row.status == "active"
-                    assert turn.author_principal.principal_id == str(row.id)
-                    assert turn.author_principal.authorization_version == row.authorization_version
-
-            run(original_association)
-            assert len(provider.requests) == 1
-            observed = provider.requests[0]
-            assert observed["authority_version"] == scope["configuration"].version
-            assert observed["scope"]["tenant_id"] == scope["tenant"]
-            assert observed["scope"]["sender"] == {
-                "provider": "slack",
-                "channel_identity_id": scope["identity"],
-                "provider_installation_id": scope["installation"],
-                "namespace": scope["namespace"].model_dump(),
-                "native_id": SENDER,
-            }
-            previous = {key: valkey.get(key) for key in _keys(valkey, scope["binding"])}
-            provider.member = False
-            refused = _post(client, token, *_submission(scope))
-            assert refused.status_code == 403 and refused.json() == {"detail": "caller_not_allowed"}
-            assert len(provider.requests) == 2
-            assert provider.requests[1]["request_id"] != observed["request_id"]
-            assert provider.responses[1]["membership"]["complete"] is True
-            assert provider.responses[1]["membership"]["groups"][0]["id"] != GROUP
-            assert {key: valkey.get(key) for key in _keys(valkey, scope["binding"])} == previous
-            assert valkey.xrange(runs_stream) == entries
-        assert identity_client.close_status().state == "closed"
-    finally:
-        keys = _keys(valkey, scope["binding"])
-        if keys:
-            valkey.delete(*keys)
-
-
 @pytest.mark.parametrize(
     "tamper", ["body", "sender", "receiving_scope", "binding_generation", "mac"]
 )
@@ -629,55 +545,73 @@ def _grid_evidence(**changes: Any) -> codec.ReceiverSlackEvidenceV1:
     })
 
 
-def test_grid_workspace_member_queues_one_organisation_context_and_outsiders_refuse(
-    clean_db: None,
-    valkey: redis.Redis,
-    runs_stream: str,
+def test_operator_adopts_and_filters_real_tls_membership(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
     synthetic_provider: SimpleNamespace,
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-2/15/21: synthetic Grid ids; no live Grid qualified."""
     provider = synthetic_provider
-    scope = _scope(provider.url, grid=True)
-    module = _runtime_api()
+    scope = _scope(provider.url, adopt_identity=False)
+    runtime = _runtime(_runtime_api(), scope)
+    identity_client = HttpIdentityClient(tls_context=provider.tls)
     try:
-        with TestClient(
-            create_app(
-                http_identity_runtime=_runtime(module, scope),
-                http_identity_client=HttpIdentityClient(tls_context=provider.tls),
+        with TestClient(create_app(
+            http_identity_runtime=runtime, http_identity_client=identity_client,
+        )) as client:
+            headers = {"X-API-Key": get_settings().api_key}
+            path = f"/identity/authorities/{scope['tenant']}"
+            adopted = client.put(path, headers=headers, json={
+                "request_id": str(uuid.uuid4()), "expected_version": 0,
+                "expected_lifecycle_generation": 0,
+                "selection": scope["configuration"].selection.model_dump(mode="json"),
+            })
+            assert adopted.status_code == 200, adopted.text
+            filtered = client.put(
+                f"/identity/roles/{scope['tenant']}/{scope['agent']}/invocation",
+                headers=headers, json={
+                    "request_id": str(uuid.uuid4()), "expected_version": 0,
+                    "groups": [{"issuer": ISSUER, "id": GROUP}],
+                },
             )
-        ) as client:
+            assert filtered.status_code == 200, filtered.text
             token = _credential(client, scope)
-            for refused in (
-                {"is_ext_shared_channel": True},
-                {"is_ext_shared_channel": None},
-                {"enterprise_ids": ()},
-                {"enterprise_ids": ("E0EXAMPLEPARTNER",)},
-                {"enterprise_ids": (GRID_ORG, "is_enterprise_install")},
-            ):
-                submission = _submission(scope, slack=_grid_evidence(**refused))
-                response = _post(client, token, *submission)
-                assert response.status_code == 401, refused
-                assert response.json() == {"detail": "invalid_http_receiver"}
-            assert provider.requests == []
-            assert _keys(valkey, scope["binding"]) == set() and valkey.xlen(runs_stream) == 0
-            accepted = _post(client, token, *_submission(scope, slack=_grid_evidence()))
+            accepted = _post(client, token, *_submission(scope))
             assert accepted.status_code == 200, accepted.text
-            (entry,) = valkey.xrange(runs_stream)
-            ring = codec.build_identity_keyring(
-                "context", (("synthetic-context", 1, scope["context_key"]),)
+            entries = valkey.xrange(runs_stream)
+            assert len(entries) == 1
+            provider.member = False
+            denied = _post(client, token, *_submission(scope))
+            assert denied.status_code == 403
+            assert denied.json() == {"detail": "caller_not_allowed"}
+            assert valkey.xrange(runs_stream) == entries
+            assert len(provider.requests) == 2
+            current = client.get(path, headers=headers).json()
+            retired = client.post(path + "/retire", headers=headers, json={
+                "request_id": str(uuid.uuid4()),
+                "expected_version": current["configuration"]["version"],
+                "expected_lifecycle_generation": current["lifecycle_generation"],
+            })
+            assert retired.status_code == 200, retired.text
+            provider.member = True
+            unavailable = _post(client, token, *_submission(scope))
+            assert unavailable.status_code == 503
+            assert unavailable.json()["detail"] == "identity_authority_unavailable"
+            assert len(provider.requests) == 2
+            assert valkey.xrange(runs_stream) == entries
+            from aci_protocol import ApprovalRequest
+
+            approval = ApprovalRequest(
+                agent_id=uuid.UUID(scope["agent"]), conversation_id="synthetic-retired",
+                author=SENDER, summary="Synthetic retired authority request",
+                reply_kind="slack", reply_channel=scope["address"],
+                reply_adapter=scope["adapter"], reply_placeholder="1760000000.000123",
+                dedupe_key="synthetic-retired-" + uuid.uuid4().hex,
             )
-            context = codec.open_invocation_context(entry[1]["curie_identity_context_v1"], ring)
-            assert isinstance(context, codec.InvocationContextV1)
-            organisation = {
-                "id": scope["namespace"].id, "authority": "", "kind": "slack_enterprise",
-                "key": GRID_ORG,
-            }
-            assert context.scope.namespace.model_dump() == organisation
-            assert context.scope.native_id == SENDER
-            (observed,) = provider.requests
-            assert observed["scope"]["sender"]["namespace"] == organisation
-            assert observed["scope"]["sender"]["native_id"] == SENDER
-            assert QueuedTurn.model_validate_json(entry[1]["payload"]).author == SENDER
+            refused_approval = client.post(
+                "/approvals", headers=headers, json=approval.model_dump(mode="json"),
+            )
+            assert refused_approval.status_code == 409, refused_approval.text
+            assert refused_approval.json() == {"detail": "unsupported_approval"}
+        assert identity_client.close_status().state == "closed"
     finally:
         keys = _keys(valkey, scope["binding"])
         if keys:

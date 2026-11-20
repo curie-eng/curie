@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import html
 import ipaddress
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import sqlite3
@@ -14,15 +18,26 @@ import ssl
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 REPOSITORY = "acme-corp/acme-bot"
 HUMAN = {"id": 6601, "login": "octocat", "type": "User"}
+READER = {"id": 6602, "login": "reader", "type": "User"}
 BOT = {"id": 51, "login": "example-app[bot]", "type": "Bot"}
+# Collaborator permission levels the REST answer may carry.
+# https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+PERMISSION_LEVELS = ("admin", "maintain", "write", "triage", "read", "none")
+# Write operations a test can make fail or answer ambiguously, and how.
+FAULT_OPERATIONS = ("issue_create", "comment_create")
+# refuse: answer the status and write nothing.
+# ambiguous: write the object, then answer the status as if it failed.
+# unreadable: write the object, then answer 201 with a body that is not JSON.
+FAULT_MODES = ("refuse", "ambiguous", "unreadable")
 PERMISSIONS = {
     "contents": "write",
     "issues": "write",
@@ -87,6 +102,10 @@ class GithubStub:
                     ) from None
         self.root = root.resolve()
         self.recording = recording
+        self.oauth_client_id = os.environ.get("CURIE_GITHUB_STUB_OAUTH_CLIENT_ID", "Iv1.example")
+        self.oauth_client_secret = os.environ.get(
+            "CURIE_GITHUB_STUB_OAUTH_CLIENT_SECRET", "EXAMPLE-github-client-secret-sentinel"
+        )
         self.host = host
         self.bind = bind_address
         self.port = port
@@ -96,6 +115,11 @@ class GithubStub:
         self._thread: threading.Thread | None = None
         self._real_start: float | None = None
         self._closed = False
+        # When set, GET rules/branches answers the plan-gated 403 GitHub Free
+        # returns for a private repository, and the repository row is private.
+        # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+        # https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
+        self.plan_gated_branch_rules = False
         self._git_root = self.root / "repositories"
         self._repository = self._git_root / f"{REPOSITORY}.git"
 
@@ -191,6 +215,21 @@ class GithubStub:
                 "CREATE TABLE objects(kind TEXT, id INTEGER, body TEXT NOT NULL,"
                 " PRIMARY KEY(kind,id)); CREATE TABLE unsupported(request TEXT);"
                 "CREATE TABLE tokens(token TEXT PRIMARY KEY, permissions TEXT);"
+                "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL);"
+                "CREATE TABLE oauth_codes(code_hash TEXT PRIMARY KEY, redirect_uri TEXT NOT NULL);"
+                "CREATE TABLE oauth_tokens(token_hash TEXT PRIMARY KEY);"
+                "CREATE TABLE collaborators(login TEXT PRIMARY KEY, permission TEXT NOT NULL,"
+                " user TEXT NOT NULL);"
+                "CREATE TABLE permission_faults(login TEXT PRIMARY KEY, status INTEGER NOT NULL);"
+                "CREATE TABLE faults(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " operation TEXT NOT NULL, mode TEXT NOT NULL, status INTEGER NOT NULL);"
+            )
+            connection.executemany(
+                "INSERT INTO collaborators VALUES(?,?,?)",
+                [
+                    (HUMAN["login"], "write", json.dumps(HUMAN)),
+                    (READER["login"], "read", json.dumps(READER)),
+                ],
             )
         self._repository.parent.mkdir(parents=True, exist_ok=True)
         self._run("git", "init", "--bare", "--initial-branch=main", str(self._repository))
@@ -311,6 +350,35 @@ class GithubStub:
                 "INSERT OR REPLACE INTO objects VALUES(?,?,?)", (kind, identifier, json.dumps(body))
             )
 
+    def _insert_new(self, kind: str, build: Callable[[int], dict[str, Any]]) -> dict[str, Any]:
+        """Insert one new object, allocating its id under a write lock.
+
+        The id is chosen and the row is inserted before the lock is released, so
+        concurrent creators cannot share an id or replace one another's row.
+        """
+
+        connection = sqlite3.connect(self._database, timeout=30, isolation_level="IMMEDIATE")
+        try:
+            # A data-changing statement opens the write transaction. This matches
+            # no row, and the id read and the insert then share that lock.
+            connection.execute("UPDATE objects SET kind=kind WHERE 0")
+            current = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM objects WHERE kind=?", (kind,)
+            ).fetchone()
+            identifier = int(current[0]) + 1
+            body = build(identifier)
+            if int(body["id"]) != identifier:
+                raise RuntimeError("allocated id does not match the stored object")
+            connection.execute(
+                "INSERT INTO objects(kind, id, body) VALUES(?,?,?)",
+                (kind, identifier, json.dumps(body)),
+            )
+            connection.commit()
+            return body
+        finally:
+            # Close rolls back when commit did not run, releasing the write lock.
+            connection.close()
+
     def _rows(self, kind: str) -> list[dict[str, Any]]:
         with sqlite3.connect(self._database) as connection:
             return [
@@ -337,19 +405,32 @@ class GithubStub:
             "updated_at": _utc(),
         }
 
-    def _label_event(self, number: int, label: str, event: str, actor: dict[str, Any]) -> None:
-        identifier = max((row["id"] for row in self._rows("event")), default=0) + 1
-        row = {
-            "id": identifier,
-            "issue_number": number,
-            "event": event,
-            "label": {"name": label},
-            "actor": actor,
-            "created_at": _utc(),
-        }
-        if actor == BOT:
-            row["performed_via_github_app"] = {"id": 51}
-        self._put("event", identifier, row)
+    def _label_event(
+        self,
+        number: int,
+        label: str,
+        event: str,
+        actor: dict[str, Any],
+        *,
+        performed_via_github_app: dict[str, Any] | None = None,
+    ) -> None:
+        def build(identifier: int) -> dict[str, Any]:
+            row = {
+                "id": identifier,
+                "issue_number": number,
+                "event": event,
+                "label": {"name": label},
+                "actor": actor,
+                "created_at": _utc(),
+            }
+            row["performed_via_github_app"] = (
+                {"id": 51}
+                if actor == BOT and performed_via_github_app is None
+                else performed_via_github_app
+            )
+            return row
+
+        self._insert_new("event", build)
 
     def _ref(self, branch: str) -> str:
         return (
@@ -434,6 +515,7 @@ class GithubStub:
             "default_branch": "main",
             "html_url": f"{self.base_url}/{REPOSITORY}",
             "clone_url": self.clone_url,
+            **({"private": True} if self.plan_gated_branch_rules else {}),
         }
 
     def _checks(self, sha: str) -> list[dict[str, Any]]:
@@ -457,12 +539,187 @@ class GithubStub:
         handler.end_headers()
         handler.wfile.write(payload)
 
+    def add_issue_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        author: dict[str, Any],
+        app: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Seed an authenticated-read comment with independent author and App provenance."""
+
+        def build(identifier: int) -> dict[str, Any]:
+            return {
+                "id": identifier,
+                "body": body,
+                "issue_number": number,
+                "user": author,
+                "performed_via_github_app": app,
+                "created_at": _utc(),
+                "updated_at": _utc(),
+                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
+                "html_url": (
+                    f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
+                ),
+            }
+
+        return self._insert_new("comment", build)
+
+    # Runtime controls. The scripted driver holds this object in process, so a
+    # control is a method call, like ``advance`` and ``add_issue_comment``. Each
+    # writes SQLite state the request threads read on every request.
+
+    def set_permission(
+        self, login: str, permission: str, *, user: dict[str, Any] | None = None
+    ) -> None:
+        """Answer ``permission`` for ``login`` from now on, adding the collaborator."""
+
+        if permission not in PERMISSION_LEVELS:
+            raise ValueError(f"unknown permission level: {permission}")
+        with sqlite3.connect(self._database) as connection:
+            row = connection.execute(
+                "SELECT user FROM collaborators WHERE login=?", (login,)
+            ).fetchone()
+            if user is None:
+                if row is None:
+                    raise ValueError(f"collaborator {login} needs a user to be added")
+                user = json.loads(row[0])
+            connection.execute(
+                "INSERT OR REPLACE INTO collaborators VALUES(?,?,?)",
+                (login, permission, json.dumps(user)),
+            )
+
+    def revoke_permission(self, login: str) -> None:
+        """Drop ``login`` to read access; GitHub still lists a read collaborator."""
+
+        self.set_permission(login, "read")
+
+    def permission(self, login: str) -> str | None:
+        with sqlite3.connect(self._database) as connection:
+            row = connection.execute(
+                "SELECT permission FROM collaborators WHERE login=?", (login,)
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def fail_permission_reads(self, login: str, status: int = 503) -> None:
+        """Answer every permission read for ``login`` with ``status`` until cleared."""
+
+        if status < 500:
+            raise ValueError("a permission read failure is a server error status")
+        with sqlite3.connect(self._database) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO permission_faults VALUES(?,?)", (login, status)
+            )
+
+    def clear_permission_failure(self, login: str) -> None:
+        with sqlite3.connect(self._database) as connection:
+            connection.execute("DELETE FROM permission_faults WHERE login=?", (login,))
+
+    def inject_fault(self, operation: str, mode: str, *, count: int = 1, status: int = 502) -> None:
+        """Make the next ``count`` ``operation`` requests fail in ``mode``.
+
+        Faults are consumed in the order they were injected, one per request.
+        """
+
+        if operation not in FAULT_OPERATIONS:
+            raise ValueError(f"unknown fault operation: {operation}")
+        if mode not in FAULT_MODES:
+            raise ValueError(f"unknown fault mode: {mode}")
+        if count < 1:
+            raise ValueError("a fault needs a positive count")
+        if mode != "unreadable" and status < 500:
+            raise ValueError("a refused or ambiguous write answers a server error status")
+        with sqlite3.connect(self._database) as connection:
+            connection.executemany(
+                "INSERT INTO faults(operation, mode, status) VALUES(?,?,?)",
+                [(operation, mode, status)] * count,
+            )
+
+    def pending_faults(self, operation: str | None = None) -> list[dict[str, Any]]:
+        with sqlite3.connect(self._database) as connection:
+            rows = connection.execute(
+                "SELECT operation, mode, status FROM faults ORDER BY id"
+            ).fetchall()
+        return [
+            {"operation": row[0], "mode": row[1], "status": row[2]}
+            for row in rows
+            if operation is None or row[0] == operation
+        ]
+
+    def _take_fault(self, operation: str) -> tuple[str, int] | None:
+        with sqlite3.connect(self._database) as connection:
+            row = connection.execute(
+                "SELECT id, mode, status FROM faults WHERE operation=? ORDER BY id LIMIT 1",
+                (operation,),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute("DELETE FROM faults WHERE id=?", (row[0],))
+        return str(row[1]), int(row[2])
+
+    def edit_issue_body(self, number: int, body: str) -> dict[str, Any]:
+        """Change an issue body out of band, as a person editing it would.
+
+        No label or timeline event is written; the next read returns ``body``.
+        """
+
+        issue = self._get("issue", number)
+        if issue is None:
+            raise ValueError(f"issue {number} does not exist")
+        issue.update(body=body, updated_at=_utc())
+        self._put("issue", number, issue)
+        return issue
+
+    def edit_comment_body(self, identifier: int, body: str) -> dict[str, Any]:
+        """Change a comment body out of band; the next read returns ``body``."""
+
+        comment = self._get("comment", identifier)
+        if comment is None:
+            raise ValueError(f"comment {identifier} does not exist")
+        comment.update(body=body, updated_at=_utc())
+        self._put("comment", identifier, comment)
+        return comment
+
+    def branches(self) -> list[str]:
+        refs = self._run(
+            "git",
+            "--git-dir",
+            str(self._repository),
+            "for-each-ref",
+            "--format=%(refname:strip=2)",
+            "refs/heads/",
+        ).decode()
+        return sorted(line for line in refs.splitlines() if line)
+
+    def main_revision(self) -> str:
+        return self._ref("main")
+
+    @property
+    def request_log(self) -> list[dict[str, str]]:
+        with sqlite3.connect(self._database) as connection:
+            return [
+                {"method": method, "path": path}
+                for method, path in connection.execute(
+                    "SELECT method,path FROM request_log ORDER BY rowid"
+                )
+            ]
+
     def _request(self, handler: BaseHTTPRequestHandler) -> None:
         parsed = urlsplit(handler.path)
         path = unquote(parsed.path)
+        with sqlite3.connect(self._database) as connection:
+            connection.execute("INSERT INTO request_log VALUES(?,?)", (handler.command, path))
         if path.startswith("/api/v3/"):
             path = path.removeprefix("/api/v3")
         body = handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+        if path in {
+            "/login/oauth/authorize",
+            "/login/oauth/access_token",
+            "/user",
+        } or path.startswith("/applications/"):
+            self._github_link_request(handler, path, parse_qs(parsed.query), body)
+            return
         if path.startswith(f"/{REPOSITORY}.git/"):
             if handler.command not in {"GET", "POST"} or not (
                 path.endswith("/info/refs")
@@ -478,14 +735,157 @@ class GithubStub:
             return
         try:
             payload = json.loads(body) if body else {}
-            result = self._rest(handler.command, path, parse_qs(parsed.query), payload)
+            actor = (
+                HUMAN
+                if handler.headers.get("Authorization") == "Bearer example-human-token"
+                else BOT
+            )
+            result = self._rest(handler.command, path, parse_qs(parsed.query), payload, actor=actor)
         except (ValueError, KeyError, subprocess.CalledProcessError) as exc:
             self._json(handler, 422, {"message": str(exc)})
             return
         if result is None:
             self._unsupported(handler)
+        elif len(result) == 3:
+            # A faulted write: the object exists, the answer is not JSON.
+            self._raw(handler, result[0], result[2])
         else:
             self._json(handler, *result)
+
+    def _github_link_request(
+        self, handler: BaseHTTPRequestHandler, path: str, query: dict[str, list[str]], raw: bytes
+    ) -> None:
+        # GitHub App user flow and token revoke shapes:
+        # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app
+        # https://docs.github.com/en/rest/apps/oauth-applications#delete-an-app-token
+        method = handler.command
+        if method == "GET" and path == "/login/oauth/authorize":
+            if (
+                query.get("client_id") != [self.oauth_client_id]
+                or not query.get("state")
+                or not query.get("redirect_uri")
+            ):
+                self._json(handler, 400, {"error": "invalid_request"})
+                return
+            raw_redirect = query["redirect_uri"][0]
+            redirect = raw_redirect.replace("\r", "").replace("\n", "")
+            state = re.fullmatch(r"[^\x00-\x1f\x7f-\x9f]+", query["state"][0])
+            if (
+                redirect != raw_redirect
+                or re.search(r"[\x00-\x1f\x7f-\x9f]", redirect)
+                or state is None
+            ):
+                self._json(handler, 400, {"error": "invalid_request"})
+                return
+            if urlsplit(redirect).scheme != "https":
+                self._json(handler, 400, {"error": "invalid_redirect"})
+                return
+            if query.get("approved") == ["1"]:
+                code = secrets.token_urlsafe(32)
+                with sqlite3.connect(self._database) as connection:
+                    connection.execute(
+                        "INSERT INTO oauth_codes VALUES(?,?)",
+                        (hashlib.sha256(code.encode()).hexdigest(), redirect),
+                    )
+                handler.send_response(302)
+                handler.send_header(
+                    "Location",
+                    redirect + "?" + urlencode({"code": code, "state": state[0]}),
+                )
+                handler.send_header("Cache-Control", "no-store")
+                handler.end_headers()
+                return
+            fields = "".join(
+                f'<input type="hidden" name="{html.escape(name)}" '
+                f'value="{html.escape(query[name][0], quote=True)}">'
+                for name in ("client_id", "state", "redirect_uri")
+            )
+            page = (
+                '<form action="/login/oauth/authorize" method="get">'
+                + fields
+                + '<input type="hidden" name="approved" value="1"><p>Authorize octocat</p>'
+                "<button>Authorize GitHub link</button></form>"
+            ).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html")
+            handler.send_header("Content-Length", str(len(page)))
+            handler.end_headers()
+            handler.wfile.write(page)
+            return
+        if method == "POST" and path == "/login/oauth/access_token":
+            form = parse_qs(raw.decode())
+            if form.get("client_id") != [self.oauth_client_id] or form.get("client_secret") != [
+                self.oauth_client_secret
+            ]:
+                self._json(handler, 401, {"error": "incorrect_client_credentials"})
+                return
+            code = form.get("code", [""])[0]
+            with sqlite3.connect(self._database) as connection:
+                row = connection.execute(
+                    "DELETE FROM oauth_codes WHERE code_hash=? RETURNING redirect_uri",
+                    (hashlib.sha256(code.encode()).hexdigest(),),
+                ).fetchone()
+                if row is None or form.get("redirect_uri") != [row[0]]:
+                    self._json(handler, 200, {"error": "bad_verification_code"})
+                    return
+                token = "ghu_" + secrets.token_urlsafe(32)
+                connection.execute(
+                    "INSERT INTO oauth_tokens VALUES(?)",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                )
+            self._json(handler, 200, {"access_token": token, "token_type": "bearer", "scope": ""})
+            return
+        token = handler.headers.get("Authorization", "").removeprefix("Bearer ")
+        if method == "GET" and path == "/user":
+            with sqlite3.connect(self._database) as connection:
+                found = connection.execute(
+                    "SELECT 1 FROM oauth_tokens WHERE token_hash=?",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                ).fetchone()
+            self._json(
+                handler, 200 if found else 401, HUMAN if found else {"message": "Bad credentials"}
+            )
+            return
+        if method == "DELETE" and path == f"/applications/{self.oauth_client_id}/token":
+            expected = (
+                "Basic "
+                + base64.b64encode(
+                    f"{self.oauth_client_id}:{self.oauth_client_secret}".encode()
+                ).decode()
+            )
+            if handler.headers.get("Authorization") != expected:
+                self._json(handler, 401, {"message": "Bad credentials"})
+                return
+            token = json.loads(raw).get("access_token", "")
+            with sqlite3.connect(self._database) as connection:
+                connection.execute(
+                    "DELETE FROM oauth_tokens WHERE token_hash=?",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                )
+            self._json(handler, 204, {})
+            return
+        self._json(handler, 404, {"message": "Not Found"})
+
+    def _raw(self, handler: BaseHTTPRequestHandler, status: int, payload: bytes) -> None:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    @staticmethod
+    def _faulted(
+        fault: tuple[str, int] | None, status: int, created: Any
+    ) -> tuple[int, Any] | tuple[int, Any, bytes]:
+        """The answer for a write that was made, under the fault that was taken."""
+
+        if fault is None:
+            return status, created
+        mode, fault_status = fault
+        if mode == "ambiguous":
+            return fault_status, {"message": "Server Error"}
+        # unreadable: a success status whose body is cut off mid-object.
+        return status, None, json.dumps(created).encode()[:12]
 
     def _unsupported(self, handler: BaseHTTPRequestHandler) -> None:
         request = f"{handler.command} {urlsplit(handler.path).path}"
@@ -528,8 +928,14 @@ class GithubStub:
         handler.wfile.write(content)
 
     def _rest(
-        self, method: str, path: str, query: dict[str, list[str]], body: Any
-    ) -> tuple[int, Any] | None:
+        self,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: Any,
+        *,
+        actor: dict[str, Any] = BOT,
+    ) -> tuple[int, Any] | tuple[int, Any, bytes] | None:
         if method == "GET" and path == "/app":
             # The authenticated App; its bot user, ``<slug>[bot]``, authors what
             # its installation token writes (BOT).
@@ -565,11 +971,34 @@ class GithubStub:
                 "permissions": PERMISSIONS,
                 "account": {"login": "acme-corp"},
             }
-        if method == "GET" and tail == "collaborators/octocat/permission":
-            return 200, {"permission": "write", "user": HUMAN}
+        if method == "GET" and tail.startswith("collaborators/") and tail.endswith("/permission"):
+            login = tail.split("/")[1]
+            with sqlite3.connect(self._database) as connection:
+                failure = connection.execute(
+                    "SELECT status FROM permission_faults WHERE login=?", (login,)
+                ).fetchone()
+                row = connection.execute(
+                    "SELECT permission, user FROM collaborators WHERE login=?", (login,)
+                ).fetchone()
+            if failure is not None:
+                return int(failure[0]), {"message": "Server Error"}
+            if row is None:
+                return 404, {"message": "Not Found"}
+            return 200, {"permission": row[0], "role_name": row[0], "user": json.loads(row[1])}
         if method == "GET" and tail.startswith("rules/branches/"):
-            # No ruleset on this fixture. HTTP 404 contributes no required names.
             # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+            if self.plan_gated_branch_rules:
+                # The message GitHub returns when rulesets are outside the plan.
+                return 403, {
+                    "message": (
+                        "Upgrade to GitHub Pro or make this repository public "
+                        "to enable this feature"
+                    ),
+                    "documentation_url": (
+                        "https://docs.github.com/rest/repos/rules#get-rules-for-a-branch"
+                    ),
+                }
+            # No ruleset on this fixture. HTTP 404 contributes no required names.
             return 404, {"message": "Not Found"}
         if method == "GET" and tail.startswith("branches/"):
             branch = tail.removeprefix("branches/")
@@ -663,15 +1092,21 @@ class GithubStub:
                     query,
                 )
             if method == "POST":
-                number = max(row["number"] for row in self._rows("issue")) + 1
-                issue = self._issue(
-                    number, body["title"], body.get("body", ""), body.get("labels", [])
-                )
-                issue.update(user=BOT, performed_via_github_app={"id": 51})
-                self._put("issue", number, issue)
+                fault = self._take_fault("issue_create")
+                if fault is not None and fault[0] == "refuse":
+                    return fault[1], {"message": "Server Error"}
+
+                def build(number: int) -> dict[str, Any]:
+                    issue = self._issue(
+                        number, body["title"], body.get("body", ""), body.get("labels", [])
+                    )
+                    issue.update(user=BOT, performed_via_github_app={"id": 51})
+                    return issue
+
+                issue = self._insert_new("issue", build)
                 for label in issue["labels"]:
-                    self._label_event(number, label["name"], "labeled", BOT)
-                return 201, issue
+                    self._label_event(issue["number"], label["name"], "labeled", BOT)
+                return self._faulted(fault, 201, issue)
         if tail.startswith("issues/"):
             parts = tail.split("/")
             number = int(parts[1])
@@ -708,9 +1143,9 @@ class GithubStub:
                     self._put("issue", number, issue)
                     current = {label["name"] for label in issue["labels"]}
                     for label in sorted(current - previous):
-                        self._label_event(number, label, "labeled", BOT)
+                        self._label_event(number, label, "labeled", actor)
                     for label in sorted(previous - current):
-                        self._label_event(number, label, "unlabeled", BOT)
+                        self._label_event(number, label, "unlabeled", actor)
                 return 200, issue["labels"]
             if suffix.startswith("labels/") and method == "DELETE":
                 removed = suffix.removeprefix("labels/")
@@ -731,23 +1166,28 @@ class GithubStub:
                         query,
                     )
                 if method == "POST":
-                    identifier = max((row["id"] for row in self._rows("comment")), default=0) + 1
-                    comment = {
-                        "id": identifier,
-                        "body": body["body"],
-                        "issue_number": number,
-                        "user": BOT,
-                        "performed_via_github_app": {"id": 51},
-                        "created_at": _utc(),
-                        "updated_at": _utc(),
-                        "issue_url": f"{self.base_url}{prefix}/issues/{number}",
-                        "html_url": (
-                            f"{self.base_url}/{REPOSITORY}/issues/{number}"
-                            f"#issuecomment-{identifier}"
-                        ),
-                    }
-                    self._put("comment", identifier, comment)
-                    return 201, comment
+                    fault = self._take_fault("comment_create")
+                    if fault is not None and fault[0] == "refuse":
+                        return fault[1], {"message": "Server Error"}
+
+                    def build(identifier: int) -> dict[str, Any]:
+                        return {
+                            "id": identifier,
+                            "body": body["body"],
+                            "issue_number": number,
+                            "user": BOT,
+                            "performed_via_github_app": {"id": 51},
+                            "created_at": _utc(),
+                            "updated_at": _utc(),
+                            "issue_url": f"{self.base_url}{prefix}/issues/{number}",
+                            "html_url": (
+                                f"{self.base_url}/{REPOSITORY}/issues/{number}"
+                                f"#issuecomment-{identifier}"
+                            ),
+                        }
+
+                    comment = self._insert_new("comment", build)
+                    return self._faulted(fault, 201, comment)
         if tail == "pulls/comments" and method == "GET":
             return 200, []
         if tail == "pulls":
@@ -763,24 +1203,32 @@ class GithubStub:
                         ]
                 return 200, self._page(pulls, query)
             if method == "POST":
-                number = max((row["id"] for row in self._rows("pull")), default=0) + 1
                 repository = self._repository_row()
-                pull = {
-                    "id": number,
-                    "node_id": f"PR_stub{number}",
-                    "number": number,
-                    "state": "open",
-                    "merged": False,
-                    "title": body["title"],
-                    "body": body.get("body", ""),
-                    "user": BOT,
-                    "html_url": f"{self.base_url}/{REPOSITORY}/pull/{number}",
-                    "head": {"ref": body["head"].split(":")[-1], "repo": repository},
-                    "base": {"ref": body["base"], "repo": repository},
-                }
-                pull = self._fresh_pull(pull)
-                self._put("pull", number, pull)
-                return 201, pull
+                # Resolve git refs before the write lock. _insert_new holds that
+                # lock only for the id allocation and the insert.
+                resolved = self._fresh_pull(
+                    {
+                        "head": {"ref": body["head"].split(":")[-1], "repo": repository},
+                        "base": {"ref": body["base"], "repo": repository},
+                    }
+                )
+
+                def build(number: int) -> dict[str, Any]:
+                    return {
+                        "id": number,
+                        "node_id": f"PR_stub{number}",
+                        "number": number,
+                        "state": "open",
+                        "merged": False,
+                        "title": body["title"],
+                        "body": body.get("body", ""),
+                        "user": BOT,
+                        "html_url": f"{self.base_url}/{REPOSITORY}/pull/{number}",
+                        "head": resolved["head"],
+                        "base": resolved["base"],
+                    }
+
+                return 201, self._insert_new("pull", build)
         if tail.startswith("pulls/"):
             parts = tail.split("/")
             number = int(parts[1])

@@ -838,7 +838,10 @@ pub fn install_curie_skills(
         (
             "preparation",
             "prepare-factory-ticket",
-            &["b4c5b268d73dad0a010ccc51c04e9049fdb1b0516af1634f60d0834c962b3d85"][..],
+            &[
+                "b4c5b268d73dad0a010ccc51c04e9049fdb1b0516af1634f60d0834c962b3d85",
+                "123752a5668200fae36335d9488412fe96a29824121e539ae44935a40a86f800",
+            ][..],
         ),
         (
             "review",
@@ -924,6 +927,10 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/hooks/hooks.json"),
     ),
     (
+        "hooks/decisions_section.py",
+        include_bytes!("../../examples/dark-factory/hooks/decisions_section.py"),
+    ),
+    (
         "hooks/review_gate.py",
         include_bytes!("../../examples/dark-factory/hooks/review_gate.py"),
     ),
@@ -994,6 +1001,107 @@ const DARK_FACTORY_EXECUTABLE_FILES: &[&str] = &["hooks/review_gate.py"];
 
 pub struct DarkFactoryRenderOpts {
     pub out: PathBuf,
+}
+
+pub const FACTORY_TRIAGE_BUNDLE_FILES: &[(&str, &[u8])] = &[
+    (
+        "README.md",
+        include_bytes!("../../examples/factory-triage/README.md"),
+    ),
+    (
+        ".claude-plugin/plugin.json",
+        include_bytes!("../../examples/factory-triage/.claude-plugin/plugin.json"),
+    ),
+    (
+        "workflow/result.json",
+        include_bytes!("../../examples/factory-triage/workflow/result.json"),
+    ),
+    (
+        "progress/phases.json",
+        include_bytes!("../../examples/factory-triage/progress/phases.json"),
+    ),
+    (
+        "hooks/hooks.json",
+        include_bytes!("../../examples/factory-triage/hooks/hooks.json"),
+    ),
+    (
+        "hooks/reproduction_gate.py",
+        include_bytes!("../../examples/factory-triage/hooks/reproduction_gate.py"),
+    ),
+    (
+        "skills/investigate-report/SKILL.md",
+        include_bytes!("../../examples/factory-triage/skills/investigate-report/SKILL.md"),
+    ),
+    (
+        "evals/triage-cases.json",
+        include_bytes!("../../examples/factory-triage/evals/triage-cases.json"),
+    ),
+    (
+        "evals/reply-format.md",
+        include_bytes!("../../examples/factory-triage/evals/reply-format.md"),
+    ),
+];
+
+pub struct FactoryTriageRenderOutput {
+    pub path: PathBuf,
+    pub implementation_label: String,
+}
+
+impl CliOutput for FactoryTriageRenderOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "bundle_dir": self.path,
+            "rendered": true,
+            "implementation_label": self.implementation_label,
+        })
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!("Factory triage bundle: {}", self.path.display()));
+    }
+}
+
+pub fn render_factory_triage(
+    out: PathBuf,
+    implementation_label: String,
+) -> Result<FactoryTriageRenderOutput> {
+    if implementation_label.trim().is_empty() || implementation_label.chars().count() > 50 {
+        return Err(crate::exit::usage(
+            "implementation label must contain 1 to 50 characters",
+        ));
+    }
+    if out.exists() && (!out.is_dir() || std::fs::read_dir(&out)?.next().is_some()) {
+        return Err(crate::exit::usage(
+            "render output must be a new or empty directory",
+        ));
+    }
+    for (name, bytes) in FACTORY_TRIAGE_BUNDLE_FILES {
+        let path = out.join(name);
+        std::fs::create_dir_all(
+            path.parent()
+                .context("bundle file needs a parent directory")?,
+        )?;
+        if *name == "workflow/result.json" {
+            let mut declaration: serde_json::Value = serde_json::from_slice(bytes)?;
+            declaration["implementation_label"] =
+                serde_json::Value::String(implementation_label.clone());
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string_pretty(&declaration)?),
+            )?;
+        } else {
+            std::fs::write(&path, bytes)?;
+        }
+        #[cfg(unix)]
+        if *name == "hooks/reproduction_gate.py" {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(FactoryTriageRenderOutput {
+        path: out,
+        implementation_label,
+    })
 }
 
 /// The dark factory runner layer each release publishes (#3747). Under ADR
@@ -2667,6 +2775,10 @@ fn route_binding_as_write(
         // notification first (`refuse_unwritable_notifications`).
         notification: None,
         approvers: binding.approvers.clone(),
+        expires_in_seconds: binding.expires_in_seconds,
+        approver_ticket: None,
+        separation: None,
+        remind_every_s: binding.remind_every_s,
     }
 }
 
@@ -2699,6 +2811,14 @@ fn sre_approvals_route_map(
                 users: Some(approvers.to_vec()),
                 emails: None,
             }),
+            expires_in_seconds: existing
+                .and_then(|routes| routes.get(SRE_APPROVALS_ROUTE))
+                .and_then(|binding| binding.expires_in_seconds),
+            approver_ticket: None,
+            separation: None,
+            remind_every_s: existing
+                .and_then(|routes| routes.get(SRE_APPROVALS_ROUTE))
+                .and_then(|binding| binding.remind_every_s),
         },
     );
     map
@@ -2774,7 +2894,9 @@ async fn bind_sre_approvals_route(
         .unwrap_or_default();
     if desired != current {
         refuse_unwritable_notifications(existing)?;
-        client.set_approval_routes(&agent.id, &desired).await?;
+        client
+            .set_approval_routes(&agent.id, &desired, None)
+            .await?;
         let action = if existing.is_some_and(|routes| routes.contains_key(SRE_APPROVALS_ROUTE)) {
             "rebound"
         } else {

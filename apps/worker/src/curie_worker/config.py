@@ -1,7 +1,7 @@
 """Typed configuration for the worker kernel, read from the environment.
 
 The kernel needs a Valkey connection (the stream it consumes plus its locks and
-markers), a Slack bot token (to edit the placeholder in place), the stream and
+markers), a gateway caller credential (to edit the placeholder in place), the stream and
 consumer-group identity, and the tunables for retry, per-thread locking, and
 crash-recovery reclaim. Substrate wiring (namespace, warm pool, runner port)
 lives in ``SubstrateConfig`` and is assembled separately by the entrypoint.
@@ -37,7 +37,9 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_channel_gateway.token_custody import refuse_slack_tokens
 from curie_internal import keyspace
+from curie_internal.connector_endpoints import StaticConnectorEndpoints, parse_endpoint_json
 from curie_upgrade_pause import authoritative_key, legacy_key
 from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -218,21 +220,26 @@ class WorkerConfig(BaseSettings):
     valkey_tls: bool = False
 
     # Slack
-    slack_bot_token: str = ""
-    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
-    # here so a malformed declaration refuses boot; `slack_tokens` reads each
-    # one's bot token for its replies and file downloads (decision 5).
-    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
-    # The worker's DEFAULT Slack Web API base URL: the endpoint used to finalize a
-    # turn whose reply handle carries no per-turn endpoint (issue #19). Unset = the
-    # real Slack API. A turn that carries its own reply endpoint (e.g. a CLI stub)
-    # overrides this per turn, so a real workspace and a no-Slack CLI stub can
-    # coexist on one worker instead of contending for this single setting.
-    slack_api_base_url: str = ""
+    channel_gateway_url: str = Field(default="", validation_alias="CURIE_CHANNEL_GATEWAY_URL")
+    channel_gateway_token: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_TOKEN", repr=False
+    )
+    channel_gateway_allow_insecure: bool = Field(
+        default=False, validation_alias="CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE"
+    )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_slack_credentials(cls, values: object) -> object:
+        return refuse_slack_tokens(values)
+
+    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
+    # here so a malformed declaration refuses boot. The gateway holds tokens
+    # and routes replies and downloads by these names (decision 5).
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
     # D4.4), comma-separated. Empty by default, which leaves the configured
-    # ``slack_api_base_url`` (or real Slack) as the only trusted origin. This
+    # gateway's default origin (or real Slack) as the only trusted origin. This
     # exists for the dev/CLI stub: `local message` advertises
     # ``host.docker.internal`` and `cluster message` a routable host, neither of
     # which the single default base URL can also name, so the origin pin would
@@ -277,6 +284,14 @@ class WorkerConfig(BaseSettings):
     # Local model demo path: the worker can point the runner at an
     # Anthropic-compatible local endpoint without changing the fake-model default.
     model_base_url: str = Field(default="", validation_alias="CURIE_MODEL_BASE_URL")
+    # Minimum remaining model credit in USD for a sufficient model_credit fact
+    # (issue 5581). The worker observer reads it. Zero still contacts the
+    # provider. A negative value is refused at startup.
+    factory_min_model_credit_usd: float = Field(
+        default=10,
+        ge=0,
+        validation_alias="CURIE_FACTORY_MIN_MODEL_CREDIT_USD",
+    )
     # The endpoint's wire protocol and the env var(s) carrying the credential
     # (#514), both declared rather than inferred. Operator scope like
     # model_base_url: they select which env var a credential is read from and
@@ -314,6 +329,25 @@ class WorkerConfig(BaseSettings):
     # scope that names a Service which cannot exist.
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
+    connector_endpoints: Annotated[
+        StaticConnectorEndpoints | None, NoDecode, BeforeValidator(parse_endpoint_json)
+    ] = Field(default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS")
+    sandbox_substrate: str = Field(default="kubernetes", validation_alias="CURIE_SANDBOX_SUBSTRATE")
+    # The dedicated namespace holding personal Claude custody Secrets (#5377,
+    # ADR 0268), rendered from the chart's personalClaude.grantNamespace. Empty
+    # means personal custody is unconfigured: every personal grant read is
+    # refused authentication-required, never answered with a service credential.
+    personal_grant_namespace: str = Field(
+        default="", validation_alias="CURIE_PERSONAL_GRANT_NAMESPACE"
+    )
+    # The installation's model auth mode (#5378, ADR 0268), the same
+    # FACTORY_MODEL_AUTH_MODE the API reads. A WorkItem execution takes its mode
+    # from its ExecutionRequest, never from here; this decides only lanes with
+    # no owner (plain runs, cron, evals), which a personal installation refuses
+    # personal_owner_required, and that personal mode needs Kubernetes.
+    factory_model_auth_mode: Literal["service", "personal"] = Field(
+        default="service", validation_alias="FACTORY_MODEL_AUTH_MODE"
+    )
 
     # The Ed25519 seed that signs each sandbox's connector caller token
     # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
@@ -478,6 +512,12 @@ class WorkerConfig(BaseSettings):
     dead_letter_maxlen: int = Field(
         default=10000, ge=1, validation_alias="CURIE_DEAD_LETTER_MAXLEN"
     )
+
+    @model_validator(mode="after")
+    def _static_endpoints_exclude_action_executor(self) -> WorkerConfig:
+        if self.connector_endpoints is not None and self.action_executor_enabled:
+            raise ValueError("static connector endpoints do not support the action executor")
+        return self
 
     @model_validator(mode="after")
     def _remediation_requires_the_executor(self) -> WorkerConfig:
@@ -965,6 +1005,12 @@ class WorkerConfig(BaseSettings):
     delivery_lease_ttl_s: float = Field(
         default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"
     )
+    abandoned_turn_grace_s: float = Field(
+        default=90.0,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="CURIE_ABANDONED_TURN_GRACE_S",
+    )
     delivery_lease_heartbeat_s: float = Field(
         default=10.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_HEARTBEAT_S"
     )
@@ -1161,6 +1207,18 @@ class WorkerConfig(BaseSettings):
     workspace_recovery_collect_interval_s: float = Field(
         default=30.0, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S"
     )
+    # Publication candidate retention (#5428). On by default; when on (which
+    # requires the internal worker token and managed workspaces), a started
+    # WorkItem run's publication snapshot and trusted base are retained as a
+    # private, non-authorizing candidate before validation, and the worker
+    # supervises the candidate object collector. Separate from recovery.
+    # Set false when this process has no token or no managed workspaces.
+    publication_candidates_enabled: bool = Field(
+        default=True, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
+    )
+    publication_candidates_collect_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S"
+    )
     # The inbound-attachment lane's resource envelope (#2567). These are the
     # operator's handles on ``AttachmentLimits``, whose own defaults these
     # literals mirror -- the chart templates the same three numbers into the
@@ -1243,6 +1301,22 @@ class WorkerConfig(BaseSettings):
             if not self.workspace_enabled:
                 raise ValueError(
                     "CURIE_WORKSPACE_RECOVERY_ENABLED requires CURIE_WORKSPACE_ENABLED"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_publication_candidate_capture(self) -> WorkerConfig:
+        # The candidate capture (#5428) authenticates its ledger calls with the
+        # worker token and retains the claim's trusted base, which only managed
+        # workspaces have. Refused before operation, not discovered per run.
+        if self.publication_candidates_enabled:
+            if not self.internal_worker_token:
+                raise ValueError(
+                    "CURIE_PUBLICATION_CANDIDATES_ENABLED requires CURIE_INTERNAL_WORKER_TOKEN"
+                )
+            if not self.workspace_enabled:
+                raise ValueError(
+                    "CURIE_PUBLICATION_CANDIDATES_ENABLED requires CURIE_WORKSPACE_ENABLED"
                 )
         return self
 
@@ -1450,6 +1524,20 @@ class WorkerConfig(BaseSettings):
     # The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered from
     # the same chart or compose value as the API's. It requires the executor.
     remediation_enabled: bool = Field(default=False, validation_alias="CURIE_REMEDIATION_ENABLED")
+    # Factory Slack run progress (#5414). Enabled, the worker posts each factory
+    # run's owed progress to its agent's configured Slack channel. Nothing posts
+    # for an agent with no destination, so the default changes nothing. Off,
+    # this worker posts nothing; what is owed is derived from existing run
+    # records, so a worker with it on later still posts it.
+    factory_slack_progress_enabled: bool = Field(
+        default=True, validation_alias="CURIE_FACTORY_SLACK_PROGRESS_ENABLED"
+    )
+    factory_slack_interval_s: float = Field(
+        default=2.0, gt=0, validation_alias="CURIE_FACTORY_SLACK_INTERVAL_S"
+    )
+    # Console origin for the rejected-plan DM's reconnect button (#5720).
+    # Empty omits the button. The value is an absolute http(s) origin.
+    console_origin: str = Field(default="", validation_alias="CURIE_CONSOLE_ORIGIN")
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
     cron_tick_interval_s: float = Field(
@@ -1551,6 +1639,9 @@ class WorkerConfig(BaseSettings):
     )
 
     key_prefix: str = keyspace.WORKER_KEY_PREFIX_DEFAULT
+    approval_pending_retention_enabled: bool = Field(
+        default=False, validation_alias="CURIE_APPROVAL_PENDING_RETENTION_ENABLED"
+    )
 
     @property
     def runner_facing_api_base_url(self) -> str:
@@ -1613,6 +1704,12 @@ class WorkerConfig(BaseSettings):
 
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
+
+    def steering_sent_key(self, event_id: str) -> str:
+        # Set before a factory steering request is sent (#5414): from then on
+        # its admission may have committed with the answer lost, so no later
+        # attempt of the delivery may invite a resend.
+        return f"{self.key_prefix}:steering-sent:{event_id}"
 
     def delivery_lease_key(self, stream: str, group: str, entry_id: str) -> str:
         """The lease STRING key: the opaque owner token, TTL'd at
@@ -1731,6 +1828,12 @@ class WorkerConfig(BaseSettings):
         # Where a posted approval card lives so its own resolution or expiry can
         # settle it without sharing identity with another approval on the thread.
         return f"{self.key_prefix}:approval-card:{approval_id}"
+
+    def approval_references_pending_key(self) -> str:
+        return f"{self.key_prefix}:approval-references:pending"
+
+    def approval_retention_key(self, approval_id: str) -> str:
+        return f"{self.key_prefix}:approval-retention:{approval_id}"
 
     def approval_notice_ref_key(self, approval_id: str) -> str:
         # The reply ref a placeholderless pending notice minted AFTER its approval

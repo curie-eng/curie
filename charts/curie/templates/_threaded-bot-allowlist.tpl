@@ -5,7 +5,7 @@
      unknown key can never reach the wire even if the shape check is loosened.
 
      Source of truth for both regexes and for the exactly-two-keys rule:
-     apps/dispatcher/src/curie_dispatcher/config.py::ThreadedBotAdmission
+     packages/channel-gateway/src/curie_channel_gateway/slack/config.py::ThreadedBotAdmission
      (extra="forbid"). They are duplicated here on purpose so a malformed entry
      is refused by `helm upgrade` instead of crash-looping the dispatcher; the
      duplication is pinned against drift by

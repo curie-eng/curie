@@ -4,6 +4,11 @@ Date: 2026-09-22
 
 Status: Accepted
 
+**Partially amended by [ADR 0270](0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0270 extends decision 7 with requester attribution after agent-only
+admission; the admission list itself is unchanged.
+
 **Superseded in part by [ADR 0198](0198-identity-links-live-in-provider-identity-namespaces.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 decision 1's choice to make a channel identity a row in

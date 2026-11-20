@@ -68,10 +68,11 @@ proof specs pass before retaining the change.
 
 Build from the repository root with `docker build -f apps/ui/Dockerfile .`.
 The build stage retains the repository-relative paths of the generated ACI types
-and `tests/vectors/user-action-wording.json`. TypeScript checks the action wording
-tests against that shared vector during `pnpm build`, so the container context
-must include the same vector as a checkout build. Admit only that vector from the
-root tests directory; other test fixtures stay outside the UI build context.
+and the shared vectors `tests/vectors/user-action-wording.json` and
+`tests/vectors/personal-enrollment-token.json`. TypeScript checks the unit tests
+against those vectors during `pnpm build`, so the container context must include
+the same vectors as a checkout build. Admit only those vectors from the root tests
+directory; other test fixtures stay outside the UI build context.
 
 ## Structure
 
@@ -167,9 +168,17 @@ only (traces named `curie-run:...`), so the platform's own request and
 background traces never show up as runs; tokens and cost sum every model call
 outside eval traces.
 
-**Not wired yet (honest stubs, no demo data):** Usage and Settings
-render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). These state
-plainly what is not wired yet rather than showing fictional data.
+**Not wired yet (honest stubs, no demo data):** Usage and the Workspace section of
+Settings render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). These
+state plainly what is not wired yet rather than showing fictional data.
+
+**Settings paths.** The console has no router. Settings has two sections with paths:
+`/settings` (Workspace) and `/settings/claude-plan` (Claude plan, the frozen route other
+tickets link to). The store pushes the path when the section changes and restores it on
+`popstate` (`src/state/route.ts`). The Claude plan section (`WiredClaudePlan.tsx`) drives
+`GET`, `PUT` and `DELETE /personal-claude/enrollment` with the principal session; it holds
+the pasted token only in component state until the request settles and keeps it out of
+every cache, storage and log.
 
 **API access.** The console never holds the platform key (ADR-0083).
 - A login screen exchanges a code from `curie local console login` or
@@ -211,6 +220,16 @@ apps/api on 8000:
 PW_INTEGRATION=1 CURIE_API_TARGET=http://localhost:8000 pnpm exec playwright test --project=integration
 ```
 
+Organization sign-in (`e2e/integration/console-principal-session.spec.ts`) is
+not started by a driver in this repo. The caller sets `PW_BASE_URL` to the
+console origin and four variables. `CURIE_OIDC_ISSUER_HOST` is the identity
+provider hostname in the authorize redirect. `CURIE_OIDC_ISSUER_MAP` is the
+Chromium host-resolver target, an address or an address and port.
+`CURIE_OIDC_TEST_EMAIL` is the password user, default `owner-a@example.com`.
+`CURIE_OIDC_TEST_PASSWORD` is that user's password, default the public fixture
+password. The redirect URI for the run is the console origin plus
+`/api/console/oidc/callback`.
+
 The integration spec (`e2e/integration/`) seeds a real OTLP (OpenTelemetry
 Protocol) trace (`seed_trace.py`, run via `uv run`), drives create -> Deploy -> verifies the
 version + stored bundle via the API, checks the malformed-skill.md validator
@@ -233,7 +252,7 @@ Config reference: `.env.example`.
 
 ## Wiring the rest
 
-- The remaining `ComingSoon` stubs (Usage, Settings) each bind to their
+- The remaining `ComingSoon` stubs (Usage, Workspace settings) each bind to their
   API endpoint once it exists; until then they must stay honest stubs, never
   demo data.
 - The Runs path renders the API's `ObservationNode` tree directly.

@@ -5,7 +5,7 @@ import logging
 import re
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
@@ -23,7 +23,8 @@ from ..turn_progress import (
 from . import attachment_access, channel_read, hooks, memory
 
 if TYPE_CHECKING:
-    from ..sandbox.types import SandboxTermination
+    from ..personal_execution import PersonalLaunch
+    from ..sandbox.types import SandboxHandle, SandboxTermination
 
 logger = logging.getLogger(__name__)
 
@@ -256,10 +257,19 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         # cannot enforce one. Not retryable: the same runner refuses again.
         TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
         "tool-access-refused",
+        # #5377 (ADR 0268): a personal run whose owner grant is missing or was
+        # rejected by the provider. Not retryable: the owner must replace or
+        # reconnect the enrollment, and no service credential stands in.
+        "authentication-required",
     }
 )
 
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
+
+#: ADR 0270 decision 3: a principal-bearing turn ran until the requester token
+#: window ended it. Worker local, and not retryable: a retry would run the same
+#: person's request past the window on a fresh token.
+REQUESTER_WINDOW_CLASSIFICATION = "requester-window"
 
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
     {
@@ -272,6 +282,7 @@ WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
         # does not advertise channel read enforcement. Worker local, so a
         # runner ErrorEvent naming it is not trusted. Not retryable.
         CHANNEL_READ_UNENFORCED_CLASSIFICATION,
+        REQUESTER_WINDOW_CLASSIFICATION,
     }
 )
 
@@ -291,10 +302,12 @@ _ESCALATION_CAUSES = {
     "model-credit-exhausted": "model_credit_exhausted",
     "model-usage-limited": "model_usage_limited",
     "model-credential-rejected": "model_credential_rejected",
+    "authentication-required": "authentication_required",
     "rate-limit": "model_rate_limited",
     "server-error": "model_error",
     "model-unreachable": "model_unreachable",
     "budget-exceeded": "budget_exceeded",
+    "runner-error": "runner_error",
     "runner-timeout": "runner_timeout",
     "runner-timeout-unconfirmed": "runner_timeout",
     "sandbox-terminated": "sandbox_terminated",
@@ -313,6 +326,11 @@ _ESCALATION_CAUSES = {
 # Operator guidance appended to an escalation lead for classifications whose
 # fix is a known knob (#3071). Keyed by the displayed classification token.
 _CLASSIFICATION_GUIDANCE = {
+    REQUESTER_WINDOW_CLASSIFICATION: (
+        "The turn reached the one-hour limit of the requester's connector credential "
+        "(connector requester identity is on for this agent) and was stopped. Work "
+        "already performed may have side effects; split the request into shorter turns."
+    ),
     "history-persistence-error": (
         "Conversation history capacity exceeded. Work already performed may have side "
         "effects; inspect the result. The run can be retried; if one turn is over the "
@@ -337,12 +355,31 @@ _RUNNER_DEFAULT_MAX_TURNS = 20
 # model sentence cannot satisfy the parser by mentioning the prefix.
 TURN_FAILURE_REPLY_PREFIX = "curie-turn-failure:"
 
+# The failure class a refused cluster message or cluster eval turn reports on
+# its relay (HTTP-INVOCATION-EXECUTION-31, #5518). Frozen with the CLI reader in
+# tests/vectors/turn-failure-reply.json.
+IDENTITY_REFUSED_FAILURE_CLASS = "identity-refused"
+
+# The relay text under that class. It names no person and no identity: only
+# that the binding needs a verified HTTP identity that this turn lacks.
+IDENTITY_REFUSED_RELAY_NOTICE = (
+    "The worker refused this turn before running it: its binding requires a "
+    "verified HTTP identity, and a cluster message or cluster eval turn carries "
+    "none."
+)
+
 # The floor of remaining DELIVERY budget below which a fresh attempt is not
 # started (ADR-0131). The runner cannot claim a sandbox, open a turn and stream a
 # final in a couple of seconds, so an attempt started under this floor is
 # guaranteed to be cut off mid-flight -- it buys nothing and spends the last of
 # the deadline that the escalation and the terminal settle still need.
 _MIN_ATTEMPT_BUDGET_S = 5.0
+
+# The cap on one sleep inside the runner-unreachable window (#4733). A
+# connect-phase turn-start failure retries for up to the sandbox claim timeout
+# without consuming max_attempts; this keeps a recreated pod from idling
+# behind a long backoff once it is reachable.
+_RUNNER_UNREACHABLE_RETRY_MAX_S = 5.0
 
 # Bound request status reads so continuations cannot stall (#4191).
 _REQUEST_STATUS_READ_TIMEOUT_S = 5.0
@@ -356,6 +393,39 @@ _REQUEST_STATUS_READ_TIMEOUT_S = 5.0
 # ``_map_start_conflict``; keep the two in sync.
 _WORK_ITEM_TERMINAL_START_REFUSALS = frozenset(
     {"work_item_cancelled", "waiting_deadline_elapsed", "not_found", "factory_start_failed"}
+)
+
+# #5378: the API refused a personal start because the owner's enrollment is no
+# longer active at the request's generation. The request stays waiting (the
+# versioned revalidation can rebind it), so this delivery releases exactly the
+# claim it made, observed absent, and defers ``not_started:<code>``. Passed
+# through unchanged by the API's ``_map_start_conflict``.
+_WORK_ITEM_ENROLLMENT_START_REFUSALS = frozenset(
+    {"enrollment_inactive", "enrollment_generation_mismatch"}
+)
+# Bounds that release: the delete plus the substrate's own absence poll.
+_ENROLLMENT_REFUSAL_RELEASE_TIMEOUT_S = 45.0
+# #5378: an unstarted personal run never defers while holding the claim it
+# recorded, because that claim is the owner's one native process. These
+# refusals are the exception and keep it. ``execution_authority_lost`` also
+# covers a lapsed or transferred acquire, where another delivery holds the same
+# request and adopts this thread's route; the code does not say which, so the
+# claim stays. ``owner_provenance_mismatch`` names a route another delivery
+# booted, never this run's own.
+_PERSONAL_REFUSALS_KEEPING_CLAIM = frozenset(
+    {"execution_authority_lost", "owner_provenance_mismatch"}
+)
+
+#: The one answer an ownerless turn gets on a personal installation (#5378).
+_PERSONAL_OWNER_REQUIRED_REPLY = (
+    "This installation runs personal subscriptions, and this request has no "
+    "owner to run it as (personal_owner_required). Nothing was started."
+)
+#: A delivery with no personal launch met a runtime booted with a personal
+#: grant (#5378). It is never steered into or adopted.
+_PERSONAL_RUNTIME_REFUSED_REPLY = (
+    "This thread's runtime belongs to a personal execution, so this request "
+    "did not run in it (owner_provenance_mismatch). Start a new thread."
 )
 
 # A factory execute turn that ends done or idle without calling publish_changes
@@ -525,6 +595,17 @@ _ROUTE_WHITESPACE = re.compile(r"\s")
 # ``ApprovalRequestingSurfaceTarget`` (``schemas.approvals.REQUESTING_SURFACE_MODE``).
 _REQUESTING_SURFACE = {"mode": "requesting_surface"}
 
+# ADR 0272 decision 1: the third form of a route's resolution, exactly
+# ``{"mode": "approver_dm", "identity": <slug>}``. The card goes to the one
+# approver the request's ticket selected, in that person's DM with the named
+# bot identity. Mirrors the API's ``schemas.approvals.APPROVER_DM_MODE``.
+_APPROVER_DM_MODE = "approver_dm"
+
+# A DM channel id as ``chat.postMessage`` answers for a post to a user id. The
+# registration endpoint accepts only this shape, and the worker checks it before
+# registering, so a user id echoed back or a public channel is a failed delivery.
+_APPROVER_DM_CHANNEL = re.compile(r"^D[A-Z0-9]{8,}$")
+
 # ADR-0177 amendment: the channels whose approvals are answered from a route's approver
 # ``emails``. Only email today: the mail adapter's kind, and the API's
 # ``schemas.channels.EMAIL_KIND``. A set rather than a comparison, because the question
@@ -597,6 +678,48 @@ _OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
 
 _DELIVERY_LEASE: ContextVar[DeliveryLease | None] = ContextVar(
     "curie_worker_delivery_lease", default=None
+)
+
+# The personal launch of this delivery's WorkItem request (#5378), or None for
+# a service request and every ownerless lane. Per delivery, like the owned
+# WorkItem above; its expectations are read live from that run.
+_PERSONAL_LAUNCH: ContextVar[PersonalLaunch | None] = ContextVar(
+    "curie_worker_personal_launch", default=None
+)
+
+
+@dataclass
+class OwnedExecution:
+    """One runner turn a delivery opened or steered into (ADR 0270 decision 3).
+
+    The claimed sandbox and the raw turn epoch the runner reported for that
+    turn, or None from a runner that reports none. The epoch is the turn's
+    private timeout credential: it lives in process memory only and is never
+    logged or written to Valkey, hence no repr.
+    """
+
+    handle: SandboxHandle = field(repr=False)
+    turn_epoch: str | None = field(default=None, repr=False)
+    # Set once a stop was attempted, so the lease-lost callback and the
+    # recorder never both stop one turn.
+    stopped: bool = False
+
+
+@dataclass
+class OwnedExecutions:
+    """What one fenced lease acquisition opened or steered into, newest last.
+
+    A lost lease stops exactly these turns, at the sandbox each recorded, and
+    nothing else: a delivery that opened or steered nothing stops nothing.
+    """
+
+    lease: DeliveryLease = field(repr=False)
+    entries: list[OwnedExecution] = field(default_factory=list, repr=False)
+
+
+# Per delivery, set by ``process_event`` for a fenced lease only.
+_OWNED_EXECUTIONS: ContextVar[OwnedExecutions | None] = ContextVar(
+    "curie_worker_owned_executions", default=None
 )
 
 _PUBLICATION_CONTEXT: ContextVar[PublicationContext | None] = ContextVar(

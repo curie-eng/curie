@@ -214,11 +214,12 @@ async def _has_outbox_record(h: object, event_id: str) -> bool:
 # --- 1. executes on the intended active deployment ---------------------------
 
 
+@pytest.mark.parametrize("source", ["schedule", "manual", "webhook"])
 def test_targetless_cron_runs_on_the_hook_agents_winning_deployment(
-    make_harness, make_hook_run
+    make_harness, make_hook_run, source: str
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
+        async with make_hook_run(source=source) as run, _seed_deployments(
             run.engine, run.agent_id
         ) as seeded, make_harness(
             hook_runs=run.recorder(),
@@ -602,6 +603,8 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
                     conversation_id=thread_key,
                     wait_deadline=datetime.now(UTC) + timedelta(hours=1),
                     repository_path="acme/widgets",
+                    execution_kind="implementation",
+                    recovery_candidate_id=None,
                     context=FactoryContext(
                         agent_id=run.agent_id,
                         tenant_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
@@ -610,6 +613,8 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
                         address="acme/widgets",
                         adapter=None,
                     ),
+                    resource_gate=None,
+                    predecessor_claim_name=None,
                 ),
                 wake=FactoryWake(
                     kind="github", address="acme/widgets", adapter=None,

@@ -1,0 +1,524 @@
+{
+  "comment": "The typed tracker result proposal a triage run submits (ADR 0277 decision 4, #5585 decision 5). A valid case gives the proposal and proposal_sha256, the SHA-256 of the canonical JSON (keys sorted, UTF-8, separators , and :, no insignificant whitespace) of the proposal with null members dropped. An invalid case gives the proposal and the expected issues as [field, code] pairs in any order; field is the dotted path, \"\" for the top level, and a key the shape does not own is shown as * so no submitted key name is echoed. A case with fill sets the text at path to char repeated length times before parsing, so oversized inputs stay small here. Read by apps/api/tests/test_factory_tracker_results.py; the runner result tool of #5586 reads it later. Readers reject unknown top-level keys.",
+  "valid": [
+    {
+      "name": "ticket",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        }
+      },
+      "proposal_sha256": "2620dea509f7d425083425266944c6c6a7978c78b12561bcfb9dbbfe8d44f2d3"
+    },
+    {
+      "name": "ticket_non_ascii",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export lässt die letzte Zeile weg",
+        "body": "Die letzte Zeile fehlt → siehe Ausgabe.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        }
+      },
+      "proposal_sha256": "961da4c0a9f51c47358a22a1b2fb947bca4e89e31d8fec3c09f13cfdd9d5723e"
+    },
+    {
+      "name": "findings_without_revision",
+      "proposal": {
+        "kind": "findings",
+        "reason": "not_reproduced",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "proposal_sha256": "2cbcf2bcb4ef9d0d2ce6ad78f45adc2068c907304cfc406634d7c6b721141199"
+    },
+    {
+      "name": "findings_with_revision",
+      "proposal": {
+        "kind": "findings",
+        "reason": "already_fixed",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row.",
+        "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+      },
+      "proposal_sha256": "b0a86299e1b711348666879b34d619d5e1bb00d33fb97d37c843862af31c0d2e"
+    },
+    {
+      "name": "findings_product_decision",
+      "proposal": {
+        "kind": "findings",
+        "reason": "product_decision_needed",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "proposal_sha256": "40ed7444d1355afa60c123fbb18a4c58ed045d7ec502066be0927105abbfda32"
+    },
+    {
+      "name": "findings_capability_unavailable",
+      "proposal": {
+        "kind": "findings",
+        "reason": "capability_unavailable",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "proposal_sha256": "647f494b1b7d88b77985191fca0570aca6d4f7298fe6e2f6e4e5db4065079dbf"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "submitted_budget_exhausted",
+      "proposal": {
+        "kind": "findings",
+        "reason": "budget_exhausted",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "issues": [
+        [
+          "reason",
+          "value"
+        ]
+      ]
+    },
+    {
+      "name": "unknown_reason",
+      "proposal": {
+        "kind": "findings",
+        "reason": "gave_up",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "issues": [
+        [
+          "reason",
+          "value"
+        ]
+      ]
+    },
+    {
+      "name": "destination_repository",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        },
+        "repository": "acme/other"
+      },
+      "issues": [
+        [
+          "*",
+          "unknown_field"
+        ]
+      ]
+    },
+    {
+      "name": "destination_labels",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        },
+        "labels": [
+          "bug"
+        ]
+      },
+      "issues": [
+        [
+          "*",
+          "unknown_field"
+        ]
+      ]
+    },
+    {
+      "name": "destination_agent",
+      "proposal": {
+        "kind": "findings",
+        "reason": "not_reproduced",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row.",
+        "agent": "other-agent"
+      },
+      "issues": [
+        [
+          "*",
+          "unknown_field"
+        ]
+      ]
+    },
+    {
+      "name": "destination_assignee",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        },
+        "assignee": "someone"
+      },
+      "issues": [
+        [
+          "*",
+          "unknown_field"
+        ]
+      ]
+    },
+    {
+      "name": "destination_assignees",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        },
+        "assignees": [
+          "someone"
+        ]
+      },
+      "issues": [
+        [
+          "*",
+          "unknown_field"
+        ]
+      ]
+    },
+    {
+      "name": "destination_destination",
+      "proposal": {
+        "kind": "findings",
+        "reason": "not_reproduced",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row.",
+        "destination": "elsewhere"
+      },
+      "issues": [
+        [
+          "*",
+          "unknown_field"
+        ]
+      ]
+    },
+    {
+      "name": "unknown_field",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        },
+        "priority": "high"
+      },
+      "issues": [
+        [
+          "*",
+          "unknown_field"
+        ]
+      ]
+    },
+    {
+      "name": "unknown_nested_field",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "c",
+          "observed": "o",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c",
+          "exit_code": 1
+        }
+      },
+      "issues": [
+        [
+          "reproduction.*",
+          "unknown_field"
+        ]
+      ]
+    },
+    {
+      "name": "oversized_body",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        }
+      },
+      "issues": [
+        [
+          "body",
+          "length"
+        ]
+      ],
+      "fill": {
+        "path": [
+          "body"
+        ],
+        "char": "a",
+        "length": 60001
+      }
+    },
+    {
+      "name": "oversized_title",
+      "proposal": {
+        "kind": "ticket",
+        "title": "",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        }
+      },
+      "issues": [
+        [
+          "title",
+          "length"
+        ]
+      ],
+      "fill": {
+        "path": [
+          "title"
+        ],
+        "char": "a",
+        "length": 257
+      }
+    },
+    {
+      "name": "revision_39_hex",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "c",
+          "observed": "o",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3"
+        }
+      },
+      "issues": [
+        [
+          "reproduction.revision",
+          "revision"
+        ]
+      ]
+    },
+    {
+      "name": "revision_uppercase",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "c",
+          "observed": "o",
+          "revision": "3F2A9C0D4B5E6F708192A3B4C5D6E7F8091A2B3C"
+        }
+      },
+      "issues": [
+        [
+          "reproduction.revision",
+          "revision"
+        ]
+      ]
+    },
+    {
+      "name": "findings_revision_short",
+      "proposal": {
+        "kind": "findings",
+        "reason": "not_reproduced",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row.",
+        "revision": "abc123"
+      },
+      "issues": [
+        [
+          "revision",
+          "revision"
+        ]
+      ]
+    },
+    {
+      "name": "blank_title",
+      "proposal": {
+        "kind": "ticket",
+        "title": "   ",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        }
+      },
+      "issues": [
+        [
+          "title",
+          "text"
+        ]
+      ]
+    },
+    {
+      "name": "empty_body",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        }
+      },
+      "issues": [
+        [
+          "body",
+          "length"
+        ]
+      ]
+    },
+    {
+      "name": "nul_in_tried",
+      "proposal": {
+        "kind": "findings",
+        "reason": "not_reproduced",
+        "tried": "ran it\u0000",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "issues": [
+        [
+          "tried",
+          "text"
+        ]
+      ]
+    },
+    {
+      "name": "missing_reproduction",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row."
+      },
+      "issues": [
+        [
+          "reproduction",
+          "missing_field"
+        ]
+      ]
+    },
+    {
+      "name": "missing_tried",
+      "proposal": {
+        "kind": "findings",
+        "reason": "not_reproduced",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "issues": [
+        [
+          "tried",
+          "missing_field"
+        ]
+      ]
+    },
+    {
+      "name": "title_not_text",
+      "proposal": {
+        "kind": "ticket",
+        "title": 7,
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": {
+          "command": "uv run pytest tests/test_export.py -q",
+          "observed": "1 failed: expected 3 rows, got 2",
+          "revision": "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+        }
+      },
+      "issues": [
+        [
+          "title",
+          "type"
+        ]
+      ]
+    },
+    {
+      "name": "reproduction_not_object",
+      "proposal": {
+        "kind": "ticket",
+        "title": "Export drops the last row",
+        "body": "## Problem\n\nThe CSV export omits the final row.\n\n## Acceptance criteria\n\n1. The export holds every row.",
+        "reproduction": "uv run pytest"
+      },
+      "issues": [
+        [
+          "reproduction",
+          "type"
+        ]
+      ]
+    },
+    {
+      "name": "missing_kind",
+      "proposal": {
+        "reason": "not_reproduced",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "issues": [
+        [
+          "kind",
+          "kind"
+        ]
+      ]
+    },
+    {
+      "name": "unknown_kind",
+      "proposal": {
+        "kind": "patch",
+        "reason": "not_reproduced",
+        "tried": "Ran the export against the sample data three times.",
+        "missing": "A dataset that shows the dropped row."
+      },
+      "issues": [
+        [
+          "kind",
+          "kind"
+        ]
+      ]
+    },
+    {
+      "name": "not_object",
+      "proposal": [
+        "ticket"
+      ],
+      "issues": [
+        [
+          "",
+          "not_object"
+        ]
+      ]
+    }
+  ]
+}

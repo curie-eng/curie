@@ -40,9 +40,9 @@ from _support import (
     wait_for_healthz,
     wait_until,
 )
-from curie_mail_adapter.adapter import EMPTY_REPLY_TEXT, EVENT_MARKER, MailAdapter
-from curie_mail_adapter.agentmail import AgentMailClient
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.adapter import EMPTY_REPLY_TEXT, EVENT_MARKER, MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailClient
+from curie_channel_gateway.mail.config import MailAdapterConfig
 
 
 def seed(mail: MailState, adapter: MailAdapter, message_id: str = "msg-1", **kwargs: Any) -> None:
@@ -103,7 +103,7 @@ def test_egress_rejection_log_names_only_the_outcome(
     """Credential material and even its transport name stay out of retained logs."""
     seed(mail, adapter)
 
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.egress"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.egress"):
         assert post_event(egress_url, completed("ev-1"), secret="attacker-value")[0] == 401
 
     assert [record.getMessage() for record in caplog.records] == [
@@ -137,6 +137,35 @@ def test_reply_text_is_the_latest_update_and_carries_the_event_marker(
     assert text.startswith("the full answer")
     assert "partial\n" not in text
     assert f"{EVENT_MARKER} ev-42" in text
+
+
+def test_wire_13_replace_and_audience_are_refused_before_recording_or_provider_send(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+    assert adapter.record_text_at("thr-1", "msg-1", "existing answer")[0] == 200
+    before = adapter.state.reply_text("thr-1", "msg-1")
+    replace = update("replacement body")
+    replace.update(
+        version="1.3",
+        text=None,
+        message={"version": "1.0", "text": "replacement body", "header": "Replacement heading"},
+        message_mode="replace",
+    )
+    audience = reply_post("only you can see this")
+    audience.update(version="1.3", audience_user="U0EXAMPLE1")
+
+    replace_status, replace_body = post_event(egress_url, replace)
+    audience_status, audience_body = post_event(egress_url, audience)
+
+    assert replace_status == 422
+    assert replace_body == {"detail": "reply wire 1.3 replace edit is not supported"}
+    assert audience_status == 422
+    assert audience_body == {"detail": "reply wire 1.3 audience post is not supported"}
+    assert adapter.state.reply_text("thr-1", "msg-1") == before
+    assert mail.replies == []
+    assert mail.thread_calls == 0
+    assert mail.list_calls == 0
 
 
 def test_verbatim_reply_update_is_refused_before_recording_or_provider_send(
@@ -727,7 +756,7 @@ class _RaiseOnceClient(AgentMailClient):
 
     A deliberate, narrow carve-out to this package's mocking rule: it is a real
     subclass of the client that wraps the EXTERNAL provider, the same seam the fake
-    HTTP servers occupy, and nothing inside `curie_mail_adapter` is patched. The
+    HTTP servers occupy, and nothing inside `curie_channel_gateway.mail` is patched. The
     fault has to be injected here because the behavior under test is the handling
     of an UNEXPECTED exception, and anything provokable through the provider's HTTP
     boundary is by definition an expected one the client turns into a failure
@@ -785,7 +814,7 @@ def test_deleted_provider_thread_is_terminal_once_across_restart(
     seed(mail, adapter)
     post_event(egress_url, update("answer one"))
     mail.deleted_threads.add("thr-1")
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
         assert post_event(egress_url, completed("ev-deleted"))[0] == 410
         assert post_event(egress_url, completed("ev-deleted"))[0] == 410
         with restarted_adapter(adapter, serve_egress, adapter.config) as (_, replacement_url):

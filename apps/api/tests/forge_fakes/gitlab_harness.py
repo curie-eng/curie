@@ -168,6 +168,10 @@ class GitLabHarness:
         else:
             self.fake.discussion_reply(iid, target.thread_id, author, text)
 
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        # The bare note id: the answer core's comment id (``note:`` is the notice's).
+        return str(self.fake.issue_note(int(issue.issue_id), actor, body))
+
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         if target.issue is not None:
             listed = self.fake.issue_notes(int(target.issue.issue_id))
@@ -186,3 +190,15 @@ class GitLabHarness:
 
     def write_count(self) -> int:
         return self.fake.writes
+
+    # UI evidence hosting is declared unsupported on this host, and its commit
+    # read reports no tree, so there is nothing to observe from outside.
+
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return None
+
+    def evidence_ref(self, key: str) -> str | None:
+        return None
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        return None

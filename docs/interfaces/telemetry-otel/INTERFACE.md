@@ -115,16 +115,39 @@ than an open bag of `gen_ai.*` names.
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
   deployment identifiers. Three bounded identifier dimensions are declared:
-  `curie.agent.turn.completed`, whose
-  `agent` label admits at most 32 distinct slugs per process and folds the rest,
-  plus any name that is not a 1 to 63 character slug, into `other`
-  (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`).
+  `curie.agent.turn.completed`, `curie.turn.duration`,
+  `curie.approval.lifecycle`, `curie.approval.pending`, and
+  `curie.approval.pending.age` share the `agent` dimension. All five instruments
+  use the same normalization and admission budget: at most 32 distinct slugs
+  per process, plus `other` and `unbound`. Names that are not 1 to 63 character
+  slugs, and names past the ceiling, share `other`
+  (`packages/telemetry/src/curie_telemetry/metrics.py::agent_metric_label`).
   Admission is first-come and resets when the process restarts, so the same slug
   can be named on one worker and counted as `other` on another. A rising
   `agent="other"` series means the ceiling or the slug rule is hiding a name.
-  `unbound` is only a turn that never resolved an agent. A real agent named
-  `other` or `unbound` shares `other`. Every other instrument refuses an
-  agent identifier. `curie.action_executor.execution` admits at most 16 distinct connector
+  `unbound` means no agent was resolved for the turn or approval. A real agent
+  named `other` or `unbound` shares `other`. The worker uses exactly the same
+  label on a turn's duration and agent completion counter. The runner uses
+  its existing configured connector agent name, or `unbound` when absent.
+  The fleet counter `curie.turn.completed` keeps its existing attributes.
+  Approval resolution and expiry use the approval's stored agent, and approval
+  resume looks up that agent independently of a channel's current binding.
+  An unavailable resume telemetry lookup shares `other` and never blocks the
+  resume. An approval is raised when the worker emits
+  `curie.approval.lifecycle{operation="request",outcome="requested"}` after
+  durable creation. Count that event by `agent`, rather than counting the
+  later `suspended` event as another raised approval.
+  The API observes pending approvals without pagination, grouped by agent.
+  Each normalized label gets one pending count and the age of its oldest
+  pending approval; overflow groups sum counts and keep the oldest creation
+  time before recording gauges. Every previously observed agent label gets
+  zero count and age when it has no pending approvals, including after an
+  agent is deleted. An empty fleet still exports `agent="unbound"` at zero.
+  Existing metric names and other attributes remain unchanged. Fleet queries
+  sum `curie.approval.pending` across agents and take the maximum of
+  `curie.approval.pending.age`; no duplicate fleet-total series is emitted.
+  Other instruments refuse an agent identifier.
+  `curie.action_executor.execution` admits at most 16 distinct connector
   slugs per process through its `connector` dimension, folding invalid names and
   overflow into `other` (`packages/telemetry/src/curie_telemetry/metrics.py`).
   `curie.slack.socket.envelopes` and `curie.slack.delivery_canary` admit at most
@@ -424,3 +447,52 @@ is the five `langfuse.*` writer attributes (`langfuse.trace.name`,
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 2 (Observability / OTel store), grade B+.
 - **ADR(s):** [ADR-0004](../../adr/0004-langfuse-observability-and-eval-backbone.md) — Langfuse as the single observability + eval backbone (OTLP over HTTP/protobuf to the collector).
   [ADR-0076](../../adr/0076-closed-typed-telemetry-attribute-schema.md) (Accepted, epic #512) — the closed, versioned attribute schema, the export-time validator, and the `gen_ai.approval.decision` key that closed the approval-gate observability gap ADR-0038 left open.
+
+
+## Refused factory trigger labels
+
+`curie.factory.intake.notice.oldest_owed_age_seconds` is the age of the oldest
+refusal notice still awaiting its App-owned issue comment, zero when none is
+owed. The API records refusals in `factory_intake_notices` independently of
+work items and retries delivery with capped backoff beside status-comment
+synchronization. A growing age means issue-visible answers are delayed;
+check GitHub availability and the factory App's comment permissions.
+
+
+## Factory polling cadence
+
+Polling intake has its own start-to-start timer on the GitHub tracker's
+`poll_interval_s`, 45 seconds by default. The label pass reads all repositories
+and delivers its new status comments and refusal notices before review, comment
+and cancellation traffic. That later traffic stops at the next label deadline
+and rotates its first repository. The five second delivery loops retry owed
+answers and recover existing comments by their markers.
+
+A trigger label that remains on an open issue is answered within 60 seconds of
+its event or intake recovery, whichever is later, within this polling envelope:
+
+| Bound | Limit |
+| --- | --- |
+| Served repositories | 20 |
+| Bound trigger labels per repository | 4 |
+| Open labelled issues per repository | 50, one listing page per label |
+| Unanswered events per pass | 10, in any distribution |
+| Events per labelled issue | 99, one response |
+| Comments per labelled issue | 200, three responses |
+| Labels per labelled issue | 99, one response |
+| Pull requests of any state per repository | 2,500, 25 pages of 100 |
+| Tracker response time | 200 milliseconds |
+| Tracker and factory credential | Available |
+
+The cold-cache label pass, including answer delivery, has a 15 second budget.
+Repositories and issues within a repository each have a concurrency limit of ten.
+Publication discovery shares one complete repository listing within each pass.
+Webhook intake keeps its separate reconciler interval and has no polling promise.
+A label removed before the next pass may never be observed.
+
+`curie.factory.intake.label_pass.age_seconds`, labelled by `repository`, records
+the age since that repository's last clean label pass at each completion. A
+retried row leaves the reference time unchanged. Outside the envelope, the age
+and `curie.factory.intake.notice.oldest_owed_age_seconds` show delayed intake
+and delayed refusal delivery respectively. Repository labels are bounded to
+20 values, with additional repositories sharing `other`.

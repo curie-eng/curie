@@ -1,0 +1,153 @@
+{
+  "contract": "ADR-0274 package 1; HMAC-SHA256; unpadded base64url key used as UTF-8 signing key",
+  "vectors": [
+    {
+      "id": "wake-v1",
+      "installation_key": "example-installation-signing-key",
+      "agent_id": "00000000-0000-4000-8000-000000000001",
+      "hook": "queue-ready",
+      "generation": 1,
+      "timestamp": "1794000000",
+      "delivery_id": "example-delivery-001",
+      "body": "{}",
+      "prefix": "curie.hook.wake.v1",
+      "expected": {
+        "derived_key": "rHvDmR2588X1tBp7KUDZq99st1gi9oJCbXSgzTeoj4g",
+        "material_hex": "63757269652e686f6f6b2e77616b652e76310a313739343030303030302e6578616d706c652d64656c69766572792d3030312e35343a5b2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c2271756575652d7265616479225d7b7d",
+        "signature": "sha256=dec685abd3f30c55145ab822f9fbd2eb3cf6b6aafa556950e28b4c3ac1110d33",
+        "installation_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+      }
+    },
+    {
+      "id": "leading-zero-timestamp",
+      "installation_key": "example-installation-signing-key",
+      "agent_id": "00000000-0000-4000-8000-000000000001",
+      "hook": "queue-ready",
+      "generation": 1,
+      "timestamp": "01794000000",
+      "delivery_id": "example-delivery-001",
+      "body": "{}",
+      "prefix": "curie.hook.wake.v1",
+      "expected": {
+        "derived_key": "rHvDmR2588X1tBp7KUDZq99st1gi9oJCbXSgzTeoj4g",
+        "material_hex": "63757269652e686f6f6b2e77616b652e76310a30313739343030303030302e6578616d706c652d64656c69766572792d3030312e35343a5b2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c2271756575652d7265616479225d7b7d",
+        "signature": "sha256=e2b314dbf1979056a2fa4552aa9703ef310a17fb89cffdcd1c2a134fe2feffa3",
+        "installation_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+      }
+    }
+  ],
+  "negative_cases": [
+    {
+      "id": "other-hook",
+      "installation_key": "example-installation-signing-key",
+      "agent_id": "00000000-0000-4000-8000-000000000001",
+      "hook": "another-queue",
+      "generation": 1,
+      "timestamp": "1794000000",
+      "delivery_id": "example-delivery-001",
+      "body": "{}",
+      "prefix": "curie.hook.wake.v1",
+      "expected": {
+        "derived_key": "4C0uQ98m9Mk_CsVL_OtFMQ12Aw3xMSdmg87tTkCe5Vg",
+        "material_hex": "63757269652e686f6f6b2e77616b652e76310a313739343030303030302e6578616d706c652d64656c69766572792d3030312e35363a5b2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c22616e6f746865722d7175657565225d7b7d",
+        "signature": "sha256=2654f38f457534f1dc2094d3a2111bc6f7bcff91a93ea5a03cec5c32e5b3e122",
+        "installation_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+      }
+    },
+    {
+      "id": "other-generation",
+      "installation_key": "example-installation-signing-key",
+      "agent_id": "00000000-0000-4000-8000-000000000001",
+      "hook": "queue-ready",
+      "generation": 2,
+      "timestamp": "1794000000",
+      "delivery_id": "example-delivery-001",
+      "body": "{}",
+      "prefix": "curie.hook.wake.v1",
+      "expected": {
+        "derived_key": "pYdwDB1FadvRItpisurxsTO9k7rqOn4bscjcloJwSm8",
+        "material_hex": "63757269652e686f6f6b2e77616b652e76310a313739343030303030302e6578616d706c652d64656c69766572792d3030312e35343a5b2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c2271756575652d7265616479225d7b7d",
+        "signature": "sha256=f20d5a3c3108ca58c5a3c4d505fd381965c95741adf1a3b4103a81dbc54af136",
+        "installation_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+      }
+    },
+    {
+      "id": "other-agent",
+      "installation_key": "example-installation-signing-key",
+      "agent_id": "00000000-0000-4000-8000-000000000002",
+      "hook": "queue-ready",
+      "generation": 1,
+      "timestamp": "1794000000",
+      "delivery_id": "example-delivery-001",
+      "body": "{}",
+      "prefix": "curie.hook.wake.v1",
+      "expected": {
+        "derived_key": "nxU1l5BbXOMssvmpdB9oztHIEeziRyoW8hWO4I7SUuc",
+        "material_hex": "63757269652e686f6f6b2e77616b652e76310a313739343030303030302e6578616d706c652d64656c69766572792d3030312e35343a5b2230303030303030302d303030302d343030302d383030302d303030303030303030303032222c2271756575652d7265616479225d7b7d",
+        "signature": "sha256=1feccf4391c9ce1f24c2113cb0a7682f0285c1cddc9d7fe9b2e7a2978465c1dc",
+        "installation_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+      }
+    },
+    {
+      "id": "other-body",
+      "installation_key": "example-installation-signing-key",
+      "agent_id": "00000000-0000-4000-8000-000000000001",
+      "hook": "queue-ready",
+      "generation": 1,
+      "timestamp": "1794000000",
+      "delivery_id": "example-delivery-001",
+      "body": "{ }",
+      "prefix": "curie.hook.wake.v1",
+      "expected": {
+        "derived_key": "rHvDmR2588X1tBp7KUDZq99st1gi9oJCbXSgzTeoj4g",
+        "material_hex": "63757269652e686f6f6b2e77616b652e76310a313739343030303030302e6578616d706c652d64656c69766572792d3030312e35343a5b2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c2271756575652d7265616479225d7b207d",
+        "signature": "sha256=8e4a5ac603e5d85dcaf6fe1b9dbcff4a0d4a10e31bfec39fc9e1d0426d7129a1",
+        "installation_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+      }
+    },
+    {
+      "id": "ordinary-ingress-prefix",
+      "installation_key": "example-installation-signing-key",
+      "agent_id": "00000000-0000-4000-8000-000000000001",
+      "hook": "queue-ready",
+      "generation": 1,
+      "timestamp": "1794000000",
+      "delivery_id": "example-delivery-001",
+      "body": "{}",
+      "prefix": "curie.hook.delivery.v2",
+      "expected": {
+        "derived_key": "rHvDmR2588X1tBp7KUDZq99st1gi9oJCbXSgzTeoj4g",
+        "material_hex": "63757269652e686f6f6b2e64656c69766572792e76320a313739343030303030302e6578616d706c652d64656c69766572792d3030312e35343a5b2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c2271756575652d7265616479225d7b7d",
+        "signature": "sha256=807f169bcb60999f06c3bf6df6b22bb3f798d1d96edf83a6f16d11b4c8121f2b",
+        "installation_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+      }
+    },
+    {
+      "id": "protected-support-prefix",
+      "installation_key": "example-installation-signing-key",
+      "agent_id": "00000000-0000-4000-8000-000000000001",
+      "hook": "queue-ready",
+      "generation": 1,
+      "timestamp": "1794000000",
+      "delivery_id": "example-delivery-001",
+      "body": "{}",
+      "prefix": "curie.hook.support.v1",
+      "expected": {
+        "derived_key": "rHvDmR2588X1tBp7KUDZq99st1gi9oJCbXSgzTeoj4g",
+        "material_hex": "63757269652e686f6f6b2e737570706f72742e76310a313739343030303030302e6578616d706c652d64656c69766572792d3030312e35343a5b2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c2271756575652d7265616479225d7b7d",
+        "signature": "sha256=82c8cb0d146c1e77e9cd745db4a90a1170c39aa54aae7c838d657f81b4cbfb9b",
+        "installation_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+      }
+    }
+  ],
+  "scope_vectors": [
+    {
+      "installation_key": "example-installation-signing-key",
+      "expected_scope": "4aa88704b14ae5b11a5bc77634f8b33befaa20d54b9b8166be9789b23a32712c"
+    },
+    {
+      "installation_key": "example-long-installation-signing-key-example-long-installation-signing-key-example-long-installation-signing-key-",
+      "expected_scope": "763eb2e5308d4d800de07f2600387b94773c8a79805ed414c3d03956ade3e043"
+    }
+  ]
+}

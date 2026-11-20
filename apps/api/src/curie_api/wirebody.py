@@ -32,7 +32,7 @@ separately.
 
 from typing import Annotated, Any
 
-from aci_protocol import READER_CONTEXT, ApprovalRequest, EvalReport, QueuedTurn
+from aci_protocol import READER_CONTEXT, ApprovalRequest, EvalReport, QueuedTurn, RetryCondition
 from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, BeforeValidator
 
@@ -98,6 +98,9 @@ EvalReportBody = Annotated[EvalReport, _reader_decode(EvalReport)]
 # newer worker's turn can carry an optional field this API predates
 # (TOOL-ACCESS-7).
 QueuedTurnBody = Annotated[QueuedTurn, _reader_decode(QueuedTurn)]
+# A worker forwards the provider retry condition it received to the finish
+# route (#5424); a newer worker's carrier can hold a member this API predates.
+RetryConditionBody = Annotated[RetryCondition, _reader_decode(RetryCondition)]
 
 
 def stored_turn_matches(turn: QueuedTurn, stored: Any) -> bool:
@@ -119,6 +122,7 @@ __all__ = [
     "ApprovalRequestBody",
     "EvalReportBody",
     "QueuedTurnBody",
+    "RetryConditionBody",
     "read_bounded_body",
     "stored_turn_matches",
 ]

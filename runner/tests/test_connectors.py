@@ -20,6 +20,7 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.connectors import build_mcp_servers, derive_mcp_servers
+from curie_runner.mcp_header_channel import hosted_header_values
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.plugin import PluginBundleError
 from curie_runner.tool_names import STATE_SERVER_NAME
@@ -879,32 +880,82 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
     # report_progress mounts only when the worker injected the progress env
     # (#3077); its name is exempt regardless, like an omitted request_approval.
-    # get_issue (ADR 0187) mounts only with the worker's issue read env.
-    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME
+    # get_issue (ADR 0187) mounts only with the worker's issue read env, and
+    # submit_tracker_result (ADR 0277) only under a tracker_result contract,
+    # and ask_questions (ADR 0286) only under an implementation contract.
+    from curie_runner.approval import (
+        ISSUE_TOOL_NAME,
+        PROGRESS_TOOL_NAME,
+        QUESTION_TOOL_NAME,
+        TRACKER_RESULT_TOOL_NAME,
+    )
 
     assert _published_live_tool_names(mounted) == platform_tool_names(state_server_mounted=True) - {
         PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
+        TRACKER_RESULT_TOOL_NAME,
+        QUESTION_TOOL_NAME,
     }
 
 
 def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch) -> None:
     # ADR 0187: an execution with a WorkItem boots with the API's issue read
-    # route and capability, and only that boot publishes get_issue.
-    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME, platform_tool_names
+    # route and capability, and only that boot publishes get_issue. Its boot
+    # asks the API's completion contract route (ADR 0277); an implementation
+    # answer publishes no submit_tracker_result.
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from curie_runner.approval import (
+        ISSUE_TOOL_NAME,
+        PROGRESS_TOOL_NAME,
+        TRACKER_RESULT_TOOL_NAME,
+        platform_tool_names,
+    )
+    from runner_boot_session import initialized_session
 
+    async def contract(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "completion_contract": "implementation",
+                "result_kinds": [],
+                "session_usd_allowance": None,
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/work-items/completion-contract", contract)
+
+    # Given rather than probed: this boot runs inside the local API's loop.
+    capability = McpToolCapabilityProbe(
+        complete=True,
+        has_potential_write_tool=True,
+        tool_count=1,
+        observed_tools=frozenset(),
+        readonly_tools=frozenset(),
+    )
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     env = _boot_env(monkeypatch, tmp_path, "issue-read")
-    monkeypatch.setenv("CURIE_ISSUE_READ_URL", "http://api.example/work-items/issue-read")
-    monkeypatch.setenv("CURIE_ISSUE_READ_TOKEN", "wir.example-capability.signature")
-    mounted = _boot_options(
-        monkeypatch,
-        RunnerConfig.from_env(env),
-        potential_write=True,
-    ).mcp_servers
+    captured: dict[str, Any] = {}
 
-    published = _published_live_tool_names(mounted)
+    async def go() -> None:
+        async with TestServer(app) as server:
+            monkeypatch.setenv(
+                "CURIE_ISSUE_READ_URL", str(server.make_url("/work-items/issue-read"))
+            )
+            monkeypatch.setenv("CURIE_ISSUE_READ_TOKEN", "wir.example-capability.signature")
+            session = await initialized_session(
+                build_runner(RunnerConfig.from_env(env), mcp_capability=capability)
+            )
+            assert isinstance(session, _CapturedSession)
+            captured["servers"] = session.options.mcp_servers
+
+    anyio.run(go)
+    published = _published_live_tool_names(captured["servers"])
     assert ISSUE_TOOL_NAME in published
-    assert published == platform_tool_names(state_server_mounted=True) - {PROGRESS_TOOL_NAME}
+    assert published == platform_tool_names(state_server_mounted=True) - {
+        PROGRESS_TOOL_NAME,
+        TRACKER_RESULT_TOOL_NAME,
+    }
 
 
 def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
@@ -930,11 +981,18 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
 
     assert set(mounted) == {APPROVAL_SERVER_NAME}
     published = _published_live_tool_names(mounted)
-    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME
+    from curie_runner.approval import (
+        ISSUE_TOOL_NAME,
+        PROGRESS_TOOL_NAME,
+        QUESTION_TOOL_NAME,
+        TRACKER_RESULT_TOOL_NAME,
+    )
 
     assert published == platform_tool_names(state_server_mounted=False) - {
         PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
+        TRACKER_RESULT_TOOL_NAME,
+        QUESTION_TOOL_NAME,
     }
     assert not any(name.startswith(f"mcp__{STATE_SERVER_NAME}__") for name in published)
 
@@ -1125,6 +1183,21 @@ def test_materialize_does_not_drop_an_unrelated_secret() -> None:
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in env
 
 
+def _assert_relayed(servers: dict[str, Any], name: str, *values: str) -> None:
+    """``name`` reaches the CLI as a relay holding ``values`` (#5378).
+
+    A runner-materialized hosted header is never handed to the CLI, whose
+    ``--mcp-config`` file same-uid Bash can read; the in-process relay holds it.
+    """
+
+    entry = servers[name]
+    assert entry["type"] == "sdk" and set(entry) == {"type", "name", "instance"}
+    assert entry["name"] == name
+    held = hosted_header_values(servers)
+    for value in values:
+        assert value in held
+
+
 def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1149,8 +1222,35 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
     assert isinstance(session, _CapturedSession)
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
     assert spawn["STDIO_TOKEN"] == "keep-me"
-    github = session.options.mcp_servers["github"]
-    assert github["headers"]["Authorization"] == "Bearer ghp_sentinel"
+    _assert_relayed(session.options.mcp_servers, "github", "Bearer ghp_sentinel", "ghp_sentinel")
+
+
+def test_undeclared_stdio_does_not_receive_hosted_connector_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "example-hosted-connector-token")
+    root = _bundle(
+        tmp_path, GITHUB,
+        mcp={"mcpServers": {"unrelated": {"command": "node"}}},
+    )
+    config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
+    spawn = {"GITHUB_PERSONAL_ACCESS_TOKEN": "example-hosted-connector-token"}
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    session = initialized_session_sync(build_runner(config, fake_model=False, sdk_env=spawn))
+    assert isinstance(session, _CapturedSession)
+    entry = session.options.mcp_servers["plugin:b:unrelated"]
+    assert set(entry["env"]) == {"CLAUDE_PLUGIN_ROOT"}
+    assert entry["env"]["CLAUDE_PLUGIN_ROOT"] == str(root)
+    assert "example-hosted-connector-token" not in json.dumps(entry)
+    _assert_relayed(session.options.mcp_servers, "github", "Bearer example-hosted-connector-token")
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in os.environ
 
 
 def test_optional_binding_is_projected_before_hosted_secret_cleanup(
@@ -1183,12 +1283,10 @@ def test_optional_binding_is_projected_before_hosted_secret_cleanup(
     runner = build_runner(config, fake_model=False, sdk_env=spawn)
     session = initialized_session_sync(runner)
     assert isinstance(session, _CapturedSession)
-    # Bound is judged at boot, before hosted credential custody removes the
-    # process variable. Preserve existing stdio placeholder semantics; this is
-    # not a claim that sharing hosted/stdio credentials authenticates stdio.
     servers = session.options.mcp_servers
     assert servers["plugin:b:stdio"]["env"]["TOKEN"] == "${GITHUB_PERSONAL_ACCESS_TOKEN}"
-    assert servers["github"]["headers"]["Authorization"] == "Bearer example-shared-token"
+    assert "example-shared-token" not in json.dumps(servers["plugin:b:stdio"])
+    _assert_relayed(servers, "github", "Bearer example-shared-token", "example-shared-token")
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in os.environ
     assert "example-shared-token" in runner._held_secrets
@@ -1395,9 +1493,7 @@ def test_a_minted_token_is_expanded_into_the_header_and_dropped_from_env(
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     session = initialized_session_sync(build_runner(config, fake_model=False, sdk_env=spawn))
     assert isinstance(session, _CapturedSession)
-    assert session.options.mcp_servers["github"]["headers"] == {
-        _CALLER_HEADER: "cct.payload.signature"
-    }
+    _assert_relayed(session.options.mcp_servers, "github", "cct.payload.signature")
     assert "CURIE_CONNECTOR_CALLER_TOKEN" not in spawn
     assert spawn["CURIE_MODEL"] == "claude-sonnet-5"
     assert "cct.payload.signature" not in spawn.values()

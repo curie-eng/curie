@@ -155,7 +155,7 @@ def collector(helper, snapshot, monkeypatch) -> tuple[Any, dict[str, Any]]:
         kind: {"metadata": {"name": "acme-owned"}}
         for kind in ("namespace", "deployment", "statefulset")
     }
-    subject = helper._Collector("acme-context", "acme-run", [])
+    subject = helper._Collector("test-context", "acme-run", [])
     monkeypatch.setattr(subject, "_get", lambda kind, *_args: objects.get(kind, {"items": []}))
     subject._poll_startup()
     for source in ("claims", "sandboxes"):
@@ -204,7 +204,7 @@ def test_owned_absence_does_not_replace_affirmative_live_proof(
 
 
 def test_main_propagates_real_child_exit_without_observed_proof(helper, monkeypatch) -> None:
-    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "acme-context")
+    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "test-context")
     monkeypatch.setenv("CURIE_SCENARIO_RUN_ID", "acme-run")
     monkeypatch.setattr(helper._Collector, "_get", lambda _self, *_args: {})
     assert helper.main(["--", sys.executable, "-c", "raise SystemExit(17)"]) == 17
@@ -212,7 +212,7 @@ def test_main_propagates_real_child_exit_without_observed_proof(helper, monkeypa
 
 @pytest.fixture
 def kubectl_inventory(helper, snapshot, monkeypatch):
-    subject = helper._Collector("acme-context", "acme-run", [])
+    subject = helper._Collector("test-context", "acme-run", [])
     resources = {
         "claims": ("sandboxclaims.extensions.agents.x-k8s.io", "extensions.agents.x-k8s.io",
                    "SandboxClaimList", "110"),
@@ -236,7 +236,7 @@ def kubectl_inventory(helper, snapshot, monkeypatch):
 
     def arguments(command):
         assert command[:5] == [
-            "kubectl", "--context", "acme-context", "--namespace", subject.namespace,
+            "kubectl", "--context", "test-context", "--namespace", subject.namespace,
         ]
         calls.append(command)
         assert command[5] == "get"
@@ -457,7 +457,7 @@ def test_null_startup_status_does_not_crash_or_start_inventory(preflight_bootstr
 
 
 def test_unexpected_error_names_its_class_only(helper, monkeypatch, capsys) -> None:
-    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "acme-context")
+    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "test-context")
     monkeypatch.setenv("CURIE_SCENARIO_RUN_ID", "acme-run")
 
     def explode(_self) -> int:
@@ -495,7 +495,7 @@ def test_completed_preflight_starts_inventory_and_worker_observation(preflight_b
 def test_main_rejects_invalid_shared_install_identity_before_starting_child(
     helper, monkeypatch, capsys, variable: str, value: str | None
 ) -> None:
-    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "acme-context")
+    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "test-context")
     monkeypatch.setenv("CURIE_SCENARIO_RUN_ID", "acme-run")
     if value is None:
         monkeypatch.delenv(variable)
@@ -520,10 +520,10 @@ def test_collector_uses_shared_install_identity_for_kubernetes_observation(
         return helper.subprocess.CompletedProcess(arguments, 0, "{}", "")
 
     monkeypatch.setattr(helper.subprocess, "run", kubectl)
-    subject = helper._Collector("acme-context", "acme-run", [])
+    subject = helper._Collector("test-context", "acme-run", [])
     subject._poll_startup()
     assert calls == [[
-        "kubectl", "--context", "acme-context", "--namespace", "acme-shared-workload",
+        "kubectl", "--context", "test-context", "--namespace", "acme-shared-workload",
         "get", "namespace", "acme-shared-workload", "--ignore-not-found", "-o", "json",
         "--request-timeout=5s",
     ]]

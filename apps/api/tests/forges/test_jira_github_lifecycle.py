@@ -27,7 +27,7 @@ Then the real passes run, through `WorkItemReconciler.run_once` (whose
 
 Two test-level shortcuts, both outside the factory core: the publication's
 approval is recorded directly (the approval and publication Job path is not
-offline, as in `test_offline_lifecycle`), and the publication Job's lineage
+offline), and the publication Job's lineage
 advance is made through the same CRUD service its route calls. The GitHub
 App's installation token mint is answered by `fake_installation_tokens`.
 
@@ -473,6 +473,12 @@ def _start(client: TestClient, request_id: uuid.UUID) -> int:
                 claim_name="claim-jira",
                 sandbox_name="sbx-jira",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)
@@ -580,7 +586,11 @@ def _record_pull_request(
     from curie_api.crud import lineages as crud_lineages
     from curie_api.crud import publication_queries
     from curie_api.factory_rediscovery import publishing_code_host
-    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+    from curie_api.publication_verification import (
+        publication_base_ref,
+        publication_revision_ids,
+        verify_publication_commit,
+    )
     from curie_api.repository_access import lineage_repository
     from test_factory_ci_wait import _execute
 
@@ -608,7 +618,12 @@ def _record_pull_request(
             )
             base_branch = await publication_base_ref(session, code_host, stored, repository)
             proof = await verify_publication_commit(
-                code_host, repository, stored, commit_sha=pull["head_sha"], base_branch=base_branch
+                code_host,
+                repository,
+                stored,
+                commit_sha=pull["head_sha"],
+                base_branch=base_branch,
+                revision_ids=publication_revision_ids(stored),
             )
             await crud_lineages.advance_publication_lineage(
                 session,

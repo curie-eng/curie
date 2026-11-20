@@ -50,15 +50,17 @@ from ..capacity_wait import (
     current_order,
 )
 from ..delivery_lease import DeliveryLease
-from ..publication_validation import validate_snapshot_against_base
+from ..publication_validation import PublicationValidationRefused, validate_snapshot_against_base
 from ..reply_sink import (
     TargetRoute,
 )
 from ..runner_client import (
     FinalAnswerProtocolError,
     RunnerError,
+    RunnerFrameInvalid,
     RunnerSnapshotReadError,
     RunnerStreamTimeout,
+    RunnerWorkspaceSnapshot,
     TurnStream,
 )
 from ..sandbox.quota import capacity_rejection_is_valid
@@ -76,8 +78,10 @@ from ..turn_progress import (
     deactivate_turn_progress,
     start_progress_pump,
 )
+from ..ui_evidence import capture_ui_evidence
 from ..workitem_dispatch import (
     WorkItemConflict,
+    WorkItemRun,
     parse_work_item_event_id,
 )
 from ..workspace import (
@@ -101,10 +105,16 @@ from . import (
     failures,
     memory,
     publication,
+    publication_recovery,
     routing,
     workspace,
 )
 from .log import logger
+
+# The publication candidate capture's ceiling (#5428), inside the snapshot budget.
+_CANDIDATE_CAPTURE_BUDGET_S = 60.0
+# Time kept back for validation, UI evidence and admission after a capture.
+_CANDIDATE_VALIDATION_RESERVE_S = 30.0
 
 # Tests replace these so the 10 s termination window does not wait on the wall clock.
 _pod_termination_clock = time.monotonic
@@ -758,7 +768,13 @@ async def _attempt_turn(
                 )
                 raise CapacityWaitRequested() from None
         logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
-        return failures.TurnOutcome(terminal_ok=False, classification="runner-error")
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            classification="runner-error",
+            runner_unreachable=isinstance(
+                exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError)
+            ),
+        )
     assert routed is not None
     record_reclaimed_retry()
     try:
@@ -828,6 +844,22 @@ async def _attempt_turn(
         await self._reply_for(qevent, route, "Folded into the in-progress reply above.")
         return failures.TurnOutcome(terminal_ok=True, steered=True)
 
+    if routed.turn is None and routed.handle is not None:
+        # #5429: a publication recovery route opened no runner turn. Its one
+        # retained candidate is validated and returned as the publish outcome,
+        # which already carries the snapshot the block below would read.
+        return await publication_recovery._attempt_recovery(
+            self,
+            qevent,
+            thread_key,
+            routed.handle,
+            (
+                None
+                if remaining_s is None
+                else remaining_s - (clock.time.monotonic() - attempt_started)
+            ),
+        )
+
     assert routed.handle is not None and routed.turn is not None
     hook_carry = constants._HOOK_RUN_CARRY.get()
     if hook_carry is not None:
@@ -884,9 +916,21 @@ async def _attempt_turn(
         outcome.workspace_inferred_repo = inferred
         if verified_review is not None:
             outcome.review_origin_key = verified_review.origin_key
-        if outcome.status is SessionStatus.AWAITING_APPROVAL and publication._is_publish_provenance(
-            outcome.approval_gate_kind,
-            outcome.approval_granted_tool,
+        owned_id = constants._OWNED_WORK_ITEM.get()
+        owned_run = self._work_item_runs.get(owned_id) if owned_id is not None else None
+        if (
+            outcome.status is SessionStatus.AWAITING_APPROVAL
+            and publication._is_publish_provenance(
+                outcome.approval_gate_kind,
+                outcome.approval_granted_tool,
+            )
+            # ADR 0277 (#5586): a tracker_result run's publish request is
+            # refused unread; no snapshot of its workspace is taken.
+            and not (
+                owned_run is not None
+                and owned_run.event_id == qevent.event_id
+                and owned_run.is_tracker_result
+            )
         ):
             snapshot = None
             # The worker names the base the snapshot is anchored at: the
@@ -974,25 +1018,35 @@ async def _attempt_turn(
                 )
             else:
                 try:
-                    if self._workspace is None:
-                        raise WorkspacePreparationError(
-                            "publication-validation",
-                            "managed workspace coordinator is unavailable",
-                        )
-                    await asyncio.to_thread(
-                        validate_snapshot_against_base,
-                        self._workspace,
-                        thread_key=thread_key,
-                        snapshot=snapshot,
-                        max_patch_bytes=self._config.publication_patch_max_bytes,
-                        scratch_root=Path(self._config.workspace_scratch_root),
-                        git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
-                        protected_paths=self._config.publication_protected_paths,
-                        allow_dependency_additions=self._config.publication_allow_dependency_additions,
+                    await self._retain_and_validate_publication_snapshot(
+                        qevent,
+                        thread_key,
+                        snapshot,
+                        owned_run,
+                        (
+                            None
+                            if snapshot_budget_s is None
+                            else snapshot_budget_s - (clock.time.monotonic() - snapshot_started)
+                        ),
                     )
                     outcome.publication_snapshot = snapshot
+                    outcome.ui_evidence = await capture_ui_evidence(
+                        self._runner,
+                        routed.handle.base_url,
+                        routed.handle.token or None,
+                        base_sha=snapshot.base_sha,
+                        remaining_s=(
+                            None
+                            if snapshot_budget_s is None
+                            else snapshot_budget_s - (clock.time.monotonic() - snapshot_started)
+                        ),
+                        execution_deadline=self._execution_deadline_for(qevent.event_id),
+                    )
                 except WorkspacePreparationError as exc:
                     outcome.publication_snapshot_error = f"publication snapshot failed: {exc}"
+                    outcome.publication_snapshot_refused = isinstance(
+                        exc, PublicationValidationRefused
+                    )
         return outcome
     finally:
         self._unregister_run(agent_id, thread_key)
@@ -1004,6 +1058,99 @@ async def _attempt_turn(
         progress_plan = constants._TURN_PROGRESS.get()
         if progress_plan is not None and self._progress is not None:
             await deactivate_turn_progress(self._progress, progress_plan)
+
+
+async def _retain_and_validate_publication_snapshot(
+    self: Kernel,
+    qevent: QueuedTurn,
+    thread_key: str,
+    snapshot: RunnerWorkspaceSnapshot,
+    run: WorkItemRun | None,
+    remaining_s: float | None,
+) -> None:
+    """Retain the snapshot as a private candidate, then validate it (#5428).
+
+    The capture runs first, and only for the owned, started WorkItem run of
+    this exact event with a runtime epoch, so finished work survives a failed
+    validation or admission. What is left is the delivery budget bounded by the
+    run's execution deadline. The capture's budget is min(60 s, half of what is
+    left beyond a 30 s reserve for validation, UI evidence and admission and the
+    capture's own failure-report allowance), and it is skipped when that is
+    under 5 s. The budget clock starts before the claim read, so the claim read
+    and the capture share it. It never raises except on cancellation and never
+    changes the outcome: validation then runs exactly as it would without it,
+    and its errors propagate unchanged.
+    """
+
+    capture = self._publication_candidates
+    if (
+        capture is not None
+        and self._workspace is not None
+        and run is not None
+        and run.event_id == qevent.event_id
+        and run.started
+        and not run.finished
+        and run.runtime_epoch is not None
+    ):
+        # Validation, UI evidence and admission keep the larger share of what is
+        # left before the delivery budget or the execution deadline, whichever
+        # comes first: the capture takes at most half of the time beyond a
+        # reserve for them and its own failure report, and is skipped rather
+        # than squeezed below a useful minimum.
+        started = clock.time.monotonic()
+        left_s = run.bound_remaining_s(remaining_s)
+        budget_s = (
+            _CANDIDATE_CAPTURE_BUDGET_S
+            if left_s is None
+            else min(
+                _CANDIDATE_CAPTURE_BUDGET_S,
+                (left_s - _CANDIDATE_VALIDATION_RESERVE_S - capture.outcome_allowance_seconds) / 2,
+            )
+        )
+        if budget_s < constants._MIN_ATTEMPT_BUDGET_S:
+            logger.warning(
+                "publication candidate capture skipped for %s: %s s left is too little",
+                qevent.event_id,
+                "unbounded" if left_s is None else f"{left_s:.1f}",
+            )
+        else:
+            stage = "claim read"
+            try:
+                prepared = await asyncio.wait_for(
+                    asyncio.to_thread(self._workspace.current, thread_key), budget_s
+                )
+                if prepared is not None:
+                    stage = "capture"
+                    await capture.capture(
+                        run,
+                        snapshot,
+                        prepared,
+                        dedupe_key=qevent.event_id,
+                        budget_seconds=budget_s - (clock.time.monotonic() - started),
+                    )
+            except Exception:  # noqa: BLE001 - a capture fault never changes the outcome
+                logger.warning(
+                    "publication candidate capture skipped for %s: %s failed",
+                    qevent.event_id,
+                    stage,
+                    exc_info=True,
+                )
+    if self._workspace is None:
+        raise WorkspacePreparationError(
+            "publication-validation",
+            "managed workspace coordinator is unavailable",
+        )
+    await asyncio.to_thread(
+        validate_snapshot_against_base,
+        self._workspace,
+        thread_key=thread_key,
+        snapshot=snapshot,
+        max_patch_bytes=self._config.publication_patch_max_bytes,
+        scratch_root=Path(self._config.workspace_scratch_root),
+        git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
+        protected_paths=self._config.publication_protected_paths,
+        allow_dependency_additions=self._config.publication_allow_dependency_additions,
+    )
 
 
 async def _require_tool_access(
@@ -1091,6 +1238,7 @@ async def _consume(
     pump = await self._start_progress_pump(qevent, route)
     stream_started_at = datetime.now(UTC)
     stream_reading = True
+    termination: SandboxTermination | None = None
     try:
         # ``async with`` releases the aiohttp response on every exit path
         # (normal end, apply-frame error, or a mid-stream transport drop), so
@@ -1142,6 +1290,17 @@ async def _consume(
                 if exc.timeout_result == "accepted"
                 else "runner-timeout-unconfirmed"
             )
+            if getattr(turn, "requester_window_bound", False) is True:
+                # ADR 0270 decision 3: the requester window, not the configured
+                # bound, ended this turn. Visible and not retried; an
+                # unconfirmed stop keeps its own classification.
+                logger.info(
+                    "requester turn %s ended at the requester token window (stop %s)",
+                    qevent.event_id,
+                    exc.timeout_result,
+                )
+                if exc.timeout_result == "accepted":
+                    classification = constants.REQUESTER_WINDOW_CLASSIFICATION
         else:
             classification = "runner-error"
             if stream_reading and isinstance(exc, aiohttp.ClientError):
@@ -1178,6 +1337,17 @@ async def _consume(
             classification=classification,
             error_message=acc.error_message,
             text=acc.rendered(),
+            # An observed end is a fact, never the classification string: an
+            # error frame's classification outranks the transport one above,
+            # and a stream that carried an error frame and then dropped did
+            # not end in a way the kernel saw.
+            runner_ended=not acc.saw_error_event
+            and (
+                (isinstance(exc, RunnerStreamTimeout) and exc.timeout_result == "accepted")
+                or termination is not None
+            ),
+            retry_condition=acc.retry_condition,
+            sandbox_exhaustion=termination.exhaustion if termination is not None else None,
         )
     except ActionBackendError as exc:
         # The ledger refused a write (ADR-0117). The change to the world has
@@ -1197,6 +1367,24 @@ async def _consume(
             terminal_ok=False,
             saw_side_effect=acc.saw_side_effect,
             classification="ledger-error",
+            error_message=acc.error_message,
+            text=acc.rendered(),
+            retry_condition=acc.retry_condition,
+        )
+    except RunnerFrameInvalid as exc:
+        # The runner wrote a frame this worker cannot decode. Only a started
+        # factory run on its own execute wake settles here: nothing proves what
+        # the turn did, so it ends failed and uncertain and the SQL lifecycle
+        # admits no successor. Every other turn keeps the loud path, where the
+        # entry stays pending.
+        if self._started_execute_run(constants._OWNED_WORK_ITEM.get(), qevent.event_id) is None:
+            raise
+        logger.warning("turn stream undecodable for %s: %s", qevent.event_id, exc)
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            saw_side_effect=acc.saw_side_effect,
+            execution_uncertain=True,
+            classification=constants.UNCLASSIFIED_ERROR_CLASSIFICATION,
             error_message=acc.error_message,
             text=acc.rendered(),
         )
@@ -1258,9 +1446,12 @@ async def _apply_frame(
             await self._markers.mark_side_effect(qevent.event_id)
         await self._record_action(frame, acc, qevent, agent_id)
     elif isinstance(frame, ErrorEvent):
+        acc.saw_error_event = True
         if frame.classification:
             acc.classification = failures.map_error_classification(frame.classification)
         acc.error_message = frame.message or acc.error_message
+        if frame.retry_condition is not None:
+            acc.retry_condition = frame.retry_condition
     elif isinstance(frame, Final):
         acc.status = frame.status
         acc.final_text = frame.text
@@ -1376,6 +1567,8 @@ async def _finish(
             status=acc.status,
             tools_called=frozenset(acc.tools_called),
             assistant_text=acc.rendered(),
+            runner_ended=True,
+            retry_condition=acc.retry_condition,
         )
     if acc.status is SessionStatus.AWAITING_APPROVAL:
         # Terminal for this turn, but the placeholder edit is deferred to
@@ -1394,6 +1587,8 @@ async def _finish(
             approval_display=acc.approval_display,
             tools_called=frozenset(acc.tools_called),
             assistant_text=acc.rendered(),
+            runner_ended=True,
+            retry_condition=acc.retry_condition,
         )
     # classified-failure, or the stream ended with no final at all.
     return failures.TurnOutcome(
@@ -1404,6 +1599,10 @@ async def _finish(
         text=acc.rendered(),
         status=acc.status,
         tools_called=frozenset(acc.tools_called),
+        # Only an applied final frame is an observed end; a stream that
+        # closed without one is not.
+        runner_ended=acc.status is not None,
+        retry_condition=acc.retry_condition,
     )
 
 

@@ -76,10 +76,57 @@ def graph_payload() -> dict[str, Any]:
         ("0140", False),
         ("0141", False),
         ("0143", False),
-        # The candidate minimum includes deleted-issue cancellation.
         ("0144", False),
         ("0145", False),
-        ("0147", True),
+        ("0146", False),
+        ("0147", False),
+        ("0148", False),
+        # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 columns.
+        ("0149", False),
+        ("0151", False),
+        ("0152", False),
+        # Approval ORM reads require the 0153 selection columns.
+        ("0153", False),
+        ("0154", False),
+        # Dynamic approval answers require the 0156 answer gate.
+        ("0156", False),
+        # 0157 adds factory Slack tables, 0158 adds GitHub host namespaces,
+        # 0159 adds the execution owner columns, 0160 adds the personal
+        # custody table and enrollment fence, and 0162 adds the agent version
+        # result policy columns. Factory CI observations require the 0163
+        # table, which stays below this floor. Cached facts and request
+        # delivery require the 0164 tables, which stay below this floor.
+        # Owner coding profiles and tenant policies require 0165, which stays
+        # below this floor. Slack kickoff thread origin reads require 0166,
+        # which stays below this floor. 0167 adds the execution request
+        # completion contract columns this candidate reads.
+        ("0157", False),
+        ("0158", False),
+        ("0159", False),
+        ("0160", False),
+        ("0162", False),
+        ("0163", False),
+        ("0164", False),
+        ("0165", False),
+        ("0166", False),
+        ("0167", False),
+        ("0168", False),
+        ("0169", False),
+        ("0170", False),
+        ("0171", False),
+        ("0172", False),
+        ("0173", False),
+        ("0174", False),
+        ("0175", False),
+        ("0176", False),
+        ("0177", False),
+        ("0178", False),
+        ("0179", False),
+        ("0180", False),
+        ("0182", False),
+        ("0183", False),
+        ("0184", False),
+        ("0185", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -100,6 +147,42 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
         schema_compat.can_serve(current, schema_compat.load_window(), schema_compat.load_kinds())
         is expected
     )
+
+
+def test_candidate_window_raises_the_floor_to_0174() -> None:
+    """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
+
+    Approval ORM reads require the 0154 reminder cursor, and dynamic approval
+    answers require the 0156 answer gate. The factory Slack progress loop reads
+    the 0157 tables, and the code host link route writes the github_host kind
+    0158 allows. Execution owner reads require 0159, personal custody reads
+    and enrollment fences require 0160, and agent version reads select the
+    0162 result policy columns. Factory CI observations require the 0163
+    table. Cached facts and request delivery require the 0164 tables, which
+    stay below this floor. Owner coding profiles and tenant policies require
+    0165, which stays below this floor. Slack kickoff thread origin reads
+    require 0166, which stays below this floor. Execution request reads select
+    the 0167 completion contract columns. Intake notice storage requires 0168,
+    which stays below this floor. Requester selection columns require 0169,
+    which stays below this floor. Refusal posts require 0170, which stays
+    below this floor. Triage handoff storage requires 0171, which stays below
+    this floor. Factory retry allowance columns require 0172, which stays below
+    this floor. Publication candidate retention requires 0173, which stays below
+    this floor. Factory resource gate columns require 0174, which stays below
+    this floor. Publication recovery requests require 0175, which stays below
+    this floor. Operator retry records require 0176.
+    Enrollment inactive intake notices require 0177.
+    The factory Slack progress card requires 0178.
+    GitHub account link states and display labels require 0179.
+    Slack account display labels require 0180.
+    Guarded automatic retry dispatch times require 0182.
+    Grant notices require 0183.
+    Factory question rounds require 0184.
+    Learned memory rules require 0185.
+    """
+    window = shared().load_metadata().window
+    assert window.schema_min == "0185"
+    assert window.schema_head == "0185"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

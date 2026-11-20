@@ -14,6 +14,8 @@ from functools import partial
 
 import httpx
 import redis.asyncio as redis
+from curie_channel_gateway.tls import gateway_http_mounts
+from curie_internal.valkey import AsyncRedis
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -31,7 +33,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from curie_api.crud import agents as crud_agents
 
-from . import __version__, oidc
+from . import __version__, custody_store, oidc, rollout_hold
+from .approval_reminders import enqueue_reminder
 from .channel_identities import start_static_slack_bootstrap
 from .code_host_trust import code_host_verify
 from .commitpoller import CommitPoller, GitHubBranchTip
@@ -62,6 +65,7 @@ from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
 from .lineage_reconciler import start_lineage_reconciler
+from .personal_custody_reconciler import start_personal_custody_reconciler
 from .protected_reconciler import ProtectedAdmissionReconciler
 from .remediation_admission import reconcile_admissions
 from .resumequeue import ResumeQueue
@@ -79,6 +83,7 @@ from .routers import (
     channel_read,
     channels,
     cluster_message_replies,
+    coding_instructions,
     config,
     console,
     control,
@@ -86,6 +91,8 @@ from .routers import (
     deployments,
     directory,
     evals,
+    factory_facts,
+    factory_slack,
     factory_status,
     forge_credential_health,
     gitflow_routing,
@@ -93,17 +100,24 @@ from .routers import (
     github_reviews,
     hook_fire,
     hook_source_policy,
+    hook_wake,
     hooks,
     identity,
     identity_admin,
     identity_approvals,
     identity_authority,
     identity_connect,
+    identity_me,
+    identity_operator,
     memory,
     observability,
+    personal_enrollments,
     provider_installations,
+    publication_candidates,
+    publication_candidates_access,
     publication_code_host,
     publication_precheck,
+    publication_ui_evidence,
     publications,
     remediation_nominations,
     remediation_policy,
@@ -127,6 +141,7 @@ from .slack_approvers import build_approver_set_selector
 from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
 from .threadreset import ThreadResetRequests
+from .ui_evidence_reconciler import start_ui_evidence_reconciler
 from .workitem_reconciler import WorkItemReconciler
 
 _LOG = logging.getLogger("curie_api")
@@ -154,7 +169,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.forges = forges_registry(settings)
     # The shared client reaches the code host, so it trusts the operator's
     # code host CA bundle as well as the public roots (#3831).
-    http_client = httpx.AsyncClient(timeout=10.0, verify=code_host_verify(settings))
+    http_client = httpx.AsyncClient(
+        timeout=10.0, verify=code_host_verify(settings),
+        mounts=gateway_http_mounts(settings.channel_gateway_url),
+    )
     app.state.http_client = http_client
     app.state.langfuse = LangfuseClient(settings, http_client)
     store = BundleStore(settings)
@@ -165,8 +183,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # for a proxy most runs never touch.
     app.state.pod_log_reader = build_lazy_pod_log_reader(settings.kube_config_path)
     app.state.pod_lister = build_lazy_pod_lister(settings.kube_config_path)
-    valkey: redis.Redis = redis.from_url(settings.valkey_dsn())
+    valkey: redis.Redis = AsyncRedis.from_url(settings.valkey_dsn())
     app.state.valkey = valkey
+    credential_valkey = AsyncRedis.from_url(settings.valkey_dsn(), retry_reads=False)
+    app.state.credential_valkey = credential_valkey
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)
     app.state.eval_queue = EvalQueue(valkey)
@@ -210,24 +230,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         and settings.github_review_reconciler_interval_s > 0
         else None
     )
-    # The composition root for approvals (#420, ADR-0034): the only place that
-    # names Slack to build the approver-set selector, so the authorizer and the
-    # resolve endpoint depend on ports rather than on a provider. Each Slack
-    # identity's usergroup client shares the app's httpx client (ADR-0168
-    # decision 5); with no bot token there is none, the normal Slack-free
-    # deployment, and a route that declares an approvers group then fails
-    # closed at resolve time rather than silently widening.
+    # Authorization and freshness policy use authenticated gateway membership ports.
     app.state.approver_sets = build_approver_set_selector(http_client, settings)
-    # Every configured Slack identity as one unattached channel identity
-    # (#2909, ADR 0168 decision 1, as scoped by ADR 0193 decision 4): the
-    # legacy default plus every CURIE_SLACK_IDENTITIES entry with a non-blank
-    # bot token, each behind its own token gate, so a Slack-free install gets
-    # no row. Attaching it to a provider_installations row is #3039's job, not
-    # boot's -- only the identity's own credential can later report which
-    # installation it belongs to. Never fails boot; if this image started
-    # below this migration it keeps retrying in the background. identities.py
-    # still reads CURIE_SLACK_IDENTITIES directly to validate a binding's
-    # declared name, not from this table, pending #2911.
+    # Declarations reserve identities; only the gateway or dispatcher can later
+    # attest provider availability. Bootstrap never reads a provider token.
     app.state.static_slack_bootstrap_task = await start_static_slack_bootstrap(
         app.state.sessionmaker, settings
     )
@@ -261,6 +267,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.work_item_reconciler_enabled
         else None
     )
+    from . import factory_poll_intake
+
+    app.state.factory_poll_intake_task = (
+        asyncio.create_task(factory_poll_intake.run_forever(app.state.sessionmaker, settings))
+        if settings.work_item_reconciler_enabled
+        and settings.factory_enabled
+        and settings.factory_intake == "poll"
+        else None
+    )
     app.state.work_item_status_comments_task = (
         asyncio.create_task(work_item_reconciler.run_status_comments_forever())
         if settings.work_item_reconciler_enabled
@@ -274,6 +289,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.lineage_reconciler_task = start_lineage_reconciler(
         app.state.sessionmaker, settings, http_client
     )
+    app.state.ui_evidence_reconciler_task = start_ui_evidence_reconciler(
+        app.state.sessionmaker, settings, http_client
+    )
+    # Personal grant custody (#5377): the Secret store exists only when a grant
+    # namespace is configured, and its cleanup loop is independent of the factory.
+    app.state.custody_store = custody_store.build_custody_secret_store(settings)
+    app.state.personal_custody_reconciler_task = start_personal_custody_reconciler(
+        app.state.sessionmaker, settings, app.state.custody_store
+    )
+    app.state.rollout_hold = rollout_hold.build_rollout_hold(settings)
+    rollout_hold.install(app.state.rollout_hold)
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
     # resume_queue); interval <= 0 disables it (no task started).
@@ -289,6 +315,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
                 http_expiry=app.state.http_approval_expiry,
                 identity_runtime=identity_runtime(app.state),
+                reminder_enqueue=(
+                    partial(enqueue_reminder, valkey, settings.runs_stream)
+                    if settings.approval_reminders_enabled
+                    else None
+                ),
                 remediation_admissions=(
                     partial(
                         reconcile_admissions,
@@ -406,6 +437,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     pass
             # These background loops use Valkey and the database, so stop them
             # before closing either resource.
+            intake_task = getattr(app.state, "factory_poll_intake_task", None)
+            if intake_task is not None:
+                intake_task.cancel()
+                try:
+                    await intake_task
+                except asyncio.CancelledError:
+                    pass
             status_task = getattr(app.state, "work_item_status_comments_task", None)
             if status_task is not None:
                 status_task.cancel()
@@ -418,6 +456,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 work_item_task.cancel()
                 try:
                     await work_item_task
+                except asyncio.CancelledError:
+                    pass
+            custody_task = getattr(app.state, "personal_custody_reconciler_task", None)
+            if custody_task is not None:
+                custody_task.cancel()
+                try:
+                    await custody_task
+                except asyncio.CancelledError:
+                    pass
+            rollout_hold.uninstall(app.state.rollout_hold)
+            evidence_task = getattr(app.state, "ui_evidence_reconciler_task", None)
+            if evidence_task is not None:
+                evidence_task.cancel()
+                try:
+                    await evidence_task
                 except asyncio.CancelledError:
                     pass
             lineage_task = getattr(app.state, "lineage_reconciler_task", None)
@@ -463,6 +516,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 except asyncio.CancelledError:
                     pass
             try:
+                await credential_valkey.aclose()
                 await valkey.aclose()
                 await http_client.aclose()
                 await engine.dispose()
@@ -697,6 +751,7 @@ def create_app(
     app.include_router(runs.router)
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
+    app.include_router(hook_wake.admin_router)
     app.include_router(state.router)
     app.include_router(state.internal_router)
     app.include_router(state.released_router)
@@ -715,13 +770,16 @@ def create_app(
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
     app.include_router(publication_code_host.router)
+    app.include_router(publication_ui_evidence.router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
+    app.include_router(factory_slack.internal_router)
     app.include_router(attachment_access.router)
     app.include_router(attachment_access.internal_router)
     app.include_router(channel_read.router)
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
+    app.include_router(factory_facts.router)
     app.include_router(factory_status.router)
     app.include_router(forge_credential_health.router)
     app.include_router(turn_progress.router)
@@ -730,21 +788,28 @@ def create_app(
     app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspace_recovery.router)
     app.include_router(workspace_recovery_access.router)
+    app.include_router(publication_candidates.router)
+    app.include_router(publication_candidates_access.router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
     app.include_router(identity_admin.router)
+    app.include_router(identity_operator.router)
+    app.include_router(personal_enrollments.router)
+    app.include_router(coding_instructions.router)
     app.include_router(identity_authority.router)
     app.include_router(identity_authority.grant_router)
     app.include_router(identity_authority.classification_router)
     app.include_router(identity_approvals.router)
     app.include_router(directory.router)
     app.include_router(identity_connect.router)
+    app.include_router(identity_me.router)
     app.include_router(identity.router)
     app.include_router(teams.router)
     app.include_router(agent_access.router)
     app.include_router(hooks.router)
+    app.include_router(hook_wake.router)
 
     # @spec IDENTITY-WRITER-LIFETIME-V1-8. Telemetry stays outside preparation.
     app.add_middleware(IdentityFenceMiddleware)

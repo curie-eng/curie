@@ -555,9 +555,6 @@ def main() -> int:
     if current == tip:
         print("already on the repository tip; nothing to do", flush=True)
         return 0
-    if dry_run:
-        print("dry run: would deploy the bundle at the tip", flush=True)
-        return 0
 
     # Two different absences, and only one of them is fatal.
     #
@@ -590,6 +587,9 @@ def main() -> int:
             "answer that leaves it somewhere known.",
             flush=True,
         )
+    if dry_run:
+        print("dry run: would deploy the bundle at the tip", flush=True)
+        return 0
 
     try:
         archive = _get(

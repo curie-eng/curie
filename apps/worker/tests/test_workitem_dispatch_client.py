@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import uuid
@@ -12,6 +13,7 @@ import httpx
 import pytest
 from curie_worker import workitem_dispatch
 from curie_worker.binding import FactoryContext, FactoryWake
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemDispatchClient,
@@ -20,6 +22,11 @@ from curie_worker.workitem_dispatch import (
     WorkItemStartRefused,
     WorkItemTransportError,
 )
+
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
+
 
 REQUEST_ID = uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 WORK_ITEM_ID = uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -45,7 +52,11 @@ def _grant() -> WorkItemAcquireGrant:
         conversation_id="slack:C0EXAMPLE1:thread",
         wait_deadline=datetime(2099, 1, 1, tzinfo=UTC),
         repository_path="acme-corp/widgets",
+        execution_kind="implementation",
+        recovery_candidate_id=None,
         context=CONTEXT,
+        resource_gate=None,
+        predecessor_claim_name=None,
     )
 
 
@@ -72,6 +83,10 @@ BASE = {
     "wait_deadline": "2026-09-23T02:00:00+00:00",
     "repository_path": "acme-corp/widgets",
     "context": CONTEXT.model_dump(mode="json"),
+    "execution_kind": "implementation",
+    "recovery_candidate_id": None,
+    "resource_gate": None,
+    "predecessor_claim_name": None,
 }
 
 
@@ -85,6 +100,8 @@ def test_acquire_grant_carries_the_work_item_repository() -> None:
     [
         "generation", "work_item_id", "conversation_id",
         "wait_deadline", "repository_path", "context",
+        "execution_kind", "recovery_candidate_id",
+        "resource_gate", "predecessor_claim_name",
     ],
 )
 def test_acquire_refuses_a_missing_required_field(field: str) -> None:
@@ -92,6 +109,81 @@ def test_acquire_refuses_a_missing_required_field(field: str) -> None:
     del body[field]
     with pytest.raises(WorkItemTransportError):
         _acquire(body)
+
+
+def test_acquire_grant_carries_the_publication_recovery_candidate() -> None:
+    candidate = uuid.uuid4()
+    grant = _acquire(
+        {
+            **BASE,
+            "execution_kind": "publication_recovery",
+            "recovery_candidate_id": str(candidate),
+        }
+    )
+    assert grant.execution_kind == "publication_recovery"
+    assert grant.recovery_candidate_id == candidate
+    plain = _acquire(BASE)
+    assert (plain.execution_kind, plain.recovery_candidate_id) == ("implementation", None)
+
+
+@pytest.mark.parametrize(
+    ("kind", "candidate"),
+    [
+        ("publication_recovery", None),
+        ("implementation", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        ("recovery", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        (None, None),
+        ("publication_recovery", "not-a-uuid"),
+    ],
+)
+def test_acquire_refuses_an_unusable_execution_kind(kind: object, candidate: object) -> None:
+    with pytest.raises(WorkItemTransportError):
+        _acquire({**BASE, "execution_kind": kind, "recovery_candidate_id": candidate})
+
+
+def test_only_an_acquired_recovery_run_is_a_publication_recovery() -> None:
+    candidate = uuid.uuid4()
+
+    async def go() -> tuple[WorkItemRun, WorkItemRun]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+        ) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example-token", client=http
+            )
+            runs = []
+            for grant in (
+                dataclasses.replace(
+                    _grant(),
+                    execution_kind="publication_recovery",
+                    recovery_candidate_id=candidate,
+                ),
+                _grant(),
+            ):
+                run = WorkItemRun(
+                    client=client,
+                    request_id=REQUEST_ID,
+                    owner="worker-1",
+                    grant=grant,
+                    wake=WAKE,
+                    event_id=f"work-item-{REQUEST_ID}-execute-1",
+                    thread_key="slack:C0EXAMPLE1:thread",
+                    on_stop=_noop_stop,
+                    on_stale=_noop_stop,
+                )
+                await run.close()
+                runs.append(run)
+            return runs[0], runs[1]
+
+    recovery, implementation = asyncio.run(go())
+    assert recovery.is_publication_recovery
+    assert recovery.recovery_candidate_id == candidate
+    assert not implementation.is_publication_recovery
+    assert implementation.recovery_candidate_id is None
+
+
+async def _noop_stop(_thread_key: str, _run: WorkItemRun) -> None:
+    return None
 
 
 @pytest.mark.parametrize("repository", [None, "", " ", 42])
@@ -151,8 +243,16 @@ def test_acquire_sends_wake_and_initial_authority_explicitly() -> None:
 
 
 def _running_body() -> dict[str, object]:
+    # The running lookup carries no execution kind, gate or fence: only acquire
+    # grants them, and a running request is past its start.
+    acquire_only = {
+        "execution_kind",
+        "recovery_candidate_id",
+        "resource_gate",
+        "predecessor_claim_name",
+    }
     return {
-        **BASE,
+        **{key: value for key, value in BASE.items() if key not in acquire_only},
         "request_id": str(REQUEST_ID),
         "agent_id": str(AGENT_ID),
         "runtime_epoch": 7,
@@ -362,7 +462,13 @@ def test_run_settlement_retries_transports_but_not_conflicts(
             async def settle() -> None:
                 if operation == "finish":
                     await run.finish(
-                        outcome="delivered", cause="completed", detail="done", ci_fix_round=None
+                        outcome="delivered",
+                        cause="completed",
+                        detail="done",
+                        ci_fix_round=None,
+                        retry_safety="uncertain",
+                        retry_condition=None,
+                        exhausted_volume=None,
                     )
                 elif operation == "hold_for_approval":
                     await run.hold_for_approval()
@@ -427,7 +533,13 @@ def test_run_finish_clamps_retry_budget_to_execution_deadline(monkeypatch) -> No
             run.execution_deadline = datetime.now(UTC) + timedelta(seconds=3)
             with pytest.raises(WorkItemTransportError):
                 await run.finish(
-                    outcome="delivered", cause="completed", detail="done", ci_fix_round=None
+                    outcome="delivered",
+                    cause="completed",
+                    detail="done",
+                    ci_fix_round=None,
+                    retry_safety="uncertain",
+                    retry_condition=None,
+                    exhausted_volume=None,
                 )
         assert 2.9 <= sum(sleeps) <= 3
 
@@ -471,6 +583,9 @@ def test_settlement_empty_transport_message_retains_the_exception_type(
                     cause="completed",
                     detail="done",
                     ci_fix_round=None,
+                    retry_safety="uncertain",
+                    retry_condition=None,
+                    exhausted_volume=None,
                     budget_s=3,
                 )
 
@@ -777,7 +892,11 @@ def test_acquire_renewal_stops_after_start_defer_or_close_at_thirty_seconds(
                 await clock.advance(20.0)
                 await clock.advance(30.0)
                 if operation == "start":
-                    await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
+                    await run.start(
+                        claim_name="acme-claim",
+                        sandbox_name="acme-sandbox",
+                        delivered_limits=UNOBSERVED_LIMITS,
+                    )
                 elif operation == "defer":
                     await run.defer("thread_busy", capacity=False, start_failure_detail=None)
                 else:
@@ -912,7 +1031,11 @@ def test_failed_start_keeps_renewing_the_acquisition(
                 await clock.advance(20.0)
                 await clock.advance(30.0)
                 with pytest.raises(WorkItemTransportError):
-                    await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
+                    await run.start(
+                        claim_name="acme-claim",
+                        sandbox_name="acme-sandbox",
+                        delivered_limits=UNOBSERVED_LIMITS,
+                    )
                 await clock.advance(40.0)
                 assert seen == [(20.0, "acquire"), (30.0, "start"), (40.0, "acquire")]
                 assert not run.started
@@ -942,7 +1065,11 @@ def test_a_refused_start_still_records_the_claim_and_sandbox_names(
             run = _renewing_run(_renewal_client(http))
             try:
                 with pytest.raises(WorkItemConflict) as refused:
-                    await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
+                    await run.start(
+                        claim_name="acme-claim",
+                        sandbox_name="acme-sandbox",
+                        delivered_limits=UNOBSERVED_LIMITS,
+                    )
                 assert refused.value.code == "not_dispatchable"
                 assert seen == ["start"]
                 assert run.claim_name == "acme-claim"
@@ -1022,7 +1149,11 @@ def test_factory_renewal_refusal_fences_subsequent_start_without_another_http_wr
                     run.ensure_acquired()
                 assert refused.value.code == code
                 with pytest.raises(WorkItemStartRefused) as start_refused:
-                    await run.start(claim_name="owned-claim", sandbox_name="owned-sandbox")
+                    await run.start(
+                        claim_name="owned-claim",
+                        sandbox_name="owned-sandbox",
+                        delivered_limits=UNOBSERVED_LIMITS,
+                    )
                 assert start_refused.value.code == code
                 assert run.claim_name == "owned-claim"
                 assert run.sandbox_name == "owned-sandbox"
@@ -1038,5 +1169,244 @@ def test_factory_renewal_refusal_fences_subsequent_start_without_another_http_wr
                 }
             finally:
                 await run.close()
+
+    asyncio.run(go())
+
+
+# --- #5427 resource gate, predecessor fence, delivered limits ------------------
+
+_MEMORY_GATE = {
+    "condition": "memory_limit",
+    "dimension": "memory",
+    "volume": None,
+    "failed_limit": 50331648,
+    "current_limit": None,
+}
+
+
+def test_acquire_grant_carries_the_resource_gate_and_predecessor_claim() -> None:
+    grant = _acquire(
+        {**BASE, "resource_gate": _MEMORY_GATE, "predecessor_claim_name": "curie-thread-old"}
+    )
+    assert grant.resource_gate == workitem_dispatch.ResourceGate(
+        condition="memory_limit",
+        dimension="memory",
+        volume=None,
+        failed_limit=50331648,
+        current_limit=None,
+    )
+    assert grant.predecessor_claim_name == "curie-thread-old"
+    scratch = _acquire(
+        {
+            **BASE,
+            "resource_gate": {
+                **_MEMORY_GATE,
+                "condition": "scratch_limit",
+                "dimension": "scratch",
+                "volume": "workspace",
+                "failed_limit": 8388608,
+            },
+        }
+    )
+    assert scratch.resource_gate is not None
+    assert scratch.resource_gate.volume == "workspace"
+    history = _acquire(
+        {
+            **BASE,
+            "resource_gate": {
+                **_MEMORY_GATE,
+                "condition": "history_capacity",
+                "dimension": "history_capacity",
+                "current_limit": 2048,
+            },
+        }
+    )
+    assert history.resource_gate is not None
+    assert history.resource_gate.current_limit == 2048
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        "memory_limit",
+        {**_MEMORY_GATE, "dimension": "cpu"},
+        {**_MEMORY_GATE, "volume": "workspace"},
+        {**_MEMORY_GATE, "dimension": "scratch"},
+        {**_MEMORY_GATE, "failed_limit": 0},
+        {**_MEMORY_GATE, "failed_limit": True},
+        {**_MEMORY_GATE, "failed_limit": "50331648"},
+        {**_MEMORY_GATE, "current_limit": -1},
+        {**_MEMORY_GATE, "condition": ""},
+        {key: value for key, value in _MEMORY_GATE.items() if key != "current_limit"},
+        {**_MEMORY_GATE, "source_request_id": str(REQUEST_ID)},
+    ],
+)
+def test_acquire_refuses_a_malformed_resource_gate(gate: object) -> None:
+    with pytest.raises(WorkItemTransportError):
+        _acquire({**BASE, "resource_gate": gate})
+
+
+@pytest.mark.parametrize("claim", ["", 7, ["curie-thread-old"]])
+def test_acquire_refuses_an_unusable_predecessor_claim(claim: object) -> None:
+    with pytest.raises(WorkItemTransportError):
+        _acquire({**BASE, "predecessor_claim_name": claim})
+
+
+def test_start_and_finish_send_delivered_limits_and_exhausted_volume() -> None:
+    seen: list[httpx.Request] = []
+    limits = DeliveredLimits(
+        memory_bytes=67108864,
+        ephemeral_storage_bytes=12582912,
+        scratch_bytes={"workspace": 8388608},
+        max_turns=1000,
+    ).to_wire()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/start"):
+            return httpx.Response(
+                200,
+                json={
+                    "runtime_epoch": 1,
+                    "execution_deadline": "2099-01-01T00:00:00+00:00",
+                    "remaining_s": 60.0,
+                    "heartbeat_interval_s": 15.0,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    async def call(client: WorkItemDispatchClient) -> None:
+        await client.start(
+            REQUEST_ID,
+            owner="worker-1",
+            generation=1,
+            claim_name="claim-1",
+            sandbox_name="sandbox-1",
+            context=CONTEXT,
+            delivered_limits=limits,
+        )
+        await client.finish(
+            REQUEST_ID,
+            runtime_epoch=1,
+            outcome="failed",
+            cause="sandbox_scratch_exhausted",
+            detail=None,
+            ci_fix_round=None,
+            retry_safety="no_effects",
+            retry_condition=None,
+            exhausted_volume="workspace",
+        )
+
+    _run(handler, call)
+    start, finish = (json.loads(request.content) for request in seen)
+    assert start["delivered_limits"] == {
+        "memory_bytes": 67108864,
+        "ephemeral_storage_bytes": 12582912,
+        "scratch_bytes": {"workspace": 8388608},
+        "max_turns": 1000,
+    }
+    assert finish["exhausted_volume"] == "workspace"
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["beat_answers_first", "finish_answers_first", "finish_refused_stale", "no_finish"],
+)
+def test_a_stale_beat_is_only_a_lost_epoch_when_this_runs_finish_did_not_commit(
+    order: str,
+) -> None:
+    """A beat in flight when this run's own finish commits is not a stale owner (#5840).
+
+    The API refuses a heartbeat for any row that is no longer running, so the
+    beat that crosses a committed finish comes back ``stale_owner`` whichever
+    answer arrives first. Abandoning on it skips the failed run's recovery
+    capture. A finish the API refuses as ``stale_owner`` (a stolen epoch), or no
+    finish at all, still abandons.
+    """
+
+    async def go() -> None:
+        finish_committed = asyncio.Event()
+        beat_answered = asyncio.Event()
+        finish_returned = asyncio.Event()
+        beat_sent = asyncio.Event()
+        beats: list[str] = []
+        stale: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            verb = request.url.path.rsplit("/", 1)[-1]
+            if verb == "heartbeat":
+                beats.append(order)
+                beat_sent.set()
+                if order == "finish_answers_first":
+                    await finish_returned.wait()
+                elif order != "no_finish":
+                    await finish_committed.wait()
+                beat_answered.set()
+                # The internal heartbeat route's 409 for a row no longer running.
+                return httpx.Response(409, json={"detail": {"code": "stale_owner"}})
+            assert verb == "finish"
+            if order == "finish_refused_stale":
+                finish_committed.set()
+                await beat_answered.wait()
+                return httpx.Response(409, json={"detail": {"code": "stale_owner"}})
+            finish_committed.set()
+            if order == "beat_answers_first":
+                await beat_answered.wait()
+                # Let the heartbeat task act on its answer before this one lands.
+                for _ in range(50):
+                    await asyncio.sleep(0)
+            return httpx.Response(200, json={})
+
+        async def on_stop(_thread: str, _run: WorkItemRun) -> None:
+            raise AssertionError("no cancellation was requested")
+
+        async def on_stale(_thread: str, run: WorkItemRun) -> None:
+            stale.append(order)
+            run.abandoned = True
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            run = WorkItemRun(
+                client=WorkItemDispatchClient(
+                    api_base_url="http://api.example", worker_token="example-token", client=http
+                ),
+                request_id=REQUEST_ID,
+                owner="worker-1",
+                grant=_grant(),
+                wake=WAKE,
+                event_id="event",
+                thread_key="slack:C1:thread",
+                on_stop=on_stop,
+                on_stale=on_stale,
+            )
+            run.started = True
+            run.runtime_epoch = 1
+            beat = asyncio.create_task(run._heartbeat_loop(0.01))
+            run._heartbeat_task = beat
+            try:
+                if order != "no_finish":
+                    await asyncio.wait_for(beat_sent.wait(), 5)
+                    try:
+                        await run.finish(
+                            outcome="failed",
+                            cause="runner_failed",
+                            detail=None,
+                            ci_fix_round=None,
+                            retry_safety="uncertain",
+                            retry_condition=None,
+                            exhausted_volume=None,
+                        )
+                    except WorkItemConflict as exc:
+                        assert order == "finish_refused_stale"
+                        assert exc.code == "stale_owner"
+                    finish_returned.set()
+                await asyncio.wait_for(asyncio.shield(beat), 5)
+            finally:
+                await run.close()
+
+        committed = order in {"beat_answers_first", "finish_answers_first"}
+        assert beats == [order]
+        assert stale == ([] if committed else [order])
+        assert run.abandoned is (not committed)
+        assert run.finished is committed
 
     asyncio.run(go())

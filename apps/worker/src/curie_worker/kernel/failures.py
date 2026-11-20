@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
     QueuedTurn,
+    RetryCondition,
     SessionStatus,
     ToolAccess,
 )
@@ -17,11 +18,13 @@ from ..runner_client import (
     RunnerWorkspaceSnapshot,
 )
 from ..sandbox.types import (
+    ResourceExhaustion,
     SandboxTermination,
 )
+from ..workitem_dispatch import RetrySafety
 
 if TYPE_CHECKING:
-    pass
+    from ..ui_evidence import UiEvidenceCapture
 
 from . import constants
 
@@ -46,10 +49,51 @@ def map_error_classification(raw: str | None) -> str:
     return constants.UNCLASSIFIED_ERROR_CLASSIFICATION
 
 
+# ADR 0269 (#5427): a sandbox termination the substrate positively identified.
+# Only the pod observation sets ``sandbox_exhaustion``, so a runner error
+# frame, whatever its text, can never produce one of these causes.
+_EXHAUSTION_CAUSES = {
+    "memory": "sandbox_memory_exhausted",
+    "ephemeral_storage": "sandbox_storage_exhausted",
+    "scratch": "sandbox_scratch_exhausted",
+    "node_disruption": "sandbox_node_disrupted",
+}
+
+
 def _escalation_cause(failure: TurnOutcome | None) -> str:
     if failure is None or failure.classification is None:
         return "runner_escalated"
+    if failure.classification == "sandbox-terminated" and failure.sandbox_exhaustion is not None:
+        return _EXHAUSTION_CAUSES[failure.sandbox_exhaustion.kind]
     return constants._ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
+
+
+def _exhausted_volume(failure: TurnOutcome | None) -> str | None:
+    """The scratch volume a ``sandbox_scratch_exhausted`` finish names, else None."""
+
+    exhaustion = failure.sandbox_exhaustion if failure is not None else None
+    if exhaustion is None or _escalation_cause(failure) != "sandbox_scratch_exhausted":
+        return None
+    return exhaustion.volume
+
+
+def retry_safety(
+    turn: TurnOutcome | None, *, marker_flagged: bool, own_execute_turn: bool
+) -> RetrySafety:
+    """The safety fact a finish reports about the turn it ends.
+
+    ``no_effects`` is a positive observation: the kernel saw the run's own
+    execute turn end with no side effect flag, no durable marker and no
+    execution uncertainty. Anything short of that is never reported as clean.
+    """
+
+    if turn is not None and turn.execution_uncertain:
+        return "uncertain"
+    if marker_flagged or (turn is not None and turn.saw_side_effect):
+        return "flagged"
+    if turn is None or not turn.runner_ended or not own_execute_turn:
+        return "uncertain"
+    return "no_effects"
 
 
 def _sandbox_termination_detail(termination: SandboxTermination) -> str:
@@ -201,6 +245,9 @@ class TurnOutcome:
     error_message: str | None = None
     workspace_stage_timeout: bool = False
     workspace_dependency_unavailable: bool = False
+    # True only when turn start failed in the connect phase, so no request
+    # reached a runner (#4733).
+    runner_unreachable: bool = False
     text: str = ""
     status: SessionStatus | None = None
     steered: bool = False
@@ -224,6 +271,10 @@ class TurnOutcome:
     approval_display: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    # The snapshot error is a publication policy refusal, not a fault (#5429):
+    # the run finishes ``publication_refused``, which admits no recovery.
+    publication_snapshot_refused: bool = False
+    ui_evidence: UiEvidenceCapture | None = None
     review_origin_key: str | None = None
     # The repository this turn attached because its own message named it
     # (#2659). Read by `_pause_for_approval` for the notice composition. None on
@@ -234,6 +285,16 @@ class TurnOutcome:
     tools_called: frozenset[str] = frozenset()
     assistant_text: str = ""
     continued: bool = False
+    # The kernel observed this turn end: the runner's final frame was applied,
+    # or, on a stream that carried no error frame, the runner accepted the
+    # timeout stop or the pod termination was observed.
+    runner_ended: bool = False
+    # The provider retry condition the runner put on an error frame, reported
+    # unchanged at finish. None when the stream carried none.
+    retry_condition: RetryCondition | None = None
+    # What the substrate positively identified as ending a ``sandbox-terminated``
+    # turn (ADR 0269, #5427). None when it identified nothing.
+    sandbox_exhaustion: ResourceExhaustion | None = None
 
 
 class _FactoryExecutionEnded(Exception):
@@ -266,6 +327,14 @@ class ThreadBusyError(RuntimeError):
     cron turn does not take this path: the kernel records its hook run
     ``deferred`` and the scheduler retries it within the catch-up bound (#2929).
     """
+
+
+class HandoffPending(ThreadBusyError):
+    """A retained turn has not reached its durable handoff boundary."""
+
+
+class PriorSideEffectObserved(Exception):
+    """The delivery's replay fence was recovered while routing its retry."""
 
 
 class ToolAccessUnenforced(Exception):
@@ -324,6 +393,30 @@ class LiveSessionBusy(ThreadBusyError):
     The one ``ThreadBusyError`` a cron fire records as ``deferred`` (#2929): the
     others (a pending publication, a failed handoff) are not a live session.
     """
+
+
+class RequesterHandoffPending(LiveSessionBusy):
+    """A different requester met the thread's live turn (ADR 0270 decision 3).
+
+    Raised under the per-thread lock before any steer, start or interrupt, so
+    nothing reaches the runner. As a ``LiveSessionBusy`` it keeps every
+    deferral the kernel already gives a live session: the stream entry stays
+    pending and is redelivered, a cron fire records ``deferred``, and an
+    unstarted work item defers ``thread_busy``. The message names the thread
+    only, never the requester.
+    """
+
+
+class RequesterTokenWindowShort(RunnerError):
+    """A requester sandbox's caller token cannot cover the turn about to start.
+
+    ADR 0270 decision 3: the admission check right before the runner start.
+    A ``RunnerError``, so it is the retryable ``runner-error`` outcome; the
+    retry replaces the sandbox with one whose claim-time token covers the turn.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("requester_token_window_short")
 
 
 class CatchUpExpired(ThreadBusyError):

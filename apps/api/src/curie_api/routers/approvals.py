@@ -16,12 +16,14 @@ point remains here, on the server that owns the record, never in the sandbox.
 """
 
 import logging
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
+    agent_metric_label,
     canonicalize_traceparent,
     operation_span,
     record_metric,
@@ -31,6 +33,7 @@ from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.crud import agents as crud_agents
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import channels as crud_channels
 from curie_api.schemas.approvals import (
@@ -45,21 +48,23 @@ from curie_api.schemas.approvals import (
     ApprovalResolve,
 )
 
-from .. import adapter_principal, approval_principal
+from .. import adapter_principal, approval_principal, approver_tickets
 from ..action_forward import ForwardRefused
 from ..admission import admit
 from ..approval_auth import (
     APPROVAL_PRINCIPAL_HEADER,
     ApprovalPrincipalDep,
+    AuthenticatedApprovalPrincipal,
     platform_key_or_adapter,
     require_adapter_principal,
 )
+from ..approval_selection import canonical_route
 from ..approval_teams import (
     approval_team_decision,
     authenticated_actor_evidence,
     team_restriction,
 )
-from ..approvers import IdpTeamApprovers, card_on_requesting_surface
+from ..approvers import ApproverSetSelector, IdpTeamApprovers, card_on_requesting_surface
 from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
@@ -250,14 +255,20 @@ async def rotate_adapter_principal(
     """
 
     remaining = await crud_channels.existing_channel_binding_ids(session, claims.bindings)
-    if not remaining:
+    if not remaining or claims.exp <= int(time.time()):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "missing or invalid adapter principal",
             headers={"Cache-Control": "no-store"},
         )
     ttl_s = data.ttl_s if data is not None else adapter_principal.DEFAULT_TTL_SECONDS
-    return _issue_adapter_principal(claims.subject, remaining, ttl_s, response)
+    successor = _issue_adapter_principal(claims.subject, remaining, ttl_s, response)
+    logger.info(
+        "adapter principal rotated principal_kind=adapter subject=%s binding_count=%d",
+        claims.subject,
+        len(remaining),
+    )
+    return successor
 
 
 def _expired(approval: Approval) -> bool:
@@ -293,12 +304,31 @@ async def create_approval(
     runner, so a sandbox cannot talk its way past it.
     """
 
+    # ADR 0271 decision 2 (@spec REQUEST-APPROVAL-2): the same route lock as the
+    # HTTP owner, before anything else. Only the HTTP owner verifies a selection,
+    # so a dynamic request or any carried ticket never creates here.
+    try:
+        agent = None if data.agent_id is None else await crud_agents.get_agent(
+            session, data.agent_id
+        )
+        if approver_tickets.check_tool_route(agent, data) is not None:
+            raise approver_tickets.ApproverTicketRefusal(
+                status.HTTP_409_CONFLICT, approver_tickets.REQUIRES_HTTP_CREATION,
+            )
+    except approver_tickets.ApproverTicketRefusal as exc:
+        raise HTTPException(exc.status, exc.code) from None
     await require_legacy_approval_creation(
         session, data, runtime=identity_runtime(request.app.state),
     )
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
+    existing = await crud_approvals.get_approval_by_dedupe_key(session, data.dedupe_key)
+    if existing is not None:
+        response.status_code = status.HTTP_200_OK
+        result = ApprovalCreateOut.model_validate(existing)
+        result.requested_by = await crud_approvals.approval_display_requester(session, existing)
+        return result
     rejected = await crud_approvals.find_rejected_reraise(session, data)
     # An existing row for this dedupe_key is a replay of a request this route
     # already accepted, so the idempotent 200 below still owns it.
@@ -306,6 +336,15 @@ async def create_approval(
         session, data.dedupe_key
     ) is None:
         raise await _refuse_rejected_reraise(session, data, rejected)
+    try:
+        # The route lock again, on the agent row locked until create_approval
+        # commits, so a registration landing since the first check is judged.
+        if await approver_tickets.locked_tool_route(session, data) is not None:
+            raise approver_tickets.ApproverTicketRefusal(
+                status.HTTP_409_CONFLICT, approver_tickets.REQUIRES_HTTP_CREATION,
+            )
+    except approver_tickets.ApproverTicketRefusal as exc:
+        raise HTTPException(exc.status, exc.code) from None
     try:
         approval = await crud_approvals.create_approval(session, data, traceparent=traceparent)
     except IntegrityError as exc:
@@ -507,6 +546,57 @@ async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sende
         raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
 
+async def _refuse_off_composition(
+    session: AsyncSession,
+    approval: Approval,
+    principal: AuthenticatedApprovalPrincipal,
+    approver_sets: ApproverSetSelector,
+    data: ApprovalResolve,
+) -> None:
+    """A selected row's canonical route judges a principal the HTTP answer cannot carry.
+
+    ADR 0271 decisions 5 and 6: an operator, console or test-driver principal
+    on a dynamic or requester-excluding route is refused by the shared
+    authorizer (an operator first, before any set's eligibility), audited
+    ``denied`` with its evidence, and answered 403 with the authorizer's
+    reason. Any other route returns, keeping today's bare refusal.
+    @spec REQUEST-APPROVAL-5 REQUEST-APPROVAL-6.
+
+    Raises:
+        HTTPException: 403 with the authorizer's reason on a canonical route.
+    """
+
+    binding = await crud_approvals.get_approval_route_binding(session, approval)
+    if not canonical_route(approval, binding):
+        return
+    name, decision = await authorize_approval(
+        approval,
+        principal.subject,
+        principal.actor_channel,
+        approver_set=approver_sets(approval, binding),
+        principal_kind=principal.kind,
+        route_binding=binding,
+    )
+    if decision.allowed:  # Unreachable: only the HTTP answer owns a canonical route.
+        return
+    await crud_approvals.append_approval_audit(
+        session,
+        approval_id=approval.id,
+        action="denied",
+        actor=principal.subject,
+        actor_channel=principal.actor_channel,
+        principal_kind=principal.kind,
+        authenticated=True,
+        principal_subject=principal.adapter,
+        decision=data.decision,
+        authorizer=name,
+        authorized=False,
+        reason=decision.reason,
+        evidence=decision.evidence,
+    )
+    raise HTTPException(status.HTTP_403_FORBIDDEN, decision.reason)
+
+
 @router.post("/{approval_id}/resolve", response_model=ApprovalOut)
 async def resolve_approval(
     approval_id: uuid.UUID,
@@ -523,7 +613,10 @@ async def resolve_approval(
     The authorizer runs first, server-side (#246): the route's approvers decide
     whether the authenticated principal belongs -- an explicit user list, a
     Slack user group, or (declaring none) the card channel's members (#420).
-    Requester equality neither grants nor vetoes membership. Then exactly one
+    Requester equality neither grants nor vetoes membership, except on a
+    canonical route (ADR 0271: dynamic selection or requester exclusion), which
+    only the HTTP answer composition may answer; every other principal there is
+    refused and audited, an operator first. Then exactly one
     authorized resolver wins
     the conditional UPDATE; a loser gets 409 naming who resolved it, and a
     past-SLA record flips to expired and returns 410 while still enqueuing the
@@ -542,6 +635,11 @@ async def resolve_approval(
     ):
         raise _approval_not_found()
     stored_parent = approval_trace_context(approval)
+    agent = (
+        await crud_agents.get_agent(session, approval.agent_id)
+        if approval.agent_id is not None else None
+    )
+    metric_agent = agent_metric_label(agent.name if agent is not None else None)
     # @spec HTTP-APPROVAL-CONTINUITY-7/10: a selected row never reaches legacy
     # admission, team lookup or CAS. Its deadline expiry goes through the sealing
     # owner, and an authenticated Slack answer through the approval commit owner;
@@ -570,16 +668,21 @@ async def resolve_approval(
             )
         proof = request.headers.get(PROOF_HEADER)
         attestation = request.headers.get(APPROVAL_PRINCIPAL_HEADER)
-        if proof is None or attestation is None or principal.kind != "chat":
+        # A mail adapter's email reply carries its signed email answer proof and
+        # no chat attestation. @spec HTTP-APPROVAL-CONTINUITY-15.
+        emailed = principal.kind == "adapter" and proof is not None
+        if proof is None or (not emailed and (attestation is None or principal.kind != "chat")):
+            if principal.kind not in ("chat", "adapter"):
+                await _refuse_off_composition(session, approval, principal, approver_sets, data)
             # 403, not 409: a 409 reads as settled and would retire a card whose
-            # row is still pending. Only a receiver-proved Slack answer qualifies.
+            # row is still pending. Only a receiver-proved answer qualifies.
             raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
         try:
             resolved = await answer_http_approval(
                 request, approval_id, principal=principal, approver_sets=approver_sets,
                 answer=ApprovalAnswer(
                     operation="resolve", decision=data.decision, note=data.note,
-                    body=await request.body(), attestation=attestation, proof=proof,
+                    body=await request.body(), attestation=attestation or "", proof=proof,
                 ),
             )
         except ApprovalSettled as settled:
@@ -594,7 +697,7 @@ async def resolve_approval(
         record_metric(
             "curie.approval.lifecycle",
             attributes={"service.name": "curie-api", "operation": "resolve",
-                        "outcome": "resolved"},
+                        "outcome": "resolved", "agent": metric_agent},
         )
         # @spec HTTP-APPROVAL-CONTINUITY-11: only after the acknowledged commit.
         out = ApprovalOut.model_validate(resolved)
@@ -631,6 +734,7 @@ async def resolve_approval(
         principal.actor_channel,
         approver_set=approver_set,
         principal_kind=principal.kind,
+        route_binding=binding,
     )
 
     if principal.kind == "test_driver" and not team_decision.restricted:
@@ -740,6 +844,7 @@ async def resolve_approval(
                 attributes={
                     "service.name": "curie-api",
                     "operation": "expire",
+                    "agent": metric_agent,
                     "outcome": "expired",
                 },
             )
@@ -874,6 +979,7 @@ async def resolve_approval(
         attributes={
             "service.name": "curie-api",
             "operation": "resolve",
+            "agent": metric_agent,
             "outcome": "resolved",
         },
     )

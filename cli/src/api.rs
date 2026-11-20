@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
     ActionUndo, AgentAccessPolicyWrite, AgentCreate, AgentUpdate, ApprovalPrincipalMint,
-    ApprovalRecover, ApprovalResolve, ChannelBindingWrite, ChannelCallersWrite,
-    ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate, DirectoryConfigIn,
-    DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
+    ApprovalRecover, ApprovalResolve, AuthorityMutation, AuthoritySelectionMutation,
+    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
+    DeploymentCreate, DirectoryConfigIn, DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest,
+    GroupFilterMutation, MemoryEntryCreate, MemoryGuidanceIn, OperatorMutation,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
-    RoutingCheckRequest, VersionCreate,
+    RoutingCheckRequest, VersionCreate, WorkItemRetryRequest,
 };
 
 pub struct ApiClient {
@@ -370,6 +371,14 @@ pub struct Agent {
     pub publication_draft: bool,
     #[serde(default)]
     pub publication_branch_prefix: Option<String>,
+    /// Whether this agent's connector calls carry the verified requester (ADR
+    /// 0270 decision 1). `None` means a platform older than the flag, which
+    /// `approvals --requester-identity` reports instead of reading it as off.
+    #[serde(default)]
+    pub connector_requester_identity: Option<bool>,
+    /// The version the flag's next compare-and-set write must name.
+    #[serde(default)]
+    pub connector_requester_identity_version: Option<u64>,
 }
 
 /// An operator authored hook configuration file. Absent maps are omitted from
@@ -444,6 +453,108 @@ pub struct ApprovalRouteBindingResponse {
     pub notification: Option<ApprovalNotificationTargetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_route_deadline",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_in_seconds: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reminder_interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remind_every_s: Option<Option<u64>>,
+    /// ADR 0271: the approver-ticket selector registered on this route, with
+    /// the server-owned pinned `ceiling.approver_role`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_ticket: Option<ApproverTicketResponse>,
+    /// ADR 0271: the stored effective separation policy for the selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separation: Option<ApprovalSeparationResponse>,
+}
+
+/// A route's approver-ticket registration as the API returns it. Tolerant of
+/// fields a newer server adds.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApproverTicketResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<ApproverCeilingResponse>,
+}
+
+/// The operator-approved ceiling of a registration. `approver_role` is the
+/// server-owned pinned copy of the agent's approver role configuration, kept
+/// opaque: the CLI shows and echoes it, and never interprets it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApproverCeilingResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_role_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<Vec<ApproverUserResponse>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_role: Option<serde_json::Value>,
+}
+
+/// One identity-provider user named in a ceiling.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApproverUserResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+/// The stored separation policy of a route, with or without a selector.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalSeparationResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_requester: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt_group: Option<ExemptGroupResponse>,
+}
+
+/// The identity-provider group exempt from the requester exclusion, as the
+/// API returns it. Tolerant of fields a newer server adds.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExemptGroupResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+fn deserialize_route_deadline<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|duration| !(1..=315_360_000).contains(&duration)) {
+        return Err(serde::de::Error::custom(
+            "expires_in_seconds must be between 1 and 315360000, or null",
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn deserialize_reminder_interval<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|interval| !(1..=i32::MAX as u64).contains(&interval)) {
+        return Err(serde::de::Error::custom(
+            "remind_every_s must be between 1 and 2147483647, or null",
+        ));
+    }
+    Ok(Some(value))
 }
 
 /// Where a route's card goes, as the API returns it: a fixed channel, or the
@@ -453,6 +564,7 @@ pub struct ApprovalRouteBindingResponse {
 #[serde(untagged)]
 pub enum ApprovalResolutionResponse {
     Fixed(ApprovalResolutionTargetResponse),
+    ApproverDm(ApproverDmTargetResponse),
     RequestingSurface(RequestingSurfaceTargetResponse),
 }
 
@@ -462,6 +574,7 @@ impl ApprovalResolutionResponse {
         match self {
             Self::Fixed(target) => format!("{}:{}", target.kind, target.address),
             Self::RequestingSurface(target) => target.mode.clone(),
+            Self::ApproverDm(target) => format!("{} (identity {})", target.mode, target.identity),
         }
     }
 }
@@ -476,8 +589,18 @@ pub struct ApprovalResolutionTargetResponse {
 
 /// The `{"mode": "requesting_surface"}` resolution as the API returns it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RequestingSurfaceTargetResponse {
     pub mode: String,
+}
+
+/// The `{"mode": "approver_dm", "identity": "<slug>"}` resolution as the API
+/// returns it (ADR 0272).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverDmTargetResponse {
+    pub mode: String,
+    pub identity: String,
 }
 
 /// Text-only notification target returned by the API. Endpoint and adapter are
@@ -532,6 +655,86 @@ pub struct ApprovalRouteBindingWrite {
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_route_deadline",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_in_seconds: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reminder_interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remind_every_s: Option<Option<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_ticket: Option<ApproverTicketWrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separation: Option<ApprovalSeparationWrite>,
+}
+
+/// An approver-ticket registration as an operator writes it (ADR 0271).
+/// Strict: an unknown key is refused locally, never dropped.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverTicketWrite {
+    pub connector: String,
+    pub tool: String,
+    pub key_id: String,
+    pub public_key: String,
+    pub ceiling: ApproverCeilingWrite,
+}
+
+/// The ceiling of a registration. `approver_role` is server-owned: it may be
+/// echoed back from a readback, and is otherwise omitted.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverCeilingWrite {
+    pub approver_role_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<Vec<ApproverUserWrite>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_role: Option<serde_json::Value>,
+}
+
+/// One identity-provider user named in a ceiling.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverUserWrite {
+    pub issuer: String,
+    pub subject: String,
+}
+
+/// The separation policy of a route (ADR 0271). `exempt_group` is accepted by
+/// the API only with `exclude_requester: true`; the API is that gate.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalSeparationWrite {
+    pub exclude_requester: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_exempt_group",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exempt_group: Option<ExemptGroupWrite>,
+}
+
+/// Decode `exempt_group`, naming the field in a shape error: serde's own
+/// message for a wrong type names only the struct.
+fn deserialize_exempt_group<'de, D>(deserializer: D) -> Result<Option<ExemptGroupWrite>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ExemptGroupWrite>::deserialize(deserializer)
+        .map_err(|e| serde::de::Error::custom(format!("exempt_group: {e}")))
+}
+
+/// The identity-provider group exempt from the requester exclusion.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExemptGroupWrite {
+    pub issuer: String,
+    pub id: String,
 }
 
 /// Where a route's card goes, as an operator writes it: a fixed Slack channel,
@@ -543,6 +746,7 @@ pub struct ApprovalRouteBindingWrite {
 pub enum ApprovalResolutionWrite {
     Fixed(ApprovalResolutionTargetWrite),
     RequestingSurface(RequestingSurfaceTargetWrite),
+    ApproverDm(ApproverDmTargetWrite),
 }
 
 impl ApprovalResolutionWrite {
@@ -567,6 +771,12 @@ impl From<ApprovalResolutionResponse> for ApprovalResolutionWrite {
             ApprovalResolutionResponse::RequestingSurface(target) => {
                 Self::RequestingSurface(RequestingSurfaceTargetWrite { mode: target.mode })
             }
+            ApprovalResolutionResponse::ApproverDm(target) => {
+                Self::ApproverDm(ApproverDmTargetWrite {
+                    mode: target.mode,
+                    identity: target.identity,
+                })
+            }
         }
     }
 }
@@ -587,6 +797,16 @@ pub struct ApprovalResolutionTargetWrite {
 #[serde(deny_unknown_fields)]
 pub struct RequestingSurfaceTargetWrite {
     pub mode: String,
+}
+
+/// `{"mode": "approver_dm", "identity": "<slug>"}`: DM the one approver the
+/// route's approver_ticket selector picks, through the named Slack identity
+/// (ADR 0272). Command validation refuses any other mode value.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApproverDmTargetWrite {
+    pub mode: String,
+    pub identity: String,
 }
 
 /// Optional notification target with write-only transport routing.
@@ -611,6 +831,18 @@ pub struct RouteBindingInput {
     pub notification: Option<NotificationTargetWrite>,
     #[serde(default)]
     pub approvers: Option<ApproversInput>,
+    #[serde(default, deserialize_with = "deserialize_route_deadline")]
+    pub expires_in_seconds: Option<Option<u64>>,
+    #[serde(default)]
+    pub approver_ticket: Option<ApproverTicketWrite>,
+    #[serde(default)]
+    pub separation: Option<ApprovalSeparationWrite>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reminder_interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remind_every_s: Option<Option<u64>>,
 }
 
 /// An `approvers` block as written in a `--routes-from` file. Strict by design.
@@ -641,6 +873,10 @@ impl From<RouteBindingInput> for ApprovalRouteBindingWrite {
             resolution: input.resolution,
             notification: input.notification,
             approvers: input.approvers.map(Into::into),
+            expires_in_seconds: input.expires_in_seconds,
+            approver_ticket: input.approver_ticket,
+            separation: input.separation,
+            remind_every_s: input.remind_every_s,
         }
     }
 }
@@ -817,6 +1053,27 @@ pub struct HookFireRecord {
     pub reason: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
+}
+
+/// `GET /agents/{agent_id}/hooks/{hook}/wake-secret` (`HookWakeSecretOut`).
+///
+/// No `Debug`: the secret is printed only by the read command's success path.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HookWakeSecret {
+    pub agent_id: String,
+    pub hook: String,
+    pub generation: u64,
+    pub secret: String,
+}
+
+/// `POST /agents/{agent_id}/hooks/{hook}/wake-secret/rotate` (`HookWakeRotationOut`).
+///
+/// Unknown response fields, including a secret, are ignored and never displayed.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HookWakeRotation {
+    pub agent_id: String,
+    pub hook: String,
+    pub generation: u64,
 }
 
 /// Provenance nested on ``MemoryEntryOut`` (`MemoryProvenanceOut`).
@@ -1374,6 +1631,14 @@ pub struct RemediationPolicyGeneration {
 pub struct WorkItemOutcome {
     pub id: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub model_auth_mode: Option<String>,
+    #[serde(default)]
+    pub owner_principal_id: Option<String>,
+    #[serde(default)]
+    pub enrollment_generation: Option<i64>,
     pub tracker: WorkItemTracker,
     pub repository: WorkItemRepository,
     pub cancelled_at: Option<String>,
@@ -1388,7 +1653,30 @@ pub struct WorkItemOutcome {
     pub publication: Option<WorkItemPublication>,
     pub correctness: WorkItemCorrectness,
     pub ci: Option<WorkItemCi>,
+    pub ci_observation: Option<WorkItemCiObservation>,
     pub requests: Vec<WorkItemRequest>,
+}
+
+/// `WorkItemRetryOut`: the answer to `POST /work-items/{id}/retry` (#5431),
+/// for a real admission, an idempotent replay and a dry run alike. Carried
+/// through verbatim so `--json` is exactly the API's contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemRetry {
+    pub work_item_id: String,
+    pub request_id: String,
+    pub dry_run: bool,
+    pub replayed: bool,
+    pub disposition: String,
+    pub predecessor_request_id: String,
+    pub predecessor_cause: String,
+    pub successor_request_id: Option<String>,
+    pub successor_dispatch_not_before: String,
+    pub successor_blocked_on: Option<String>,
+    pub work_item_version: i64,
+    pub retries_used: i64,
+    pub retry_limit: i64,
+    pub actor_kind: String,
+    pub recorded_at: Option<String>,
 }
 
 /// `WorkItemTrackerOut`: the tracker issue that keys the work item (ADR 0197).
@@ -1455,9 +1743,28 @@ pub struct WorkItemCi {
     pub observed_at: Option<String>,
 }
 
+/// `WorkItemCiObservationOut`: persisted CI observation for a work item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemCiObservation {
+    pub status: String,
+    pub head_sha: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub observed_at: Option<String>,
+}
+
 /// `WorkItemRequestOut`: one execution request of a work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItemRequest {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub model_auth_mode: Option<String>,
+    #[serde(default)]
+    pub owner_principal_id: Option<String>,
+    #[serde(default)]
+    pub enrollment_generation: Option<i64>,
     pub sequence: u64,
     pub status: String,
     pub created_at: String,
@@ -2174,12 +2481,147 @@ fn mint_channel_token_body(
 /// Both of the failures this guards against happened for real: a CLI with
 /// `--target` against an API that predated the resolver, and a CLI that
 /// applied connectors against an API that could not render them.
+/// The 409 and 404 answers of `POST /work-items/{id}/retry`: a failure (exit
+/// 1) naming the API `code` and `message` with one fix sentence per code.
+fn work_item_retry_refusal(status: reqwest::StatusCode, body: &str) -> crate::exit::CliError {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("detail").cloned());
+    let field = |name: &str| {
+        detail
+            .as_ref()
+            .and_then(|d| d.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let code = field("code").unwrap_or_else(|| {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            "not_found".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    });
+    let message = field("message");
+    let text = match message {
+        Some(message) => format!("work item retry refused ({code}): {message}"),
+        None => format!("work item retry refused ({code})"),
+    };
+    let fix = match code.as_str() {
+        "stale_version" => {
+            "reread with `curie cluster work-items ID` and pass the current version as --expected-version"
+        }
+        "idempotency_conflict" => {
+            "this --request-id was already used with different facts; use a new --request-id"
+        }
+        "active_execution" => "wait for the active request to finish, then rerun",
+        "allowance_exhausted" => {
+            "no retry authority remains; readmit through the tracker if policy allows"
+        }
+        "not_found" => "run `curie cluster work-items` without an id to list the known work items",
+        "work_item_cancelled" => "a cancelled work item cannot be rerun; readmit it through the tracker",
+        "readmit_pending" => "a readmission is already pending; wait for it to be admitted",
+        "no_failed_request" => {
+            "only a work item whose newest request failed can be rerun; reread it with `curie cluster work-items ID`"
+        }
+        "teardown_unconfirmed" => "wait for the failed request's teardown to be confirmed, then rerun",
+        "not_retryable" => "this failure is not retryable by policy; fix the cause and readmit through the tracker",
+        "side_effects_unproven" => {
+            "the failed request may have had side effects; inspect it before readmitting through the tracker"
+        }
+        "admission_refused" => {
+            "a lifecycle fence refused the admission now; reread the work item and rerun when it clears"
+        }
+        _ => "reread the work item with `curie cluster work-items ID` and check the API message",
+    };
+    crate::exit::CliError::failure(text).with_fix(fix)
+}
+
 fn is_unrouted(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::NOT_FOUND
         && serde_json::from_str::<serde_json::Value>(body)
             .ok()
             .and_then(|v| v.get("detail").and_then(|d| d.as_str()).map(str::to_string))
             .is_some_and(|d| d == "Not Found")
+}
+
+/// The wake-key `detail` token when it is one of the contract's reasons.
+/// Any other body, including a secret field, is dropped.
+fn allowlisted_wake_reason(body: &str) -> Option<&'static str> {
+    let detail = api_detail_reason(body)?;
+    Some(match detail.as_str() {
+        "wake_query_forbidden" => "wake_query_forbidden",
+        "wake_body_invalid" => "wake_body_invalid",
+        "wake_not_declared" => "wake_not_declared",
+        "wake_declaration_unavailable" => "wake_declaration_unavailable",
+        "wake_source_not_ordinary" => "wake_source_not_ordinary",
+        "authority_unavailable" => "authority_unavailable",
+        "wake_generation_exhausted" => "wake_generation_exhausted",
+        _ => return None,
+    })
+}
+
+const WAKE_KEY_API_KEY_FIX: &str =
+    "verify --api-key or CURIE_API_KEY matches the selected platform API";
+
+/// Map one wake-key refusal onto the CLI exit class. `reason` is an allowlisted
+/// token or absent. The message names that token and the fix. It never includes
+/// the response body.
+fn wake_key_refusal(
+    what: &str,
+    status: reqwest::StatusCode,
+    reason: Option<&str>,
+) -> anyhow::Error {
+    use crate::exit::CliError;
+    use reqwest::StatusCode;
+
+    let error = match (status, reason) {
+        (StatusCode::UNAUTHORIZED, _) => {
+            CliError::failure(format!("{what} failed with 401: {WAKE_KEY_API_KEY_FIX}"))
+                .with_fix(WAKE_KEY_API_KEY_FIX)
+        }
+        (StatusCode::NOT_FOUND, Some("wake_not_declared")) => CliError::failure(format!(
+            "{what} failed: wake_not_declared. The hook needs wake: true in the in-force bundle."
+        ))
+        .with_fix("set wake: true on the webhook in the in-force bundle and deploy it"),
+        (StatusCode::CONFLICT, Some("wake_source_not_ordinary")) => CliError::failure(format!(
+            "{what} failed: wake_source_not_ordinary. The cause is a source policy, unresolved \
+             source history, a remediation policy, a partition, or a source binding."
+        ))
+        .with_fix(
+            "remove the source policy, unresolved source history, remediation policy, partition, \
+             or source binding, then retry",
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("authority_unavailable")) => CliError::transient(
+            format!("{what} failed: authority_unavailable. The metadata authority is unavailable."),
+        )
+        .with_fix("retry once the metadata authority is available"),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("wake_generation_exhausted")) => {
+            CliError::failure(format!(
+                "{what} failed: wake_generation_exhausted. The wake key generation cannot \
+                 increase further, and the key was not rotated."
+            ))
+            .with_fix("keep the current key; another rotation cannot mint a generation")
+        }
+        (StatusCode::SERVICE_UNAVAILABLE, Some("wake_declaration_unavailable")) => {
+            CliError::failure(format!(
+                "{what} failed: wake_declaration_unavailable. The stored bundle could not be read."
+            ))
+            .with_fix("redeploy the bundle so the in-force wake declaration can be read")
+        }
+        (StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY, reason) => {
+            let detail = reason.unwrap_or("rejected");
+            CliError::usage(format!("{what} failed with {status}: {detail}"))
+                .with_fix("send the wake-key request with no query string and no body")
+        }
+        _ => {
+            let message = match reason {
+                Some(reason) => format!("{what} failed with {status}: {reason}"),
+                None => format!("{what} failed with {status}"),
+            };
+            CliError::failure(message)
+        }
+    };
+    anyhow::Error::from(error)
 }
 
 /// Validate one trace id as the single safe path segment accepted by the API.
@@ -2216,6 +2658,36 @@ pub(crate) fn hook_fire_path(agent: &str, name: &str) -> String {
 /// `/agents/{agent}/hooks/{name}/runs/{run_id}`.
 pub(crate) fn hook_run_path(agent: &str, name: &str, run_id: &str) -> String {
     hook_agent_path(agent, name, &["runs", run_id])
+}
+
+/// The percent-encoded request path for reading a targetless wake key:
+/// `/agents/{agent_id}/hooks/{hook}/wake-secret`.
+pub(crate) fn hook_wake_secret_path(agent_id: &str, hook: &str) -> String {
+    hook_agent_path(agent_id, hook, &["wake-secret"])
+}
+
+/// The percent-encoded request path for rotating a targetless wake key:
+/// `/agents/{agent_id}/hooks/{hook}/wake-secret/rotate`.
+pub(crate) fn hook_wake_secret_rotate_path(agent_id: &str, hook: &str) -> String {
+    hook_agent_path(agent_id, hook, &["wake-secret", "rotate"])
+}
+
+/// The deploy receipt route for one targetless wake: `/hooks/{agent_id}/{hook}/wake`.
+///
+/// This is the platform route, not the manifest webhook path and not an absolute URL.
+pub(crate) fn hook_wake_route(agent_id: &str, hook: &str) -> String {
+    let mut url = reqwest::Url::parse("http://hook.invalid").expect("static URL base parses");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static URL base accepts path segments");
+        segments
+            .push("hooks")
+            .push(agent_id)
+            .push(hook)
+            .push("wake");
+    }
+    url.path().to_string()
 }
 
 /// Percent-encode an agent hook path by pushing each segment through a
@@ -2276,6 +2748,192 @@ pub(crate) fn memory_state_url(
 }
 
 impl ApiClient {
+    pub async fn identity_operator_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        if method == reqwest::Method::GET {
+            return self.directory_admin_read(path).await;
+        }
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        let dry_run = match query {
+            "" => false,
+            "dry_run=true" => true,
+            _ => bail!("invalid identity operator query"),
+        };
+        let body = body.context("identity operator mutation requires a body")?;
+        fn decode<T: serde::de::DeserializeOwned>(body: &serde_json::Value) -> Result<T> {
+            serde_json::from_value(body.clone())
+                .map_err(|_| anyhow::anyhow!("invalid identity operator request"))
+        }
+        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        match segments.as_slice() {
+            ["identity", "authorities", tenant_id] if method == reqwest::Method::PUT => {
+                self.adopt_http_authority(tenant_id, &decode(body)?, dry_run)
+                    .await
+            }
+            ["identity", "authorities", tenant_id, "replace"]
+                if method == reqwest::Method::POST =>
+            {
+                self.replace_http_authority(tenant_id, &decode(body)?, dry_run)
+                    .await
+            }
+            ["identity", "authorities", tenant_id, "retire"]
+                if method == reqwest::Method::POST && !dry_run =>
+            {
+                self.retire_http_authority(tenant_id, &decode(body)?).await
+            }
+            ["identity", "roles", tenant_id, agent_id, role]
+                if method == reqwest::Method::PUT && !dry_run =>
+            {
+                self.set_http_role_filter(tenant_id, agent_id, role, &decode(body)?)
+                    .await
+            }
+            ["identity", "roles", tenant_id, agent_id, role]
+                if method == reqwest::Method::DELETE && !dry_run =>
+            {
+                self.remove_http_role_filter(tenant_id, agent_id, role, &decode(body)?)
+                    .await
+            }
+            _ => bail!("invalid identity operator mutation"),
+        }
+    }
+
+    async fn adopt_http_authority(
+        &self,
+        tenant_id: &str,
+        body: &AuthoritySelectionMutation,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .put(format!(
+                "{}/identity/authorities/{tenant_id}",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .query(
+                &dry_run
+                    .then_some(("dry_run", true))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )
+            .json::<AuthoritySelectionMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
+    async fn replace_http_authority(
+        &self,
+        tenant_id: &str,
+        body: &AuthoritySelectionMutation,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/identity/authorities/{tenant_id}/replace",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .query(
+                &dry_run
+                    .then_some(("dry_run", true))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )
+            .json::<AuthoritySelectionMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
+    async fn retire_http_authority(
+        &self,
+        tenant_id: &str,
+        body: &AuthorityMutation,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/identity/authorities/{tenant_id}/retire",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .json::<AuthorityMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
+    async fn set_http_role_filter(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        role: &str,
+        body: &GroupFilterMutation,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .put(format!(
+                "{}/identity/roles/{tenant_id}/{agent_id}/{role}",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .json::<GroupFilterMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
+    async fn remove_http_role_filter(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        role: &str,
+        body: &OperatorMutation,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .delete(format!(
+                "{}/identity/roles/{tenant_id}/{agent_id}/{role}",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .json::<OperatorMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
     /// Read a route selected by the directory verb's bounded resource inventory.
     pub async fn directory_admin_read(&self, path: &str) -> Result<serde_json::Value> {
         let response = self
@@ -2532,6 +3190,85 @@ impl ApiClient {
             .await
             .context("decoding hook secret response")?;
         required_response_string(&body, "secret", "hook secret response")
+    }
+
+    /// Read the current targetless wake key.
+    ///
+    /// `GET /agents/{agent_id}/hooks/{hook}/wake-secret` with no query and no body.
+    /// The secret stays inside the returned value; this method does not log it.
+    pub async fn read_hook_wake_key(&self, agent_id: &str, hook: &str) -> Result<HookWakeSecret> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_wake_secret_path(agent_id, hook)
+        ))?;
+        let resp = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/hooks/{hook}/wake-secret",
+            )
+            .await?;
+        Self::expect_wake_ok(resp, "reading wake key")
+            .await?
+            .json()
+            .await
+            .context("decoding wake key")
+    }
+
+    /// Rotate the targetless wake key.
+    ///
+    /// `POST /agents/{agent_id}/hooks/{hook}/wake-secret/rotate` with no query and
+    /// zero body bytes. The decoded value has no secret field, so a secret on
+    /// the response is dropped and not logged.
+    pub async fn rotate_hook_wake_key(
+        &self,
+        agent_id: &str,
+        hook: &str,
+    ) -> Result<HookWakeRotation> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_wake_secret_rotate_path(agent_id, hook)
+        ))?;
+        let resp = self
+            .send_request(
+                self.http
+                    .post(url)
+                    .header("X-API-Key", &self.api_key)
+                    .body(Vec::<u8>::new()),
+                "POST /agents/{id}/hooks/{hook}/wake-secret/rotate",
+            )
+            .await?;
+        Self::expect_wake_ok(resp, "rotating wake key")
+            .await?
+            .json()
+            .await
+            .context("decoding wake key rotation")
+    }
+
+    /// A non-success wake-key response is classified from its status and an
+    /// allowlisted `detail` token. The raw body is not copied into the error,
+    /// so a secret field on the refusal cannot reach the terminal.
+    async fn expect_wake_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let status = resp.status();
+        if let Some(refusal) = redirect_refusal(status, resp.headers()) {
+            bail!("{what} failed: {refusal}");
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if is_unrouted(status, &body) {
+            bail!(
+                "{what} failed: this platform release does not have that endpoint, so it is \
+                 older than this CLI. Upgrade the release, or use a CLI matching it."
+            );
+        }
+        Err(wake_key_refusal(
+            what,
+            status,
+            allowlisted_wake_reason(&body),
+        ))
     }
 
     /// Poll one opaque disconnected cluster-message reply bucket.
@@ -4105,6 +4842,64 @@ impl ApiClient {
             .context("decoding the work item")
     }
 
+    /// Operator retry of a failed work item: `POST /work-items/{id}/retry`
+    /// (#5431). The API owns every refusal; this client names the API `code`
+    /// and `message` and adds a fix per code.
+    pub async fn retry_work_item(
+        &self,
+        work_item_id: &str,
+        body: &WorkItemRetryRequest,
+    ) -> Result<WorkItemRetry> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/work-items/{work_item_id}/retry", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<WorkItemRetryRequest>(body)
+                    .timeout(std::time::Duration::from_secs(60)),
+                "POST /work-items/{id}/retry",
+            )
+            .await?;
+        use reqwest::StatusCode;
+        let status = resp.status();
+        let error = match status {
+            StatusCode::OK => {
+                return resp
+                    .json()
+                    .await
+                    .context("decoding the work item retry answer")
+            }
+            StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                let text = resp.text().await.unwrap_or_default();
+                work_item_retry_refusal(status, &text)
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => {
+                crate::exit::CliError::transient(format!("work item retry failed with {status}"))
+                    .with_fix("retry the same command with the same --request-id; a replay is safe")
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                crate::exit::CliError::failure(format!("work item retry failed with {status}"))
+                    .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API")
+            }
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                let text = resp.text().await.unwrap_or_default();
+                crate::exit::CliError::usage(format!(
+                    "work item retry rejected with {status}: {}",
+                    text.trim()
+                ))
+                .with_fix(
+                    "pass --request-id as a UUID, --expected-version as a positive integer and \
+                     --reason as 1 to 500 characters",
+                )
+            }
+            _ => return Err(Self::expect_ok(resp, "work item retry").await.unwrap_err()),
+        };
+        Err(anyhow::Error::from(error))
+    }
+
     /// Status classes for the work item reads (ADR 0021/0041): 404 is a
     /// failure (exit 1), 5xx transient (exit 3), 401/403 a failure carrying the
     /// API key fix, 400/422 usage (exit 2). Bodies are not echoed on auth
@@ -5032,7 +5827,11 @@ impl ApiClient {
         &self,
         agent_id: &str,
         routes: &std::collections::BTreeMap<String, ApprovalRouteBindingWrite>,
+        expected_version: Option<u64>,
     ) -> Result<Agent> {
+        use crate::exit::CliError;
+        use reqwest::StatusCode;
+        let what = "updating approval routes";
         let resp = self
             .send_request(
                 self.http
@@ -5040,16 +5839,137 @@ impl ApiClient {
                     .header("X-API-Key", &self.api_key)
                     .json::<AgentUpdate>(&AgentUpdate {
                         approval_routes: Some(routes.clone()),
+                        approval_routes_expected_version: expected_version,
                         ..AgentUpdate::default()
                     }),
                 "PATCH /agents/{id} (approval routes)",
             )
             .await?;
-        Self::expect_ok(resp, "updating approval routes")
+        if resp.status() == StatusCode::CONFLICT {
+            let body = resp.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .map(|value| value["detail"].clone());
+            let code = detail
+                .as_ref()
+                .and_then(|detail| detail["code"].as_str())
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        "approval_routes.version_conflict"
+                            | "approval_routes.expected_version_required"
+                    )
+                });
+            if let Some(code) = code {
+                let reason = detail
+                    .as_ref()
+                    .and_then(|detail| detail["message"].as_str())
+                    .map_or_else(|| code.to_string(), |message| format!("{code}: {message}"));
+                return Err(anyhow::Error::from(
+                    CliError::failure(format!("{what} failed with 409 Conflict: {reason}"))
+                        .with_fix(
+                            "another write moved the agent's selector configuration version \
+                             since it was read, or the write named none. Re-read the routes \
+                             with `curie <local|cluster> approvals <AGENT> --list-routes`, \
+                             confirm the current state, then retry (pass \
+                             --routes-expected-version with the version it was read at to \
+                             pin it)",
+                        ),
+                ));
+            }
+            bail!(
+                "{what} failed with {}: {}",
+                StatusCode::CONFLICT,
+                body.trim()
+            );
+        }
+        Self::expect_ok(resp, what)
             .await?
             .json()
             .await
             .context("decoding updated agent")
+    }
+
+    /// Compare-and-set the agent's connector requester identity flag (ADR 0270
+    /// decision 1): `PATCH /agents/{id}` carrying ONLY the flag and the version
+    /// it expects, which the API requires. Sent once; a 409 is a recovery for
+    /// the operator, never retried here with a freshly read version.
+    pub async fn set_connector_requester_identity(
+        &self,
+        agent_id: &str,
+        enabled: bool,
+        expected_version: u64,
+    ) -> Result<Agent> {
+        use crate::exit::CliError;
+        use reqwest::StatusCode;
+        let what = "setting connector requester identity";
+        let resp = self
+            .send_request(
+                self.http
+                    .patch(format!("{}/agents/{agent_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentUpdate>(&AgentUpdate {
+                        connector_requester_identity: Some(enabled),
+                        connector_requester_identity_expected_version: Some(expected_version),
+                        ..AgentUpdate::default()
+                    }),
+                "PATCH /agents/{id} (connector requester identity)",
+            )
+            .await?;
+        let status = resp.status();
+        if status.is_success() || status.is_redirection() {
+            return Self::expect_ok(resp, what)
+                .await?
+                .json()
+                .await
+                .context("decoding updated agent");
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .map(|value| value["detail"].clone());
+        let code = detail
+            .as_ref()
+            .and_then(|detail| detail["code"].as_str())
+            .map(str::to_string);
+        let reason = match (&code, &detail) {
+            (Some(code), Some(detail)) => match detail["message"].as_str() {
+                Some(message) => format!("{code}: {message}"),
+                None => code.clone(),
+            },
+            _ => api_detail_reason(&body).unwrap_or_else(|| status.to_string()),
+        };
+        let message = format!("{what} failed with {status}: {reason}");
+        let error = match (status, code.as_deref()) {
+            (StatusCode::CONFLICT, _) => CliError::failure(message).with_fix(
+                "another write moved the agent's connector requester identity version since \
+                 it was read. Run `curie <local|cluster> approvals <AGENT> --requester-identity \
+                 show`, confirm the current state, then retry with --expected-version set to \
+                 the version it reports",
+            ),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("requester_identity_requires_http_identity"),
+            ) => CliError::usage(message).with_fix(
+                "enabling needs the tenant's HTTP identity selection and an operator \
+                 receiver registration (Slack or email) that lists one of this agent's \
+                 bindings. Configure both, complete the rollout of the api, worker and the \
+                 agent's connector proxies, then retry",
+            ),
+            (StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_REQUEST, _) => {
+                CliError::usage(message)
+            }
+            (StatusCode::NOT_FOUND, _) if is_unrouted(status, &body) => CliError::failure(format!(
+                "{what} failed: this platform release does not have that endpoint, so it is \
+                 older than this CLI"
+            ))
+            .with_fix("upgrade the release, or use a CLI matching it"),
+            (StatusCode::UNAUTHORIZED, _) => CliError::failure(message)
+                .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API"),
+            (s, _) if s.is_server_error() => CliError::transient(message),
+            _ => CliError::failure(message),
+        };
+        Err(anyhow::Error::from(error))
     }
 
     /// Enqueue an on-demand platform eval run: `POST /evals/trigger`. With no
@@ -5186,6 +6106,723 @@ impl ApiClient {
             .await?;
         Self::expect_ok(resp, "deleting the agent").await?;
         Ok(())
+    }
+}
+
+// --- Owner-scoped personal Claude enrollment (#5377) ------------------------
+//
+// These routes authenticate a PERSON by their Console session cookie
+// (`auth.require_principal_session`). The platform key is a different
+// identity and never travels on them, so they have their own client rather
+// than an `ApiClient` method: `OwnerApiClient` has no key field to send.
+
+/// The cookie the owner API reads (`auth.CONSOLE_SESSION_COOKIE`).
+pub const CONSOLE_SESSION_COOKIE: &str = "__Host-curie_console_session";
+
+/// The longest grant token the owner API accepts
+/// (`tests/vectors/personal-enrollment-token.json`).
+pub const PERSONAL_TOKEN_MAX_LEN: usize = 4096;
+
+/// The longest Console session cookie value this CLI sends.
+pub const SESSION_COOKIE_MAX_LEN: usize = 4096;
+
+/// How long one owner API request may take, connect included.
+const OWNER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a session cookie or grant token value was refused. It never carries the
+/// value, so it is safe to render anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialShapeError {
+    Empty,
+    TooLong,
+    InvalidByte,
+    NamedCookie,
+}
+
+impl std::fmt::Display for CredentialShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "it is empty",
+            Self::TooLong => "it is longer than 4096 bytes",
+            Self::InvalidByte => {
+                "it contains a space, control, non-ASCII or otherwise disallowed character"
+            }
+            Self::NamedCookie => {
+                "it starts with the cookie name; the file must hold only the cookie value"
+            }
+        })
+    }
+}
+
+/// RFC 6265 `cookie-octet`: printable ASCII except space, `"`, `,`, `;` and `\`.
+fn is_cookie_octet(byte: u8) -> bool {
+    matches!(byte, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E)
+}
+
+/// A Console session cookie value. `Debug` is redacted and there is no
+/// `Display`, so no diagnostic can print it by accident.
+pub struct SessionCookie(String);
+
+impl std::fmt::Debug for SessionCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionCookie(<redacted>)")
+    }
+}
+
+impl SessionCookie {
+    /// Accept 1 to 4096 cookie-octets, and refuse a value that still carries
+    /// the `__Host-curie_console_session=` name.
+    pub fn parse(value: &[u8]) -> std::result::Result<Self, CredentialShapeError> {
+        if value.is_empty() {
+            return Err(CredentialShapeError::Empty);
+        }
+        if value.len() > SESSION_COOKIE_MAX_LEN {
+            return Err(CredentialShapeError::TooLong);
+        }
+        if !value.iter().copied().all(is_cookie_octet) {
+            return Err(CredentialShapeError::InvalidByte);
+        }
+        if value.starts_with(format!("{CONSOLE_SESSION_COOKIE}=").as_bytes()) {
+            return Err(CredentialShapeError::NamedCookie);
+        }
+        String::from_utf8(value.to_vec())
+            .map(Self)
+            .map_err(|_| CredentialShapeError::InvalidByte)
+    }
+
+    /// The `Cookie` header, marked sensitive so the HTTP stack never logs it.
+    fn header_value(&self) -> Result<reqwest::header::HeaderValue> {
+        let mut value =
+            reqwest::header::HeaderValue::from_str(&format!("{CONSOLE_SESSION_COOKIE}={}", self.0))
+                .map_err(|_| anyhow::anyhow!("the session cookie is not a valid header value"))?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+}
+
+/// A personal Claude grant token. `Debug` is redacted, there is no `Display`,
+/// and the only way out is the request body it serializes into.
+pub struct GrantToken(String);
+
+impl std::fmt::Debug for GrantToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GrantToken(<redacted>)")
+    }
+}
+
+impl GrantToken {
+    /// The shared token rule: 1 to 4096 characters, each printable ASCII
+    /// `0x21..=0x7E`. Shape only; it never implies validity or expiry.
+    pub fn parse(value: &[u8]) -> std::result::Result<Self, CredentialShapeError> {
+        if value.is_empty() {
+            return Err(CredentialShapeError::Empty);
+        }
+        if value.len() > PERSONAL_TOKEN_MAX_LEN {
+            return Err(CredentialShapeError::TooLong);
+        }
+        if !value.iter().all(|byte| (0x21..=0x7E).contains(byte)) {
+            return Err(CredentialShapeError::InvalidByte);
+        }
+        String::from_utf8(value.to_vec())
+            .map(Self)
+            .map_err(|_| CredentialShapeError::InvalidByte)
+    }
+}
+
+impl Serialize for GrantToken {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// What a `PUT /personal-claude/enrollment` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnrollmentIntent {
+    Enroll,
+    Replace,
+    Reconnect,
+}
+
+/// `PUT /personal-claude/enrollment` (`PersonalEnrollmentWrite`).
+/// `expected_version` is always sent: null for an enroll, the CAS version
+/// otherwise.
+#[derive(Debug, Serialize)]
+pub struct PersonalEnrollmentWrite {
+    pub intent: EnrollmentIntent,
+    pub expected_version: Option<i64>,
+    pub token: GrantToken,
+}
+
+/// The owner's enrollment state as the API reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnrollmentState {
+    Absent,
+    Active,
+    Inactive,
+}
+
+/// The owner's teardown still outstanding after a replace or disconnect.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PersonalEnrollmentTeardown {
+    pub pending_runtimes: i64,
+    pub pending_custody_cleanup: i64,
+}
+
+/// Every owner enrollment route's answer (`PersonalEnrollmentOut`). It never
+/// carries the grant or where it is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PersonalEnrollmentStatus {
+    pub state: EnrollmentState,
+    pub generation: Option<i64>,
+    pub version: Option<i64>,
+    pub teardown: PersonalEnrollmentTeardown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodingInstructionsApplication {
+    Available,
+    Unavailable,
+}
+
+/// Every owner coding instructions route's answer (`CodingInstructionsOut`).
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CodingInstructionsStatus {
+    pub revision: i64,
+    pub sha256: Option<String>,
+    pub format_version: i64,
+    pub byte_length: i64,
+    pub text: Option<String>,
+    pub updated_at: Option<String>,
+    pub tenant_enabled: bool,
+    pub application: CodingInstructionsApplication,
+}
+
+impl std::fmt::Debug for CodingInstructionsStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodingInstructionsStatus")
+            .field("revision", &self.revision)
+            .field("text", &"<redacted>")
+            .field("application", &self.application)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Serialize)]
+pub struct CodingInstructionsWrite {
+    pub text: String,
+    pub expected_revision: i64,
+}
+
+impl std::fmt::Debug for CodingInstructionsWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodingInstructionsWrite")
+            .field("text", &"<redacted>")
+            .field("expected_revision", &self.expected_revision)
+            .finish()
+    }
+}
+
+fn coding_instructions_refusal(
+    operation: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    use crate::exit::ExitClass::{Failure, Transient, Usage};
+
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let detail = value.as_ref().and_then(|value| value.get("detail"));
+    let code = detail
+        .and_then(|detail| detail.get("code"))
+        .and_then(serde_json::Value::as_str);
+    let current_revision = detail
+        .and_then(|detail| detail.get("current_revision"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|revision| *revision >= 0);
+    let (class, problem, fix) = match (status.as_u16(), code) {
+        (401, _) => (
+            Failure,
+            "the platform refused the Console principal session (HTTP 401)".to_string(),
+            ENROLLMENT_SESSION_FIX.to_string(),
+        ),
+        (403, _) => (
+            Failure,
+            "the platform refused the session or request origin (HTTP 403)".to_string(),
+            ENROLLMENT_ORIGIN_FIX.to_string(),
+        ),
+        (409, Some("stale_revision")) => (
+            Failure,
+            current_revision.map_or_else(
+                || "the document changed (stale_revision)".to_string(),
+                |revision| {
+                    format!("the document changed (stale_revision, current revision {revision})")
+                },
+            ),
+            "run `curie cluster coding-instructions get`, review the document, then retry with \
+             --expected-revision set to its revision"
+                .to_string(),
+        ),
+        (409, Some("revision_exhausted")) => (
+            Failure,
+            "the document reached its maximum revision (revision_exhausted)".to_string(),
+            "the document cannot be changed further; contact the platform administrator"
+                .to_string(),
+        ),
+        (413, _) => (
+            Usage,
+            "the coding instructions request exceeds the maximum size (HTTP 413)".to_string(),
+            "reduce the instruction file, then retry".to_string(),
+        ),
+        (422, Some("too_large")) => (
+            Usage,
+            "the instruction document exceeds 16384 normalized UTF-8 bytes (too_large)".to_string(),
+            "reduce the file to at most 16384 bytes after line-ending normalization, then retry"
+                .to_string(),
+        ),
+        (422, _) => (
+            Usage,
+            "the platform refused the coding instructions request (invalid_text)".to_string(),
+            "use UTF-8 text without NUL and a nonnegative --expected-revision".to_string(),
+        ),
+        (502..=504, _) => (
+            Transient,
+            format!("the platform API is temporarily unavailable (HTTP {status})"),
+            "retry once the platform API is available".to_string(),
+        ),
+        _ if status.is_redirection() => (
+            Failure,
+            format!("the endpoint answered {status} with a redirect, which this CLI never follows"),
+            "point --api-url at the platform API's own address".to_string(),
+        ),
+        (404, _) if is_unrouted(status, body) => (
+            Failure,
+            "this platform release does not serve /coding-instructions".to_string(),
+            "upgrade the release, or use a CLI matching it".to_string(),
+        ),
+        _ => (
+            Failure,
+            format!("the platform answered HTTP {status}"),
+            "check the platform API and Console session, then retry".to_string(),
+        ),
+    };
+    crate::exit::CliError {
+        message: format!("{operation} failed: {problem}; {fix}"),
+        fix: Some(fix),
+        class,
+    }
+    .into()
+}
+
+/// The `detail.code` of an owner enrollment refusal, when it is one the
+/// contract defines. Any other body is dropped, never echoed.
+fn allowlisted_enrollment_code(body: &str) -> Option<&'static str> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let code = value.get("detail")?.get("code")?.as_str()?;
+    Some(match code {
+        "enrollment_absent" => "enrollment_absent",
+        "stale_version" => "stale_version",
+        "enrollment_exists" => "enrollment_exists",
+        "enrollment_active" => "enrollment_active",
+        "enrollment_inactive" => "enrollment_inactive",
+        "staging_conflict" => "staging_conflict",
+        "invalid_enrollment_request" => "invalid_enrollment_request",
+        "custody_unconfigured" => "custody_unconfigured",
+        "custody_unavailable" => "custody_unavailable",
+        "enrollment_busy" => "enrollment_busy",
+        "personal_rollout_in_progress" => "personal_rollout_in_progress",
+        _ => return None,
+    })
+}
+
+const ENROLLMENT_SESSION_FIX: &str = "sign in to the Curie Console again, then write the new \
+     __Host-curie_console_session cookie value to the --session-file with mode 0600";
+const ENROLLMENT_ORIGIN_FIX: &str =
+    "pass --api-url with the same host and port as the Console that issued the session";
+const ENROLLMENT_ABSENT_FIX: &str = "run `curie cluster subscription enroll` first";
+const ENROLLMENT_CONFLICT_FIX: &str = "run `curie cluster subscription status`, then retry with \
+     --expected-version set to its version, or with the verb its state calls for: enroll when \
+     absent, replace when active, reconnect when inactive";
+const ENROLLMENT_INVALID_FIX: &str = "check that the token file holds only the token printed by \
+     `claude setup-token`, and that --expected-version is the version `status` reports";
+const ENROLLMENT_UNCONFIGURED_FIX: &str = "ask an operator to set the chart value \
+     personalClaude.grantNamespace and upgrade the release";
+const ENROLLMENT_RETRY_FIX: &str = "retry; the previous enrollment is unchanged";
+const ENROLLMENT_ROLLOUT_FIX: &str =
+    "retry after the API rollout completes; the previous enrollment is unchanged";
+
+/// Map one owner enrollment refusal onto the CLI exit class. The message names
+/// the status, an allowlisted code and the fix; it never includes the body.
+fn enrollment_refusal(operation: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    use crate::exit::ExitClass::{Failure, Transient, Usage};
+
+    let code = allowlisted_enrollment_code(body);
+    let (class, problem, fix): (_, String, Option<&str>) = match (status.as_u16(), code) {
+        (401, _) => (
+            Failure,
+            "the platform refused the Console session (HTTP 401): it is missing, expired, \
+             revoked, or not a person's session"
+                .to_string(),
+            Some(ENROLLMENT_SESSION_FIX),
+        ),
+        (403, _) => (
+            Failure,
+            "the platform rejected the request origin (HTTP 403)".to_string(),
+            Some(ENROLLMENT_ORIGIN_FIX),
+        ),
+        (404, Some("enrollment_absent")) => (
+            Failure,
+            "no personal Claude enrollment exists for this person (enrollment_absent)".to_string(),
+            Some(ENROLLMENT_ABSENT_FIX),
+        ),
+        (404, _) if is_unrouted(status, body) => (
+            Failure,
+            "this platform release does not serve /personal-claude/enrollment, so it is older \
+             than this CLI"
+                .to_string(),
+            Some("upgrade the release, or use a CLI matching it"),
+        ),
+        (409, code) => (
+            Failure,
+            format!(
+                "the enrollment is not at that version or in that state ({})",
+                code.unwrap_or("conflict")
+            ),
+            Some(ENROLLMENT_CONFLICT_FIX),
+        ),
+        (422, _) => (
+            Usage,
+            "the platform refused the request as invalid (invalid_enrollment_request)".to_string(),
+            Some(ENROLLMENT_INVALID_FIX),
+        ),
+        (503, Some("custody_unconfigured")) => (
+            Failure,
+            "personal Claude custody is not configured on this release (custody_unconfigured)"
+                .to_string(),
+            Some(ENROLLMENT_UNCONFIGURED_FIX),
+        ),
+        (503, Some("custody_unavailable")) => (
+            Transient,
+            "the platform could not reach its grant custody store (custody_unavailable)"
+                .to_string(),
+            Some(ENROLLMENT_RETRY_FIX),
+        ),
+        (503, Some("enrollment_busy")) => (
+            Transient,
+            "another change to this enrollment is in progress (enrollment_busy)".to_string(),
+            Some(ENROLLMENT_RETRY_FIX),
+        ),
+        (503, Some("personal_rollout_in_progress")) => (
+            Transient,
+            "the platform API is mid-rollout, so it holds enrollment changes \
+             (personal_rollout_in_progress)"
+                .to_string(),
+            Some(ENROLLMENT_ROLLOUT_FIX),
+        ),
+        (502..=504, _) => (
+            Transient,
+            format!("the platform API is temporarily unavailable (HTTP {status})"),
+            None,
+        ),
+        _ if status.is_redirection() => (
+            Failure,
+            format!(
+                "the endpoint answered {status} with a redirect, which this CLI never follows \
+                 because the session cookie would go with it"
+            ),
+            Some("point --api-url at the platform API's own address"),
+        ),
+        _ => (
+            Failure,
+            format!("the platform answered HTTP {status}"),
+            None,
+        ),
+    };
+    let message = match fix {
+        Some(fix) => format!("{operation} failed: {problem}; {fix}"),
+        None => format!("{operation} failed: {problem}"),
+    };
+    anyhow::Error::from(crate::exit::CliError {
+        message,
+        fix: fix.map(str::to_string),
+        class,
+    })
+}
+
+/// The owner API client. It holds the caller's Console session cookie
+/// and no platform key, sends the cookie on every request and `Origin` on every
+/// unsafe one, and never follows a redirect.
+pub struct OwnerApiClient {
+    base_url: String,
+    origin: reqwest::header::HeaderValue,
+    cookie: SessionCookie,
+    http: reqwest::Client,
+}
+
+impl OwnerApiClient {
+    pub fn new(base_url: &str, cookie: SessionCookie) -> Result<Self> {
+        let base_url = base_url.trim().trim_end_matches('/').to_string();
+        let endpoint = reqwest::Url::parse(&base_url)
+            .ok()
+            .filter(|endpoint| matches!(endpoint.scheme(), "http" | "https"))
+            .ok_or_else(|| {
+                crate::exit::usage(format!(
+                    "--api-url {base_url:?} is not an absolute http(s) URL"
+                ))
+            })?;
+        let origin =
+            reqwest::header::HeaderValue::from_str(&endpoint.origin().ascii_serialization())
+                .context("building the Origin header")?;
+        let http = http_client(&base_url, Some(std::time::Duration::from_secs(5)))
+            .context("building HTTP client")?;
+        Ok(Self {
+            base_url,
+            origin,
+            cookie,
+            http,
+        })
+    }
+
+    /// `GET /personal-claude/enrollment`. An absent enrollment is a 200 with
+    /// `state: "absent"`.
+    pub async fn get_personal_enrollment(&self) -> Result<PersonalEnrollmentStatus> {
+        let request = self
+            .http
+            .get(format!("{}/personal-claude/enrollment", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        self.exchange(
+            request,
+            "GET /personal-claude/enrollment",
+            "a personal enrollment",
+            enrollment_refusal,
+        )
+        .await
+    }
+
+    /// `PUT /personal-claude/enrollment`: enroll, replace or reconnect.
+    pub async fn put_personal_enrollment(
+        &self,
+        body: &PersonalEnrollmentWrite,
+    ) -> Result<PersonalEnrollmentStatus> {
+        let request = self
+            .http
+            .put(format!("{}/personal-claude/enrollment", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<PersonalEnrollmentWrite>(body);
+        self.exchange(
+            request,
+            "PUT /personal-claude/enrollment",
+            "a personal enrollment",
+            enrollment_refusal,
+        )
+        .await
+    }
+
+    /// `DELETE /personal-claude/enrollment?expected_version=N`: disconnect.
+    pub async fn delete_personal_enrollment(
+        &self,
+        expected_version: i64,
+    ) -> Result<PersonalEnrollmentStatus> {
+        let request = self
+            .http
+            .delete(format!("{}/personal-claude/enrollment", self.base_url))
+            .query(&[("expected_version", expected_version)])
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone());
+        self.exchange(
+            request,
+            "DELETE /personal-claude/enrollment",
+            "a personal enrollment",
+            enrollment_refusal,
+        )
+        .await
+    }
+
+    pub async fn get_coding_instructions(&self) -> Result<CodingInstructionsStatus> {
+        let request = self
+            .http
+            .get(format!("{}/coding-instructions", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        self.exchange(
+            request,
+            "GET /coding-instructions",
+            "a coding instructions document",
+            coding_instructions_refusal,
+        )
+        .await
+    }
+
+    pub async fn put_coding_instructions(
+        &self,
+        body: &CodingInstructionsWrite,
+    ) -> Result<CodingInstructionsStatus> {
+        let request = self
+            .http
+            .put(format!("{}/coding-instructions", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<CodingInstructionsWrite>(body);
+        self.exchange(
+            request,
+            "PUT /coding-instructions",
+            "a coding instructions document",
+            coding_instructions_refusal,
+        )
+        .await
+    }
+
+    pub async fn delete_coding_instructions(
+        &self,
+        expected_revision: i64,
+    ) -> Result<CodingInstructionsStatus> {
+        let request = self
+            .http
+            .delete(format!("{}/coding-instructions", self.base_url))
+            .query(&[("expected_revision", expected_revision)])
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone());
+        self.exchange(
+            request,
+            "DELETE /coding-instructions",
+            "a coding instructions document",
+            coding_instructions_refusal,
+        )
+        .await
+    }
+
+    async fn exchange<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+        resource: &'static str,
+        refusal: fn(&str, reqwest::StatusCode, &str) -> anyhow::Error,
+    ) -> Result<T> {
+        let response = match request.timeout(OWNER_REQUEST_TIMEOUT).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                let transient = err.is_connect() || err.is_timeout();
+                let source = anyhow::Error::new(err.without_url()).context(operation);
+                let (message, remedy) = if transient {
+                    (
+                        format!("the platform API at {} is unreachable", self.base_url),
+                        format!(
+                            "Run `curl -fsS {}/health` to check it, then retry.",
+                            self.base_url
+                        ),
+                    )
+                } else {
+                    (
+                        format!(
+                            "the platform API at {} could not be sent the request",
+                            self.base_url
+                        ),
+                        "Set --api-url to an absolute http(s) URL, then retry.".to_string(),
+                    )
+                };
+                return Err(crate::exit::operator_context(source, message, Some(remedy)));
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            let body = response
+                .bytes()
+                .await
+                .with_context(|| format!("{operation}: reading the response"))?;
+            return serde_json::from_slice::<T>(&body).map_err(|_| {
+                anyhow::Error::from(
+                    crate::exit::CliError::failure(format!(
+                        "{operation} answered {status} with a body that is not {resource}; \
+                         the platform release may not match this CLI"
+                    ))
+                    .with_fix("use a CLI matching the release"),
+                )
+            });
+        }
+        let body = if status.is_redirection() {
+            String::new()
+        } else {
+            response.text().await.unwrap_or_default()
+        };
+        Err(refusal(operation, status, &body))
+    }
+}
+
+#[cfg(test)]
+mod owner_enrollment_tests {
+    use super::*;
+
+    #[test]
+    fn credential_debug_is_redacted() {
+        let cookie = SessionCookie::parse(b"cookie-sentinel-1234").expect("valid cookie");
+        let token = GrantToken::parse(b"token-sentinel-5678").expect("valid token");
+        let write = PersonalEnrollmentWrite {
+            intent: EnrollmentIntent::Replace,
+            expected_version: Some(3),
+            token,
+        };
+        let rendered = format!("{cookie:?} {write:?} {write:#?}");
+        assert!(!rendered.contains("cookie-sentinel"), "{rendered}");
+        assert!(!rendered.contains("token-sentinel"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        let header = cookie.header_value().expect("header");
+        assert!(header.is_sensitive());
+        assert!(!format!("{header:?}").contains("cookie-sentinel"));
+    }
+
+    #[test]
+    fn write_body_carries_the_token_and_an_explicit_null_version() {
+        let write = PersonalEnrollmentWrite {
+            intent: EnrollmentIntent::Enroll,
+            expected_version: None,
+            token: GrantToken::parse(b"abc").expect("valid token"),
+        };
+        assert_eq!(
+            serde_json::to_value(&write).expect("serializes"),
+            serde_json::json!({"intent": "enroll", "expected_version": null, "token": "abc"})
+        );
+    }
+
+    #[test]
+    fn cookie_octets_follow_rfc_6265() {
+        for refused in [
+            &b" "[..],
+            b"a b",
+            b"a\"b",
+            b"a,b",
+            b"a;b",
+            b"a\\b",
+            b"a\x7f",
+            b"\xc3\xa9",
+        ] {
+            assert_eq!(
+                SessionCookie::parse(refused).map(|_| ()),
+                Err(CredentialShapeError::InvalidByte),
+                "{refused:?}"
+            );
+        }
+        assert!(SessionCookie::parse(b"A-z0.9_~!#$%&'()*+-./:<=>?@[]^`{|}").is_ok());
+        assert_eq!(
+            SessionCookie::parse(b"__Host-curie_console_session=abc").map(|_| ()),
+            Err(CredentialShapeError::NamedCookie)
+        );
+    }
+
+    #[test]
+    fn refusal_never_echoes_the_body() {
+        let error = enrollment_refusal(
+            "PUT /personal-claude/enrollment",
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"detail":{"code":"invalid_enrollment_request","input":"body-sentinel"}}"#,
+        );
+        let (class, fix) = crate::exit::classify(&error);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(fix.is_some());
+        assert!(!format!("{error:#}").contains("body-sentinel"));
     }
 }
 

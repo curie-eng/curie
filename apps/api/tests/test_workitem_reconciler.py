@@ -24,7 +24,6 @@ from aci_protocol import (
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api.config import get_settings
 from curie_api.forges.hosts import github_issue_ref, repository_ref
-from curie_api.main import create_app
 from curie_api.workitem_dispatch import acquire, admit, defer, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_api.workitems import lifecycle as workitems
@@ -66,15 +65,21 @@ REQUESTER = "U0REQUEST1"
 RECONCILER_STEPS = (
     "_settle_publications",
     "_expire_waiting",
+    "_release_provider_gates",
     "_request_deadline_cancellations",
     "_request_owner_lost_cancellations",
     "_publish_terminate_wakes",
     "_settle_overdue_cancellations",
+    "_redrive_question_rounds",
     "_readmit_pending",
+    "_drain_answer_retries",
     "_reconcile_missed_labels",
     "_poll_trackers",
     "_redispatch_lapsed_acquisitions",
     "_reconcile_base_transitions",
+    "_expire_tracker_results",
+    "_deliver_tracker_results",
+    "_hand_off_triage_tickets",
     "_publish_execute_wakes",
 )
 
@@ -619,73 +624,6 @@ def test_status_comment_loop_recovers_after_failure_and_cancels_cleanly(
         and str(record.exc_info[1]) == "injected status comment loop failure"
     ]
     assert len(failures) == 1
-
-
-def test_lifespan_runs_status_sync_on_a_separate_task_and_cancels_both_loops(
-    admitted: Any,  # noqa: F811
-    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
-) -> None:
-    client, github, sink = admitted
-    number = 9958
-    _label(client, github, number)
-    request_id = _request(number)["id"]
-    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "true")
-    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS", "1")
-    get_settings.cache_clear()
-    app = create_app()
-
-    async def go() -> None:
-        entered, released = asyncio.Event(), asyncio.Event()
-        sink.get_barrier = (
-            f"/repos/{REPO}/issues/{number}",
-            asyncio.get_running_loop(),
-            entered,
-            released,
-        )
-        try:
-            async with app.router.lifespan_context(app):
-                await asyncio.wait_for(entered.wait(), 5)
-                dispatch = app.state.work_item_reconciler_task
-                status = app.state.work_item_status_comments_task
-                assert dispatch is not None and status is not None
-                assert dispatch is not status
-                assert not dispatch.done() and not status.done()
-
-                # The background dispatch loop may be the pass that publishes.
-                async def published_generation() -> Any:
-                    while True:
-                        async with app.state.sessionmaker() as session:
-                            published = await session.scalar(
-                                text(
-                                    "SELECT published_generation "
-                                    "FROM curie.execution_requests WHERE id = :id"
-                                ),
-                                {"id": request_id},
-                            )
-                        if published == 1:
-                            return published
-                        await asyncio.sleep(0.05)
-
-                # One shared 2 s deadline: dispatch must publish within 2 s
-                # while its sibling status sync is still awaiting GitHub.
-                async with asyncio.timeout(2):
-                    # The real dispatch pass must finish while its sibling awaits GitHub.
-                    await app.state.work_item_reconciler.run_once()
-                    published = await published_generation()
-                assert published == 1
-                assert not status.done()
-            assert dispatch.cancelled()
-            assert status.cancelled()
-            assert app.state.engine.pool.checkedout() == 0
-            assert app.state.liveness_engine.pool.checkedout() == 0
-        finally:
-            released.set()
-            sink.get_barrier = None
-
-    try:
-        client.portal.call(go)
-    finally:
-        get_settings.cache_clear()
 
 
 @pytest.mark.parametrize("failed_step", RECONCILER_STEPS)

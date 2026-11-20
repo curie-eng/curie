@@ -1488,7 +1488,7 @@ mod fail_forward_tests {
     #[tokio::test]
     async fn upgrade_recovery_preserves_context_and_available_chart_operand() {
         let _lock = crate::PROCESS_ENV_LOCK.lock().await;
-        let _guard = ContextGuard::set(Some("acme-context"));
+        let _guard = ContextGuard::set(Some("test-context"));
         for chart in [
             UpgradeChart::AvailableLocal("charts/curie".into()),
             UpgradeChart::HelmReference("acme/curie".into()),
@@ -1498,7 +1498,7 @@ mod fail_forward_tests {
             assert_eq!(
                 recovery.command,
                 format!(
-                    "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --context acme-context --chart {}",
+                    "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --context test-context --chart {}",
                     opts.chart.operand()
                 )
             );
@@ -1509,7 +1509,7 @@ mod fail_forward_tests {
     #[tokio::test]
     async fn pending_release_recovery_preserves_context_without_chart() {
         let _lock = crate::PROCESS_ENV_LOCK.lock().await;
-        let _guard = ContextGuard::set(Some("acme-context"));
+        let _guard = ContextGuard::set(Some("test-context"));
         let opts = opts(UpgradeChart::PendingRelease {
             source_url: "https://example.com/curie-0.9.0.tgz".into(),
             cache_path: "/cache/curie-0.9.0.tgz".into(),
@@ -1517,14 +1517,14 @@ mod fail_forward_tests {
         let recovery = fail_forward_for(&opts, false, "convergence failed");
         assert_eq!(
             recovery.command,
-            "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --context acme-context"
+            "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --context test-context"
         );
     }
 
     #[tokio::test]
     async fn rollback_recovery_preserves_context_without_chart() {
         let _lock = crate::PROCESS_ENV_LOCK.lock().await;
-        let _guard = ContextGuard::set(Some("acme-context"));
+        let _guard = ContextGuard::set(Some("test-context"));
         let recovery = fail_forward_for(
             &opts(UpgradeChart::AvailableLocal("charts/curie".into())),
             true,
@@ -1532,7 +1532,7 @@ mod fail_forward_tests {
         );
         assert_eq!(
             recovery.command,
-            "curie cluster rollback --yes --release acme-bot --namespace acme-test --context acme-context"
+            "curie cluster rollback --yes --release acme-bot --namespace acme-test --context test-context"
         );
     }
 

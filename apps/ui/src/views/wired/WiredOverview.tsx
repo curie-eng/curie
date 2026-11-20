@@ -3,6 +3,7 @@ import { Card, SectionTitle, Button, CliHint, Dot, Notice, cliCommand } from "..
 import { hoverBg } from "../../lib/style";
 import { channelIdentityLabel, formatLatency } from "../../lib/format";
 import { useStore } from "../../state/store";
+import { useOptionalConsoleSession } from "../../state/session";
 import { useWired } from "../../state/wired";
 import { useMetricsSummary, useTraces, useAllDeployments } from "../../api/hooks";
 import { hiddenAgentIdsForEnv } from "../../state/env";
@@ -205,10 +206,43 @@ function LiveOverview({ agents }: { agents: AgentOut[] }) {
   );
 }
 
+function PrincipalSessionNotice() {
+  const session = useOptionalConsoleSession();
+  if (session?.kind !== "principal") return null;
+  const name = session.principal?.display_name?.trim() || session.principal?.email?.trim() || "your account";
+  return (
+    <div
+      data-testid="console-principal-notice"
+      style={{
+        border: "1px solid " + C.border,
+        borderLeft: "3px solid " + C.brand,
+        borderRadius: 6,
+        padding: "8px 10px",
+        color: C.text2,
+        fontSize: 13,
+        marginBottom: 16,
+      }}
+    >
+      Signed in as {name}. This session also works with `curie cluster subscription`.
+    </div>
+  );
+}
+
 export function WiredOverview() {
   const { agents, loading, error } = useWired();
-  if (loading) return <Notice>Loading your workspace…</Notice>;
-  if (error) return <Notice>Could not reach the backend: {error}</Notice>;
-  if (agents.length === 0) return <Onboarding />;
-  return <LiveOverview agents={agents} />;
+  const body = loading ? (
+    <Notice>Loading your workspace…</Notice>
+  ) : error ? (
+    <Notice>Could not reach the backend: {error}</Notice>
+  ) : agents.length === 0 ? (
+    <Onboarding />
+  ) : (
+    <LiveOverview agents={agents} />
+  );
+  return (
+    <div>
+      <PrincipalSessionNotice />
+      {body}
+    </div>
+  );
 }

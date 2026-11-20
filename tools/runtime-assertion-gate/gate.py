@@ -110,18 +110,25 @@ def _registered_chart_step(
                  if words[0] != "set"]
         if lines != [command]:
             return False
-        consumers = sorted(
-            scenario_id for scenario_id, entry in registry.get("scenarios", {}).items()
-            if isinstance(entry, dict) and entry.get("leg") == "workload"
-            and script in entry.get("inputs", [])
-        )
+        consumers: dict[str, list[str]] = {}
+        for scenario_id, entry in registry.get("scenarios", {}).items():
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("leg"), str)
+                and entry["leg"].startswith("workload-")
+                and script in entry.get("inputs", [])
+            ):
+                consumers.setdefault(entry["leg"], []).append(scenario_id)
         if not consumers:
             return False
-        conditions = " || ".join(
-            "contains(fromJSON(needs.changes.outputs.chart_scenarios), '" + name + "')"
-            for name in consumers
-        )
-        expected = "${{ matrix.leg == 'workload' && (" + conditions + ") }}"
+        clauses = []
+        for workload_leg, names in sorted(consumers.items()):
+            conditions = " || ".join(
+                "contains(fromJSON(needs.changes.outputs.chart_scenarios), '" + name + "')"
+                for name in sorted(names)
+            )
+            clauses.append("(matrix.leg == '" + workload_leg + "' && (" + conditions + "))")
+        expected = "${{ " + " || ".join(clauses) + " }}"
         return step.get("if") == expected
     for scenario_id, entry in registry.get("scenarios", {}).items():
         if not isinstance(scenario_id, str) or not isinstance(entry, dict):
@@ -185,7 +192,12 @@ def _runs_other_commands(run: str) -> bool:
 
 
 def _installs_calico(step: dict[str, Any], run: str) -> bool:
-    return "if" not in step and all(marker in run for marker in CALICO_MARKERS)
+    if "if" in step or step.get("continue-on-error"):
+        return False
+    return (
+        run.strip() == "bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml"
+        or all(marker in run for marker in CALICO_MARKERS)
+    )
 
 
 @dataclass(frozen=True)

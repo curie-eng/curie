@@ -1,46 +1,9 @@
-{{/*
-Agent Sandbox substrate (G1): the runner SandboxTemplate and SandboxWarmPool
-the worker claims from, plus (optionally) the vendored upstream controller.
-
-- CRDs live in this chart's crds/ directory (Helm installs them before
-  templates render, so the CRs below never race their own CRDs).
-- The controller bundle is the upstream v0.5.0 release manifests
-  (core manifest + extensions overlay: the Deployment runs with --extensions),
-  vendored under files/agent-sandbox/ with two Curie security patches (#66:
-  the networkpolicies RBAC is de-scoped from cluster-wide to the release
-  namespace via the Role/RoleBinding below, and the Deployment carries a
-  hardened securityContext). Cluster-scoped, one per cluster. A third,
-  template-layer patch injects the platform priorityClassName into the
-  controller Deployment below (issue #816, ADR-0059 decision 5) rather than
-  baking it into the vendored file, so it tracks the operator-set class name;
-  the vendored file itself still carries only the #66 securityContext patch.
-- The SandboxTemplate bakes the generic warm-pod env. Per-session env
-  (CURIE_HISTORY_REF, CURIE_SESSION_ID) is injected per-claim by the
-  substrate; envVarsInjectionPolicy Overrides makes that injection win.
-- service: true is what gives every claimed sandbox its routable
-  .status.serviceFQDN (PT-1: without it no Service is created at all).
-- networkPolicyManagement: Unmanaged (issue #765, ADR-0067) stops the
-  controller from reconciling its OWN separately-managed NetworkPolicy for
-  this template. NetworkPolicy allows are additive across objects selecting
-  the same pods, so the controller's default "allow public internet"
-  behavior would otherwise silently widen (not be narrowed by) Rail 1's
-  default-deny + allowlist in security-networkpolicy.yaml.
-*/}}
+{{/* Agent Sandbox substrate (G1): the runner SandboxTemplate and SandboxWarmPool, plus optionally the vendored upstream v0.5.0 controller (files/agent-sandbox/, #66 securityContext patch). The platform priorityClassName is injected here, not in the vendored file (#816, ADR-0059 decision 5). Per-claim env wins via envVarsInjectionPolicy Overrides. networkPolicyManagement: Unmanaged (#765, ADR-0067): the controller's own allow-public-internet policy would widen Rail 1. */}}
 {{- if (dig "liteLLM" "enabled" false .Values.agentSandbox.runner) }}
 {{- fail "agentSandbox.runner.liteLLM.enabled is unsupported by ADR-0037: in-path LiteLLM gateways are unsupported; remove or disable agentSandbox.runner.liteLLM.enabled and use direct session-pinned provider routing." }}
 {{- end }}
 {{- if .Values.agentSandbox.controller.deploy }}
-{{/*
-ADR-0059 decision 5 / issue #816: the vendored controller carries no
-priorityClassName (priority 0), so under node Disk/Memory pressure the
-kubelet would evict it BEFORE the sandbox pods (curie-sandbox, value
-100000) it reconciles, halting claim/release servicing exactly when the node
-is under pressure. Injecting the platform PriorityClass keeps the controller
-ranked above the sandboxes it manages. The name tracks
-.Values.priorityClasses.platform.name so an operator rename propagates; the
-vendored file stays a static .Files.Get (not tpl-ed) and this value-dependent
-patch lives in the template layer alongside the #66 RBAC patch below.
-*/}}
+{{/* ADR-0059 decision 5 / #816: the vendored controller has no priorityClassName and would be evicted before the sandbox pods under node pressure. Inject .Values.priorityClasses.platform.name here, not in the vendored file. */}}
 {{- $controllerManifest := .Files.Get "files/agent-sandbox/controller.yaml" }}
 {{- $controllerMetadataAnchor := "    metadata:\n      labels:\n        app: agent-sandbox-controller" }}
 {{- $controllerMetadata := "    metadata:\n      labels:" }}
@@ -65,24 +28,7 @@ patch lives in the template layer alongside the #66 RBAC patch below.
 {{- $controllerManifest = $controllerManifest | replace $controllerServiceAccount $controllerPodFields }}
 {{ $controllerManifest }}
 ---
-{{/*
-NetworkPolicy RBAC for the vendored controller, split by verb along the
-read/mutate line (issue #350, ADR-0023). The upstream v0.5.0 controller runs a
-CLUSTER-scope NetworkPolicy informer (upstream `Owns(&networkingv1.NetworkPolicy{})`
-with no cache namespace scoping and no `--namespace` flag), so it needs
-cluster-wide get/list/watch to sync -- a namespaced Role alone can never satisfy a
-cluster-scope LIST, so the informer cache never syncs, the manager aborts, and the
-controller crash-loops (no SandboxClaim ever binds -- issue #350). The read-only
-ClusterRole below is that minimum, and grants nothing more.
-
-#66's guarantee is preserved in its load-bearing form -- NO cluster-wide mutate:
-create/delete/patch/update stay confined to the namespaced Role in
-.Release.Namespace (this chart creates every Sandbox there, the worker's
-CURIE_NAMESPACE is .Release.Namespace), so a compromised controller SA still
-cannot delete the fail-closed egress policy (Rail 1) in any other namespace.
-Cross-namespace binding is intentional -- the SA lives in agent-sandbox-system,
-the NetworkPolicies it manages live in this namespace.
-*/}}
+{{/* NetworkPolicy RBAC for the vendored controller (#350, ADR-0023). Upstream runs a CLUSTER-scope NetworkPolicy informer, so it needs cluster-wide get/list/watch or it crash-loops. #66 holds: NO cluster-wide mutate; create/delete/patch/update stay in the namespaced Role. */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -171,10 +117,7 @@ roleRef:
 {{- $extraEnv = append $extraEnv (dict "name" $name "value" (get $agentEnv $name)) }}
 {{- end }}
 {{- end }}
-{{- /* @spec ACTION-EXECUTOR-16: key custody. Both runner env sources reach
-       the runner outside the connector-secret marker, so unredacted too.
-       The snapshot sealing key must reach only the hosted connector: fail
-       the render, naming the key and never its value. */}}
+{{- /* @spec ACTION-EXECUTOR-16: key custody. Both runner env sources bypass the connector-secret marker, so the snapshot sealing key must reach only the hosted connector: fail the render naming the key, never its value. */}}
 {{- $sealing := splitList " " (trim (include "curie.sealingKeyNames" .)) }}
 {{- range $extraEnv }}
 {{- if has .name $sealing }}
@@ -188,18 +131,7 @@ roleRef:
 {{- $bf := $runner.bundleFetch }}
 {{- $wf := set (deepCopy ($runner.workspace | default dict)) "sizeLimit" $env.workspaceSizeLimit }}
 {{- $af := $runner.attachments | default dict }}
-{{/*
-The inbound-attachment lane is ONE switch. `worker.attachments.enabled` gates
-the worker half -- the channel download, the parked bytes, the retention ledger
-and the minted capability -- and it gates this half too, because the halves are
-only useful together. With the worker half off and this one on, the pod carries
-an init container that never receives a reference; with this half off and the
-worker half on, the worker pays for every upload and the agent is handed
-nothing, which is a worse silent loss than the bug the lane closes.
-`agentSandbox.runner.attachments.enabled` remains as the sandbox-side sub-gate
-for an operator who wants the pod shape without the mount; it cannot turn the
-lane ON by itself.
-*/}}
+{{/* The inbound-attachment lane is ONE switch: `worker.attachments.enabled` gates the worker half and this half, which only work together. `agentSandbox.runner.attachments.enabled` is a sandbox-side sub-gate and cannot turn the lane ON. */}}
 {{- if not .Values.worker.attachments.enabled }}
 {{- $af = set (deepCopy $af) "enabled" false }}
 {{- end }}
@@ -266,11 +198,7 @@ spec:
       {{- if $runner.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-runner
       {{- end }}
-      {{- /* Rail 2 (#3842): the runner never calls the Kubernetes API, so no
-             template mounts a ServiceAccount token, whichever SA it runs as.
-             The runner-resources admission policy requires this on every
-             template the worker writes; any other value of the knob is
-             refused here rather than silently ignored. */}}
+      {{- /* Rail 2 (#3842): the runner never calls the Kubernetes API, so no template mounts a ServiceAccount token; the runner-resources admission policy requires this and other knob values are refused. */}}
       {{- if ne (toString $runner.serviceAccount.automountToken) "false" }}
       {{- fail (printf "agentSandbox.runner.serviceAccount.automountToken must be false (Rail 2: the runner pod never mounts a Kubernetes API token, and runner template admission refuses one); got %q" (toString $runner.serviceAccount.automountToken)) }}
       {{- end }}
@@ -390,14 +318,7 @@ spec:
         {{- end }}
       {{- end }}
       {{- if or $bf.enabled $wf.enabled $af.enabled }}
-      {{/*
-      Claim-scoped provisioning. The bundle path retains its S3 object-key
-      contract and object-store identity; the workspace path consumes only a
-      worker-minted, exact-object signed URL. Baked empty refs keep warm/unbound
-      pods as no-ops. A set-but-invalid ref fails the pod instead of booting
-      stale or empty content. Egress to RustFS is opened by the runner
-      NetworkPolicy carve out.
-      */}}
+      {{/* Claim-scoped provisioning. The bundle path keeps its S3 object-key contract; the workspace path takes only a worker-minted exact-object signed URL. Baked empty refs keep warm pods no-ops; a set-but-invalid ref fails the pod. */}}
       initContainers:
         {{- if $bf.enabled }}
         - name: bundle-fetch
@@ -667,52 +588,7 @@ spec:
             {{- toYaml $env.resources | nindent 12 }}
         {{- end }}
         {{- if and $af.enabled (ne (.Values.worker.attachments.mode | default "eager") "lazy") }}
-        {{/*
-        Inbound channel attachments (#2567). The worker holds the channel bot
-        token, downloads each referenced file, parks it in the private object
-        store and mints a short-lived ONE-OBJECT presigned read capability; this
-        is the only thing in the cluster that redeems it. Deliberately an init
-        container rather than a sidecar: it completes before the runner starts,
-        so the agent can never read a half-written file, and it is ordered after
-        workspace-init, which wipes its own root on entry.
-
-        CURIE_ATTACHMENTS_REF is baked here and NOWHERE else. The claim's
-        Overrides injection only wins over env the pod template already
-        declares, so the empty entry has to exist; and the runner runs
-        prompt-injectable model code that could echo a presigned URL into a
-        channel, so it must not receive the same key. The worker's k8s substrate
-        scopes the injection to this container by name.
-
-        Fail-closed on every axis (ADR-0059 decision 3): the digest minted from
-        the bytes that actually landed in the store is VERIFIED before anything
-        becomes visible, the operator's own size cap is enforced while
-        streaming, redirects are refused (a redirect carries the fetch to a host
-        the store named rather than one we chose), and a non-HTTP(S) url is
-        refused. Each name is written exactly as the worker recorded it (ADR
-        0205 decision 4); one that is not a clean leaf, sits in the reserved
-        `.curie-` prefix or repeats refuses the boot rather than being repaired.
-        A payload with no "c" on any entry comes from a worker that predates
-        ADR 0205 and keeps the old rules whole (basename cleaning, a numeric
-        suffix for a repeat, all-or-nothing, no status file), so a new chart
-        never regresses an old worker mid-rollout.
-        A refusal leaves NOTHING visible: files are staged under a hidden
-        directory and revealed only once the whole set verified, because a
-        partial set reads to an agent exactly like a complete one. No reference
-        at all -- the overwhelming majority of turns -- is a clean no-op.
-
-        ADR 0205 decision 6: the payload also carries the thread's earlier files
-        ("c": 0). The current message's files ("c": 1) are fetched first and
-        stay all-or-nothing. An earlier file that has expired, is answered with
-        an HTTP error or a redirect, outgrows the size cap, has a name the
-        filesystem cannot hold, times out, or is reached after the overall
-        fetchTimeoutSeconds deadline is skipped, never failing the boot; a
-        digest mismatch is fatal either way, because that is integrity, not
-        availability. The outcome of every entry lands in the hidden
-        `.curie-attachments-status.json` the runner reconciles (decision 8).
-        The docker driver's `_prepare_attachments` is the twin of this program;
-        tests/vectors/attachment-init-outcomes.json pins both to one outcome
-        per payload (ci/attachment-init-behavior-assertions.sh runs this one).
-        */}}
+        {{/* Inbound channel attachments (#2567). The worker parks each file in the object store and mints a short-lived ONE-OBJECT presigned read capability; this init container is its only redeemer, ordered after workspace-init (which wipes its root). CURIE_ATTACHMENTS_REF is baked here and NOWHERE else: the runner is prompt-injectable and must not receive the key. Fail-closed (ADR-0059 decision 3): verify the digest before anything is visible, enforce the size cap while streaming, refuse redirects, non-HTTP(S) urls and unclean, reserved `.curie-` or repeated names (ADR 0205 decision 4). A payload with no "c" is from a pre-ADR 0205 worker and keeps the old rules. ADR 0205 decision 6: earlier files ("c": 0) are skipped on availability failures, current files ("c": 1) are all-or-nothing, a digest mismatch is always fatal; outcomes go to `.curie-attachments-status.json`. The docker driver's `_prepare_attachments` is the twin; tests/vectors/attachment-init-outcomes.json pins both. */}}
         - name: attachments-init
           image: {{ $runnerImageRef | quote }}
           imagePullPolicy: {{ $runner.imagePullPolicy }}
@@ -1059,18 +935,7 @@ spec:
             {{- end }}
             {{- end }}
           {{- end }}
-{{/*
-The SandboxWarmPool is always rendered whenever the sandbox substrate is
-deployed, including at replicas 0. The worker's SandboxClaims reference this
-pool by name (spec.warmPoolRef.name); with the object absent every claim fails
-Ready=False reason=WarmPoolNotFound and the run times out. replicas 0 means no
-pre-warmed pods (claims cold-create sandboxes from the template) -- it must not
-mean no pool object. Raise replicas only for a fake-model/dev pool where an
-unbound warm pod boots cleanly (a real-model warm pod has no bundle and
-crash-loops, and a real claim cold-creates anyway because per-claim env
-injection cannot bind a pre-warmed pod, the envVarsInjectionPolicy Overrides
-gotcha).
-*/}}
+{{/* The SandboxWarmPool always renders when the substrate is deployed, including at replicas 0: claims reference it by name (spec.warmPoolRef.name) and a missing pool fails every claim with WarmPoolNotFound. replicas 0 means cold-create, not no pool. Raise replicas only for a fake-model/dev pool. */}}
 ---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxWarmPool

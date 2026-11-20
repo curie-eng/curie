@@ -135,6 +135,64 @@ Sandbox resource envelopes (request/limit; volume sizeLimits; agentSandbox.resou
 {{- range $differingEnvs }}
   - agent {{ .agent }} (profile {{ .env.profile }}): {{ include "curie.sandboxEnvelope.summary" (dict "root" $ "env" .env) }}
 {{- end }}
+{{- if .Values.resourceQuota.enabled }}
+{{- $quotaProfiles := .Values.agentSandbox.resourceProfiles | default dict }}
+{{- $standardResources := dig "standard" "resources" (dict) $quotaProfiles }}
+{{- $factoryResources := dig "factory" "resources" (dict) $quotaProfiles }}
+{{- $standardRequestMemory := dig "requests" "memory" "" $standardResources }}
+{{- $factoryRequestMemory := dig "requests" "memory" "" $factoryResources }}
+{{- $standardLimitMemory := dig "limits" "memory" "" $standardResources }}
+{{- $factoryLimitMemory := dig "limits" "memory" "" $factoryResources }}
+{{- $standardLimitCpu := dig "limits" "cpu" "" $standardResources }}
+{{- $factoryLimitCpu := dig "limits" "cpu" "" $factoryResources }}
+{{- $standardRequestCpu := dig "requests" "cpu" "" $standardResources }}
+{{- $factoryRequestCpu := dig "requests" "cpu" "" $factoryResources }}
+{{- $hard := .Values.resourceQuota.hard }}
+{{- $quotaBytes := include "curie.capacity.memBytes" $hard.requestsMemory | int64 }}
+{{- $factoryBytes := include "curie.capacity.memBytes" $factoryRequestMemory | int64 }}
+{{- $standardBytes := include "curie.capacity.memBytes" $standardRequestMemory | int64 }}
+{{- $memoryBeside := 0 }}
+{{- if and (gt $factoryBytes 0) (gt $standardBytes 0) (ge $quotaBytes $factoryBytes) }}
+{{- $memoryBeside = div (sub $quotaBytes $factoryBytes) $standardBytes }}
+{{- end }}
+{{- $limitMemoryBeside := 0 }}
+{{- $quotaLimitMemory := include "curie.capacity.memBytes" $hard.limitsMemory | int64 }}
+{{- $factoryLimitMemoryBytes := include "curie.capacity.memBytes" $factoryLimitMemory | int64 }}
+{{- $standardLimitMemoryBytes := include "curie.capacity.memBytes" $standardLimitMemory | int64 }}
+{{- if and (gt $factoryLimitMemoryBytes 0) (gt $standardLimitMemoryBytes 0) (ge $quotaLimitMemory $factoryLimitMemoryBytes) }}
+{{- $limitMemoryBeside = div (sub $quotaLimitMemory $factoryLimitMemoryBytes) $standardLimitMemoryBytes }}
+{{- end }}
+{{- $cpuBeside := 0 }}
+{{- $quotaLimitCpu := include "curie.capacity.cpuMillis" $hard.limitsCpu | int64 }}
+{{- $factoryLimitCpuMillis := include "curie.capacity.cpuMillis" $factoryLimitCpu | int64 }}
+{{- $standardLimitCpuMillis := include "curie.capacity.cpuMillis" $standardLimitCpu | int64 }}
+{{- if and (gt $factoryLimitCpuMillis 0) (gt $standardLimitCpuMillis 0) (ge $quotaLimitCpu $factoryLimitCpuMillis) }}
+{{- $cpuBeside = div (sub $quotaLimitCpu $factoryLimitCpuMillis) $standardLimitCpuMillis }}
+{{- end }}
+{{- $requestCpuBeside := 0 }}
+{{- $quotaRequestCpu := include "curie.capacity.cpuMillis" $hard.requestsCpu | int64 }}
+{{- $factoryRequestCpuMillis := include "curie.capacity.cpuMillis" $factoryRequestCpu | int64 }}
+{{- $standardRequestCpuMillis := include "curie.capacity.cpuMillis" $standardRequestCpu | int64 }}
+{{- if and (gt $factoryRequestCpuMillis 0) (gt $standardRequestCpuMillis 0) (ge $quotaRequestCpu $factoryRequestCpuMillis) }}
+{{- $requestCpuBeside = div (sub $quotaRequestCpu $factoryRequestCpuMillis) $standardRequestCpuMillis }}
+{{- end }}
+{{- $podBeside := 0 }}
+{{- $podHard := $hard.sandboxPodCount | int }}
+{{- if ge $podHard 1 }}
+{{- $podBeside = sub $podHard 1 }}
+{{- end }}
+{{- $beside := $memoryBeside }}
+{{- $binding := "requests.memory" }}
+{{- if lt (int $cpuBeside) (int $beside) }}{{- $beside = $cpuBeside }}{{- $binding = "limits.cpu" }}{{- end }}
+{{- if lt (int $limitMemoryBeside) (int $beside) }}{{- $beside = $limitMemoryBeside }}{{- $binding = "limits.memory" }}{{- end }}
+{{- if lt (int $requestCpuBeside) (int $beside) }}{{- $beside = $requestCpuBeside }}{{- $binding = "requests.cpu" }}{{- end }}
+{{- if lt (int $podBeside) (int $beside) }}{{- $beside = $podBeside }}{{- $binding = "pods" }}{{- end }}
+{{- if eq $binding "limits.cpu" }}
+Beside one factory sandbox the quota admits {{ $beside }} standard sandboxes. limits.cpu binds before requests.memory. requests.memory would allow {{ $memoryBeside }} and limits.cpu would allow {{ $cpuBeside }}.
+{{- else }}
+Beside one factory sandbox the quota admits {{ $beside }} standard sandboxes. {{ $binding }} binds first. requests.memory would allow {{ $memoryBeside }} and limits.cpu would allow {{ $cpuBeside }}.
+{{- end }}
+{{- end }}
 {{- if and .Values.resourceQuota.enabled (ne (toString .Values.resourceQuota.capacityReport) "false") }}
 {{- /* capacity-report-guard: every Node/Pod lookup stays inside this block.
      Empty under helm template / --dry-run: print nothing (#2949). */}}
@@ -261,3 +319,10 @@ manage yourself, so it never passes through helm values or release history:
 
   Create any of them with kubectl, External Secrets, or Sealed Secrets.
 ─────────────────────────────────────────────────────────────────────────────
+
+{{- $gateway := include "curie.channelGateway.values" . | fromYaml }}
+{{- if and (eq (include "curie.channelGateway.deploy" .) "true") (not $gateway.tlsSecret) (not $gateway.allowInsecure) }}
+WARNING: Offline renderers (helm template, Argo, --dry-run=client) cannot reuse
+chart-managed gateway certificates through lookup. Set channelGateway.tlsSecret
+to a managed TLS Secret, or the CA and key rotate on every render.
+{{- end }}

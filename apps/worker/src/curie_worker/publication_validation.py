@@ -58,6 +58,18 @@ _CARGO_DEPENDENCY_SECTIONS = ("dependencies", "dev-dependencies", "build-depende
 _LOCAL_SPECIFIERS = ("link:", "file:", "workspace:")
 
 
+class PublicationValidationRefused(WorkspacePreparationError):
+    """The snapshot itself is refused by publication policy, not by a fault.
+
+    A protected, unsafe, workflow or metadata path, a dependency addition, an
+    oversized patch, a snapshot that names another repository or commit, an
+    inconsistent path set, an unsafe mode or a patch that does not apply. The
+    same snapshot is refused again on any retry. Infrastructure faults (no
+    retained base, archive limits or extraction, git missing or timing out)
+    stay plain ``WorkspacePreparationError``.
+    """
+
+
 def _dependency_table(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise ValueError("dependency table is malformed")
@@ -360,7 +372,7 @@ def _validate_dependency_additions(
         ) as exc:
             # Parser diagnostics and package identities are untrusted patch
             # content. Publish only the fixed reason and validated relative path.
-            raise WorkspacePreparationError(
+            raise PublicationValidationRefused(
                 "publication-validation", f"{DEPENDENCY_ADDITION_REFUSAL}: {path}"
             ) from exc
 
@@ -430,7 +442,7 @@ def _validate_changed_paths(paths: tuple[str, ...], protected_paths: tuple[str, 
     refusals = [publication_path_refusal(path, protected_paths) for path in paths]
     for reason in _REFUSAL_PRIORITY:
         if reason in refusals:
-            raise WorkspacePreparationError("publication-validation", reason)
+            raise PublicationValidationRefused("publication-validation", reason)
 
 
 def validate_snapshot_against_base(
@@ -452,28 +464,28 @@ def validate_snapshot_against_base(
             "publication-validation", "thread has no retained sanitized base"
         )
     if snapshot.repo_full_name.casefold() != prepared.repo_full_name.casefold():
-        raise WorkspacePreparationError(
+        raise PublicationValidationRefused(
             "publication-validation", "snapshot repository does not match sanitized base"
         )
     if snapshot.base_sha != prepared.base_sha:
         # #4121: name both commits so the factory run's details line is actionable.
-        raise WorkspacePreparationError(
+        raise PublicationValidationRefused(
             "publication-validation",
             f"snapshot commit {snapshot.base_sha[:12]} does not match "
             f"sanitized base {prepared.base_sha[:12]}",
         )
     if len(snapshot.patch) > max_patch_bytes:
-        raise WorkspacePreparationError(
+        raise PublicationValidationRefused(
             "publication-validation", f"patch exceeds {max_patch_bytes} raw bytes"
         )
     if not snapshot.changed_paths:
         if snapshot.patch:
-            raise WorkspacePreparationError(
+            raise PublicationValidationRefused(
                 "publication-validation", "snapshot patch has no declared changed paths"
             )
         return
     if not snapshot.patch:
-        raise WorkspacePreparationError(
+        raise PublicationValidationRefused(
             "publication-validation", "snapshot changed paths have no patch"
         )
     protected_paths = normalize_protected_publication_paths(protected_paths)
@@ -587,7 +599,7 @@ def validate_snapshot_against_base(
             _validate_changed_paths(derived_paths, protected_paths)
             declared_paths = tuple(sorted(snapshot.changed_paths))
             if len(set(declared_paths)) != len(declared_paths) or declared_paths != derived_paths:
-                raise WorkspacePreparationError(
+                raise PublicationValidationRefused(
                     "publication-validation",
                     "snapshot changed_paths do not exactly match the validated patch",
                 )
@@ -614,7 +626,7 @@ def validate_snapshot_against_base(
                 old_mode = header[0].removeprefix(":")
                 new_mode = header[1]
                 if old_mode not in _SAFE_GIT_MODES or new_mode not in _SAFE_GIT_MODES:
-                    raise WorkspacePreparationError(
+                    raise PublicationValidationRefused(
                         "publication-validation",
                         "patch contains a symlink, submodule, or unsafe file mode",
                     )
@@ -633,7 +645,7 @@ def validate_snapshot_against_base(
                 f"publication git validation exceeded {git_timeout_seconds} seconds",
             ) from exc
         except subprocess.CalledProcessError as exc:
-            raise WorkspacePreparationError(
+            raise PublicationValidationRefused(
                 "publication-validation", "patch does not apply to sanitized base"
             ) from exc
     finally:

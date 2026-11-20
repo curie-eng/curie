@@ -202,6 +202,77 @@
     }
   ],
   "properties": {
+    "channelGateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deploy": {
+          "type": ["boolean", "null"]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "url": {
+          "type": "string"
+        },
+        "allowInsecure": {
+          "type": "boolean"
+        },
+        "tlsSecret": {
+          "type": "string"
+        },
+        "apiToken": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workerToken": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "groupCacheTtlSeconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "identityLookup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "type": "string"
+            },
+            "tokenKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "timeoutSeconds": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        },
+        "replayStorageSize": {
+          "type": "string"
+        },
+        "replayStorageClass": {
+          "type": "string"
+        },
+        "readinessProbe": {
+          "type": "object"
+        },
+        "livenessProbe": {
+          "type": "object"
+        }
+      }
+    },
     "config": {
       "type": "object",
       "description": "Installed configuration schema stamp written by the CLI on every install and upgrade (issue #2299).",
@@ -241,9 +312,16 @@
       "type": "object",
       "description": "Rendered as CURIE_FORGES (#4397); the api validates the entries. appId stays untyped like api.githubAppId.",
       "properties": {
+        "githubAppClientId": {"type": "string"},
+        "githubAppClientSecretExistingSecret": {"type": "string"},
+        "githubAppClientSecretExistingSecretKey": {"type": "string"},
         "enabled": {"type": "boolean"},
         "intake": {"type": "string", "enum": ["poll", "webhook"]},
         "baseLabelSettleSeconds": {"type": "integer", "minimum": 0},
+        "requesterCodingInstructions": {
+          "type": "object",
+          "properties": {"apply": {"type": "boolean"}}
+        },
         "cardBaseUrl": {"type": "string"},
         "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
         "codeHosts": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
@@ -287,7 +365,14 @@
                 "metadataRerunKeys": {"type": "array", "items": {"type": "string", "minLength": 1}}}}
           }
         }}}}},
-        "sandboxEgress": {"type": "object", "additionalProperties": {"type": "boolean"}}
+        "sandboxEgress": {"type": "object", "additionalProperties": {"type": "boolean"}},
+        "admission": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "minModelCreditUsd": {"type": "number", "minimum": 0}
+          }
+        }
       }
     },
     "api": {
@@ -400,6 +485,11 @@
           "maximum": 43200,
           "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800 (a three hour run). Below 60s a budget cannot cover claim + one runner request + settle; at most 43200s (twelve hours, the factory maximum execution deadline, #5067). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
         },
+        "hookClaimLeaseSeconds": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "description": "Optional cron claim lease in seconds, rendered as CURIE_HOOK_CLAIM_LEASE_S on the API and the worker only when set. Null leaves the variable unset so the process uses worker.deliveryBudgetSeconds. A positive number with no chart maximum, matching the released worker. The process refuses a lease shorter than the delivery budget at boot. There is no cross-field check in the schema."
+        },
         "runnerTotalTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
@@ -483,6 +573,13 @@
               "properties": {
                 "enabled": {"type": "boolean"},
                 "maxBytes": {"type": ["integer", "null"], "minimum": 1}
+              }
+            },
+            "publicationCandidates": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean", "default": true},
+                "maxBytes": {"type": "integer", "minimum": 1}
               }
             }
           }
@@ -617,6 +714,14 @@
       "description": "The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered into both the API and the worker. Requires actionExecutor.enabled. A boolean, so a quoted \"true\" cannot turn it on.",
       "properties": {
         "enabled": {"type": "boolean"}
+      }
+    },
+    "console": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Console origin for the rejected Claude plan direct message (#5720). Empty omits the reconnect button.",
+      "properties": {
+        "origin": {"type": "string"}
       }
     },
     "testInstallation": {

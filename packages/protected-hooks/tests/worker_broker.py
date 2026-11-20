@@ -62,13 +62,12 @@ def pworker_service(tmp_path_factory, request):
     fixture.private.chmod(0o700)
     fixture.cid = None
     fixture.admin = None
+    fixture.tls_volume = None
+    fixture.docker_redactions = []
     cidfile = fixture.private / "container.cid"
     owner = "curie-check-pworker-" + uuid4().hex[:12]
-    data_directory = None
+    data_volume = None
     try:
-        if persistent:
-            data_directory = fixture.private / "data"
-            data_directory.mkdir(mode=0o700)
         config = fixture.private / "docker"
         config.mkdir(mode=0o700)
         fixture.env = {key: FixtureSecret(value) for key, value in os.environ.items()}
@@ -78,6 +77,7 @@ def pworker_service(tmp_path_factory, request):
         fixture.docker("ps", "--format", "{{.ID}}")
         fixture.passwords = {}
         provisioner_password = FixtureSecret(secrets.token_hex(24))
+        fixture.docker_redactions = [provisioner_password]
         fixture.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         now = datetime.now(UTC)
         subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "fixture-ca")])
@@ -112,6 +112,41 @@ def pworker_service(tmp_path_factory, request):
             fixture.private / "users.acl",
             "user default off\nuser provisioner on >" + provisioner_password + " ~* &* +@all\n",
         )
+        fixture.tls_volume = owner + "-tls"
+        fixture.docker(
+            "volume", "create", "--label", "curie.test.owner=" + owner, fixture.tls_volume
+        )
+        fixture.seed_cid = fixture.docker(
+            "create",
+            "--name",
+            owner + "-seed",
+            "--label",
+            "curie.test.owner=" + owner,
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--mount",
+            "type=volume,src=" + fixture.tls_volume + ",dst=/tls",
+            IMAGE,
+            "true",
+        ).strip()
+        fixture.copy_tls("ca.crt", "server.crt", "server.key", "users.acl")
+        if persistent:
+            data_volume = owner + "-data"
+            fixture.docker("volume", "create", "--label", "curie.test.owner=" + owner, data_volume)
+            fixture.docker(
+                "run",
+                "--rm",
+                "--label",
+                "curie.test.owner=" + owner,
+                "--user",
+                "0:0",
+                "--mount",
+                "type=volume,src=" + data_volume + ",dst=/data",
+                IMAGE,
+                "chown",
+                f"{os.getuid()}:{os.getgid()}",
+                "/data",
+            )
         for _attempt in range(5):
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
@@ -133,9 +168,13 @@ def pworker_service(tmp_path_factory, request):
                 f"{os.getuid()}:{os.getgid()}",
                 "-p",
                 f"127.0.0.1:{fixture.port}:6379",
-                "-v",
-                str(fixture.private) + ":/tls:ro",
-                *(["-v", str(data_directory) + ":/data"] if persistent else []),
+                "--mount",
+                "type=volume,src=" + fixture.tls_volume + ",dst=/tls,readonly",
+                *(
+                    ["--mount", "type=volume,src=" + data_volume + ",dst=/data"]
+                    if persistent
+                    else []
+                ),
                 IMAGE,
                 "valkey-server",
                 "--port",
@@ -190,11 +229,16 @@ def pworker_service(tmp_path_factory, request):
             try:
                 fixture.remove_owned(owner, cidfile)
             finally:
-                if data_directory is not None:
-                    shutil.rmtree(data_directory)
-                for path in fixture.private.iterdir():
-                    if path.is_file():
-                        path.unlink()
+                try:
+                    if data_volume is not None:
+                        fixture.docker("volume", "rm", data_volume)
+                finally:
+                    try:
+                        fixture.remove_tls_owned(owner)
+                    finally:
+                        for path in fixture.private.iterdir():
+                            if path.is_file():
+                                path.unlink()
 
 
 def worker_acl():

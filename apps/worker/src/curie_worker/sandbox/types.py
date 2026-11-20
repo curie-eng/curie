@@ -46,6 +46,13 @@ TURN_PROGRESS_ELIGIBILITY_ENV = "CURIE_TURN_PROGRESS_ENABLED"
 # ACTION-EXECUTOR-5): ``action-exec:<execution id>``. Pressure reclamation keys
 # on it, so the substrate refuses a claim whose key and executor keyword disagree.
 EXECUTOR_THREAD_KEY_PREFIX = "action-exec:"
+# Claim-object labels naming whose personal grant a claim booted with (#5378,
+# ADR 0268). Only a personal claim carries them; they are evidence and the
+# owner inventory's selector, never authority (the route record is).
+MODEL_AUTH_MODE_LABEL = "curietech.ai/model-auth-mode"
+OWNER_TENANT_LABEL = "curietech.ai/owner-tenant"
+OWNER_PRINCIPAL_LABEL = "curietech.ai/owner-principal"
+ENROLLMENT_GENERATION_LABEL = "curietech.ai/enrollment-generation"
 
 
 def is_executor_thread_key(thread_key: str) -> bool:
@@ -151,9 +158,13 @@ HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
         API_KEY_ENV,
         "LANGFUSE_SECRET_KEY",
         "CURIE_ADAPTER_CREDENTIALS",
+        "CURIE_CHANNEL_GATEWAY_TOKEN",
         "CURIE_SEALING_PRIVATE_KEY",
         "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
         "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
+        # The static-pool shell control credential: it can start or retire
+        # any claim on any shell.
+        "CURIE_STATIC_SHELL_CONTROL_TOKEN",
     }
 )
 
@@ -183,6 +194,24 @@ def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
         if not _is_host_application_credential(name)
         or (name in declared_connector_secret_names and not is_reserved_boot_env_name(name))
     }
+
+
+# How the worker dials a runner: plain HTTP to a pod or a
+# container on a trusted network, or HTTPS to a static-pool shell supervisor,
+# which validates the certificate and the host name.
+Transport = Literal["http", "https"]
+TRANSPORTS: frozenset[str] = frozenset({"http", "https"})
+
+
+def _check_endpoint(transport: str, host: str, base_path: str) -> None:
+    """Refuse an endpoint whose parts would compose a different URL."""
+
+    if transport not in TRANSPORTS:
+        raise ValueError(f"unsupported runner transport {transport!r}")
+    if "/" in host or "://" in host:
+        raise ValueError("a runner host carries no scheme or path")
+    if base_path and (not base_path.startswith("/") or base_path.endswith("/") or "?" in base_path):
+        raise ValueError("a runner base path is absolute with no trailing slash or query")
 
 
 class RouteState(StrEnum):
@@ -236,6 +265,13 @@ class SandboxHandle:
     # this runner was not booted for a work item. Missing on a route written
     # before the field existed, which reads as no run.
     caller_run: str | None = None
+    # ADR 0270 decision 3: the requester the runner's caller token booted
+    # with, and that token's expiry. ``"absent"`` when the boot env carried no
+    # cct, ``"none"`` for a cct naming no principal, else ``"sha256:<hex>"``
+    # over the principal (never the plaintext). None only on a route written
+    # before the fields existed, which cannot prove a requester match.
+    caller_requester: str | None = None
+    caller_token_exp: int | None = None
     # #3823: the boot state token's credential id, the agent it names, and its
     # absolute expiry. Missing on a route written before the field existed.
     # Release reports the id; a later turn replaces a route whose token has
@@ -257,6 +293,24 @@ class SandboxHandle:
     # repository's entry is replaced, not reused.
     runner_digests: tuple[str, ...] | None = None
     runner_docker: bool = False
+    # How the worker dials this runner, and the path prefix under which the
+    # endpoint serves its ACI routes. A static-pool shell answers HTTPS under
+    # ``/c/<claim>/<generation>``; Kubernetes and Docker routes are plain HTTP
+    # at the root. A route stored before these fields existed is migrated to
+    # HTTP at the root when it is read (``RouteRecord.from_json``).
+    transport: Transport = "http"
+    base_path: str = ""
+    # Whose grant the runner booted with (#5378, ADR 0268): ``"personal"`` and
+    # the owner's tenant, principal and enrollment generation for a personal
+    # claim. None on a service claim and on a route written before the fields
+    # existed, which is unknown provenance: a personal request never adopts it.
+    model_auth_mode: str | None = None
+    owner_tenant_id: str | None = None
+    owner_principal_id: str | None = None
+    enrollment_generation: int | None = None
+
+    def __post_init__(self) -> None:
+        _check_endpoint(self.transport, self.service_fqdn, self.base_path)
 
     @property
     def sandbox_id(self) -> str:
@@ -266,7 +320,14 @@ class SandboxHandle:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.service_fqdn}:{self.port}"
+        return f"{self.transport}://{self.service_fqdn}:{self.port}{self.base_path}"
+
+
+@dataclass(frozen=True)
+class WorkItemRouteOwner:
+    request_id: str
+    dispatch_generation: int
+    acquire_owner: str
 
 
 @dataclass
@@ -275,20 +336,154 @@ class RouteRecord:
 
     handle: SandboxHandle
     state: RouteState = RouteState.LIVE
+    work_item_owner: WorkItemRouteOwner | None = None
 
     def to_json(self) -> str:
         payload = asdict(self.handle)
         payload["state"] = self.state.value
+        if self.work_item_owner is not None:
+            payload["work_item_owner"] = asdict(self.work_item_owner)
         return json.dumps(payload, sort_keys=True)
 
     @classmethod
     def from_json(cls, raw: str) -> RouteRecord:
         payload = json.loads(raw)
         state = RouteState(payload.pop("state", RouteState.LIVE.value))
+        owner = payload.pop("work_item_owner", None)
+        # Data migration of routes stored before the endpoint fields existed:
+        # every such route was written by a plain HTTP substrate at the root,
+        # so it reads back as exactly that and drains on its own TTL.
+        payload.setdefault("transport", "http")
+        payload.setdefault("base_path", "")
         # JSON has no tuple; equality with a freshly claimed handle needs one.
         if payload.get("runner_digests") is not None:
             payload["runner_digests"] = tuple(payload["runner_digests"])
-        return cls(handle=SandboxHandle(**payload), state=state)
+        return cls(
+            handle=SandboxHandle(**payload),
+            state=state,
+            work_item_owner=WorkItemRouteOwner(**owner) if owner is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class ClaimProvenance:
+    """Whose grant a personal claim boots with (#5378, ADR 0268). Never the grant.
+
+    The tuple an ExecutionRequest snapshotted. A service request passes no
+    provenance at all; ``provenance_admits`` gives None the service rule.
+    """
+
+    owner_tenant_id: str
+    owner_principal_id: str
+    enrollment_generation: int
+    model_auth_mode: Literal["personal"] = "personal"
+
+    def labels(self) -> dict[str, str]:
+        return {
+            MODEL_AUTH_MODE_LABEL: self.model_auth_mode,
+            OWNER_TENANT_LABEL: self.owner_tenant_id,
+            OWNER_PRINCIPAL_LABEL: self.owner_principal_id,
+            ENROLLMENT_GENERATION_LABEL: str(self.enrollment_generation),
+        }
+
+    def recorded_by(self, handle: SandboxHandle) -> bool:
+        return (
+            handle.model_auth_mode,
+            handle.owner_tenant_id,
+            handle.owner_principal_id,
+            handle.enrollment_generation,
+        ) == (
+            self.model_auth_mode,
+            self.owner_tenant_id,
+            self.owner_principal_id,
+            self.enrollment_generation,
+        )
+
+
+def provenance_admits(provenance: ClaimProvenance | None, handle: SandboxHandle) -> bool:
+    """Whether a retained route may serve a request with ``provenance``.
+
+    A personal request needs the exact tuple; a route with unknown provenance
+    (written before the fields existed) or any other owner or generation fails
+    closed. A service request (None) takes any route that did not boot with a
+    personal grant, so no mode crosses in either direction.
+    """
+
+    if provenance is None:
+        return handle.model_auth_mode != "personal"
+    return provenance.recorded_by(handle)
+
+
+class PersonalCreate(Protocol):
+    """What a personal claim create needs from the kernel (#5378, ADR 0268).
+
+    The substrate runs on a worker thread and calls these synchronously; the
+    kernel bridges each to its event loop. ``begin`` takes the owner launch
+    lease (``OwnerBusy`` when another create holds it), ``grant_env`` runs the
+    authority check after all preparation and returns the grant's claim env
+    (a refusal raises), and ``fence`` runs the authority check again (a
+    refusal raises) and proves the lease is still this create's, immediately
+    before the create write and after any predecessor teardown (``OwnerBusy``
+    when lost).
+    """
+
+    @property
+    def provenance(self) -> ClaimProvenance: ...
+
+    def begin(self) -> None: ...
+
+    def grant_env(self) -> Mapping[str, str]: ...
+
+    def fence(self) -> None: ...
+
+
+#: Grant refusals and enrollment fences: the owner reconnects or the request
+#: is revalidated, and a started request ends authentication-required.
+AUTHENTICATION_REQUIRED = "authentication-required"
+
+
+class PersonalLaunchRefused(Exception):
+    """A personal execution may not claim, adopt, steer or start (#5378).
+
+    Deliberately not a ``SandboxError``: a refusal is a decision, so the
+    kernel settles it instead of retrying it as a runner error. ``code`` is
+    the named refusal; ``classification`` is ``authentication-required`` for
+    grant refusals and enrollment fences, and None for a structural refusal.
+    The message names the code only, never an owner or a grant.
+    """
+
+    def __init__(self, code: str, *, classification: str | None = None) -> None:
+        self.code = code
+        self.classification = classification
+        super().__init__(code)
+
+    @property
+    def authentication_required(self) -> bool:
+        return self.classification == AUTHENTICATION_REQUIRED
+
+
+class PersonalModeUnsupported(PersonalLaunchRefused):
+    """Personal mode on a Docker or static substrate (ADR 0268 decision 2)."""
+
+    def __init__(self) -> None:
+        super().__init__("personal_mode_requires_kubernetes")
+
+
+class ProvenanceMismatch(PersonalLaunchRefused):
+    """A concurrent route winner booted for another owner, generation or mode."""
+
+    def __init__(self) -> None:
+        super().__init__("owner_provenance_mismatch")
+
+
+class OwnerBusy(Exception):  # noqa: N818 - a capacity condition, not an error
+    """The owner's one native process slot is taken (ADR 0268 decision 2).
+
+    Another thread's claim for the same owner exists, another create holds the
+    owner launch lease, or this create lost that lease. Capacity-like: an
+    unstarted request waits without spending start attempts. Not a
+    ``CapacityExhaustedError``, so pressure reclamation never runs for it.
+    """
 
 
 @dataclass(frozen=True)
@@ -489,9 +684,10 @@ class SandboxView:
     """What the substrate needs to know about a Sandbox.
 
     ``port`` is the dial port when it is sandbox-specific (the Docker substrate
-    publishes each runner on its own loopback host port); ``None`` means the
-    substrate falls back to the fleet-wide ``SubstrateConfig.runner_port`` (the
-    Kubernetes path, where every sandbox listens on the same in-cluster port).
+    publishes each runner on its own loopback host port, a static-pool shell
+    names its supervisor port); ``None`` means the substrate falls back to the
+    fleet-wide ``SubstrateConfig.runner_port`` (the Kubernetes path, where
+    every sandbox listens on the same in-cluster port).
     """
 
     name: str
@@ -499,6 +695,28 @@ class SandboxView:
     service_fqdn: str | None
     operating_mode: str
     port: int | None = None
+    # The dial transport and ACI path prefix the substrate hands to the route
+    # (see ``SandboxHandle``). ``service_fqdn`` stays a bare host name.
+    transport: Transport = "http"
+    base_path: str = ""
+
+
+ResourceExhaustionKind = Literal["memory", "ephemeral_storage", "scratch", "node_disruption"]
+
+
+@dataclass(frozen=True)
+class ResourceExhaustion:
+    """A termination the substrate positively identified, and the limit it hit.
+
+    ``limit_bytes`` comes from the spec of the same pod the evidence was read
+    from, never from desired configuration or from message text alone.
+    ``volume`` names the emptyDir for ``scratch`` and is None otherwise. A
+    ``node_disruption`` names no volume and no limit.
+    """
+
+    kind: ResourceExhaustionKind
+    volume: str | None
+    limit_bytes: int | None
 
 
 @dataclass(frozen=True)
@@ -506,12 +724,58 @@ class SandboxTermination:
     """Confirmed termination of the runner pod, with safe diagnostic text.
 
     ``exit_code`` is the runner container's terminated exit code when the pod
-    status reported a real int; it never changes ``detail``.
+    status reported a real int; it never changes ``detail``. ``exhaustion`` is
+    set only on positive identification; None is unknown, not "not exhausted".
     """
 
     reason: str
     detail: str | None = None
     exit_code: int | None = None
+    exhaustion: ResourceExhaustion | None = None
+
+
+@dataclass(frozen=True)
+class RecordedPod:
+    """The runner pod's identity and wire spec as the worker read them at start.
+
+    Substrate-neutral data (ADR 0269, #5427): ``uid`` is the pod's own UID and
+    ``spec`` its spec as plain wire data. A later diagnosis binds an eviction
+    event to this UID and checks the limit it states against this spec, so an
+    event for another pod or another limit identifies nothing.
+    """
+
+    uid: str
+    spec: Mapping[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class DeliveredLimits:
+    """The enforced limits one runtime actually got (ADR 0269, #5427).
+
+    ``memory_bytes`` is the runner container's memory limit,
+    ``ephemeral_storage_bytes`` the sum of the regular containers'
+    ephemeral-storage limits (the quantity the kubelet compares), and
+    ``scratch_bytes`` each emptyDir's sizeLimit by volume name. None and an
+    empty mapping mean the limit was not observed, which never releases a gate.
+    """
+
+    memory_bytes: int | None
+    ephemeral_storage_bytes: int | None
+    scratch_bytes: Mapping[str, int]
+    max_turns: int | None
+    # The pod these limits were read from, kept by the substrate for a later
+    # termination diagnosis. Never part of the start body.
+    recorded: RecordedPod | None = field(default=None, compare=False, repr=False)
+
+    def to_wire(self) -> dict[str, Any]:
+        """The start body's ``delivered_limits`` object."""
+
+        return {
+            "memory_bytes": self.memory_bytes,
+            "ephemeral_storage_bytes": self.ephemeral_storage_bytes,
+            "scratch_bytes": dict(self.scratch_bytes),
+            "max_turns": self.max_turns,
+        }
 
 
 OperatingMode = Literal["Running", "Suspended"]
@@ -618,7 +882,16 @@ class SandboxClient(Protocol):
 
     def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None: ...
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]: ...
+    def list_claims(
+        self, *, label_selector: str, request_timeout_seconds: float | None = None
+    ) -> list[ClaimView]:
+        """Claims matching ``label_selector``; a timeout bounds the one request.
+
+        The personal owner inventory always passes one (#5378): it runs under
+        the owner launch lease, so it must end before that lease could lapse.
+        """
+
+        ...
 
     def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
         """Delete claim-scoped templates whose claim is gone; return their names.
@@ -647,9 +920,42 @@ class SandboxClient(Protocol):
         ...
 
     def pod_termination(
-        self, name: str, *, since: datetime, request_timeout_seconds: float
+        self,
+        name: str,
+        *,
+        since: datetime,
+        request_timeout_seconds: float,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
-        """Confirmed pod termination, or None when the evidence is absent."""
+        """Confirmed pod termination, or None when the evidence is absent.
+
+        ``recorded`` is the pod identity the worker recorded at start. None
+        means no identity was recorded, and an eviction event then identifies
+        nothing.
+        """
+
+        ...
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        """The limits in pod ``name``'s own spec; None when it cannot be read.
+
+        ``max_turns`` is not a pod fact and is always None here.
+        """
+
+        ...
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        """What the next claim from ``pool`` would deliver, read only.
+
+        The same source template and override resolution a claim uses. Raises
+        when the template does not resolve. ``max_turns`` is always None here.
+        """
 
         ...
 

@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any, Protocol
 
 import httpx
@@ -25,6 +26,7 @@ from curie_api.forges.capabilities import (
     Operation,
     Support,
 )
+from curie_api.forges.errors import ForgeError, Unauthorized, Unavailable
 from curie_api.forges.github import code_host as github_code_host
 from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.github.comments import GitHubMarkedComments, static_token
@@ -41,17 +43,26 @@ from curie_api.forges.ports import CodeHost, Tracker
 from curie_api.forges.types import (
     Actor,
     CheckState,
+    EvidenceFile,
     FeedbackKind,
     PullRequest,
     PullRequestRef,
     PullRequestState,
     ReplyTarget,
     RepositoryRef,
+    StoredEvidence,
     TrackerIssueRef,
+    ends_with_marker,
 )
 
 from forge_fakes import jira as jira_fake
-from forge_fakes.github import CONTRACT_APP_ID, REPO, REPO_ID, GitHubRepositoryFake
+from forge_fakes.github import (
+    CONTRACT_APP_ID,
+    CONTRACT_BOT,
+    REPO,
+    REPO_ID,
+    GitHubRepositoryFake,
+)
 
 
 class AdapterHarness(Protocol):
@@ -114,6 +125,11 @@ class AdapterHarness(Protocol):
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         """Comments posted on ``target``; on a thread, the replies in it."""
 
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        """``actor`` posts a plain comment ``body`` (no mention, no marker) on
+        ``issue`` from outside the port; returns the tracker's comment id as
+        the intake hands it to the answer core (on GitLab the bare note id)."""
+
     def fail_next_page(self, *, after: int = 0) -> None:
         """The listing page read after ``after`` more successful reads fails once.
 
@@ -121,6 +137,65 @@ class AdapterHarness(Protocol):
 
     def write_count(self) -> int:
         """Forge writes made through port calls so far."""
+
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        """Push a commit to ``branch`` whose tree id is ``tree``; returns its sha,
+        or None on a host whose commit read reports no tree."""
+
+    def evidence_ref(self, key: str) -> str | None:
+        """The commit the UI evidence ref named by ``key`` points to, read from
+        outside the port, or None when no such ref exists."""
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        """The bytes an image URL `CodeHost.store_evidence` returned serves, or
+        None when it serves nothing."""
+
+
+class LinkedIssueHarness(AdapterHarness, Protocol):
+    """The hooks the linked output issue vectors need (ADR 0277,
+    ``apps/api/tests/forges/contract/test_linked_issue.py``). Implemented only
+    by the pairs whose tracker supports `Operation.CREATE_LINKED_ISSUE`:
+    `InMemoryHarness` and `GitHubHarness`."""
+
+    def lose_next_create_response(self) -> None:
+        """The next issue create is applied, then its answer is lost."""
+
+    def add_issue(self, author: Actor | None, body: str) -> TrackerIssueRef:
+        """An issue in the tracker's scope created from outside the port by
+        ``author``, or by the adapter's own identity when None (a past run)."""
+
+    def marked_issue_count(self, output_identity: str) -> int:
+        """Issues our own identity created whose last non-empty line is the
+        embedded marker for ``output_identity``, read from outside the port."""
+
+    def issue_body(self, issue: TrackerIssueRef) -> str:
+        """The issue's stored body, read from outside the port."""
+
+    def sent_issue_bodies(self) -> list[str]:
+        """The body of every issue create the adapter sent, in order."""
+
+    def embed_linked_marker(self, output_identity: str) -> str:
+        """The marker line exactly as the adapter embeds it."""
+
+    def edit_issue_body(self, issue: TrackerIssueRef, body: str) -> None:
+        """A person replaces the issue's body from outside the port."""
+
+    def issue_count(self) -> int:
+        """Issues in the tracker's scope, pull requests excluded."""
+
+    def listing_count(self) -> int:
+        """How many own-issue listing reads the adapter has made; compared only for change."""
+
+    def lag_listing(self) -> None:
+        """Listing lag starts: every issue the adapter creates from now on is
+        absent from its creator listing, yet readable directly."""
+
+    def end_listing_lag(self) -> None:
+        """Listing lag ends: every hidden issue is listed again."""
+
+    def refuse_next_create(self, status: int) -> None:
+        """The next issue create is refused definitely, writing nothing, as
+        GitHub answers ``status`` (401 or 422)."""
 
 
 async def open_pull(harness: AdapterHarness, branch: str) -> PullRequest:
@@ -159,14 +234,25 @@ class InMemoryHarness:
         self._faults = PageFaults()
         tracker_caps: dict[Operation, Support] = all_supported(TRACKER_OPERATIONS)
         code_caps: dict[Operation, Support] = all_supported(CODE_HOST_OPERATIONS)
+        # Code host account ids map to logins only on GitHub (#5414, ADR 0198).
+        # The member arrives with production; until then the in-memory host has
+        # nothing to refuse and the existing contract stays on today's operations.
+        account_login = getattr(Operation, "ACCOUNT_LOGIN", None)
+        if account_login is not None:
+            code_caps[account_login] = Support.UNSUPPORTED
         if minimal:
             tracker_caps[Operation.LINK_PULL_REQUEST] = Support.NOOP
             tracker_caps[Operation.DEPENDENCIES] = Support.NOOP
             tracker_caps[Operation.GROUP_MEMBERSHIP] = Support.UNSUPPORTED
+            # Jira's shape: linked output issues are GitHub only (ADR 0277).
+            tracker_caps[Operation.CREATE_LINKED_ISSUE] = Support.UNSUPPORTED
             code_caps[Operation.RERUN_FAILED] = Support.NOOP
+            code_caps[Operation.CURRENT_INSTALLATION_CREDENTIAL] = Support.UNSUPPORTED
             code_caps[Operation.CI_DIAGNOSTICS] = Support.UNSUPPORTED
             code_caps[Operation.USER_CAN_WRITE] = Support.UNSUPPORTED
             code_caps[Operation.REQUIRED_CHECKS] = Support.UNSUPPORTED
+            code_caps[Operation.STORE_EVIDENCE] = Support.UNSUPPORTED
+            code_caps[Operation.DELETE_EVIDENCE] = Support.UNSUPPORTED
         self._tracker = InMemoryTracker(
             kind=types.MEMORY_TRACKER_ONLY if minimal else types.MEMORY,
             label=LABEL,
@@ -174,7 +260,7 @@ class InMemoryHarness:
             ledger=self._ledger,
             faults=self._faults,
         )
-        self._code_host = InMemoryCodeHost(
+        self._code_host = _ObservedEvidenceCodeHost(
             capabilities=code_caps, ledger=self._ledger, faults=self._faults
         )
         self.tracker: Tracker = self._tracker
@@ -238,6 +324,9 @@ class InMemoryHarness:
         side = self._comments_side(target)
         side.seed_comment(target, author, side.embed(marker, body))
 
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        return self._tracker.comment(issue, actor, body)
+
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         return self._comments_side(target).comments(target)
 
@@ -246,6 +335,92 @@ class InMemoryHarness:
 
     def write_count(self) -> int:
         return self._ledger.writes
+
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return self._code_host.push(self.repository, branch, tree=tree)
+
+    def evidence_ref(self, key: str) -> str | None:
+        return self._code_host.evidence_commits.get(key)
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        return self._code_host.raw(url)
+
+    def lose_next_create_response(self) -> None:
+        self._tracker.write_faults.lose_next_response(Operation.CREATE_LINKED_ISSUE)
+
+    def add_issue(self, author: Actor | None, body: str) -> TrackerIssueRef:
+        return self._tracker.seed_issue(
+            "Planted", body, author=self._tracker.identity if author is None else author
+        )
+
+    def marked_issue_count(self, output_identity: str) -> int:
+        embedded = self.embed_linked_marker(output_identity)
+        own = self._tracker.issues(author=self._tracker.identity)
+        return sum(ends_with_marker(self._tracker.issue_body(ref), embedded) for ref in own)
+
+    def issue_body(self, issue: TrackerIssueRef) -> str:
+        return self._tracker.issue_body(issue)
+
+    def sent_issue_bodies(self) -> list[str]:
+        return list(self._tracker.sent_issue_bodies)
+
+    def embed_linked_marker(self, output_identity: str) -> str:
+        return InMemoryTracker.embed_linked_marker(output_identity)
+
+    def edit_issue_body(self, issue: TrackerIssueRef, body: str) -> None:
+        self._tracker.edit_issue_body(issue, body)
+
+    def issue_count(self) -> int:
+        return len(self._tracker.issues())
+
+    def listing_count(self) -> int:
+        return self._tracker.linked_listings
+
+    def lag_listing(self) -> None:
+        self._tracker.hide_new_from_listing = True
+
+    def end_listing_lag(self) -> None:
+        self._tracker.hide_new_from_listing = False
+        self._tracker.show_in_listing()
+
+    def refuse_next_create(self, status: int) -> None:
+        refusals: dict[int, ForgeError] = {
+            401: Unauthorized("linked_issue"),
+            422: Unavailable("unprocessable"),
+        }
+        self._tracker.write_faults.refuse_next_write(
+            Operation.CREATE_LINKED_ISSUE, refusals[status]
+        )
+
+
+class _ObservedEvidenceCodeHost(InMemoryCodeHost):
+    """The in-memory code host, unchanged, noting which commit each evidence
+    key's ref names after every successful store or delete. The in-memory host
+    keeps no ref the harness can read from outside, so this is its stand-in."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.evidence_commits: dict[str, str] = {}
+
+    async def store_evidence(
+        self,
+        repository: RepositoryRef,
+        *,
+        key: str,
+        files: Sequence[EvidenceFile],
+        message: str,
+        stamp: datetime,
+    ) -> StoredEvidence:
+        stored = await super().store_evidence(
+            repository, key=key, files=files, message=message, stamp=stamp
+        )
+        self.evidence_commits[key] = stored.commit_sha
+        return stored
+
+    async def delete_evidence(self, repository: RepositoryRef, *, key: str) -> bool:
+        deleted = await super().delete_evidence(repository, key=key)
+        self.evidence_commits.pop(key, None)
+        return deleted
 
 
 def _github_user(actor: Actor) -> dict[str, Any]:
@@ -301,6 +476,7 @@ class GitHubHarness:
             label=LABEL,
             mention="curie",
             app_id=str(CONTRACT_APP_ID),
+            own_login=static_token(str(CONTRACT_BOT["login"])),
             page_size=2,
         )
         settings = Settings(github_api_url="https://api.github.com")
@@ -345,6 +521,19 @@ class GitHubHarness:
 
     def set_write_access(self, actor: Actor, allowed: bool) -> None:
         self.fake.permissions[actor.login] = (int(actor.id), "write" if allowed else "read")
+
+    def seed_account(self, account_id: str, login: str, *, payload_id: int | None = None) -> None:
+        """What `GET /user/{account_id}` answers; ``payload_id`` names another
+        account, the mismatch an id check must refuse (#5414).
+
+        Shape: https://docs.github.com/en/rest/users/users#get-a-user-using-their-id
+        """
+
+        self.fake.accounts[account_id] = {
+            "id": int(account_id) if payload_id is None else payload_id,
+            "login": login,
+            "type": "User",
+        }
 
     def feedback_allowlist(self) -> frozenset[str]:
         return frozenset()
@@ -393,6 +582,10 @@ class GitHubHarness:
                 number, user, text, app=False, in_reply_to=int(target.thread_id)
             )
 
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        added = self.fake.add_comment(int(issue.issue_id), _github_user(actor), body, app=False)
+        return str(added["id"])
+
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         if target.thread_id is not None:
             thread = int(target.thread_id)
@@ -410,6 +603,64 @@ class GitHubHarness:
 
     def write_count(self) -> int:
         return self.fake.writes
+
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return self.fake.push_head(branch, tree=tree)
+
+    def evidence_ref(self, key: str) -> str | None:
+        return self.fake.evidence_ref(key)
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        response = self.fake.handle(httpx.Request("GET", url))
+        return response.content if response.status_code == 200 else None
+
+    def lose_next_create_response(self) -> None:
+        self.fake.lose_write_responses(rf"^POST /repos/{REPO}/issues$")
+
+    def add_issue(self, author: Actor | None, body: str) -> TrackerIssueRef:
+        user = dict(self.fake.bot_user) if author is None else _github_user(author)
+        return self._tracker.issue(self.fake.seed_issue("Planted", body, user=user))
+
+    def marked_issue_count(self, output_identity: str) -> int:
+        embedded = self.embed_linked_marker(output_identity)
+        own = str(self.fake.bot_user["login"]).casefold()
+        return sum(
+            "pull_request" not in issue
+            and str(issue["user"]["login"]).casefold() == own
+            and ends_with_marker(issue.get("body"), embedded)
+            for issue in self.fake.issues.values()
+        )
+
+    def issue_body(self, issue: TrackerIssueRef) -> str:
+        return str(self.fake.issues[int(issue.issue_id)].get("body") or "")
+
+    def sent_issue_bodies(self) -> list[str]:
+        return [str(post["body"]) for post in self.fake.issue_posts]
+
+    def embed_linked_marker(self, output_identity: str) -> str:
+        return GitHubTracker.embed_linked_marker(output_identity)
+
+    def edit_issue_body(self, issue: TrackerIssueRef, body: str) -> None:
+        self.fake.issues[int(issue.issue_id)]["body"] = body
+
+    def issue_count(self) -> int:
+        return sum("pull_request" not in issue for issue in self.fake.issues.values())
+
+    def listing_count(self) -> int:
+        """Pages of the repository issue listing requested, not lookups."""
+
+        path = f"/repos/{REPO}/issues"
+        return sum(r.method == "GET" and r.url.path == path for r in self.fake.http_requests)
+
+    def lag_listing(self) -> None:
+        self.fake.hide_new_from_listing = True
+
+    def end_listing_lag(self) -> None:
+        self.fake.hide_new_from_listing = False
+        self.fake.hidden_from_listing.clear()
+
+    def refuse_next_create(self, status: int) -> None:
+        self.fake.fail_writes(rf"^POST /repos/{REPO}/issues$", status)
 
 
 class JiraGitHubHarness:
@@ -440,6 +691,9 @@ class JiraGitHubHarness:
         self.tracker: Tracker = jira_fake.jira_tracker(self.jira, label=LABEL)
         self.code_host: CodeHost = self._github.code_host
         self.repository = self._github.repository
+
+    def seed_account(self, account_id: str, login: str, *, payload_id: int | None = None) -> None:
+        self._github.seed_account(account_id, login, payload_id=payload_id)
 
     def check_key(self, name: str) -> str:
         return self._github.check_key(name)
@@ -498,6 +752,10 @@ class JiraGitHubHarness:
             properties={"curie.factory": {"marker": marker, "body_sha256": digest}},
         )
 
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        # One ADF paragraph of text, no mention node, by the mapped Jira person.
+        return self.jira.add_comment(issue, self.jira.user_for(actor), body)
+
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         if target.issue is None:
             return self._github.comment_bodies(target)
@@ -513,8 +771,23 @@ class JiraGitHubHarness:
     def write_count(self) -> int:
         return self.jira.writes + self._github.write_count()
 
+    def push_head_with_tree(self, branch: str, tree: str) -> str | None:
+        return self._github.push_head_with_tree(branch, tree)
+
+    def evidence_ref(self, key: str) -> str | None:
+        return self._github.evidence_ref(key)
+
+    def evidence_raw(self, url: str) -> bytes | None:
+        return self._github.evidence_raw(url)
+
 
 def _conforms(harness: InMemoryHarness | GitHubHarness | JiraGitHubHarness) -> AdapterHarness:
     """Type-checked proof that each harness satisfies the protocol."""
+
+    return harness
+
+
+def _conforms_linked(harness: InMemoryHarness | GitHubHarness) -> LinkedIssueHarness:
+    """Type-checked proof that the two linked issue pairs satisfy theirs."""
 
     return harness

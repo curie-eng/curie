@@ -664,17 +664,15 @@ deliberately — reading a binding means parsing the Slack-shaped `approvers` sc
 selection is provider-aware by nature. That placement is what keeps `authorizer.py` free of
 Slack entirely.
 
-**`GroupMembershipSource`** (`usergroups.py`) is the narrowest port, behind
-`SlackUserGroupMembers`: `async members(group_id) -> UserGroupMembership`, raising
-`UserGroupLookupError` for every mode that yields no member set. Its one implementation is
-`SlackUserGroupClient` (`slack_usergroups.py`), which reads `usergroups.users.list` with a
-bot token (`usergroups:read` scope). `build_approver_set_selector`
-(`apps/api/src/curie_api/slack_approvers.py::build_approver_set_selector`) builds one client per
-configured Slack identity, each with that identity's own token and its own cache, and the
-selector hands a user-group set the client for the identity that posted the card; the
-`default` identity's client uses `SLACK_BOT_TOKEN`. Each client caches member sets in
-process for `slack_usergroup_cache_ttl_s` (env `SLACK_USERGROUP_CACHE_TTL_S`, default 60s;
-`0` forces a per-resolve fetch).
+**`GroupMembershipSource`** is the frozen gateway port behind
+`SlackUserGroupMembers`. The gateway's `SlackUserGroupClient` reads
+`usergroups.users.list` with its own bot token. The API selector binds one
+remote membership source per declared Slack identity and retains authorization
+and freshness policy. `SLACK_USERGROUP_CACHE_TTL_S` on the API bounds acceptable
+cached evidence; zero forces `fresh_members` on every resolve. A proof requiring
+fresh membership always bypasses the provider cache. An unavailable source or a
+member missing from its answer can only narrow access.
+
 
 **`main.py` is the application composition root**: it builds the selector so the
 authorizer and resolve endpoint depend on ports rather than a provider. A second
@@ -725,7 +723,7 @@ notification contains no interaction. Email cards have a separate adapter-princi
 resolution path, checked against the served binding, its allowed callers, and the route's
 email approvers. The shipped AgentMail adapter currently refuses all inbound mail before
 approval handling because it cannot verify positive sender authentication
-(`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.handle_inbound`),
+(`packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.handle_inbound`),
 so that API path does not prove working approval replies through AgentMail.
 The policy gate `ApprovalGate`
 (`runner/src/curie_runner/approval.py::ApprovalGate`) contains no Claude SDK

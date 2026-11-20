@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import contextlib
+import functools
 import json
+import math
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from aci_protocol import (
     CHANNEL_READ_STATUS_FIELD,
@@ -17,7 +17,7 @@ from aci_protocol import (
     TurnSource,
 )
 
-from .. import caller_token, sweep
+from .. import caller_token, memory_rules_context, requester_context, sweep
 from ..approvals import (
     ApprovalBackendError,
     PublicationLineage,
@@ -31,16 +31,21 @@ from ..behaviorpacks import (
     match_help,
 )
 from ..binding import (
+    BOOT_TOKEN_GRACE_SECONDS,
     CONNECTOR_CALLER_TOKEN_ENV,
     HISTORY_TOKEN_ENV,
     MAX_TURNS_ENV,
+    REQUESTER_CALLER_TOKEN_TTL_SECONDS,
     SANDBOX_TOKEN_TTL_SECONDS,
     boot_token_facts,
+    caller_requester_facts,
 )
 from ..capacity_wait import (
     CapacityWaitExpired,
     CapacityWaitRefused,
     CapacityWaitRequested,
+    RequesterHandoffWaitRequested,
+    current_order,
     current_wait,
 )
 from ..connector_grant import mint as mint_connector_grant
@@ -50,14 +55,22 @@ from ..runner_client import (
     TurnStream,
 )
 from ..sandbox.types import (
+    ClaimProvenance,
+    PersonalCreate,
+    ProvenanceMismatch,
     RouteChangedError,
     SandboxHandle,
     SuspendedThreadError,
+    WorkItemRouteOwner,
+    provenance_admits,
 )
 from ..turn_progress import (
     ELIGIBILITY_ENV,
 )
 from ..workitem_dispatch import (
+    PREDECESSOR_RUNTIME_PRESENT,
+    RESOURCE_GATE_UNMET,
+    WorkItemConflict,
     WorkItemRun,
     WorkItemStartRefused,
 )
@@ -91,6 +104,36 @@ def _is_fenced(lease: DeliveryLease | None) -> bool:
     return lease is not None and lease.generation > 0 and bool(lease.owner)
 
 
+async def _watch_turn_before_start(
+    self: Kernel,
+    thread_key: str,
+    handle: SandboxHandle,
+    queued_event_id: str,
+    remaining_s: float | None,
+) -> None:
+    delivery_lease = constants._DELIVERY_LEASE.get()
+    if not _is_fenced(delivery_lease):
+        return
+    assert delivery_lease is not None
+    previous = await self._markers.watched_turn(handle.claim_name)
+    if previous is not None:
+        predecessor = json.loads(previous)
+        if predecessor["owner"] != delivery_lease.owner:
+            if not await self._markers.is_terminal(
+                predecessor["event_id"]
+            ) and not await self._workspace_handoff_ready(
+                handle,
+                remaining_s=remaining_s,
+                predecessor_event_id=predecessor["event_id"],
+            ):
+                raise failures.HandoffPending(
+                    f"thread {thread_key} still has an unsettled leased turn"
+                )
+    if await self._markers.saw_side_effect(queued_event_id):
+        raise failures.PriorSideEffectObserved()
+    await self._markers.watch_turn(thread_key, handle.claim_name, delivery_lease, queued_event_id)
+
+
 def _remaining_budget(lease: DeliveryLease | None) -> float | None:
     """Seconds of delivery budget left, or ``None`` for a caller with no budget.
 
@@ -101,26 +144,77 @@ def _remaining_budget(lease: DeliveryLease | None) -> float | None:
     return None if lease is None else lease.remaining_s()
 
 
+_PRINCIPAL_LESS_REQUESTERS = frozenset({caller_token.REQUESTER_ABSENT, caller_token.REQUESTER_NONE})
+
+
+def _is_requester_digest(fact: str | None) -> bool:
+    """Whether a recorded requester fact names a principal (ADR 0270 decision 3)."""
+
+    return isinstance(fact, str) and fact.startswith(caller_token.REQUESTER_DIGEST_PREFIX)
+
+
+def _requester_change(recorded: str | None, desired: str, *, enforced: bool) -> bool:
+    """Whether a route that booted for ``recorded`` must not serve ``desired``.
+
+    ADR 0270 decision 3. A digest on either side must match exactly, with or
+    without the operator flag: that is what makes a machine turn, or turning
+    the flag off, replace a person's sandbox instead of inheriting it. The two
+    principal-less facts (no cct, or a cct naming no principal) match each
+    other both ways. A route recorded before this field existed (None) cannot
+    prove a match for an opted-in turn (``enforced``) and is adopted by any
+    other as before. Any other recorded value cannot prove a match either.
+    """
+
+    if recorded is None:
+        return enforced or desired not in _PRINCIPAL_LESS_REQUESTERS
+    if recorded in _PRINCIPAL_LESS_REQUESTERS and desired in _PRINCIPAL_LESS_REQUESTERS:
+        return False
+    return recorded != desired
+
+
 def _boots_differently(
     handle: SandboxHandle,
     boot_env: Mapping[str, str] | None,
     *,
     caller_run: str | None = None,
+    requester_enforced: bool = False,
+    caller_needed: int | None = None,
+    provenance: ClaimProvenance | None = None,
 ) -> bool:
     """Whether a live runner booted with facts this delivery must not inherit.
 
     Read once at boot: ``CURIE_MAX_TURNS`` (#3071), the connector caller token
-    (ADR-0168 decision 7), and the run that token names (ADR 0178). A runner
-    claimed before the install had a caller key, or booted for a different
-    run, is replaced on the next new turn.
+    (ADR-0168 decision 7), the run that token names (ADR 0178), and the
+    requester it names (ADR 0270 decision 3). A runner claimed before the
+    install had a caller key, booted for a different run, or booted for a
+    different requester is replaced on the next new turn. ``caller_needed``
+    is the expiry a requester token must reach to cover this turn; a digest
+    route whose token does not reach it (or whose expiry is unknown) is
+    replaced too.
+
+    ``provenance`` is the personal owner this delivery runs as (#5378, ADR
+    0268), None for a service delivery: a runner that booted with another
+    owner's or generation's grant, with unknown provenance, or in the other
+    mode boots differently.
     """
 
     env = boot_env or {}
+    if not provenance_admits(provenance, handle):
+        return True
     if handle.max_turns != env.get(MAX_TURNS_ENV):
         return True
     if (ELIGIBILITY_ENV in env) != handle.carries_turn_progress:
         return True
     if handle.caller_run != caller_run:
+        return True
+    desired, _exp = caller_requester_facts(env)
+    if _requester_change(handle.caller_requester, desired, enforced=requester_enforced):
+        return True
+    if (
+        caller_needed is not None
+        and _is_requester_digest(handle.caller_requester)
+        and (handle.caller_token_exp is None or handle.caller_token_exp < caller_needed)
+    ):
         return True
     # #3823: replace a warm sandbox whose boot token cannot cover the turn
     # this delivery is about to boot. Comparing with the new token expiry
@@ -135,21 +229,140 @@ def _boots_differently(
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 
-def _caller_token_exp(token: str) -> int | None:
-    """The ``exp`` claim of a caller token, or None when the token is unreadable."""
+def _requester_turn_cap_s(self: Kernel) -> float:
+    """The longest runtime bound a principal-bearing turn may have.
 
-    parts = token.split(".")
-    if len(parts) != 3:
+    ADR 0270 decision 3: the requester cct lives one hour from its claim-time
+    mint, and a cold claim and the boot grace come out of that hour before
+    the turn can start.
+    """
+
+    return float(
+        REQUESTER_CALLER_TOKEN_TTL_SECONDS
+        - BOOT_TOKEN_GRACE_SECONDS
+        - self._substrate.claim_timeout_seconds
+    )
+
+
+def _requester_turn_budget(self: Kernel, remaining_s: float | None) -> float:
+    """``remaining_s`` capped at the requester window (ADR 0270 decision 3).
+
+    Passing the capped budget to the runner bounds the turn's stream deadline,
+    and every credential minted from the same budget, to the window.
+    """
+
+    cap = _requester_turn_cap_s(self)
+    return cap if remaining_s is None else min(remaining_s, cap)
+
+
+def _requester_window_s(handle: SandboxHandle) -> float | None:
+    """What the sandbox's credentials leave for a requester turn opened now.
+
+    ADR 0270 decision 3: the earliest expiry among the credentials the turn
+    depends on, less now and the boot grace. That is the requester cct and,
+    when the route records it, the boot state token the history and state
+    calls carry (#3823), which is minted before the claim and so usually ends
+    first. None for a route that did not boot with a requester digest. A digest
+    route whose cct expiry is unknown has no window at all.
+    """
+
+    if not _is_requester_digest(handle.caller_requester):
         return None
-    try:
-        padded = parts[1] + "=" * (-len(parts[1]) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded))
-    except (ValueError, binascii.Error):
-        return None
-    exp = payload.get("exp") if isinstance(payload, dict) else None
-    if type(exp) is not int:
-        return None
-    return exp
+    if handle.caller_token_exp is None:
+        return 0.0
+    expiry = handle.caller_token_exp
+    if handle.state_token_exp is not None:
+        expiry = min(expiry, handle.state_token_exp)
+    return expiry - clock.time.time() - BOOT_TOKEN_GRACE_SECONDS
+
+
+def _bound_requester_turn(
+    self: Kernel, handle: SandboxHandle, remaining_s: float | None
+) -> tuple[float | None, bool]:
+    """The budget a turn on ``handle`` opens with, and whether the window bounds it.
+
+    ADR 0270 decision 3. A turn on a route that booted with a requester digest
+    runs for at most min(its configured bound, the static window cap, what the
+    sandbox's own token has left after the boot grace). A slow claim therefore
+    shortens the turn instead of refusing it. Only a window below the kernel's
+    minimum attempt budget (or an unknown expiry) refuses, with the retryable
+    ``RequesterTokenWindowShort``, whose retry boots a fresh token. Called
+    before the turn's credentials are minted and again immediately before the
+    runner start. Log lines name the thread and the bounds, never the
+    requester. Any other route is unchanged.
+    """
+
+    window = _requester_window_s(handle)
+    if window is None:
+        return remaining_s, False
+    if window < constants._MIN_ATTEMPT_BUDGET_S:
+        logger.warning(
+            "turn start refused for thread %s before any runner request: "
+            "reason=requester_token_window_short",
+            handle.thread_key,
+        )
+        raise failures.RequesterTokenWindowShort()
+    configured = self._runner.turn_deadline_s(remaining_s)
+    cap = min(_requester_turn_cap_s(self), window)
+    if configured <= cap:
+        return remaining_s, False
+    logger.info(
+        "requester turn on thread %s bounded to %.0fs by the requester token window "
+        "(configured bound %.0fs)",
+        handle.thread_key,
+        cap,
+        configured,
+    )
+    return (cap if remaining_s is None else min(remaining_s, cap)), True
+
+
+def _requester_needed_exp(self: Kernel, remaining_s: float | None, run: WorkItemRun | None) -> int:
+    """The expiry a requester token must reach to cover a turn opened now.
+
+    ADR 0270 decision 3: now, plus the turn's runtime bound for this budget
+    capped at the requester window, plus the boot grace, lowered to the run's
+    execution deadline when the delivery owns one (the turn cannot outlive it).
+    """
+
+    needed = (
+        int(clock.time.time())
+        + math.ceil(self._runner.turn_deadline_s(_requester_turn_budget(self, remaining_s)))
+        + BOOT_TOKEN_GRACE_SECONDS
+    )
+    deadline = run.execution_deadline if run is not None else None
+    if deadline is not None:
+        needed = min(needed, int(deadline.timestamp()))
+    return needed
+
+
+def _requester_handoff_pending(thread_key: str, queued_event_id: str) -> BaseException:
+    """Log a different-requester deferral and return the exception to raise.
+
+    The line names the event and the thread only, never the requester or its
+    digest. ADR 0270 decision 3: a delivery that can park asks the consumer
+    for a durable requester handoff wait, also when it is already a woken
+    capacity or thread order wait, so the wait leaves the thread order and the
+    live turn's requester keeps steering. The consumer opens this delivery's
+    thread order scope exactly when ``can_park`` holds for it, so that scope
+    is the kernel's proof. Inside any other wait the deferral is that wait's
+    own retry, and any other delivery (an approval resume, a factory turn, a
+    direct kernel caller) keeps the pending deferral.
+    """
+
+    logger.info(
+        "requester handoff pending for event %s on thread %s: "
+        "a different requester's turn is live; deferring without steering",
+        queued_event_id,
+        thread_key,
+    )
+    ordering = current_order()
+    if ordering is not None and ordering[1] == queued_event_id:
+        return RequesterHandoffWaitRequested()
+    if current_wait() is not None:
+        return CapacityWaitRequested()
+    return failures.RequesterHandoffPending(
+        f"thread {thread_key} has a live turn for a different requester; deferring"
+    )
 
 
 def _connector_tool_grant(
@@ -181,6 +394,97 @@ def _connector_tool_grant(
         exp=int(clock.time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
         jti=str(uuid.uuid4()),
     )
+
+
+_SUBSTRATE_GATE_DIMENSIONS = frozenset({"memory", "ephemeral_storage", "scratch"})
+
+
+def _positive_int(raw: str | None) -> int | None:
+    if raw is None or not raw.isascii() or not raw.isdigit():
+        return None
+    value = int(raw)
+    return value if value >= 1 else None
+
+
+async def _defer_unstarted(run: WorkItemRun, reason: str) -> NoReturn:
+    """Defer an unstarted request uncounted and end this delivery without a turn."""
+
+    try:
+        await run.defer(reason, capacity=False, start_failure_detail=None)
+    except WorkItemConflict as exc:
+        logger.info("work-item %s defer refused for %s: %s", reason, run.request_id, exc.code)
+    raise failures._WorkItemDeferred()
+
+
+async def _admit_resource_successor(
+    self: Kernel,
+    run: WorkItemRun,
+    thread_key: str,
+    *,
+    boot_env: dict[str, str] | None,
+    workspace_repo: str | None,
+    agent_name: str | None,
+    runner_resources: dict[str, Any] | None,
+) -> None:
+    """ADR 0269 (#5427): what a resource successor proves before it claims anything.
+
+    First its failed predecessor's runtime is fenced: released if the thread's
+    route still names it, then confirmed gone. Then a gated request needs no
+    live route on the thread and a current limit strictly greater than the one
+    its predecessor failed under, resolved the way the next claim would
+    resolve it. Either short of that defers uncounted and creates nothing.
+    """
+
+    predecessor = run.predecessor_claim_name
+    if predecessor is not None and not await asyncio.to_thread(
+        self._substrate.predecessor_absent, thread_key, predecessor
+    ):
+        logger.info(
+            "work-item %s waits for predecessor runtime %s to be gone",
+            run.request_id,
+            predecessor,
+        )
+        await _defer_unstarted(run, PREDECESSOR_RUNTIME_PRESENT)
+    gate = run.resource_gate
+    if gate is None:
+        return
+    live = await asyncio.to_thread(self._substrate.lookup, thread_key)
+    current: int | None
+    if live is not None:
+        current = None
+    elif gate.dimension in _SUBSTRATE_GATE_DIMENSIONS:
+        current = await asyncio.to_thread(
+            functools.partial(
+                self._substrate.resource_gate_readiness,
+                gate,
+                env=boot_env,
+                workspace_repo=workspace_repo,
+                agent_name=agent_name,
+                runner_resources=runner_resources,
+            )
+        )
+    elif gate.dimension == "max_turns":
+        current = _positive_int((boot_env or {}).get(MAX_TURNS_ENV))
+    else:
+        current = gate.current_limit
+    if current is not None and current > gate.failed_limit:
+        logger.info(
+            "resource gate %s met for %s: failed limit %d, current limit %d",
+            gate.condition,
+            run.request_id,
+            gate.failed_limit,
+            current,
+        )
+        return
+    logger.info(
+        "resource gate %s unmet for %s: failed limit %d, current limit %s%s",
+        gate.condition,
+        run.request_id,
+        gate.failed_limit,
+        current,
+        "; a live route holds the thread" if live is not None else "",
+    )
+    await _defer_unstarted(run, RESOURCE_GATE_UNMET)
 
 
 async def _route_and_start(
@@ -229,6 +533,12 @@ async def _route_and_start(
     if owned_run is not None and owned_run.agent_id != agent_id:
         raise WorkItemStartRefused("factory_agent_mismatch")
     caller_run = str(owned_run.request_id) if owned_run is not None else None
+    # #5429: a publication recovery run never steers and never opens a turn.
+    recovery = owned_run is not None and owned_run.is_publication_recovery
+    # #5378: whose grant a runtime for this delivery boots with. None is a
+    # service delivery, which never inherits a personal runtime either.
+    launch = constants._PERSONAL_LAUNCH.get()
+    desired_provenance = None if launch is None else launch.provenance
     lineage: PublicationLineage | None = None
     if workspace_deployment_id is not None:
         # The API already bound a verified review to its persisted thread
@@ -363,6 +673,17 @@ async def _route_and_start(
         # repository record remains authority for this refusal, so an
         # approval resume cannot rebuild a workspace route as generic.
         raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
+    if owned_run is not None and not owned_run.started:
+        # Before the route snapshot, any claim and any capacity preflight.
+        await _admit_resource_successor(
+            self,
+            owned_run,
+            thread_key,
+            boot_env=boot_env,
+            workspace_repo=workspace_repo,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+        )
     existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
     # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
     # route lock, if an enabled greeting/help pack matches the message text AND
@@ -388,6 +709,30 @@ async def _route_and_start(
             or existing_handle.publication_visible_outcome_revision
             != publication_visible_outcome_revision
         )
+    # ADR 0270 decision 3: the requester this delivery's boot env names, and
+    # whether it is an opted-in turn (which cannot adopt an unrecorded route).
+    # Compared with the route record under this per-thread lock, before any
+    # steer, against the snapshot and again against the claimed handle.
+    from .identity import requester_enforced
+
+    enforced = requester_enforced()
+    desired_requester, _desired_exp = caller_requester_facts(boot_env)
+    # ADR 0270 decision 3: an opted-in approval resume boots with a fresh
+    # short-lived credential for the original requester, so it never adopts a
+    # live warm route (a failed suspend leaves the paused runner live). The
+    # snapshot's route is replaced through the turn budget handoff below, whose
+    # fence accepts the paused runner's ``awaiting-approval`` status, and a
+    # claim with no route to replace refuses a live route instead of adopting
+    # it. A flag-off resume adopts as before.
+    resume_replaces = approval_resume and enforced
+
+    def caller_needed_for(candidate: SandboxHandle) -> int | None:
+        # Only a requester route has a token window to cover; computed for
+        # this turn, never read from the env's own (possibly stale) token.
+        if not _is_requester_digest(candidate.caller_requester):
+            return None
+        return self._requester_needed_exp(remaining_s, owned_run)
+
     continuation = (
         source is TurnSource.CRON and sweep.parse_continuation(queued_event_id) is not None
     )
@@ -395,7 +740,14 @@ async def _route_and_start(
         existing_handle is None
         or force_lineage_replacement
         or (workspace_repo is not None and existing_handle.workspace_repo != workspace_repo)
-        or _boots_differently(existing_handle, boot_env, caller_run=caller_run)
+        or _boots_differently(
+            existing_handle,
+            boot_env,
+            caller_run=caller_run,
+            requester_enforced=enforced,
+            caller_needed=caller_needed_for(existing_handle),
+            provenance=desired_provenance,
+        )
     ):
         # ADR-0160: a sweep continues only on the claim it already holds.
         # Any state that would claim, resume or hand off a sandbox stops it.
@@ -412,7 +764,7 @@ async def _route_and_start(
             pending_publication_approval=pending_publication_approval,
         )
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable lineage handoff boundary"
         )
     if (
@@ -430,11 +782,29 @@ async def _route_and_start(
         and workspace_repo is not None
         and existing_handle is not None
         and existing_handle.workspace_repo is None
-        and not await self._workspace_handoff_ready(existing_handle, remaining_s=remaining_s)
+        and not await self._workspace_handoff_ready(
+            existing_handle,
+            remaining_s=remaining_s,
+            # ADR 0270 decision 3: a replacing resume meets its paused runner.
+            lineage_reconciliation=resume_replaces,
+        )
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable workspace handoff boundary"
         )
+    # ADR 0270 decision 3: a different requester never steers into, adopts or
+    # interrupts another person's live turn. It defers here, before the turn
+    # budget block below would keep the route to steer a live turn. An
+    # unreadable runner counts as live. An idle route is replaced below
+    # through the same durable handoff a turn budget change uses.
+    if (
+        existing_handle is not None
+        and _requester_change(
+            existing_handle.caller_requester, desired_requester, enforced=enforced
+        )
+        and await self._turn_active(existing_handle, remaining_s=remaining_s)
+    ):
+        raise _requester_handoff_pending(thread_key, queued_event_id)
     # Turn budget fence (#3071), generalized to a runner booted without a
     # caller token (ADR-0168 decision 7). CURIE_MAX_TURNS and the caller
     # token both bind only at boot, so a live route booted with a
@@ -444,12 +814,26 @@ async def _route_and_start(
     # message arriving while a turn is live keeps the one-live-session
     # rule instead: it adopts and steers, and the replacement applies
     # from the next new turn.
-    turn_budget_replacement = existing_handle is not None and _boots_differently(
-        existing_handle, boot_env, caller_run=caller_run
+    turn_budget_replacement = existing_handle is not None and (
+        resume_replaces
+        or _boots_differently(
+            existing_handle,
+            boot_env,
+            caller_run=caller_run,
+            requester_enforced=enforced,
+            caller_needed=caller_needed_for(existing_handle),
+            provenance=desired_provenance,
+        )
     )
     if (
         turn_budget_replacement
         and existing_handle is not None
+        # A replacing resume never keeps the route to steer a live turn: the
+        # fence below refuses a live runner, and the redelivery replaces it.
+        and not resume_replaces
+        # #5378: nor does a runtime of another owner, generation or mode. Its
+        # live turn is never steered; the fence below waits it out.
+        and provenance_admits(desired_provenance, existing_handle)
         and not source.is_job
         and verified_review is None
         and await self._turn_active(existing_handle, remaining_s=remaining_s)
@@ -458,9 +842,16 @@ async def _route_and_start(
     if (
         turn_budget_replacement
         and existing_handle is not None
-        and not await self._workspace_handoff_ready(existing_handle, remaining_s=remaining_s)
+        and not await self._workspace_handoff_ready(
+            existing_handle,
+            remaining_s=remaining_s,
+            # The fence's only use of this flag is to also accept an idle
+            # ``awaiting-approval`` runner with durable history: exactly the
+            # paused runner a replacing resume continues (ADR 0270 decision 3).
+            lineage_reconciliation=resume_replaces,
+        )
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable turn budget handoff boundary"
         )
     # @spec WORKER-TOOL-ACCESS-3: a restricted turn never gets a canned reply.
@@ -538,7 +929,7 @@ async def _route_and_start(
             # path asks it; it evicts exactly what that claim would evict.
             # Same condition ``_claim_or_resume`` uses to take that path.
             if workspace_repo is not None and workspace_deployment_id is not None:
-                boots = await asyncio.to_thread(self._substrate.adopt, thread_key) is None
+                boots = await _adopt(self, thread_key) is None
             else:
                 boots = await asyncio.to_thread(self._substrate.lookup, thread_key) is None
         if (
@@ -583,9 +974,23 @@ async def _route_and_start(
                 agent_name=agent_name,
                 runner_resources=runner_resources,
                 remaining_s=remaining_s,
-                attachment_fresh_only=attachment_fresh_only,
+                # ADR 0270 decision 3: a replacing resume with no route to
+                # replace never adopts one that appeared since the snapshot.
+                # The claim refuses it (a retryable RouteChangedError) and the
+                # retry's snapshot replaces it through the handoff above.
+                attachment_fresh_only=(
+                    attachment_fresh_only or (resume_replaces and replace_handle is None)
+                ),
                 caller_run=caller_run,
+                resume_replacement=resume_replaces,
             )
+            # ADR 0270 decision 3: the claimed handle, not only the snapshot.
+            # A claim can adopt a live route the snapshot never saw (no route
+            # then a concurrent one, or the workspace adopt). A fresh boot or
+            # handoff records this env's own requester, so this never fires
+            # there.
+            if _requester_change(handle.caller_requester, desired_requester, enforced=enforced):
+                raise _requester_handoff_pending(thread_key, queued_event_id)
         except Exception:
             if thread_set is not None:
                 await self._discard_unclaimed_thread_set(thread_key, thread_set, existing_handle)
@@ -723,6 +1128,18 @@ async def _route_and_start(
     if inferred is not None:
         workspace_inference.repo = inferred
     self._log_claim_latency(thread_key, claim_started)
+    # #5378: before any steer or turn start, the runtime is this delivery's
+    # own (a continuation adopts without claiming, and a claim can adopt a
+    # route the snapshot never saw), and a personal request is authorized
+    # afresh: the owner rows, the enrollment and this worker's authority.
+    if launch is not None and owned_run is not None:
+        await asyncio.to_thread(
+            self._substrate.bind_work_item,
+            thread_key,
+            handle.claim_name,
+            WorkItemRouteOwner(str(owned_run.request_id), owned_run.generation, owned_run.owner),
+        )
+    await _authorize_turn_start(handle)
     if wait is not None:
         # A capacity wake may meet a different live turn on this thread.
         # Keep its original deadline and retry after that turn finishes;
@@ -759,7 +1176,7 @@ async def _route_and_start(
                 or capacity_status.get("turn_active") is not False
             ):
                 raise CapacityWaitRequested()
-    elif source.is_job or verified_review is not None or event.tool_access is not None:
+    elif source.is_job or verified_review is not None or event.tool_access is not None or recovery:
         # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
         # a webhook must never fold itself into whatever a person is currently
         # saying. A verified review likewise owns a separately reserved
@@ -803,6 +1220,9 @@ async def _route_and_start(
         await check(self, "steer")
         active_before_steer = False
         live_turn_before_steer: str | None = None
+        # The raw epoch of the live turn a steer would join, kept in memory
+        # only: it is that turn's private timeout credential.
+        steered_turn_epoch: object = None
         channel_read_supported = False
         if retained_live_route:
             try:
@@ -832,6 +1252,7 @@ async def _route_and_start(
                 # the steer both run under the per-thread lock, so no other
                 # attempt can open a turn on this thread between them.
                 live_turn_before_steer = memory._live_memory_turn(status.get("turn_epoch"))
+                steered_turn_epoch = status.get("turn_epoch")
                 # ADR 0100: renew the channel read capability only for a
                 # runner that enforces it; any other answer clears it.
                 channel_read_supported = status.get(CHANNEL_READ_STATUS_FIELD) is True
@@ -879,10 +1300,20 @@ async def _route_and_start(
             # fallback as a 409; never send a null-authority steer to a live turn.
             steered = False
         else:
+            lease = constants._DELIVERY_LEASE.get()
+            if (
+                _is_fenced(lease)
+                and lease is not None
+                and lease.generation > 1
+                and await self._markers.saw_side_effect(queued_event_id)
+            ):
+                raise failures.PriorSideEffectObserved()
             steered = await self._runner.steer(
                 handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
             )
         if steered:
+            # ADR 0270 decision 3 [D2]: a lost lease stops this joined turn.
+            await self._own_execution(handle, steered_turn_epoch if active_before_steer else None)
             memory_turns = constants._MEMORY_TURNS.get()
             if memory_turns is not None:
                 memory_turns.steered_into = live_turn_before_steer
@@ -904,7 +1335,18 @@ async def _route_and_start(
         # caller token both bind at boot, so a new turn must not open on
         # this runner. Retry: the redelivery finds the turn idle and
         # takes the replacement path above.
-        if _boots_differently(handle, boot_env, caller_run=caller_run):
+        # A fresh or replacement runner booted with this very env, so only a
+        # retained route can boot differently here. Its token window is
+        # judged only there too: a fresh claim whose window is already short
+        # is refused by the admission check, a retryable runner error.
+        if _boots_differently(
+            handle,
+            boot_env,
+            caller_run=caller_run,
+            requester_enforced=enforced,
+            caller_needed=caller_needed_for(handle) if retained_live_route else None,
+            provenance=desired_provenance,
+        ):
             raise failures.ThreadBusyError(
                 f"thread {thread_key} turn ended before its steer; "
                 "retrying to replace the runner's turn budget or caller token"
@@ -952,10 +1394,30 @@ async def _route_and_start(
     if run is not None and run.finished:
         raise WorkItemStartRefused("work item authority is finished")
     if run is not None and not run.started:
-        started = await run.start(
-            claim_name=handle.claim_name,
-            sandbox_name=handle.sandbox_name,
+        # ADR 0269 (#5427): what this runtime was actually given, read from
+        # the created pod. An unread pod sends nulls, which release nothing.
+        delivered = await asyncio.to_thread(
+            functools.partial(
+                self._substrate.delivered_limits,
+                handle,
+                max_turns=_positive_int(handle.max_turns),
+            )
         )
+        try:
+            started = await run.start(
+                claim_name=handle.claim_name,
+                sandbox_name=handle.sandbox_name,
+                delivered_limits=delivered.to_wire(),
+            )
+        except WorkItemStartRefused as exc:
+            if exc.code != RESOURCE_GATE_UNMET:
+                raise
+            # The limit fell back between the gate and the start. Give the
+            # unstarted claim back and wait again, uncounted.
+            from .work_items import _release_claim
+
+            await _release_claim(self, thread_key, handle.claim_name)
+            await _defer_unstarted(run, RESOURCE_GATE_UNMET)
         remaining_s = (
             started.remaining_s if remaining_s is None else min(remaining_s, started.remaining_s)
         )
@@ -996,10 +1458,39 @@ async def _route_and_start(
         if run.event_id == queued_event_id:
             run.claim_name = handle.claim_name
             run.sandbox_name = handle.sandbox_name
+    if run is not None and run.event_id == queued_event_id and run.is_publication_recovery:
+        # #5429: the started, booted runtime is the validation runtime. No
+        # requester context, publication context or turn: the attempt reads
+        # the retained candidate instead (kernel/publication_recovery.py).
+        routing._record_route("publication-recovery")
+        return routing._RouteResult(steered=False, handle=handle)
     if agent_id is not None:
         self._register_run(agent_id, thread_key)
     turn: TurnStream | None = None
     try:
+        # ADR 0278 (#5592): the request's pinned requester context is
+        # delivered, validated and acknowledged before its first turn, on
+        # every handle this run's event starts on; a refusal fails it here.
+        work_items = getattr(self, "_work_items", None)
+        if run is not None and run.event_id == queued_event_id and work_items is not None:
+            await requester_context.deliver(
+                work_items=work_items,
+                runner=self._runner,
+                run=run,
+                base_url=handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
+            # #5798: the pinned learned rules travel beside the requester
+            # context, never inside it, and are acknowledged before the turn.
+            await memory_rules_context.deliver(
+                work_items=work_items,
+                runner=self._runner,
+                run=run,
+                base_url=handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
         event, remaining_s = await self._bind_publication_context(
             event,
             queued_event_id=queued_event_id,
@@ -1009,6 +1500,7 @@ async def _route_and_start(
             remaining_s=remaining_s,
         )
         wait_budget_s = await check_capacity_before_request()
+        await _watch_turn_before_start(self, thread_key, handle, queued_event_id, remaining_s)
         if wait is None:
             turn = await self._start_turn_under_hook_control(handle, event, remaining_s)
         elif wait_budget_s is None:
@@ -1111,6 +1603,13 @@ async def _cap_caller_token_to_deadline(
     Writes the corrected token back onto ``boot_env`` so a later claim of
     this same env, including a retry after the request has already started,
     does not restore the provisional expiry.
+
+    ADR 0270 decision 3: the re-signed token keeps the exact principal the
+    original carried and is only ever shorter: at most the signed expiry, the
+    deadline, and one hour from now with a principal (24 hours without). A
+    principal that cannot be read exactly raises ``ValueError`` before
+    anything changes; there is no fallback to a principal-less or longer
+    token.
     """
 
     if boot_env is None or run.execution_deadline is None:
@@ -1120,16 +1619,23 @@ async def _cap_caller_token_to_deadline(
     if not isinstance(agent_name, str) or not agent_name:
         return handle
     token = boot_env.get(CONNECTOR_CALLER_TOKEN_ENV)
-    signed_exp = _caller_token_exp(token) if isinstance(token, str) else None
+    if not isinstance(token, str):
+        return handle
+    _requester, signed_exp = caller_token.unsigned_facts(token)
     deadline_unix = int(run.execution_deadline.timestamp())
     if signed_exp is None or signed_exp <= deadline_unix:
         return handle
+    principal = caller_token.principal_of(token)
+    lifetime = (
+        SANDBOX_TOKEN_TTL_SECONDS if principal is None else REQUESTER_CALLER_TOKEN_TTL_SECONDS
+    )
     boot_env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token.mint(
         self._config.connector_caller_signing_key,
         agent=agent_name,
-        exp=min(int(clock.time.time()) + SANDBOX_TOKEN_TTL_SECONDS, deadline_unix),
+        exp=min(signed_exp, deadline_unix, int(clock.time.time()) + lifetime),
         run=str(run.request_id),
         work_item=str(run.work_item_id),
+        principal=principal,
     )
     replaced = await self._claim_or_resume(
         thread_key,
@@ -1170,6 +1676,98 @@ async def _claim_or_resume(
     remaining_s: float | None = None,
     attachment_fresh_only: bool = False,
     caller_run: str | None = None,
+    resume_replacement: bool = False,
+) -> SandboxHandle:
+    """Adopt, claim, resume or hand off the thread's runtime.
+
+    The one choke point every runtime of a personal request passes (#5378):
+    a delivery carrying a personal launch is authorized afresh at entry, and
+    any create below runs under that launch's owner lease, released here.
+    """
+
+    launch = constants._PERSONAL_LAUNCH.get()
+    guard = None if launch is None else launch.guard(asyncio.get_running_loop())
+    try:
+        return await _claim_or_resume_as(
+            self,
+            thread_key,
+            boot_env,
+            personal=guard,
+            workspace_deployment_id=workspace_deployment_id,
+            workspace_repo=workspace_repo,
+            replace_handle=replace_handle,
+            lineage_branch=lineage_branch,
+            lineage_head=lineage_head,
+            lineage_base_sha=lineage_base_sha,
+            publication_visible_outcome_revision=publication_visible_outcome_revision,
+            force_lineage_replacement=force_lineage_replacement,
+            pending_publication_approval=pending_publication_approval,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+            remaining_s=remaining_s,
+            attachment_fresh_only=attachment_fresh_only,
+            caller_run=caller_run,
+            resume_replacement=resume_replacement,
+        )
+    finally:
+        if guard is not None:
+            await guard.close()
+
+
+async def _authorize_turn_start(handle: SandboxHandle) -> None:
+    """Refuse a steer or turn start on a runtime this delivery may not use (#5378).
+
+    The runtime must have booted with this delivery's provenance (none for a
+    service delivery), and a personal request is authorized afresh. Raises
+    ``PersonalLaunchRefused``, which the delivery settles.
+    """
+
+    launch = constants._PERSONAL_LAUNCH.get()
+    if not provenance_admits(None if launch is None else launch.provenance, handle):
+        raise ProvenanceMismatch()
+    if launch is not None:
+        await launch.authorize()
+
+
+async def _adopt(self: Kernel, thread_key: str) -> SandboxHandle | None:
+    """``substrate.adopt`` with this delivery's provenance (#5378)."""
+
+    launch = constants._PERSONAL_LAUNCH.get()
+    if launch is None:
+        return await asyncio.to_thread(self._substrate.adopt, thread_key)
+    return await asyncio.to_thread(
+        functools.partial(self._substrate.adopt, thread_key, provenance=launch.provenance)
+    )
+
+
+def _personal_kwargs(personal: PersonalCreate | None) -> dict[str, Any]:
+    """Passed only for a personal create, so a substrate or workspace double
+    that predates the keyword keeps serving service claims unchanged."""
+
+    return {} if personal is None else {"personal": personal}
+
+
+async def _claim_or_resume_as(
+    self: Kernel,
+    thread_key: str,
+    boot_env: dict[str, str] | None,
+    *,
+    personal: PersonalCreate | None,
+    workspace_deployment_id: uuid.UUID | None,
+    workspace_repo: str | None,
+    replace_handle: SandboxHandle | None,
+    lineage_branch: str | None,
+    lineage_head: str | None,
+    lineage_base_sha: str | None,
+    publication_visible_outcome_revision: int,
+    force_lineage_replacement: bool,
+    pending_publication_approval: bool,
+    agent_name: str | None,
+    runner_resources: dict[str, Any] | None,
+    remaining_s: float | None,
+    attachment_fresh_only: bool,
+    caller_run: str | None,
+    resume_replacement: bool,
 ) -> SandboxHandle:
     wait = current_wait()
     previous_handle: SandboxHandle | None = None
@@ -1210,6 +1808,11 @@ async def _claim_or_resume(
     from .identity import check
 
     await check(self, "claim_or_resume")
+    # #5378: fresh SQL at every claim, adopt, resume and handoff, including
+    # the credential-capping re-claim after the API start.
+    launch = constants._PERSONAL_LAUNCH.get()
+    if launch is not None:
+        await launch.authorize()
     if workspace_deployment_id is not None:
         handoff_budget_started = clock.time.monotonic()
 
@@ -1227,7 +1830,7 @@ async def _claim_or_resume(
             )
         existing = None
         if not force_lineage_replacement:
-            existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
+            existing = await _adopt(self, thread_key)
         if attachment_fresh_only and existing is not None:
             # A runner appeared after the attachment lookup; it never saw
             # the staged files, so refuse rather than adopt it (#2739).
@@ -1292,7 +1895,9 @@ async def _claim_or_resume(
                     lambda probe_remaining_s: self._workspace_handoff_ready(
                         replace_handle,
                         remaining_s=probe_remaining_s,
-                        lineage_reconciliation=force_lineage_replacement,
+                        # ADR 0270 decision 3: a replacing approval resume
+                        # meets its paused ``awaiting-approval`` runner.
+                        lineage_reconciliation=(force_lineage_replacement or resume_replacement),
                         pending_publication_approval=pending_publication_approval,
                     ),
                     failure=(
@@ -1300,7 +1905,7 @@ async def _claim_or_resume(
                     ),
                 )
                 if not ready:
-                    raise failures.ThreadBusyError(
+                    raise failures.HandoffPending(
                         f"thread {thread_key} lost its durable workspace "
                         "handoff boundary during preparation"
                     )
@@ -1373,6 +1978,7 @@ async def _claim_or_resume(
                 fresh_only=attachment_fresh_only,
                 caller_run=caller_run,
                 **identity_arguments,
+                **_personal_kwargs(personal),
             )
         except asyncio.CancelledError:
             # @spec HTTP-INVOCATION-EXECUTION-18: only unfinished cancellation ends this carry.
@@ -1397,6 +2003,7 @@ async def _claim_or_resume(
             agent_name=agent_name,
             runner_resources=runner_resources,
             caller_run=caller_run,
+            **_personal_kwargs(personal),
         )
         return await validate_wait_claim(handle)
     try:
@@ -1408,6 +2015,7 @@ async def _claim_or_resume(
             runner_resources=runner_resources,
             fresh_only=attachment_fresh_only,
             caller_run=caller_run,
+            **_personal_kwargs(personal),
         )
         return await validate_wait_claim(handle)
     except SuspendedThreadError:
@@ -1423,6 +2031,7 @@ async def _claim_or_resume(
             agent_name=agent_name,
             runner_resources=runner_resources,
             caller_run=caller_run,
+            **_personal_kwargs(personal),
         )
         return await validate_wait_claim(handle)
 

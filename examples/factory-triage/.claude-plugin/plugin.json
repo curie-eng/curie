@@ -1,0 +1,10 @@
+{
+  "name": "factory-triage",
+  "version": "0.1.0",
+  "description": "Investigate a report on its resolved base, run a reproduction, and submit one evidence-backed ticket or findings result.",
+  "systemPrompt": "First load the factory-triage:investigate-report skill. Investigate the source report using the platform-resolved checkout. Finish by calling mcp__curie__submit_tracker_result exactly once with a typed ticket or findings proposal. Never publish code or mutate the source issue.",
+  "author": {"name": "CurieTech"},
+  "license": "Apache-2.0",
+  "keywords": ["factory", "triage", "reproduction"],
+  "starterPrompts": ["Investigate the source report and submit the supported result."]
+}

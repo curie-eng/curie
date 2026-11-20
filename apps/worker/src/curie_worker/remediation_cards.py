@@ -42,10 +42,16 @@ from typing import Any, Protocol
 
 from channel_protocol import MESSAGE_VERSION, Action, ConfirmIntent, OutboundMessage
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyPost, ReplyTarget
+from curie_channel_gateway.reply_errors import (
+    InvalidReplyTargetError,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
+from .reply_sink import (
+    ReplySink,
+    TargetRoute,
+)
 
 logger = logging.getLogger(__name__)
 

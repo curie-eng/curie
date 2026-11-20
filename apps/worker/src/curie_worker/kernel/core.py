@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from typing import TYPE_CHECKING
 
 from ..actions import ActionRecorder
 from ..approval_cards import ApprovalCardStore
@@ -53,11 +54,13 @@ from . import (
     channel_read,
     claim,
     completion,
+    constants,
     delivery,
     hooks,
     lifecycle,
     memory,
     publication,
+    publication_recovery,
     route_tokens,
     routing,
     sweep_slices,
@@ -65,6 +68,12 @@ from . import (
     workspace,
 )
 from .work_items import _SettlingWorkItem
+
+if TYPE_CHECKING:
+    from ..factory_steering import FactorySteeringClient
+    from ..personal_execution import PersonalExecution
+    from ..publication_candidate_capture import PublicationCandidateCapture
+    from ..publication_candidate_storage import CandidateReader
 
 
 class Kernel:
@@ -105,6 +114,10 @@ class Kernel:
         progress: ProgressStore | None = None,
         bundles: BundleReader | None = None,
         recovery: WorkspaceRecoveryCapture | None = None,
+        publication_candidates: PublicationCandidateCapture | None = None,
+        publication_candidate_reader: CandidateReader | None = None,
+        factory_steering: FactorySteeringClient | None = None,
+        personal_execution: PersonalExecution | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -143,6 +156,14 @@ class Kernel:
         # The terminal recovery capture (ADR 0251, #5143). None, the default and
         # the disabled configuration, keeps every release on the plain path.
         self._recovery = recovery
+        # The publication candidate capture (#5428). None, the default and the
+        # disabled configuration, validates every publication snapshot exactly
+        # as before; wired, a started WorkItem run's snapshot is retained first.
+        self._publication_candidates = publication_candidates
+        # The candidate reader a publication recovery run reads its one
+        # retained candidate through (#5429). None refuses every recovery run
+        # ``recovery_unavailable``; no other run reads it.
+        self._publication_candidate_reader = publication_candidate_reader
         # The inbound-attachment lane (#2567), optional on exactly the same
         # terms as the workspace lane above: a deployment that has not wired it
         # runs every turn unchanged rather than discovering a missing attribute.
@@ -188,6 +209,14 @@ class Kernel:
         self._sibling_limit = sibling_limit
         # Deliberate progress (ADR 0130). None sends no capability to any turn.
         self._progress = progress
+        # Factory run steering (#5414). None leaves every Slack turn on the
+        # ordinary path; wired, a mention in a factory run's Slack root is
+        # answered by the API's steering decision and never claims a sandbox.
+        self._factory_steering = factory_steering
+        # The personal execution authority (#5378, ADR 0268). Every production
+        # entry point wires it; a WorkItem request is then launched only as the
+        # owner its own snapshot names. None (a unit harness) enforces nothing.
+        self._personal_execution = personal_execution
         # ADR 0100: where a turn's channel read grant is read from (the stored
         # bundle's manifest). None means the grant is never known locally.
         self._bundles = bundles
@@ -256,6 +285,11 @@ class Kernel:
         # cancelled turn clears its own entry in ``process_event``'s finally, and
         # a FAILED one is cleared by the notice that reads it.
         self._terminal_reply_attempted: set[str] = set()
+        # ADR 0270 decision 3 [D2]: what each fenced lease acquisition opened or
+        # steered into, by its owner token, for exactly the life of its
+        # ``process_event``. A lost lease stops only these turns. Process
+        # memory only: an entry holds a turn's private epoch.
+        self._owned_executions: dict[str, constants.OwnedExecutions] = {}
 
     _finalize_settled_card = approval._finalize_settled_card
     _settle_remembered_card = approval._settle_remembered_card
@@ -265,6 +299,7 @@ class Kernel:
     _adopt_remembered_notice_ref = approval._adopt_remembered_notice_ref
     _approval_run_abandoned = approval._approval_run_abandoned
     _pause_for_approval = approval._pause_for_approval
+    _deliver_approver_dm_card = approval._deliver_approver_dm_card
     _escalate_unanswerable_email_approval = approval._escalate_unanswerable_email_approval
     _is_approval_resume = staticmethod(approval_key._is_approval_resume)
     _route_attachment_and_start = attachments._route_attachment_and_start
@@ -277,6 +312,7 @@ class Kernel:
     _attempt = attempt._attempt
     _attempt_turn = attempt._attempt_turn
     _require_tool_access = attempt._require_tool_access
+    _retain_and_validate_publication_snapshot = attempt._retain_and_validate_publication_snapshot
     _consume = attempt._consume
     _start_progress_pump = attempt._start_progress_pump
     _apply_frame = attempt._apply_frame
@@ -300,6 +336,10 @@ class Kernel:
     _log_claim_latency = staticmethod(claim._log_claim_latency)
     _turn_active = claim._turn_active
     _cap_caller_token_to_deadline = claim._cap_caller_token_to_deadline
+    _requester_turn_cap_s = claim._requester_turn_cap_s
+    _requester_turn_budget = claim._requester_turn_budget
+    _bound_requester_turn = claim._bound_requester_turn
+    _requester_needed_exp = claim._requester_needed_exp
     _claim_or_resume = claim._claim_or_resume
     _keep_route_alive = claim._keep_route_alive
     _complete = completion._complete
@@ -313,8 +353,11 @@ class Kernel:
     _emit_status = completion._emit_status
     forget_delivery = delivery.forget_delivery
     notify_turn_not_started = delivery.notify_turn_not_started
+    _steering_may_have_admitted = delivery._steering_may_have_admitted
     notify_broker_entry_vanished = delivery.notify_broker_entry_vanished
     interrupt_thread = delivery.interrupt_thread
+    stop_owned_execution = delivery.stop_owned_execution
+    _own_execution = delivery._own_execution
     release_thread = delivery.release_thread
     interrupt_agent = delivery.interrupt_agent
     _close_hook_run_after_error = hooks._close_hook_run_after_error
@@ -343,10 +386,12 @@ class Kernel:
     _bind_publication_context = publication._bind_publication_context
     _request_not_running = publication._request_not_running
     _continue_unpublished = publication._continue_unpublished
+    _recover_publication = publication_recovery._recover_publication
     _target_for = routing._kernel_target_for
     _adopt_ref = routing._adopt_ref
     _reply_for = routing._reply_for
     _drop_with_message = routing._drop_with_message
+    _settle_relay_after_refusal = routing._settle_relay_after_refusal
     _drop_ambiguous_route = routing._drop_ambiguous_route
     _drop_sibling_turn = routing._drop_sibling_turn
     _reply = routing._reply
@@ -361,8 +406,10 @@ class Kernel:
     _evict_expired_held_work_items = work_items._evict_expired_held_work_items
     _forget_held_work_items = work_items._forget_held_work_items
     _run_for_event = work_items._run_for_event
+    _started_execute_run = work_items._started_execute_run
     _is_factory_work_item_turn = work_items._is_factory_work_item_turn
     _work_item_repository = work_items._work_item_repository
+    _execution_deadline_for = work_items._execution_deadline_for
     _adopt_resumed_work_item = work_items._adopt_resumed_work_item
     reap_orphans = work_items.reap_orphans
     _preflight_reclaimed_delivery = work_items._preflight_reclaimed_delivery

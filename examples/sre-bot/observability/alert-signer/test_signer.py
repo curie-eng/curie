@@ -254,6 +254,117 @@ def test_signer_http_authentication_and_forwarding(
         )
 
 
+_BODY_SENTINEL = "ALERTS-BODY-SENTINEL"
+
+
+def _post_raw(url: str, payload: object, token: str) -> tuple[int, bytes]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return int(response.status), response.read()
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), exc.read()
+
+
+class _Recorder(BaseHTTPRequestHandler):
+    """An external ingress that records every POST it receives, support probes too."""
+
+    requests: list[tuple[str, bytes]]
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+    def do_POST(self) -> None:  # noqa: N802
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.requests.append((self.path, body))
+        self.send_response(202)
+        self.end_headers()
+
+
+def _recorder() -> type[_Recorder]:
+    return type("Recorder", (_Recorder,), {"requests": []})
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "protected"])
+@pytest.mark.parametrize(
+    "alerts",
+    [
+        pytest.param(1, id="integer"),
+        pytest.param(0, id="zero"),
+        pytest.param(True, id="boolean-true"),
+        pytest.param(False, id="boolean-false"),
+        pytest.param(f"x {_BODY_SENTINEL}", id="string"),
+        pytest.param("", id="empty-string"),
+        pytest.param({"a": _BODY_SENTINEL}, id="object"),
+        pytest.param({}, id="empty-object"),
+    ],
+)
+def test_malformed_alerts_container_returns_400_without_forwarding(
+    monkeypatch: pytest.MonkeyPatch, mode: str, alerts: object
+) -> None:
+    monkeypatch.setenv("CURIE_SIGNER_TOKEN", "signer-token")
+    if mode == "protected":
+        monkeypatch.delenv("CURIE_HOOK_SECRET", raising=False)
+        monkeypatch.setenv("CURIE_HOOK_SOURCE_MODE", "protected")
+        monkeypatch.setenv("CURIE_HOOK_SOURCE_SECRET", _SCOPED)
+        query = "?tool_access=read-only"
+    else:
+        monkeypatch.delenv("CURIE_HOOK_SOURCE_MODE", raising=False)
+        monkeypatch.delenv("CURIE_HOOK_SOURCE_SECRET", raising=False)
+        monkeypatch.setenv("CURIE_HOOK_SECRET", "hook-secret")
+        query = ""
+    ingress = _recorder()
+    payload = {"groupKey": "g", "status": "firing", "alerts": alerts}
+    with _http_server(ingress) as ingress_url:
+        monkeypatch.setenv(
+            "CURIE_HOOK_URL", f"{ingress_url}/hooks/acme-agent/alertmanager%2Erelease{query}"
+        )
+        with _http_server(signer.Handler) as signer_url:
+            status, answer = _post_raw(signer_url, payload, "signer-token")
+            # Authentication still comes first: a bad token never reaches the
+            # payload check.
+            denied, _ = _post_raw(signer_url, payload, "wrong-token")
+
+    assert status == 400
+    assert denied == 401
+    assert ingress.requests == []
+    for secret in ("signer-token", "hook-secret", _SCOPED, _BODY_SENTINEL):
+        assert secret.encode() not in answer
+
+
+@pytest.mark.parametrize(
+    "alerts",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="empty-list"),
+        pytest.param([1, "x", None, {"fingerprint": "fp-a"}], id="non-object-members-skipped"),
+    ],
+)
+def test_alerts_container_absent_null_or_list_still_forwards_once(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, alerts: object
+) -> None:
+    monkeypatch.setenv("CURIE_SIGNER_TOKEN", "signer-token")
+    monkeypatch.setenv("CURIE_HOOK_SECRET", "hook-secret")
+    payload: dict[str, object] = {"groupKey": "g", "status": "firing"}
+    if not request.node.callspec.id == "missing":
+        payload["alerts"] = alerts
+    ingress = _recorder()
+    with _http_server(ingress) as ingress_url:
+        monkeypatch.setenv("CURIE_HOOK_URL", f"{ingress_url}/hooks/acme-agent/alertmanager")
+        with _http_server(signer.Handler) as signer_url:
+            status, _ = _post_raw(signer_url, payload, "signer-token")
+
+    assert status == 200
+    assert len(ingress.requests) == 1
+    assert json.loads(ingress.requests[0][1])["curie_partition"]
+
+
 @pytest.mark.parametrize("upstream_status", [200, 202, 409, 429, 500])
 def test_forwarding_reports_only_safe_status_diagnostics(
     monkeypatch: pytest.MonkeyPatch,

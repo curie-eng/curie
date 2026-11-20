@@ -729,6 +729,21 @@ export async function getApprovalAudit(approvalId: string): Promise<ApprovalAudi
 export type ApprovalResolveInput = Schemas["ApprovalResolve"];
 
 export type ConsoleSession = Schemas["ConsoleSessionOut"];
+export type ConsoleSignInMethods = Schemas["ConsoleSignInMethodsOut"];
+
+export type OwnedLink = Schemas["OwnedLinkOut"];
+
+export async function getOwnedLinks(): Promise<Schemas["OwnedLinksOut"]> {
+  return jsonOrThrow(await request("/identity/me/links", { cache: "no-store" }));
+}
+
+export async function startGithubLink(): Promise<Schemas["GithubLinkStartOut"]> {
+  return jsonOrThrow(await request("/identity/me/github-link", { method: "POST" }));
+}
+
+export async function unlinkOwnedAccount(id: string): Promise<void> {
+  await jsonOrThrow(await request(`/identity/me/links/${encodeURIComponent(id)}`, { method: "DELETE" }));
+}
 
 // Inspect the HttpOnly same-origin console session. No platform key is sent:
 // the ambient cookie is the only credential on this identity boundary.
@@ -753,6 +768,86 @@ export async function exchangeConsoleLoginCode(code: string): Promise<ConsoleSes
     body: JSON.stringify({ code }),
   });
   return jsonOrThrow<ConsoleSession>(resp);
+}
+
+// Which sign-in paths this install offers. Unauthenticated, and a failure means
+// the login screen hides the organization link rather than guessing it is on.
+// Bypasses request() so a 401 does not look like an expired console session.
+export async function getConsoleSignInMethods(): Promise<ConsoleSignInMethods> {
+  const resp = await fetch(url("/console/sign-in-methods"), { credentials: "same-origin" });
+  return jsonOrThrow<ConsoleSignInMethods>(resp);
+}
+
+// End the cookie session. Direct fetch, same as the probe: a 401 here is the
+// answer, not a signal to re-probe. True only when the API clears the cookie.
+export async function logoutConsoleSession(): Promise<boolean> {
+  const resp = await fetch(url("/console/logout"), {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  return resp.status === 204;
+}
+
+export type PersonalEnrollment = Schemas["PersonalEnrollmentOut"];
+export type EnrollmentIntent = Schemas["PersonalEnrollmentWrite"]["intent"];
+
+/**
+ * A refused enrollment call. Only the HTTP status and the API's machine code
+ * survive: the message is a fixed string, so nothing the API or the person sent
+ * (the token above all) can reach a log line, a toast or the DOM through it.
+ */
+export class EnrollmentApiError extends Error {
+  status: number;
+  code: string | null;
+  constructor(status: number, code: string | null) {
+    super("personal enrollment request refused");
+    this.name = "EnrollmentApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+async function enrollmentOrThrow(resp: Response): Promise<PersonalEnrollment> {
+  if (resp.ok) return (await resp.json()) as PersonalEnrollment;
+  const body: unknown = await resp.json().catch(() => null);
+  let code: string | null = null;
+  if (body && typeof body === "object" && "detail" in body) {
+    const detail = (body as { detail: unknown }).detail;
+    if (detail && typeof detail === "object" && "code" in detail) {
+      const raw = (detail as { code: unknown }).code;
+      if (typeof raw === "string") code = raw;
+    }
+  }
+  throw new EnrollmentApiError(resp.status, code);
+}
+
+// The owner's own enrollment, read with the principal console session cookie.
+export async function getPersonalEnrollment(): Promise<PersonalEnrollment> {
+  return enrollmentOrThrow(await request("/personal-claude/enrollment", { cache: "no-store" }));
+}
+
+// Enroll (`expectedVersion` null), replace or reconnect. The token travels only
+// in this request body; callers must not keep it in a cache or any storage.
+export async function writePersonalEnrollment(
+  intent: EnrollmentIntent,
+  expectedVersion: number | null,
+  token: string,
+): Promise<PersonalEnrollment> {
+  const resp = await request("/personal-claude/enrollment", {
+    method: "PUT",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ intent, expected_version: expectedVersion, token }),
+  });
+  return enrollmentOrThrow(resp);
+}
+
+export async function disconnectPersonalEnrollment(expectedVersion: number): Promise<PersonalEnrollment> {
+  const resp = await request(
+    `/personal-claude/enrollment?expected_version=${encodeURIComponent(String(expectedVersion))}`,
+    { method: "DELETE", cache: "no-store" },
+  );
+  return enrollmentOrThrow(resp);
 }
 
 // Resolve an approval (resolve-once compare-and-set) as the immutable subject

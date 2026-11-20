@@ -42,19 +42,37 @@ allowlist below records those remaining callers.
 marked and described:
 
 1. `poll_marked` returns every marking since a cursor as `MarkedNotice` values
-   (admit, cancel or mention) plus the next cursor, and re-reads the WorkItems
-   already running so a marker removed before the cursor still cancels. A
-   listing that cannot be read to its end raises `Unavailable` and yields no
-   cursor. Events by the adapter's own identity are never notices. Each notice
-   carries `occurred_at`, the event time the tracker reported, or None when it
+   (admit, cancel, mention or answer) plus the next cursor, and re-reads the
+   WorkItems already running so a marker removed before the cursor still
+   cancels. Its required `answering` argument names the issues whose WorkItem
+   has a factory question round open; on those, every new comment by a person,
+   with or without a mention, is an answer notice, including on a first poll.
+   A first poll also delivers a running issue's mentions made since its label
+   was last added, because a label whose first page held an issue polls as a
+   first poll again. The shared intake decides each mention again under the
+   WorkItem lock: any mention acts only while the issue is open and keeps the
+   WorkItem's trigger label, one on an issue whose round opened after the
+   poll began is admitted as an answer, and a comment already decided as an
+   answer starts nothing. An
+   answer that arrives while the question is still posting, or after its round
+   ended since the poll began, is held with the issue's later notices and the
+   cursor stays unsaved until a later poll can settle it; on that later poll a
+   comment on an ended round is a mention or nothing. A listing that cannot be
+   read to its end raises `Unavailable` and yields no cursor. Events by the
+   adapter's own identity are never notices. Each notice carries
+   `occurred_at`, the event time the tracker reported, or None when it
    reported none; admission treats None as unknown.
-2. `verify_current` says whether a notice still describes the issue.
+2. `verify_current` says whether a notice still describes the issue. An
+   answer is current only while the issue keeps the trigger label, is open,
+   and the comment still stands.
 3. `marking_actor` names who applied the marker that is on the issue now.
 4. `may_start` decides whether that actor may start a run. A native tracker
    checks write access to its own repository. A tracker-only kind checks the
    binding's allowlist or group.
 5. `read_ticket` returns the ticket as markdown for the sandbox. Nothing is
-   stored.
+   stored. The Jira and GitLab trackers cap the comments they read and keep
+   the newest ones, rendered oldest first after a line saying earlier comments
+   were not read, so a recent answer to the factory's questions is read.
 6. `ticket_labels` returns the issue's current labels and component names,
    which admission reads for repository routing and label conflicts. Sandbox
    acquisition and base reconciliation read them again for the current `base:`
@@ -68,22 +86,72 @@ marked and described:
    held before a move. An unreadable answer raises `Unavailable`.
 10. `issue_url` gives the issue's web URL, which work item links come from.
     It makes no request and raises `NotFound` for an issue outside the tracker.
-11. Optional: `link_pull_request`, `dependencies` and `in_group` (group start
-    authority).
+11. Optional: `link_pull_request`, `dependencies`, `in_group` (group start
+    authority) and `create_linked_issue`
+    ([ADR 0277](../../adr/0277-factory-triage-publishes-tickets-before-implementation-admission.md)).
+    `create_linked_issue` opens one issue in the source issue's own scope whose
+    body ends with a related-source line and a hidden marker carrying the
+    caller's output identity, with no closing keyword and no blocked-by
+    relation, and returns a `LinkedIssue` with the read-back body digest. Its
+    lookup lists the scope's issues its own identity created (never a search
+    API) and matches the one whose last non-empty line is the marker. A marker
+    in an issue anyone else created counts for nothing, and two matches raise
+    `Ambiguous` without writing. The creator-filtered listing can lag a create
+    by seconds (observed on GitHub), so neither a listing nor elapsed time
+    proves a create absent. By default the call reconciles to a match or
+    creates once. A definite refusal of the create keeps its type and created
+    nothing (`Unauthorized`, `NotFound`, `Unavailable("unprocessable")`). Any
+    failure after the create request may have reached the tracker (transport
+    error, 5xx, unreadable success, failed read-back, or a relist after an
+    uncertain answer that finds nothing or cannot be read) raises
+    `LinkedIssueUnconfirmed`, after which the caller never creates again for
+    that output identity. `reconcile_only=True` never creates: one match is
+    returned, none raises `NotFound("linked_issue")`, two raise `Ambiguous`.
+    A caller that has recorded the output issue passes it as `expected`: the
+    adapter then never lists and never creates, reads that issue directly, and
+    returns it only when it is an issue, not a pull request, its own identity
+    created it, and its last non-empty line is the marker; anything else
+    raises `NotFound("linked_issue")`, so a recorded issue whose marker was
+    removed never yields a second one. `expected` and `reconcile_only`
+    together are a ValueError. The GitHub and in-memory adapters implement
+    it; GitLab and Jira Cloud declare it unsupported and raise
+    `Unsupported`.
 
 ### CodeHost
 
 `CodeHost` (`apps/api/src/curie_api/forges/ports.py::CodeHost`) is where code,
 pull requests, CI and review live: `resolve_repository` from an immutable id;
-`credential` for clone or push scope; `branch_head` and `read_commit`;
+`credential` for clone or push scope; `branch_head` and `read_commit` (whose
+`Commit.tree` is the commit's tree id where the host reports one: the GitHub
+adapter fills it, every other adapter leaves it None);
 `is_ancestor`, one forge request asking whether a commit is another's ancestor;
 `find_pull_request`, `open_pull_request`, `update_pull_request`,
 `retarget_pull_request` and `read_pull_request`; `list_factory_publications`;
 `observe_ci` on an exact head; `list_review_feedback` since a cursor and
 `verify_feedback`. Optional:
-`ci_diagnostics`, `rerun_failed`, `user_can_write` and `required_checks`
-(GitHub only among the shipped code hosts; GitLab and both Bitbucket adapters
-raise `Unsupported`).
+`ci_diagnostics`, `rerun_failed`, `user_can_write`, `account_login`,
+`required_checks`, `store_evidence` and `delete_evidence` (GitHub only among
+the shipped code hosts; GitLab and both Bitbucket adapters raise
+`Unsupported`). `account_login(repository, account_id)` returns the account's
+current login for a numeric id, which factory Slack steering uses to apply pull
+request write authority.
+
+UI evidence. `store_evidence(repository, *, key, files, message, stamp)` hosts
+image files (`EvidenceFile`: a path, its bytes and their sha256) outside every
+branch under one ref named by `key`, creating or replacing it, and returns a
+`StoredEvidence` with the ref, the commit and each path's image URL pinned to
+that commit. The same inputs give the same commit, so a replay moves nothing.
+`delete_evidence(repository, *, key)` removes the ref and answers whether one
+existed. The GitHub adapter uses the Git Data API with the installation token
+every other write carries: blobs, one tree, a parentless commit dated `stamp`
+with a fixed author, then `refs/curie/ui-evidence/<key>` created or force
+moved. The core (`apps/api/src/curie_api/ui_evidence_reconciler.py`) keys the
+ref by lineage, publishes only after the code publication is recorded, and
+shows an `after` image only when `read_commit` of the pull request head reports
+the captured candidate tree. A host that declares the operations unsupported
+gets a comment saying it cannot show evidence. A GitHub install with no
+configured App id cannot tell its own comment apart, so the core writes
+nothing for it: no ref and no comment.
 
 `retarget_pull_request(ref, *, base_ref, expected_head_sha)` is the mandatory
 operation for changing only an open pull request's base. `update_pull_request`
@@ -215,6 +283,10 @@ comments, injects a page failure and counts writes. One module per behavior:
    raises `Unsupported`, and the allowlist fallback answers.
 10. `test_issue_url.py`: an issue link names the issue on the tracker host,
     writes nothing, and an issue in another scope has no link.
+11. `test_ui_evidence_hosting.py`: storing the same evidence twice gives the
+    same commit and URLs, different evidence moves the one ref, a delete
+    answers True then False, an unsupported host raises and writes nothing, and
+    `read_commit` reports the tree where the host carries one.
 
 The GitHub identity golden test is
 `apps/api/tests/forges/test_identity_golden.py`.

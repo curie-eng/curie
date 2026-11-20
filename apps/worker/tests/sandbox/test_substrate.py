@@ -4,13 +4,18 @@ the real cluster path is the e2e in test_e2e_k8scratch.py)."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from aci_protocol import BootEnv
+from curie_worker import caller_token
 from curie_worker.sandbox import (
     THREAD_HASH_LABEL,
     AffinityStore,
@@ -31,6 +36,7 @@ from curie_worker.sandbox import (
 )
 from curie_worker.sandbox.k8s import KubernetesSandboxClient, _claim_view
 from curie_worker.sandbox.types import KubeTransientError
+from nacl.signing import SigningKey
 from urllib3.exceptions import ReadTimeoutError
 
 from .conftest import FakeClaim, FakeSandbox, FakeSandboxClient
@@ -2970,3 +2976,188 @@ def test_await_service_fqdn_times_out_under_persistent_transient_reads(
         substrate._await_service_fqdn("sbx-claim-x", deadline=10.0)  # noqa: SLF001
 
     assert fake_k8s.sandbox_calls > 1
+
+
+# -- ADR 0270 decision 3: every boot records the requester it booted with ---------------
+
+# Named from the boot contract, as the history and session names above are.
+CALLER_TOKEN_ENV = BootEnv.env_key("connector_caller_token")
+_REQUESTER_DIGEST_DOMAIN = b"curie-cct-principal-v1\n"
+_REQUESTER_TENANT = "33333333-3333-4333-8333-333333333333"
+_REQUESTER_ISSUER = "https://identity.example.test/directory"
+_ALICE = {
+    "tenant_id": _REQUESTER_TENANT,
+    "issuer": _REQUESTER_ISSUER,
+    "subject": "SyntheticAliceSubject",
+}
+_BOB = {
+    "tenant_id": _REQUESTER_TENANT,
+    "issuer": _REQUESTER_ISSUER,
+    "subject": "SyntheticBobSubject",
+}
+# Fixed expiries; the substrate reads them, it never compares them with a clock.
+_ALICE_EXP = 1_900_003_600
+_PLAIN_EXP = 1_900_086_400
+_MINTED_EXP = 1_900_007_200
+
+
+def _requester_digest(principal: dict[str, str]) -> str:
+    """The plan's requester fact, computed independently. @spec CONNECTOR-REQUESTER-3."""
+    canonical = json.dumps(principal, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    digest = hashlib.sha256(_REQUESTER_DIGEST_DOMAIN + canonical.encode("ascii")).hexdigest()
+    return "sha256:" + digest
+
+
+def _requester_seed() -> str:
+    """A fresh worker Ed25519 seed, minted at runtime. @spec CONNECTOR-REQUESTER-3."""
+    return base64.b64encode(bytes(SigningKey.generate())).decode()
+
+
+def _cct(seed: str, *, exp: int, principal: dict[str, str] | None = None) -> str:
+    """@spec CONNECTOR-REQUESTER-3."""
+    return caller_token.mint(
+        seed,
+        agent="test-agent",
+        exp=exp,
+        principal=None if principal is None else caller_token.CallerPrincipal(**principal),
+    )
+
+
+def _boot_by(
+    substrate: SandboxSubstrate,
+    path: str,
+    thread_key: str,
+    env: dict[str, str] | None,
+    predecessor_env: dict[str, str],
+) -> tuple[SandboxHandle, SandboxHandle | None]:
+    """Boot ``thread_key`` with ``env`` through one substrate entry point.
+
+    Resume and handoff start from a predecessor booted with a different cct, so
+    a record copied from the old route cannot pass. @spec CONNECTOR-REQUESTER-3.
+    """
+    if path == "claim":
+        return substrate.claim(thread_key, env=env), None
+    first = substrate.claim(thread_key, env=predecessor_env)
+    if path == "resume":
+        substrate.suspend(thread_key, history_ref=f"history/{thread_key}")
+        return substrate.resume(thread_key, env=env), first
+    assert env is not None
+    return substrate.handoff(thread_key, expected=first, env=env, workspace_repo=None), first
+
+
+_BOOT_PATHS = ["claim", "resume", "handoff"]
+# booted -> (env factory, expected fact name). None means no env at all.
+_BOOTED = ["requester", "principal-less", "unreadable", "no-cct", "no-env"]
+
+
+# @spec CONNECTOR-REQUESTER-3
+@pytest.mark.parametrize(
+    ("path", "booted"),
+    [
+        (path, booted)
+        for path in _BOOT_PATHS
+        for booted in _BOOTED
+        if not (path == "handoff" and booted == "no-env")
+    ],
+)
+def test_every_boot_path_records_the_booted_requester(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    path: str,
+    booted: str,
+) -> None:
+    """The handle and the durable record describe the cct the runner booted with.
+
+    A digest for a principal-bearing cct, ``"none"`` for a principal-less or
+    unreadable one, and ``"absent"`` when the boot env has no cct at all. From
+    this change no boot records None: None is reserved for routes written
+    before the fields existed, which cannot prove a match.
+    """
+    seed = _requester_seed()
+    thread_key = f"T-requester-{path}-{booted}"
+    envs: dict[str, dict[str, str] | None] = {
+        "requester": {CALLER_TOKEN_ENV: _cct(seed, exp=_ALICE_EXP, principal=_ALICE)},
+        "principal-less": {CALLER_TOKEN_ENV: _cct(seed, exp=_PLAIN_EXP)},
+        "unreadable": {CALLER_TOKEN_ENV: "cct.payload.signature"},
+        "no-cct": {SESSION_ENV: "logical-session"},
+        "no-env": None,
+    }
+    expected = {
+        "requester": (_requester_digest(_ALICE), _ALICE_EXP),
+        "principal-less": ("none", _PLAIN_EXP),
+        "unreadable": ("none", None),
+        "no-cct": ("absent", None),
+        "no-env": ("absent", None),
+    }[booted]
+    env = envs[booted]
+    predecessor_env = {CALLER_TOKEN_ENV: _cct(seed, exp=_ALICE_EXP + 1, principal=_BOB)}
+
+    handle, first = _boot_by(substrate, path, thread_key, env, predecessor_env)
+
+    assert (handle.caller_requester, handle.caller_token_exp) == expected
+    record = affinity.get(thread_key)
+    assert record is not None and record.state is RouteState.LIVE
+    assert record.handle == handle
+    assert (record.handle.caller_requester, record.handle.caller_token_exp) == expected
+    # The fact describes the env this claim really booted.
+    booted_env = fake_k8s.claims[handle.claim_name].env
+    assert booted_env.get(CALLER_TOKEN_ENV) == (env or {}).get(CALLER_TOKEN_ENV)
+    if first is not None:
+        # The predecessor recorded its own requester, and the new boot did not copy it.
+        assert first.caller_requester == _requester_digest(_BOB)
+        assert first.caller_token_exp == _ALICE_EXP + 1
+        assert handle.claim_name != first.claim_name
+
+
+# @spec CONNECTOR-REQUESTER-3
+@pytest.mark.parametrize("path", _BOOT_PATHS)
+def test_every_boot_path_records_the_requester_the_minter_booted(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    path: str,
+) -> None:
+    """With a claim-time minter wired, the record follows the env the minter returned.
+
+    The minter runs before the handle is built, so the recorded requester and
+    expiry are the re-minted token's, never the caller's. The minter here
+    swaps in a different principal so a record taken from the pre-minter env
+    cannot pass.
+    """
+    seed = _requester_seed()
+    thread_key = f"T-requester-minted-{path}"
+    predecessor_env = {CALLER_TOKEN_ENV: _cct(seed, exp=_PLAIN_EXP)}
+    minted: list[str] = []
+
+    def minter(env: Mapping[str, str]) -> dict[str, str]:
+        out = dict(env)
+        if CALLER_TOKEN_ENV in out:
+            token = _cct(seed, exp=_MINTED_EXP + len(minted), principal=_BOB)
+            minted.append(token)
+            out[CALLER_TOKEN_ENV] = token
+        return out
+
+    alice_env = {CALLER_TOKEN_ENV: _cct(seed, exp=_ALICE_EXP, principal=_ALICE)}
+    if path == "claim":
+        substrate.set_boot_credential_minter(minter)
+        handle = substrate.claim(thread_key, env=alice_env)
+    else:
+        first = substrate.claim(thread_key, env=predecessor_env)
+        assert (first.caller_requester, first.caller_token_exp) == ("none", _PLAIN_EXP)
+        substrate.set_boot_credential_minter(minter)
+        if path == "resume":
+            substrate.suspend(thread_key, history_ref=f"history/{thread_key}")
+            handle = substrate.resume(thread_key, env=alice_env)
+        else:
+            handle = substrate.handoff(
+                thread_key, expected=first, env=alice_env, workspace_repo=None
+            )
+
+    assert len(minted) == 1
+    assert fake_k8s.claims[handle.claim_name].env[CALLER_TOKEN_ENV] == minted[0]
+    expected = (_requester_digest(_BOB), _MINTED_EXP)
+    assert (handle.caller_requester, handle.caller_token_exp) == expected
+    record = affinity.get(thread_key)
+    assert record is not None and record.handle == handle
+    assert (record.handle.caller_requester, record.handle.caller_token_exp) == expected

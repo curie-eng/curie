@@ -15,13 +15,15 @@ from channel_protocol.reply import (
     NavAffordance,
 )
 from curie_internal import sandbox_token
+from curie_telemetry import agent_metric_label
 from opentelemetry.trace import SpanKind, StatusCode
 
-from .. import sweep
+from .. import personal_execution, sweep
 from ..behaviorpacks import (
     BehaviorPacks,
 )
 from ..binding import (
+    BOOT_TOKEN_GRACE_SECONDS,
     DECISION_ENV,
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     GRANT_ARGUMENTS_ENV,
@@ -31,25 +33,31 @@ from ..binding import (
     MAX_TURNS_ENV,
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
+    REQUESTER_CALLER_TOKEN_TTL_SECONDS,
     RESUMED_KIND_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
     AmbiguousRoute,
     FactoryBindingRefused,
     FactoryWake,
     binding_adapter_for_handle,
+    caller_requester_facts,
 )
 from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease
 from ..hook_runs import HookRunOutcome, HookRunReason, HookRunRecorderError, retry_expiry
+from ..memory_rules_context import MemoryRulesContextRefused
 from ..reply_sink import (
     TargetRoute,
 )
+from ..requester_context import RequesterContextRefused
+from ..sandbox.types import OwnerBusy, PersonalLaunchRefused
 from ..turn_progress import (
     ELIGIBILITY_ENV,
     plan_turn_progress,
     progress_eligible,
 )
 from ..workitem_dispatch import (
+    _FACTORY_AUTHORITY_REFUSALS,
     WorkItemConflict,
     WorkItemRun,
     WorkItemStartRefused,
@@ -61,6 +69,7 @@ if TYPE_CHECKING:
     from .core import Kernel
 
 from . import (
+    approval,
     capacity,
     channel_read,
     claim,
@@ -72,10 +81,22 @@ from . import (
     identity,
     log,
     memory,
+    publication,
     routing,
+    work_items,
     workspace,
 )
 from .log import logger
+
+# ADR 0277 (#5586): the internal bound on a tracker_result run's capability
+# mint. The mint is that run's gate, and a gate decides within a minute.
+_TRACKER_RESULT_MINT_TIMEOUT_S = 30.0
+# The coded refusal a tracker_result run's publish request finishes with; the
+# API refuses the same request at its own boundary under this code.
+_TRACKER_RESULT_PUBLICATION_REFUSAL = (
+    "publication.tracker_result_request: this run reports a tracker result "
+    "and does not publish a branch or pull request."
+)
 
 
 async def process_event(
@@ -101,6 +122,17 @@ async def process_event(
     identity_token = identity.CURRENT.set(identity_carry)
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
     lease_token = constants._DELIVERY_LEASE.set(lease)
+    # ADR 0270 decision 3 [D2]: what this lease acquisition opens or steers
+    # into, so a lost lease stops exactly that and nothing else. The owner
+    # token is unique per acquisition.
+    owned = (
+        constants.OwnedExecutions(lease=lease)
+        if lease is not None and claim._is_fenced(lease)
+        else None
+    )
+    owned_executions_token = constants._OWNED_EXECUTIONS.set(owned)
+    if owned is not None:
+        self._owned_executions[owned.lease.owner] = owned
     termination_carry = constants._SandboxTerminationCarry()
     termination_token = constants._SANDBOX_TERMINATION_CARRY.set(termination_carry)
     # A redelivery must never inherit an earlier delivery's terminal-send mark
@@ -136,6 +168,8 @@ async def process_event(
                 await self._markers.mark_done(qevent.event_id, marker_value="1")
                 constants._LIFECYCLE_OUTCOME.set("classified_failure")
                 logger.info("HTTP invocation refused before further execution")
+                # @spec HTTP-INVOCATION-EXECUTION-31: only the relay hears of it.
+                await self._settle_relay_after_refusal(qevent)
         except asyncio.CancelledError as exc:
             error = exc
             await self._close_hook_run_after_error(
@@ -207,6 +241,9 @@ async def process_event(
             constants._LIFECYCLE_SPAN.reset(token)
             constants._HOOK_RUN_CARRY.reset(hook_token)
             constants._DELIVERY_LEASE.reset(lease_token)
+            constants._OWNED_EXECUTIONS.reset(owned_executions_token)
+            if owned is not None and self._owned_executions.get(owned.lease.owner) is owned:
+                del self._owned_executions[owned.lease.owner]
             constants._SANDBOX_TERMINATION_CARRY.reset(termination_token)
     if error is not None:
         raise error
@@ -257,6 +294,7 @@ async def _process_event(
 
     owned_work_item_id: uuid.UUID | None = None
     owned_token = constants._OWNED_WORK_ITEM.set(None)
+    personal_token = constants._PERSONAL_LAUNCH.set(None)
     publication_token = constants._PUBLICATION_CONTEXT.set(None)
     progress_token = constants._TURN_PROGRESS.set(None)
     try:
@@ -281,6 +319,54 @@ async def _process_event(
             return
 
         await identity.prepare(self)
+        # Factory run steering (#5414): a turn in a factory run's Slack root
+        # never enters ordinary chat. The client returns None for every other
+        # turn; an unavailable decision raises and leaves the delivery pending.
+        # The client refuses a mapped root whose remaining delivery budget is at
+        # or below ``_MIN_ATTEMPT_BUDGET_S`` with no API call, and bounds the API
+        # call by the rest. The reply completes through the lease-fenced
+        # ``_complete``, so the completion outbox records the turn: an
+        # admission as delivered, every refusal as dropped. The order lock is
+        # released by the ``finally`` below on every exit.
+        if self._factory_steering is not None:
+            from ..factory_steering import SteeringUnavailable
+
+            try:
+                steered = await self._factory_steering.steer(
+                    qevent,
+                    budget_s=None if lease is None else lease.remaining_s(),
+                    record_intent=lambda: self._markers.mark_steering_sent(event_id),
+                )
+            except SteeringUnavailable as exc:
+                # Steering may own this delivery, and an earlier attempt may
+                # have admitted with its answer lost, so the consumer's generic
+                # not-started notice (an invitation to resend) never follows.
+                # An attempt whose request may have reached the API says so as
+                # its result; any other keeps what the thread already shows.
+                # The delivery stays pending either way.
+                if exc.pending_text is not None:
+                    if lease is not None:
+                        lease.raise_if_lost()
+                    await self._reply_for(qevent, route, exc.pending_text)
+                else:
+                    self._terminal_reply_attempted.add(event_id)
+                raise
+            if steered is not None:
+                if lease is not None:
+                    lease.raise_if_lost()
+                if steered.admitted:
+                    # An admitted kickoff (#5715) posts nothing and leaves the
+                    # placeholder unedited: the progress lane renders the
+                    # run's card into it. Only the reply is skipped; the turn
+                    # still settles through the same fenced completion.
+                    if not steered.progress_card:
+                        await self._reply_for(qevent, route, steered.text)
+                    await self._complete(
+                        qevent, route, "delivered", telemetry_outcome="done", lease=lease
+                    )
+                else:
+                    await self._drop_with_message(qevent, route, steered.text, lease=lease)
+                return
         if qevent.source is TurnSource.CRON:
             if self._hook_runs is None or qevent.hook_run is None:
                 logger.error(
@@ -496,6 +582,26 @@ async def _process_event(
                 )
                 return
 
+        # #5378, ADR 0268 decision 1: a personal installation runs only as a
+        # WorkItem request's owner. A turn with no owner (a plain run, a cron
+        # or webhook hook, a continuation outside a WorkItem) is refused here,
+        # before any binding lookup, card, claim or model call, and answered
+        # once. A decision, not a fault: INFO, and the entry is acked.
+        if owned_work_item_id is None and self._config.factory_model_auth_mode == "personal":
+            logger.info("event %s refused: personal_owner_required", event_id)
+            if not targetless:
+                await self._reply_for(qevent, route, constants._PERSONAL_OWNER_REQUIRED_REPLY)
+            await self._complete(
+                qevent,
+                route,
+                "dropped",
+                telemetry_outcome="interrupted",
+                lease=lease,
+                hook_outcome="blocked",
+                hook_reason="identity_refused",
+            )
+            return
+
         # If this is an approval resume, settle its live card before running
         # the continuation: expired (#419) or resolved (#1084). Best-effort,
         # and gated on the resume event id so an ordinary turn pays nothing.
@@ -515,12 +621,22 @@ async def _process_event(
             ) as approval_span:
                 await self._finalize_settled_card(qevent, route)
                 approval_span.add_event("approval.resumed", {"outcome": "resumed"})
+            resume_agent: str | None = None
+            if self._binding is not None:
+                try:
+                    resume_agent = await self._binding.approval_agent_name(qevent.event_id)
+                except Exception as exc:  # noqa: BLE001 - telemetry never gates the resume.
+                    logger.warning(
+                        "approval telemetry agent lookup failed (%s)", type(exc).__name__
+                    )
+                    resume_agent = "other"
             log.record_metric(
                 "curie.approval.lifecycle",
                 attributes={
                     "service.name": "curie-worker",
                     "operation": "resume",
                     "outcome": "resumed",
+                    "agent": agent_metric_label(resume_agent),
                 },
             )
         elif not targetless:
@@ -529,24 +645,7 @@ async def _process_event(
 
         # Crash-safety: prior observed or unconfirmed execution latched the
         # retry fence but never reached done. Do not auto-retry the action.
-        if await self._markers.saw_side_effect(event_id):
-            # This path is NOT silent: it is the one message a human most
-            # needs to see. It runs before binding resolution, so it emits
-            # over the server-minted handle's route, verbatim -- never a
-            # lookup it cannot reach and never a default standing in for a
-            # missing adapter.
-            #
-            # And it is a DURABLE TERMINAL OUTCOME, so it completes through
-            # the same ordering every other terminal path uses (driver
-            # adjudication, superseding the earlier "suppress the completion
-            # here" wording). Marking done without a completion is only
-            # survivable on an edit-in-place channel: a BUFFERED adapter
-            # accumulates the reply and flushes on ``turn.completed``, so a
-            # suppressed completion writes the escalation, marks the turn
-            # done, and never delivers it -- silently, on exactly the channel
-            # with nobody watching a thread. The handle-derived route is what
-            # the record stores, so a sweeper re-emits over the same
-            # transport the escalation text went to.
+        async def halt_prior_side_effect() -> None:
             escalation_update = await self._escalate(
                 qevent,
                 route,
@@ -564,6 +663,55 @@ async def _process_event(
                 hook_outcome="failed",
                 hook_reason="prior_side_effect",
             )
+
+        prior_side_effect = await self._markers.saw_side_effect(event_id)
+        predecessor_watch = None
+        if lease is not None and lease.generation > 1:
+            predecessor = await asyncio.to_thread(self._substrate.lookup, thread_key)
+            if predecessor is not None:
+                predecessor_watch = await self._markers.watched_turn(predecessor.claim_name)
+                if (
+                    predecessor_watch is not None
+                    and json.loads(predecessor_watch)["event_id"] == event_id
+                ):
+                    try:
+                        status = await self._runner.status(
+                            predecessor.base_url,
+                            token=predecessor.token or None,
+                            remaining_s=min(5.0, max(0.0, lease.remaining_s())),
+                        )
+                    except Exception:  # noqa: BLE001 - preflight keeps unreadable runners fenced
+                        status = {}
+                    if status.get("side_effect_emitted") is True:
+                        await self._markers.mark_side_effect(event_id)
+                        prior_side_effect = True
+                else:
+                    predecessor_watch = None
+        if prior_side_effect:
+            if predecessor_watch is not None:
+                assert lease is not None
+                handoff_refusals = 0
+                while lease.remaining_s() > constants._MIN_ATTEMPT_BUDGET_S:
+                    lease.raise_if_lost()
+                    try:
+                        assert predecessor is not None
+                        await self._preflight_reclaimed_delivery(
+                            thread_key,
+                            lease,
+                            event_id=event_id,
+                            desired_requester=(
+                                predecessor.caller_requester
+                                or caller_requester_facts(None)[0]
+                            ),
+                            requester_enforced=False,
+                        )
+                        break
+                    except memory.ReclaimPreflightUnsafe:
+                        handoff_refusals += 1
+                        await asyncio.sleep(
+                            min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                        )
+            await halt_prior_side_effect()
             return
 
         # ADR-0168 decision 6: a turn one of this installation's own
@@ -711,6 +859,9 @@ async def _process_event(
                                 cause="runner_escalated",
                                 detail="Factory execution authority is no longer valid.",
                                 ci_fix_round=None,
+                                retry_safety="uncertain",
+                                retry_condition=None,
+                                exhausted_volume=None,
                             )
                         else:
                             await factory_run.defer(
@@ -727,6 +878,11 @@ async def _process_event(
                             # is refused once it committed; the request ended.
                             factory_run.finished = True
                     await self._markers.mark_done(event_id, marker_value="1")
+                    return
+                # #5378: the request's own owner snapshot decides its mode. A
+                # refused personal launch settles here, before any boot env
+                # or claim; a service request carries no launch at all.
+                if await _start_personal_launch(self, factory_run, event_id):
                     return
             else:
                 try:
@@ -915,11 +1071,49 @@ async def _process_event(
                 if selected and qevent.tool_access is None
                 else None
             )
-            boot_env = self._binding.boot_env(
-                resolved,
-                thread_key,
-                **boot_env_kwargs,
+            # @spec CONNECTOR-REQUESTER-1/2: an HTTP-context turn reads the
+            # operator opt-in here, immediately before boot. The verified
+            # requester rides the cct only for an opted-in agent; an invalid
+            # opt-in, or a requester without it, refuses before any claim.
+            principal = (
+                await identity.requester_principal(self, resolved.agent_id) if selected else None
             )
+            if principal is not None:
+                # ADR 0270 decision 3: a requester cct lives one hour from its
+                # claim-time mint. The turn's runtime bound is capped at what
+                # is left of that hour after the boot grace and a cold claim,
+                # so the boot token is minted from the capped budget. Only a
+                # bound that cannot be lowered that far (the runner's minimum
+                # request time) still refuses before boot: no opted-in turn
+                # runs longer than the window.
+                boot_env_kwargs["token_ttl_s"] = self._runner.turn_deadline_s(
+                    self._requester_turn_budget(claim._remaining_budget(lease))
+                )
+                window_s = (
+                    float(boot_env_kwargs["token_ttl_s"])
+                    + BOOT_TOKEN_GRACE_SECONDS
+                    + self._substrate.claim_timeout_seconds
+                )
+                if window_s > REQUESTER_CALLER_TOKEN_TTL_SECONDS:
+                    logger.info(
+                        "requester turn %s refused before boot: its runtime bound "
+                        "cannot be lowered into the requester token window",
+                        event_id,
+                    )
+                    raise identity.HttpIdentityRefused()
+                boot_env_kwargs["caller_principal"] = principal
+            try:
+                boot_env = self._binding.boot_env(
+                    resolved,
+                    thread_key,
+                    **boot_env_kwargs,
+                )
+            except ValueError:
+                if principal is None:
+                    raise
+                # The minter refused the principal (a token over the verifier
+                # bound): the turn refuses before any sandbox claim.
+                raise identity.HttpIdentityRefused() from None
             # The deployment id is the server-side authority used to select
             # and redeem a repository at initial claim time.  The legacy
             # per-deployment workspace_enabled bit is deliberately not a
@@ -988,10 +1182,38 @@ async def _process_event(
             # WorkItem's issue, and the runner mounts get_issue only when
             # it is present. A refused or failed mint leaves the tool off
             # and never stops the boot; the bundle states the gap.
-            if owned_work_item_id is not None and self._work_items is not None:
+            fail_closed_run = _fail_closed_mint_run(self, owned_work_item_id, event_id)
+            if (
+                owned_work_item_id is not None
+                and self._work_items is not None
+                and fail_closed_run is not None
+            ):
+                # ADR 0277 (#5586): a tracker_result session cannot report its
+                # result without this capability, and a publication recovery
+                # runner (#5429) learns from it to construct no model session,
+                # so their mint fails closed: no sandbox, no runner, no model
+                # session.
+                minted = await _mint_fail_closed_capability(
+                    self, fail_closed_run, owned_work_item_id, event_id
+                )
+                if minted is None:
+                    return
+                issue, capability = minted
+                base = self._config.runner_facing_api_base_url.rstrip("/")
+                boot_env[ISSUE_READ_URL_ENV] = f"{base}/work-items/issue-read"
+                boot_env[ISSUE_READ_TOKEN_ENV] = capability
+                logger.info(
+                    "issue read capability bound for %s to %s",
+                    owned_work_item_id,
+                    issue,
+                )
+            elif owned_work_item_id is not None and self._work_items is not None:
                 try:
+                    # Any delivery here is an ordinary turn: a CI fix or
+                    # review turn on a publication recovery request runs its
+                    # model as a bounded workflow turn (#5429, ADR 0269).
                     issue, capability = await self._work_items.issue_read_context(
-                        owned_work_item_id
+                        owned_work_item_id, publication_recovery=False
                     )
                 except (WorkItemConflict, WorkItemTransportError) as exc:
                     logger.warning(
@@ -1093,18 +1315,11 @@ async def _process_event(
         # message text, so kernel rule 3 stands -- may not simply route: the
         # ordinary path would STEER into a retained live turn, which is right
         # for a follow-up and wrong for a retry of the same event. Placed
-        # deliberately AFTER the side-effect check above (rule 1 of the
-        # preflight is that check, and a marker must forbid replay before any
-        # interrupt-and-rehydrate is contemplated) and BEFORE the first
-        # attempt.
-        if claim._is_fenced(lease) and lease is not None and lease.generation > 1:
-            wait_scope = current_wait()
-            if wait_scope is None:
-                await self._preflight_reclaimed_delivery(thread_key, lease)
-            else:
-                record = await wait_scope[0].get(wait_scope[1])
-                if record is not None and record.grant_epoch is not None:
-                    await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
+        # before the first attempt. Maintenance retains the recovery watch
+        # if a side-effect escalation settles before its predecessor quiesces.
+        reclaim_preflight_pending = (
+            claim._is_fenced(lease) and lease is not None and lease.generation > 1
+        )
 
         # Retry carry for the inferred repository announcement (#2659); see
         # _WorkspaceInferenceCarry. Local to this delivery, never kernel state,
@@ -1127,10 +1342,13 @@ async def _process_event(
         termination_detail: str | None = None
         attempt = 0
         capacity_refusals = 0
+        handoff_refusals = 0
         capacity_wait_run: WorkItemRun | None = None
         dependency_deadline: float | None = None
         dependency_refusals = 0
         dependency_attempts = 0
+        unreachable_deadline: float | None = None
+        unreachable_attempts = 0
         while True:
             attempt += 1
             hook_carry = constants._HOOK_RUN_CARRY.get()
@@ -1188,7 +1406,8 @@ async def _process_event(
                         qevent,
                         route,
                         "The run exceeded its delivery deadline after "
-                        f"{attempt - 1 + dependency_attempts} attempt(s) and was not restarted. "
+                        f"{attempt - 1 + dependency_attempts + unreachable_attempts} attempt(s) "
+                        "and was not restarted. "
                         "Flagging for a human.",
                         failure_class="delivery-deadline",
                     )
@@ -1205,6 +1424,49 @@ async def _process_event(
                         ),
                     )
                     return
+            if reclaim_preflight_pending:
+                assert lease is not None
+                try:
+                    wait_scope = current_wait()
+                    if wait_scope is None:
+                        await self._preflight_reclaimed_delivery(
+                            thread_key,
+                            lease,
+                            event_id=event_id,
+                            desired_requester=caller_requester_facts(boot_env)[0],
+                            requester_enforced=identity.requester_enforced(),
+                        )
+                    else:
+                        record = await wait_scope[0].get(wait_scope[1])
+                        if record is not None and record.grant_epoch is not None:
+                            previous_handle = await asyncio.to_thread(
+                                self._substrate.lookup, thread_key
+                            )
+                            previous_watch = (
+                                await self._markers.watched_turn(previous_handle.claim_name)
+                                if previous_handle is not None
+                                else None
+                            )
+                            await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
+                            if (
+                                previous_handle is not None
+                                and previous_watch is not None
+                                and json.loads(previous_watch)["event_id"] == event_id
+                            ):
+                                await self._markers.forget_watched_turn(
+                                    previous_handle.claim_name, previous_watch
+                                )
+                except memory.ReclaimPreflightUnsafe:
+                    handoff_refusals += 1
+                    attempt -= 1
+                    await asyncio.sleep(
+                        min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                    )
+                    continue
+                reclaim_preflight_pending = False
+            if await self._markers.saw_side_effect(event_id):
+                await halt_prior_side_effect()
+                return
             try:
                 outcome = await self._attempt(
                     qevent,
@@ -1223,8 +1485,73 @@ async def _process_event(
                     memory_grant=memory_grant,
                     channel_read_grant=channel_read_grant,
                 )
+            except failures.PriorSideEffectObserved:
+                await halt_prior_side_effect()
+                return
             except failures._WorkItemDeferred:
                 return
+            except (RequesterContextRefused, MemoryRulesContextRefused) as exc:
+                # ADR 0278 (#5592) and #5798: no model work without the
+                # acknowledged requester context and learned rules. The started
+                # request fails with the reason of the first refused delivery.
+                release_order()
+                refused_run = (
+                    self._work_item_runs.get(owned_work_item_id)
+                    if owned_work_item_id is not None
+                    else None
+                )
+                if refused_run is not None:
+                    await _settle_requester_refusal(self, refused_run, exc, event_id)
+                return
+            except PersonalLaunchRefused as exc:
+                release_order()
+                refused_run = (
+                    self._work_item_runs.get(owned_work_item_id)
+                    if owned_work_item_id is not None
+                    else None
+                )
+                if refused_run is not None:
+                    await _settle_personal_refusal(self, refused_run, exc, event_id)
+                    return
+                # A delivery with no personal launch met a runtime that booted
+                # with a personal grant (#5378): it never steers into it.
+                logger.info("event %s refused: %s", event_id, exc.code)
+                if not targetless:
+                    await self._reply_for(qevent, route, constants._PERSONAL_RUNTIME_REFUSED_REPLY)
+                await self._complete(
+                    qevent,
+                    route,
+                    "dropped",
+                    telemetry_outcome="interrupted",
+                    lease=lease,
+                    hook_outcome="blocked",
+                    hook_reason="identity_refused",
+                )
+                return
+            except OwnerBusy:
+                # ADR 0268 decision 2: the owner's one native process is in
+                # use. A waiting request waits for it like capacity, without
+                # spending start attempts. A started continuation retries as
+                # sandbox capacity within this loop's existing bound, and
+                # never through pressure reclamation.
+                release_order()
+                busy_run = (
+                    self._work_item_runs.get(owned_work_item_id)
+                    if owned_work_item_id is not None
+                    else None
+                )
+                logger.info("event %s waiting for its owner's runtime slot", event_id)
+                if busy_run is not None and not busy_run.started:
+                    try:
+                        await busy_run.defer("owner_busy", capacity=True, start_failure_detail=None)
+                    except WorkItemConflict as conflict:
+                        logger.info(
+                            "work-item owner_busy defer refused for %s: %s",
+                            event_id,
+                            conflict.code,
+                        )
+                    return
+                outcome = failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             except failures.SweepClaimGone as exc:
                 # ADR-0160: a continuation never claims, resumes or hands off
                 # a sandbox. The sweep stops; ``_complete`` posts the notice.
@@ -1245,6 +1572,39 @@ async def _process_event(
                     event_id,
                     exc.code,
                 )
+                if exc.code in constants._WORK_ITEM_ENROLLMENT_START_REFUSALS:
+                    # #5378: the owner's enrollment moved after the claim was
+                    # made. The request stays waiting; release exactly that
+                    # claim, observed gone, then defer so it can be rebound.
+                    refused_run = (
+                        self._work_item_runs.get(owned_work_item_id)
+                        if owned_work_item_id is not None
+                        else None
+                    )
+                    if refused_run is not None:
+                        await _settle_personal_refusal(
+                            self,
+                            refused_run,
+                            personal_execution.refused(exc.code),
+                            event_id,
+                        )
+                    return
+                if (
+                    exc.code in _FACTORY_AUTHORITY_REFUSALS
+                    and constants._PERSONAL_LAUNCH.get() is not None
+                ):
+                    # #5378: the API deferred this personal request itself
+                    # (``_defer_factory_refusal``) and it stays waiting.
+                    # Release the claim this delivery recorded, so the
+                    # owner's one slot is free; no second defer.
+                    refused_run = (
+                        self._work_item_runs.get(owned_work_item_id)
+                        if owned_work_item_id is not None
+                        else None
+                    )
+                    if refused_run is not None:
+                        await work_items._release_unstarted_personal_claim(self, refused_run)
+                    return
                 if exc.code in constants._WORK_ITEM_TERMINAL_START_REFUSALS:
                     # #3208: the request settled before a turn opened, so
                     # this delivery is the only one that can release the
@@ -1266,6 +1626,15 @@ async def _process_event(
                         run.finished = True
                 return
             except failures.ThreadBusyError as busy:
+                if isinstance(busy, failures.HandoffPending) and claim._is_fenced(lease):
+                    assert lease is not None
+                    handoff_refusals += 1
+                    attempt -= 1
+                    logger.info("waiting for durable handoff for event %s", event_id)
+                    await asyncio.sleep(
+                        min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                    )
+                    continue
                 run = (
                     self._work_item_runs.get(owned_work_item_id)
                     if owned_work_item_id is not None
@@ -1326,6 +1695,23 @@ async def _process_event(
                         )
                         await asyncio.sleep(backoff_s)
                         continue
+                carry = constants._HOOK_RUN_CARRY.get()
+                if (
+                    isinstance(busy, failures.HookPaused)
+                    and carry is not None
+                    and carry.state is not None
+                    and carry.state.source == "webhook"
+                ):
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="blocked",
+                        hook_reason="hook_paused",
+                    )
+                    return
                 if qevent.source is TurnSource.CRON and (
                     isinstance(busy, failures.HookPaused)
                     or (
@@ -1337,7 +1723,7 @@ async def _process_event(
                     # under the per-thread lock. Record the fire deferred and
                     # settle this delivery; the scheduler reopens the slot on
                     # a later tick or ages it out, so stream reclaim never
-                    # holds a cron turn. A targetless hook is never deferred.
+                    # holds a cron turn.
                     # A retry past its catch-up bound, busy or not, is
                     # skipped rather than deferred again.
                     expiry = retry_expiry(event_id)
@@ -1432,14 +1818,22 @@ async def _process_event(
                 # A gate fired (ADR-0010): persist the durable record, then
                 # suspend the session until a human resolves it. The event
                 # is done -- the resolution arrives as its own queued turn.
-                pause = await self._pause_for_approval(
-                    qevent,
-                    route,
-                    outcome,
-                    agent_id,
-                    approval_routes,
-                    deployment_id=workspace_deployment_id,
-                )
+                if publication._is_publish_provenance(
+                    outcome.approval_gate_kind, outcome.approval_granted_tool
+                ) and _tracker_result_run(self, owned_work_item_id, event_id):
+                    # ADR 0277 (#5586): a tracker_result run never publishes.
+                    # Refused here, before any API call: no publication row,
+                    # no approval, nothing pushed.
+                    pause = await _refuse_tracker_result_publication(self, qevent, route)
+                else:
+                    pause = await self._pause_for_approval(
+                        qevent,
+                        route,
+                        outcome,
+                        agent_id,
+                        approval_routes,
+                        deployment_id=workspace_deployment_id,
+                    )
                 if pause.abandoned:
                     # #4331: a stale owner writes no finish and posts no
                     # escalation; the API termination chain owns the lost
@@ -1456,9 +1850,26 @@ async def _process_event(
                             await self._finish_or_settle(
                                 run,
                                 outcome="failed",
-                                cause="approval_create_failed",
+                                # #5429: a policy refusal of the snapshot is
+                                # terminal and admits no publication recovery.
+                                cause=(
+                                    "publication_refused"
+                                    if outcome.publication_snapshot_refused
+                                    else "approval_create_failed"
+                                ),
                                 detail=pause.failure_detail,
                                 ci_fix_round=None,
+                                retry_safety=failures.retry_safety(
+                                    outcome,
+                                    marker_flagged=await self._markers.saw_side_effect(event_id),
+                                    own_execute_turn=(
+                                        parsed_work_item is not None
+                                        and parsed_work_item.kind == "execute"
+                                        and run.event_id == event_id
+                                    ),
+                                ),
+                                retry_condition=outcome.retry_condition,
+                                exhausted_volume=None,
                             )
                         except WorkItemConflict as exc:
                             # work_item_cancelled means what it does in
@@ -1582,7 +1993,8 @@ async def _process_event(
                     qevent,
                     route,
                     "The run exceeded its delivery deadline after "
-                    f"{attempt + dependency_attempts} attempt(s) and was not restarted. "
+                    f"{attempt + dependency_attempts + unreachable_attempts} attempt(s) "
+                    "and was not restarted. "
                     "Flagging for a human.",
                     failure_class="delivery-deadline",
                 )
@@ -1604,7 +2016,52 @@ async def _process_event(
                 if dependency_retry
                 else retryable and qevent.source is not TurnSource.CRON
             )
-            if not retryable or (attempt >= self._config.max_attempts and not dependency_retry):
+            if retryable and not dependency_retry:
+                tracker_run = _tracker_result_run(self, owned_work_item_id, event_id)
+                if tracker_run is not None and tracker_run.started and not tracker_run.finished:
+                    # ADR 0277 (#5586): a retry would open a second model
+                    # session. The started tracker_result run settles failed
+                    # with its classification cause instead.
+                    retryable = False
+            if (
+                retryable
+                and not dependency_retry
+                and outcome.classification != "sandbox-capacity"
+                and self._started_execute_run(owned_work_item_id, event_id) is not None
+            ):
+                # ADR 0269: a started factory execute turn is one attempt. The
+                # SQL lifecycle owns its retry as a fresh request, so this loop
+                # settles it failed. A sandbox-capacity refusal opened no
+                # runner turn and keeps this loop's bound on the same request.
+                retryable = False
+            # #4733: a connect-phase turn-start failure (a recreated sandbox
+            # pod not yet listening) retries for one window per delivery, the
+            # sandbox claim timeout long and never reset, without consuming
+            # max_attempts. Placed after the side-effect halt, between
+            # attempts and outside the thread lock. After the window closes it
+            # is an ordinary runner-error outcome again.
+            unreachable_wait = False
+            unreachable_remaining = 0.0
+            if outcome.runner_unreachable and retryable and not dependency_retry:
+                if unreachable_deadline is None:
+                    window_s = self._substrate.claim_timeout_seconds
+                    unreachable_deadline = clock.time.monotonic() + window_s
+                    logger.warning(
+                        "runner unreachable at turn start for event %s; retrying for up to "
+                        "%.1fs without consuming attempts",
+                        event_id,
+                        window_s,
+                    )
+                unreachable_remaining = unreachable_deadline - clock.time.monotonic()
+                if unreachable_remaining > 0:
+                    unreachable_wait = True
+                    unreachable_attempts += 1
+                    attempt -= 1
+            if not retryable or (
+                attempt >= self._config.max_attempts
+                and not dependency_retry
+                and not unreachable_wait
+            ):
                 if (
                     outcome.classification in {"runner-error", "sandbox-capacity"}
                     and termination_detail is not None
@@ -1623,7 +2080,7 @@ async def _process_event(
                         qevent,
                         lead=failures._with_guidance(
                             f"The run failed ({token}) after "
-                            f"{attempt + dependency_attempts} attempt(s).",
+                            f"{attempt + dependency_attempts + unreachable_attempts} attempt(s).",
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                         ),
@@ -1667,6 +2124,12 @@ async def _process_event(
                 if capacity_continuation is not None
                 else attempt
             )
+            if unreachable_wait:
+                backoff_s = min(
+                    self._backoff(unreachable_attempts),
+                    constants._RUNNER_UNREACHABLE_RETRY_MAX_S,
+                    unreachable_remaining,
+                )
             remaining = claim._remaining_budget(lease)
             if dependency_retry:
                 remaining = (
@@ -1706,6 +2169,7 @@ async def _process_event(
                         # nothing on this thread needs the sandbox (#3075).
                         await self._release_work_item_sandbox(owned_run)
         constants._OWNED_WORK_ITEM.reset(owned_token)
+        constants._PERSONAL_LAUNCH.reset(personal_token)
         constants._PUBLICATION_CONTEXT.reset(publication_token)
         constants._TURN_PROGRESS.reset(progress_token)
         release_order()
@@ -1738,6 +2202,91 @@ async def _process_event(
         self._minted_refs.pop(event_id, None)
 
 
+async def _start_personal_launch(self: Kernel, run: WorkItemRun, event_id: str) -> bool:
+    """Carry this delivery's personal launch, or settle its refusal (#5378).
+
+    True when the request was refused and settled: the caller returns. A
+    service request carries no launch. A kernel built without the personal
+    execution service (``Kernel(personal_execution=...)``) enforces nothing.
+    """
+
+    service = self._personal_execution
+    if service is None:
+        return False
+    try:
+        launch = await service.launch_for(run)
+    except PersonalLaunchRefused as exc:
+        await _settle_personal_refusal(self, run, exc, event_id)
+        return True
+    constants._PERSONAL_LAUNCH.set(launch)
+    return False
+
+
+async def _settle_personal_refusal(
+    self: Kernel, run: WorkItemRun, exc: PersonalLaunchRefused, event_id: str
+) -> None:
+    """Settle a refused personal execution the way a binding refusal settles.
+
+    Decision 3 of #5378: an unstarted request defers ``not_started:<code>``
+    (bounded by the start deferral limit, ending ``start_failed``), first
+    releasing the claim this delivery recorded unless the refusal is one of
+    ``_PERSONAL_REFUSALS_KEEPING_CLAIM``. A started request finishes failed:
+    ``authentication_required`` for grant refusals and enrollment fences,
+    ``runner_escalated`` for structural refusals.
+    """
+
+    logger.info("personal execution refused for %s: %s", event_id, exc.code)
+    try:
+        if run.started:
+            await run.finish(
+                outcome="failed",
+                cause=(
+                    "authentication_required" if exc.authentication_required else "runner_escalated"
+                ),
+                detail=f"The personal execution was refused ({exc.code}).",
+                ci_fix_round=None,
+                retry_safety="uncertain",
+                retry_condition=None,
+                exhausted_volume=None,
+            )
+        else:
+            if exc.code not in constants._PERSONAL_REFUSALS_KEEPING_CLAIM:
+                await work_items._release_unstarted_personal_claim(self, run)
+            await run.defer(f"not_started:{exc.code}", capacity=False, start_failure_detail=None)
+    except WorkItemConflict as conflict:
+        logger.info("personal refusal settlement for %s refused: %s", event_id, conflict.code)
+        if run.started and conflict.code == "not_running":
+            run.finished = True
+    await self._markers.mark_done(event_id, marker_value="1")
+
+
+async def _settle_requester_refusal(
+    self: Kernel,
+    run: WorkItemRun,
+    exc: RequesterContextRefused | MemoryRulesContextRefused,
+    event_id: str,
+) -> None:
+    """Fail a started request whose requester context (ADR 0278) or learned
+    rules (#5798) were refused."""
+
+    logger.info("%s refused for %s: %s", type(exc).__name__, event_id, exc.reason)
+    try:
+        await run.finish(
+            outcome="failed",
+            cause="runner_escalated",
+            detail=exc.detail,
+            ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
+        )
+    except WorkItemConflict as conflict:
+        logger.info("requester refusal settlement for %s refused: %s", event_id, conflict.code)
+        if conflict.code == "not_running":
+            run.finished = True
+    await self._markers.mark_done(event_id, marker_value="1")
+
+
 def _acquire_order_entry(self: Kernel, thread_key: str) -> delivery._LockEntry:
     entry = self._order_locks.get(thread_key)
     if entry is None:
@@ -1751,3 +2300,103 @@ def _release_order_entry(self: Kernel, thread_key: str, entry: delivery._LockEnt
     entry.refs -= 1
     if entry.refs == 0 and self._order_locks.get(thread_key) is entry:
         del self._order_locks[thread_key]
+
+
+def _tracker_result_run(
+    self: Kernel, owned_work_item_id: uuid.UUID | None, event_id: str
+) -> WorkItemRun | None:
+    """This delivery's own WorkItem run when its request is tracker_result (ADR 0277)."""
+
+    run = _fail_closed_mint_run(self, owned_work_item_id, event_id)
+    return run if run is not None and run.is_tracker_result else None
+
+
+def _fail_closed_mint_run(
+    self: Kernel, owned_work_item_id: uuid.UUID | None, event_id: str
+) -> WorkItemRun | None:
+    """This delivery's own WorkItem run when its capability mint fails closed.
+
+    A tracker_result request (ADR 0277) and a publication recovery request
+    (#5429) both need the capability before their runner boots.
+    """
+
+    if owned_work_item_id is None:
+        return None
+    run = self._work_item_runs.get(owned_work_item_id)
+    if (
+        run is None
+        or run.event_id != event_id
+        or not (run.is_tracker_result or run.is_publication_recovery)
+    ):
+        return None
+    return run
+
+
+async def _mint_fail_closed_capability(
+    self: Kernel, run: WorkItemRun, request_id: uuid.UUID, event_id: str
+) -> tuple[str, str] | None:
+    """Mint a tracker_result or publication recovery run's capability, failing closed.
+
+    The capability is how the runner learns the completion contract: a
+    tracker_result session submits its result through it, and a publication
+    recovery runner learns from it to construct no model session. Any mint
+    fault (a refusal, a transport error, a malformed answer, its
+    own deadline) returns None after settling the delivery: an unstarted run
+    defers its acquisition (``issue_read_unavailable``, not a capacity
+    deferral) and claims no sandbox, so dispatch retries it within its waiting
+    deadline. A started run, which no tracker_result path adopts, finishes
+    failed rather than boot without it.
+    """
+
+    assert self._work_items is not None
+    try:
+        async with asyncio.timeout(_TRACKER_RESULT_MINT_TIMEOUT_S):
+            return await self._work_items.issue_read_context(
+                request_id, publication_recovery=run.is_publication_recovery
+            )
+    except Exception as exc:  # noqa: BLE001 - this gate fails closed on any fault
+        reason = type(exc).__name__
+    logger.warning(
+        "issue read capability unavailable for fail-closed run %s: %s; starting no session",
+        request_id,
+        reason,
+    )
+    try:
+        if run.started:
+            await run.finish(
+                outcome="failed",
+                cause="runner_escalated",
+                detail="The issue read capability for this execution is unavailable.",
+                ci_fix_round=None,
+                retry_safety="uncertain",
+                retry_condition=None,
+                exhausted_volume=None,
+            )
+        else:
+            await run.defer("issue_read_unavailable", capacity=False, start_failure_detail=None)
+    except WorkItemConflict as conflict:
+        logger.info(
+            "fail-closed capability settlement for %s refused: %s", event_id, conflict.code
+        )
+        if run.started and conflict.code == "not_running":
+            run.finished = True
+    await self._markers.mark_done(event_id, marker_value="1")
+    return None
+
+
+async def _refuse_tracker_result_publication(
+    self: Kernel, qevent: QueuedTurn, route: TargetRoute
+) -> approval._ApprovalPause:
+    """Refuse a tracker_result run's publish request before any API call."""
+
+    logger.info("publication refused for tracker_result event %s", qevent.event_id)
+    escalation_update = await self._escalate(
+        qevent,
+        route,
+        "This investigation reports its result to the tracker and does not publish; "
+        "nothing was pushed and no pull request was opened.",
+        failure_class="publication-refused",
+    )
+    return approval._ApprovalPause.refused(
+        _TRACKER_RESULT_PUBLICATION_REFUSAL, escalation_update=escalation_update
+    )

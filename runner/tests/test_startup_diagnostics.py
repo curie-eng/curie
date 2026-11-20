@@ -24,6 +24,7 @@ import os
 import socket
 import sys
 import textwrap
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ import pytest
 from claude_agent_sdk import ProcessError
 from claude_agent_sdk.types import PermissionResultAllow
 from curie_runner.adapter import ClaudeAgentSession, build_options
+from curie_runner.startup_diagnostics import sdk_initialize_diagnostics
 
 # The issue fixes these values. Pinned literally, not imported, so this module
 # still collects when the fix pin reverses the implementation.
@@ -134,7 +136,7 @@ def _assert_late_line_forwarded_not_retained(
     callback = session._options.stderr  # noqa: SLF001
     assert callback is not None
     callback(f"late diagnostic after connect {_BEARER}")
-    assert capsys.readouterr().err == f"late diagnostic after connect {_BEARER}\n"
+    assert capsys.readouterr().err == "late diagnostic after connect [REDACTED:bearer_token]\n"
     assert len(caplog.records) == before
     assert session._stderr_tail.finish() == ""  # noqa: SLF001
 
@@ -158,7 +160,7 @@ def test_successful_connect_records_timing_and_discards_stderr(
     assert _tails(caplog) == []
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     # Every line still reaches stderr, as the inherited fd 2 did before.
-    assert capsys.readouterr().err == f"startup noise {_BEARER}\n"
+    assert capsys.readouterr().err == "startup noise [REDACTED:bearer_token]\n"
     _assert_late_line_forwarded_not_retained(session, caplog, capsys)
 
 
@@ -402,6 +404,8 @@ def _failing_cli(tmp_path: Path) -> Path:
         if sys.argv[1:] == ["-v"]:
             print("9.9.9 (Claude Code)")
             sys.exit(0)
+        sys.stderr.write("Loading tools\\nMCP server ready\\n")
+        sys.stderr.write("service key {_API_KEY}\\n")
         sys.stderr.write("synthetic diagnostic: upstream refused Authorization: {_BEARER}\\n")
         sys.stderr.flush()
         sys.exit(7)
@@ -431,17 +435,108 @@ def _real_options(cli_path: Path | None, *, with_permission_callback: bool, **en
     return options if cli_path is None else replace(options, cli_path=str(cli_path))
 
 
+def test_service_stderr_preserves_real_line_boundaries(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = ClaudeAgentSession(
+        _real_options(None, with_permission_callback=False, ANTHROPIC_API_KEY=_API_KEY)
+    )
+    tail = session._options.stderr  # noqa: SLF001
+    assert tail is not None
+    expected = "Loading tools\nMCP server ready\nChecking plugins\n"
+
+    session._stderr_tail.start()  # noqa: SLF001
+    for line in expected.splitlines():
+        tail(line)
+    assert capsys.readouterr().err == expected
+    assert session._stderr_tail.finish() == expected.rstrip("\n")  # noqa: SLF001
+    tail("after finish")
+    assert capsys.readouterr().err == "after finish\n"
+
+
+@pytest.mark.parametrize("boundary", ["finish", "discard"])
+def test_service_stderr_capture_boundary_clears_pending_secret_prefix(
+    capsys: pytest.CaptureFixture[str],
+    boundary: str,
+) -> None:
+    session = ClaudeAgentSession(
+        replace(
+            _real_options(None, with_permission_callback=False, ANTHROPIC_API_KEY=_API_KEY),
+            max_buffer_size=100,
+        )
+    )
+    tail = session._stderr_tail  # noqa: SLF001
+    tail.start()
+    tail("p" * 100 + _API_KEY[:11])
+    assert capsys.readouterr().err == "p" * 100 + "\n"
+
+    result = getattr(tail, boundary)()
+
+    if boundary == "finish":
+        assert result == _CAPTURE_STOPPED
+        assert capsys.readouterr().err == "[REDACTED:held_secret]\n"
+    else:
+        assert result is None
+        assert capsys.readouterr().err == ""
+    tail.start()
+    tail("MCP server ready")
+    assert tail.finish() == "MCP server ready"
+    assert capsys.readouterr().err == "MCP server ready\n"
+    assert tail.finish() == ""
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("boundary", ["finish", "discard"])
+@pytest.mark.parametrize("continuation", ["partial", "truncated", "unrelated"])
+def test_service_stderr_continuation_preserves_real_line_boundaries(
+    capsys: pytest.CaptureFixture[str], boundary: str, continuation: str,
+) -> None:
+    session = ClaudeAgentSession(
+        replace(
+            _real_options(None, with_permission_callback=False, ANTHROPIC_API_KEY=_API_KEY),
+            max_buffer_size=16,
+        )
+    )
+    tail = session._stderr_tail  # noqa: SLF001
+    tail.start()
+    tail("p" * 16 + _API_KEY[:11])
+    getattr(tail, boundary)()
+    capsys.readouterr()
+
+    remaining = _API_KEY[11:]
+    if continuation == "partial":
+        tail(remaining[:17])
+        getattr(tail, boundary)()
+        tail(remaining[17:] + " public")
+        expected = "[REDACTED:held_secret]\n[REDACTED:held_secret] public\n"
+    elif continuation == "truncated":
+        tail(remaining[:5])
+        expected = "[REDACTED:held_secret]\n"
+    else:
+        unrelated = remaining[:3] + " unrelated"
+        tail(unrelated)
+        expected = unrelated + "\n"
+    tail("Loading tools")
+    tail("MCP server ready")
+    assert capsys.readouterr().err == expected + "Loading tools\nMCP server ready\n"
+
+
 @pytest.mark.parametrize("with_permission_callback", [False, True], ids=["plain", "can-use-tool"])
 def test_real_sdk_process_failure_retains_diagnostic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
     with_permission_callback: bool,
 ) -> None:
     caplog.set_level(logging.INFO, logger="curie_runner")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     session = ClaudeAgentSession(
-        _real_options(_failing_cli(tmp_path), with_permission_callback=with_permission_callback)
+        _real_options(
+            _failing_cli(tmp_path),
+            with_permission_callback=with_permission_callback,
+            ANTHROPIC_API_KEY=_API_KEY,
+        )
     )
     env_before = dict(os.environ)
 
@@ -458,7 +553,12 @@ def test_real_sdk_process_failure_retains_diagnostic(
     (finish,) = _finishes(caplog)
     _assert_record_shape(finish, "failure")
     assert finish.error_class == "ProcessError"  # type: ignore[attr-defined]
-    expected = "synthetic diagnostic: upstream refused Authorization: [REDACTED:bearer_token]"
+    expected = (
+        "Loading tools\nMCP server ready\n"
+        "service key [REDACTED:held_secret]\n"
+        "synthetic diagnostic: upstream refused Authorization: [REDACTED:bearer_token]"
+    )
+    assert capsys.readouterr().err == expected + "\n"
     (tail,) = _tails(caplog)
     assert _tail_text(tail) == expected
     runner_records = [r for r in caplog.records if r.name.startswith("curie_runner")]
@@ -602,6 +702,100 @@ def _protocol_cli(tmp_path: Path) -> Path:
     )
 
 
+@pytest.fixture
+def capture_boundary_cli(tmp_path: Path) -> Iterator[tuple[Path, int]]:
+    gate = tmp_path / "stderr-gate"
+    os.mkfifo(gate)
+    descriptor = os.open(gate, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        cli = _write_cli_fixture(
+            tmp_path / "capture-boundary-cli",
+            f"""
+            import json, sys
+            if sys.argv[1:] == ["-v"]:
+                print("9.9.9 (Claude Code)")
+                sys.exit(0)
+            for raw in sys.stdin:
+                message = json.loads(raw)
+                if message.get("type") != "control_request":
+                    continue
+                with open({str(gate)!r}, "rb", buffering=0) as gate:
+                    sys.stderr.write("p" * {_PARTIAL_FLUSH_CHARS + 16} + {_API_KEY[:11]!r})
+                    sys.stderr.flush()
+                    assert gate.read(1) == b"i"
+                    print(json.dumps({{
+                        "type": "control_response",
+                        "response": {{
+                            "subtype": "success",
+                            "request_id": message["request_id"],
+                            "response": {{}},
+                        }},
+                    }}), flush=True)
+                    assert gate.read(1) == b"c"
+                    sys.stderr.write({_API_KEY[11:]!r} + " public continuation\\n")
+                    sys.stderr.write("Loading tools\\nMCP server ready\\n")
+                    sys.stderr.flush()
+            """,
+        )
+        yield cli, descriptor
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("boundary", ["finish", "discard"])
+def test_real_sdk_partial_secret_crosses_capture_boundary(
+    capture_boundary_cli: tuple[Path, int],
+    boundary: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cli, descriptor = capture_boundary_cli
+    forwarded: list[str] = []
+    ready = asyncio.Event()
+
+    def receive(line: str) -> None:
+        forwarded.append(line)
+        if line.startswith("p" * 16):
+            os.write(descriptor, b"i")
+        if line == "MCP server ready":
+            ready.set()
+
+    session = ClaudeAgentSession(
+        replace(
+            _real_options(cli, with_permission_callback=False, ANTHROPIC_API_KEY=_API_KEY),
+            max_buffer_size=_PARTIAL_FLUSH_CHARS,
+            stderr=receive,
+        )
+    )
+
+    async def scenario() -> None:
+        with anyio.fail_after(_REAL_CLI_TIMEOUT_S):
+            try:
+                with contextlib.suppress(SyntheticConnectError):
+                    with sdk_initialize_diagnostics(
+                        session._stderr_tail, claude_agent_sdk.__version__,  # noqa: SLF001
+                    ):
+                        await session._client.connect()  # noqa: SLF001
+                        if boundary == "finish":
+                            raise SyntheticConnectError()
+                os.write(descriptor, b"c")
+                await ready.wait()
+            finally:
+                await session.close()
+
+    anyio.run(scenario)
+
+    assert forwarded == [
+        "p" * (_PARTIAL_FLUSH_CHARS + 16),
+        *(["[REDACTED:held_secret]"] if boundary == "finish" else []),
+        "[REDACTED:held_secret] public continuation",
+        "Loading tools",
+        "MCP server ready",
+    ]
+    assert _API_KEY[:11] not in "\n".join(forwarded)
+    assert _API_KEY[11:] not in "\n".join(forwarded)
+    assert _API_KEY not in _all_log_text(caplog)
+
+
 def test_real_sdk_post_connect_stderr_reaches_stderr_through_the_options_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -631,8 +825,8 @@ def test_real_sdk_post_connect_stderr_reaches_stderr_through_the_options_copy(
 
     seen = anyio.run(scenario)
 
-    assert f"during initialize {_BEARER}\n" in seen
-    assert f"after connect {_BEARER}\n" in seen
+    assert "during initialize [REDACTED:bearer_token]\n" in seen
+    assert "after connect [REDACTED:bearer_token]\n" in seen
     (finish,) = _finishes(caplog)
     _assert_record_shape(finish, "success")
     assert _tails(caplog) == []

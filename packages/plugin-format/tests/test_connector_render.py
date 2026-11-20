@@ -2456,3 +2456,209 @@ def test_declared_routes_reach_the_proxy_env_without_their_callers() -> None:
 # @spec ADR-0240 d3
 def test_without_declared_routes_the_proxy_env_does_not_name_any() -> None:
     assert "CURIE_CALLER_PROXY_ROUTES" not in _proxy_env(_proxied())
+
+
+# --------------------------------------------------------------------------- #
+# `scratch`: a bounded writable volume for the server container (#5415).
+# --------------------------------------------------------------------------- #
+def _pod(spec: ConnectorSpec) -> dict:
+    return _proxied(spec)["Deployment"]["spec"]["template"]["spec"]
+
+
+def test_scratch_renders_a_bounded_disk_backed_empty_dir() -> None:
+    spec = _tuned(scratch={"path": "/scratch", "size_limit": "2Gi"})
+    pod = _pod(spec)
+    assert pod["volumes"] == [{"name": "scratch", "emptyDir": {"sizeLimit": "2Gi"}}]
+    # Disk, never memory: a memory-backed volume counts against the limit.
+    assert "medium" not in pod["volumes"][0]["emptyDir"]
+    server = _containers(_proxied(spec))["server"]
+    assert server["volumeMounts"] == [{"name": "scratch", "mountPath": "/scratch"}]
+    # The mount is writable and the root filesystem is not.
+    assert server["securityContext"]["readOnlyRootFilesystem"] is True
+
+
+def test_scratch_leaves_the_proxy_and_the_pod_security_context_alone() -> None:
+    spec = _tuned(scratch={"path": "/scratch", "size_limit": "2Gi"})
+    tuned = _proxied(spec)
+    baseline = _proxied()
+    proxy = r.CALLER_PROXY_CONTAINER
+    assert _containers(tuned)[proxy] == _containers(baseline)[proxy]
+    pod = tuned["Deployment"]["spec"]["template"]["spec"]
+    base_pod = baseline["Deployment"]["spec"]["template"]["spec"]
+    # An emptyDir is world-writable, so no fsGroup is needed to write it.
+    assert pod["securityContext"] == base_pod["securityContext"]
+    assert "fsGroup" not in pod["securityContext"]
+
+
+def test_scratch_sits_beside_secret_files() -> None:
+    spec = _tuned(
+        secret_files={"FILES_TOKEN": "/secrets/token"},
+        scratch={"path": "/scratch", "size_limit": "1Gi"},
+    )
+    pod = _pod(spec)
+    assert [v["name"] for v in pod["volumes"]] == ["secret-file-0", "scratch"]
+    server = _containers(_proxied(spec))["server"]
+    mounts = {m["name"]: m for m in server["volumeMounts"]}
+    assert mounts["secret-file-0"]["readOnly"] is True
+    assert mounts["scratch"] == {"name": "scratch", "mountPath": "/scratch"}
+    assert pod["securityContext"]["fsGroup"] == 65532
+
+
+def test_scratch_moves_nothing_but_the_server_mount_and_the_pod_volume() -> None:
+    tuned = _proxied(_tuned(scratch={"path": "/scratch", "size_limit": "2Gi"}))
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert tuned[key] == baseline[key], key
+    server = dict(_containers(tuned)["server"])
+    assert server.pop("volumeMounts") == [{"name": "scratch", "mountPath": "/scratch"}]
+    assert server == _containers(baseline)["server"]
+    pod = dict(tuned["Deployment"]["spec"]["template"]["spec"])
+    base_pod = dict(baseline["Deployment"]["spec"]["template"]["spec"])
+    pod.pop("volumes")
+    pod.pop("containers")
+    base_pod.pop("containers")
+    assert pod == base_pod
+
+
+def test_an_unset_scratch_renders_the_same_bytes() -> None:
+    cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        explicit = ConnectorSpec.model_validate({**case["spec"], "scratch": None})
+        assert _baseline_render_digest(explicit, case["connector"]) == case["sha256"], case["name"]
+
+
+# #5550: the grant store password never enters a rendered object. The proxy
+# gets a credential-free address as a literal and the password by reference.
+_GRANT_STORE_ADDRESS = "redis://acme-rel-valkey:6379/0"
+_GRANT_STORE_SECRET = "acme-rel-secrets"
+_GRANT_STORE_KEY = "valkeyPassword"
+
+
+def _grant_store(
+    address: str = _GRANT_STORE_ADDRESS,
+    secret_name: str = _GRANT_STORE_SECRET,
+    secret_key: str = _GRANT_STORE_KEY,
+) -> r.GrantStore:
+    return r.GrantStore(address=address, secret_name=secret_name, secret_key=secret_key)
+
+
+def _proxy_env_entries(objs: dict[str, dict]) -> dict[str, dict]:
+    return {e["name"]: e for e in _containers(objs)[r.CALLER_PROXY_CONTAINER]["env"]}
+
+
+def test_rendered_objects_never_contain_the_grant_store_password() -> None:
+    # The password lives only in the Secret the chart owns. The caller's DSN
+    # embeds it, which is exactly what used to be rendered as a literal.
+    password = "Sentinel-grant-store-password-5550"
+    dsn = f"redis://:{password}@acme-rel-valkey:6379/0"
+    rendered = r.render(
+        release="acme-rel",
+        agent="acme-bot",
+        namespace="acme-ns",
+        app_name="curie",
+        connector="grafana",
+        spec=HOSTED,
+        secret_name="conn-secrets",
+        proxy=_proxy(),
+        gated_tools=("update_dashboard",),
+        grant_store=_grant_store(address=dsn.replace(f":{password}@", "")),
+    )
+    assert password not in json.dumps(rendered)
+    entries = _proxy_env_entries(_by_kind(rendered))
+    assert entries["CURIE_CALLER_PROXY_GRANT_STORE"] == {
+        "name": "CURIE_CALLER_PROXY_GRANT_STORE",
+        "value": "redis://acme-rel-valkey:6379/0",
+    }
+    assert entries["CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD"] == {
+        "name": "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": _GRANT_STORE_SECRET,
+                "key": _GRANT_STORE_KEY,
+                "optional": False,
+            }
+        },
+    }
+
+
+def test_a_render_without_a_grant_store_emits_neither_grant_store_variable() -> None:
+    entries = _proxy_env_entries(_proxied())
+    assert "CURIE_CALLER_PROXY_GRANT_STORE" not in entries
+    assert "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD" not in entries
+
+
+def test_render_deployment_carries_the_grant_store_reference() -> None:
+    deployment = r.render_deployment(
+        "acme-rel",
+        "acme-bot",
+        "acme-ns",
+        "grafana",
+        HOSTED,
+        "conn-secrets",
+        _proxy(),
+        grant_store=_grant_store(),
+    )
+    containers = deployment["spec"]["template"]["spec"]["containers"]
+    proxy = next(c for c in containers if c["name"] == r.CALLER_PROXY_CONTAINER)
+    entries = {e["name"]: e for e in proxy["env"]}
+    assert entries["CURIE_CALLER_PROXY_GRANT_STORE"]["value"] == _GRANT_STORE_ADDRESS
+    ref = entries["CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD"]["valueFrom"]["secretKeyRef"]
+    assert ref == {"name": _GRANT_STORE_SECRET, "key": _GRANT_STORE_KEY, "optional": False}
+
+
+@pytest.mark.parametrize(
+    ("address", "secret_name", "secret_key", "reason"),
+    [
+        ("redis://:hunter2-5550@valkey:6379/0", _GRANT_STORE_SECRET, "k", "password"),
+        ("redis://user:hunter2-5550@valkey:6379/0", _GRANT_STORE_SECRET, "k", "password"),
+        ("redis://:@valkey:6379/0", _GRANT_STORE_SECRET, "k", "password"),
+        ("http://valkey:6379/0", _GRANT_STORE_SECRET, "k", "scheme"),
+        ("valkey:6379", _GRANT_STORE_SECRET, "k", "scheme"),
+        ("redis:///0", _GRANT_STORE_SECRET, "k", "no host"),
+        ("redis://valkey:6379/0?password=hunter2-5550", _GRANT_STORE_SECRET, "k", "query"),
+        ("redis://valkey:6379/0#hunter2-5550", _GRANT_STORE_SECRET, "k", "fragment"),
+        ("redis://valkey:notaport/0", _GRANT_STORE_SECRET, "k", "parsable"),
+        (_GRANT_STORE_ADDRESS, "Not_A_Secret", "k", "Secret name"),
+        (_GRANT_STORE_ADDRESS, "", "k", "Secret name"),
+        (_GRANT_STORE_ADDRESS, "a" * 254, "k", "Secret name"),
+        (_GRANT_STORE_ADDRESS, _GRANT_STORE_SECRET, "", "key is empty"),
+    ],
+)
+def test_grant_store_refuses_an_unsafe_or_malformed_reference(
+    address: str, secret_name: str, secret_key: str, reason: str
+) -> None:
+    with pytest.raises(ValueError, match=reason) as caught:
+        r.GrantStore(address=address, secret_name=secret_name, secret_key=secret_key)
+    # A refused address may carry a credential, so no message echoes it.
+    assert "hunter2-5550" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "redis://valkey",
+        "redis://valkey:6379",
+        "redis://valkey:6379/3",
+        "redis://grant-user@valkey:6379/0",
+        "rediss://valkey.example.com:6380/0",
+        "redis://[fd00::1]:6379/0",
+    ],
+)
+def test_grant_store_accepts_a_credential_free_address(address: str) -> None:
+    store = _grant_store(address=address)
+    entries = _proxy_env_entries(
+        _by_kind(
+            r.render(
+                release="acme-rel",
+                agent="acme-bot",
+                namespace="acme-ns",
+                app_name="curie",
+                connector="grafana",
+                spec=HOSTED,
+                secret_name="conn-secrets",
+                proxy=_proxy(),
+                grant_store=store,
+            )
+        )
+    )
+    assert entries["CURIE_CALLER_PROXY_GRANT_STORE"]["value"] == address

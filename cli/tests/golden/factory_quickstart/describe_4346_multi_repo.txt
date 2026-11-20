@@ -11,9 +11,9 @@ configure factory intake factory.intake=poll for a/x,b/y with --app-id 12345 --p
 configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values
 render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image
 create agent dark-factory only if absent, with initial surface github=a/x and the tracker default label; preserve an existing agent
-curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir /tmp/factory-quickstart-golden/curie-factory-quickstart-curie-curie/dark-factory --agent dark-factory --env prod --repo a/x
-curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=a/x
-curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=b/y
 curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800
 curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto
 curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5 --output-tokens 250000
+curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir /tmp/factory-quickstart-golden/curie-factory-quickstart-curie-curie/dark-factory --agent dark-factory --env prod --repo a/x
+curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=a/x
+curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=b/y

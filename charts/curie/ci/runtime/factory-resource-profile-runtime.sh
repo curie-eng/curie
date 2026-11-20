@@ -6,7 +6,7 @@
 # The caller owns the installed workload release; this scenario uses it.
 #
 # Phases, strictly sequential so the 8Gi factory request is never reserved
-# twice (one factory sandbox fills the default sandbox requests.memory quota):
+# twice (10Gi requests.memory admits one 8Gi factory sandbox, not two):
 #   1. The caller installs the repository chart through `curie cluster up`, selecting the
 #      factory profile for agent acme-fp with
 #      agentSandbox.agentResourceProfiles.acme-fp=factory. factory.enabled is

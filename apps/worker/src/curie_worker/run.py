@@ -13,23 +13,26 @@ import logging
 import math
 import os
 import signal
-import socket
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, NoReturn, TypedDict
+from typing import Any, Literal, NoReturn, TypedDict
 
 import httpx
-import redis
 from aci_protocol.s3 import build_s3_client
 from aci_protocol.turn import DEFAULT_IDENTITY
 from aiohttp import web
+from curie_channel_gateway.read_transport import GatewayClient, RemoteFileSource
+from curie_channel_gateway.tls import gateway_http_mounts
+from curie_channel_gateway.token_custody import refuse_slack_tokens
+from curie_internal.valkey import AsyncRedis, Redis
 from curie_internal.workspace_objects import WorkspaceObjectPort
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import bootstrap_service_telemetry, record_metric
-from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
@@ -39,15 +42,17 @@ from . import __version__
 from .action_executor_loop import ActionExecutorLoop
 from .actions import ActionClient, ActionRecorder
 from .approval_cards import ApprovalCardStore
+from .approval_reminders import deliver_reminder
 from .approvals import ApprovalClient
 from .attachment_access_client import AttachmentAccessClient
 from .attachments import (
     AttachmentCoordinator,
     AttachmentLimits,
     ChannelPortFileClient,
-    SlackFileClient,
+    _file_transport,
 )
 from .binding import BindingResolver
+from .boot_grace import BOOT_GRACE_S, is_dependency_not_ready
 from .bundle_store import BundleStore
 from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
@@ -60,6 +65,10 @@ from .delivery_lease import DeliveryLeaseStore
 from .deploy_notice import DeployNoticeConsumer
 from .e2e_reaper import E2EReaperLoop
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
+from .factory_credit import FactoryCreditLoop
+from .factory_slack_progress import FactorySlackProgressLoop, PostgresFactorySlackStore
+from .factory_steering import FactorySteeringClient
+from .factory_tool_observer import FactoryToolObserver
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
@@ -70,7 +79,26 @@ from .kernel.memory import drain_pending_memory_closes
 from .killswitch import KillSwitch
 from .ledger_client import ThreadAttachmentLedgerClient
 from .markers import Markers
+from .personal_custody import (
+    CustodySecret,
+    PersonalCustodyReader,
+    SecretReader,
+    build_secret_reader,
+)
+from .personal_execution import PersonalExecution, owner_lease_ttl_ms
 from .progress import ProgressStore
+from .provider_probe import ProviderProbeLoop
+from .publication_candidate_capture import PublicationCandidateCapture
+from .publication_candidate_storage import (
+    PATCH_LIMIT_BYTES as PUBLICATION_CANDIDATE_PATCH_LIMIT_BYTES,
+)
+from .publication_candidate_storage import (
+    CandidateObjectStore,
+    CandidateReader,
+    CandidateWriter,
+    build_candidate_collector,
+)
+from .publication_candidates import PublicationCandidateClient
 from .publication_clients import (
     PublicationCodeHostClient,
     PublicationCredentialClient,
@@ -99,13 +127,17 @@ from .sandbox import (
     RunnerHardening,
     SandboxClient,
     SandboxSubstrate,
+    StaticPoolSandboxClient,
     SubstrateConfig,
     SuspendedThreadError,
+    agent_warm_pool_name,
+    parse_static_shells,
+    shell_ssl_context,
 )
 from .sandbox.quota import parse_admission_config
+from .sandbox.static import cleanup_stale_archives, parse_agent_credential_files
 from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
-from .slack_tokens import slack_bot_tokens
 from .stream_retention import StreamRetention, build_stream_retention
 from .sweep import SweepCoverage
 from .threadlock import ThreadLock
@@ -154,10 +186,12 @@ class Runtime:
     # drive its one-shot legacy rekey at boot (#1751) without constructing a
     # second client-and-config pair that could drift from the kernel's.
     card_store: ApprovalCardStore
+    approval_reference_reader: ApprovalClient
     # None unless the connector reconciler is enabled (ADR-0090, #1184). Held
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
     connector_loop: ConnectorReconcileLoop | None = None
+    factory_tool_observer: FactoryToolObserver | None = None
     # The cron scheduler (#268). Always built by ``build``; optional only so a
     # Runtime constructed elsewhere need not name it.
     cron_loop: CronSchedulerLoop | None = None
@@ -170,6 +204,18 @@ class Runtime:
     # one thread message per remediation stage, beside the card loop and outside
     # the consumer, the thread lock and the markers.
     remediation_receipts: RemediationReceiptLoop | None = None
+    # None unless factory Slack progress is on (#5414): posts each factory
+    # run's owed progress to its agent's Slack destination, outside the
+    # consumer, the thread lock and the markers.
+    factory_slack_progress: FactorySlackProgressLoop | None = None
+    # Always built. Records model_credit facts from this worker's own model
+    # credential (issue 5581). Optional only so a Runtime constructed in tests
+    # need not name it.
+    factory_credit: FactoryCreditLoop | None = None
+    # Always built. Registers this worker's provider scope and probes its
+    # allowance while a provider gate waits on it (#5426). Optional only so a
+    # Runtime constructed in tests need not name it.
+    provider_probe: ProviderProbeLoop | None = None
     # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
     # beside the connector reconcile loop, never inside the consumer.
     action_executor: ActionExecutorLoop | None = None
@@ -180,6 +226,8 @@ class Runtime:
     e2e_reaper: E2EReaperLoop | None = None
     # None unless workspace recovery is on with the internal token (ADR 0251).
     workspace_recovery_gc: RecoveryCollector | None = None
+    # None unless publication candidates are on with the internal token (#5428).
+    publication_candidates_gc: RecoveryCollector | None = None
     deploy_notice_consumer: DeployNoticeConsumer | None = None
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
     # only so a Runtime constructed elsewhere need not name it.
@@ -275,14 +323,43 @@ def _agent_names(env: Mapping[str, str], key: str) -> frozenset[str]:
     return frozenset(name.strip() for name in env.get(key, "").split(",") if name.strip())
 
 
+SandboxSubstrateKind = Literal["kubernetes", "docker", "static"]
+_SANDBOX_SUBSTRATES: tuple[SandboxSubstrateKind, ...] = ("kubernetes", "docker", "static")
+
+
+def sandbox_substrate(env: Mapping[str, str]) -> SandboxSubstrateKind:
+    """``CURIE_SANDBOX_SUBSTRATE``: kubernetes (the default), docker or static.
+
+    Any other value refuses worker start. It used to select Kubernetes
+    silently, which turned a typo into a worker claiming pods it was never
+    meant to reach.
+    """
+
+    raw = env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").strip().lower()
+    for kind in _SANDBOX_SUBSTRATES:
+        if raw == kind:
+            return kind
+    raise ValueError(
+        f"CURIE_SANDBOX_SUBSTRATE={raw!r} is not a sandbox substrate; "
+        "use kubernetes, docker or static"
+    )
+
+
 def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     # claim_timeout is overridable so a slow cluster can raise it; when unset the
     # authoritative default lives in SubstrateConfig. Keep any override below the
     # per-thread lock TTL (WorkerConfig.lock_ttl_ms) -- see that comment.
     overrides: dict[str, Any] = {}
+    substrate = sandbox_substrate(env)
     admission = parse_admission_config(env.get("CURIE_SANDBOX_ADMISSION"))
-    if admission is not None and env.get("CURIE_SANDBOX_SUBSTRATE") == "docker":
-        raise ValueError("Docker substrate cannot use Kubernetes quota admission")
+    if admission is not None and substrate != "kubernetes":
+        raise ValueError(f"the {substrate} substrate cannot use Kubernetes quota admission")
+    repo_runner_pools = parse_repo_runner_pools(env.get(REPO_RUNNER_POOLS_ENV)).root
+    if repo_runner_pools and substrate == "static":
+        # A repository runner pool is a Kubernetes warm pool, and a Docker
+        # enabled one adds a privileged per-claim tool daemon (ADR 0216, 0217);
+        # a static shell is neither, so binding one is refused, not ignored.
+        raise ValueError(f"the static substrate cannot serve {REPO_RUNNER_POOLS_ENV}")
     claim_timeout = _bounded_seconds(env, "CURIE_CLAIM_TIMEOUT_SECONDS", float)
     if claim_timeout is not None:
         overrides["claim_timeout_seconds"] = claim_timeout
@@ -307,7 +384,7 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
         connector_secret_pools=_agent_names(env, "CURIE_AGENT_CONNECTOR_SECRET_POOLS"),
         # ADR 0216: malformed input fails worker startup rather than routing a
         # bound repository to the generic pool.
-        repo_runner_pools=parse_repo_runner_pools(env.get(REPO_RUNNER_POOLS_ENV)).root,
+        repo_runner_pools=repo_runner_pools,
         platform_runner_digest=platform_runner_digest(env.get("CURIE_RUNNER_IMAGE")),
         runner_port=int(env.get("CURIE_RUNNER_PORT", "8080")),
         **overrides,
@@ -367,14 +444,83 @@ def _attachment_limits(config: WorkerConfig) -> AttachmentLimits:
     )
 
 
+def _static_pool_client(
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    sub_config: SubstrateConfig,
+    redis_client: Redis | None,
+) -> StaticPoolSandboxClient:
+    """The static shell pool (``CURIE_SANDBOX_SUBSTRATE=static``).
+
+    The deployment supplies the shell inventory (``CURIE_STATIC_SHELLS``), the
+    CA bundle that signs every shell's certificate
+    (``CURIE_STATIC_SHELL_CA_FILE``) and the control credential the shells
+    share with the worker (``CURIE_STATIC_SHELL_CONTROL_TOKEN``). Leases live
+    in the worker's own Valkey beside the routes.
+    """
+
+    if config.action_executor_enabled:
+        # The executor's serving attestation reads Kubernetes Deployments,
+        # which a static pool has none of; static connector endpoints refuse
+        # it for the same reason.
+        raise ValueError("the static substrate does not run the action executor")
+    if redis_client is None:
+        raise ValueError("the static substrate keeps its leases in the worker's Valkey")
+    slots = parse_static_shells(env.get("CURIE_STATIC_SHELLS"))
+    ca_file = env.get("CURIE_STATIC_SHELL_CA_FILE")
+    if not ca_file:
+        raise ValueError("CURIE_STATIC_SHELL_CA_FILE names the CA that signs the shells")
+    pools = {slot.pool for slot in slots}
+    missing = sorted(
+        agent
+        for agent in sub_config.agent_pools | sub_config.connector_secret_pools
+        if agent_warm_pool_name(sub_config.warm_pool, agent) not in pools
+    )
+    if missing:
+        raise ValueError(
+            "CURIE_AGENT_SANDBOX_POOLS or CURIE_AGENT_CONNECTOR_SECRET_POOLS names agents "
+            "with no static shell: " + ", ".join(missing)
+        )
+    if sub_config.warm_pool not in pools:
+        logger.warning(
+            "no static shell serves the generic pool %s; claims of agents without "
+            "their own shells will be refused",
+            sub_config.warm_pool,
+        )
+    cleanup_stale_archives()
+    return StaticPoolSandboxClient(
+        slots=slots,
+        redis_client=redis_client,
+        control_token=env.get("CURIE_STATIC_SHELL_CONTROL_TOKEN", ""),
+        ssl_context=shell_ssl_context(ca_file),
+        bundle_store=BundleStore(config),
+        key_prefix=sub_config.key_prefix,
+        bundle_max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+        bundle_max_compression_ratio=config.bundle_max_compression_ratio,
+        bundle_max_members=config.bundle_max_members,
+        workspace_limits=_workspace_limits(config),
+        attachment_limits=_attachment_limits(config),
+        connector_upload_signing_key=config.connector_caller_signing_key,
+        agent_credential_files=parse_agent_credential_files(
+            env.get("CURIE_AGENT_CREDENTIAL_FILES")
+        ),
+    )
+
+
 def _sandbox_client(
-    config: WorkerConfig, env: Mapping[str, str], sub_config: SubstrateConfig
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    sub_config: SubstrateConfig,
+    *,
+    redis_client: Redis | None = None,
 ) -> SandboxClient:
-    """The cluster/Docker seam, chosen by ``CURIE_SANDBOX_SUBSTRATE``.
+    """The cluster/Docker/static seam, chosen by ``CURIE_SANDBOX_SUBSTRATE``.
 
     ``kubernetes`` (default) claims agent-sandbox CRs; ``docker`` boots runner
-    containers locally (middle mode on a laptop, no cluster). The eval consumer
-    shares the substrate this client backs, so the choice applies to both lanes.
+    containers locally (middle mode on a laptop, no cluster); ``static`` leases
+    long-lived shells from a fixed pool (``redis_client`` holds the leases).
+    The eval consumer shares the substrate this client backs, so the choice
+    applies to both lanes.
 
     Local middle mode defaults to a REAL model. Fake model is an explicit
     offline/test opt-in, so a Docker worker with neither a model credential,
@@ -384,7 +530,9 @@ def _sandbox_client(
     (``CLAUDE_CODE_OAUTH_TOKEN`` / ``ANTHROPIC_API_KEY``) or the ACI
     ``CURIE_CREDENTIALS`` reference, which the runner maps onto an SDK var.
     """
-    substrate = env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower()
+    substrate = sandbox_substrate(env)
+    if substrate == "static":
+        return _static_pool_client(config, env, sub_config, redis_client)
     if substrate == "docker":
         bundle_store = BundleStore(config)
         has_credential = bool(config.credentials) or any(v in env for v in _MODEL_CREDENTIAL_ENV)
@@ -450,29 +598,15 @@ async def _close_sync(close: Callable[[], None]) -> None:
 
 
 def _attachment_coordinator(
-    config: WorkerConfig, objects: WorkspaceObjectPort, slack_tokens: Mapping[str, str]
+    config: WorkerConfig, objects: WorkspaceObjectPort, slack_files: Mapping[str, RemoteFileSource]
 ) -> AttachmentCoordinator | None:
     """Keep legacy object retention cleanup active during lazy rollout."""
     return (
         AttachmentCoordinator(
-            # The lane is on when any identity holds a token, so `default`'s
-            # may be blank here; `_files_for` refuses that identity before any
-            # fetch rather than this module standing in a broken port for it.
-            files=(
-                SlackFileClient(
-                    token=config.slack_bot_token,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                if config.slack_bot_token
-                else None
-            ),
+            # Bind every configured identity to its gateway file source.
+            files=slack_files.get(DEFAULT_IDENTITY),
             identity_files={
-                name: SlackFileClient(
-                    token=token,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                for name, token in slack_tokens.items()
-                if name != DEFAULT_IDENTITY
+                name: source for name, source in slack_files.items() if name != DEFAULT_IDENTITY
             },
             channel_files=(
                 ChannelPortFileClient(
@@ -488,10 +622,87 @@ def _attachment_coordinator(
         if config.attachment_enabled
         and (
             config.attachment_mode == "lazy"
-            or any(slack_tokens.values())
+            or bool(slack_files)
             or bool(config.adapter_credentials)
         )
         else None
+    )
+
+
+def refuse_personal_without_kubernetes(config: WorkerConfig, env: Mapping[str, str]) -> None:
+    """A personal installation needs the Kubernetes substrate (#5378, ADR 0268).
+
+    Docker and static runners have no per-claim grant Secret or owner labels,
+    so worker start refuses before any substrate or container exists.
+    """
+
+    if config.factory_model_auth_mode == "personal" and sandbox_substrate(env) != "kubernetes":
+        raise ValueError(
+            "personal_mode_requires_kubernetes: FACTORY_MODEL_AUTH_MODE=personal needs "
+            "CURIE_SANDBOX_SUBSTRATE=kubernetes"
+        )
+
+
+class _LazySecretReader:
+    """The custody Secret reader, built on the first personal grant read.
+
+    A worker that never launches a personal execution (a laptop on Docker)
+    never loads cluster credentials. A failed build is a failed read, which
+    the custody reader refuses ``custody_unreadable``.
+    """
+
+    def __init__(self) -> None:
+        self._reader: SecretReader | None = None
+        self._guard = threading.Lock()
+
+    def read_secret(self, namespace: str, name: str) -> CustodySecret | None:
+        with self._guard:
+            if self._reader is None:
+                self._reader = build_secret_reader()
+            reader = self._reader
+        return reader.read_secret(namespace, name)
+
+
+def build_personal_execution(
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    *,
+    engine: AsyncEngine,
+    binding: BindingResolver,
+    async_redis: AsyncRedis,
+    claim_timeout_seconds: float,
+) -> PersonalExecution:
+    """The Kernel's personal execution authority (#5378), in both modes.
+
+    A service installation still meets personal requests only through their
+    own snapshot, so it carries the same authority and refuses what it
+    cannot run (``personal_mode_requires_kubernetes`` off Kubernetes).
+    """
+
+    return PersonalExecution(
+        authority=binding,
+        custody=PersonalCustodyReader(
+            engine,
+            schema=config.db_schema,
+            namespace=config.personal_grant_namespace,
+            secrets=_LazySecretReader(),
+        ),
+        owner_lock=ThreadLock(
+            async_redis,
+            ttl_ms=owner_lease_ttl_ms(
+                thread_lock_ttl_ms=config.lock_ttl_ms,
+                claim_timeout_seconds=claim_timeout_seconds,
+            ),
+            # One attempt: a held owner lease answers OwnerBusy at once.
+            acquire_timeout_s=0.0,
+            poll_interval_s=config.lock_poll_interval_s,
+            owner=config.consumer_name,
+        ),
+        owner_key=lambda provenance: (
+            f"{config.key_prefix}:personal-owner:"
+            f"{provenance.owner_tenant_id}:{provenance.owner_principal_id}"
+        ),
+        kubernetes=sandbox_substrate(env) == "kubernetes",
     )
 
 
@@ -499,6 +710,8 @@ def build(
     config: WorkerConfig, env: Mapping[str, str], *, resources: WorkerResources | None = None
 ) -> Runtime:
     """@spec PROTECTED-HOOK-SOURCE-2."""
+    refuse_slack_tokens(env)
+    refuse_personal_without_kubernetes(config, env)
     owner = resources if resources is not None else WorkerResources()
     owner.register_close("memory-drain", drain_pending_memory_closes, order=0)
     # Channel read revocations likewise (ADR 0100): one not finished leaves the
@@ -514,12 +727,13 @@ def build(
         socket_timeout=config.valkey_socket_timeout_s,
     )
     owner.register_close("runs-redis", async_redis.aclose, order=40)
-    sync_redis = redis.Redis(
+    sync_redis = Redis(
         **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
     owner.register_close("affinity-redis", lambda: _close_sync(sync_redis.close), order=43)
     pressure_async_redis: AsyncRedis = AsyncRedis(
+        retry_reads=False,
         **config.valkey_client_kwargs(),
         socket_timeout=1.0,
         socket_connect_timeout=1.0,
@@ -529,8 +743,9 @@ def build(
     )
     owner.register_close("pressure-redis", pressure_async_redis.aclose, order=41)
     sub_config = _substrate_config(env)
+    sandbox_client = _sandbox_client(config, env, sub_config, redis_client=sync_redis)
     substrate = SandboxSubstrate(
-        _sandbox_client(config, env, sub_config),
+        sandbox_client,
         AffinityStore(sync_redis, pressure_client=pressure_async_redis),
         sub_config,
     )
@@ -538,6 +753,12 @@ def build(
         connect_timeout_s=config.runner_connect_timeout_s,
         total_timeout_s=config.runner_total_timeout_s,
         snapshot_patch_max_bytes=config.publication_patch_max_bytes,
+        # A static shell answers HTTPS under the deployment's shell CA.
+        ssl_context=(
+            shell_ssl_context(env["CURIE_STATIC_SHELL_CA_FILE"])
+            if isinstance(sandbox_client, StaticPoolSandboxClient)
+            else None
+        ),
     )
     owner.register_close("runner", runner.close, order=10)
     workspace_s3 = build_s3_client(
@@ -585,8 +806,8 @@ def build(
     # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
     # sandbox half from the same value, so there is one knob and not two.
     #
-    # In eager mode the credential condition is separate: the lane downloads a referenced
-    # file with a Slack bot token, or with a channel-port adapter's secret
+    # In eager mode the lane downloads through gateway caller credentials or
+    # a channel-port adapter's secret
     # (ADR-0153), and the kernel treats a wired lane as authoritative. An
     # install holding neither (compose smoke) keeps running every turn exactly
     # as it does today rather than failing on the first message with a file.
@@ -602,22 +823,43 @@ def build(
     # through a short-lived one-object presigned URL redeemed by the sandbox's
     # attachments-init container.
     #
-    # Each Slack identity's bot token, read once from this process's env
-    # (ADR-0168 decision 5), so the lane and the sink serve the same set.
-    slack_tokens = slack_bot_tokens(config, environ=env)
-    attachments = _attachment_coordinator(config, workspace_objects, slack_tokens)
+    # File sources bind an identity at the gateway; the worker holds only its caller token.
+    gateway_identities = tuple(identity.name for identity in config.slack_identities) or (
+        DEFAULT_IDENTITY,
+    )
+    slack_files = (
+        {
+            name: RemoteFileSource(
+                config.channel_gateway_url,
+                config.channel_gateway_token,
+                name,
+                allow_insecure_http=config.channel_gateway_allow_insecure,
+                transport=_file_transport,
+                chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                max_bytes=config.attachment_max_file_bytes,
+            )
+            for name in gateway_identities
+        }
+        if config.channel_gateway_url
+        else {}
+    )
+    attachments = _attachment_coordinator(config, workspace_objects, slack_files)
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
-    eval_http = httpx.AsyncClient(timeout=30.0)
+    eval_http = httpx.AsyncClient(
+        timeout=30.0, mounts=gateway_http_mounts(config.channel_gateway_url)
+    )
     owner.register_close("eval-http", eval_http.aclose, order=30)
     # @spec HTTP-INVOCATION-EXECUTION-18/22: one client answers the kernel's
     # current checks and the binding owner's per-identity classification.
     identity_authority = (
         HttpTurnAuthorityClient(
-            api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
             client=eval_http,
         )
-        if config.internal_worker_token else None
+        if config.internal_worker_token
+        else None
     )
     binding = BindingResolver(engine, config, identity_classifier=identity_authority)
     recovery_gc: RecoveryCollector | None = None
@@ -657,6 +899,58 @@ def build(
                 runner=runner,
                 coordinator=workspace,
             )
+    candidates_gc: RecoveryCollector | None = None
+    candidate_capture: PublicationCandidateCapture | None = None
+    candidate_reader: CandidateReader | None = None
+    if config.publication_candidates_enabled and config.internal_worker_token:
+        candidates_s3 = build_recovery_s3_client(
+            endpoint_url=config.s3_endpoint_url,
+            access_key=config.s3_access_key,
+            secret_key=config.s3_secret_key,
+            region=config.s3_region,
+        )
+        owner.register_close(
+            "publication-candidates-s3", lambda: _close_sync(candidates_s3.close), order=70
+        )
+        candidate_ledger = PublicationCandidateClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        candidate_store = CandidateObjectStore(client=candidates_s3, bucket=config.workspace_bucket)
+        candidates_gc = build_candidate_collector(
+            ledger=candidate_ledger, store=candidate_store, collector_id=config.consumer_name
+        )
+        # The pre-validation capture (#5428). The config refuses candidates
+        # without managed workspaces, so the coordinator is always built here.
+        if workspace is not None:
+            candidate_capture = PublicationCandidateCapture(
+                ledger=candidate_ledger,
+                writer=CandidateWriter(
+                    ledger=candidate_ledger,
+                    store=candidate_store,
+                    scratch_root=Path(config.workspace_scratch_root) / "candidates",
+                    base_archive_limit_bytes=config.workspace_max_archive_bytes,
+                    patch_limit_bytes=min(
+                        PUBLICATION_CANDIDATE_PATCH_LIMIT_BYTES,
+                        config.publication_patch_max_bytes,
+                    ),
+                ),
+                coordinator=workspace,
+            )
+            # The reader a publication recovery run reads its candidate
+            # through (#5429). Signed reads go to a bare transport, never an
+            # httpx client, whose logger would record the signed URL.
+            candidate_read_transport = httpx.AsyncHTTPTransport()
+            owner.register_close(
+                "publication-candidates-read", candidate_read_transport.aclose, order=30
+            )
+            candidate_reader = CandidateReader(
+                ledger=candidate_ledger,
+                store=candidate_store,
+                transport=candidate_read_transport,
+                reference_ttl_seconds=config.workspace_reference_ttl_seconds,
+            )
     attachment_access_client = None
     broker_server = None
     if config.attachment_enabled and config.attachment_mode == "lazy":
@@ -665,11 +959,7 @@ def build(
         broker = AttachmentBroker(
             internal_token=config.internal_worker_token,
             routes_for_agent=binding.routes_for_agent,
-            slack_files={
-                name: SlackFileClient(token=token, read_chunk_bytes=64 * 1024)
-                for name, token in slack_tokens.items()
-                if token
-            },
+            slack_files=slack_files,
             channel_files=(
                 ChannelPortFileClient(
                     credentials=config.adapter_credentials, read_chunk_bytes=64 * 1024
@@ -707,14 +997,25 @@ def build(
             worker_token=config.internal_worker_token,
         ),
     )
-    sink = build_reply_sink(config, slack_tokens=slack_tokens)
+    sink = build_reply_sink(config)
     owner.register_close("reply-sink", sink.aclose, order=20)
     # ADR-0168 decision 6. None unless a sibling identity can exist here, so a
     # stock install asks no auth.test, reads no binding and makes no Valkey
     # call for it.
-    sibling_limit = build_sibling_limit(
-        config, async_redis, slack_tokens=slack_tokens, channel=binding
+    gateway_senders = (
+        GatewayClient(
+            eval_http,
+            config.channel_gateway_url,
+            config.channel_gateway_token,
+            allow_insecure_http=config.channel_gateway_allow_insecure,
+            identities=gateway_identities,
+        )
+        if config.channel_gateway_url and len(config.slack_identities) > 1
+        else None
     )
+    if gateway_senders is not None:
+        owner.register_close("gateway-senders", gateway_senders.aclose, order=19)
+    sibling_limit = build_sibling_limit(config, async_redis, slack=gateway_senders, channel=binding)
     card_store = ApprovalCardStore(async_redis, config)
     work_items = (
         WorkItemDispatchClient(
@@ -767,6 +1068,8 @@ def build(
         identity_authority=identity_authority,
         workspace=workspace,
         recovery=recovery_capture,
+        publication_candidates=candidate_capture,
+        publication_candidate_reader=candidate_reader,
         attachments=attachments,
         attachment_access=attachment_access_client,
         # ADR 0205: the thread attachment ledger, behind the internal worker
@@ -786,8 +1089,7 @@ def build(
         # refusal in the kernel before either durable row is created.
         publication_creator=(
             approval_client
-            if config.publication_enabled
-            and env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() == "kubernetes"
+            if config.publication_enabled and sandbox_substrate(env) == "kubernetes"
             else None
         ),
         # The same client, handed in twice under the two roles the kernel needs
@@ -810,6 +1112,20 @@ def build(
         # ADR 0100: the stored bundle is where a turn's channel read grant is
         # read from, so the kernel knows it without asking the API.
         bundles=BundleStore(config),
+        # Factory run steering (#5414): always built, so a factory run's Slack
+        # root never starts ordinary chat on any worker.
+        factory_steering=_build_factory_steering(
+            config, engine, async_redis, client=eval_http, sink=sink
+        ),
+        # #5378: a WorkItem request runs only as the owner its snapshot names.
+        personal_execution=build_personal_execution(
+            config,
+            env,
+            engine=engine,
+            binding=binding,
+            async_redis=async_redis,
+            claim_timeout_seconds=sub_config.claim_timeout_seconds,
+        ),
     )
     owner.register_close("work-item-settlement", kernel.close, order=5)
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
@@ -830,6 +1146,12 @@ def build(
         config=config,
         leases=DeliveryLeaseStore(async_redis, config),
         drain=drain_gate,
+        reminders=partial(
+            deliver_reminder,
+            reader=approval_client,
+            cards=card_store,
+            sink=ObservedReplySink(sink),
+        ),
     )
 
     # The eval lane (F3): a second consumer group on curie:evals, on its own
@@ -911,6 +1233,10 @@ def build(
             else None
         ),
         connector_loop=_build_connector_loop(config, engine, client=eval_http),
+        factory_tool_observer=(
+            FactoryToolObserver(engine=engine, substrate=substrate, db_schema=config.db_schema)
+            if isinstance(sandbox_client, KubernetesSandboxClient) else None
+        ),
         action_executor=_build_action_executor(
             config,
             engine,
@@ -923,6 +1249,7 @@ def build(
         ),
         e2e_reaper=_build_e2e_reaper(config, work_items),
         workspace_recovery_gc=recovery_gc,
+        publication_candidates_gc=candidates_gc,
         cron_loop=CronSchedulerLoop(
             source_guard=CronHookSourceGuard(source_gate, engine),
             engine=engine,
@@ -937,8 +1264,12 @@ def build(
             default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
         ),
         publication_loop=publication_loop,
+        approval_reference_reader=approval_client,
         remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
         remediation_receipts=_build_remediation_receipts(config, engine, sink),
+        factory_slack_progress=_build_factory_slack_progress(config, engine, sink),
+        factory_credit=FactoryCreditLoop(engine, config),
+        provider_probe=ProviderProbeLoop(engine, config, async_redis),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -954,6 +1285,9 @@ _SUPERVISED_OPERATIONS = frozenset(
         "publications",
         "e2e-reaper",
         "workspace-recovery-gc",
+        "publication-candidates-gc",
+        "factory-credit",
+        "provider-probe",
     }
 )
 
@@ -971,50 +1305,6 @@ def _restart_delay_s(consecutive_failures: int, *, base_s: float, max_s: float) 
     # Clamp the exponent so a long streak cannot overflow the float math.
     exponent = min(consecutive_failures - 1, 62)
     return min(base_s * float(2**exponent), max_s)
-
-
-# How long after boot a dependency that is not reachable yet is expected rather
-# than a fault (#3079). On a fresh install postgres, Valkey and the object store
-# come up alongside the worker; for this window a supervised task that fails on
-# them logs a one-line warning and retries instead of a full traceback.
-_BOOT_GRACE_S = 120.0
-
-# Object-store error codes a fresh install returns until its bucket is created.
-_NOT_READY_S3_CODES = frozenset({"NoSuchBucket"})
-
-
-def _is_dependency_not_ready(exc: BaseException) -> bool:
-    """True when ``exc`` (or anything in its cause chain) means a dependency is
-    not reachable or not provisioned yet, rather than a bug in the task."""
-
-    import redis.exceptions
-    import sqlalchemy.exc
-
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        # Network failures only: a PermissionError or FileNotFoundError is a
-        # local fault, not a dependency warming up.
-        if isinstance(
-            current,
-            socket.gaierror
-            | ConnectionError
-            | TimeoutError
-            | redis.exceptions.ConnectionError
-            | redis.exceptions.TimeoutError
-            | sqlalchemy.exc.OperationalError
-            | sqlalchemy.exc.InterfaceError,
-        ):
-            return True
-        # botocore's ClientError, matched by shape so boto3 stays a lazy import.
-        response = getattr(current, "response", None)
-        if isinstance(response, dict):
-            code = response.get("Error", {}).get("Code")
-            if code in _NOT_READY_S3_CODES:
-                return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 def _record_supervised(name: str, outcome: str) -> None:
@@ -1066,7 +1356,7 @@ async def _supervise(
     disables the give-up.
 
     For the first ``boot_grace_s`` after the supervisor starts, a crash caused by
-    a dependency that is not ready yet (see ``_is_dependency_not_ready``) logs a
+    a dependency that is not ready yet (see ``is_dependency_not_ready``) logs a
     one-line warning with the retry delay instead of a traceback (#3079). Any
     other crash, and any crash after that window, logs the full traceback.
 
@@ -1105,7 +1395,7 @@ async def _supervise(
                 base_s=restart_backoff_s,
                 max_s=max_restart_backoff_s,
             )
-            if clock() - booted < boot_grace_s and _is_dependency_not_ready(exc):
+            if clock() - booted < boot_grace_s and is_dependency_not_ready(exc):
                 logger.warning(
                     "worker task %s is waiting for a dependency that is not ready "
                     "yet; retrying in %.1fs (expected during startup) cause=%s: %s",
@@ -1147,7 +1437,7 @@ def _supervise_policy(config: WorkerConfig) -> _SupervisePolicy:
         "max_restart_backoff_s": config.supervise_restart_backoff_max_s,
         "max_consecutive_failures": config.supervise_max_consecutive_failures,
         "failure_reset_s": config.supervise_failure_reset_s,
-        "boot_grace_s": _BOOT_GRACE_S,
+        "boot_grace_s": BOOT_GRACE_S,
     }
 
 
@@ -1242,8 +1532,7 @@ def _build_action_executor(
 
         if not config.connector_reconcile_enabled:
             logger.info(
-                "action executor reads connector Deployments by name; "
-                "connector reconcile loop off"
+                "action executor reads connector Deployments by name; connector reconcile loop off"
             )
         deployments = connector_deployments_api()
         manifests = HttpManifestSource(
@@ -1254,6 +1543,7 @@ def _build_action_executor(
             app_name=config.connector_app_name,
         )
     bindings = ExecutorBindings(
+        static_endpoints=config.connector_endpoints is not None,
         binding=binding,
         bundles=bundles,
         manifests=manifests,
@@ -1481,6 +1771,56 @@ def _build_remediation_receipts(
     )
 
 
+def _build_factory_steering(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    redis_client: AsyncRedis,
+    *,
+    client: httpx.AsyncClient,
+    sink: ReplySinkRouter,
+) -> FactorySteeringClient:
+    """The kernel's factory run steering client (#5414), always built.
+
+    The mapped root read needs only the database engine, so every worker
+    intercepts a factory run's Slack root and never lets it start ordinary
+    chat. A worker without the internal worker token refuses such a turn
+    locally with ``steering_unconfigured`` instead of asking the API.
+    """
+
+    return FactorySteeringClient(
+        engine=engine,
+        schema=config.db_schema,
+        redis=redis_client,
+        api_base_url=config.api_base_url,
+        worker_token=config.internal_worker_token or None,
+        client=client,
+        intent_key=config.steering_sent_key,
+        replies=ObservedReplySink(sink),
+    )
+
+
+def _build_factory_slack_progress(
+    config: WorkerConfig, engine: AsyncEngine, sink: ReplySinkRouter
+) -> FactorySlackProgressLoop | None:
+    """The factory Slack progress loop (#5414), behind the factory Slack progress switch.
+
+    Its own observed reply sink, as the remediation receipt loop has.
+    """
+
+    if not config.factory_slack_progress_enabled:
+        return None
+    return FactorySlackProgressLoop(
+        store=PostgresFactorySlackStore(
+            engine,
+            schema=config.db_schema,
+            lease_owner=config.consumer_name,
+            console_origin=config.console_origin,
+        ),
+        replies=ObservedReplySink(sink),
+        interval_seconds=config.factory_slack_interval_s,
+    )
+
+
 def _build_publication_loop(
     config: WorkerConfig,
     env: Mapping[str, str],
@@ -1491,10 +1831,7 @@ def _build_publication_loop(
 ) -> PublicationReconcileLoop | None:
     """Build the worker-owned Kubernetes publication lane, never a local twin."""
 
-    if (
-        not config.publication_enabled
-        or env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() != "kubernetes"
-    ):
+    if not config.publication_enabled or sandbox_substrate(env) != "kubernetes":
         return None
     namespace = config.publication_namespace
     cluster = KubernetesPublicationCluster(namespace)
@@ -1642,7 +1979,7 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             _CARD_MIGRATION_BUDGET_S,
         )
     except Exception as exc:
-        if _is_dependency_not_ready(exc):
+        if is_dependency_not_ready(exc):
             logger.warning(
                 "legacy approval card migration skipped: a dependency is not ready "
                 "yet (expected during startup) cause=%s: %s",
@@ -1660,7 +1997,7 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         except TimeoutError:
             logger.warning("work-item orphan boot sweep exceeded its budget; the loop resumes it")
         except Exception as exc:
-            if _is_dependency_not_ready(exc):
+            if is_dependency_not_ready(exc):
                 logger.warning(
                     "work-item orphan boot sweep deferred to its loop: a dependency "
                     "is not ready yet (expected during startup) cause=%s: %s",
@@ -1689,10 +2026,19 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             lambda: run_heartbeat(config.heartbeat_file, config.heartbeat_interval_s, shutdown),
         ),
     ]
+    tasks.append(
+        launch(
+            "approval-reference-retention",
+            lambda: rt.card_store.run_retention(rt.approval_reference_reader, shutdown),
+        )
+    )
     if rt.deploy_notice_consumer is not None:
         tasks.append(launch("deploy-notices", rt.deploy_notice_consumer.run))
     if rt.connector_loop is not None:
         tasks.append(launch("connectors", lambda: rt.connector_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    tool_observer = rt.factory_tool_observer
+    if tool_observer is not None:
+        tasks.append(launch("factory-tools", lambda: tool_observer.run_forever(shutdown)))
     if getattr(rt, "action_executor", None) is not None:
         tasks.append(launch("action-executor", lambda: rt.action_executor.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "e2e_reaper", None) is not None:
@@ -1706,6 +2052,15 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
                 lambda: recovery_gc.run_forever(shutdown, interval_s=interval_s),
             )
         )
+    candidates_gc = getattr(rt, "publication_candidates_gc", None)
+    if candidates_gc is not None:
+        candidates_interval_s = config.publication_candidates_collect_interval_s
+        tasks.append(
+            launch(
+                "publication-candidates-gc",
+                lambda: candidates_gc.run_forever(shutdown, interval_s=candidates_interval_s),
+            )
+        )
     if rt.cron_loop is not None:
         tasks.append(launch("cron", lambda: rt.cron_loop.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "publication_loop", None) is not None:
@@ -1717,6 +2072,27 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
     if getattr(rt, "remediation_receipts", None) is not None:
         tasks.append(
             launch("remediation-receipts", lambda: rt.remediation_receipts.run_forever(shutdown))  # type: ignore[union-attr]
+        )
+    if getattr(rt, "factory_slack_progress", None) is not None:
+        tasks.append(
+            launch(
+                "factory-slack-progress",
+                lambda: rt.factory_slack_progress.run_forever(shutdown),  # type: ignore[union-attr]
+            )
+        )
+    if getattr(rt, "factory_credit", None) is not None:
+        tasks.append(
+            launch(
+                "factory-credit",
+                lambda: rt.factory_credit.run_forever(shutdown),  # type: ignore[union-attr]
+            )
+        )
+    if getattr(rt, "provider_probe", None) is not None:
+        tasks.append(
+            launch(
+                "provider-probe",
+                lambda: rt.provider_probe.run_forever(shutdown),  # type: ignore[union-attr]
+            )
         )
     if sweeper is not None:
         tasks.append(launch("work-item-orphans", lambda: sweeper.run_forever(shutdown)))

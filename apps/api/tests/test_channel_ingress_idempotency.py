@@ -53,7 +53,7 @@ EMAIL_ADAPTER = "agentmail-sandbox"
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DISPATCHER_QUEUE = (
-    REPO_ROOT / "apps/dispatcher/src/curie_dispatcher/queue.py"
+    REPO_ROOT / "packages/curie-internal/src/curie_internal/turn_queue.py"
 )
 # The claim primitive moved to `curie_api.delivery` when the hook ingress became
 # its second caller (#269); this scan follows it, because what it corroborates is

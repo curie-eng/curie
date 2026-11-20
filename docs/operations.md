@@ -105,8 +105,11 @@ curie cluster status --context <your-production-context>
    sandbox**, with a **1 CPU / 768Mi limit** on each runner (the `standard`
    resource profile). A factory agent uses the `factory` profile instead:
    **8Gi memory request and limit**, so it needs a node with 8Gi of unrequested
-   allocatable memory, and the default quota admits one factory sandbox at a
-   time. With `factory.enabled`, the API container's memory limit is **2Gi**
+   allocatable memory. The default `resourceQuota.hard.requestsMemory` of 10Gi
+   admits one factory sandbox at a time. Beside it, six standard sandboxes fit
+   and a seventh is refused, because limits.cpu binds before requests.memory
+   (factory CPU limit 2, standard CPU limit 1, limits.cpu 8). requests.memory
+   would allow ten standard sandboxes at 192Mi in the 2Gi remainder. With `factory.enabled`, the API container's memory limit is **2Gi**
    instead of 512Mi (its request stays 256Mi); set
    `api.resources.limits.memory` to choose another value. See the chart README's
    [resource profiles](../charts/curie/README.md#resource-profiles). Each distinct
@@ -265,8 +268,8 @@ Two things to know:
 Copy [`examples/curie.yaml`](../examples/curie.yaml) into your repository as
 `curie.yaml` and customize it, or write the same starter from a released binary
 with `curie apply --init`. Credential fields contain credential names, not
-secret values. `install.context` (and `curie apply --context` / `curie diff
---context`, which win over the file) selects the kube context; `curie diff`
+secret values. `install.context` (and `curie apply --context <context>` / `curie diff
+--context <context>`, which win over the file) selects the kube context; `curie diff`
 prints the cluster that context names. Shared-cluster singleton opt-outs are
 modeled as `platform.sandbox_controller` and `platform.priority_classes.platform`
 / `sandbox`. `platform.gvisor` is `auto`, `require`, or `off` and controls
@@ -1498,8 +1501,23 @@ configuration loaded. No separate Helm upgrade is needed.
 
 Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
-is `poll` or `webhook`, and `poll` is the default. The `factory:` block replaces
-the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
+is `poll` or `webhook`, and `poll` is the default. The API setting
+`FACTORY_MODEL_AUTH_MODE` (default `service`) selects the mode that GitHub and
+tracker intake, pull request review feedback, and
+[Slack steering](#factory-slack-steering) of a service WorkItem admit under.
+A labelled issue in `personal` mode names an owner when the labeller is linked
+to a principal with an active personal Claude enrollment. The WorkItem owner
+is that principal at the enrollment's generation. An unlinked labeller is
+refused `personal_owner_required`. A linked labeller with no active enrollment
+is refused `enrollment_inactive`. Each refusal is answered by an issue comment
+and, when a factory Slack channel is configured, one channel post. A WorkItem
+admitted as service before the switch refuses its tracker mentions, review
+feedback and Slack steering with `personal_owner_required`. No owner is
+invented for it. A personal WorkItem keeps its owner on every revision,
+whoever asked for it. It is an environment setting only,
+with no chart value, and the worker reads it too
+([Personal Claude enrollment](#personal-claude-enrollment)). The `factory:`
+block replaces the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
 with `curie cluster factory`, use the
 [automatic retained migration](#automatic-migration-of-a-legacy-github-factory)
 through `curie cluster upgrade` with a CLI containing the #4628 fix. If using
@@ -1529,13 +1547,20 @@ applying anything, and `--disable` turns intake off.
 
 Bind the agent with a `github` channel whose address is the repository
 `owner/name`. No Slack binding is required. The configured label is only the
-initial admission convention. A later bounded execution requires a new issue
-comment that explicitly mentions that login and whose sender currently has
-write or admin permission. Ordinary comments, edits, and events sent by the
-App do not execute work. Removing that label or closing the issue cancels
-waiting work and requests termination of a running execution. Cancellation
-stays requested until the runtime reports that it stopped. An already linked
-pull request stays linked, and later publication is refused.
+initial admission convention. While the factory's question is open on the
+issue, a plain comment from anyone who could have started the ticket (current
+write or admin permission) answers it and restarts the work, with no mention
+needed. Edits, bot comments, and comments made through the factory's own App
+never do, and a closed issue or a removed trigger label refuses the answer. A
+reply that arrives while the question is still being recorded is read again
+by the poll pass, or in webhook mode by the work item reconciler. Otherwise a
+later bounded execution requires a new issue comment that explicitly mentions
+that login and whose sender currently has write or admin permission; ordinary
+comments, edits, and events sent by the App do not execute work. Removing
+that label or closing the issue cancels waiting work and requests termination
+of a running execution. Cancellation stays requested until the runtime
+reports that it stopped. An already linked pull request stays linked, and
+later publication is refused.
 
 Polling reads each bound repository every `factory.trackers[].pollIntervalSeconds`
 (default 45 seconds). It can admit an open labeled issue immediately, but
@@ -1660,6 +1685,19 @@ refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_stat
 `github_forbidden_get_branch_rules` or `github_forbidden_get_branch`). The
 reason names the operation and does not claim which App permission is missing:
 a 403 alone cannot say that (#5222).
+
+A latest request that ended `ci_timeout` or `ci_unverified` with an open recorded
+pull request keeps a separate, read-only CI observation for 24 hours from its
+creation. It polls every 20 seconds and survives API restarts without extending
+the window or the execution deadline. The work item exposes `ci_observation`;
+a later verified green on its authorized recorded head reports item-level
+observed completion while the original request stays failed. Observation
+creates no execution request, model turn, publication or workflow rerun and
+uses no repair allowance. The status comment retains the failure and adds the
+watch deadline. Observed completion adds the head and observation time and moves
+the state label from `curie-factory:needs-human` to `curie-factory:pr-open`.
+Expiry says the checks were not verified within 24 hours and keeps the human
+handoff label. Other terminal causes do not start this observation.
 
 Per-repository factory settings live under `factory.bindings[].repos[]`. A
 binding joins one tracker (`tracker`) to its repositories, and each `repos`
@@ -1788,6 +1826,18 @@ When a publication request is refused, the issue's `Could not complete:`
 notice (cause `approval_create_failed`) carries the refusal code and message
 on its `Details:` line.
 
+### Model credit facts
+
+The worker reads model credit with its own model credential and records one model_credit fact per factory agent. A factory agent is an agent with a GitHub channel binding. The worker ticks when it starts and then every 300 seconds. One replica holds a Postgres advisory lock for the tick, so only one replica reads the provider at a time. Each row expires 900 seconds after it was observed. A later tick refreshes the row even when the comparison is unchanged.
+
+The minimum is factory.admission.minModelCreditUsd, rendered into the worker as CURIE_FACTORY_MIN_MODEL_CREDIT_USD. The default is 10 USD and the chart rejects a negative value. Zero still reads the provider. Any key the provider accepts is sufficient at that minimum.
+
+The worker treats the provider as OpenRouter when the model base URL host is openrouter.ai. It does the same when no base URL is set and the credential is one the runner would send to OpenRouter, because that is the host the runner selects from the env the worker builds for a claim. Any other explicit host is recorded as unknown with reason provider_unsupported, and the worker makes no request. OpenRouter is read with GET /key and GET /credits only. The worker never sends a model request for this fact, and it never stores, logs, or returns an amount or the key.
+
+Both halves at or above the minimum record sufficient. A null key limit counts as satisfied on the key half. Either readable half below the minimum records insufficient. A 401 from /key records unknown with reason credential_rejected. A half that cannot be read (a timeout, a 429, a 5xx response, or a 401 or 403 from /credits), when no readable half is below the minimum, records unknown with reason unreadable. The facts answer reports unknown with observation_expired when the row is older than 900 seconds, and unknown with observation_missing when no row exists.
+
+This observation does not admit or refuse a factory run. Admission remains the separate hold described by issue 4451.
+
 ### The default factory agent
 
 Curie ships its factory agent as the bundle in
@@ -1914,6 +1964,21 @@ list. Admission, acquire, start, heartbeat, finish, and termination are internal
 worker-token routes under `/v1/internal/work-items`. The API lifespan reconciler
 publishes execute and terminate wakes onto `curie:runs`.
 
+A personal WorkItem has two more worker-token routes:
+`GET /v1/internal/work-items/{id}/personal-context` reads its owner tuple, and
+`POST /v1/internal/work-items/{id}/personal-context/revalidate` moves the item,
+and its queued or waiting requests, to the owner's current enrollment
+generation. Requests that already ran keep the generation they ran under.
+Revalidation proceeds only once every request of the WorkItem that started has
+a worker-recorded runtime termination. The worker confirms termination for a
+run that finished normally too, once it has torn the run's runtime down, so a
+WorkItem answers `runtime_live` only until that confirmation is recorded. On
+the read, a wrong tenant, agent or owner gets the same 404 as an unknown id. On revalidation, a wrong tenant or agent gets that 404,
+while another owner, a stale version, an inactive enrollment, a live runtime or
+an unchanged generation returns 409 with its code (`owner_mismatch`,
+`stale_version`, `enrollment_inactive`, `runtime_live` or
+`generation_current`).
+
 Reconciler steps fail independently: each failure logs the step and traceback,
 and execute wakes continue despite an unrelated step failure. OpenTelemetry
 records the `curie.work_item.reconciler.step.failure` counter and
@@ -1979,6 +2044,178 @@ using the flat base backoff without charging start or capacity deferrals.
 The SQL wait retains its original deadline and bounded stage diagnostic.
 Other workspace preparation faults keep the counted `not_started` behavior.
 
+Each WorkItem has two automatic retries for its whole lifetime
+([ADR 0269](adr/0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md)),
+so an issue gets at most three full implementation attempts. A retry is a new
+execution request with its own identity, sequence, waiting deadline and
+execution deadline; the failed request is never changed. Three things spend a
+retry, and they share the same two slots:
+
+1. A request lost with its worker. Curie admits the retry once the worker
+   records the sandbox teardown
+   ([ADR 0206](adr/0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md)).
+   That proves the old sandbox is gone; it does not prove the lost run did
+   nothing.
+2. An ordinary failure whose worker reported `retry_safety` `no_effects`: no
+   side effect flag on the turn and an observed end of the turn. A `flagged`
+   or `uncertain` run never earns another implementation attempt; a failed
+   `flagged` publication is the one exception, item 3. The cause must also be
+   one the factory policy retries: `model_unreachable`, `model_rate_limited`,
+   `model_error` or `sandbox_node_disrupted`; `workspace_error`,
+   `runner_error`, `runner_failed`, `runner_timeout` or `sandbox_terminated`
+   only with a diagnosed `transient_service` condition; a provider credential,
+   credit or usage refusal only as described below; or a limit exhaustion
+   under a resource gate.
+3. A failed publication whose exact candidate Curie retained
+   (`publication_failed`, `approval_create_failed` or
+   `publication_unrecorded`, with publication candidates enabled, see below).
+   Curie admits a publication recovery request that publishes the retained
+   candidate and runs no model turn. It is refused when the worker reported
+   `uncertain`, when a publication of the same request, lineage or
+   conversation is still in flight, when a ready applied base move still owns
+   the result, when the lineage is closed, when a newer revision is queued,
+   or when no exact complete candidate exists. A recovery that fails again
+   with one of those three causes can admit another recovery of the same
+   candidate while retention and the allowance last. Loss of that recovery
+   with its worker admits the same candidate again inside the shared
+   allowance. Any other failure of it admits nothing, and none of them ever
+   starts an implementation run.
+
+Some failures settle needs-human at once and spend no retry, because nothing
+Curie runs today could release a wait on them (#5424). These are a
+`workspace_error`, `runner_error`, `runner_failed`, `runner_timeout` or
+`sandbox_terminated` failure without a diagnosed `transient_service`
+condition; a credential, credit or usage refusal that names no probed provider
+scope, such as an account-level credit refusal, a workspace daily budget with
+no readable reset time, or any refusal on an Anthropic credential; a credential
+or credit refusal that carries a provider time; and a provider time at or past
+the retry's waiting deadline. `merge_conflict` and `pull_request_not_adopted`
+are terminal as well: a person changes the pull request lineage, then relabels
+the issue. The status comment says needs-human with the cause and promises no
+wait.
+
+Curie admits the retry in the same transaction that settles the failed
+request, and reserves its slot there. Relabelling the issue, a revision, an
+operator rerun or a restart never gives a slot back. Capacity waits,
+`workspace_timeout` waits and `start_failed` spend no slot, and a cancelled or
+deleted issue, a newer queued revision, a closed lineage, a publication that
+owns the result and `budget_exceeded` all suppress an ordinary retry.
+
+A retry is either scheduled or blocked. A scheduled retry is dispatched after a
+backoff of about 30 seconds for the first retry and about 120 seconds for the
+second, each with a fixed 20 percent jitter keyed by the WorkItem, or later
+when the worker reported a provider time. A provider rate limit or usage reset
+time is used plus 60 seconds, and a provider rate limit that names no reset
+time takes the plain backoff. A blocked retry exists only where something can
+release it: a provider gate (`provider_credential`, `provider_credit` or
+`provider_usage_reset`) whose failed run named a probed provider scope and no
+reset time, or a resource gate, described below. It is never dispatched while
+it is blocked.
+
+Three provider waits can be released before their deadline. A retry blocked
+on `provider_credential` is released once the worker runs with a different
+credential for the same provider and a read-only probe of that credential
+authenticated after the failure. A retry blocked on `provider_credit` or
+`provider_usage_reset` is released once the same credential is still in use, a
+probe shows a strictly greater credit limit than before the failure, and some
+of it remains. The probe must be at most two minutes old, and only OpenRouter
+keys have such a probe today. A falling usage figure, a refund, an unlimited
+key, an unrelated deployment change or a provider without a probe never
+releases a wait. The reconciler rechecks the evidence, the WorkItem and the
+failed request's condition in the same transaction that lifts the block, and
+the released retry is dispatched in that same pass. Releasing spends no retry
+and keeps the waiting deadline. A resource gate, described below, is released
+only at a start whose delivered limit is strictly larger. A blocked retry that
+nothing released ends `expired` with cause `retry_condition_expired` when its
+waiting deadline passes, unless a person relabels the issue first. Only a wait
+that was not blocked expires as `capacity_wait_expired`. The counted `not_started` deferrals carry across the
+retries of one WorkItem, so `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` bounds the
+whole chain, not each request.
+
+A run that exhausted a limit is retried only under a strictly larger limit
+(#5427). Each start records the limits actually delivered to its sandbox: the
+runner container memory limit, the pod's ephemeral storage limit, each scratch
+volume's size, the turn limit, the conversation history capacity and the
+execution deadline. A clean `sandbox_memory_exhausted`,
+`sandbox_storage_exhausted`, `sandbox_scratch_exhausted`, `history_capacity`
+or `max_turns` failure admits one retry blocked on `memory_limit`,
+`ephemeral_storage_limit`, `scratch_limit`, `history_capacity` or
+`turn_limit`, gated on the limit the failed run had. A failed run with no
+recorded value for that limit admits no retry. Every
+`CURIE_WORK_ITEM_RESOURCE_GATE_PROBE_SECONDS` (default 300) the reconciler
+offers the gated retry again. The worker checks the current limit before it
+claims a sandbox and defers `resource_gate_unmet` when it is not larger; that
+wait is never counted as a failed start. The start itself refuses the retry
+unless the limit delivered to the new sandbox is strictly larger, so raise
+memory or ephemeral storage with `curie cluster overrides <agent>
+--runner-resources`, and scratch with the volume size in
+`agentSandbox.resourceProfiles`, the conversation history capacity with
+`api.transcriptMaxThreadBytes`, and the turn limit with
+`worker.workItemMaxTurns`. An unrelated change, such as CPU or another
+scratch volume, does not release it. A gated retry that is never released
+expires as `retry_condition_expired` naming its condition. A clean
+`sandbox_node_disrupted` failure is retried on the ordinary backoff.
+
+Publication recovery needs retained candidates.
+`worker.workspace.publicationCandidates.enabled` is on by default. Set it to
+false to turn retention off. Candidates still need
+`agentSandbox.runner.workspace.enabled` and the internal worker token. When
+workspaces are off, the chart renders the switch off and the install still
+succeeds. A worker run outside the chart with workspaces off or an empty
+`CURIE_INTERNAL_WORKER_TOKEN` must set
+`CURIE_PUBLICATION_CANDIDATES_ENABLED=false`, or it refuses to start.
+`worker.workspace.publicationCandidates.maxBytes`, default
+1073741824, caps all candidate bytes. Curie then keeps a private copy of each
+factory run's base and patch from before validation until 24 hours after the
+request's final disposition. With the switch off, a failed publication settles
+needs-human and nothing is recovered.
+
+An operator can ask for the same admission again instead of relabelling the
+issue (#5431):
+`curie cluster work-items <ID> --rerun --request-id <UUID> --expected-version <N> --reason <TEXT> --yes`,
+which calls the administrative `POST /work-items/{id}/retry` with the platform
+key or a live console session. It reruns exactly the automatic admission
+against the WorkItem's newest request, so it admits only what automatic
+recovery would admit now: the same two shared slots, the same backoff, and a
+publication recovery of the exact retained candidate in preference to a new
+implementation run. It helps only when a fence that refused the automatic
+retry has since cleared: a publication of the same conversation was still in
+flight, or a newer revision was queued. It does not cover a failure that
+settled before automatic retries existed: that request has no `retry_safety`
+fact, so a cause the policy would retry is refused `side_effects_unproven`. A
+cause the policy settles terminal, such as an undiagnosed `runner_error`, is
+refused `not_retryable`. It never grants a slot, resets a count, writes a
+tracker label or posts a notice. The successor's status comment follows the
+normal flow.
+
+Use it in this order:
+
+1. Read the WorkItem with `curie cluster work-items <ID>` and note its
+   version and newest request.
+2. Pick a new UUID for `--request-id` and give a reason of at most 500
+   characters. The reason and the authenticated actor are recorded; the
+   credential is not.
+3. Run the command with `--dry-run` first. It answers the exact plan, the
+   disposition (`implementation` or `publication_recovery`), the retries used
+   after this one and the successor's due time, and writes nothing, so the
+   same UUID stays free.
+4. Run it again with `--yes` and the same UUID. Repeating that exact call
+   returns the same result with `replayed` true, even after the version moved;
+   the same UUID with another reason, version or actor is refused as
+   `idempotency_conflict`.
+
+A refusal writes nothing and names its code: `stale_version` (read the item
+again), `work_item_cancelled`, `readmit_pending` (a relabel is already
+pending), `active_execution` (a request is waiting, queued, running or being cancelled),
+`no_failed_request` (the newest request completed, expired or was cancelled),
+`teardown_unconfirmed` (a lost run's teardown is not observed yet),
+`allowance_exhausted` (it names the used count and the last cause; nothing here
+adds more), `not_retryable` (for example `no_pull_request`, a denial or
+`budget_exceeded`), `side_effects_unproven` (for an implementation retry the
+failed run was `flagged`, `uncertain` or carries no safety fact; for a
+publication recovery only `uncertain`) and `admission_refused` (a fence inside
+the automatic admission still holds).
+
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the
@@ -1995,8 +2232,18 @@ URL. A follow-up that needs no change, including a relabel that continues the
 open pull request, ends with `Status: SUCCEEDED` and a result starting
 `No changes needed:` that names the open pull request.
 When the run cannot complete, the result starts with `Could not complete:`
-and a plain sentence for the cause. A request lost with its worker and retried
-as a new run shows `Status: RETRYING` and its result starts with `Retrying:`.
+and a plain sentence for the cause. A request whose settlement admitted an
+automatic retry, whether it was lost with its worker or failed with no side
+effects, shows `Status: RETRYING`. Its result starts with `Retrying:`, names
+which of the two automatic retries it spent, and then says
+`Scheduled:` with the time the retry may start, or `Blocked:` with the named
+condition and the waiting deadline. A lost request also says that work the
+lost run already did is not ruled out. The waiting retry's own comment shows
+`Status: QUEUED` and the same `Scheduled:` or `Blocked:` line, and the issue
+keeps `curie-factory:queued`. When a failed or expired request has no
+retry and its WorkItem has used any, one line after the cause sentence says
+`N of 2 automatic retries used.`, so the final needs-human result names both
+the cause and the count.
 When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
 of keys and tokens. An execute turn that ends without publishing is prompted
@@ -2024,8 +2271,9 @@ converter decodes entities and backslash escapes only in prose after parsing,
 leaving code content escaped. Within blockquotes it converts headings to
 paragraphs, rules to literal `---` paragraphs, and flattens nested quote content.
 A last `Cause:` line names the platform cause code
-(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`, `issue_deleted`,
-`owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
+(`capacity_wait_expired`, `retry_condition_expired`, `start_failed`, `execution_deadline`,
+`issue_cancelled`, `issue_deleted`, `owner_lost`, `runner_escalated`, `runner_error`,
+`unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`, `revision_unchanged`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
 `publication_unrecorded`, or a
@@ -2039,7 +2287,8 @@ first line of the channel reply, `curie-turn-failure: <class>`, so a consumer
 that sees only the delivered text can tell the turn from a successful reply.
 Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
-`approval-approvers-unverifiable`, `approval-no-email-approvers`, `approval-backend-missing`,
+`approval-approvers-unverifiable`, `approval-route-unsupported`, `approval-no-email-approvers`,
+`approval-backend-missing`,
 `publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
 `sandbox_terminated`, `publication_unrecorded`, `unclassified`, `max_turns`, or `ci_failed`
 still shows as needing a person.
@@ -2047,11 +2296,16 @@ A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted
 credits, including an OpenRouter key's HTTP 403 spend limit, ends the run as
-`model_credit_exhausted` without retrying. An SDK `rate_limit` error or a
+`model_credit_exhausted` without retrying in the same run. An SDK `rate_limit` error or a
 subscription session, weekly or model usage limit ends the run as
-`model_usage_limited` with failure class `model-usage-limited`, without retrying.
-The status comment says that the model provider's usage limit for the credential
-was reached; re-add the factory label after the limit resets. Ordinary usage
+`model_usage_limited` with failure class `model-usage-limited`, without retrying in the
+same run. A flag clean run of either cause gets an automatic retry only as
+described above: a usage reset time inside the waiting deadline is scheduled,
+and a wait blocks only on a probed provider scope with no reset time. Otherwise
+the run settles needs-human at once and spends no retry.
+When no retry was admitted, the status comment says that the model provider's
+usage limit for the credential was reached; re-add the factory label after the
+limit resets. Ordinary usage
 warnings and rejected rate-limit events keep their existing behavior. A run that
 a relabel replaced ends with `Stopped: the label was added again, so a new run
 replaced this one.`, and the new run gets its own status comment. The
@@ -2061,8 +2315,10 @@ row, stops further edits, and does not change the execution row.
 
 The same pass keeps one state label on the originating issue, for revisions
 too: `curie-factory:queued` while waiting, `curie-factory:running` while running
-or stopping, `curie-factory:pr-open` after a completed run, and
-`curie-factory:needs-human` after a failed or expired one. A cancelled run
+or stopping, `curie-factory:pr-open` after a completed run until its pull request merges, and
+`curie-factory:needs-human` after a failed or expired one. A merged pull request
+removes the label and ends the status comment with `Pull request merged: <url>`;
+The factory itself sends no status transition; a closing keyword in the pull request is the code host's own automation and may still close the issue. A cancelled run
 removes all four. The same pass removes a legacy `curie:queued`,
 `curie:running`, `curie:pr-open`, or `curie:needs-human` label by exact name
 whenever it sets or clears the state label, including after an upgrade.
@@ -2136,9 +2392,12 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
    got HTTP 200 and `factory_admitted`, and
    `GET /v1/internal/work-items/requests/{id}` returns the admitted WorkItem.
 
-`curie dev factory-e2e scripted` runs the factory on its own disposable kind
-cluster with a GitHub stub and recorded model responses. Scripted mode honors
-`CURIE_BIN`, including when `--build-images` builds the runner with that CLI.
+`curie dev factory-e2e scripted --scenario publication` runs issue-to-PR on a
+disposable kind cluster with a GitHub stub and recorded model responses.
+Select `--scenario triage-to-pr` to run the triage handoff on the same install
+after publication passes, or `--scenario facts` to check admission facts.
+Scripted mode honors `CURIE_BIN`, including when `--build-images` builds the
+runner with that CLI.
 Every factory mode defaults to `curie` on PATH when `CURIE_BIN` is unset,
 resolves the executable to an absolute path before any cluster or GitHub
 action, and prints that path with the first line of its `--version` output.
@@ -2375,14 +2634,20 @@ request, a `state` and an `actionable_cause`. The states:
   failure (its stage and a redacted reason, at most 2000 characters), and the
   request's `last_start_failure_detail` holds the same text. Later capacity
   deferrals and a worker replacement keep it; a successful start clears it.
+  An automatic retry that is still inside its backoff says
+  `automatic retry scheduled for <time>`. A blocked automatic retry says
+  `automatic retry blocked on <condition>`, what that condition waits for, and
+  its waiting deadline.
 - `running`: started, bounded by the agent's execution deadline (default 1800 s).
 - `cancellation_requested`: termination requested (`issue_cancelled`,
   `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
 - `cancelled`: the issue label was removed or the issue was closed. A pull
   request already opened is kept.
-- `expired`: `capacity_wait_expired` or `execution_deadline`. A capacity
-  wait that expires after a failed start still names the previous start
-  failure.
+- `expired`: `capacity_wait_expired`, `retry_condition_expired` or
+  `execution_deadline`. A capacity wait that expires after a failed start
+  still names the previous start failure. A `retry_condition_expired` cause
+  names the condition the automatic retry was still blocked on and its
+  waiting deadline.
 - `failed`: the cause names the terminal cause verbatim. For
   `deadline_halted`, raise `worker.deliveryBudgetSeconds`. For `start_failed`,
   the sandbox never started; the cause names the attempt count, the last
@@ -2393,6 +2658,36 @@ request, a `state` and an `actionable_cause`. The states:
 - `published`: a pull request is open for the work.
 - `completed_unpublished`: the run completed with no publication, or its
   publication was denied, expired or failed.
+
+Each item and each of its requests carry four owner facts: `tenant_id`,
+`model_auth_mode`, `owner_principal_id` and `enrollment_generation`. A service
+item has `model_auth_mode` of `service` and null `owner_principal_id` and
+`enrollment_generation`. A personal item has `model_auth_mode` of `personal`
+with an owner principal and a generation. A row written by an older API during
+the schema upgrade window can also show a null `tenant_id`. The tenant, mode
+and owner are fixed at creation. A worker-token revalidation can move the
+item's generation together with that of its queued or waiting requests; a
+request that already ran keeps the generation it ran under. The fields name
+identifiers and a generation only, never a credential.
+`curie <tier> work-items --json` carries the same four fields,
+and the human detail view prints one `auth` line.
+
+Each item also reports its automatic retry allowance:
+`automatic_retries_used` (owner loss and ordinary failures together) and
+`automatic_retry_limit` (2). Each request reports its retry facts:
+`retry_of_request_id` (the request it retries, or null), `retry_kind`
+(`owner_loss`, `failure` or null), `dispatch_not_before` (the earliest
+dispatch time; a blocked retry stores its waiting deadline here),
+`blocked_on` (the named condition, or null) and `retry_safety` (the worker's
+`no_effects`, `flagged` or `uncertain` fact from its finish, or null when the
+request did not end through a worker finish or its worker sent no fact, as a
+worker from an earlier release does; null never admits an implementation
+retry). A request retried after owner
+loss before this release reports `owner_loss`
+with a null `retry_of_request_id`. Its predecessor's status card shows
+`NEEDS HUMAN` rather than `RETRYING`; the issue label still follows the newest
+request. The CLI does not print these fields; its
+`actionable_cause` already says when a request is a scheduled or blocked retry.
 
 The platform never asserts correctness: every item reports
 `correctness: {"asserted": false, "owner": "bundle"}`. Verification belongs
@@ -2415,11 +2710,277 @@ NAME_OR_ID] [--json]` and `curie local work-items`. Exit codes are 0 on
 success, 1 for not found or refused, 2 for invalid input and 3 when the API
 is unreachable. The skill tier has no work items and exits 4.
 
+### Personal Claude enrollment
+
+Developers follow the [personal subscription guide](guides/personal-subscription.md)
+to enroll and start a run. This section is the operator configuration that
+guide links to.
+
+A personal WorkItem runs on its owner's own Claude subscription. The owner
+enrolls once, and Curie keeps the resulting credential in custody for that
+owner alone.
+
+1. The user runs the provider's own, unmodified `claude setup-token` and gets
+   a long-lived token. Curie never collects a password, a saved browser
+   profile or any other login material, and it never runs that command for the
+   user.
+2. The user saves the value of the console session cookie
+   (`__Host-curie_console_session`) to a file with mode 0600. Keep it readable by you only. The owner API accepts only that
+   cookie, and PUT and DELETE also require an `Origin` matching the console
+   host.
+3. The user saves the token to a second 0600 file. The CLI trims exactly one
+   trailing newline and accepts 1 to 4096 printable ASCII characters. The
+   check is format sanity only; it says nothing about validity or expiry.
+
+The five verbs are subcommands of `curie cluster subscription`:
+
+```bash
+curie cluster subscription status     --session-file ~/.curie/session
+curie cluster subscription enroll     --session-file ~/.curie/session --token-file ~/.curie/token
+curie cluster subscription replace    --session-file ~/.curie/session --token-file ~/.curie/token --expected-version 1
+curie cluster subscription reconnect  --session-file ~/.curie/session --token-file ~/.curie/token --expected-version 3
+curie cluster subscription disconnect --session-file ~/.curie/session --expected-version 2
+```
+
+`enroll` requires no enrollment. `replace` requires an active one and
+`reconnect` an inactive one. Replace, reconnect and disconnecting an active
+enrollment raise both the generation and the version by one. Repeating a
+disconnect at the inactive version changes nothing.
+
+`--expected-version <N>` is optional for `replace`, `reconnect` and `disconnect`.
+When supplied, the CLI sends that version with the compare-and-set write. When
+omitted, it first reads the owner's enrollment and sends the returned version
+with the write. If that read finds no enrollment, the command exits 1 with an
+instruction to enroll first and sends no write. Direct API callers must supply
+`expected_version` in the PUT body for replace or reconnect, or in the DELETE
+query for disconnect. `--dry-run` prints the plan and sends nothing. A 409 means the
+enrollment moved or the verb does not fit its state (`stale_version`,
+`enrollment_exists`, `enrollment_absent`, `enrollment_active`,
+`enrollment_inactive` or `staging_conflict`): run `status` again and retry with
+the version it prints. Status answers even before the first enrollment, with
+state `absent`. No output ever contains the token, a Secret name or a
+namespace.
+
+Disconnect makes the enrollment inactive and fences the old generation: its
+running requests end with `enrollment_fenced`, the owner's runtimes for that
+generation are torn down, and the custody Secret is retired. It does not revoke
+the token at the provider and it does not reverse any billing; revoke the token
+in the provider's own settings when it should stop working everywhere. Replace
+and reconnect fence the previous generation the same way.
+
+Status reports `teardown` with two counts. `pending_runtimes` is the owner's
+older-generation requests whose runtime teardown the worker has not confirmed.
+`pending_custody_cleanup` is the owner's custody entries still being staged or
+retired. A disconnect is complete when both are zero. A WorkItem fenced this
+way does not resume on its own: it continues only through an explicit
+revalidation under the owner's current generation, which starts a fresh
+process once the earlier runtime has been confirmed torn down.
+
+Operators turn the feature on with one chart value:
+
+```yaml
+personalClaude:
+  grantNamespace: acme-personal-grants
+```
+
+Create that namespace yourself; the chart does not. The API then gets Secret
+create, get, list and delete there, and the worker Secret get only, through
+Roles bound to their ServiceAccounts in the release namespace. The namespace
+must be dedicated to personal custody Secrets, because Kubernetes cannot scope
+Secret get and list by label: anything else in it is readable by those
+identities. It must differ from the release namespace, and the chart refuses a
+render that sets them equal. While the value is empty the owner API answers 503
+`custody_unconfigured`. Changing the value orphans the custody Secrets in the
+old namespace, so every user must reconnect after a change.
+
+During an API rollout the owner API answers enroll, replace and reconnect with
+503 `personal_rollout_in_progress`, and personal WorkItem admission refuses
+with the same code, until every API pod of the release runs the same pod
+template. An older API
+replica would otherwise settle a fenced personal request the old way and lose
+its transcript. Disconnect is never held. The CLI treats the refusal as
+transient (exit 3); retry once the rollout completes. Single-instance stacks
+outside Kubernetes set `CURIE_PERSONAL_ROLLOUT_HOLD=false`.
+
+The worker reads `FACTORY_MODEL_AUTH_MODE` too, and it must match the API's
+value. With `personal`, the worker refuses to start with
+`personal_mode_requires_kubernetes` unless `CURIE_SANDBOX_SUBSTRATE` is
+`kubernetes`, and it refuses every turn that has no owner (a plain run, a cron
+or webhook hook, an eval) with `personal_owner_required` before any claim. The
+protected hook lane is configured only from its provisioned `process.json`, so
+it does not read this setting and never runs WorkItem requests. In
+either mode a personal WorkItem request runs as the owner its own snapshot
+names, never as the installation's service credential. The worker checks the
+owner again at every claim, adoption, steer and turn start, reads the grant
+only for a create, and keeps one native process per owner across all workers.
+A request it cannot run that way is refused with one of these codes:
+
+| Code | Meaning |
+| --- | --- |
+| `personal_mode_requires_kubernetes` | The worker runs Docker or a static pool, which cannot carry a grant. |
+| `execution_owner_unknown` | The request is unknown to this installation's tenant. |
+| `owner_mismatch` | The request's owner does not match the acquired agent or tenant. |
+| `owner_tenant_inactive` | The owner's tenant is not active. |
+| `owner_principal_inactive` | The owner's principal is disabled or revoked. |
+| `enrollment_inactive` | The owner disconnected their enrollment. |
+| `enrollment_generation_mismatch` | The enrollment moved past the request's generation. |
+| `execution_authority_lost` | This worker no longer holds the request, or its WorkItem was cancelled. |
+| `owner_provenance_mismatch` | The thread's runtime booted for another owner, generation or mode. |
+
+A request that has not started defers with `not_started:<code>`, counted
+against the start deferral limit. A started request finishes failed:
+`authentication_required` for the two enrollment codes and for a grant the
+custody read refuses (its own code, such as `custody_missing`), and
+`runner_escalated` for the rest. A waiting request whose owner already has a
+runtime on another thread defers `owner_busy` like capacity, without spending
+a start attempt.
+
+When a personal run finishes `failed` with `authentication_required` and the
+owner's enrollment is still active at that run's generation, the worker sends
+the owner one Slack direct message for that principal and generation. The
+message names the issue and says the work is kept. It includes one button,
+Reconnect your Claude plan, to `<Console origin>/settings/claude-plan`. Set
+the worker environment `CURIE_CONSOLE_ORIGIN` from the chart value
+`console.origin` to that console origin. An empty origin still sends the
+message and omits the button. A later failure at the same generation sends
+nothing more. A failure after the owner disconnects or replaces the enrollment
+sends nothing, because they already changed it. A service-mode run sends
+nothing. There is no warning before a plan expires. Enrollment stores no
+expiry, and a token's shape does not say when it stops working.
+
 ## Talking to your agent
 
 The plugin bundle you just deployed is the agent's backend. There are two
 frontends that can talk to it: your terminal (no Slack involved) or a real
 Slack workspace.
+
+### Requester coding instructions
+
+A requester can store one private coding instructions document. When that
+requester starts a factory WorkItem, admission pins the document's text and
+digest to the WorkItem, and the implementer session reads it as a preferences
+section after the bundle's own instructions ([ADR 0278](adr/0278-requester-coding-instructions.md)).
+Reviewer sessions never receive it.
+
+The chart value `factory.requesterCodingInstructions.apply` (default `true`)
+renders `CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY` into the API. Set it to
+`false` and admission records the absence reason `application_unavailable`
+for every new WorkItem. A WorkItem keeps the selection or absence it was
+admitted with when the value changes later, so turning it on never adds a
+document to work already admitted.
+
+Delivery happens once per execution, after the request starts and before its
+first model turn:
+
+1. The worker reads the version 1 context envelope for the request's current
+   execution fence from `POST /v1/internal/work-items/requests/{request_id}/requester-context`.
+   An absent selection is delivered too.
+2. The worker posts the envelope to the runner's `POST /v1/requester-context`,
+   behind the same per-claim bearer as every other runner route. The runner
+   checks it against the execution its completion contract names: the version,
+   the WorkItem, the request, the fence, the 16,384 byte bound, the format and
+   the digest of the text.
+3. The worker relays the runner's acknowledgment to
+   `POST /v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment`.
+   The API accepts it only for the current request and fence. Model work
+   starts only after the API accepted it.
+
+The request's `coding_instructions_evidence` records the outcome: `none` (no
+document selected), `pending` (selected, not yet acknowledged), `applied` or
+`failed`. Any failure fails the request before model work, with
+`terminal_cause` `runner_escalated` and the reason in its detail. The reasons
+are `missing_envelope`, `unsupported_version`, `wrong_execution`,
+`wrong_fence`, `too_large`, `unsupported_format`, `digest_mismatch` and
+`malformed_envelope` from the runner; `runner_unacknowledged` for a runner
+that never answered, including an older runner without the route;
+`tenant_disabled` when the tenant turned the capability off after the
+document was pinned (the pinned snapshot is kept); and
+`coding_instructions_unavailable` when the stored snapshot no longer matches
+its digest.
+
+A pull request published for a request whose evidence is `applied` ends with
+exactly one line, `Requester preferences: applied; sha256:<digest>`. It names
+no requester, principal or text. Any other evidence adds no line, and a
+publication body that already carries a line starting with
+`Requester preferences:` is refused with
+`publication.requester_annotation_reserved`.
+
+Limits:
+
+1. The runner refuses an `Agent` or `Task` tool call that carries a section
+   delimiter line or the exact pinned text in any field. It does not detect a
+   paraphrase of the text.
+2. The text never appears in API, worker or runner logs, traces or errors. The
+   runner registers the text, each of its lines and the section with its held
+   secret redaction as soon as it accepts the envelope.
+3. A runner process serves the one execution its completion contract names. An
+   envelope for any other execution is refused, so a request never runs under
+   another requester's preferences.
+4. The document cannot add tools, skills, credentials, egress, grants or
+   budget, change the task's acceptance criteria, or remove review and
+   publication gates. Those come from the platform, the bundle and the
+   repository, which take precedence in that order.
+
+### Accepted learned rules
+
+A learned rule is a one-line instruction that a person who can merge to a repository
+accepted after a review comment suggested it ([ADR 0287](adr/0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md)).
+When the first request of a factory WorkItem is admitted, admission reads the
+repository's accepted rules, oldest acceptance first, and pins their numbers, canonical
+text and digest to the WorkItem in the same transaction as the requester selection. A
+rule accepted or removed afterwards changes the next WorkItem for that repository, never
+one already admitted: every request of the WorkItem (revision, repair, retry, recovery),
+and a relabel that reuses the WorkItem, keeps the pin. The WorkItem read shows
+`memory_rules` with the state, count, rule numbers, digest and format version, and never
+the text.
+
+A repository scope that would not fit its bounds (more than 16 accepted rules, or a
+canonical text over 4096 bytes) refuses admission with `409 memory_rules_unavailable` and
+writes nothing; the accept route keeps a scope inside both bounds, so this is a backstop.
+
+Delivery runs beside the requester delivery and never inside its envelope, once per
+execution, before the first model turn:
+
+1. The worker reads the version 1 envelope from
+   `POST /v1/internal/work-items/requests/{request_id}/memory-rules-context` for the
+   request's current fence.
+2. The worker posts it to the runner's `POST /v1/memory-rules-context`. The runner checks
+   the execution its completion contract names, the version, the 4096 byte bound and that
+   the digest is the SHA-256 of the text, and acknowledges before it builds the model
+   session. The session waits for both this and the requester acknowledgment.
+3. The worker relays the acknowledgment to
+   `POST /v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment`.
+
+The request's `memory_rules_evidence` records the outcome: `none`, `pending`, `applied` or
+`failed`. Any failure fails the request before model work with the reason in its terminal
+detail: the runner's `wrong_execution`, `wrong_fence`, `unsupported_version`, `too_large`,
+`digest_mismatch`, `malformed_envelope` and `unsupported_format`, `runner_unacknowledged`
+for a runner that never answered, `runner_refused` for a refusal without a usable reason,
+and `memory_rules_unavailable` when the stored snapshot no longer matches its digest.
+
+The implementer's system prompt carries the rules between two delimiter lines, after the
+bundle prompt and model line and before the requester preferences. The section states
+the order of authority, strongest first: platform safety and operator controls and the
+bundle's mandatory rules, the repository's own instruction files, the learned rules, then
+the requester's personal preferences. A learned rule cannot add tools, skills,
+credentials, egress, grants or budget, change acceptance criteria, or remove review and
+publication gates. Reviewer sessions never receive the section, and the runner refuses an
+`Agent` or `Task` call that carries a delimiter line or a pinned rule line.
+
+A pull request published for a request whose evidence is `applied` carries one line,
+`Learned rules: in force; rules:R1,R4; sha256:<digest>`, immediately before the
+`Requester preferences:` line. It names rule numbers and a digest, never text, and says
+"in force", not "followed". A publication body that already carries a line starting
+with `Learned rules:` is refused with `publication.learned_rules_annotation_reserved`
+before any other work.
+
+Only a request under the implementation completion contract is served the rules: a request
+under any other contract (the separate triage path) carries `memory_rules_evidence` `none`
+and is served an absent envelope. The rule text rides the implementer's system prompt, so
+the conversation transcript and its native checkpoint can retain it, under the transcript's
+own access controls and expiry and not the WorkItem snapshot's, as for requester
+preferences. A rule removed after a WorkItem was admitted can therefore remain in that
+WorkItem's snapshot and in its recorded transcript until they expire.
 
 ### Driving the deployed agent
 
@@ -2522,6 +3083,11 @@ The path, and what an operator can check on each hop:
 The fake model is network-free, including when progress headers are present.
 Use a live model or the API/worker integration fixture to exercise the ingress;
 `[fake:progress-demo]` is only a deterministic long turn for steering tests.
+Its one network directive, `[fake:connector-call]`, sends one MCP `initialize`
+and one `tools/list` to each hosted connector behind the caller proxy and
+answers one `connector-call <name>: ok tools=<n> caller=<fp>` or
+`... failed <reason> caller=<fp>` line each; `<fp>` is a sha256 prefix of the
+caller token, never the token.
 
 With an integration turn, inspect the durable result with:
 
@@ -2618,6 +3184,80 @@ share it with a local dispatcher or another cluster install.
 
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
+
+### Factory Slack progress
+
+An agent opts in with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears), described in the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack). The channel must have exactly one Slack binding on that agent, whose app identity posts; otherwise the API answers 409 `factory_slack_channel_unbound`. Only runs live at or after the moment the channel was set are posted. Changing the channel keeps each existing WorkItem in its original thread while that channel keeps its binding; clearing it stops all posting.
+
+The worker's progress lane derives what is owed from existing run records on each pass and keeps it in a durable outbox (`factory_slack_threads` binds each WorkItem to one Slack root for its whole life, `factory_slack_posts` holds the owed posts). Each thread records its origin. A `configured` thread is one this lane roots in `factory_slack_channel`, as above. A `kickoff` thread is the message that started the run from Slack ([Factory Slack kickoff](#factory-slack-kickoff)): no root post is owed, and it needs no `factory_slack_channel`, so setting, changing or clearing the channel neither stops nor moves it. Either origin is delivered only while its channel holds exactly one Slack binding of the agent and that binding names the thread's identity. Two settings govern it: `CURIE_FACTORY_SLACK_PROGRESS_ENABLED` (default true) and `CURIE_FACTORY_SLACK_INTERVAL_S` (default 2 seconds). With the progress switch off a worker posts nothing; a worker with it on later still finds and posts what is owed.
+
+A configured thread's root is one line, `Factory run: <repository> <issue key> <issue title>`, with the issue URL. Every thread then has one progress card as its first reply, edited in place for the WorkItem's whole life. The card always shows the latest implementation run of the WorkItem, so a steering revision or an automatic retry changes the card and never adds a second one. It reads, top to bottom:
+
+1. A header, `Factory run: <state>`, where the state is `starting`, `working`, `needs a person`, `finished` (the run's own pull request is open) or `stopped` (cancelled).
+2. The issue as a link, then the repository and `Started by <name>`: the Slack sender for a kickoff, the requester's GitHub login for a label.
+3. One line per declared step of the bundle's progress declaration, the same steps the GitHub status comment shows, with a mark for done, in progress, pending, blocked or redo, and the latest progress note for that step. A review loop that ran more than once adds its round.
+4. When finished, `Done.` with the pull request number and title and whether CI passed, failed or is still running, and a `View pull request` button. When it needs a person, the cause sentence and a `View issue` button.
+5. The elapsed time: `Running for <n> min` while live, then `Finished in` or `Stopped after`.
+
+The card's message text is the same content without the buttons. A kickoff's card is the dispatcher's placeholder reply under the mention; when there was none, and in a configured thread, the lane posts the card as a reply and edits it from then on. Each pass re-renders the card and edits it only when the render changed, at most once every 30 seconds while the run is live; a final state is edited at once. Edits never notify anyone, so two events also post one short reply each, once per run: `<mention> this run needs you: <cause>` when a run ends failed or expired with no automatic retry admitted, and `<mention> your pull request is ready for review: <url>` when the run's own publication opens or updates the pull request. The mention is the kickoff sender, or in a configured thread the WorkItem owner's (else the requester's) one active Slack identity link in the posting app's workspace; with none the reply mentions no one. A failed run whose automatic retry was admitted with it posts nothing; its card moves on to the retry. A refused trigger label posts once in the channel, outside any thread, with no card, from its intake notice (`factory_slack_refusal_posts`).
+
+Delivery is at least once and ordered per WorkItem: the root first, then the card, then each reply only after every earlier owed one. A rejected send, including one for an identity whose token this worker lacks, stays owed and retries with backoff; only an invalid target fails permanently. A refused card edit is retried on a later pass. A worker that stops mid-send posts that message again after a restart, and a worker restarted after a long outage posts everything owed since; an edit in flight is sent again with the same content.
+
+Upgrading to a release with the card: a thread whose run is live at upgrade time gets its card as its next reply, since it cannot be the first. Threads that ended before the upgrade get no card. The migration records a durable cutoff, so a run live at upgrade time still gets its card after a worker outage. Phase, PR open and run outcome lines left unposted by an older release are never posted and never hold back the card or a reply. The worker no longer reads a phase lines setting.
+
+### Factory Slack steering
+
+A person steers a run by explicitly mentioning the app in that run's Slack thread; the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack) describes what a steering mention does. Membership in the channel and having tagged the original issue confer no authority. Steering needs an operator-managed account link from the person to a code-host account, created with the platform key:
+
+1. `POST /identity/admin/{tenant_id}/code-host-links` with `principal_id`, `code_host_kind` (`github`), `host` (for example `github.com`), the numeric `account_id`, and `created_by_principal_id`. An account already actively linked answers 409 `link_exists`.
+2. `POST /identity/admin/{tenant_id}/links/{link_id}/revoke` ends a link. A revoked link, a disabled principal or a lost write permission refuses a mention that was queued before the change.
+
+A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `FACTORY_MODEL_AUTH_MODE=personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
+
+The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, and for each top-level human mention whose text links an issue, before its dedupe claim, so the worker can verify the sender and the exact message. On a test installation it also stores one for a declared test driver's marked action in that driver's channel, at root or in a thread; that receipt is version 2 and names the declared bot user and bot id, never the event's user. Steering reads only a person's thread receipt and refuses any other; root receipts and version 2 receipts serve kickoff. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
+
+Every worker intercepts a mention in a mapped run root before any sandbox starts. A worker without its internal worker token refuses it with `steering_unconfigured`; a delivery with too little budget left is refused with `steering_budget_expired`. When the worker cannot read a decision, the delivery stays pending under its usual lease and delivery cap, and a request whose answer was lost is replied to as unconfirmed rather than with an invitation to send it again. Each reply names its outcome code.
+
+Live Slack Socket Mode delivery and the runner's checkout of the revised branch are not covered by the automated verification of this feature.
+
+### Factory Slack kickoff
+
+A person starts a personal factory run from Slack by mentioning the app with a link to one GitHub issue, either at a channel's root or in a thread no factory run owns: `@curie https://github.com/acme-corp/acme-fixture/issues/7`. Slack's `<URL>` and `<URL|label>` forms both count, and a label that names another issue reads as a second link. The channel must be a public or private channel where the agent has its Slack binding and a `github` surface that serves the issue's repository; a direct message stays ordinary chat.
+
+The sender must resolve through an active Slack identity link to an active principal in the binding's tenant, and that principal's [personal Claude enrollment](#personal-claude-enrollment) must be active. Trusted admission then records one personal WorkItem owned by the sender at the enrollment's current generation, with the issue link as its objective and no trigger label, under a request id derived from the Slack delivery, so a redelivered mention finds the run it already admitted. The mention's message becomes the run's thread, and the dispatcher's placeholder reply under it becomes the run's progress card: an admitted kickoff hands the placeholder to the progress lane, which edits it into the card and posts the needs a person and ready for review replies there, mentioning the sender (see [Factory Slack progress](#factory-slack-progress)). There is no separate admitted reply. The progress lane posts no root, because the mention already rooted the thread. This holds whether or not the agent has a `factory_slack_channel`.
+
+The bot needs `users:read` for account labels (`users.info`) and `team:read`
+for the workspace name (`team.info`). After adding these scopes to the app
+manifest, reinstall the app in the workspace to refresh its bot-token grant.
+Each successful lookup supplies its own labels; a failed lookup leaves only
+its labels unavailable. The confirmation shows native user and workspace ids
+in separate fields and isolates display labels from their direction.
+
+Exactly one link to an issue on the factory's GitHub code host is accepted.
+A `sender_unverified` or `enrollment_inactive` refusal is sent privately to the
+verified Slack sender, with `Code: <outcome>` and a **Connect your Claude plan**
+link button when a URL is available. The public placeholder becomes
+"Not started. I sent you a private message about what to do next."
+An unlinked account gets a sender-bound, single-use confirmation URL under
+`/api/identity/connect/<token>` when the Console uses HTTPS OIDC. The token
+expires after ten minutes, issuance is spaced one minute apart, and each
+account can hold at most five live tokens. The confirmation names the Slack
+account, warns that anyone using it can start runs on the confirming person's
+plan, and requires sign-in and an explicit CSRF-bound confirmation. In personal
+mode, confirmation redirects to `/settings/claude-plan`; a linked sender with
+an inactive enrollment gets that page directly. A refusal without a URL stays
+private, has no button, and names the operator. Other kickoff refusals keep
+their public thread replies ending with `Outcome: <code>`:
+
+1. The link: `link_missing` (no issue link), `link_multiple` (more than one), `link_malformed` (an issue-shaped link that is not exactly `/{owner}/{repo}/issues/{number}`), `link_host_unsupported` (another host) and `link_pull_request` (a pull request).
+2. The sender: `sender_unverified` when the Slack account does not resolve to an active principal, and `enrollment_inactive` when the principal has no active enrollment, including one disconnected or replaced while the mention was decided.
+3. The issue: `issue_inaccessible`, `issue_closed`, `publication_exists` when the code host already holds a factory publication for it, and `base_refused` when no base branch can be chosen.
+4. The binding and the thread: `binding_missing`, `binding_ambiguous`, `thread_conflict` (the issue or the thread already belongs to another run) and `authority_changed` (the sender or binding changed while the mention was decided).
+5. The evidence: `receipt_mismatch`, `test_driver_refused`, `admission_refused` with its reason, and the worker's own `kickoff_evidence_missing` (no matching mention receipt, as for a turn that arrived through the HTTP receiver) and `kickoff_budget_expired`.
+
+An installation that does not run factory work keeps ordinary chat. When the factory is off, no GitHub tracker or code host is configured, the agent holds no `github` surface, or none of its surfaces serves the linked repository, the API answers `not_factory` and the worker runs the mention as an ordinary turn. A worker without its internal worker token does the same without asking. When the code host cannot answer, the API returns 503 and the worker keeps the delivery pending.
+
+A bot never starts a run on a production installation. On a test installation (`testInstallation.enabled`, [ADR 0202](adr/0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md)), a declared test driver's marked action in its own channel, `<@APP_USER> [test action] <issue URL>`, is a kickoff from the driver's bot user, which needs its own identity link and enrollment like a person. Any other bot's mention writes no receipt and is not a kickoff, and the API refuses a version 2 receipt naming a driver its own test installation does not declare with `test_driver_refused`. The live acceptance proof for kickoff is `tools/factory-e2e/personal_slack_kickoff.py`; see its section in `tools/factory-e2e/README.md`.
 
 ### Connecting email
 
@@ -2830,6 +3470,15 @@ thread identifiers, recovery text, and delivery receipts, though never the three
 credentials or a platform database credential. Back up with a storage snapshot
 that is consistent for SQLite, or stop the Deployment before copying the file.
 Restore the claim before starting the writer.
+
+That claim is local single-writer storage. A network filesystem is a different
+deployment: set `CURIE_MAIL_EXCLUSIVE_WAL=true` so the process takes SQLite
+exclusive locking before it touches the WAL, and still run one replica with
+stop-before-start. Give that adapter its own access point, mount it as the
+process UID, and encrypt the mount. Backups on that volume follow the same
+rule, a stopped adapter or a consistent SQLite backup. EFS locking and crash
+recovery still need qualification on real tasks. The chart does not set the
+variable. See the mail adapter README for the process contract.
 
 A disposable synthetic restore of postgres records, immutable bundle objects,
 that SQLite delivery state, and a Valkey dump is `curie dev restore-drill`
@@ -3054,6 +3703,10 @@ ordinary approval path on a **disposable target inside the policy's bounds**:
      leaves the ledger record without a `post_version`, so it cannot produce
      this evidence: recording the qualification is refused
      `evidence_not_idempotent` and the action cannot be made automatic.
+     The SRE example's opt-in
+     [`restarter`](../examples/sre-bot/README.md#remediation-restarter-connector-opt-in)
+     is such a connector for a rolling restart: its `restart_at` token makes a
+     repeat write nothing and leave the same `post_version`.
 4. **Run the verifier twice** against a literal member of the action's allowed
    targets, with the target recovered (outcome `verified`) and not recovered
    (`not-recovered`), under the same verifier declaration:
@@ -3196,6 +3849,25 @@ nominates, admits or executes.
 A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
+
+### Channel gateway and protected workers
+
+Slack installations require `channelGateway.deploy: true` with a TLS certificate
+in `channelGateway.tlsSecret`, or an authenticated gateway at
+`channelGateway.url`. `curie cluster up` enables the gateway for a retained Slack
+installation that has no external gateway URL. Supply the TLS Secret before
+upgrading; plaintext HTTP requires an explicit `channelGateway.allowInsecure:
+true` opt-out. The chart refuses a Slack installation without a gateway, and
+rejects an HTTP URL when a TLS Secret is set.
+
+Protected workers commissioned with a schema-1 `process.json` must be
+re-commissioned before starting the upgraded worker image. The new image accepts
+only schema 2, whose `channel_gateway` configuration replaces process-owned
+Slack tokens with the gateway URL and worker caller credential. An image-only
+upgrade leaves the old process file invalid and the worker refuses to boot.
+Use the protected-worker commissioning workflow to produce a new process file
+and provision the gateway; do not copy Slack tokens into the new worker's
+environment or edit the schema number alone.
 
 ### Connector action executor (0.13.0)
 
@@ -3896,6 +4568,54 @@ If the fence cannot be taken inside `CURIE_MIGRATION_FENCE_LOCK_TIMEOUT_MS`
 database is exactly as it was. Stop that writer, or raise the bound, and
 re-run.
 
+## Factory tool observations
+
+The Kubernetes worker observes the runner selected for each GitHub factory
+agent and repository. Selection uses the same repository, agent and platform
+pool routing as a factory claim. The loop starts with the worker and ticks
+every 300 seconds under a Postgres advisory lock. One subject's failure does
+not stop the remaining subjects or the worker.
+
+Tool facts require an immutable digest declared by the deployment: a repository
+runner entry, an agent runner image digest, or the worker's platform runner
+digest. A deployment whose runner is a mutable tag with no declared digest gets
+`unknown` with reason `unreadable` for tools. A probe whose cluster-reported
+runner digest differs from its declaration also produces `unknown` with reason
+`unreadable`. Missing repository pools and stale runner bases produce `unknown`
+with reason `runner_unavailable`.
+
+The probe uses a separate short-lived claim with no workspace, bundle fetch,
+model credential or connector secret. It looks up the fixed catalog in PATH
+as the sandbox user with the image's default environment, without executing
+catalog programs. It releases its claim and confirms removal within its
+120-second budget. Capacity refusal defers the subject until another tick.
+
+The same probe records `uname -s` and `uname -m` for its process platform.
+Linux on `x86_64` or `aarch64` becomes `linux/amd64` or `linux/arm64` in the
+observation digest. Missing or unsupported platform answers produce `unknown`
+with reason `unreadable`. The observer needs no cluster-scoped permission.
+
+Catalog version 1 contains `bash`, `sh`, `git`, `curl`, `wget`, `jq`, `make`,
+`gcc`, `cc`, `python3`, `pip`, `uv`, `pytest`, `ruff`, `node`, `npm`, `npx`,
+`pnpm`, `yarn`, `tsc`, `cargo`, `rustc`, `rustfmt`, `go`, `java`, `mvn`,
+`gradle`, `ruby`, `bundle`, `php`, `composer`, `dotnet`, `docker`, `kubectl`,
+`helm`, `terraform`, `psql`, `sqlite3`, `redis-cli`, `valkey-cli`, `gh` and
+`shellcheck`. Versions and subcommands are outside this catalog.
+
+Observations expire 900 seconds after their original observation time. Reading
+facts or ticking an unchanged subject never extends a positive observation;
+renewal requires another successful probe. Unchanged subjects reprobe when
+300 seconds or less remain, keeping the old rows readable until replacement.
+A changed selection, configuration or catalog deletes old rows before
+replacement. The API reads these cached rows without starting a run or
+accepting uploaded observations. A name outside
+the current catalog answers `unknown` with reason `outside_catalog`; missing or
+expired observations remain `unknown`.
+
+The separate `docker` service fact is `configured` only when the selected
+repository runner enables per-claim daemon provisioning. It never claims the
+daemon has been observed healthy. Other services remain `unknown`.
+
 ## Which claim env reaches which sandbox container
 
 Almost nobody writes a `SandboxClaim` by hand -- the worker creates them. But
@@ -3963,6 +4683,31 @@ bundle. Two things now name the real cause:
 - the runner refuses to boot with `CURIE_BUNDLE_REF` set over an empty plugin
   dir, and says so in those terms instead of blaming the bundle.
 
+## Langfuse v4 read APIs
+
+For a Langfuse v4 backend, set `LANGFUSE_API_VERSION=v4` on the API process.
+The default is `v3`, which keeps the legacy reads used by the bundled v3 server.
+With Helm, set this through `api.extraEnv`; for a local Compose override, add it
+under the API service's `environment`.
+
+The setting switches trace and observation reads to Observations API v2 and
+aggregate reads to Metrics API v2. It does not migrate trace ingestion. The
+worker evaluation recorder still uses legacy ingestion and needs a separate
+migration before running it against a v4 backend in `events_only` mode.
+
+In v4, run counts and latency aggregates use logical root observations rather
+than trace rows. If a trace contains several application roots, each root
+contributes to these aggregates. Do not compare the v3 and v4 aggregate counts
+as if their units were identical.
+
+The Runs list scans up to 5,000 matching observations to find the most
+recently active trace IDs. Each listed trace and each exact read use the
+earliest logical root for the summary, or the earliest exported observation
+if the project has no logical root. The summary timestamp is that observation's
+start time. The eval matrix groups matching tagged observations by trace ID and
+uses the same root preference within its scan. A read that requires complete
+results returns an upstream error when it exceeds the pagination bound.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the
@@ -4006,3 +4751,71 @@ unreadable controller data blocks reuse.
   lands. This is functionally irrelevant for runners (the first model call
   comes later) but worth knowing when reading probe output from the first
   seconds of a pod's life.
+
+
+## Refused factory trigger labels
+
+`curie.factory.intake.notice.oldest_owed_age_seconds` is the age of the oldest
+refusal notice still awaiting its App-owned issue comment, zero when none is
+owed. The API records refusals in `factory_intake_notices` independently of
+work items and retries delivery with capped backoff beside status-comment
+synchronization. A growing age means issue-visible answers are delayed;
+check GitHub availability and the factory App's comment permissions.
+
+
+## Factory polling cadence
+
+Polling intake has its own start-to-start timer on the GitHub tracker's
+`poll_interval_s`, 45 seconds by default. The label pass reads all repositories
+and delivers its new status comments and refusal notices before review, comment
+and cancellation traffic. That later traffic stops at the next label deadline
+and rotates its first repository. The five second delivery loops retry owed
+answers and recover existing comments by their markers.
+
+A trigger label that remains on an open issue is answered within 60 seconds of
+its event or intake recovery, whichever is later, within this polling envelope:
+
+| Bound | Limit |
+| --- | --- |
+| Served repositories | 20 |
+| Bound trigger labels per repository | 4 |
+| Open labelled issues per repository | 50, one listing page per label |
+| Unanswered events per pass | 10, in any distribution |
+| Events per labelled issue | 99, one response |
+| Comments per labelled issue | 200, three responses |
+| Labels per labelled issue | 99, one response |
+| Pull requests of any state per repository | 2,500, 25 pages of 100 |
+| Tracker response time | 200 milliseconds |
+| Tracker and factory credential | Available |
+
+The cold-cache label pass, including answer delivery, has a 15 second budget.
+Repositories and issues within a repository each have a concurrency limit of ten.
+Publication discovery shares one complete repository listing within each pass.
+Webhook intake keeps its separate reconciler interval and has no polling promise.
+A label removed before the next pass may never be observed.
+
+`curie.factory.intake.label_pass.age_seconds`, labelled by `repository`, records
+the age since that repository's last clean label pass at each completion. A
+retried row leaves the reference time unchanged. Outside the envelope, the age
+and `curie.factory.intake.notice.oldest_owed_age_seconds` show delayed intake
+and delayed refusal delivery respectively. Repository labels are bounded to
+20 values, with additional repositories sharing `other`.
+
+## GitHub account linking
+
+For a personal-mode installation with Console organization sign-in, register
+`https://console.example.com/api/identity/me/github-link/callback` as a callback
+URL in the factory GitHub App settings. Use your Console origin in place of
+`https://console.example.com`. Set `factory.githubAppClientId` to the App OAuth
+client id, `factory.githubAppClientSecretExistingSecret` to an existing Secret
+in the release namespace, and `factory.githubAppClientSecretExistingSecretKey`
+to its client-secret key. These become `FACTORY_GITHUB_APP_CLIENT_ID` and
+`FACTORY_GITHUB_APP_CLIENT_SECRET` in the API. Keep the client secret in that
+Secret, outside Helm values and release history.
+
+People can then use **Settings > Claude plan > Link GitHub** to prove ownership
+of their GitHub account. Curie reads the numeric account id, revokes the
+short-lived user token, and retains only the account link and display login.
+Without both client settings, the linking action is hidden and its routes
+answer 404. GitHub Enterprise Server uses the factory code host web and API
+bases. The callback requires HTTPS on the Console origin.

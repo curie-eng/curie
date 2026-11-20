@@ -1,0 +1,11 @@
+# Per-Dockerfile ignore (BuildKit honors <dockerfile>.dockerignore). The shell
+# image builds from the repository root but copies only the supervisor
+# package; everything else comes from the runner image it layers on.
+*
+!packages/shell-supervisor
+packages/shell-supervisor/tests
+**/__pycache__
+**/*.pyc
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache

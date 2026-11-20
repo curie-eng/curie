@@ -56,14 +56,9 @@ impl crate::ui::CliOutput for SealOutput {
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
+        // The unsupported-feature note is emitted by `seal` itself so it also
+        // reaches `--json` callers; render only prints the fragment.
         ui.payload_plain(&snippet(&self.env_name, &self.sealed));
-        ui.note(&format!(
-            "sealed to public key {}. Only a cluster holding the matching private \
-             key can read it, so this is safe to commit. The block above belongs under \
-             connectors.{} in connectors.yaml, but connector validation rejects \
-             sealed_secrets until #1434 lands, so it cannot be used yet.",
-            self.public_key, self.connector
-        ));
     }
 }
 
@@ -196,6 +191,18 @@ pub async fn seal(opts: SealOpts) -> Result<SealOutput> {
 
     let value = read_value(&opts)?;
     let sealed = crate::sealing::seal(&public_key, &value)?;
+
+    // Emitted once per successful seal, in both human and `--json` modes, so a
+    // caller who writes the fragment into connectors.yaml is told that
+    // connector validation refuses it. `Ui::note` goes to stderr and honors
+    // `--quiet`.
+    crate::ui::ui().note(&format!(
+        "sealed to public key {public_key}. Only a cluster holding the matching \
+         private key can read it, so this is safe to commit. The yaml fragment \
+         belongs under connectors.{} in connectors.yaml, but connector validation \
+         rejects sealed_secrets until #1434 lands, so it cannot be used yet.",
+        opts.connector
+    ));
 
     Ok(SealOutput {
         connector: opts.connector,

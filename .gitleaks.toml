@@ -49,6 +49,18 @@ id = "generic-api-key"
   paths = ['''^cli/tests/config_migrate\.rs$''']
   regexes = ['''^secret-sentinel-4628$''']
 
+  [[rules.allowlists]]
+  description = "Fixed wake signing vectors derived from the committed example installation key by the independent test reference"
+  condition = "AND"
+  regexTarget = "secret"
+  paths = ['''^tests/vectors/hook-wake-signing\.json$''']
+  regexes = [
+    '''^4C0uQ98m9Mk_CsVL_OtFMQ12Aw3xMSdmg87tTkCe5Vg$''',
+    '''^nxU1l5BbXOMssvmpdB9oztHIEeziRyoW8hWO4I7SUuc$''',
+    '''^pYdwDB1FadvRItpisurxsTO9k7rqOn4bscjcloJwSm8$''',
+    '''^rHvDmR2588X1tBp7KUDZq99st1gi9oJCbXSgzTeoj4g$''',
+  ]
+
 [[rules]]
 id = "slack-conversation-id"
 description = "Slack conversation id (channel/group/DM) -- use an EXAMPLE id in docs and tests"

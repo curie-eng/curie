@@ -34,8 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
 from curie_api.factory_card import CardInput, render_card
-from curie_api.factory_progress import phase_view, record_wait_ci
+from curie_api.factory_progress import record_wait_ci
 from curie_api.models import ExecutionRequestPhaseReport
+from curie_internal.factory_phase_view import phase_view
 from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401  (fixtures)
 from test_factory_progress import (
     ACTIVITY,
@@ -316,7 +317,12 @@ def test_terminal_cause_selects_the_card_pill_at_the_route(
     finished = client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": cause,
+            "retry_safety": "uncertain",
+        },
     )
     assert finished.status_code == 200, finished.text
 

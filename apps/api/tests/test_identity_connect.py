@@ -30,6 +30,23 @@ EVIDENCE = SlackEvidence(
 )
 
 
+def connect_plan_settings(
+    monkeypatch: pytest.MonkeyPatch, *, oidc: bool = True, scheme: str = "https"
+) -> None:
+    values = {
+        "FACTORY_MODEL_AUTH_MODE": "personal",
+        "CURIE_OIDC_ISSUER": ISSUER,
+        "CURIE_OIDC_AUDIENCE": "curie-console",
+        "CURIE_OIDC_JWKS_URL": ISSUER + "/jwks",
+        "CURIE_OIDC_REDIRECT_URI": f"{scheme}://console.example.com/api/console/oidc/callback",
+        "CURIE_OIDC_CLIENT_SECRET": "example-client-secret",
+        "CURIE_OIDC_REQUIRED_CLAIMS": '{"groups":"operators"}',
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value if oidc or not key.startswith("CURIE_OIDC_") else "")
+    get_settings.cache_clear()
+
+
 async def seed(s: AsyncSession) -> tuple[Tenant, Principal, IdentityNamespace, Team]:
     tenant = Tenant(deployment_id=f"connect-test-{uuid.uuid4()}")
     s.add(tenant)
@@ -464,6 +481,312 @@ def browser_links(tenant_id: uuid.UUID) -> list[tuple[str, uuid.UUID | None]]:
     return asyncio.run(read())
 
 
+@pytest.fixture
+def connect_plan_browser(connect_browser, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", "personal")
+    monkeypatch.setenv("CURIE_OIDC_REDIRECT_URI", "https://testserver/console/oidc/callback")
+    get_settings.cache_clear()
+    _, raw, tenant_id, _, _, _ = connect_browser
+
+    async def prepare():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as s:
+                config = await s.get(TenantIdentityProvider, tenant_id)
+                assert config is not None
+                await s.delete(config)
+                row = await s.get(IdentityConnectToken, connect.hash_token(raw))
+                assert row is not None
+                row.slack_display_name = "Alice <Example>"
+                row.slack_handle = "alice"
+                row.slack_workspace_name = "Example Workspace"
+                await s.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(prepare())
+    yield connect_browser
+
+
+def test_connect_plan_confirmation_names_account_and_redirects(connect_plan_browser) -> None:
+    import re
+
+    from curie_api.routers.identity_connect import PROOF_COOKIE
+
+    client, raw, tenant_id, principal_id, proof, _ = connect_plan_browser
+    path = f"/identity/connect/{raw}"
+    client.cookies.set(PROOF_COOKIE, proof)
+    page = client.get(path)
+    assert page.status_code == 200
+    assert "<bdi>Alice &lt;Example&gt;</bdi>" in page.text
+    assert "<bdi>@alice</bdi>" in page.text
+    assert '<code dir="ltr">UALICE001</code>' in page.text
+    assert "<bdi>Example Workspace</bdi>" in page.text
+    assert '<code dir="ltr">TEXAMPLE1</code>' in page.text
+    assert (
+        "Confirm only if this is your own Slack account. "
+        "Anyone using it will start runs on your Claude plan."
+    ) in page.text
+    assert "Alice <Example>" not in page.text
+    assert page.headers["referrer-policy"] == "strict-origin"
+    assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+    response = client.post(
+        f"{path}/confirm",
+        data={"csrf": csrf},
+        headers={"Origin": "https://testserver"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303 and response.headers["location"] == "/settings/claude-plan"
+    assert response.headers["cache-control"] == "private, no-store"
+    assert browser_links(tenant_id) == [("UALICE001", principal_id)]
+
+    async def source():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as s:
+                link = await s.scalar(
+                    select(IdentityLink).where(IdentityLink.tenant_id == tenant_id)
+                )
+                assert link and link.verification_source == "provider_event_verified"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(source())
+    assert client.get(path).status_code == 400
+
+
+def test_connect_plan_confirmation_isolates_labels_from_native_ids(connect_plan_browser):
+    from html.parser import HTMLParser
+
+    class Labels(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.active = None
+            self.labels = []
+            self.ids = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in {"bdi", "code"}:
+                self.active = tag
+
+        def handle_endtag(self, tag):
+            if tag == self.active:
+                self.active = None
+
+        def handle_data(self, data):
+            if self.active == "bdi":
+                self.labels.append(data)
+            elif self.active == "code":
+                self.ids.append(data)
+
+    client, raw, _, _, _, _ = connect_plan_browser
+    crafted = "Pat (@pat, U000) in workspace Acme (T000)\u202e"
+
+    async def prepare():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                row = await session.get(IdentityConnectToken, connect.hash_token(raw))
+                row.slack_display_name = crafted
+                row.slack_handle = "pat\u202e"
+                row.slack_workspace_name = "Acme (T000)\u202e"
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(prepare())
+    response = client.get(f"/identity/connect/{raw}")
+    assert response.status_code == 200
+    parsed = Labels()
+    parsed.feed(response.text)
+    assert parsed.labels == [crafted, "@pat\u202e", "Acme (T000)\u202e"]
+    assert parsed.ids == ["UALICE001", "TEXAMPLE1"]
+
+
+@pytest.mark.parametrize("bad", ["linked", "expired", "consumed", "csrf", "cross_tenant"])
+def test_connect_plan_confirmation_refuses_without_changing_links(connect_plan_browser, bad: str):
+    from curie_api.routers.identity_connect import CSRF_COOKIE, PROOF_COOKIE
+
+    client, raw, tenant_id, principal_id, proof, _ = connect_plan_browser
+    client.cookies.set(PROOF_COOKIE, proof)
+    path = f"/identity/connect/{raw}"
+    assert client.get(path).status_code == 200
+    csrf = client.cookies.get(CSRF_COOKIE)
+
+    async def break_precondition():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as s:
+                row = await s.get(IdentityConnectToken, connect.hash_token(raw))
+                assert row
+                if bad == "linked":
+                    s.add(
+                        IdentityLink(
+                            tenant_id=tenant_id,
+                            identity_namespace_id=row.identity_namespace_id,
+                            provider_native_id=row.provider_native_id,
+                            principal_id=principal_id,
+                            verification_source="provider_event_verified",
+                            created_by_principal_id=principal_id,
+                        )
+                    )
+                elif bad == "expired":
+                    row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                elif bad == "consumed":
+                    row.consumed_at = datetime.now(UTC)
+                elif bad == "cross_tenant":
+                    other = Tenant(deployment_id=f"connect-other-{uuid.uuid4()}")
+                    s.add(other)
+                    await s.flush()
+                    person = Principal(
+                        tenant_id=other.id,
+                        idp_issuer=row.idp_issuer,
+                        idp_subject="other",
+                        type="human",
+                    )
+                    s.add(person)
+                    await s.flush()
+                    with pytest.raises(connect.ConnectRefused):
+                        await connect.confirm(s, token=raw, principal=person)
+                await s.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(break_precondition())
+    before = browser_links(tenant_id)
+    if bad == "cross_tenant":
+        client.cookies.set(PROOF_COOKIE, "x" * 43)
+    response = client.post(
+        f"{path}/confirm",
+        data={} if bad == "csrf" else {"csrf": csrf},
+        headers={"Origin": "https://testserver"},
+        follow_redirects=False,
+    )
+    assert response.status_code in {400, 401}
+    assert browser_links(tenant_id) == before
+
+
+def test_connect_plan_personal_tokens_keep_cap_and_service_directory_rules(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+):
+    connect_plan_settings(monkeypatch)
+
+    async def body(s: AsyncSession):
+        tenant, person, _, _ = await seed(s)
+        config = await s.get(TenantIdentityProvider, tenant.id)
+        assert config
+        await s.delete(config)
+        await s.flush()
+        for _ in range(connect.MAX_ACCOUNT_TOKENS):
+            raw = await issue(s, tenant)
+            assert raw
+            row = await connect.live_token(s, raw)
+            assert row.idp_issuer == person.idp_issuer
+            row.created_at -= timedelta(minutes=2)
+            await s.flush()
+        assert await issue(s, tenant) is None
+        get_settings().factory_model_auth_mode = "service"
+        with pytest.raises(connect.ConnectRefused):
+            await connect.live_token(s, raw)
+
+    run(body)
+    get_settings.cache_clear()
+
+
+def test_connect_plan_disabled_tenant_cannot_issue_without_directory(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connect_plan_settings(monkeypatch)
+
+    async def body(s: AsyncSession):
+        tenant, _, _, _ = await seed(s)
+        config = await s.get(TenantIdentityProvider, tenant.id)
+        assert config
+        await s.delete(config)
+        tenant.status = "disabled"
+        await s.flush()
+        assert await issue(s, tenant) is None
+
+    run(body)
+    get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("provider_ok", [True, False])
+def test_connect_plan_captures_slack_names_through_gateway(migrated: None, provider_ok: bool):
+    import httpx
+    from aiohttp.test_utils import TestServer
+    from curie_channel_gateway.read_transport import GatewayProviders, gateway_application
+    from curie_channel_gateway.request_replay import RequestReplayStore
+    from curie_channel_gateway.slack.account_profiles import SlackAccountProfiles
+
+    async def body(s: AsyncSession):
+        tenant, _, _, _ = await seed(s)
+        raw = await issue(s, tenant)
+        assert raw
+
+        def slack(request):
+            # Shapes: https://docs.slack.dev/reference/methods/users.info/
+            # and https://docs.slack.dev/reference/methods/team.info/.
+            assert request.headers["authorization"] == "Bearer xoxb-example"
+            if request.url.path.endswith("users.info"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": provider_ok,
+                        "user": {
+                            "id": "UALICE001",
+                            "name": "al\u200bice\t",
+                            "profile": {"display_name": "Al\u202eice\n"},
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"ok": True, "team": {"id": "TEXAMPLE1", "name": "Example \u2066Workspace\r"}},
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(slack)) as provider:
+            app = gateway_application(
+                tokens={"api": "api-credential", "worker": "worker-credential"},
+                replay=RequestReplayStore(":memory:"),
+                allow_insecure_http=True,
+                providers=GatewayProviders(
+                    profiles=SlackAccountProfiles(
+                        provider,
+                        {"example-bot": "xoxb-example"},
+                        base_url="https://slack.example.com/api/",
+                    )
+                ),
+            )
+            async with TestServer(app) as server, httpx.AsyncClient() as client:
+                settings = get_settings().model_copy(
+                    update={
+                        "channel_gateway_url": str(server.make_url("")),
+                        "channel_gateway_token": "api-credential",
+                        "channel_gateway_allow_insecure": True,
+                    }
+                )
+                await connect.capture_slack_profile(
+                    s,
+                    token=raw,
+                    identity="example-bot",
+                    user_id="UALICE001",
+                    workspace="TEXAMPLE1",
+                    settings=settings,
+                    client=client,
+                )
+        row = await s.get(IdentityConnectToken, connect.hash_token(raw))
+        assert row
+        assert (row.slack_display_name, row.slack_handle, row.slack_workspace_name) == (
+            ("Alice", "alice", "Example Workspace")
+            if provider_ok
+            else (None, None, "Example Workspace")
+        )
+
+    run(body)
+
+
 def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) -> None:
     import re
 
@@ -475,7 +798,7 @@ def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) ->
     assert page.status_code == 200 and "Sign in with your organization" in page.text
     assert "UALICE001" in page.text and "TEXAMPLE1" in page.text
     assert page.headers["cache-control"] == "private, no-store"
-    assert page.headers["referrer-policy"] == "no-referrer"
+    assert page.headers["referrer-policy"] == "strict-origin"
     for value in page.headers.get_list("set-cookie"):
         assert "Secure" in value and "HttpOnly" in value and "SameSite=lax" in value
     assert browser_links(tenant_id) == []
@@ -492,7 +815,9 @@ def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) ->
     assert client.get(path).status_code == 400
 
 
-@pytest.mark.parametrize("bad", ["origin", "missing_origin", "csrf", "token", "session"])
+@pytest.mark.parametrize(
+    "bad", ["origin", "missing_origin", "null_origin", "csrf", "token", "session"]
+)
 def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str) -> None:
     import re
 
@@ -506,6 +831,8 @@ def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str)
     headers = {"Origin": "https://testserver"}
     if bad == "origin":
         headers["Origin"] = "https://sibling.example.com"
+    elif bad == "null_origin":
+        headers["Origin"] = "null"
     elif bad == "missing_origin":
         headers = {}
     elif bad == "csrf":
@@ -517,6 +844,32 @@ def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str)
     response = client.post(f"{path}/confirm", data={"csrf": csrf}, headers=headers)
     assert response.status_code in {400, 401, 403}
     assert browser_links(tenant_id) == []
+
+
+def test_connect_confirm_page_referrer_policy_is_strict_origin(connect_browser) -> None:
+    """#5836. no-referrer makes a browser send Origin null. strict-origin does not."""
+
+    import re
+
+    from curie_api.routers.identity_connect import PROOF_COOKIE
+
+    client, raw, tenant_id, principal_id, proof, _ = connect_browser
+    client.cookies.set(PROOF_COOKIE, proof)
+    path = f"/identity/connect/{raw}"
+    page = client.get(path)
+    assert page.status_code == 200, page.text
+    assert page.headers["referrer-policy"] == "strict-origin"
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+    rejected = client.post(f"{path}/confirm", data={"csrf": csrf}, headers={"Origin": "null"})
+    assert rejected.status_code == 403
+    assert rejected.json()["detail"] == "console session origin rejected"
+    assert browser_links(tenant_id) == []
+    confirmed = client.post(
+        f"{path}/confirm", data={"csrf": csrf}, headers={"Origin": "https://testserver"}
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert "Account connected" in confirmed.text
+    assert browser_links(tenant_id) == [("UALICE001", principal_id)]
 
 
 def test_oidc_callback_returns_to_confirmation_and_preserves_verified_claim(
@@ -641,7 +994,7 @@ def test_form_parser_errors_are_private_and_do_not_link(connect_browser) -> None
     response = client.post(f"{path}/confirm", data={}, headers={"Origin": "https://testserver"})
     assert response.status_code == 400
     assert response.headers["cache-control"] == "private, no-store"
-    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["referrer-policy"] == "strict-origin"
     assert browser_links(tenant_id) == []
 
 
@@ -728,6 +1081,129 @@ def test_ordinary_connect_login_never_mints_console_administration(
     assert confirmed.status_code == 200, confirmed.text
     assert ("UALICE001", principal_id) in browser_links(tenant_id)
     assert console_sessions() == before
+
+
+@pytest.mark.parametrize("groups", [None, "staff"], ids=["missing", "wrong"])
+def test_shared_issuer_connect_claims_depend_on_directory(
+    connect_browser, monkeypatch: pytest.MonkeyPatch, groups: str | None
+) -> None:
+    import re
+    from urllib.parse import urlsplit
+
+    import httpx
+    from curie_api.routers.identity_connect import CONNECT_COOKIE, CSRF_COOKIE, PROOF_COOKIE
+
+    client, directory_token, directory_id, directory_principal_id, _, idp = connect_browser
+    idp.redirect_uri = "https://testserver/console/oidc/callback"
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", "personal")
+    monkeypatch.setenv("CURIE_OIDC_REDIRECT_URI", idp.redirect_uri)
+    monkeypatch.setenv("CURIE_OIDC_REQUIRED_CLAIMS", '{"groups":"curie-admins"}')
+    monkeypatch.setenv("CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "false")
+    get_settings.cache_clear()
+    if groups is not None:
+        idp.extra_claims["groups"] = groups
+
+    async def issue_personal_token() -> tuple[uuid.UUID, str]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                tenant, person, _, team = await seed(session)
+                config = await session.get(TenantIdentityProvider, tenant.id)
+                assert config is not None
+                await session.delete(config)
+                await session.delete(team)
+                await session.delete(person)
+                await session.flush()
+                token = await issue(session, tenant)
+                assert token is not None
+                personal = await session.get(IdentityConnectToken, connect.hash_token(token))
+                directory = await session.get(
+                    IdentityConnectToken, connect.hash_token(directory_token)
+                )
+                assert personal is not None and directory is not None
+                assert personal.idp_issuer == directory.idp_issuer == get_settings().oidc_issuer
+                await session.commit()
+                return tenant.id, token
+        finally:
+            await engine.dispose()
+
+    tenant_id, personal_token = asyncio.run(issue_personal_token())
+
+    async def personal_counts() -> list[int | None]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                return [
+                    await session.scalar(select(func.count()).select_from(model).where(*filters))
+                    for model, filters in (
+                        (Principal, (Principal.tenant_id == tenant_id,)),
+                        (IdentityLink, (IdentityLink.tenant_id == tenant_id,)),
+                        (
+                            IdentityConnectToken,
+                            (
+                                IdentityConnectToken.tenant_id == tenant_id,
+                                IdentityConnectToken.consumed_at.is_not(None),
+                            ),
+                        ),
+                    )
+                ]
+        finally:
+            await engine.dispose()
+
+    def sign_in() -> httpx.Response:
+        login = client.get("/console/oidc/login", follow_redirects=False)
+        assert login.status_code == 302, login.text
+        with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
+            authorized = browser.get(login.headers["location"])
+        back = urlsplit(authorized.headers["location"])
+        return client.get(f"{back.path}?{back.query}", follow_redirects=False)
+
+    def confirm(path: str) -> None:
+        page = client.get(path)
+        csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+        assert csrf is not None
+        response = client.post(
+            f"{path}/confirm",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "https://testserver"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303, response.text
+        assert response.headers["location"] == "/settings/claude-plan"
+
+    console_refusal = sign_in()
+    assert console_refusal.status_code == 401
+
+    directory_path = f"/identity/connect/{directory_token}"
+    assert client.get(directory_path).status_code == 200
+    callback = sign_in()
+    assert callback.status_code == 303, callback.text
+    assert callback.headers["location"] == directory_path
+    confirm(directory_path)
+    assert ("UALICE001", directory_principal_id) in browser_links(directory_id)
+
+    personal_path = f"/identity/connect/{personal_token}"
+    assert client.get(personal_path).status_code == 200
+    before = asyncio.run(personal_counts())
+    assert before == [0, 0, 0]
+    callback = sign_in()
+    assert callback.status_code == console_refusal.status_code
+    assert callback.json() == console_refusal.json()
+    expired_cookies = {
+        cookie.partition("=")[0]
+        for cookie in callback.headers.get_list("set-cookie")
+        if "Max-Age=0" in cookie
+    }
+    assert {CONNECT_COOKIE, CSRF_COOKIE, PROOF_COOKIE} <= expired_cookies
+    assert asyncio.run(personal_counts()) == before
+
+    idp.extra_claims["groups"] = ["curie-admins"]
+    assert client.get(personal_path).status_code == 200
+    callback = sign_in()
+    assert callback.status_code == 303, callback.text
+    assert callback.headers["location"] == personal_path
+    confirm(personal_path)
+    assert asyncio.run(personal_counts()) == [1, 1, 1]
 
 
 @pytest.mark.parametrize("connect_browser", ["/api"], indirect=True)
@@ -878,7 +1354,7 @@ def test_admission_wire_keeps_real_connect_url_and_private_confirmation(connect_
             page = client.get(url.path)
             assert page.status_code == 200, page.text
             assert page.headers["cache-control"] == "private, no-store"
-            assert page.headers["referrer-policy"] == "no-referrer"
+            assert page.headers["referrer-policy"] == "strict-origin"
             login = client.get("/api/console/oidc/login", follow_redirects=False)
             assert login.status_code == 302, login.text
             with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:

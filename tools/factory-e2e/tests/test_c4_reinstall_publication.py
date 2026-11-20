@@ -729,6 +729,12 @@ class Install:
                     "claim_name": f"curie-thread-{request_id.hex[:12]}",
                     "sandbox_name": f"sbx-{request_id.hex[:12]}",
                     "context": work["context"],
+                    "delivered_limits": {
+                        "memory_bytes": None,
+                        "ephemeral_storage_bytes": None,
+                        "scratch_bytes": {},
+                        "max_turns": None,
+                    },
                 },
             )
             assert started.status_code == 200, started.text
@@ -774,6 +780,7 @@ class Install:
             return str(publication["id"])
 
     async def _reconcile(self) -> None:
+        from curie_channel_gateway.reply_transport import HttpReplyAdapter
         from curie_worker.publication_clients import (
             PublicationCodeHostClient,
             PublicationCredentialClient,
@@ -785,7 +792,6 @@ class Install:
         from curie_worker.publication_store import PostgresPublicationStore
         from curie_worker.reply_sink import (
             TRACKER_KINDS,
-            HttpReplyAdapter,
             ReplySinkRouter,
             TrackerReplySink,
         )

@@ -305,6 +305,21 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   `sandbox-terminated`, `workspace-error` and `model-unreachable` are transient (bounded exponential
   backoff);
   `budget-exceeded` and everything else escalate.
+  A started factory implementation execute turn is the one exception (ADR
+  0269): it never retries inside a delivery, except a `sandbox-capacity`
+  refusal that opened no runner turn. Its finish reports a required safety fact
+  (`no_effects`, `flagged` or `uncertain`) and the provider retry condition the
+  runner sent, and the SQL lifecycle owns the retry as a fresh request.
+  Interactive, cron, CI fix and approval resume turns keep the classification
+  list.
+  A `runner-error` whose turn start failed in the connect phase (no connection
+  was made, as when a recreated sandbox pod is not yet listening) opens one
+  retry window per delivery, as long as the sandbox claim timeout (90 s by
+  default) and never reset (#4733). Attempts inside the window do not consume
+  `max_attempts`, sleep at most 5 s each, run between attempts outside the
+  thread lock, and are still counted in the escalation text; after the window an
+  unreachable runner is an ordinary `runner-error`. Cron deliveries and
+  deliveries with a persisted side-effect flag get no window.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
   told apart from `runner-error`, which is a plain transport failure without
   confirmed sandbox termination. When Kubernetes confirms that the sandbox pod
@@ -498,7 +513,7 @@ The floor of 2 is enforced because `max_delivery=1` would dead-letter every
 ordinary worker crash on its first reclaim; values below 3 undermine the crash
 recovery of ADR-0013.
 
-Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
+Config surface (`WorkerConfig`): `VALKEY_*`, `CURIE_CHANNEL_GATEWAY_URL`, `CURIE_CHANNEL_GATEWAY_TOKEN`,
 `CURIE_STREAM` / `CURIE_CONSUMER_GROUP` / `CURIE_CONSUMER_NAME`,
 `CURIE_WORKER_MAX_CONCURRENCY` (turns one worker runs at once, default `16`,
 `1` through `256`; chart `worker.maxConcurrency`),
@@ -587,7 +602,8 @@ source without a container rebuild -- point it at the stack's exposed ports:
 export CLAUDE_CODE_OAUTH_TOKEN=...        # or ANTHROPIC_API_KEY=... / CURIE_CREDENTIALS=...
 env CURIE_SANDBOX_SUBSTRATE=docker \
     VALKEY_HOST=localhost VALKEY_PORT=26379 VALKEY_PASSWORD=valkeypass \
-    SLACK_API_BASE_URL=http://localhost:8155/api/ SLACK_BOT_TOKEN=xoxb-dev \
+    CURIE_CHANNEL_GATEWAY_URL=http://localhost:8081 CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true \
+    CURIE_CHANNEL_GATEWAY_TOKEN=curie-dev-gateway-worker \
     CURIE_DOCKER_NETWORK=curie_default \
     OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
     uv run python -m curie_worker &
@@ -607,10 +623,16 @@ env CURIE_SANDBOX_SUBSTRATE=docker \
   failure).
 - `CURIE_RUNNER_IMAGE` overrides the runner image tag (default
   `curie-runner`).
-- `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` and `SLACK_BOT_TOKEN` point at
-  the compose stack's exposed ports and dev bot token (see `compose.dev.yaml`);
-  `SLACK_API_BASE_URL` points at the stack's Slack stub instead of real
-  slack.com.
+- `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` point at the compose stores.
+  The worker uses a gateway caller credential for provider operations;
+  configure `SLACK_API_BASE_URL` on the gateway to select the stack's Slack stub.
+
+The protected worker's `process.json` uses schema version 2 and a
+`channel_gateway` object with `url`, `token`, `allow_insecure_http` and
+`identities`. Its token authenticates this worker to the gateway. TLS is required
+unless `allow_insecure_http` is explicitly true. Empty URL, token and identities
+disable Slack delivery. Both worker entry points refuse ambient Slack tokens,
+and the protected worker rejects the former provider-credential configuration.
 
 Drive a turn the normal way once it's up (`curie local deploy` / `curie
 local message`, pinned at whichever API port you brought up) -- the hand-run
@@ -638,6 +660,67 @@ fencing generation (`delivery_lease.py`, driven by the shared lifecycle in
 heartbeat renews it; a renewal that Valkey cannot confirm fails **closed** —
 the owner is lease-lost, its runner is interrupted through the bounded control
 path, and it may no longer settle anything.
+
+A retained turn that has not reached a durable handoff boundary waits with
+exponential backoff inside its fenced delivery. These refusals consume the
+original delivery deadline, without consuming attempts or increasing the PEL
+delivery count. Reclaim preflight waits use the same rule. Deadline exhaustion
+still emits an operator-visible delivery failure.
+
+Before starting a turn, the worker records the claim and its delivery owner in
+Valkey. Maintenance observes missing ownership and allows
+`CURIE_ABANDONED_TURN_GRACE_S` (90 seconds by default) before checking the exact
+claim under the thread lock. For an unfinished delivery, a runner that remains
+active, unreadable or unable to confirm durable history is retired through its
+backend. A terminal delivery's runner is retired only when status reports an
+active turn. An idle terminal runner keeps its route even if its history is
+non-durable; its watch is removed. An unreadable terminal runner keeps its watch
+for a later status read. Three unreadable status probes remove that terminal
+watch without retiring the runner, bounding probes to 15 seconds across ticks
+and worker restarts while allowing two transient failures. An unreadable
+unfinished runner latches the action marker before retirement. Static shells stop
+the child and verify cleanup. If the runner settled before the supervisor's
+check, the cleaned shell can be reused; otherwise it is quarantined and its 503
+health response asks the platform to replace it. Settlement retains the recovery
+watch for maintenance, which removes it after an eligible idle status,
+confirming the claim is gone, or retiring it.
+Failed retirements retain their watch and do not block other maintenance. Before
+retirement or replacing an unfinished predecessor's watch for a follow-up,
+recovery persists the runner's retained side-effect marker so reclaim escalates
+instead of replaying. Reclaim waits without interrupting a different delivery's
+live watched turn. The runner flag is not tied to an event, so a change in
+delivery ownership can conservatively escalate a delivery that performed no action.
+Turns started through the attachment handoff currently register no recovery
+watch and are a known gap in this bound. The bound and runner cleanup settings
+are described in [the static substrate reference](../../docs/static-pool-substrate.md).
+
+### Shared static shells
+
+With `CURIE_SANDBOX_SUBSTRATE=static`, agents share `CURIE_WARM_POOL` by default.
+Size that pool for concurrent claims. `CURIE_AGENT_SANDBOX_POOLS` and
+`CURIE_AGENT_CONNECTOR_SECRET_POOLS` remain explicit isolation opt-ins and
+require matching inventory entries. Connector credentials alone do not force
+an agent into its own pool.
+
+Agent identity, connector endpoints, caller credentials, bundle inputs and
+connector secrets arrive per claim. `CURIE_AGENT_CREDENTIAL_FILES` maps an
+agent to credential environment names and absolute UTF-8 source file paths
+on the worker, for example an external tool server's bearer. The worker reads
+those files afresh on each claim, removes one final LF or CRLF, and refuses any
+other leading or trailing whitespace. Missing, unreadable, empty, reserved or
+withheld inputs fail closed. Their values join the runner's held-secret
+inventory before it serves. Shells retain only deployment-wide model
+credentials and shared connector trust material.
+
+The supervisor stages runtime configuration and credentials as runner-owned
+`0400` files, consumes and unlinks the bootstrap environment file before exec,
+and wipes the complete claim tree after stopping all claim processes. Removing
+the bootstrap file preserves the runner's existing caller-token shielding
+from bundle subprocesses. Bundle code stays root-owned and read only.
+A stale retirement targets its exact claim and generation, never another
+agent's later lease. Kubernetes pool selection and Secret delivery are
+unchanged. See [the static substrate reference](../../docs/static-pool-substrate.md)
+for configuration and recovery behavior.
 
 ### Capability audit: every owner verb and the fence that gates it
 
@@ -724,6 +807,8 @@ raises, so the delivery remains retryable under the same key.
 | `SlackReplyAdapter`, approval card (`reply.post` with a `ConfirmIntent`) | For a 1.0 body, `chat.postMessage` keeps the approval UUID as `client_msg_id`. For a 1.1 body, `client_msg_id` is the wire operation's `delivery_id`; the approval UUID remains in the structured Approve button value, where `cli/src/chat.rs::approval_card_id` reads it. | Slack deduplicates by whichever stable key the body form supplies. | One visible card per approval UUID on 1.0, or per `delivery_id` on 1.1. |
 | `SlackReplyAdapter`, progress post (`reply.post` carrying `progress`: a card's first revision or a milestone) | `chat.postMessage` with `client_msg_id` set to the `delivery_id`, which the coordinator derives and never re-mints for a retry. | Slack deduplicates by `client_msg_id`; the measured duplicate returned the original `ts` (above). | One visible card or milestone per `delivery_id`; the adapter adopts the original `ts`. |
 | `SlackReplyAdapter`, progress edit (`reply.update` carrying `progress`) | `chat.update` on the card's own ts, the `ref` acknowledged for its first post, never the placeholder's. Never the answer path, and never the approval card's settle path. | Yes, by **stable target**. The `delivery_id` has no Slack expression on an edit. | One visible card whatever the retry count. Which revision shows last is the coordinator's order, because Slack keeps the last edit it received. |
+| `SlackReplyAdapter` replace edit (`reply.update` version 1.3, `message_mode` replace) | `chat.update` of the generic message blocks on `(target.address, target.reply_ref)`, never the placeholder and never an approval card. | Yes, by **stable target**. | One visible message. |
+| `SlackReplyAdapter` audience post (`reply.post` version 1.3, `audience_user`) | `chat.postEphemeral` to that user with `thread_ts` from `conversation_id`. Only that user sees it. Ack is `message_ts`. | No. `chat.postEphemeral` takes no idempotency key. | Only that user sees it. Ack is `message_ts`. |
 | `HttpReplyAdapter` (`reply_sink.py`) | Whatever the binding's operator-controlled endpoint does with one POST. `turn.completed` carries `event_id` in the body, so the key is on the wire, but this repo cannot verify what the receiver does with it. | Unknown — receiver-owned, unverifiable from here. | **Explicitly at-least-once.** May not advertise exactly-once terminal effect. |
 | Eval report (`eval/stream.py` `_report` → `POST /evals/report`) | The platform API's report endpoint. `EvalReport` carries `repo_full_name`, `sha`, and counts — no idempotency key. | No. | **Explicitly at-least-once.** The pre-send lease check closes most of the window, not the send-then-lose-the-ack window; closing it needs eval-report idempotency at the platform API (follow-up F2). |
 
@@ -1434,3 +1519,49 @@ The Docker substrate uses a claim-owned named tmpfs volume, bounded by
 effective memory resources in addition to the model process; a file under the
 volume capacity is not guaranteed to fit the runner's remaining memory. This is
 a resource capacity limit, not a catalog selection or per-file policy ceiling.
+
+
+## Approval deadline and reference-retention rollout
+
+An approval route may set `expires_in_seconds` to a positive integer, or to
+explicit JSON null for no deadline. Omitting it keeps the producer duration;
+session approvals keep their 24-hour default. The API freezes the actual
+deadline at creation. Route edits do not reschedule pending approvals.
+Publication and remediation retain their independent deadline policies.
+
+The reference-retention rollout has an explicit compatibility gate:
+
+1. Keep the new route key absent and
+   `CURIE_APPROVAL_PENDING_RETENTION_ENABLED=false` while deploying compatible
+   API readers, every worker card writer and every settlement consumer.
+2. Drain all old versions before writing deadline keys. Old workers refuse
+   those keys, and old HTTP API readers refuse their route bindings.
+3. Enable `CURIE_APPROVAL_PENDING_RETENTION_ENABLED=true` on every worker.
+   Pending card, notice and reply-placement references then have no TTL.
+   Compatible flag-off writers preserve references already made persistent.
+4. After the final old and flag-off writer drains, run the one-time migration
+   in a compatible worker with its ordinary API and Valkey configuration:
+   `python3 -m curie_worker.approval_cards --writers-drained`.
+   Require a successful JSON `references_reconciled` result. The command visits
+   only still-present references and cannot reconstruct expired references.
+   This in-process maintenance command reuses the worker's credentials and
+   exact store configuration; it exposes no new administrative API.
+   An unreadable approval id stops the pass. Restore API access or repair the
+   invalid legacy reference, then rerun to completion.
+5. Keep compatible reference owners running during rollback until pending
+   approvals settle. Remove `expires_in_seconds` from stored route bindings
+   through the compatible API before rolling any reader back to an old version.
+   Removing the key leaves existing approval deadlines unchanged. Disabling
+   pending retention alone is not a safe rollback of persistent references.
+
+All compatible writers index approval ids, even with the flag off. The worker
+always runs bounded cleanup over that owned index. It checks current API state;
+a definitive missing-approval reply also bounds references after agent deletion.
+An outage or generic proxy 404 preserves them for another pass. The only
+keyspace scan is the explicit one-time post-drain migration.
+
+Terminal settlement starts a fresh 14-day reference window before delivery.
+Retries and late registrations share that window. Successful card delivery may
+consume the exact card reference immediately; failed delivery keeps it within
+the window. Reconciliation also bounds terminal approvals that never resume a
+model turn, including remediation approvals.

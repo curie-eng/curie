@@ -25,7 +25,7 @@ Two contracts an adapter must build against:
 ``reply_ref`` is OPAQUE and adapter-minted: Slack's is the placeholder ``ts``,
 email's is the upstream message id. The platform never parses it.
 
-Three wire versions, and a body carries the one it needs (ADR-0130 section 4,
+Four wire versions, and a body carries the one it needs (ADR-0130 section 4,
 ADR-0227):
 
 - **1.0** (``REPLY_WIRE_VERSION``) is every form above. The models are closed,
@@ -47,13 +47,22 @@ ADR-0227):
 - **1.2** (``VERBATIM_REPLY_WIRE_VERSION``) is exclusively a text-only
   ``reply.update`` with ``text_mode: "verbatim"``, nonempty text, and a
   ``delivery_id``. It carries no message, settlement, navigation or progress.
+- **1.3** (``SCOPED_REPLY_WIRE_VERSION``) is a replace edit or a private post.
+  It does not require ``delivery_id``. A present ``delivery_id`` stays the
+  optional 1.1 field. A ``reply.update`` carries ``message_mode: "replace"``,
+  a ``message``, and a ``target.reply_ref``, and no ``text``, ``settled``,
+  ``nav``, ``progress`` or ``text_mode``. A ``reply.post`` carries
+  ``audience_user`` and no ``progress``, and its ``message`` has no
+  ``interaction``.
 
 The version is ``"1.1"`` when the body carries ``delivery_id`` without
-``text_mode``, and ``"1.2"`` exactly when it carries ``text_mode``. A
-body carrying ``progress`` carries ``delivery_id``. ``turn.status`` and
-``turn.completed`` have no 1.1 field and are 1.0 only. A body that breaks either
-rule is refused at validation, so no producer can put a 1.1 version on a body a
-1.0 adapter could otherwise have read, or a 1.1 field on a body labelled 1.0.
+``text_mode``, ``"1.2"`` exactly when it carries ``text_mode``, and ``"1.3"``
+for a replace edit or a private post. A body carrying ``progress`` carries
+``delivery_id``, except a 1.3 body, which is refused for its own shape before
+that rule. ``turn.status`` and ``turn.completed`` have no 1.1 field and are
+1.0 only. A body that breaks either rule is refused at validation, so no
+producer can put a 1.1 version on a body a 1.0 adapter could otherwise have
+read, or a 1.1 field on a body labelled 1.0.
 
 A progress body is never an answer (ADR-0130 section 5). A ``reply.update``
 carrying ``progress`` carries no ``text``, ``message``, ``settled`` or ``nav``,
@@ -65,8 +74,9 @@ platform message (ADR-0130 section 3).
 
 Each of those cross-field rules refuses with its own error type, never a bare
 ``value_error``: ``reply_wire_version``, ``progress_delivery_id``,
-``progress_not_an_answer`` and ``progress_not_actionable``, plus
-``progress_terminal`` from ``channel_protocol.progress``. The type is stable for
+``progress_not_an_answer``, ``progress_not_actionable``, ``replace_shape`` and
+``audience_shape``, plus ``progress_terminal`` from ``channel_protocol.progress``.
+The type is stable for
 a decoder in any language to match on, and it keeps the error list
 JSON-serializable. A ``value_error`` carries the raised exception object in its
 context, so an adapter that answers a refused body with its validation errors, as
@@ -89,10 +99,11 @@ from pydantic_core import PydanticCustomError
 from .models import OutboundMessage
 from .progress import ProgressCard, ProgressMilestone
 
-ReplyWireVersion = Literal["1.0", "1.1", "1.2"]
+ReplyWireVersion = Literal["1.0", "1.1", "1.2", "1.3"]
 REPLY_WIRE_VERSION: Literal["1.0"] = "1.0"
 PROGRESS_REPLY_WIRE_VERSION: Literal["1.1"] = "1.1"
 VERBATIM_REPLY_WIRE_VERSION: Literal["1.2"] = "1.2"
+SCOPED_REPLY_WIRE_VERSION: Literal["1.3"] = "1.3"
 _STRICT = ConfigDict(extra="forbid")
 
 DeliveryId = Annotated[
@@ -104,7 +115,7 @@ DeliveryId = Annotated[
 # The fields newer wires added. Absent, each is left out of the serialized body rather
 # than sent as null: a 1.0-built adapter's closed models refuse an unknown key
 # even when its value is null.
-_OPTIONAL_WIRE_FIELDS = ("delivery_id", "progress", "text_mode")
+_OPTIONAL_WIRE_FIELDS = ("delivery_id", "progress", "text_mode", "message_mode", "audience_user")
 _DELIVERY_ID_DESCRIPTION = (
     "Reply wire 1.1. The platform-minted idempotency key of this one post or edit; "
     "a retry of an ambiguous attempt carries the same value. Outbound, and unrelated "
@@ -177,8 +188,17 @@ class _DeliveredEvent(_ReplyEventBase):
         """This body's ``(delivery_id, progress)``."""
         raise NotImplementedError
 
+    def _require_scoped_shape(self) -> None:
+        """Refuse a 1.3 body that is not a well-shaped replace edit or audience post."""
+        raise NotImplementedError
+
     @model_validator(mode="after")
     def _version_names_the_wire_the_body_uses(self) -> Self:
+        # 1.3 does not require delivery_id. Its shape errors win over the 1.1
+        # progress rules and over the 1.2 text_mode rule, which run later.
+        if self.version == SCOPED_REPLY_WIRE_VERSION:
+            self._require_scoped_shape()
+            return self
         delivery_id, progress = self._progress_wire()
         if self.version == REPLY_WIRE_VERSION:
             if delivery_id is not None or progress is not None:
@@ -193,6 +213,14 @@ class _DeliveredEvent(_ReplyEventBase):
                 "reply_wire_version",
                 "a reply wire 1.1 or 1.2 body carries a delivery_id; "
                 "send a body without one as 1.0",
+            )
+        if (
+            getattr(self, "message_mode", None) is not None
+            or getattr(self, "audience_user", None) is not None
+        ):
+            raise PydanticCustomError(
+                "reply_wire_version",
+                "message_mode and audience_user need reply wire 1.3",
             )
         return self
 
@@ -222,7 +250,8 @@ class ReplyUpdate(_DeliveredEvent):
     other form: an already-posted platform message being settled (an approval
     card that expired or was resolved). ``progress`` is the third, 1.1 only: an
     edit of the progress card ``target.reply_ref`` names, carrying none of the
-    answer fields.
+    answer fields. ``message_mode`` replace is the fourth, 1.3 only: ``message``
+    replaces the posted message ``target.reply_ref`` names.
     """
 
     event: Literal["reply.update"]
@@ -242,9 +271,38 @@ class ReplyUpdate(_DeliveredEvent):
         default=None,
         description="Reply wire 1.2. Preserve this text-only answer literally.",
     )
+    message_mode: Literal["replace"] | None = Field(
+        default=None,
+        description=(
+            "Reply wire 1.3. Replace the posted message target.reply_ref names "
+            "with message. The body then carries no text, settled, nav, progress "
+            "or text_mode, and message.interaction is absent."
+        ),
+    )
 
     def _progress_wire(self) -> tuple[str | None, ProgressCard | None]:
         return self.delivery_id, self.progress
+
+    def _require_scoped_shape(self) -> None:
+        if self.message_mode != "replace":
+            raise PydanticCustomError(
+                "reply_wire_version",
+                "a reply wire 1.3 update requires message_mode replace",
+            )
+        if (
+            self.message is None
+            or self.message.interaction is not None
+            or self.target.reply_ref is None
+            or any(
+                value is not None
+                for value in (self.text, self.settled, self.nav, self.progress, self.text_mode)
+            )
+        ):
+            raise PydanticCustomError(
+                "replace_shape",
+                "a replace update carries a message and a reply_ref, and no text, "
+                "settled, nav, progress or text_mode, and its message carries no interaction",
+            )
 
     @model_validator(mode="after")
     def _progress_is_not_an_answer(self) -> Self:
@@ -289,10 +347,11 @@ class ReplyPost(_DeliveredEvent):
     """A NEW platform-owned message, acked with its ref.
 
     The approval card, or, 1.1 only, a progress card's first revision or a
-    milestone. ``message.text`` is the complete plain-text fallback either way.
+    milestone, or, 1.3 only, a private post for one ``audience_user``.
+    ``message.text`` is the complete plain-text fallback in every form.
     """
 
-    version: Literal["1.0", "1.1"]
+    version: Literal["1.0", "1.1", "1.3"]
     event: Literal["reply.post"]
     message: OutboundMessage
     requested_by: str
@@ -306,9 +365,31 @@ class ReplyPost(_DeliveredEvent):
             ),
         )
     )
+    audience_user: (
+        Annotated[str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Z0-9]+$")]
+        | None
+    ) = Field(
+        default=None,
+        description=(
+            "Reply wire 1.3. The only user who may see this post. The body then "
+            "carries no progress, and message.interaction is absent."
+        ),
+    )
 
     def _progress_wire(self) -> tuple[str | None, ProgressCard | ProgressMilestone | None]:
         return self.delivery_id, self.progress
+
+    def _require_scoped_shape(self) -> None:
+        if self.audience_user is None:
+            raise PydanticCustomError(
+                "reply_wire_version",
+                "a reply wire 1.3 post requires audience_user",
+            )
+        if self.progress is not None or self.message.interaction is not None:
+            raise PydanticCustomError(
+                "audience_shape",
+                "an audience post carries no progress and its message carries no interaction",
+            )
 
     @model_validator(mode="after")
     def _progress_is_not_actionable(self) -> Self:
@@ -341,8 +422,17 @@ ReplyEvent = Annotated[
 
 
 class ReplyAck(BaseModel):
-    """What an adapter answers with. ``ref`` is None when it mints no handle."""
+    """What an adapter answers with. ``ref`` is None when it mints no handle.
+
+    ``channel`` is the conversation the provider says a new top-level post
+    landed in, when that differs from the address posted to (ADR 0272: a
+    Slack post to a user id lands in the bot's DM with that user, a ``D...``
+    id). None when the adapter reports no such conversation, and then omitted
+    from the wire, so a strict reader that predates the field reads every
+    other ack unchanged.
+    """
 
     model_config = _STRICT
 
     ref: str | None = None
+    channel: str | None = Field(default=None, exclude_if=lambda value: value is None)

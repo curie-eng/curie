@@ -22,6 +22,7 @@ use crate::args::*;
 
 mod cluster_action;
 mod cluster_target;
+mod coding_instructions;
 mod dev_action;
 mod local_action;
 mod skill_action;
@@ -507,6 +508,10 @@ pub(crate) fn skill_runner_image(
 pub(crate) async fn run(command: Option<Command>) -> Result<()> {
     match command {
         None => curie::interactive::run().await,
+        Some(Command::MigrateProtectedProcess {
+            runtime_dir,
+            gateway_config,
+        }) => emit(curie::process_migrate::run(&runtime_dir, &gateway_config)?),
         Some(Command::Try { keep }) => {
             let image =
                 artifacts::resolve_image(None, artifacts::Channel::current(), artifacts::version());
@@ -528,6 +533,20 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
             curie::examples::render_dark_factory(curie::examples::DarkFactoryRenderOpts { out })
                 .await?,
         ),
+        Some(Command::Example {
+            action:
+                ExampleAction::FactoryTriage {
+                    action:
+                        FactoryTriageAction::Render {
+                            out,
+                            implementation_label,
+                        },
+                },
+            ..
+        }) => emit(curie::examples::render_factory_triage(
+            out,
+            implementation_label,
+        )?),
         Some(Command::Example {
             action: ExampleAction::SreBot { action },
             context,
@@ -676,6 +695,9 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Skill { action }) => skill_action::run(action).await,
         Some(Command::Local { action }) => local_action::run(action).await,
         Some(Command::Factory { action }) => match action {
+            FactoryAction::Explain { reference, api_url } => {
+                emit(commands::explain(reference, api_url).await?)
+            }
             FactoryAction::Skills {
                 action:
                     AgentSkillsAction::Install {

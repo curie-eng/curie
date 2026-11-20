@@ -798,6 +798,70 @@ def test_dependency_exporter_rejects_malformed_lock_input() -> None:
     assert "invalid uv.lock" in result.stderr
 
 
+def _exact_pins_by_name(output: str, source: str) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        requirement = line.split(";", 1)[0].split(" --hash=", 1)[0].strip()
+        name, separator, version = requirement.partition("==")
+        assert separator and name and version, f"{source} emitted a non-exact pin: {raw_line!r}"
+        normalized = _normalize_python_name(name)
+        assert normalized not in pins, f"{source} emitted {normalized} more than once"
+        pins[normalized] = version
+    return pins
+
+
+def test_dependency_exporter_real_lock_matches_uv() -> None:
+    exporter = subprocess.run(
+        [sys.executable, str(_EXPORTER)],
+        input=_UV_LOCK.read_text(encoding="utf-8"),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=60,
+    )
+    assert exporter.returncode == 0, exporter.stderr
+    uv_export = subprocess.run(
+        [
+            "uv",
+            "export",
+            "--offline",
+            "--locked",
+            "--package",
+            "curie-runner",
+            "--no-dev",
+            "--no-emit-workspace",
+            "--no-header",
+            "--no-hashes",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=60,
+    )
+    assert uv_export.returncode == 0, uv_export.stderr
+
+    exported = _exact_pins_by_name(exporter.stdout, "the dependency exporter")
+    expected = _exact_pins_by_name(uv_export.stdout, "uv export")
+    assert exported, "the dependency exporter emitted no pins for the real uv.lock"
+    assert expected, "uv export emitted no pins for the real uv.lock"
+
+    missing = sorted(expected.keys() - exported.keys())
+    additional = sorted(exported.keys() - expected.keys())
+    different = {
+        name: {"exporter": exported[name], "uv": expected[name]}
+        for name in sorted(exported.keys() & expected.keys())
+        if exported[name] != expected[name]
+    }
+    assert (missing, additional, different) == ([], [], {}), (
+        f"exporter vs uv export: missing from exporter {missing}, "
+        f"additional in exporter {additional}, different versions {different}"
+    )
+
+
 def test_dockerfile_generates_python_requirements_from_the_lock_exporter() -> None:
     dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
     instructions = logical_instructions(dockerfile)
@@ -844,7 +908,7 @@ def test_actual_runner_dockerfile_rejects_unpinned_pip_requirements() -> None:
     ) in _find_violations(_UV_LOCK.read_text(encoding="utf-8"), mutated)
 
 
-def test_prechange_drift_reports_all_six_violations() -> None:
+def test_prechange_drift_reports_all_violations() -> None:
     lock_text = _UV_LOCK.read_text(encoding="utf-8")
     expected = _locked_runner_dependencies(lock_text)
     # The opentelemetry-sdk pin tracks the lock so it stays the one matching pin.
@@ -880,6 +944,10 @@ RUN /app/.venv/bin/pip install \\
             "claude-agent-sdk",
             "expected lock version "
             f"{expected['claude-agent-sdk']}, found Dockerfile version 0.2.115",
+        ),
+        Violation(
+            "httpx2",
+            f"missing exact Dockerfile pin for lock version {expected['httpx2']}",
         ),
         Violation(
             "mcp",

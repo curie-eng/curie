@@ -16,9 +16,9 @@ from typing import Any
 
 import pytest
 from _support import ALLOWED_SENDER, CHANNEL_TOKEN, INBOX, IngressState
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.config import MailAdapterConfig
 from curie_internal import identity_context as codec
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
 from pydantic import ValidationError
 
 RECEIVER = "00000000-0000-4000-8000-0000000000a1"

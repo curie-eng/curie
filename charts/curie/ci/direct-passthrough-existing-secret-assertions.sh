@@ -103,7 +103,7 @@ render() {
   local out="$TMP/$name"
   rm -rf "$out"
   local rc=0
-  helm template curie "$CHART" -n curie --output-dir "$out" "$@" \
+  helm template curie "$CHART" -n curie --output-dir "$out" --set channelGateway.deploy=true --set channelGateway.allowInsecure=true "$@" \
     >/dev/null 2>"$out.stderr" || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "FAIL [$name] helm template failed unexpectedly (rc=$rc): $*" >&2
@@ -372,10 +372,12 @@ check_ref("1g", f"{d}/dispatcher.yaml", "dispatcher", "SLACK_APP_TOKEN",
           SECRET, "slackAppToken", "slackAppToken via dispatcher.yaml")
 check_ref("1h", f"{d}/dispatcher.yaml", "dispatcher", "SLACK_BOT_TOKEN",
           SECRET, "slackBotToken", "slackBotToken via dispatcher.yaml")
-check_ref("1i", f"{d}/api.yaml", "api", "SLACK_BOT_TOKEN",
-          SECRET, "slackBotToken", "slackBotToken via api.yaml")
-check_ref("1j", f"{d}/worker.yaml", "worker", "SLACK_BOT_TOKEN",
-          SECRET, "slackBotToken", "slackBotToken via worker.yaml")
+check_ref("1gateway", f"{d}/channel-gateway.yaml", "channel-gateway", "SLACK_BOT_TOKEN",
+          SECRET, "slackBotToken", "slackBotToken via gateway")
+check_absent("1i", f"{d}/api.yaml", "api", "SLACK_BOT_TOKEN",
+             "provider credentials stay in gateway and dispatcher")
+check_absent("1j", f"{d}/worker.yaml", "worker", "SLACK_BOT_TOKEN",
+             "provider credentials stay in gateway and dispatcher")
 check_ref("1k", f"{d}/dispatcher.yaml", "dispatcher", "SLACK_SIGNING_SECRET",
           SECRET, "slackSigningSecret", "slackSigningSecret via dispatcher.yaml")
 # The mail adapter is the third multi-key consumer template (after worker.yaml
@@ -411,10 +413,12 @@ check_ref("2g", f"{b}/dispatcher.yaml", "dispatcher", "SLACK_APP_TOKEN",
           "byo-apptoken", "slackAppToken", "slackAppToken via dispatcher.yaml")
 check_ref("2h", f"{b}/dispatcher.yaml", "dispatcher", "SLACK_BOT_TOKEN",
           "byo-bottoken", "slackBotToken", "slackBotToken via dispatcher.yaml")
-check_ref("2i", f"{b}/api.yaml", "api", "SLACK_BOT_TOKEN",
-          "byo-bottoken", "slackBotToken", "slackBotToken via api.yaml")
-check_ref("2j", f"{b}/worker.yaml", "worker", "SLACK_BOT_TOKEN",
-          "byo-bottoken", "slackBotToken", "slackBotToken via worker.yaml")
+check_ref("2gateway", f"{b}/channel-gateway.yaml", "channel-gateway", "SLACK_BOT_TOKEN",
+          "byo-bottoken", "slackBotToken", "slackBotToken via gateway")
+check_absent("2i", f"{b}/api.yaml", "api", "SLACK_BOT_TOKEN",
+             "provider credentials stay in gateway and dispatcher")
+check_absent("2j", f"{b}/worker.yaml", "worker", "SLACK_BOT_TOKEN",
+             "provider credentials stay in gateway and dispatcher")
 check_ref("2k", f"{b}/dispatcher.yaml", "dispatcher", "SLACK_SIGNING_SECRET",
           "byo-signingsecret", "slackSigningSecret", "slackSigningSecret via dispatcher.yaml")
 # Same three mail keys on the third multi-key consumer template, each pointed at

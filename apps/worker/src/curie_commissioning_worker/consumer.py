@@ -26,7 +26,7 @@ from curie_protected_hooks.worker_transport import (
     AuthenticatedWorkerClient,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel.core import Kernel
 from curie_worker.protected_lane import _UnqualifiedKernel
@@ -80,6 +80,7 @@ class CommissioningConsumer(Consumer):
             kernel=cast(Kernel, _UnqualifiedKernel()),
             config=config,
             leases=DeliveryLeaseStore(runs, config),
+            reminders=refuse_unconfigured_reminder,
         )
         if execute_claim is not None:
             self._liveness_store = ReplicaLivenessStore(runs)

@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -35,16 +36,37 @@ class ConsoleSessionExchange(BaseModel):
     code: str = Field(min_length=1)
 
 
+class ConsoleSessionPrincipal(BaseModel):
+    """The person a principal console session names. No token, no issuer."""
+
+    id: uuid.UUID
+    display_name: str | None
+    email: str | None
+
+
 class ConsoleSessionOut(BaseModel):
-    """The result of an exchange. Deliberately carries NO token.
+    """The result of an exchange or a session probe. Deliberately carries NO token.
 
     The session token travels only as an `HttpOnly` cookie, so page script cannot
     read it -- putting it in the body would hand the credential straight back to
     the JavaScript this design exists to keep it away from.
+
+    ``kind`` is ``operator`` for a login-code session and ``principal`` for an
+    OIDC session. ``principal`` is populated only for the latter. A principal
+    session's ``subject`` is ``principal:<id>``, the same subject
+    ``authenticate_administrator`` already records.
     """
 
     subject: str | None
     expires_at: datetime
+    kind: Literal["operator", "principal"]
+    principal: ConsoleSessionPrincipal | None
+
+
+class ConsoleSignInMethodsOut(BaseModel):
+    """Which unauthenticated sign-in paths this install offers."""
+
+    oidc: bool
 
 
 class PrincipalOut(BaseModel):

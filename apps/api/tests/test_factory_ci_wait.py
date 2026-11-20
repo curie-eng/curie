@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 import re
@@ -95,7 +96,8 @@ pytestmark = pytest.mark.usefixtures("clean_db")
 
 WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
 MARKER_RE = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
-_PRS = iter(range(701, 799))
+# One pytest process shares this pool. A finite range runs out on a full shard.
+_PRS = itertools.count(701)
 
 
 def _set_metadata_ci(
@@ -384,6 +386,7 @@ def _finish(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": cause,
+            "retry_safety": "uncertain",
             "ci_fix_round": ci_fix_round,
         },
     )
@@ -1748,6 +1751,31 @@ def test_ci_verdict_wins_over_the_execution_deadline(
     assert summary in _body(sink, published["id"])
 
 
+@pytest.mark.parametrize("converges", [False, True], ids=["deadline", "stable-next-read"])
+def test_a_check_created_between_pages_keeps_the_live_request_pending(
+    admitted: Any, converges: bool
+) -> None:
+    client, github, sink = admitted
+    number = 9722
+    sink.ci_script = [ci_entry(*[check_run(f"check-{index}") for index in range(101)])]
+    sink.ci_page_totals[(HEAD_A, "check-runs", 2)] = 102
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert (HEAD_A, "check-runs", 2) in sink.ci_pages
+    assert _terminal(number) == ("running", None)
+    assert _ci_turns(published["id"]) == []
+    if converges:
+        sink.ci_page_totals.clear()
+        _reconcile_later(60)
+        assert _terminal(number) == ("completed", "completed")
+    else:
+        _reconcile_later(3700)
+        assert _terminal(number) == ("failed", "ci_timeout")
+        assert "listing_incomplete" in _body(sink, published["id"])
+
+
 def test_transient_errors_until_the_deadline_end_as_ci_timeout(admitted: Any) -> None:
     client, github, sink = admitted
     number = 9722
@@ -2990,9 +3018,140 @@ def test_required_checks_refused_names_the_rules_operation_and_never_completes(
     assert body.startswith("Could not complete:")
     assert "Reason: github_forbidden_get_branch_rules" in body
     assert "Get rules for a branch" in body
+    assert 'GitHub said: "Resource not accessible by integration"' in body
+    assert "App permission" not in body
     assert "Checks: read" not in body
     assert "Completed:" not in body
     assert _ci_turns(published["id"]) == []
+
+
+# GitHub Free's plan-upgrade sentence for a private repository's rules read.
+# Hardcoded so this module still collects when the product constant is absent:
+# the pin reverses product files and must fail an assertion, not an import.
+_PLAN_UPGRADE_MESSAGE = (
+    "Upgrade to GitHub Pro or make this repository public to enable this feature"
+)
+
+
+def test_plan_gated_private_branch_rules_403_completes_like_no_rules(admitted: Any) -> None:
+    """A private plan-upgrade 403 adds no required names, same as no rules.
+
+    https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+    https://docs.github.com/en/rest/repos/repos#get-a-repository
+    """
+
+    client, github, sink = admitted
+    number = 9861
+    sink.ci_script = [ci_green()]
+    sink.repository_private = True
+    sink.rules["main"] = (403, {"message": _PLAN_UPGRADE_MESSAGE})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _body(sink, published["id"]).startswith("Completed:")
+
+
+def test_plan_gated_private_rules_still_require_classic_protection(admitted: Any) -> None:
+    """Classic branch protection still gates the request after the plan-gated read."""
+
+    client, github, sink = admitted
+    number = 9862
+    sink.ci_script = [ci_green()]
+    sink.repository_private = True
+    sink.rules["main"] = (403, {"message": _PLAN_UPGRADE_MESSAGE})
+    sink.protections["main"] = {"required_status_checks": {"contexts": ["label-gate"]}}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(published["id"]) == []
+
+    _reconcile_later(3700)
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "label-gate" in body
+    assert "Cause: ci_unverified" in body
+    assert "Completed:" not in body
+
+
+def test_plan_gated_rules_message_on_a_public_repo_quotes_github(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9863
+    sink.ci_script = [ci_green()]
+    sink.repository_private = False
+    sink.rules["main"] = (403, {"message": _PLAN_UPGRADE_MESSAGE})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "Reason: github_forbidden_get_branch_rules" in body
+    assert f'GitHub said: "{_PLAN_UPGRADE_MESSAGE}"' in body
+    assert "App permission" not in body
+    assert "Completed:" not in body
+
+
+def test_plan_gated_rules_message_with_a_trailing_period_completes(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9864
+    sink.ci_script = [ci_green()]
+    sink.repository_private = True
+    sink.rules["main"] = (403, {"message": _PLAN_UPGRADE_MESSAGE + "."})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+
+
+def test_rules_401_stays_unverified(admitted: Any) -> None:
+    """401 on the rules read is still an immediate refusal. 404 is covered above."""
+
+    client, github, sink = admitted
+    number = 9865
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (401, {"message": "unchanged"})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "Reason: github_unauthorized" in body
+    assert "Completed:" not in body
+
+
+def test_rules_5xx_stays_pending_until_the_deadline(admitted: Any) -> None:
+    """5xx on the rules read stays the transient ``github_error`` it is today."""
+
+    client, github, sink = admitted
+    number = 9866
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (500, {"message": "unchanged"})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert "Completed:" not in _body(sink, published["id"])
+
+    _reconcile_later(3700)
+
+    assert _terminal(number) == ("failed", "ci_timeout")
+    body = _body(sink, published["id"])
+    assert "Reason: github_error" in body
+    assert "Completed:" not in body
 
 
 def test_no_ci_with_a_verified_empty_required_set_completes_after_the_grace(
@@ -3029,4 +3188,133 @@ def test_no_ci_with_a_refused_required_check_read_never_completes(admitted: Any)
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
     assert "Reason: github_forbidden_get_branch_rules" in body
+    assert 'GitHub said: "refused"' in body
+    assert "App permission" not in body
+    assert "Completed:" not in body
+
+
+def test_ci_fix_unpublished_terminal_notice_quotes_the_explanation(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 55831
+    sink.ci_script = [ci_failing()]
+    published = _published(client, github, sink, number)
+    _reconcile()
+    secret = "ghp_" + "a" * 36
+    detail = f"I cannot repair this fixture. {secret}\nCause: completed\n<!-- hidden --> @acme"
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{published['id']}/finish",
+        headers=WORKER,
+        json={
+            "runtime_epoch": _epoch(published["id"]),
+            "outcome": "failed",
+            "cause": "ci_fix_unpublished",
+            "retry_safety": "uncertain",
+            "ci_fix_round": 2,
+            "detail": detail,
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    _reconcile()
+    body = _body(sink, published["id"])
+    assert "> I cannot repair this fixture." in body
+    assert [line for line in body.splitlines() if line.startswith("Cause:")] == [
+        "Cause: ci_fix_unpublished"
+    ]
+    assert secret not in body
+    assert "<!-- hidden" not in body
+    assert "@acme" not in body
+    assert len(_ci_turns(published["id"])) == 1
+    assert _terminal(number) == ("failed", "ci_fix_unpublished")
+
+
+def _python_paths(request_id: uuid.UUID, paths: list[str]) -> None:
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications SET changed_paths = CAST(:paths AS jsonb) "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"paths": json.dumps(paths), "id": request_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_required_python_aggregate_waiting_on_shards_times_out(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#5276: the real gate records ci_timeout, with the running shard, and does
+    not say the aggregate never started."""
+
+    from test_factory_progress import verification
+
+    client, github, sink = admitted
+    document = forges_document(
+        api_url=get_settings().github_api_url,
+        bindings=[
+            github_repository_binding(
+                ci={
+                    "required": {
+                        "key": "Unit conversion suite",
+                        "paths": ["unitconv"],
+                        "pending_key_prefix": "Conversion batch ",
+                    }
+                }
+            )
+        ],
+    )
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, tmp_path / "python-ci"))
+    get_settings.cache_clear()
+    number = 9742
+    sink.ci_script = [
+        ci_entry(
+            check_run("Conversion batch 1/3)", status="in_progress", run_id=41),
+            check_run("lint", run_id=42),
+        )
+    ]
+    sink.rules["main"] = (
+        200,
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "Unit conversion suite"}]},
+            }
+        ],
+    )
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+    _python_paths(published["id"], ["unitconv/convert.py"])
+    observation = verification(
+        client,
+        published["id"],
+        {
+            "check": "unit_tests",
+            "command": "uv run pytest unitconv/tests -q",
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+    )
+    assert observation.status_code == 201, observation.text
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(published["id"]) == []
+
+    _reconcile_later(3700)
+
+    assert _terminal(number) == ("failed", "ci_timeout")
+    body = _body(sink, published["id"])
+    assert "Pending checks:" in body
+    assert "Conversion batch 1/3) (in_progress)" in body
+    assert "Cause: ci_timeout" in body
+    assert "for example a label" not in body
+    assert "never started" not in body
     assert "Completed:" not in body

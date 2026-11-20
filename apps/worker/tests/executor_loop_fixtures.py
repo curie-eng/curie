@@ -38,7 +38,7 @@ import httpx
 from aiohttp import web
 from curie_api.action_execution_codes import CodeRejected, outcome_code
 from curie_worker import connector_grant
-from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxView
+from curie_worker.sandbox.types import ClaimView, QuotaRejection, RecordedPod, SandboxView
 
 if TYPE_CHECKING:
     from curie_worker.sandbox.types import ToolDaemonMount
@@ -893,9 +893,27 @@ class FakeSandboxes:
         return None
 
     def pod_termination(
-        self, name: str, *, request_timeout_seconds: float, since: datetime
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        since: datetime,
+        recorded: RecordedPod | None = None,
     ) -> Any | None:
+        del recorded
         return None
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> Any | None:
+        return None
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> NoReturn:
+        raise AssertionError("no resource gate is resolved in this suite")
 
     # No Docker repository pool is configured in this suite, so the substrate
     # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.

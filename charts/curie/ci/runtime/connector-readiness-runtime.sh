@@ -28,20 +28,18 @@
 # a real one. Runnable directly:
 #
 #   bash charts/curie/ci/runtime/connector-readiness-runtime.sh \
-#     [--context k8scratch] [--namespace test-3338-connector-readiness] \
+#     --context <context> [--namespace test-3338-connector-readiness] \
 #     [--release c3338] [--force]
 #
-# The context must be a disposable cluster (k8scratch, k8, kind-*, k3d-*,
-# minikube); --force overrides only that check, never the fresh-namespace one.
-# The default context is k8scratch. CI and every other caller pass
-# CONNECTOR_READINESS_CONTEXT or --context explicitly. The Calico kind job
-# uses kind-curie-e2e.
+# Pass CONNECTOR_READINESS_CONTEXT or the context flag explicitly. The context must
+# name a disposable cluster; --force accepts a context outside the generic
+# kind, k3d and minikube patterns, never an existing namespace.
 # The deny leg additionally needs a CNI that enforces NetworkPolicy (kind:
 # disable the default CNI and install Calico; k3s/k3d enforce by default),
 # which is also what the chart's own preflights.networkPolicyProbe requires.
 set -euo pipefail
 
-KUBE_CONTEXT="${CONNECTOR_READINESS_CONTEXT:-k8scratch}"
+KUBE_CONTEXT="${CONNECTOR_READINESS_CONTEXT:-}"
 NAMESPACE="${CONNECTOR_READINESS_NAMESPACE:-test-3338-connector-readiness}"
 RELEASE="${CONNECTOR_READINESS_RELEASE:-c3338}"
 CONNECTOR_IMAGE="${CONNECTOR_READINESS_CONNECTOR_IMAGE:-busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662}"
@@ -73,12 +71,11 @@ CONTROL_POD="connector-readiness-control-target"
 OUTSIDE_POD="connector-readiness-outside"
 SANDBOX_POD="connector-readiness-sandbox"
 
-TMP_DIR="$(mktemp -d)"
 
 usage() {
   cat <<'EOF'
 Usage: bash charts/curie/ci/runtime/connector-readiness-runtime.sh \
-  [--context k8scratch] [--namespace test-3338-connector-readiness] \
+  --context <context> [--namespace test-3338-connector-readiness] \
   [--release c3338] [--connector-image <image>] [--probe-image <image>] \
   [--control-image <image>] [--force]
 
@@ -117,6 +114,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+[[ -n "$KUBE_CONTEXT" ]] || {
+  echo "the context flag or CONNECTOR_READINESS_CONTEXT is required" >&2
+  exit 2
+}
+
 [[ "$NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#NAMESPACE} -le 63 ]] || {
   echo "namespace must be a DNS label of at most 63 characters" >&2
   exit 2
@@ -141,20 +143,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # runtime/ sits four levels below the repo root (charts/curie/ci/runtime).
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
 required_command() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "required command is missing: $1" >&2
     exit 2
   }
 }
+case "$KUBE_CONTEXT" in
+  *ProdCurietechAi*|*StagingCurietechAi*)
+    fail "refusing context $KUBE_CONTEXT"
+    ;;
+  kind-*|k3d-*|minikube|minikube-*) ;;
+  *)
+    (( FORCE == 1 )) || fail "context '$KUBE_CONTEXT' is not a disposable kind/k3d/minikube context (override with --force)"
+    ;;
+esac
+
 required_command kubectl
 required_command uv
 required_command python3
 
+TMP_DIR="$(mktemp -d)"
+
 kc() { kubectl --context "$KUBE_CONTEXT" "$@"; }
 
 banner() { echo; echo "== $* =="; }
-fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # The rendered object name. Cross-checked against what the renderer actually
 # produced, so this script cannot drift from connector_render's naming (whose
@@ -209,15 +224,7 @@ trap 'cleanup $?' EXIT
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
 
-case "$KUBE_CONTEXT" in
-  *ProdCurietechAi*|*StagingCurietechAi*)
-    fail "refusing context $KUBE_CONTEXT"
-    ;;
-  k8scratch|k8|kind-*|k3d-*|minikube|minikube-*) ;;
-  *)
-    (( FORCE == 1 )) || fail "context '$KUBE_CONTEXT' is not k8scratch/k8/kind-*/k3d-*/minikube (override with --force)"
-    ;;
-esac
+
 
 # ---------------------------------------------------------------------------
 # Render + apply helpers. The manifests come from the real renderer, the same

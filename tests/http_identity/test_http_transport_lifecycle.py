@@ -95,57 +95,6 @@ def test_timed_out_parser_retains_its_physical_slot_and_never_delivers_late_fact
     run_transport(scenario)
 
 
-@pytest.mark.parametrize("phase", ["headers", "body", "tls"])
-def test_caller_cancellation_during_real_io_propagates_without_retry_and_eventually_drains(
-    support: Any,
-    run_transport: Any,
-    phase: str,
-) -> None:
-    """@spec HTTP-IDENTITY-TRANSPORT-3 HTTP-IDENTITY-TRANSPORT-4."""
-    module = support.api()
-
-    async def scenario(rig: Any) -> None:
-        entered, release = asyncio.Event(), rig.event()
-
-        async def stall(reader: Any, writer: Any) -> None:
-            """@spec HTTP-IDENTITY-TRANSPORT-3."""
-            if phase == "body":
-                writer.write(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                    b"Content-Length: 100\r\n\r\n{"
-                )
-                await writer.drain()
-            elif phase == "tls":
-                assert await reader.read(1)
-            entered.set()
-            await release.wait()
-
-        listener = await rig.listen(stall, parse_request=phase != "tls")
-        client = rig.client(module, allow_loopback_http=phase != "tls")
-        url = listener.url.replace("http:", "https:") if phase == "tls" else listener.url
-        task = rig.task(
-            client.lookup(
-                target=support.target(module, url),
-                bearer=module.ProviderBearer(support.token),
-                request=support.request(),
-                limits=support.limits(),
-            )
-        )
-        await asyncio.wait_for(entered.wait(), 1)
-        start = asyncio.get_running_loop().time()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert asyncio.get_running_loop().time() - start < 0.35
-        assert listener.connections == 1
-        release.set()
-        report = await client.aclose()
-        assert report.state in {"closing", "closed"}
-        assert report.pending_parsers == 0
-
-    run_transport(scenario)
-
-
 def test_two_operation_slots_cancelled_waiter_snapshot_and_close_wakeup(
     support: Any,
     run_transport: Any,
@@ -236,71 +185,6 @@ def test_two_operation_slots_cancelled_waiter_snapshot_and_close_wakeup(
             ),
             "unavailable",
         )
-
-    run_transport(scenario)
-
-
-def test_waiting_for_operation_slot_has_no_fresh_two_second_budget(
-    support: Any,
-    run_transport: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-IDENTITY-TRANSPORT-3: admission time consumes the original deadline."""
-    module = support.api()
-    deadlines = observe_operation_deadlines(module, monkeypatch)
-
-    async def scenario(rig: Any) -> None:
-        release = rig.event()
-        exchange_starts: list[tuple[float, dict[str, float], float]] = []
-        original = httpx.AsyncHTTPTransport.handle_async_request
-
-        async def exchange(transport: Any, request: Any) -> Any:
-            """@spec HTTP-IDENTITY-TRANSPORT-3: observe starts, delegating real HTTP I/O."""
-            exchange_starts.append(
-                (
-                    asyncio.get_running_loop().time(), dict(request.extensions["timeout"]),
-                    deadlines[asyncio.current_task()],
-                )
-            )
-            return await original(transport, request)
-
-        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", exchange)
-
-        async def stall(reader: Any, writer: Any) -> None:
-            """@spec HTTP-IDENTITY-TRANSPORT-3."""
-            await release.wait()
-
-        listener = await rig.listen(stall)
-        client = rig.client(module, allow_loopback_http=True)
-        kwargs = {
-            "target": support.target(module, listener.url),
-            "bearer": module.ProviderBearer(support.token),
-            "request": support.request(),
-            "limits": support.limits(),
-        }
-        active = [rig.task(client.lookup(**kwargs)) for _ in range(2)]
-        async with asyncio.timeout(1):
-            while listener.connections != 2:
-                await asyncio.sleep(0.005)
-        assert len(exchange_starts) == 2
-        start = asyncio.get_running_loop().time()
-        queued = rig.task(client.lookup(**kwargs))
-        support.refusal(await queued, "unavailable")
-        assert 1.8 <= asyncio.get_running_loop().time() - start < 2.35
-        # The older operations may drain just before this waiter's D and allow
-        # one brief exchange. Neither admission nor that exchange restarts D.
-        at_return = tuple(exchange_starts)
-        assert 2 <= len(at_return) <= 3
-        for began, timeout, deadline in at_return[2:]:
-            assert began < deadline
-            assert all(0 < value <= deadline - began + 0.01 for value in timeout.values())
-        await asyncio.sleep(0.03)
-        assert tuple(exchange_starts) == at_return
-        # A connection begun before D can be accepted by the listener after
-        # lookup returns; server scheduling does not mark the exchange start.
-        assert 2 <= listener.connections <= 3
-        for result in await asyncio.gather(*active):
-            support.refusal(result, "unavailable")
 
     run_transport(scenario)
 

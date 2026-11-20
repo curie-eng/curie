@@ -151,8 +151,8 @@ def test_candidate_tag_and_repository_prefix() -> None:
 
 def test_kind_is_chosen_by_context_prefix_or_flag() -> None:
     assert fe.kind_cluster_name("kind-dev") == "dev"
-    assert fe.kind_cluster_name("k8") is None
-    assert fe.kind_cluster_name("k8", named="local") == "local"
+    assert fe.kind_cluster_name("scratch-cluster") is None
+    assert fe.kind_cluster_name("scratch-cluster", named="local") == "local"
     assert fe.kind_cluster_name("kind-dev", named="other") == "other"
 
 
@@ -261,7 +261,7 @@ def _build(
 def test_push_mode_pushes_every_image_under_a_fresh_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    preflight, fake = _build(tmp_path, monkeypatch, context="k8")
+    preflight, fake = _build(tmp_path, monkeypatch, context="scratch-cluster")
     builds = [c for c in fake.calls if c[:3] == ["docker", "buildx", "build"]]
     assert len(builds) == len(fe.CANDIDATE_BUILDS)
     assert all("--push" in c and "--load" not in c for c in builds)
@@ -304,7 +304,7 @@ def test_kind_mode_loads_images_and_pushes_only_the_layer_base(
 def test_layer_is_built_on_the_candidate_runner_for_its_platforms(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    preflight, _ = _build(tmp_path, monkeypatch, context="k8")
+    preflight, _ = _build(tmp_path, monkeypatch, context="scratch-cluster")
     calls: list[list[str]] = []
 
     def fake_run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:

@@ -34,11 +34,20 @@
 set -euo pipefail
 
 CLUSTER=0
-case "${1:-}" in
-  "") [ "$#" -eq 0 ] || { echo "Usage: $0 [--cluster]" >&2; exit 2; } ;;
-  --cluster) [ "$#" -eq 1 ] || { echo "Usage: $0 [--cluster]" >&2; exit 2; }; CLUSTER=1 ;;
-  *) echo "Usage: $0 [--cluster]" >&2; exit 2 ;;
-esac
+KUBE_CONTEXT="${CURIE_E2E_KUBE_CONTEXT:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cluster) CLUSTER=1; shift ;;
+    --context)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "context flag needs a value" >&2; exit 2; }
+      KUBE_CONTEXT="$2"; shift 2 ;;
+    *) echo "Usage: $0 [--cluster --context <context>]" >&2; exit 2 ;;
+  esac
+done
+if (( CLUSTER )) && [[ -z "$KUBE_CONTEXT" ]]; then
+  echo "--cluster requires the context flag or CURIE_E2E_KUBE_CONTEXT" >&2
+  exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -536,34 +545,34 @@ if (( CLUSTER )); then
     trap - EXIT INT TERM
     if (( NAMESPACE_OWNED )); then
       if (( INSTALL_STARTED )); then
-        helm --kube-context k8 uninstall "$RELEASE" --namespace "$NS" --no-hooks --ignore-not-found >"$TMP/uninstall.out" 2>&1 || cleanup_failed=1
+        helm --kube-context "$KUBE_CONTEXT" uninstall "$RELEASE" --namespace "$NS" --no-hooks --ignore-not-found >"$TMP/uninstall.out" 2>&1 || cleanup_failed=1
         while read -r kind name; do
           [ -n "$kind" ] || continue
-          object=$(kubectl --context k8 get "$kind" "$name" --ignore-not-found -o json) || { cleanup_failed=1; continue; }
+          object=$(kubectl --context "$KUBE_CONTEXT" get "$kind" "$name" --ignore-not-found -o json) || { cleanup_failed=1; continue; }
           [ -n "$object" ] || continue
           if ! python3 -c 'import json,sys; d=json.load(sys.stdin)["metadata"]; assert d.get("labels",{}).get("app.kubernetes.io/instance")==sys.argv[1]; assert d.get("annotations",{}).get("meta.helm.sh/release-name")==sys.argv[1]; assert d.get("annotations",{}).get("meta.helm.sh/release-namespace")==sys.argv[2]' "$RELEASE" "$NS" <<<"$object"; then
             echo "FAIL: cleanup refused an unowned $kind/$name" >&2
             cleanup_failed=1
             continue
           fi
-          kubectl --context k8 delete "$kind" "$name" --wait=true --timeout=60s >/dev/null || cleanup_failed=1
+          kubectl --context "$KUBE_CONTEXT" delete "$kind" "$name" --wait=true --timeout=60s >/dev/null || cleanup_failed=1
         done <"$CLUSTER_OBJECTS"
       fi
-      object=$(kubectl --context k8 get namespace "$NS" --ignore-not-found -o json) || cleanup_failed=1
+      object=$(kubectl --context "$KUBE_CONTEXT" get namespace "$NS" --ignore-not-found -o json) || cleanup_failed=1
       if [ -n "$object" ]; then
         if python3 -c 'import json,sys; d=json.load(sys.stdin)["metadata"]; assert d.get("labels",{}).get("owner")=="factory-tools"; assert d.get("labels",{}).get("app.kubernetes.io/instance")=="ft-tools"' <<<"$object"; then
-          kubectl --context k8 delete namespace "$NS" --wait=true --timeout=60s >/dev/null || cleanup_failed=1
+          kubectl --context "$KUBE_CONTEXT" delete namespace "$NS" --wait=true --timeout=60s >/dev/null || cleanup_failed=1
         else
           echo "FAIL: cleanup refused an unowned namespace" >&2
           cleanup_failed=1
         fi
       fi
-      object=$(kubectl --context k8 get namespace "$NS" --ignore-not-found -o name) || cleanup_failed=1
+      object=$(kubectl --context "$KUBE_CONTEXT" get namespace "$NS" --ignore-not-found -o name) || cleanup_failed=1
       [ -z "$object" ] || cleanup_failed=1
       if (( INSTALL_STARTED )); then
         while read -r kind name; do
           [ -n "$kind" ] || continue
-          object=$(kubectl --context k8 get "$kind" "$name" --ignore-not-found -o name) || { cleanup_failed=1; continue; }
+          object=$(kubectl --context "$KUBE_CONTEXT" get "$kind" "$name" --ignore-not-found -o name) || { cleanup_failed=1; continue; }
           [ -z "$object" ] || cleanup_failed=1
         done <"$CLUSTER_OBJECTS"
       fi
@@ -581,9 +590,9 @@ if (( CLUSTER )); then
   trap cleanup_cluster EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  existing=$(kubectl --context k8 get namespace "$NS" --ignore-not-found -o name) || fail "cluster namespace precondition"
+  existing=$(kubectl --context "$KUBE_CONTEXT" get namespace "$NS" --ignore-not-found -o name) || fail "cluster namespace precondition"
   [ -z "$existing" ] || fail "cluster test namespace already exists"
-  kubectl --context k8 create -f - >/dev/null <<EOF
+  kubectl --context "$KUBE_CONTEXT" create -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -615,13 +624,13 @@ with open(sys.argv[2], "w") as out:
             out.write(f"{doc['kind']} {doc['metadata']['name']}\n")
 PY
   while read -r kind name; do
-    existing=$(kubectl --context k8 get "$kind" "$name" --ignore-not-found -o name) || fail "cluster object precondition"
+    existing=$(kubectl --context "$KUBE_CONTEXT" get "$kind" "$name" --ignore-not-found -o name) || fail "cluster object precondition"
     [ -z "$existing" ] || fail "cluster resource $kind/$name already exists"
   done <"$CLUSTER_OBJECTS"
   INSTALL_STARTED=1
-  helm --kube-context k8 install "$RELEASE" "$CHART" --namespace "$NS" --skip-crds --no-hooks "${CLUSTER_VALUES[@]}" >"$TMP/install.out" 2>&1 || { cat "$TMP/install.out" >&2; fail "cluster fixture install"; }
-  helm --kube-context k8 get values "$RELEASE" --namespace "$NS" -o json >"$TMP/installed-values.json" || fail "installed values readback"
-  kubectl --context k8 --namespace "$NS" get sandboxtemplates.extensions.agents.x-k8s.io,sandboxwarmpools.extensions.agents.x-k8s.io,deployment -o json >"$TMP/installed.json" || fail "installed object readback"
+  helm --kube-context "$KUBE_CONTEXT" install "$RELEASE" "$CHART" --namespace "$NS" --skip-crds --no-hooks "${CLUSTER_VALUES[@]}" >"$TMP/install.out" 2>&1 || { cat "$TMP/install.out" >&2; fail "cluster fixture install"; }
+  helm --kube-context "$KUBE_CONTEXT" get values "$RELEASE" --namespace "$NS" -o json >"$TMP/installed-values.json" || fail "installed values readback"
+  kubectl --context "$KUBE_CONTEXT" --namespace "$NS" get sandboxtemplates.extensions.agents.x-k8s.io,sandboxwarmpools.extensions.agents.x-k8s.io,deployment -o json >"$TMP/installed.json" || fail "installed object readback"
   python3 - "$TMP/installed.json" "$TMP/repository-values.json" "$REPO_SCHEMA" "$TMP" "$NS" "$RELEASE" "$DAEMON_VECTOR" <<'PY'
 import copy, json, pathlib, sys
 import jsonschema
@@ -683,10 +692,10 @@ PY
   image_policy_enforced=0
   admission_deadline=$((SECONDS + 60))
   while (( SECONDS < admission_deadline )); do
-    if kubectl --context k8 --namespace "$NS" --as="$IMPERSONATE" create -f "$TMP/admit-unknown.json" >"$TMP/admission-negative.out" 2>&1; then
+    if kubectl --context "$KUBE_CONTEXT" --namespace "$NS" --as="$IMPERSONATE" create -f "$TMP/admit-unknown.json" >"$TMP/admission-negative.out" 2>&1; then
       # Admission can become active after install. Remove only this proof's
       # accepted template before retrying the same unknown image.
-      kubectl --context k8 --namespace "$NS" delete sandboxtemplate repo-unknown-resources --wait=true --timeout=15s >/dev/null || fail "transient admission probe cleanup"
+      kubectl --context "$KUBE_CONTEXT" --namespace "$NS" delete sandboxtemplate repo-unknown-resources --wait=true --timeout=15s >/dev/null || fail "transient admission probe cleanup"
     elif grep -qF 'runner templates may run only the images' "$TMP/admission-negative.out"; then
       image_policy_enforced=1
       break
@@ -695,21 +704,15 @@ PY
   done
   (( image_policy_enforced )) || { cat "$TMP/admission-negative.out" >&2; fail "runner image admission did not deny the unknown image within 60 seconds"; }
   for fixture in "$TMP"/admit-[0-9].json; do
-    kubectl --context k8 --namespace "$NS" --as="$IMPERSONATE" create -f "$fixture" >/dev/null || fail "runner admission refused a rendered repository image"
+    kubectl --context "$KUBE_CONTEXT" --namespace "$NS" --as="$IMPERSONATE" create -f "$fixture" >/dev/null || fail "runner admission refused a rendered repository image"
   done
 
   # The stored values still require both repository pools, but the intentional
   # post-renderer removes just those four objects from this owned release.
   # The changed CLI must refuse that inventory before attempting an upgrade.
-  python3 - "$TMP" "$REAL_KUBECTL" "$REAL_HELM" <<'PY'
+  python3 - "$TMP" <<'PY'
 import pathlib, shlex, sys
 tmp = pathlib.Path(sys.argv[1])
-bin_dir = tmp / "cluster-bin"
-bin_dir.mkdir()
-for command, executable, context in (("kubectl", sys.argv[2], "--context"), ("helm", sys.argv[3], "--kube-context")):
-    wrapper = bin_dir / command
-    wrapper.write_text("#!/usr/bin/env bash\nexec " + shlex.quote(executable) + " " + context + ' k8 "$@"\n')
-    wrapper.chmod(0o755)
 post_renderer = tmp / "drop-repository-pairs.py"
 post_renderer.write_text('''#!/usr/bin/env python3
 import sys, yaml
@@ -723,26 +726,26 @@ yaml.safe_dump_all([doc for doc in docs if not remove(doc)], sys.stdout, sort_ke
 ''')
 post_renderer.chmod(0o755)
 PY
-  helm --kube-context k8 upgrade "$RELEASE" "$CHART" --namespace "$NS" --skip-crds --no-hooks "${CLUSTER_VALUES[@]}" --post-renderer "$TMP/drop-repository-pairs.py" >"$TMP/broken-inventory-upgrade.out" 2>&1 || { cat "$TMP/broken-inventory-upgrade.out" >&2; fail "owned incomplete inventory setup"; }
-  helm --kube-context k8 get values "$RELEASE" --namespace "$NS" -o json >"$TMP/incomplete-values.json" || fail "incomplete inventory values readback"
+  helm --kube-context "$KUBE_CONTEXT" upgrade "$RELEASE" "$CHART" --namespace "$NS" --skip-crds --no-hooks "${CLUSTER_VALUES[@]}" --post-renderer "$TMP/drop-repository-pairs.py" >"$TMP/broken-inventory-upgrade.out" 2>&1 || { cat "$TMP/broken-inventory-upgrade.out" >&2; fail "owned incomplete inventory setup"; }
+  helm --kube-context "$KUBE_CONTEXT" get values "$RELEASE" --namespace "$NS" -o json >"$TMP/incomplete-values.json" || fail "incomplete inventory values readback"
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))==json.load(open(sys.argv[2])), "post-renderer changed stored Helm values"' "$TMP/installed-values.json" "$TMP/incomplete-values.json" || fail "runner requirements were not retained"
-  helm --kube-context k8 history "$RELEASE" --namespace "$NS" -o json >"$TMP/history-before-cli.json" || fail "CLI baseline revision readback"
+  helm --kube-context "$KUBE_CONTEXT" history "$RELEASE" --namespace "$NS" -o json >"$TMP/history-before-cli.json" || fail "CLI baseline revision readback"
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))[-1]["status"]=="deployed", "CLI baseline release is not deployed"' "$TMP/history-before-cli.json" || fail "CLI baseline release state"
-  if PATH="$TMP/cluster-bin:$PATH" "$CURIE_BIN" cluster github-app --disconnect --namespace "$NS" --release "$RELEASE" --chart "$CHART" >"$TMP/cli-inventory-negative.out" 2>&1; then
+  if "$CURIE_BIN" cluster github-app --context "$KUBE_CONTEXT" --disconnect --namespace "$NS" --release "$RELEASE" --chart "$CHART" >"$TMP/cli-inventory-negative.out" 2>&1; then
     fail "changed CLI accepted a stored manifest missing repository pools"
   fi
   grep -qF 'inventory' "$TMP/cli-inventory-negative.out" || { cat "$TMP/cli-inventory-negative.out" >&2; fail "changed CLI did not name the inventory refusal"; }
   grep -qF "$PREFIX-agent-factory-img-aaaaaaaaaaaa-runner" "$TMP/cli-inventory-negative.out" || { cat "$TMP/cli-inventory-negative.out" >&2; fail "changed CLI did not name the missing repository template"; }
-  helm --kube-context k8 history "$RELEASE" --namespace "$NS" -o json >"$TMP/history-after-cli.json" || fail "CLI final revision readback"
+  helm --kube-context "$KUBE_CONTEXT" history "$RELEASE" --namespace "$NS" -o json >"$TMP/history-after-cli.json" || fail "CLI final revision readback"
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))==json.load(open(sys.argv[2])), "CLI changed Helm history before rejecting the missing repository inventory"' "$TMP/history-before-cli.json" "$TMP/history-after-cli.json" || fail "changed CLI mutated the release before refusal"
-  helm --kube-context k8 get manifest "$RELEASE" --namespace "$NS" >"$TMP/manifest-after-cli.yaml" || fail "CLI final manifest readback"
+  helm --kube-context "$KUBE_CONTEXT" get manifest "$RELEASE" --namespace "$NS" >"$TMP/manifest-after-cli.yaml" || fail "CLI final manifest readback"
   python3 - "$TMP/manifest-after-cli.yaml" <<'PY'
 import sys, yaml
 docs = [doc for doc in yaml.safe_load_all(open(sys.argv[1])) if doc]
 names = {doc["metadata"]["name"] for doc in docs if doc.get("kind") in {"SandboxTemplate", "SandboxWarmPool"}}
 assert names == {"ft-tools-curie-runner", "ft-tools-curie-runner-pool", "ft-tools-curie-agent-factory-runner", "ft-tools-curie-agent-factory-runner-pool"}, "CLI changed the intentionally incomplete desired sandbox inventory"
 PY
-  kubectl --context k8 --namespace "$NS" get pods -o json >"$TMP/pods.json" || fail "stackless fixture pod check"
+  kubectl --context "$KUBE_CONTEXT" --namespace "$NS" get pods -o json >"$TMP/pods.json" || fail "stackless fixture pod check"
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["items"]==[], "stackless admission proof started a pod"' "$TMP/pods.json" || fail "stackless fixture spawned pods"
 fi
 

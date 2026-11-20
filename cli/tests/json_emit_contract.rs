@@ -41,12 +41,11 @@ fn manifest() -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("manifest {path} must be valid JSON: {e}"))
 }
 
-/// Placeholder value for a required arg. `--limit` parses as an f64, so a
-/// non-numeric placeholder would be a clap parse error (empty stdout -> false
-/// failure); everything else is a plain string.
+/// Valid representatives for required argument parsers.
 fn placeholder(id: &str) -> &'static str {
     match id {
         "limit" => "1",
+        "expected_revision" => "0",
         "tenant" => "00000000-0000-0000-0000-000000000001",
         "resource" => "config",
         // `migrate-store --phase` restricts its values, so the generic "x" is
@@ -108,8 +107,20 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                         continue;
                     }
                     let id = a.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let sample = a
+                        .get("possible_values")
+                        .and_then(|values| values.as_array())
+                        .and_then(|values| values.first())
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_else(|| {
+                            if id == "agent" && path.join(" ") == "cluster role-filter" {
+                                "00000000-0000-0000-0000-000000000001"
+                            } else {
+                                placeholder(id)
+                            }
+                        });
                     if a.get("positional").and_then(|p| p.as_bool()) == Some(true) {
-                        required.push(placeholder(id).to_string());
+                        required.push(sample.to_string());
                     } else {
                         let long = a
                             .get("long")
@@ -125,7 +136,7 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                                     && values.iter().any(|value| value == "false")
                             });
                         if !boolean_switch {
-                            required.push(placeholder(id).to_string());
+                            required.push(sample.to_string());
                         }
                     }
                 }
@@ -1223,6 +1234,7 @@ fn deploy_output_json_shape_is_pinned() {
             deployment_environment: "dev".to_string(),
             deployment_status: "active".to_string(),
             cron_triggers: Vec::new(),
+            wake_triggers: Vec::new(),
             warnings: Vec::new(),
         }
         .to_json(),
@@ -2019,6 +2031,7 @@ fn expected_deploy(target: &str) -> serde_json::Value {
             "status": "active"
         },
         "cron_triggers": [],
+        "wake_triggers": [],
         "warnings": []
     })
 }

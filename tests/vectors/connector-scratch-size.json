@@ -1,0 +1,121 @@
+{
+  "comment": "The `scratch.size_limit` grammar of a hosted connector (docs/interfaces/bundle-format/INTERFACE.md): a whole number of bytes with an optional Ki, Mi or Gi suffix, from 1Mi to 64Gi inclusive. Every reader (plugin_format.validate_connectors and the CLI's local docker tier) reads these cases with its own parser. `bytes` is the size an accepted value means; a case with `bytes: null` is refused.",
+  "cases": [
+    {
+      "size_limit": "1Mi",
+      "bytes": 1048576
+    },
+    {
+      "size_limit": "1048576",
+      "bytes": 1048576
+    },
+    {
+      "size_limit": "1024Ki",
+      "bytes": 1048576
+    },
+    {
+      "size_limit": "512Mi",
+      "bytes": 536870912
+    },
+    {
+      "size_limit": "2Gi",
+      "bytes": 2147483648
+    },
+    {
+      "size_limit": "65536Mi",
+      "bytes": 68719476736
+    },
+    {
+      "size_limit": "64Gi",
+      "bytes": 68719476736
+    },
+    {
+      "size_limit": "1048575",
+      "bytes": null
+    },
+    {
+      "size_limit": "1023Ki",
+      "bytes": null
+    },
+    {
+      "size_limit": "68719476737",
+      "bytes": null
+    },
+    {
+      "size_limit": "65Gi",
+      "bytes": null
+    },
+    {
+      "size_limit": "0",
+      "bytes": null
+    },
+    {
+      "size_limit": "0Mi",
+      "bytes": null
+    },
+    {
+      "size_limit": "01Mi",
+      "bytes": null
+    },
+    {
+      "size_limit": "1.5Gi",
+      "bytes": null
+    },
+    {
+      "size_limit": "1G",
+      "bytes": null
+    },
+    {
+      "size_limit": "1M",
+      "bytes": null
+    },
+    {
+      "size_limit": "1Ti",
+      "bytes": null
+    },
+    {
+      "size_limit": "1mi",
+      "bytes": null
+    },
+    {
+      "size_limit": "1gi",
+      "bytes": null
+    },
+    {
+      "size_limit": "-1Gi",
+      "bytes": null
+    },
+    {
+      "size_limit": "+1Gi",
+      "bytes": null
+    },
+    {
+      "size_limit": " 1Gi",
+      "bytes": null
+    },
+    {
+      "size_limit": "1Gi ",
+      "bytes": null
+    },
+    {
+      "size_limit": "",
+      "bytes": null
+    },
+    {
+      "size_limit": "1e9",
+      "bytes": null
+    },
+    {
+      "size_limit": "1Mi\n",
+      "bytes": null
+    },
+    {
+      "size_limit": "2 Gi",
+      "bytes": null
+    },
+    {
+      "size_limit": "Gi",
+      "bytes": null
+    }
+  ]
+}

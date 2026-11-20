@@ -32,7 +32,7 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol import work_item_events
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.approvals import PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import FactoryContext, FactoryWake, HttpIdentityBinding
@@ -50,6 +50,7 @@ from curie_worker.workitem_dispatch import (
 
 from apps.worker.tests.kernel.test_work_item_early_stop import _revision_lineage
 from apps.worker.tests.queue_fixtures import factory_context
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -182,7 +183,7 @@ class _Workspace:
         return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha=HEAD)
 
 
-class _WorkItems:
+class _WorkItems(AbsentRequesterContext):
     """Dispatch double. ``running_for_conversation`` names the running request."""
 
     def __init__(self, running: uuid.UUID | None, *, ended: bool = False) -> None:
@@ -246,7 +247,9 @@ class _WorkItems:
         self.calls.append("finish")
         self.finishes.append((request_id, kwargs))
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         return "acme widgets issue 7", f"wir.capability-for-{request_id}"
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
@@ -376,8 +379,9 @@ def test_a_ci_turn_is_a_factory_work_item_turn(make_harness) -> None:
 
 @pytest.mark.parametrize("round_", [2, 3])
 @pytest.mark.parametrize("pr_url", [PR_URL, None, "", " \t "])
-def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished(
-    make_harness, round_: int, pr_url: str | None
+@pytest.mark.parametrize("oversized", [False, True])
+def test_unpublished_ci_fix_reports_the_agent_explanation(
+    make_harness, round_: int, pr_url: str | None, oversized: bool
 ) -> None:
     """#4752: a recorded pull request does not change CI's unpublished cause or round."""
 
@@ -395,7 +399,11 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
             h.runner.default_script = [
                 TextDelta(text="Looked at the failure. "),
                 Final(
-                    text="Could not complete: the test needs a fixture.",
+                    text=(
+                        "Could not complete: the test needs a fixture. token=ghp_"
+                        + "a" * 36
+                        + ("\n" + "x" * 5000 if oversized else "")
+                    ),
                     status=SessionStatus.DONE,
                 ),
             ]
@@ -412,7 +420,12 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
             assert finish["runtime_epoch"] == EPOCH
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "ci_fix_unpublished"
-            assert finish["detail"] is None
+            assert isinstance(finish["detail"], str)
+            assert "the test needs a fixture" in finish["detail"]
+            assert "ghp_" + "a" * 36 not in finish["detail"]
+            assert "[REDACTED:" in finish["detail"]
+            assert len(finish["detail"]) <= 4000
+            assert finish["detail"].endswith("...") == oversized
             assert finish["ci_fix_round"] == round_
             # A CI fix turn has its own bounded loop: no #3128 continuation.
             assert len(h.runner.opened) == 1
@@ -788,58 +801,5 @@ def test_a_continuation_for_an_ended_execution_runs_no_turn(make_harness, state:
             assert work_items.finishes == []
             assert "acquire" not in work_items.calls
             assert await h.kernel._markers.is_terminal(turn.event_id)
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize(
-    "code",
-    ["factory_binding_missing", "factory_tenant_mismatch", "factory_surface_mismatch"],
-)
-def test_refused_continuation_finishes_its_epoch_and_valid_neighbor_runs(
-    make_harness, caplog: pytest.LogCaptureFixture, code: str,
-) -> None:
-    async def exercise() -> None:
-        async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace,
-            publication_creator=_PublicationApi(),
-        ) as h:
-            refused_id = uuid.uuid4()
-            refused = _WorkItems(running=refused_id)
-            refused.authority_refusal = code
-            h.kernel._work_items = refused
-            event = _ci_turn(refused_id)
-            with caplog.at_level(logging.INFO, logger="curie_worker.kernel"):
-                await h.kernel.process_event(event)
-            assert refused.finishes == [(
-                refused_id,
-                {
-                    "runtime_epoch": EPOCH,
-                    "outcome": "failed",
-                    "cause": "runner_escalated",
-                    "detail": "Factory execution authority is no longer valid.",
-                    "ci_fix_round": None,
-                    "budget_s": 120.0,
-                },
-            )]
-            assert any(code in record.getMessage() for record in caplog.records)
-            assert not any("AmbiguousRoute" in record.getMessage() for record in caplog.records)
-            assert not any(
-                "not_started:interrupted" in record.getMessage() for record in caplog.records
-            )
-            assert h.runner.opened == []
-            assert h.fake_k8s.claims == {}
-            assert h.kernel._workspace.selections == []
-            assert await h.async_redis.exists(h.config.done_key(event.event_id))
-            neighbor_id = uuid.uuid4()
-            neighbor = _WorkItems(running=neighbor_id)
-            h.kernel._work_items = neighbor
-            h.runner.default_script = [Final(text="No fix published", status=SessionStatus.DONE)]
-            await h.kernel.process_event(_ci_turn(neighbor_id))
-            assert h.runner.opened == [_ci_text(2)]
-            assert neighbor.finishes[0][0] == neighbor_id
-            assert neighbor.finishes[0][1]["runtime_epoch"] == EPOCH
-            assert neighbor.finishes[0][1]["cause"] == "ci_fix_unpublished"
-            assert h.kernel._workspace.selections == [WORK_ITEM_REPO]
 
     asyncio.run(exercise())

@@ -4,6 +4,17 @@ Date: 2026-09-22
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Adds the single internal delegated-selection exception to the human-event
+admission authority, while retaining bot/App event rejection.
+
+The amendment by ADR 0277 recorded above is withdrawn by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md), which supersedes ADR 0277 in full; the withdrawal takes effect in code when its triage removal tickets land. Also partially amended by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md) (back-link added under ADR 0045): in section "Decision", a plain comment from a person who could have started the ticket also admits the next execution while a factory question is outstanding, and an answer while a request is active queues exactly one follow-up and never creates a WorkItem.
+
+Partially amended by [ADR 0279](0279-a-person-acting-through-a-github-app-can-select-factory-work.md)
+under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md),
+only where this record ignores every App-related label event.
+
 **Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 only where it names GitHub as the sole source of a notice; notices come

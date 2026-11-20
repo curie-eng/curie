@@ -4,14 +4,25 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useRef,
   type Dispatch,
   type ReactNode,
 } from "react";
-import type { Action, AppState } from "./types";
+import type { Action, AppState, Nav } from "./types";
+import { pathForRoute, routeForPath } from "./route";
+
+// The first paint opens Settings for the two Settings paths; every other URL,
+// including /agents, stays on Overview.
+export function navForPath(pathname: string): Nav {
+  return routeForPath(pathname).nav;
+}
 
 export function initialState(): AppState {
+  const pathname = typeof window === "undefined" ? "/" : window.location.pathname;
+  const route = routeForPath(pathname);
   return {
-    nav: "overview",
+    nav: route.nav,
+    settingsSection: route.settingsSection,
     env: "prod",
     obsTab: "traces",
     modal: null,
@@ -33,6 +44,28 @@ export function reducer(s: AppState, a: Action): AppState {
   switch (a.type) {
     case "go":
       return { ...s, nav: a.nav, agentDetail: null, traceOpen: null, tracesAgentId: null, logsPod: null };
+    case "settingsSection":
+      return {
+        ...s,
+        nav: "settings",
+        settingsSection: a.section,
+        agentDetail: null,
+        traceOpen: null,
+        tracesAgentId: null,
+        logsPod: null,
+      };
+    case "locate": {
+      const route = routeForPath(a.pathname);
+      return {
+        ...s,
+        nav: route.nav,
+        settingsSection: route.settingsSection,
+        agentDetail: null,
+        traceOpen: null,
+        tracesAgentId: null,
+        logsPod: null,
+      };
+    }
     case "openModal":
       return { ...s, modal: a.modal };
     case "closeModal":
@@ -125,6 +158,24 @@ const StoreContext = createContext<Store | null>(null);
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
+
+  // Keep the address bar on the section the console shows, and show the section
+  // the bar names after Back or Forward. The first render adopts the URL it was
+  // opened at, so an unknown path is left alone until the person navigates.
+  const synced = useRef(pathForRoute(state.nav, state.settingsSection));
+  useEffect(() => {
+    const onPop = () => dispatch({ type: "locate", pathname: window.location.pathname });
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+  useEffect(() => {
+    const path = pathForRoute(state.nav, state.settingsSection);
+    if (path === synced.current) return;
+    synced.current = path;
+    // Already showing what the address names (after Back or Forward): no new entry.
+    const shown = routeForPath(window.location.pathname);
+    if (pathForRoute(shown.nav, shown.settingsSection) !== path) window.history.pushState({}, "", path);
+  }, [state.nav, state.settingsSection]);
 
   // Auto-clear toasts after 2.5s, matching the canon's toast lifetime.
   useEffect(() => {

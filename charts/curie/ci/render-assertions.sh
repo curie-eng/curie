@@ -908,6 +908,7 @@ rendered, platform_name, sandbox_name = sys.argv[1], sys.argv[2], sys.argv[3]
 EXPECTED_PLATFORM = {
     ("Deployment", "curie-api"),
     ("Deployment", "curie-dispatcher"),
+    ("Deployment", "curie-channel-gateway"),
     ("Deployment", "curie-worker"),
     ("Deployment", "curie-ui"),
     ("Deployment", "curie-inference"),
@@ -1480,6 +1481,7 @@ prefix = "placement-render-curie"
 expected = {
     ("Deployment", f"{prefix}-api"): "platform",
     ("Deployment", f"{prefix}-dispatcher"): "platform",
+    ("Deployment", f"{prefix}-channel-gateway"): "platform",
     ("Deployment", f"{prefix}-worker"): "platform",
     ("Deployment", f"{prefix}-ui"): "platform",
     ("Deployment", f"{prefix}-inference"): "platform",
@@ -2624,6 +2626,7 @@ import yaml
 # (RollingUpdate for a Deployment, the controller default for the others).
 EXPECTED = {
     ("Deployment", "curie-dispatcher"): ("strategy", {"type": "Recreate"}),
+    ("Deployment", "curie-channel-gateway"): ("strategy", {"type": "Recreate"}),
     ("Deployment", "agent-sandbox-controller"): ("strategy", None),
     ("Deployment", "curie-api"): ("strategy", {
         "type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},

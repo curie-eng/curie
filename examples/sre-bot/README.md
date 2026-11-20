@@ -34,9 +34,12 @@ The renderer requires an explicit namespace and impact description; it does not
 change the default installation or treat intentionally suspended templates as healthy.
 
 Installations preparing automated remediation can opt into the
-[remediation scaler connector](#remediation-scaler-connector-opt-in), an
-acting connector whose replies the platform can record and qualify. The default
-bundle does not declare it.
+[remediation scaler connector](#remediation-scaler-connector-opt-in) and the
+[remediation restarter connector](#remediation-restarter-connector-opt-in),
+acting connectors whose replies the platform can record and qualify, and the
+[remediation metrics connector](#remediation-metrics-connector-opt-in), a
+read-only Prometheus verifier for them. The default bundle declares none of
+them.
 
 Installations with existing paired adapter reply credentials can opt into
 the worker map reconciler described in
@@ -347,6 +350,150 @@ qualification drills and a verifier through a different connector are still
 required, in the [drill order](../../docs/operations.md#qualifying-an-action-the-drill-order).
 `examples/tests/test_sre_bot_scaler_opt_in.py` applies the opt-in file to the
 shipped bundle and runs the intake validators on the result.
+
+## Remediation restarter connector (opt-in)
+
+A rolling restart is the remediation operators reach for first, and it cannot
+be undone: writing the old state back would roll the workload a second time.
+ADR 0203 admits such an action to automatic execution only in its REMEDIATION-11
+class: idempotent, bounded to the policy's declared target, and verified. The
+`restarter` connector in [`connectors/restarter`](connectors/restarter/server.py)
+is the acting connector for that action. It is **off by default**, like the
+scaler.
+
+What it serves:
+
+- `restart_deployment(name, restart_at)`: sets
+  `kubectl.kubernetes.io/restartedAt` on the pod template of one allowlisted
+  Deployment, in the one namespace it is configured for, to `restart_at`
+  formatted as RFC 3339 UTC. That is the annotation `kubectl rollout restart`
+  writes, so the controller rolls the workload. It is gated for the model.
+
+Nothing else: no `observe_version` and no `restore`. The capability probe never
+records it as restore capable, so every record it leaves is not undoable
+(`refused_not_restore_capable`).
+
+`restart_at` is the token that makes the restart idempotent: a Unix time in
+seconds, normally the start time of the alert being handled. A remediation
+policy bounds an argument only by a closed set or a numeric range, so the token
+is an integer, and the policy bounds it with a range:
+
+- the same `restart_at` again writes nothing and replies with the same version,
+  `deployments/<uid>/restartedAt=<value>`, so two approved forwards with the same
+  arguments leave the same `post_version`, which the idempotent qualification
+  compares;
+- the annotation never moves backwards: when it already names an instant at or
+  after `restart_at`, the workload was restarted since that incident began and
+  the call writes nothing;
+- a `restart_at` more than five minutes in the future is refused, because it
+  would suppress every later restart;
+- a new incident has a new start time, so it restarts again, at most once per
+  incident per target under the platform's limits.
+
+The reply carries a sealed `prior` (the previous annotation and the uid) only
+because the ledger records a `post_version` from a sealed reply alone; nothing
+ever opens it. The write is a merge patch of the one annotation carrying the
+read's `uid` and `resourceVersion` as preconditions, so a concurrent restart is
+refused `version_conflict`. A paused Deployment is refused, because the
+annotation would not roll it.
+
+To opt in, in your copy of the bundle:
+
+1. Merge [`connectors/restarter/opt-in.yaml`](connectors/restarter/opt-in.yaml):
+   its `connector` entry into `connectors.yaml` and its `plugin` entries into
+   `.claude-plugin/plugin.json`. Set `RESTARTER_NAMESPACE` and
+   `RESTARTER_DEPLOYMENTS` for your workload. An empty namespace or allowlist
+   refuses every call.
+2. Edit and apply [`manifests/restarter-access.yaml`](manifests/restarter-access.yaml)
+   so its Role's namespace and `resourceNames` match those settings. It is a
+   separate identity from both the general connector identity and the scaler's,
+   limited to `get` and `patch` on the named Deployments.
+3. Assemble a kubeconfig for `sre-bot-restarter` from its token Secret and store
+   it as the connector secret `RESTARTER_KUBECONFIG`.
+4. Create the Kubernetes Secret `sre-bot-restarter-sealing` with the key
+   `SNAPSHOT_SEALING_KEY` (`<kid>:<base64 of 32 bytes>`).
+5. Build the connector image with `curie build --plugin-dir <bundle> --registry <ref>`,
+   then deploy the bundle.
+
+Why a separate connector rather than a verb on the scaler: the scaler's
+credential reaches only the `scale` subresource and never a pod template, and a
+restart must patch the pod template. RBAC cannot narrow `patch` to one field, so
+a leaked restarter token can change anything in the named Deployments; say so in
+the qualification's worst case statement. Undo is also decided per connector, so
+a restart on the restore-capable scaler would be reported undoable.
+
+A policy action for it, with placeholder bounds:
+
+```json
+{"name": "restart-api", "kind": "remediate",
+ "connector": "restarter", "tool": "restart_deployment",
+ "arguments": {"name": {"type": "string", "allowed": ["example-api"]},
+               "restart_at": {"type": "integer", "minimum": 1767225600, "maximum": 4102444800}},
+ "target": {"argument": "name", "allowed": ["example-api"]},
+ "reversibility": "idempotent",
+ "verifier": {"connector": "example-metrics", "...": "..."},
+ "automatic": false, "qualification": null}
+```
+
+Its qualification is the idempotent drill in the
+[drill order](../../docs/operations.md#qualifying-an-action-the-drill-order):
+two `confirmed` approved forwards with the same `name` and `restart_at`, the
+second leaving the same `post_version`.
+`examples/tests/test_sre_bot_restarter_opt_in.py` applies the opt-in file to the
+shipped bundle and runs the intake validators on the result.
+
+## Remediation metrics connector (opt-in)
+
+Every automated remediation is checked before it runs (`precondition`) and
+judged after it ran (`verifier`) by a read-only tool of a connector other than
+the acting one. The platform applies one RFC 6901 pointer to the read's
+structured reply and one comparator to the value it finds
+([operator guide](../../docs/operations.md#automated-remediation)). The
+`metrics` connector in [`connectors/metrics`](connectors/metrics/server.py) is
+that read for the scaler and the restarter: one tool, `query_value(query)`, that runs a Prometheus
+instant query against one configured URL. It holds no Kubernetes credential and
+has no write verb.
+
+It is **off by default**, like the scaler.
+
+The reply is structured content shaped for the documented pointers:
+
+- a vector is `{"resultType": "vector", "data": [{"metric", "value": [<time>, "<sample>"]}]}`,
+  ordered by labels, so `/data/0/value/1` is the first series' sample as a
+  decimal string the ordering comparators read as a number. An empty vector
+  leaves that pointer absent; write `... or vector(0)` when no series should
+  read as zero, and aggregate (`max`, `sum`) to one series;
+- a scalar is `{"resultType": "scalar", "data": {"value": "<sample>", "time"}}`,
+  read at `/data/value`.
+
+Anything else is a tool error, which the platform records as an unsuccessful
+sample, never a pass: no `METRICS_URL`, a transport error, a timeout
+(`METRICS_TIMEOUT_SECONDS`), a redirect, a non-2xx answer, a Prometheus error, a
+range (`matrix`) or string result, a malformed sample, more than
+`METRICS_MAX_SERIES` series or a body past `METRICS_MAX_RESPONSE_BYTES`.
+
+To opt in, in your copy of the bundle:
+
+1. Merge [`connectors/metrics/opt-in.yaml`](connectors/metrics/opt-in.yaml): its
+   `connector` entry into `connectors.yaml` and its `plugin` entry into
+   `.claude-plugin/plugin.json`. Set `METRICS_URL` to your Prometheus; the
+   default is the bundled observability stack's.
+2. If your Prometheus needs a bearer token, store it in a Secret and declare it
+   as the SecretRef the opt-in file shows. It must not be a secret the acting
+   connector's headers expand, or the platform refuses the policy
+   `verifier_not_independent`.
+3. Build the connector image with `curie build --plugin-dir <bundle> --registry <ref>`,
+   then deploy the bundle.
+
+[`connectors/metrics/example-policy.json`](connectors/metrics/example-policy.json)
+pairs the two: restore `example-api` to one replica with the scaler when
+kube-state-metrics reports no available replica, and verify with the same query
+that at least one is available. It binds with `automatic: false`; the
+[drill order](../../docs/operations.md#qualifying-an-action-the-drill-order)
+still decides when it may run without a person.
+`examples/tests/test_sre_bot_metrics_opt_in.py` applies the opt-in file to the
+shipped bundle, runs the intake validators, validates the example policy with
+the platform's document validator and checks the two connectors' independence.
 
 ## Live demo
 

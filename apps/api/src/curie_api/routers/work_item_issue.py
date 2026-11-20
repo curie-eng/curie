@@ -1,25 +1,54 @@
-"""The single issue read authorized by a factory issue read capability (ADR 0187)."""
+"""The single issue read authorized by a factory issue read capability (ADR 0187),
+its two tracker result siblings (ADR 0277, #5586) and the question route (#5785).
 
+The same ``wir`` capability authorizes ``/work-items/completion-contract`` (the
+runner asks which contract its execution runs under; a tracker result request
+reserves its one model session there) and ``/work-items/tracker-result`` (the
+runner's ``submit_tracker_result`` tool), and ``/work-items/questions`` (the
+runner's ``ask_questions`` tool). Each re-checks that the capability names the
+durable WorkItem's issue before and after any tracker call.
+"""
+
+import asyncio
+import json
+import logging
+import math
 import time
 import uuid
-from typing import Annotated
+from typing import Annotated, Final, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import select
 
 from curie_api.schemas.workitems import (
+    CompletionContractOut,
     IssueReadContext,
     IssueReadContextMint,
     IssueReadResult,
+    QuestionsOut,
+    QuestionsSubmission,
+    TrackerResultOut,
+    TrackerResultSubmission,
 )
 
+from .. import factory_questions as questions_core
+from .. import factory_tracker_result_runtime as runtime
+from .. import requester_instruction_context
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
+from ..factory_tracker_result_delivery import (
+    TrackerResultRefused,
+    TrackerResultStorageError,
+    deliver,
+)
+from ..factory_tracker_results import ProposalInvalid, parse_proposal
 from ..forges.errors import ForgeError
 from ..forges.registry import forges_registry
 from ..forges.trackers import display_reference, issue_link
+from ..forges.types import TrackerIssueRef
 from ..issue_read import (
     CAPABILITY_TTL_SECONDS,
     IssueReadAuthority,
@@ -29,11 +58,17 @@ from ..issue_read import (
     read_issue_authority,
 )
 from ..issue_read_token import IssueReadClaims, mint, verify_claims
+from ..models import ExecutionRequest
+from ..wirebody import read_bounded_body
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/work-items", tags=["work-items"])
 internal_router = APIRouter(prefix="/v1/internal/work-items", tags=["internal-work-items"])
 
 CAPABILITY_HEADER = "X-Curie-Issue-Read"
+# ``execution_requests.execution_kind`` of a publication recovery (#5429).
+_PUBLICATION_RECOVERY: Final = "publication_recovery"
 
 
 def issue_read_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -82,6 +117,19 @@ async def mint_issue_read_context(
         raise issue_read_error(
             409, "invalid_context", "the execution cannot read its issue"
         ) from None
+    if data.publication_recovery and (
+        await session.scalar(
+            select(ExecutionRequest.execution_kind).where(
+                ExecutionRequest.id == data.execution_request_id
+            )
+        )
+        != _PUBLICATION_RECOVERY
+    ):
+        # Only a publication recovery request's own execute delivery may
+        # learn that its runner constructs no model session (#5429).
+        raise issue_read_error(
+            409, "invalid_context", "the execution is not a publication recovery"
+        )
     now = int(time.time())
     exp = now + CAPABILITY_TTL_SECONDS
     if authority.execution_deadline is not None:
@@ -94,6 +142,7 @@ async def mint_issue_read_context(
         tracker_host=authority.issue.host,
         tracker_scope_id=authority.issue.scope_id,
         tracker_issue_id=authority.issue.issue_id,
+        publication_recovery=data.publication_recovery,
         iat=now,
         exp=exp,
     )
@@ -122,12 +171,17 @@ return 1
 """
 
 
-async def charge_issue_read_attempt(client: Redis, execution_request_id: uuid.UUID) -> None:
+async def charge_issue_read_attempt(
+    client: Redis, execution_request_id: uuid.UUID, *, purpose: str = "issue_read"
+) -> None:
+    """Charge one attempt to the execution's ``purpose`` window (issue reads,
+    or the tracker result routes, which keep their own)."""
+
     try:
         charged = await client.eval(
             _CHARGE_ATTEMPT,
             1,
-            f"work_item:issue_read:{execution_request_id}",
+            f"work_item:{purpose}:{execution_request_id}",
             uuid.uuid4().hex,
             _ISSUE_READS_PER_WINDOW,
         )
@@ -194,3 +248,336 @@ def _unavailable() -> HTTPException:
     return issue_read_error(
         503, "issue_unavailable", "The tracker could not answer the issue read; retry shortly"
     )
+
+
+# Tracker result siblings (ADR 0277, #5586) -----------------------------------------
+
+# One inline delivery attempt after a submission; the reconciler retries the rest.
+_INLINE_DELIVERY_SECONDS = 45.0
+_TRACKER_RESULT_BUDGET = "tracker_result"
+_REFUSAL_MESSAGES = {
+    runtime.INVALID_CONTEXT: "the execution no longer grants this call",
+    runtime.SESSION_ALREADY_STARTED: "this execution's one model session already started",
+    runtime.SESSION_NOT_STARTED: "this execution has not reserved its model session",
+    runtime.NOT_TRACKER_RESULT: "this execution does not complete with a tracker result",
+    runtime.RESULT_ALREADY_SUBMITTED: "this execution already submitted its result",
+}
+
+
+def _refused(code: str) -> HTTPException:
+    return issue_read_error(
+        409, code, _REFUSAL_MESSAGES.get(code, "the tracker result was refused")
+    )
+
+
+def _tracker_unavailable() -> HTTPException:
+    return issue_read_error(
+        503, "tracker_unavailable", "The tracker could not answer; retry shortly"
+    )
+
+
+async def _named_pair(session: SessionDep, claims: IssueReadClaims) -> runtime.RuntimePair:
+    """The capability's request and WorkItem, refused unless the capability
+    names exactly that WorkItem's issue. Read-only; the transaction ends here,
+    and the returned rows are detached snapshots (no tracker call is made
+    inside a transaction)."""
+
+    pair = await runtime.load_pair(session, claims.execution_request_id)
+    session.expunge_all()
+    await session.rollback()
+    claimed = TrackerIssueRef(
+        claims.tracker_kind, claims.tracker_host, claims.tracker_scope_id, claims.tracker_issue_id
+    )
+    if (
+        pair is None
+        or pair.work_item.id != claims.work_item_id
+        or not runtime.names_issue(pair, claimed)
+    ):
+        raise runtime.RuntimeRefused(runtime.INVALID_CONTEXT)
+    return pair
+
+
+@router.post("/completion-contract", response_model=CompletionContractOut)
+async def read_completion_contract(
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
+) -> CompletionContractOut:
+    """The execution's completion contract; for a tracker result request, the
+    reservation of its one model session.
+
+    The first call for a tracker result request reads the source issue's
+    title and body, mints the request's grant and reserves the session; any
+    later call is 409 ``session_already_started``, so a second runner starts
+    no model. An implementation request reserves nothing and gets no grant.
+    A publication recovery request (#5429) passes the same fences as an
+    implementation request, reserves nothing, and is answered
+    ``publication_recovery`` with no execution binding, so its runner
+    constructs no model session.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+    settings = get_settings()
+    try:
+        pair = await _named_pair(session, claims)
+        view = await runtime.contract_precheck(session, pair)
+        await session.rollback()
+        if view is None:
+            await charge_issue_read_attempt(
+                request.app.state.valkey,
+                claims.execution_request_id,
+                purpose=_TRACKER_RESULT_BUDGET,
+            )
+            _tracker, digest = await runtime.read_source_sha256(
+                settings, request.app.state.http_client, pair.work_item
+            )
+            # Cancellation or a re-route may land during the tracker read.
+            await _named_pair(session, claims)
+            view = await runtime.reserve_session(
+                session,
+                request_id=claims.execution_request_id,
+                content_sha256=digest,
+                settings=settings,
+            )
+    except runtime.RuntimeRefused as refused:
+        raise _refused(refused.code) from None
+    except (runtime.SourceUnavailable, IssueReadUnavailable):
+        raise _tracker_unavailable() from None
+    if claims.publication_recovery:
+        # Minted only for a publication recovery request's execute delivery,
+        # whose kind cannot change. A CI fix or review turn on the same
+        # request mints an ordinary capability and gets the ordinary
+        # workflow contract below (ADR 0269 point 5). The column CHECK pins a
+        # recovery's stored contract to implementation, so the precheck
+        # above reserved nothing.
+        return CompletionContractOut(
+            completion_contract=_PUBLICATION_RECOVERY,
+            result_kinds=[],
+            session_usd_allowance=None,
+            execution=None,
+        )
+    # ADR 0278 (#5592): the runner waits for the worker's envelope for this
+    # execution, and checks it against this binding, before any model work.
+    execution = await requester_instruction_context.execution_binding(
+        session, pair.work_item, pair.request
+    )
+    await session.rollback()
+    return CompletionContractOut(
+        completion_contract=view.completion_contract,
+        result_kinds=list(view.result_kinds),
+        session_usd_allowance=view.session_usd_allowance,
+        execution=execution,
+    )
+
+
+@router.post("/tracker-result", response_model=TrackerResultOut)
+async def submit_tracker_result(
+    data: TrackerResultSubmission,
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
+) -> TrackerResultOut:
+    """Seal the execution's one tracker result and attempt its delivery once.
+
+    Refuses (409, nothing written) an implementation request, a request
+    whose session was never reserved, a second submission, a source issue
+    whose title or body changed since the reservation, and every grant fence
+    (`RefusalReason`); an invalid proposal is 422 with field paths and codes
+    only. An accepted result is answered with its delivery state after one
+    inline attempt; the WorkItem reconciler retries an owed one.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+    settings = get_settings()
+    try:
+        pair = await _named_pair(session, claims)
+        target = await runtime.submission_precheck(session, pair)
+        await session.rollback()
+        try:
+            proposal = parse_proposal(data.proposal)
+        except ProposalInvalid as invalid:
+            raise HTTPException(
+                422,
+                {
+                    "code": "proposal_invalid",
+                    "issues": [
+                        {"field": issue.field, "code": issue.code} for issue in invalid.issues
+                    ],
+                },
+                headers={"Cache-Control": "no-store"},
+            ) from None
+        await charge_issue_read_attempt(
+            request.app.state.valkey, claims.execution_request_id, purpose=_TRACKER_RESULT_BUDGET
+        )
+        tracker, digest = await runtime.read_source_sha256(
+            settings, request.app.state.http_client, pair.work_item
+        )
+        if target.source_content_sha256 is None or digest != target.source_content_sha256:
+            raise runtime.RuntimeRefused("source_fingerprint_changed")
+        await _named_pair(session, claims)
+        delivery_id = await runtime.seal_submission(
+            session,
+            request_id=claims.execution_request_id,
+            target=target,
+            proposal=proposal,
+            tracker=tracker,
+            settings=settings,
+        )
+    except runtime.RuntimeRefused as refused:
+        raise _refused(refused.code) from None
+    except TrackerResultRefused as refused:
+        raise _refused(refused.reason.value) from None
+    except TrackerResultStorageError:
+        raise issue_read_error(
+            503, "storage_unavailable", "The result could not be stored; retry shortly"
+        ) from None
+    except (runtime.SourceUnavailable, IssueReadUnavailable):
+        raise _tracker_unavailable() from None
+    try:
+        async with asyncio.timeout(_INLINE_DELIVERY_SECONDS):
+            await deliver(
+                request.app.state.sessionmaker,
+                delivery_id,
+                tracker=tracker,
+                settings=settings,
+                owner=f"tracker-result-route:{uuid.uuid4()}",
+            )
+    except (TimeoutError, TrackerResultStorageError):
+        # Sealed and owed: the reconciler's delivery pass retries it.
+        logger.warning("tracker result inline delivery did not finish delivery=%s", delivery_id)
+    answer = await runtime.submission_answer(session, delivery_id)
+    return TrackerResultOut.model_validate(
+        {
+            "result_kind": answer.result_kind,
+            "state": answer.state,
+            "result_comment_url": answer.result_comment_url,
+            "ticket_url": answer.ticket_url,
+        }
+    )
+
+
+# The question route (#5785) ----------------------------------------------------------
+
+_QUESTION_REFUSALS = {
+    questions_core.INVALID_CONTEXT: "the execution no longer grants this call",
+    questions_core.INVALID_QUESTIONS: "the questions are outside the tool's bounds",
+    questions_core.NOT_IMPLEMENTATION_CONTRACT: "this execution does not run the "
+    "implementation contract",
+    questions_core.REQUEST_NOT_RUNNING: "this execution is not running",
+    questions_core.WORK_ITEM_CANCELLED: "this work item is cancelled",
+    questions_core.PULL_REQUEST_OPEN: "this work item already has an open pull request",
+    questions_core.ALREADY_PUBLISHED: "this execution already published",
+    questions_core.ALREADY_ASKED: "this execution already posted different questions",
+    questions_core.QUESTION_ROUNDS_EXHAUSTED: "this ticket's question rounds are used",
+}
+
+
+def _question_refused(code: str) -> HTTPException:
+    return issue_read_error(409, code, _QUESTION_REFUSALS.get(code, "the questions were refused"))
+
+
+# Far above any input inside the bounds, even with every character escaped.
+_QUESTIONS_BODY_MAX_BYTES: Final = 256 * 1024
+# Documented, not bound: the handler reads the body itself, after the
+# capability, so no body shape is answered with FastAPI's echoing 422.
+_QUESTIONS_BODY = {
+    key: value
+    for key, value in QuestionsSubmission.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    ).items()
+    if key != "$defs"
+}
+
+
+def _refuse_json_constant(name: str) -> NoReturn:
+    raise ValueError(f"not a JSON value: {name}")
+
+
+def _finite_float(literal: str) -> float:
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError("not a finite number")
+    return value
+
+
+async def _questions_submission(request: Request) -> QuestionsSubmission:
+    """The body as a submission, or 409 ``invalid_questions`` echoing nothing
+    for anything that is not one JSON object within the size bound."""
+
+    try:
+        raw = await read_bounded_body(request, _QUESTIONS_BODY_MAX_BYTES, subject="questions body")
+    except HTTPException:
+        raise _question_refused(questions_core.INVALID_QUESTIONS) from None
+    try:
+        # NaN and the infinities are not JSON (RFC 8259), and a number too
+        # large for a float (1e999) decodes to one; refuse them like any other
+        # body outside the shape rather than carry them on.
+        parsed = json.loads(raw, parse_constant=_refuse_json_constant, parse_float=_finite_float)
+    except (ValueError, RecursionError):
+        raise _question_refused(questions_core.INVALID_QUESTIONS) from None
+    if not isinstance(parsed, dict):
+        raise _question_refused(questions_core.INVALID_QUESTIONS)
+    return QuestionsSubmission.model_validate(parsed)
+
+
+@router.post(
+    "/questions",
+    response_model=QuestionsOut,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _QUESTIONS_BODY}},
+        }
+    },
+)
+async def post_questions(
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
+) -> QuestionsOut:
+    """Post this execution's numbered questions on its own ticket (#5785).
+
+    The platform composes the comment and writes it as one marked comment per
+    asking request through the tracker's marked-comment write. The round is
+    recorded ``posting`` and committed before the tracker write, and
+    ``outstanding`` after it, with the answer fence read from the database
+    clock then. A replay of the same body by the same request answers the
+    first result with no second write. Refusals are 409 with a fixed code and
+    nothing echoed; a tracker failure is 503 ``tracker_unavailable`` and
+    leaves the round ``posting``, which settlement treats as not asked. The
+    body is read only after the capability is verified, and any body that is
+    not a JSON object inside the bounds is 409 ``invalid_questions``.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+    data = await _questions_submission(request)
+    if not questions_core.input_valid(data.summary, data.questions):
+        raise _question_refused(questions_core.INVALID_QUESTIONS)
+    try:
+        await _named_pair(session, claims)
+    except runtime.RuntimeRefused as refused:
+        raise _question_refused(refused.code) from None
+    try:
+        begun = await questions_core.begin_round(
+            session,
+            request_id=claims.execution_request_id,
+            summary=data.summary,
+            questions=data.questions,
+        )
+        if isinstance(begun, questions_core.Posting):
+            try:
+                begun = await questions_core.post_and_record(
+                    session,
+                    get_settings(),
+                    request.app.state.http_client,
+                    request_id=claims.execution_request_id,
+                    posting=begun,
+                )
+            except questions_core.TrackerUnavailable:
+                raise _tracker_unavailable() from None
+    except questions_core.QuestionsRefused as refused:
+        raise _question_refused(refused.code) from None
+    return QuestionsOut(round=begun.round, rounds_limit=questions_core.ROUND_LIMIT)

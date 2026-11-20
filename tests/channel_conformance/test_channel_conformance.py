@@ -30,7 +30,7 @@ from channel_protocol.conformance import (
     applicable_checks,
 )
 from curie_api.routers.channels import TurnIn
-from curie_mail_adapter.adapter import MailAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
 from subjects import REGISTRY, REGISTRY_CAPABILITIES, MailSubject
 
 # The four adapters #3830 names. A registry that loses one would silently shrink
@@ -220,12 +220,13 @@ def test_fresh_mail_is_refused_on_retry_and_restart_without_reply_ownership(
             assert_refused(replacement)
             assert subject._mail.list_calls == listing_count + 3
 
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail"):
         asyncio.run(run())
     warnings = [
         record.getMessage()
         for record in caplog.records
-        if record.name.startswith("curie_mail_adapter") and record.levelno >= logging.WARNING
+        if record.name.startswith("curie_channel_gateway.mail")
+        and record.levelno >= logging.WARNING
     ]
     assert len(warnings) == 1
     assert "authentication_unverifiable" in warnings[0]

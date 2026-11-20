@@ -31,7 +31,7 @@ from curie_protected_hooks.worker_verification import (
 
 from .capacity_wait import CapacityWaitExpired, CapacityWaitRequested, wait_delivery_scope
 from .config import WorkerConfig
-from .consumer import Consumer
+from .consumer import Consumer, refuse_unconfigured_reminder
 from .delivery_lease import DeliveryLease, DeliveryLeaseStore
 from .kernel.core import Kernel
 from .protected_binding import ProtectedMediatedBindingResolver, current_protected_delivery
@@ -347,6 +347,7 @@ class ExecutingProtectedConsumer(Consumer):
             kernel=cast(Kernel, kernel),
             config=config,
             leases=DeliveryLeaseStore(runs, config),
+            reminders=refuse_unconfigured_reminder,
             drain=UpgradeDrainGate(runs, config),
         )
         self._waits = ProtectedCapacityWaitStore(client, trusted_manifest, config)

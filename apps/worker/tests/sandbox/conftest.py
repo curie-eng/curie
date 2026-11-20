@@ -4,7 +4,7 @@ Affinity tests run against the REAL Valkey from the compose stack (repo test
 discipline: never mock Valkey). The Kubernetes control plane is an external
 service, so substrate-logic tests use ``FakeSandboxClient`` (an in-memory model
 of the agent-sandbox claim/pool behavior observed in PT-1/PT-D); the real
-client is exercised by the env-gated k8scratch e2e in ``test_e2e_k8scratch.py``.
+client is exercised by the env-gated cluster e2e tests.
 """
 
 from __future__ import annotations
@@ -46,7 +46,13 @@ from curie_worker.sandbox import (
 )
 from curie_worker.sandbox.claim_tokens import CLAIM_LABEL
 from curie_worker.sandbox.docker import DockerError, DockerSandboxClient
-from curie_worker.sandbox.types import ClaimTimeoutError, SandboxError, SandboxTermination
+from curie_worker.sandbox.types import (
+    ClaimTimeoutError,
+    DeliveredLimits,
+    RecordedPod,
+    SandboxError,
+    SandboxTermination,
+)
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
@@ -604,6 +610,15 @@ class FakeSandboxClient:
     pod_reads: list[str] = field(default_factory=list)
     termination: SandboxTermination | None = None
     termination_reads: list[str] = field(default_factory=list)
+    # ADR 0269 (#5427): what pod_limits and claim_limits answer. Unobserved
+    # by default, which never releases a resource gate.
+    delivered: DeliveredLimits | None = None
+    template_limits: DeliveredLimits = field(
+        default_factory=lambda: DeliveredLimits(
+            memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
+    )
+    pod_limit_reads: list[str] = field(default_factory=list)
     created: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     # Every claim-scoped template sweep the substrate asked for, as
@@ -1055,7 +1070,11 @@ class FakeSandboxClient:
             self.sandboxes.pop(claim.sandbox_name, None)
         self.deleted.append(name)
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self, *, label_selector: str, request_timeout_seconds: float | None = None
+    ) -> list[ClaimView]:
+        # The owner inventory (#5378) bounds its read; any other caller omits it.
+        assert request_timeout_seconds is None or request_timeout_seconds > 0
         key, _, value = label_selector.partition("=")
         views = []
         for claim in self.claims.values():
@@ -1104,12 +1123,32 @@ class FakeSandboxClient:
         return self.unschedulable_message
 
     def pod_termination(
-        self, name: str, *, request_timeout_seconds: float, since: datetime
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        since: datetime,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
         assert request_timeout_seconds > 0
         assert since.tzinfo is not None
+        del recorded
         self.termination_reads.append(name)
         return self.termination
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        assert request_timeout_seconds > 0
+        self.pod_limit_reads.append(name)
+        return self.delivered
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        return self.template_limits
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode

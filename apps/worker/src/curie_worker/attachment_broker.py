@@ -18,13 +18,9 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, web
+from curie_channel_gateway.ports.reads import FileSource
 
-from .attachments import (
-    AgentRoute,
-    AttachmentFilePort,
-    AttachmentReadScope,
-    ChannelPortFileClient,
-)
+from .attachments import AgentRoute, AttachmentReadScope, ChannelPortFileClient
 
 HEADER = "X-Curie-Worker-Token"
 CHUNK = 1024 * 1024
@@ -45,7 +41,7 @@ class AttachmentBroker:
         *,
         internal_token: str,
         routes_for_agent: Callable[[uuid.UUID], Awaitable[list[AgentRoute]]],
-        slack_files: Mapping[str, AttachmentFilePort],
+        slack_files: Mapping[str, FileSource],
         channel_files: ChannelPortFileClient | None,
         api_url: str,
         max_concurrent: int = 8,
@@ -98,7 +94,7 @@ class AttachmentBroker:
                 raise ValueError("invalid attachment control response")
             return parsed
 
-    async def file_port(self, reference: dict[str, Any]) -> AttachmentFilePort:
+    async def file_port(self, reference: dict[str, Any]) -> FileSource:
         routes = await self.routes_for_agent(uuid.UUID(reference["agent_id"]))
         kind, adapter, identity = (
             reference["route_kind"],

@@ -4,20 +4,30 @@ The fake is the mock at the adapter seam: it constructs real claude-agent-sdk
 message dataclasses with canned content, so everything above it (translation,
 budget, side-effect flagging, status, NDJSON, the HTTP layer) runs unmodified and
 un-mocked while the model (the only external dependency) is replaced. It never
-spawns the CLI or touches the network. ``aci-protocol`` is never mocked.
+spawns the CLI or touches the network, with one explicit exception: a prompt
+carrying ``[fake:connector-call]`` dials the hosted connectors the session was
+handed (ADR 0270). ``aci-protocol`` is never mocked.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+import socket
+import tempfile
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 import anyio
+import httpx2
 from claude_agent_sdk import (
     AssistantMessage,
+    RateLimitEvent,
     ResultMessage,
     TextBlock,
     ToolResultBlock,
@@ -27,8 +37,11 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import (
     CanUseTool,
     PermissionResultDeny,
+    RateLimitInfo,
     ToolPermissionContext,
 )
+from mcp import ClientSession
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .adapter import PartialMessageBoundary
 from .approval import (
@@ -37,13 +50,35 @@ from .approval import (
     ApprovalGate,
     process_approval_request,
 )
+from .connectors import CALLER_HEADER
 from .history import ConversationMessage
+from .mcp_tool_capability import _caller_refusal, _probe_error_leaves, server_streams
 from .tool_access import TurnToolAccess
 from .turn_progress import NOT_SHOWN_TEXT, TurnProgress
 
 
 def _assistant(*blocks: Any, usage: dict[str, Any] | None = None) -> AssistantMessage:
     return AssistantMessage(content=list(blocks), model="fake-model", usage=usage)
+
+
+_SdkError = Literal[
+    "authentication_failed",
+    "billing_error",
+    "rate_limit",
+    "invalid_request",
+    "server_error",
+    "unknown",
+]
+
+
+def _errored(error: _SdkError, text: str) -> AssistantMessage:
+    """An assistant message carrying a provider error, as the SDK delivers one."""
+
+    return AssistantMessage(
+        content=[TextBlock(text=text)] if text else [],
+        model="fake-model",
+        error=error,
+    )
 
 
 def _result(
@@ -251,6 +286,567 @@ def progress_demo_turn() -> list[Any]:
     return script
 
 
+# Explicit test-only marker for ADR 0270 evidence: the turn dials every hosted
+# connector the session was handed, in sorted name order, through the same
+# standalone MCP client the boot probe uses (one ``initialize``, one
+# ``tools/list``), and answers one line per connector:
+#
+#     connector-call <name>: ok tools=<n> caller=<fp>
+#     connector-call <name>: failed <reason> caller=<fp>
+#
+# ``<fp>`` is the first 16 hex characters of the sha256 of the X-Curie-Caller
+# value that connector was dialled with, or ``-`` without one, so a run can tie
+# a dial to its token without the token being printed. ``<reason>`` is the
+# caller proxy's refusal code when it refused, else the failure's exception
+# class name; neither ever carries exception text. With no connectors the
+# answer is ``connector-call: none``. This is the fake's only network call.
+CONNECTOR_CALL_MARKER = "[fake:connector-call]"
+# Per connector, read at call time. One dial bounds a connector that accepts
+# and then hangs, so the turn always completes.
+CONNECTOR_CALL_TIMEOUT_S = 15.0
+_CONNECTOR_CALL_USAGE = {"input_tokens": 20, "output_tokens": 8}
+
+
+@dataclass(frozen=True)
+class _ConnectorCalls:
+    """A scripted dial of every connector, answered as the turn's closing text."""
+
+
+def connector_call_turn() -> list[Any]:
+    """A turn that dials the session's connectors, then answers one line each."""
+
+    return [_assistant(TextBlock(text="Calling the connectors")), _ConnectorCalls()]
+
+
+def _connector_call_answer(text: str) -> list[Any]:
+    return [
+        _assistant(TextBlock(text=text), usage=dict(_CONNECTOR_CALL_USAGE)),
+        _result(text=text, usage=dict(_CONNECTOR_CALL_USAGE)),
+    ]
+
+
+def _caller_fingerprint(config: Mapping[str, Any]) -> str:
+    """The sent X-Curie-Caller value's sha256, first 16 hex characters, or ``-``.
+
+    ``server_streams`` expands ``${NAME}`` against the empty env this dial
+    passes, which leaves the value as written, so this is what was sent.
+    """
+
+    headers = config.get("headers")
+    value = headers.get(CALLER_HEADER) if isinstance(headers, Mapping) else None
+    if value is None:
+        return "-"
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _connector_failure(exc: BaseException) -> str:
+    """The proxy's refusal code, or the innermost failure's class name.
+
+    Never the exception text: it can carry a header value.
+    """
+
+    refusal = _caller_refusal(exc)
+    if refusal is not None:
+        return refusal
+    leaves = _probe_error_leaves(exc)
+    return type(leaves[0] if leaves else exc).__name__
+
+
+CONNECTOR_CALL_ATTEMPTS = 3
+_CONNECTOR_CALL_BACKOFF_S = 0.2
+# mcp's HTTP transport is httpx2 (installed with mcp; the runner image has no
+# httpx): a dial that never reached the server arrives as an exception group
+# whose leaf is one of these.
+_TRANSPORT_FAILURES = (
+    httpx2.ConnectError,
+    httpx2.ConnectTimeout,
+    ConnectionResetError,
+    socket.gaierror,
+)
+
+
+def _failed_before_answer(exc: BaseException) -> bool:
+    """True when every leaf is a transport failure and the proxy did not refuse."""
+
+    if _caller_refusal(exc) is not None:
+        return False
+    leaves = _probe_error_leaves(exc)
+    return bool(leaves) and all(isinstance(leaf, _TRANSPORT_FAILURES) for leaf in leaves)
+
+
+async def _dial_connector(config: Mapping[str, Any], timeout: float) -> int:
+    async with server_streams(config, plugin_dir=None, inherited_env={}) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream, write_stream, read_timeout_seconds=timeout
+        ) as session:
+            await session.initialize()
+            listed = await session.list_tools()
+    return len(listed.tools)
+
+
+async def _retry_dial(dial: Callable[[float], Awaitable[Any]]) -> Any:
+    """Run one bounded dial, retrying transport failures before any answer."""
+
+    timeout = CONNECTOR_CALL_TIMEOUT_S
+    with anyio.fail_after(timeout):
+        attempt = 1
+        while True:
+            try:
+                return await dial(timeout)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                if attempt >= CONNECTOR_CALL_ATTEMPTS or not _failed_before_answer(exc):
+                    raise
+                await anyio.sleep(_CONNECTOR_CALL_BACKOFF_S * attempt)
+                attempt += 1
+
+
+async def _call_connector(config: Mapping[str, Any]) -> str:
+    """One bounded dial: ``ok tools=<n>`` or ``failed <reason>``.
+
+    A transport failure before the connector answers is retried, up to
+    ``CONNECTOR_CALL_ATTEMPTS`` inside the one per-server timeout. A proxy
+    refusal or any answered protocol error is reported at once.
+    """
+
+    try:
+        tools = await _retry_dial(lambda timeout: _dial_connector(config, timeout))
+    except Exception as exc:  # noqa: BLE001 - every failure is reported, none escapes
+        return f"failed {_connector_failure(exc)}"
+    return f"ok tools={tools}"
+
+
+# ``[fake:connector-tool <connector> <tool> <json-object-args>]`` dials exactly
+# one hosted connector, runs ``initialize`` then ``tools/call``, and answers one
+# line (ADR 0270 identity E2E):
+#
+#     connector-tool <connector>/<tool>: ok <first line of first text> caller=<fp>
+#     connector-tool <connector>/<tool>: refused <code> caller=<fp>
+#     connector-tool <connector>/<tool>: failed <reason> caller=<fp>
+#     connector-tool <connector>: failed unknown_connector
+#     connector-tool: failed bad_directive
+#
+# ``[fake:forge-principal <value>]`` adds the literal ``X-Curie-Principal``
+# header to that dial only, on a copy of the config.
+CONNECTOR_TOOL_MARKER = "[fake:connector-tool"
+_CONNECTOR_TOOL_RE = re.compile(r"\[fake:connector-tool (\S+) (\S+) (\{.*\})\]")
+_FORGE_PRINCIPAL_RE = re.compile(r"\[fake:forge-principal (\S+)\]")
+_FORGED_PRINCIPAL_HEADER = "X-Curie-Principal"
+
+
+@dataclass(frozen=True)
+class _ConnectorToolCall:
+    """A scripted single tool call, answered as the turn's closing text."""
+
+    connector: str | None
+    tool: str = ""
+    args: Mapping[str, Any] | None = None
+    forged_principal: str | None = None
+
+
+def connector_tool_turn(last: str) -> list[Any]:
+    """A turn that calls one connector tool as the person's message directs."""
+
+    match = _CONNECTOR_TOOL_RE.search(last)
+    call = _ConnectorToolCall(connector=None)
+    if match:
+        try:
+            args = json.loads(match.group(3))
+        except ValueError:
+            args = None
+        if isinstance(args, dict):
+            forge = _FORGE_PRINCIPAL_RE.search(last)
+            call = _ConnectorToolCall(
+                connector=match.group(1),
+                tool=match.group(2),
+                args=args,
+                forged_principal=forge.group(1) if forge else None,
+            )
+    return [_assistant(TextBlock(text="Calling the connector tool")), call]
+
+
+# ``[fake:gated-connector-tool <connector> <tool> <json-object>]`` (ADR 0271)
+# emits one ToolUseBlock named ``mcp__<connector>__<tool>`` carrying exactly the
+# parsed object, so the permission gate runs over it like any scripted call.
+# The directive only raises the permission gate; it dials nothing.
+# A directive that does not parse falls back to the default turn.
+GATED_CONNECTOR_TOOL_MARKER = "[fake:gated-connector-tool"
+_GATED_CONNECTOR_TOOL_RE = re.compile(r"\[fake:gated-connector-tool (\S+) (\S+) (\{.*\})\]")
+
+
+def _parse_gated_connector_tool(last: str) -> tuple[str, dict[str, Any]] | None:
+    match = _GATED_CONNECTOR_TOOL_RE.search(last)
+    if not match:
+        return None
+    try:
+        args = json.loads(match.group(3))
+    except ValueError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    return f"mcp__{match.group(1)}__{match.group(2)}", args
+
+
+def gated_connector_tool_turn(name: str, args: dict[str, Any]) -> list[Any]:
+    """A turn that attempts one connector tool call and never dials it."""
+
+    return [
+        _assistant(TextBlock(text="Attempting the connector tool")),
+        _assistant(ToolUseBlock(id="t1", name=name, input=args)),
+        _tool_result("t1", "ok"),
+        _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
+        _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
+# ``[fake:write-file <name> <content>]`` emits one built-in ``Write`` call for
+# ``<name>`` in the session's working directory, with the absolute path the
+# real CLI would put in its arguments, and performs that write only when the
+# permission gate let the call run. It is the offline proof that an approved
+# file write runs exactly once after resume (#5571). Nothing outside the
+# working directory is ever written: ``<name>`` is a single path component.
+# The working directory is the session's own (the mounted managed checkout on a
+# workspace sandbox, as the real CLI's ``cwd`` option), else the process's, so
+# a factory turn on the fake tier changes the checkout it publishes (#5429).
+WRITE_FILE_MARKER = "[fake:write-file"
+_WRITE_FILE_RE = re.compile(r"\[fake:write-file ([A-Za-z0-9._-]+) (\S+)\]")
+
+
+@dataclass(frozen=True)
+class _FileWrite:
+    """A scripted built-in write, performed only if the gate let it run."""
+
+    tool_use_id: str
+    path: str
+    content: str
+
+
+def write_file_turn(last: str, cwd: str | None = None) -> list[Any]:
+    """A turn that writes one file in the working directory, then answers.
+
+    ``cwd`` is the session's working directory; None means the process's.
+    """
+
+    match = _WRITE_FILE_RE.search(last)
+    if match is None or match.group(1) in {".", ".."}:
+        return default_turn()
+    path = os.path.join(cwd or os.getcwd(), match.group(1))
+    content = match.group(2)
+    return [
+        _assistant(TextBlock(text="Writing the file")),
+        _assistant(
+            ToolUseBlock(id="w1", name="Write", input={"file_path": path, "content": content})
+        ),
+        _FileWrite(tool_use_id="w1", path=path, content=content),
+        _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
+        _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
+# ``[fake:publish-changes]`` is read only together with a parsed write-file
+# directive (#5429). The turn is that write, then exactly one
+# ``mcp__curie__publish_changes`` tool use. The call goes through the same
+# permission gate as any other scripted tool, so a gated publish pauses the
+# turn where candidate capture happens. A publish marker without a parsed
+# write does not take the turn.
+PUBLISH_CHANGES_MARKER = "[fake:publish-changes]"
+# A fixed proposal the publication gate can record. The directive takes no
+# arguments; title and body stay inside the limits ``ApprovalGate`` accepts.
+PUBLISH_CHANGES_INPUT: dict[str, str] = {
+    "title": "Publish the reviewed change",
+    "body": "Publish the file written in this turn.",
+}
+
+
+def publish_changes_turn(last: str, cwd: str | None = None) -> list[Any]:
+    """The write-file turn followed by one publication tool use."""
+
+    match = _WRITE_FILE_RE.search(last)
+    if match is None or match.group(1) in {".", ".."}:
+        return default_turn()
+    written = write_file_turn(last, cwd)
+    publish = _assistant(
+        ToolUseBlock(id="p1", name=PLATFORM_PUBLISH_TOOL_NAME, input=dict(PUBLISH_CHANGES_INPUT))
+    )
+    return [*written[:3], publish, *written[3:]]
+
+
+# ``[fake:model-fault <kind>]`` emits the SDK shape the real provider uses for
+# that refusal (#5429, #5424, #5426), and nothing else. The production
+# translator classifies it. A marker whose argument does not parse falls back
+# to the default turn and does not fall through to a later directive.
+# ``<s>`` is the provider reset as a Unix timestamp in whole seconds, the same
+# instant ``RateLimitInfo.resets_at`` and the daily-budget RFC 3339 clause name.
+MODEL_FAULT_MARKER = "[fake:model-fault"
+_MODEL_FAULT_RE = re.compile(
+    r"\[fake:model-fault (?:"
+    r"rate-limit (?P<rate>\d+)"
+    r"|daily-budget (?P<budget>\d+)"
+    r"|rate-limit-untimed"
+    r"|generic-403"
+    r"|unreachable"
+    r")\]"
+)
+# Observed 2026-10-29 (#5163): an OpenRouter workspace daily budget refusal.
+# The reset clause is filled from the directive's timestamp. Built by
+# concatenation so the JSON braces are not a format string.
+# A 403 with no credit, budget or documented 401 text (test_translate.py).
+_GENERIC_403_TEXT = 'API Error: 403 {"error":{"message":"invalid api key","code":403}}'
+# #4333: the SDK reports a transport failure as server_error plus this text.
+_UNREACHABLE_TEXT = "API Error: 500 Connection refused"
+
+
+def _utc_stamp(seconds: int) -> str | None:
+    """RFC 3339 UTC for ``seconds``, or None when it is not a real instant."""
+
+    try:
+        when = datetime.fromtimestamp(seconds, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return when.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _rate_limit_event(resets_at: int | None) -> RateLimitEvent:
+    info = RateLimitInfo(status="rejected", resets_at=resets_at)
+    return RateLimitEvent(rate_limit_info=info, uuid="fake-rate-limit", session_id="fake-session")
+
+
+def model_fault_turn(last: str) -> list[Any]:
+    """One provider-fault turn, or the default turn when the argument is bad."""
+
+    match = _MODEL_FAULT_RE.search(last)
+    if match is None:
+        return default_turn()
+    if match.group("rate") is not None:
+        seconds = int(match.group("rate"))
+        if _utc_stamp(seconds) is None:
+            return default_turn()
+        return [
+            _rate_limit_event(seconds),
+            _result(is_error=True, text="model rate limit reached"),
+        ]
+    if match.group("budget") is not None:
+        seconds = int(match.group("budget"))
+        stamp = _utc_stamp(seconds)
+        if stamp is None:
+            return default_turn()
+        text = (
+            'API Error: 403 {"error":{"message":"Workspace daily budget of $20.00 exceeded. '
+            "Contact your org admin. $20.08 of $20.00 used; resets " + stamp + '.",'
+            '"code":403}}'
+        )
+        return [_errored("authentication_failed", text), _result(is_error=True, text=text)]
+    if "rate-limit-untimed" in match.group(0):
+        return [
+            _rate_limit_event(None),
+            _result(is_error=True, text="model rate limit reached"),
+        ]
+    if "generic-403" in match.group(0):
+        return [
+            _errored("authentication_failed", _GENERIC_403_TEXT),
+            _result(is_error=True, text=_GENERIC_403_TEXT),
+        ]
+    return [
+        _errored("server_error", _UNREACHABLE_TEXT),
+        _result(is_error=True, text=_UNREACHABLE_TEXT),
+    ]
+
+
+# Resource exhaustion directives (#5427). ``[fake:hold-memory <MiB>]`` allocates
+# that many MiB inside the runner process, touching every page so the memory
+# is resident, holds it, releases it and answers. ``[fake:fill-scratch <MiB>]``
+# writes that many MiB of zeros to one file in the temporary directory (the
+# runner's /tmp scratch volume in a sandbox, whose root filesystem is read-only)
+# in 1 MiB chunks, holds it, deletes it and answers. Neither emits a tool call, so the
+# turn raises no side effect flag, and neither touches the network. Under a
+# runner limit smaller than the request the kubelet or the kernel ends the
+# runner first, which is the point. Out of range or unparsable arguments fall
+# back to the default turn, like the other directives.
+HOLD_MEMORY_MARKER = "[fake:hold-memory"
+FILL_SCRATCH_MARKER = "[fake:fill-scratch"
+_HOLD_MEMORY_RE = re.compile(r"\[fake:hold-memory (\d{1,5})\]")
+_FILL_SCRATCH_RE = re.compile(r"\[fake:fill-scratch (\d{1,5})\]")
+RESOURCE_DIRECTIVE_MAX_MIB = 16384
+_MIB = 1024 * 1024
+_PAGE = 4096
+# Read at call time, so a test can shorten them. Memory is resident the moment
+# it is touched, so a short hold suffices. The kubelet measures local storage
+# on its own housekeeping cadence, so a scratch file is held long enough for
+# at least one eviction pass to see it.
+HOLD_MEMORY_SECONDS = 5.0
+FILL_SCRATCH_SECONDS = 180.0
+FILL_SCRATCH_FILE = "curie-fake-fill-scratch.bin"
+# A standing directive for every turn of this runner (fake tier only), read at
+# call time: the fake treats it as part of the person's words. A factory turn's
+# text is only the issue link, so a test that needs a directive on a tracker
+# admitted turn sets it per agent through the chart's agentSandbox.runnerEnv.
+STANDING_DIRECTIVE_ENV = "FAKE_MODEL_DIRECTIVE"
+
+
+@dataclass(frozen=True)
+class _HoldMemory:
+    """A scripted allocation of ``mib`` resident MiB, held and then released."""
+
+    mib: int
+
+
+@dataclass(frozen=True)
+class _FillScratch:
+    """A scripted ``mib`` MiB scratch file in the temporary directory, held and then deleted."""
+
+    path: str
+    mib: int
+
+
+def _resource_mib(pattern: re.Pattern[str], last: str) -> int | None:
+    match = pattern.search(last)
+    if match is None:
+        return None
+    mib = int(match.group(1))
+    return mib if 1 <= mib <= RESOURCE_DIRECTIVE_MAX_MIB else None
+
+
+def _resource_answer() -> list[Any]:
+    return [
+        _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
+        _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
+def hold_memory_turn(last: str) -> list[Any]:
+    """A turn that holds the directive's MiB of resident memory, then answers."""
+
+    mib = _resource_mib(_HOLD_MEMORY_RE, last)
+    if mib is None:
+        return default_turn()
+    return [_assistant(TextBlock(text="Holding memory")), _HoldMemory(mib), *_resource_answer()]
+
+
+def fill_scratch_turn(last: str) -> list[Any]:
+    """A turn that fills the directive's MiB of temporary scratch, then answers."""
+
+    mib = _resource_mib(_FILL_SCRATCH_RE, last)
+    if mib is None:
+        return default_turn()
+    path = os.path.join(tempfile.gettempdir(), FILL_SCRATCH_FILE)
+    return [
+        _assistant(TextBlock(text="Filling scratch")),
+        _FillScratch(path, mib),
+        *_resource_answer(),
+    ]
+
+
+def _touch_memory(mib: int) -> bytearray:
+    buffer = bytearray(mib * _MIB)
+    for offset in range(0, len(buffer), _PAGE):
+        buffer[offset] = 1
+    return buffer
+
+
+def _write_scratch(path: str, mib: int) -> None:
+    chunk = bytes(_MIB)
+    with open(path, "wb") as stream:
+        for _ in range(mib):
+            stream.write(chunk)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+async def _hold_memory(mib: int) -> None:
+    buffer = await anyio.to_thread.run_sync(_touch_memory, mib)
+    try:
+        await anyio.sleep(HOLD_MEMORY_SECONDS)
+    finally:
+        del buffer
+
+
+async def _fill_scratch(call: _FillScratch) -> None:
+    try:
+        await anyio.to_thread.run_sync(_write_scratch, call.path, call.mib)
+        await anyio.sleep(FILL_SCRATCH_SECONDS)
+    finally:
+        try:
+            os.unlink(call.path)
+        except FileNotFoundError:
+            pass
+
+
+async def _dial_connector_tool(
+    config: Mapping[str, Any], tool: str, args: Mapping[str, Any], timeout: float
+) -> tuple[bool, str]:
+    async with server_streams(config, plugin_dir=None, inherited_env={}) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream, write_stream, read_timeout_seconds=timeout
+        ) as session:
+            await session.initialize()
+            result = await session.call_tool(tool, dict(args))
+    content = getattr(result, "content", None) or []
+    first = next(
+        (
+            block.text
+            for block in content
+            if getattr(block, "type", None) == "text" and isinstance(block.text, str)
+        ),
+        "",
+    )
+    return bool(getattr(result, "is_error", False)), first.split("\n", 1)[0].strip()
+
+
+async def call_connector_tool(
+    servers: Mapping[str, Mapping[str, Any]], call: _ConnectorToolCall
+) -> str:
+    """The ``[fake:connector-tool]`` answer: exactly one line."""
+
+    if call.connector is None or call.args is None:
+        return "connector-tool: failed bad_directive"
+    base = servers.get(call.connector)
+    if base is None:
+        return f"connector-tool {call.connector}: failed unknown_connector"
+    config: Mapping[str, Any] = base
+    if call.forged_principal is not None:
+        headers = base.get("headers")
+        config = {
+            **base,
+            "headers": {
+                **(dict(headers) if isinstance(headers, Mapping) else {}),
+                _FORGED_PRINCIPAL_HEADER: call.forged_principal,
+            },
+        }
+    label = f"connector-tool {call.connector}/{call.tool}"
+    caller = _caller_fingerprint(config)
+    args = call.args
+    tool = call.tool
+    try:
+        is_error, first = await _retry_dial(
+            lambda timeout: _dial_connector_tool(config, tool, args, timeout)
+        )
+    except Exception as exc:  # noqa: BLE001 - every failure is reported, none escapes
+        return f"{label}: failed {_connector_failure(exc)} caller={caller}"
+    if not is_error:
+        return f"{label}: ok {first} caller={caller}"
+    if first.startswith("refused ") and len(first.split()) == 2:
+        return f"{label}: refused {first.split()[1]} caller={caller}"
+    return f"{label}: failed {first or 'tool_error'} caller={caller}"
+
+
+async def call_connectors(servers: Mapping[str, Mapping[str, Any]]) -> str:
+    """The ``[fake:connector-call]`` answer: one line per connector, by name."""
+
+    if not servers:
+        return "connector-call: none"
+    lines = []
+    for name in sorted(servers):
+        config = servers[name]
+        outcome = await _call_connector(config)
+        lines.append(f"connector-call {name}: {outcome} caller={_caller_fingerprint(config)}")
+    return "\n".join(lines)
+
+
 class FakeModelSession:
     """A ModelSession that replays a fixed script of SDK messages per turn.
 
@@ -285,6 +881,10 @@ class FakeModelSession:
     emulated tool (the approval request) runs, and is answered the way the real
     CLI answers a PreToolUse deny: an error result carrying the refusal, in
     place of whatever result the script had for that call. The turn continues.
+
+    ``connector_servers`` are the derived hosted connector entries the caller
+    proxy fronts, headers already materialized. Only a prompt carrying
+    ``CONNECTOR_CALL_MARKER`` reads them; without it nothing is dialled.
     """
 
     def __init__(
@@ -303,8 +903,14 @@ class FakeModelSession:
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
         turn_progress: TurnProgress | None = None,
         tool_access: TurnToolAccess | None = None,
+        connector_servers: Mapping[str, Mapping[str, Any]] | None = None,
+        cwd: str | None = None,
     ) -> None:
         self._script_factory = script_factory or self._default_script
+        # The session's working directory, as the real CLI's ``cwd`` option;
+        # None means the process's own.
+        self._cwd = cwd
+        self._connector_servers: Mapping[str, Mapping[str, Any]] = connector_servers or {}
         # The session's progress holder (ADR 0130); None when the tool is not
         # mounted, which the demo answers as "not shown", like no capability.
         self._turn_progress = turn_progress
@@ -313,6 +919,9 @@ class FakeModelSession:
         # replaced, and the refusal results not yet delivered.
         self._refused_ids: set[str] = set()
         self._pending_refusals: list[UserMessage] = []
+        # Per turn: the calls the permission gate or a hook denied, which a
+        # scripted built-in write must not perform.
+        self._denied_ids: set[str] = set()
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
         self._pre_tool_use_hook = pre_tool_use_hook
@@ -344,6 +953,9 @@ class FakeModelSession:
         """
 
         last = _user_message(self.queries[-1] if self.queries else "")
+        standing = os.environ.get(STANDING_DIRECTIVE_ENV, "").strip()
+        if standing:
+            last = f"{last}\n{standing}"
         match = _APPROVAL_MARKER_RE.search(last)
         if match:
             summary = last[match.end() :].strip() or "unspecified request"
@@ -352,6 +964,29 @@ class FakeModelSession:
             return reversible_turn()
         if PROGRESS_DEMO_MARKER in last:
             return progress_demo_turn()
+        # A model fault outranks write-file and gated-connector-tool: the turn
+        # is the provider refusal and makes no tool call. A bad fault argument
+        # returns the default turn here and does not fall through. publish-changes
+        # is not its own branch; it only extends a parsed write-file turn, which
+        # keeps its place above the resource directives and gated-connector-tool.
+        # A bare publish marker falls through.
+        if MODEL_FAULT_MARKER in last:
+            return model_fault_turn(last)
+        if WRITE_FILE_MARKER in last:
+            if PUBLISH_CHANGES_MARKER in last:
+                return publish_changes_turn(last, self._cwd)
+            return write_file_turn(last, self._cwd)
+        if HOLD_MEMORY_MARKER in last:
+            return hold_memory_turn(last)
+        if FILL_SCRATCH_MARKER in last:
+            return fill_scratch_turn(last)
+        if GATED_CONNECTOR_TOOL_MARKER in last:
+            gated = _parse_gated_connector_tool(last)
+            return gated_connector_tool_turn(*gated) if gated else default_turn()
+        if CONNECTOR_TOOL_MARKER in last:
+            return connector_tool_turn(last)
+        if CONNECTOR_CALL_MARKER in last:
+            return connector_call_turn()
         return default_turn()
 
     async def connect(self) -> None:
@@ -363,21 +998,44 @@ class FakeModelSession:
         self._halted = False
         self._refused_ids = set()
         self._pending_refusals = []
+        self._denied_ids = set()
 
     async def interrupt(self) -> None:
         self.interrupts += 1
         self._interrupted = True
 
     async def receive_turn(self) -> AsyncIterator[Any]:
-        for scripted in self._script_factory():
+        script = deque(self._script_factory())
+        while script:
+            scripted = script.popleft()
             if self._interrupted and self._truncate_on_interrupt:
                 return
             message = self._without_refused_results(scripted)
             if message is None:
                 continue
+            if isinstance(message, _ConnectorCalls):
+                # The answer exists only once every connector has answered, so
+                # the dial expands in place into the turn's closing messages,
+                # which then take the same path as any scripted message.
+                answer = await call_connectors(self._connector_servers)
+                script.extendleft(reversed(_connector_call_answer(answer)))
+                continue
+            if isinstance(message, _ConnectorToolCall):
+                answer = await call_connector_tool(self._connector_servers, message)
+                script.extendleft(reversed(_connector_call_answer(answer)))
+                continue
             if isinstance(message, _Pause):
                 # Read at call time, so a test can shorten the demo's waits.
                 await anyio.sleep(PROGRESS_DEMO_PAUSE_S)
+                continue
+            if isinstance(message, _FileWrite):
+                yield self._perform_write(message)
+                continue
+            if isinstance(message, _HoldMemory):
+                await _hold_memory(message.mib)
+                continue
+            if isinstance(message, _FillScratch):
+                await _fill_scratch(message)
                 continue
             if isinstance(message, _ProgressCall):
                 # A refused call already got its refusal from the gate; the
@@ -404,6 +1062,15 @@ class FakeModelSession:
                 # separate mechanism from the ``_interrupted`` truncation above,
                 # which models an OPERATOR stop and must keep working on its own.
                 return
+
+    def _perform_write(self, call: _FileWrite) -> UserMessage:
+        """Write the file the way the built-in tool would, unless the call was stopped."""
+
+        if call.tool_use_id in self._refused_ids or call.tool_use_id in self._denied_ids:
+            return _tool_result(call.tool_use_id, "The tool use was not run.", is_error=True)
+        with open(call.path, "w", encoding="utf-8") as stream:
+            stream.write(call.content)
+        return _tool_result(call.tool_use_id, f"File created successfully at: {call.path}")
 
     async def _answer_progress(self, call: _ProgressCall) -> UserMessage:
         """The offline fake acknowledges the marker without any network I/O."""
@@ -471,6 +1138,8 @@ class FakeModelSession:
                     {"signal": None},
                 )
                 specific = hook_output.get("hookSpecificOutput", {})
+                if specific.get("permissionDecision") == "deny":
+                    self._denied_ids.add(block.id)
                 if (
                     specific.get("permissionDecision") == "deny"
                     and hook_output.get("continue_") is False
@@ -494,6 +1163,8 @@ class FakeModelSession:
                 decision = await self._can_use_tool(
                     block.name, block.input, ToolPermissionContext(tool_use_id=block.id)
                 )
+                if isinstance(decision, PermissionResultDeny):
+                    self._denied_ids.add(block.id)
                 if isinstance(decision, PermissionResultDeny) and decision.interrupt:
                     return (
                         _tool_result(
@@ -521,6 +1192,9 @@ class FakeModelSession:
         if not kept:
             return None
         return UserMessage(content=kept)
+
+    async def abort(self) -> None:
+        self._interrupted = True
 
     async def close(self) -> None:
         self.connected = False

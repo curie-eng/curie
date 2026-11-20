@@ -56,8 +56,8 @@
       "replace": ", and every available product check passes."
     },
     {
-      "find": "findings was resolved, then the diff review rounds it took, then anything",
-      "replace": "findings was resolved, then anything"
+      "find": "each finding's resolution, then each completed diff review round's verdict\n  and the resolution of its findings. Include",
+      "replace": "each finding's resolution. Include"
     },
     {
       "find": "The platform opens the pull request after\nthe approval, and its checks run there.",

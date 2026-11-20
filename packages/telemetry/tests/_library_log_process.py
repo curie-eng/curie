@@ -25,8 +25,9 @@ SERVICE_CARRIER = "service logger probe 2535"
 LIBRARY_LOGGER = "some_new_library.client"
 
 _SERVICE_LOGGERS = {
-    "mail": "curie_mail_adapter",
+    "mail": "curie_channel_gateway.mail",
     "dispatcher": "curie_dispatcher",
+    "gateway-slack": "curie_channel_gateway.slack",
     "worker": "curie_worker",
     "runner": "curie_runner",
 }
@@ -53,12 +54,12 @@ def _arm(scenario: str) -> Callable[[], None]:
     service_logger = _SERVICE_LOGGERS[scenario]
     replacement = _blocker(service_logger)
     if scenario == "mail":
-        import curie_mail_adapter.run as run
+        import curie_channel_gateway.mail.run as run
 
         run.MailAdapterConfig = replacement  # type: ignore[misc, assignment]
         return run.main
-    if scenario == "dispatcher":
-        import curie_dispatcher.run as run
+    if scenario in {"dispatcher", "gateway-slack"}:
+        import curie_channel_gateway.slack.run as run
 
         run.DispatcherConfig = replacement  # type: ignore[misc, assignment]
         return run.main

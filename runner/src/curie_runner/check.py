@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 # generated `env_keys::CURIE_PLUGIN_DIR`) when it runs this check, so the
 # consumer side reads it from the declaration too rather than retyping it (#488).
 PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
+REVIEWER_MODEL_ENV = BootEnv.env_key("reviewer_model")
 
 CHECK_NAME = "mcp-load"
 CHECK_VERSION = 1
@@ -656,6 +657,8 @@ async def _connect_and_poll(plugins: list[Any], plugin_dir: str) -> list[dict[st
         max_budget_usd=None,
         resume=None,
         # Parity with the session entry point (ADR-0189); this check runs no query.
+        # The reviewer is read as RunnerConfig reads it, unset when empty.
+        reviewer_model=os.environ.get(REVIEWER_MODEL_ENV) or None,
         skills=bundle_skill_names(plugin_dir),
     )
     client = ClaudeSDKClient(options)

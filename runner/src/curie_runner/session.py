@@ -23,6 +23,8 @@ import asyncio
 import contextlib
 import hmac
 import logging
+import math
+import os
 import time
 import uuid
 from collections import OrderedDict
@@ -37,6 +39,7 @@ from aci_protocol import (
     Final,
     Interrupt,
     SessionStatus,
+    SideEffectFlag,
     ToolAccess,
     ToolNote,
     parse_ndjson_line,
@@ -50,7 +53,8 @@ from claude_agent_sdk import (
     TaskNotificationMessage,
     TaskUpdatedMessage,
 )
-from curie_telemetry import record_metric
+from curie_internal.provider_scope import ProviderScope
+from curie_telemetry import agent_metric_label, record_metric
 from opentelemetry.context import Context
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
@@ -94,6 +98,13 @@ from .memory import (
 )
 from .memory_facts import MemoryTurn
 from .otel import RunTracer, _GenerationSpan
+from .personal_auth import (
+    AuthenticationRequiredError,
+    AuthMode,
+    InvalidAuthModeError,
+    PersonalAuthError,
+    effective_auth_mode,
+)
 from .platform_slack.capability import ChannelReadTurn
 from .platform_slack.retention import strip_channel_bodies
 from .progress import ProgressActivity
@@ -109,6 +120,7 @@ from .tool_access import (
 from .tool_names import PLATFORM_SLACK_TOOL_NAMES
 from .translate import (
     TurnState,
+    credential_rejection_condition,
     is_credit_refusal,
     is_usage_refusal,
     map_error_classification,
@@ -163,6 +175,30 @@ _AUTH_REJECTION_SDK_CODE = "authentication_failed"
 # rules) can tell a rejected credential from a transient failure and NOT retry
 # it -- distinct from both a budget halt and a generic runner error.
 AUTH_REJECTED_CLASSIFICATION = "model-credential-rejected"
+# The same terminal outcome in personal mode (#5377, ADR 0268): the owner's
+# grant is missing, refused by personal_auth before the CLI starts, or rejected
+# by the provider. The owner, not the operator, acts on it, so the message names
+# the enrollment and never CURIE_CREDENTIALS. Not retryable, and no service
+# credential is tried in its place. Expiry is never inferred from token shape:
+# only a refusal or a real provider rejection lands here.
+AUTH_REQUIRED_CLASSIFICATION = "authentication-required"
+_ENROLLMENT_FIX = "reconnect or replace the personal Claude enrollment"
+
+
+def _personal_mode() -> bool:
+    """Whether this runner process authenticates with the owner's grant.
+
+    An invalid selector counts as personal: it already refused the launch, and
+    service guidance would point the owner at the platform credential.
+    """
+
+    try:
+        return effective_auth_mode(os.environ, {}) is AuthMode.PERSONAL
+    except InvalidAuthModeError:
+        return True
+
+
+_MISSING_GRANT_REASON = "no personal Claude grant reached this runner"
 
 # Classification tagging the OBSERVE-ONLY reconciliation warning (#544, Decision
 # A2): a resumed policy-gate turn that armed gates yet took no action -- the
@@ -382,6 +418,7 @@ class SessionRunner:
         held_secrets: frozenset[str],
         session_id: str | None = None,
         model: str | None = None,
+        agent_name: str | None = None,
         memory_store: MemoryStore | None = None,
         history_store: TranscriptStore | None = None,
         approval_gate: ApprovalGate | None = None,
@@ -405,7 +442,17 @@ class SessionRunner:
         channel_kind: str | None = None,
         final_answer: FinalAnswerPolicy | None = None,
         initializer: Callable[[], Awaitable[None]] | None = None,
+        session_initializer: Callable[[], Awaitable[None]] | None = None,
+        cleanup_timeout_s: float = _ABANDONED_TURN_DRAIN_TIMEOUT_S,
+        provider_scope: ProviderScope | None = None,
     ) -> None:
+        if not math.isfinite(cleanup_timeout_s) or cleanup_timeout_s <= 0:
+            raise ValueError("runner cleanup timeout must be finite and positive")
+        # The scope of the boot credential (#5426), derived before the harness
+        # rewrote the env; None in fake model mode or when it cannot be named.
+        # Every turn's RetryCondition names it, never the credential.
+        self._provider_scope = provider_scope
+        self._cleanup_timeout_s = cleanup_timeout_s
         self._final_answer = final_answer
         self._factory = session_factory
         # Boot work that must finish before the first session exists, such as
@@ -413,6 +460,8 @@ class SessionRunner:
         # task, which is scheduled at application startup and does not block
         # the listener from binding (#4777).
         self._initializer = initializer
+        self._session_initializer = session_initializer
+        self._boot_ready = False
         self._start_task: asyncio.Task[None] | None = None
         # The attachments this boot found, named on the first prompt sent
         # (#3691): the worker boots a sandbox for every turn that carries a
@@ -462,6 +511,7 @@ class SessionRunner:
         self._trace_name = trace_name
         self._session_id = session_id
         self._model = model
+        self._agent_name = agent_name
         # The memory port (#264). Prior memory is loaded at boot and delivered
         # via the system prompt; this store is the write side for learned records
         # (append + provenance). NullMemoryStore when no CURIE_MEMORY_REF.
@@ -586,7 +636,14 @@ class SessionRunner:
         # The cap and turn size of the last unboundable turn (#3301).
         self._capacity_detail: str | None = None
         self._active_state: TurnState | None = None
+        self._side_effect_emitted = False
         self._turn_ready = False
+
+    @property
+    def side_effect_emitted(self) -> bool:
+        return self._side_effect_emitted or (
+            self._active_state is not None and self._active_state.side_effect_emitted
+        )
 
     @property
     def final_answer_required(self) -> bool:
@@ -599,7 +656,7 @@ class SessionRunner:
 
     @property
     def ready(self) -> bool:
-        return self._started
+        return self._started or self._boot_ready
 
     @property
     def turn_active(self) -> bool:
@@ -1049,16 +1106,30 @@ class SessionRunner:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is not None:
+        if isinstance(exc, PersonalAuthError):
+            # Classified before anything logs it: the class, never the text.
+            logger.error(
+                "session start failed error_class=%s: personal model authentication refused",
+                type(exc).__name__,
+            )
+        elif exc is not None:
             logger.error("session start failed error_class=%s: %s", type(exc).__name__, exc)
 
     async def _initialize(self) -> None:
         if self._initializer is not None:
             await self._initializer()
-        self._advertised_tools = None
-        self._session = self._factory()
-        await self._session.connect()
-        self._started = True
+        # The worker must observe boot readiness before it can deliver inputs
+        # needed to construct the model session (ADR 0278, #5592).
+        self._boot_ready = self._session_initializer is not None
+        try:
+            if self._session_initializer is not None:
+                await self._session_initializer()
+            self._advertised_tools = None
+            self._session = self._factory()
+            await self._session.connect()
+            self._started = True
+        finally:
+            self._boot_ready = False
         logger.info("session started session=%s", self._session_id)
 
     async def start(self) -> None:
@@ -1070,6 +1141,33 @@ class SessionRunner:
         """
 
         await asyncio.shield(self.begin_start())
+
+    async def _cleanup_turn_session(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        stopped = not self._turn_open
+        pending_timeout = self._timeout_interrupt_settled
+        if pending_timeout is not None:
+            stopped = False
+        try:
+            with (
+                anyio.CancelScope(shield=True),
+                contextlib.suppress(Exception),
+                anyio.move_on_after(self._cleanup_timeout_s),
+            ):
+                if pending_timeout is not None:
+                    await pending_timeout.wait()
+                if self._turn_open and not self._timeout_interrupt_delivered:
+                    await session.interrupt()
+                stopped = True
+        finally:
+            if not stopped:
+                logger.error("turn interrupt did not settle; aborting session")
+                self._started = False
+                self._status = SessionStatus.CLASSIFIED_FAILURE
+                with anyio.fail_after(5.0, shield=True):
+                    await session.abort()
 
     async def close(self) -> None:
         if self._attachment_access is not None:
@@ -1394,11 +1492,13 @@ class SessionRunner:
             self._turn_ready = False
             state = TurnState(
                 tool_access=event.tool_access,
+                provider_scope=self._provider_scope,
                 final_answer=(
                     FinalAnswerValidation(self._final_answer)
                     if self._final_answer is not None else None
                 ),
             )
+            self._side_effect_emitted = False
             self._active_state = state
             attachment_opener = (
                 self._attachment_access.begin(event)
@@ -1440,7 +1540,12 @@ class SessionRunner:
                 }
                 elapsed = time.monotonic() - start
                 record_metric("curie.turn.completed", attributes=completed_attributes)
-                record_metric("curie.turn.duration", elapsed, attributes=completed_attributes)
+                record_metric(
+                    "curie.turn.duration", elapsed,
+                    attributes={
+                        **completed_attributes, "agent": agent_metric_label(self._agent_name),
+                    },
+                )
 
             try:
                 with self._tracer.run_span(
@@ -1607,7 +1712,10 @@ class SessionRunner:
                             return
                         self._turn_ready = True
                         async for line in self._drive_turn(event, state, tracker, gen):
-                            if isinstance(parse_ndjson_line(line), Final):
+                            frame = parse_ndjson_line(line)
+                            if isinstance(frame, SideEffectFlag):
+                                self._side_effect_emitted = True
+                            if isinstance(frame, Final):
                                 # The terminal decision is authoritative once the
                                 # Final reaches the consumer, even if it closes
                                 # without requesting the generator's next item.
@@ -1663,12 +1771,27 @@ class SessionRunner:
                                     status=SessionStatus.IDLE_AWAITING_INPUT,
                                 )
                             )
+                        elif isinstance(exc, AuthenticationRequiredError):
+                            # #5377: a missing owner grant, classified before
+                            # anything logs ``exc`` or copies its text; it is
+                            # terminal, not a retryable runner-error, and no
+                            # service credential is tried.
+                            lines = self._personal_auth_halt_lines(_MISSING_GRANT_REASON)
+                            metric_outcome = self._metric_outcome(tracker)
+                            self._set_failed(gen)
+                            terminal_for_log = True
+                            for line in lines:
+                                yield line
                         else:
+                            # Other personal_auth refusals (reviewer model, launch
+                            # refused, invalid mode) keep the runner-error class
+                            # but never log or copy their text: the class only.
+                            refusal = isinstance(exc, PersonalAuthError)
                             logger.error(
                                 "turn failed session=%s error_class=%s: %s duration_ms=%d",
                                 self._session_id,
                                 type(exc).__name__,
-                                exc,
+                                "personal model authentication refused" if refusal else exc,
                                 int((time.monotonic() - start) * 1000),
                             )
                             self._status = SessionStatus.CLASSIFIED_FAILURE
@@ -1676,7 +1799,11 @@ class SessionRunner:
                             self._set_failed(gen)
                             yield to_ndjson_line(
                                 ErrorEvent(
-                                    message=f"runner error: {exc}",
+                                    message=(
+                                        f"runner error: {type(exc).__name__}"
+                                        if refusal
+                                        else f"runner error: {exc}"
+                                    ),
                                     classification="runner-error",
                                 )
                             )
@@ -1706,19 +1833,6 @@ class SessionRunner:
                                 emit_completed_metrics()
                                 terminal_for_log = True
                         finally:
-                            # The SDK serializes this turn's stop and any later
-                            # query onto one locked stdin stream. Wait until the
-                            # timeout attempt settles before cleanup: a normally
-                            # returned stop is already ordered ahead of the next
-                            # query and the CLI cannot latch it for that later
-                            # turn. If the timeout call does not return normally,
-                            # the cleanup path below supplies the safety-net while
-                            # this turn still owns the lock; cancellation before
-                            # the write sends nothing for a later turn to observe.
-                            timeout_settled = self._timeout_interrupt_settled
-                            if timeout_settled is not None:
-                                with anyio.CancelScope(shield=True):
-                                    await timeout_settled.wait()
                             # Retire this turn's control token before cleanup can
                             # await the session-global interrupt. A timeout that
                             # arrives during that await is stale and must not
@@ -1731,19 +1845,8 @@ class SessionRunner:
                                 self._attachment_access.end(attachment_opener)
                             if self._turn_open and self._channel_read is not None:
                                 self._channel_read.end()
-                            # If the turn never reached a terminal final (_turn_open
-                            # still set), the consumer abandoned the stream mid-run
-                            # (client disconnect -> GeneratorExit, or cancellation).
-                            # Stop the SDK so it cannot keep executing tools past the
-                            # released turn lock and bleed into the next turn.
                             try:
-                                if (
-                                    self._turn_open
-                                    and not self._timeout_interrupt_delivered
-                                    and self._session is not None
-                                ):
-                                    with contextlib.suppress(Exception):
-                                        await self._session.interrupt()
+                                await self._cleanup_turn_session()
                             finally:
                                 self._turn_open = False
                                 self._turn_ready = False
@@ -1772,6 +1875,7 @@ class SessionRunner:
                         self._status.value,
                         int((time.monotonic() - start) * 1000),
                     )
+                self._side_effect_emitted = self.side_effect_emitted
                 self._active_state = None
                 if self._attachment_access is not None:
                     self._attachment_access.end(attachment_opener)
@@ -1960,7 +2064,7 @@ class SessionRunner:
                     with contextlib.suppress(Exception):
                         await self._session.interrupt()
                     self._set_failed(gen)
-                    for line in self._auth_halt_lines():
+                    for line in self._auth_halt_lines(message, state.provider_scope):
                         yield line
                     return
                 if isinstance(message, SystemMessage) and message.subtype == "init":
@@ -2901,17 +3005,60 @@ class SessionRunner:
         text = f"{notice}\n\n{final.text}" if final.text else notice
         return final.model_copy(update={"text": text})
 
-    def _auth_halt_lines(self) -> list[str]:
+    def _auth_halt_lines(self, message: object, scope: ProviderScope | None) -> list[str]:
         """The error+final pair emitted when the provider rejects the credential.
 
         Distinct from a budget halt and a generic runner error so downstream
         retry rules do NOT retry a rejected credential (retrying only burns the
         wall). The message names ``CURIE_CREDENTIALS`` since that is the ACI
-        reference the operator must fix; it carries no credential value.
+        reference the operator must fix; it carries no credential value. In
+        personal mode the rejected credential is the owner's grant, so the pair
+        is ``authentication-required`` naming the enrollment instead (#5377).
+
+        ``message`` is the rejecting SDK message. Its provider text decides the
+        ``credential_rejected`` RetryCondition (#5426), named by ``scope``: only
+        a documented 401 carries one, and personal mode never does.
+        """
+
+        if _personal_mode():
+            return self._personal_auth_halt_lines("the provider rejected the personal Claude grant")
+        logger.error(
+            "auth failure session=%s: model credential rejected by provider", self._session_id
+        )
+        self._turn_open = False
+        self._turn_ready = False
+        self._status = SessionStatus.CLASSIFIED_FAILURE
+        condition = (
+            credential_rejection_condition(message, scope)
+            if isinstance(message, AssistantMessage)
+            else None
+        )
+        return [
+            to_ndjson_line(
+                ErrorEvent(
+                    message="model credential rejected by provider (check CURIE_CREDENTIALS)",
+                    classification=AUTH_REJECTED_CLASSIFICATION,
+                    retry_condition=condition,
+                )
+            ),
+            to_ndjson_line(
+                Final(
+                    text="run failed: model credential rejected by provider",
+                    status=SessionStatus.CLASSIFIED_FAILURE,
+                )
+            ),
+        ]
+
+    def _personal_auth_halt_lines(self, reason: str) -> list[str]:
+        """The ``authentication-required`` error+final pair (#5377, ADR 0268).
+
+        ``reason`` is a fixed sentence, never exception text, and the message
+        carries no credential value. Personal mode never names CURIE_CREDENTIALS:
+        no service credential stands in for the owner's grant.
         """
 
         logger.error(
-            "auth failure session=%s: model credential rejected by provider", self._session_id
+            "auth failure session=%s: authentication required (%s)", self._session_id, reason
         )
         self._turn_open = False
         self._turn_ready = False
@@ -2919,13 +3066,13 @@ class SessionRunner:
         return [
             to_ndjson_line(
                 ErrorEvent(
-                    message="model credential rejected by provider (check CURIE_CREDENTIALS)",
-                    classification=AUTH_REJECTED_CLASSIFICATION,
+                    message=f"authentication required: {reason}; {_ENROLLMENT_FIX}",
+                    classification=AUTH_REQUIRED_CLASSIFICATION,
                 )
             ),
             to_ndjson_line(
                 Final(
-                    text="run failed: model credential rejected by provider",
+                    text="run failed: authentication required",
                     status=SessionStatus.CLASSIFIED_FAILURE,
                 )
             ),

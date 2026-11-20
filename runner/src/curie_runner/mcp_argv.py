@@ -3,22 +3,47 @@
 The SDK dumps ``mcp_servers`` onto ``--mcp-config`` as a JSON token, which
 puts hosted-connector credentials on ``/proc/pid/cmdline``. Rewrite that
 token to a ``0600`` tempfile in the default temp dir (``/tmp`` scratch).
+
+The tempfile is readable by the sandbox's same-uid Bash, so runner-materialized
+hosted headers never reach it: they ride ``mcp_header_channel`` relays (#5378).
+The transport refuses, before writing anything, a command line, configuration
+or CLI environment that carries a value one of those relays holds.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import signal
+import sys
 import tempfile
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Collection, Iterable
 from typing import Any
 
+import anyio
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import (
     SubprocessCLITransport as _SDKSubprocessCLITransport,
 )
+from curie_telemetry.redact import held_secret_literals
+
+from .mcp_header_channel import hosted_header_values
+from .mcp_stdio import UnsafeStdioConfiguration
 
 _TMP_PREFIX = "curie-mcp-config-"
+
+
+class HostedHeaderExposure(UnsafeStdioConfiguration):
+    """CLI input would carry a hosted header value only a relay may hold (#5378)."""
+
+
+def _refuse_held(texts: Iterable[str], protected: Collection[str]) -> None:
+    """Raise when any text carries a protected value or its base64 form."""
+
+    literals = held_secret_literals(list(protected))
+    if literals and any(literal in text for text in texts for literal in literals):
+        # Never the value: an exception text can reach a log line.
+        raise HostedHeaderExposure("Claude CLI input carries a relay-held hosted connector header")
 
 
 def _write_mcp_config_file(payload: str) -> str:
@@ -39,11 +64,18 @@ def _write_mcp_config_file(payload: str) -> str:
     return path
 
 
-def offload_mcp_config_argv(cmd: list[str]) -> list[str]:
+def offload_mcp_config_argv(cmd: list[str], *, protected: Collection[str] = ()) -> list[str]:
     """Rewrite two-token JSON ``--mcp-config`` values to ``0600`` temp files (#2635).
 
     Path-like values are left unchanged. Returns a new list.
+
+    ``protected`` is what the hosted-header relays hold
+    (``mcp_header_channel.hosted_header_values``). A command whose tokens, the
+    JSON configuration included, carry one of those values is refused with
+    ``HostedHeaderExposure`` before any file is written (#5378). Every other
+    header, declared stdio credential and model-credential check is unchanged.
     """
+    _refuse_held(cmd, protected)
     rewritten = list(cmd)
     created: list[str] = []
     try:
@@ -87,7 +119,11 @@ class CredentialSafeCLITransport(_SDKSubprocessCLITransport):
     def _build_command(self) -> list[str]:
         self._unlink_mcp_config_tmps()
         cmd = super()._build_command()
-        rewritten = offload_mcp_config_argv(cmd)
+        protected = hosted_header_values(self._options.mcp_servers)
+        # The SDK spawns the CLI with the process env under the options env;
+        # neither may carry what a relay holds (#5378).
+        _refuse_held([*os.environ.values(), *self._options.env.values()], protected)
+        rewritten = offload_mcp_config_argv(cmd, protected=protected)
         offloaded: list[str] = []
         for i, token in enumerate(cmd):
             if token == "--mcp-config" and i + 1 < len(cmd):
@@ -95,12 +131,36 @@ class CredentialSafeCLITransport(_SDKSubprocessCLITransport):
                 if new_val != cmd[i + 1]:
                     offloaded.append(new_val)
         self._mcp_config_tmps = offloaded
-        return rewritten
+        return [
+            sys.executable,
+            "-I",
+            "-c",
+            "import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])",
+            *rewritten,
+        ]
+
+    async def stop_process_group(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        with anyio.fail_after(5, shield=True):
+            await process.wait()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
 
     async def close(self) -> None:
+        process = self._process
         try:
             await super().close()
         finally:
+            if process is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
             # SDK returns early when no process was spawned; still unlink (#2635).
             self._unlink_mcp_config_tmps()
 

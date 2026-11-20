@@ -4,6 +4,14 @@ Date: 2026-11-02
 
 Status: Accepted
 
+**Partially amended by [ADR 0274](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0274 adds the wake admission path to decision 2's writer inventory. External
+wake admission is authenticated by a hook-scoped key rather than an operator key
+and creates declaration-derived run rows. Completion remains a terminal update.
+The targeted scheduled-authority predicate and boundary rechecks remain
+unchanged.
+
 Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
 approval by Junwon Jung (jw3329), including merging alongside its realizing
 code path, recorded in the publishing pull request ([#5309](https://github.com/curie-eng/curie/pull/5309)).

@@ -44,7 +44,36 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
     # Workspace recovery reads require the 0141 outcome ledger.
     # The 0145 join requires both the stable deadline backport (0140) and 0144.
-    assert window == {"schema_min": "0147", "schema_head": "0147"}
+    # The UI evidence reconciler reads the 0146 tables, and the 0148 join
+    # also requires main's deleted issue cancellation (0147).
+    # 0149 stores webhook provenance and a wake-key generation and does not
+    # raise the floor. Dynamic approval answers require the 0156 answer gate,
+    # and the factory Slack progress loop reads the 0157 tables. GitHub host
+    # namespaces require 0158. Execution owner reads require 0159, personal
+    # custody reads and enrollment fences require 0160, agent
+    # version reads select the 0162 result policy columns, factory CI
+    # observations require the 0163 table, cached facts and request
+    # delivery require the 0164 tables, and Slack kickoff thread origin
+    # reads require 0166.
+    # Owner coding profiles and tenant policies require 0165, which stays below
+    # this floor. Execution request reads select the 0167 completion contract
+    # columns. Intake notice storage requires 0168, which stays below this floor.
+    # Requester selection columns require 0169, which stays below this floor.
+    # Refusal posts require 0170, which stays below this floor.
+    # Triage handoff storage requires 0171, which stays below this floor.
+    # Factory retry allowance columns require 0172, which stays below this floor.
+    # Factory resource gate columns require 0174, which stays below this floor.
+    # Publication recovery requests require 0175, which stays below this floor.
+    # Operator retry records require 0176.
+    # Enrollment inactive intake notices require 0177.
+    # The factory Slack progress card requires 0178.
+    # GitHub account link states and display labels require 0179.
+    # Slack account display labels require 0180.
+    # Guarded automatic retry dispatch times require 0182.
+    # Grant notices require 0183.
+    # Factory question rounds require 0184.
+    # Learned memory rules require 0185.
+    assert window == {"schema_min": "0185", "schema_head": "0185"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -75,7 +104,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-30:] == [
+    assert data["revisions"][-65:] == [
         "0095",
         "0096",
         "0097",
@@ -105,7 +134,42 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0143",
         "0144",
         "0145",
+        "0146",
         "0147",
+        "0148",
+        "0149",
+        "0151",
+        "0152",
+        "0153",
+        "0154",
+        "0156",
+        "0157",
+        "0158",
+        "0159",
+        "0160",
+        "0162",
+        "0163",
+        "0164",
+        "0165",
+        "0166",
+        "0167",
+        "0168",
+        "0169",
+        "0170",
+        "0171",
+        "0172",
+        "0173",
+        "0174",
+        "0175",
+        "0176",
+        "0177",
+        "0178",
+        "0179",
+        "0180",
+        "0182",
+        "0183",
+        "0184",
+        "0185",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -131,6 +195,42 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0143"] == "expand"
     assert kinds["0144"] == "expand"
     assert kinds["0145"] == "expand"
+    assert kinds["0146"] == "expand"
+    assert kinds["0147"] == "expand"
+    assert kinds["0148"] == "expand"
+    assert kinds["0149"] == "expand"
+    assert kinds["0151"] == "expand"
+    assert kinds["0152"] == "expand"
+    assert kinds["0153"] == "expand"
+    assert kinds["0154"] == "expand"
+    assert kinds["0156"] == "expand"
+    assert kinds["0157"] == "expand"
+    assert kinds["0158"] == "expand"
+    assert kinds["0159"] == "expand"
+    assert kinds["0160"] == "expand"
+    assert kinds["0162"] == "expand"
+    assert kinds["0163"] == "expand"
+    assert kinds["0164"] == "expand"
+    assert kinds["0165"] == "expand"
+    assert kinds["0166"] == "expand"
+    assert kinds["0167"] == "expand"
+    assert kinds["0168"] == "expand"
+    assert kinds["0169"] == "expand"
+    assert kinds["0170"] == "expand"
+    assert kinds["0171"] == "expand"
+    assert kinds["0172"] == "expand"
+    assert kinds["0173"] == "expand"
+    assert kinds["0174"] == "expand"
+    assert kinds["0175"] == "expand"
+    assert kinds["0176"] == "expand"
+    assert kinds["0177"] == "expand"
+    assert kinds["0178"] == "expand"
+    assert kinds["0179"] == "expand"
+    assert kinds["0180"] == "expand"
+    assert kinds["0182"] == "expand"
+    assert kinds["0183"] == "expand"
+    assert kinds["0184"] == "expand"
+    assert kinds["0185"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -141,6 +241,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
         (Path(__file__).parent / "fixtures/source_schema_prior_windows.json").read_text()
     )
     actual = catalog()["windows"]
+    assert actual["0.15.3"] == {"schema_min": "0147", "schema_head": "0147"}
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
     # `curie dev bump-version` registers a window at the cut, so no window may
@@ -158,7 +259,7 @@ def _release_key(version: str) -> tuple[int, int, int, int, int]:
     return int(major), int(minor), int(patch), int(rc is None), int(rc or 0)
 
 
-def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
+def test_released_0076_startup_refuses_without_migrating_then_candidate_starts(
     isolated_migration_db: IsolatedMigrationDb, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
@@ -187,7 +288,7 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
                 pass
         assert current_revision() == "0100"
         command.upgrade(alembic_config(), load_window().schema_head)
-        assert current_revision() == load_window().schema_head
+        assert current_revision() == "0185"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200
@@ -196,7 +297,9 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
         get_settings.cache_clear()
 
 
-@pytest.mark.parametrize("source", ["0105", "0107", "0106", "0123", "0130", "0131", "0140", "0144"])
+@pytest.mark.parametrize(
+    "source", ["0105", "0107", "0106", "0123", "0130", "0131", "0140", "0144", "0146", "0147"]
+)
 def test_both_train_heads_upgrade_without_losing_existing_rows(
     source: str, isolated_migration_db: IsolatedMigrationDb
 ) -> None:
@@ -212,9 +315,21 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
             pass
     assert current_revision() == source
 
+    if source == "0147":
+        assert sql_rows("SELECT to_regclass('curie.publication_ui_evidence')") == [(None,)]
+    if source == "0146":
+        assert (
+            "issue_deleted"
+            not in sql_rows(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = 'curie.execution_requests'::regclass "
+                "AND conname = 'execution_requests_state_shape_ck'"
+            )[0][0]
+        )
+
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0147"
+    assert current_revision() == "0185"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
@@ -229,6 +344,47 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
     assert {("agent_channels", "trigger_label"), ("work_items", "trigger_label")} <= columns
     assert {("attachment_catalogs", "id"), ("attachment_references", "id")} <= columns
     assert ("execution_requests", "last_start_failure_detail") in columns
+    assert {
+        ("publication_ui_evidence", "publication_id"),
+        ("publication_ui_evidence_images", "content"),
+        ("publication_lineage_ui_evidence", "ref_commit_sha"),
+    } <= columns
+    assert (
+        "issue_deleted"
+        in sql_rows(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = 'curie.execution_requests'::regclass "
+            "AND conname = 'execution_requests_state_shape_ck'"
+        )[0][0]
+    )
+    assert sql_rows(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = 'curie' "
+        "AND indexname IN ('ix_publication_ui_evidence_status_lease', "
+        "'ix_publication_ui_evidence_lineage_id') ORDER BY indexname"
+    ) == [("ix_publication_ui_evidence_lineage_id",), ("ix_publication_ui_evidence_status_lease",)]
+    assert {
+        ("work_items", "model_auth_mode"),
+        ("execution_requests", "owner_principal_id"),
+        ("personal_claude_enrollments", "generation"),
+        ("personal_claude_custody", "secret_uid"),
+        ("factory_slack_threads", "origin"),
+        ("agent_versions", "result_policy_digest"),
+        ("factory_tracker_result_grants", "output_identity"),
+        ("factory_tracker_result_deliveries", "proposal_sha256"),
+        ("factory_tracker_result_deliveries", "create_attempted_at"),
+        ("factory_tracker_result_receipts", "result_comment_id"),
+        ("factory_tracker_result_artifacts", "content"),
+        ("requester_coding_profiles", "revision"),
+        ("requester_coding_profiles", "sha256"),
+        ("requester_coding_policies", "enabled"),
+        ("execution_requests", "completion_contract"),
+        ("execution_requests", "result_policy_digest"),
+        ("execution_requests", "model_session_reserved_at"),
+        ("agent_versions", "result_policy"),
+        ("factory_tracker_result_grants", "source_content_sha256"),
+        ("factory_tracker_result_deliveries", "origin"),
+        ("factory_tracker_result_receipts", "result_comment_url"),
+    } <= columns
     assert {
         ("tenant_identity_providers", "http_selection"),
         ("tenant_identity_providers", "lifecycle_generation"),

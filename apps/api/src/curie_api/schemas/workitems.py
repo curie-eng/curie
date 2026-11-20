@@ -1,9 +1,19 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict
+from curie_internal.requester_coding_instructions import AbsenceReason
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+)
+
+from curie_api.factory_retry_policy import RetrySafety
 
 
 class IssueReadContextMint(BaseModel):
@@ -12,6 +22,10 @@ class IssueReadContextMint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     execution_request_id: uuid.UUID
+    # True only for a publication recovery request's own execute delivery
+    # (#5429): its runner learns from the capability to construct no model
+    # session. A later CI fix or review turn on the same request mints false.
+    publication_recovery: StrictBool
 
 
 class IssueReadContext(BaseModel):
@@ -38,6 +52,86 @@ class IssueReadResult(BaseModel):
     execution_seconds: int
 
 
+class ExecutionBindingOut(BaseModel):
+    """The execution a runner process is bound to (ADR 0278, #5592).
+
+    The runner checks the worker's requester context envelope against it, and
+    its presence tells the runner to wait for one before any model work.
+    """
+
+    tenant_id: uuid.UUID
+    work_item_id: uuid.UUID
+    execution_request_id: uuid.UUID
+    execution_fence: int
+
+
+class CompletionContractOut(BaseModel):
+    """How the execution completes (ADR 0277, #5586): by a pull request
+    (``implementation``), by one delivered tracker result (``tracker_result``),
+    or by publishing a retained publication candidate with no model run
+    (``publication_recovery``, #5429).
+
+    ``result_kinds`` are the kinds the deployed policy allows and
+    ``session_usd_allowance`` the per-session model allowance in USD (the
+    agent's dollar limit, else 5); both empty for ``implementation`` and
+    ``publication_recovery``. A ``publication_recovery`` answer also carries
+    no ``execution``: that process runs no model, so it waits for no requester
+    context.
+    """
+
+    completion_contract: Literal["implementation", "tracker_result", "publication_recovery"]
+    result_kinds: list[str]
+    session_usd_allowance: float | None
+    execution: ExecutionBindingOut | None = None
+
+
+class TrackerResultSubmission(BaseModel):
+    """The runner result tool's call: one typed proposal, validated by the API
+    (`curie_api.factory_tracker_results.parse_proposal`)."""
+
+    proposal: Any = Field(description="A ticket or findings proposal object.")
+
+
+class TrackerResultOut(BaseModel):
+    """The accepted result after one inline delivery attempt.
+
+    ``state`` ``owed`` means the platform keeps retrying until the delivery
+    deadline. ``result_comment_url`` is the source issue's marked result
+    comment and ``ticket_url`` the published ticket, each once delivered.
+    """
+
+    result_kind: Literal["ticket", "findings"]
+    state: Literal["owed", "delivered", "failed"]
+    result_comment_url: str | None
+    ticket_url: str | None
+
+
+class QuestionsSubmission(BaseModel):
+    """The runner question tool's call (#5785): what the investigation found and
+    the numbered questions. The API checks the bounds and composes the comment;
+    input outside them, a missing field, a field of another type or a body that
+    is not one JSON object included, is refused 409 ``invalid_questions`` with
+    nothing echoed, as is a comment that would pass 25,000 characters once
+    composed and redacted."""
+
+    summary: Any = Field(
+        default=None,
+        description="What the investigation found, 1 to 4,000 characters, including a "
+        "reproduction result when there is one.",
+    )
+    questions: Any = Field(
+        default=None,
+        description="1 to 10 questions, each 1 to 1,000 characters with no blank line.",
+    )
+
+
+class QuestionsOut(BaseModel):
+    """The posted round: ``round`` of ``rounds_limit`` for the WorkItem."""
+
+    round: int
+    rounds_limit: int
+
+
 WorkItemOutcomeState = Literal[
     "queued",
     "waiting",
@@ -52,6 +146,50 @@ WorkItemOutcomeState = Literal[
     "completed_unpublished",
 ]
 WorkItemCiState = Literal["passing", "failing", "pending", "none", "unavailable", "not_applicable"]
+# Who an execution's model calls are billed to (#5376, ADR 0268).
+ModelAuthMode = Literal["service", "personal"]
+RetryKind = Literal["owner_loss", "failure"]
+
+
+class ResourceGateOut(BaseModel):
+    """The raised limit a blocked retry of a resource failure waits for (#5427).
+
+    ``failed_limit`` is the limit the failed attempt actually had; the retry
+    starts only when the limit delivered to its own sandbox is larger.
+    ``volume`` names the scratch volume for a scratch gate.
+    """
+
+    condition: str
+    dimension: Literal[
+        "memory",
+        "ephemeral_storage",
+        "scratch",
+        "max_turns",
+        "history_capacity",
+        "execution_seconds",
+    ]
+    volume: str | None
+    failed_limit: int
+
+
+class CodingInstructionsMetadata(BaseModel):
+    """Public selection metadata; the private snapshot text is never serialized."""
+
+    state: Literal["absent", "selected"]
+    absence_reason: AbsenceReason | None = None
+    revision: int | None = None
+    sha256: str | None = None
+    format_version: Literal[1] | None = None
+
+
+class MemoryRulesMetadata(BaseModel):
+    """The learned rules pinned at admission (#5798): numbers and digest, never the text."""
+
+    state: Literal["absent", "selected"]
+    count: int = 0
+    rule_numbers: list[int] = Field(default_factory=list)
+    sha256: str | None = None
+    format_version: Literal[1] | None = None
 
 
 class WorkItemRequestOut(BaseModel):
@@ -70,6 +208,30 @@ class WorkItemRequestOut(BaseModel):
     capacity_deferrals: int
     last_deferral_reason: str | None
     last_start_failure_detail: str | None
+    # The owner tuple this request snapshotted at insertion (#5376).
+    tenant_id: uuid.UUID | None = None
+    model_auth_mode: ModelAuthMode = "service"
+    owner_principal_id: uuid.UUID | None = None
+    enrollment_generation: int | None = None
+    coding_instructions_selection_id: uuid.UUID | None = None
+    coding_instructions_evidence: Literal["none", "pending", "applied", "failed"] = "none"
+    # Whether this request's runner loaded the WorkItem's pinned learned rules (#5798).
+    memory_rules_evidence: Literal["none", "pending", "applied", "failed"] = "none"
+    # Automatic retry lineage (ADR 0269): the request this one retries, and
+    # whether it was admitted after owner loss or after an ordinary failure.
+    retry_of_request_id: uuid.UUID | None
+    retry_kind: RetryKind | None
+    # The earliest time the reconciler dispatches the request; a blocked retry
+    # stores its waiting deadline here.
+    dispatch_not_before: datetime
+    # The named condition a blocked retry waits for; null when nothing blocks it.
+    blocked_on: str | None
+    # The raised limit a resource gated retry waits for; null when ungated.
+    resource_gate: ResourceGateOut | None
+    # The worker's side effect fact from this request's finish; null when the
+    # request did not end through a worker finish or its worker sent no fact,
+    # as a worker from an earlier release does.
+    retry_safety: RetrySafety | None
 
 
 class WorkItemPrOut(BaseModel):
@@ -163,7 +325,7 @@ class WorkItemStageOut(BaseModel):
 
 
 class WorkItemProgressOut(BaseModel):
-    """The latest execution's progress, derived by ``factory_progress.phase_view``."""
+    """The latest execution's progress, derived by ``factory_phase_view.phase_view``."""
 
     current: str | None
     note: str | None
@@ -195,6 +357,17 @@ class WorkItemRepositoryOut(BaseModel):
     path: str
 
 
+class WorkItemCiObservationOut(BaseModel):
+    """Item-level observation; the failed execution remains historical truth."""
+
+    status: Literal["observing", "completed", "expired", "invalidated"]
+    head_sha: str
+    reason: str | None
+    created_at: datetime
+    expires_at: datetime
+    observed_at: datetime | None
+
+
 class WorkItemOutcomeOut(BaseModel):
     id: uuid.UUID
     agent_id: uuid.UUID
@@ -213,14 +386,198 @@ class WorkItemOutcomeOut(BaseModel):
     correctness: WorkItemCorrectnessOut
     # Null on the list route: CI is observed live on the detail route only.
     ci: WorkItemCiOut | None
+    ci_observation: WorkItemCiObservationOut | None = None
     requests: list[WorkItemRequestOut]
     # ``derive_outcome`` stays pure and leaves these null; ``_views`` fills
     # them from the factory status comment rows and phase reports.
     title: str | None = None
     progress: WorkItemProgressOut | None = None
+    # Who the WorkItem's executions run as (#5376, ADR 0268): the tenant, the
+    # mode, and for a personal WorkItem its owner principal and the bound
+    # enrollment generation. Identifiers only, never a credential.
+    tenant_id: uuid.UUID | None = None
+    model_auth_mode: ModelAuthMode = "service"
+    owner_principal_id: uuid.UUID | None = None
+    enrollment_generation: int | None = None
+    requester_principal_id: uuid.UUID | None = None
+    coding_instructions: CodingInstructionsMetadata
+    memory_rules: MemoryRulesMetadata
+    # The WorkItem's lifetime automatic retry allowance (ADR 0269): slots spent
+    # by owner loss and ordinary failures together, and the limit.
+    automatic_retries_used: int
+    automatic_retry_limit: int
 
 
 class WorkItemOutcomeList(BaseModel):
     items: list[WorkItemOutcomeOut]
     limit: int
     truncated: bool
+
+
+# Every answer the factory Slack steering route gives (#5414). Each refusal is
+# final for its delivery; only an unavailable code host answers 503.
+FactorySlackSteerOutcome = Literal[
+    "admitted",
+    "not_mapped",
+    "receipt_mismatch",
+    "sender_unverified",
+    "code_host_identity_missing",
+    "code_host_identity_ambiguous",
+    "code_host_identity_unsupported",
+    "code_host_mismatch",
+    "repository_mismatch",
+    "not_authorized",
+    "work_item_cancelled",
+    "lineage_closed",
+    "no_pull_request",
+    "pull_request_not_open",
+    "pull_request_branch_mismatch",
+    "authority_changed",
+    "objective_too_large",
+    "admission_refused",
+]
+
+
+class FactorySlackSteerIn(BaseModel):
+    """One threaded Slack mention in a factory run's root, as the worker consumed it.
+
+    ``receipt`` is the dispatcher's verified mention receipt
+    (``curie_internal.slack_mention_receipt.SlackMentionReceipt``), validated by
+    the route so a malformed one is a refusal, not a retry. ``author`` is the
+    turn's Slack user id; the receipt must name the same delivery, route and
+    sender.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    delivery_id: str = Field(min_length=1, max_length=256)
+    channel_identity: str = Field(min_length=1, max_length=256)
+    channel: str = Field(min_length=1, max_length=64)
+    root_ts: str = Field(min_length=1, max_length=64)
+    author: str = Field(min_length=1, max_length=64)
+    receipt: dict[str, Any]
+
+
+class FactorySlackSteerOut(BaseModel):
+    outcome: FactorySlackSteerOutcome
+    request_id: str | None = None
+    request_status: str | None = None
+    replayed: bool = False
+    pull_request_url: str | None = None
+    reason: str | None = None
+
+
+# Every answer the factory Slack kickoff route gives (#5380). ``not_factory``
+# sends the mention down the ordinary chat path; every other refusal is final
+# for its delivery and is replied in its thread. Only an unavailable code host
+# or store answers 503.
+FactorySlackKickoffOutcome = Literal[
+    "admitted",
+    "not_factory",
+    "receipt_mismatch",
+    "test_driver_refused",
+    "binding_missing",
+    "binding_ambiguous",
+    "link_missing",
+    "link_multiple",
+    "link_malformed",
+    "link_host_unsupported",
+    "link_pull_request",
+    "sender_unverified",
+    "enrollment_inactive",
+    "issue_inaccessible",
+    "issue_closed",
+    "publication_exists",
+    "base_refused",
+    "thread_conflict",
+    "authority_changed",
+    "admission_refused",
+]
+
+
+class FactorySlackKickoffIn(BaseModel):
+    """One Slack mention linking an issue, at a channel root or in a thread no
+    factory run owns, as the worker consumed it.
+
+    ``receipt`` is the dispatcher's verified mention receipt
+    (``curie_internal.slack_mention_receipt.SlackMentionReceipt``, version 1
+    for a person, 2 for a declared test driver), validated by the route so a
+    malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
+    the message's own at root. ``author`` is the turn's Slack user id; the
+    receipt must name the same delivery, route and sender.
+    ``placeholder_ts`` is the ts of the dispatcher's placeholder reply under
+    the mention, None when it posted none; an admission stores it as the
+    run's progress card.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    delivery_id: str = Field(min_length=1, max_length=256)
+    channel_identity: str = Field(min_length=1, max_length=256)
+    channel: str = Field(min_length=1, max_length=64)
+    root_ts: str = Field(min_length=1, max_length=64)
+    author: str = Field(min_length=1, max_length=64)
+    receipt: dict[str, Any]
+    placeholder_ts: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class FactorySlackKickoffOut(BaseModel):
+    """The kickoff decision. ``reason`` is the resolver's reason for
+    ``sender_unverified``, the base refusal code for ``base_refused`` and the
+    admission refusal code for ``admission_refused``."""
+
+    outcome: FactorySlackKickoffOutcome
+    request_id: str | None = None
+    request_status: str | None = None
+    work_item_id: str | None = None
+    issue_url: str | None = None
+    replayed: bool = False
+    reason: str | None = None
+    connect_url: str | None = None
+    plan_url: str | None = None
+
+
+# The operator's reason for a retry, stripped before validation, hashing and storage.
+RetryReason = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+
+
+class WorkItemRetryIn(BaseModel):
+    """An operator's request to admit one fresh request for a failed WorkItem (#5431).
+
+    ``request_id`` is the operator's idempotency key. ``expected_version`` is
+    the WorkItem version the operator read. ``dry_run`` answers the exact plan
+    and writes nothing, reserving neither the key nor a retry slot.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: uuid.UUID
+    expected_version: int = Field(ge=1)
+    reason: RetryReason
+    dry_run: StrictBool = False
+
+
+class WorkItemRetryOut(BaseModel):
+    """The admission an operator retry made, would make (dry run) or made before (replay).
+
+    ``disposition`` is the successor's kind: ``implementation`` reruns the
+    work, ``publication_recovery`` publishes the retained candidate without a
+    model run. ``retries_used`` counts the slot this admission spends.
+    ``successor_request_id`` and ``recorded_at`` are null in a dry run.
+    """
+
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    dry_run: bool
+    replayed: bool
+    disposition: Literal["implementation", "publication_recovery"]
+    predecessor_request_id: uuid.UUID
+    predecessor_cause: str
+    successor_request_id: uuid.UUID | None
+    successor_dispatch_not_before: datetime
+    successor_blocked_on: str | None
+    work_item_version: int
+    retries_used: int
+    retry_limit: int
+    actor_kind: Literal["platform_key", "console_session"]
+    recorded_at: datetime | None

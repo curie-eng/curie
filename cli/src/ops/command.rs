@@ -773,7 +773,7 @@ mod tests {
             "apiVersion: v1\nkind: Config\ncurrent-context: ambient-ctx\n\
              contexts:\n\
              - name: ambient-ctx\n  context:\n    cluster: ambient-cluster\n\
-             - name: pin-ctx\n  context:\n    cluster: pinned-cluster\n",
+             - name: scratch-cluster\n  context:\n    cluster: pinned-cluster\n",
         )
         .expect("write synthetic kubeconfig");
         let output =
@@ -841,17 +841,17 @@ mod tests {
         match mode.as_str() {
             "unpinned" => assert_display(None),
             "pinned" => {
-                let target = crate::kube_context::pin_for_cluster_command(Some("pin-ctx"))
+                let target = crate::kube_context::pin_for_cluster_command(Some("scratch-cluster"))
                     .expect("pin synthetic target")
                     .expect("resolved target");
-                assert_eq!(target.context, "pin-ctx");
-                assert_display(Some("pin-ctx"));
+                assert_eq!(target.context, "scratch-cluster");
+                assert_display(Some("scratch-cluster"));
                 std::env::set_var("KUBECONFIG", kubeconfig);
                 assert_eq!(
                     crate::kube_context::current_context_name().as_deref(),
                     Some("ambient-ctx")
                 );
-                assert_display(Some("pin-ctx"));
+                assert_display(Some("scratch-cluster"));
             }
             _ => panic!("unknown display driver mode: {mode}"),
         }
@@ -867,8 +867,10 @@ mod tests {
             let before = command.clone();
             let child_before = command.tokio_command();
             assert_eq!(
-                command.display_with_context(Some("pin-ctx")),
-                format!("'PRIVATE=private-***' VISIBLE=yes {program} {flag} pin-ctx version"),
+                command.display_with_context(Some("scratch-cluster")),
+                format!(
+                    "'PRIVATE=private-***' VISIBLE=yes {program} {flag} scratch-cluster version"
+                ),
             );
             assert_eq!(command, before);
             assert_eq!(command.argv(), ["version"]);
@@ -883,7 +885,10 @@ mod tests {
             );
         }
         let docker = OpsCommand::new("docker", vec![plain("ps")]);
-        assert_eq!(docker.display_with_context(Some("pin-ctx")), "docker ps");
+        assert_eq!(
+            docker.display_with_context(Some("scratch-cluster")),
+            "docker ps"
+        );
         for program in ["helm", "kubectl"] {
             let command = OpsCommand::new(program, vec![plain("version")]);
             assert_eq!(
@@ -901,10 +906,10 @@ mod tests {
                 vec![plain("version"), plain(format!("{flag}=already-selected"))],
             ] {
                 let command = OpsCommand::new(program, args);
-                let rendered = command.display_with_context(Some("pin-ctx"));
+                let rendered = command.display_with_context(Some("scratch-cluster"));
                 assert_eq!(rendered.matches(flag).count(), 1, "{rendered}");
                 assert!(rendered.contains("already-selected"), "{rendered}");
-                assert!(!rendered.contains("pin-ctx"), "{rendered}");
+                assert!(!rendered.contains("scratch-cluster"), "{rendered}");
             }
         }
         let command = OpsCommand::new(
@@ -921,7 +926,10 @@ mod tests {
         );
         let rendered = command.display_with_context(Some("ctx '$;\\name"));
         assert!(
-            rendered.starts_with(r"helm --kube-context 'ctx '\''$;\name' upgrade"),
+            rendered.starts_with(&format!(
+                "helm --kube-context {} upgrade",
+                r"'ctx '\''$;\name'"
+            )),
             "{rendered}"
         );
         assert!(rendered.contains("***"), "{rendered}");

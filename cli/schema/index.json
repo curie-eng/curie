@@ -31,7 +31,7 @@
       "result": "AllTargetsDeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "ApplyOutput",
@@ -43,7 +43,13 @@
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": "2.4"
+      "version": "2.6"
+    },
+    {
+      "result": "RequesterIdentityOutput",
+      "kind": "CliOutput",
+      "schema": "approvals.schema.json",
+      "version": "2.6"
     },
     {
       "result": "BudgetOutput",
@@ -118,6 +124,12 @@
       "version": "1.1"
     },
     {
+      "result": "CodingInstructionsOutput",
+      "kind": "CliOutput",
+      "schema": "coding-instructions.schema.json",
+      "version": "1.1"
+    },
+    {
       "result": "CommsOutput",
       "kind": "CliOutput",
       "schema": "comms.schema.json",
@@ -136,6 +148,12 @@
       "version": "2.0"
     },
     {
+      "result": "FactoryTriageRenderOutput",
+      "kind": "CliOutput",
+      "schema": "factory-triage-render.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "DeleteOutput",
       "kind": "CliOutput",
       "schema": "delete.schema.json",
@@ -145,7 +163,7 @@
       "result": "DeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "DiffOutput",
@@ -175,7 +193,7 @@
       "result": "EvalOutput",
       "kind": "CliOutput",
       "schema": "eval.schema.json",
-      "version": "1.3"
+      "version": "1.4"
     },
     {
       "result": "FactoryAppRegistrationOutput",
@@ -188,6 +206,12 @@
       "kind": "CliOutput",
       "schema": "factory.schema.json",
       "version": "2.0"
+    },
+    {
+      "result": "FactoryExplainOutput",
+      "kind": "CliOutput",
+      "schema": "factory-explain.schema.json",
+      "version": "1.0"
     },
     {
       "result": "FactoryIntakeOutput",
@@ -266,6 +290,12 @@
       "kind": "CliOutput",
       "schema": "memory.schema.json",
       "version": "2.2"
+    },
+    {
+      "result": "MigrationOutput",
+      "kind": "CliOutput",
+      "schema": "migrate-protected-process.schema.json",
+      "version": "1.0"
     },
     {
       "result": "MemoryOutput",
@@ -436,6 +466,12 @@
       "version": "1.1"
     },
     {
+      "result": "SubscriptionOutput",
+      "kind": "CliOutput",
+      "schema": "subscription.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "SchedulesOutput",
       "kind": "CliOutput",
       "schema": "schedules.schema.json",
@@ -445,7 +481,7 @@
       "result": "HookFireOutput",
       "kind": "CliOutput",
       "schema": "hook-fire.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "SreBotRenderOutput",
@@ -460,16 +496,28 @@
       "version": "1.0"
     },
     {
+      "result": "WakeKeyOutput",
+      "kind": "CliOutput",
+      "schema": "wake-key.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "WorkItemRetryOutput",
+      "kind": "CliOutput",
+      "schema": "work-item-retry.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "WorkItemsOutput",
       "kind": "CliOutput",
       "schema": "work-items.schema.json",
-      "version": "2.0"
+      "version": "2.2"
     },
     {
       "result": "all_targets_deploy_failure_json",
       "kind": "builder",
       "schema": "deploy.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "error_json",
@@ -481,7 +529,7 @@
       "result": "eval_json",
       "kind": "builder",
       "schema": "eval.schema.json",
-      "version": "1.3"
+      "version": "1.4"
     },
     {
       "result": "message_awaiting_approval_json",

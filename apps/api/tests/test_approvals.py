@@ -34,17 +34,17 @@ from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
-from curie_api.models import Approval
+from curie_api.models import Agent, Approval
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
 from curie_api.routers import approvals as approvals_module
 from curie_api.slack_approvers import SlackApproverSetSelector
-from curie_api.slack_usergroups import SlackUserGroupClient
 from curie_api.sweeper import (
     observe_pending_approvals,
     run_expiry_sweeper,
     sweep_expired_approvals,
 )
+from curie_channel_gateway.slack.groups import SlackUserGroupClient
 from curie_internal.sandbox_token import mint
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -52,6 +52,8 @@ from curie_telemetry import (
     operation_span,
     record_metric,
 )
+from curie_telemetry.metrics import record_metric as validate_record_metric
+from curie_telemetry.metrics import reset_bounded_labels
 from curie_telemetry.tracing import configure_tracer_provider
 from curie_test_support.valkey import (
     connect_or_skip,
@@ -59,6 +61,8 @@ from curie_test_support.valkey import (
 from fastapi.testclient import TestClient
 from opentelemetry import context as otel_context
 from opentelemetry import trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -1129,6 +1133,12 @@ def test_stored_factory_approval_resume_wake_adopts_the_same_running_request(
                 "owner": "factory-worker", "generation": 1,
                 "claim_name": "acme-factory-claim", "sandbox_name": "acme-factory-sandbox",
                 "context": acquired.json()["context"],
+                "delivered_limits": {
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             },
             headers=worker,
         )
@@ -1644,6 +1654,21 @@ def test_gate_kind_check_constraint_rejects_unknown_values(
         asyncio.run(_insert("bogus"))
 
 
+def _historical_unbound_route_approval(
+    client: TestClient, auth: dict[str, str], payload: dict[str, Any]
+) -> dict[str, Any]:
+    refused = client.post("/approvals", json=payload, headers=auth)
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == "approval route is missing or malformed"
+    created = client.post("/approvals", json={**payload, "route": None}, headers=auth)
+    assert created.status_code == 201, created.text
+    approval_id = created.json()["id"]
+    _requester_edit(approval_id, route=payload["route"])
+    record = client.get(f"/approvals/{approval_id}", headers=auth)
+    assert record.status_code == 200, record.text
+    return record.json()
+
+
 def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -1672,11 +1697,11 @@ def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     authority.
     """
 
-    created = approvals_client.post(
-        "/approvals",
-        json=_payload(route="managers", card_channel="C_MGRS"),
-        headers=auth_headers,
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client,
+        auth_headers,
+        _payload(route="managers", card_channel="C_MGRS"),
+    )
     assert created["route"] == "managers"
     assert created["card_channel"] == "C_MGRS"
     assert created["agent_id"] is None
@@ -3108,9 +3133,9 @@ def test_agentless_routed_approval_fails_closed_without_a_binding(
     so a routed agentless approval fails closed too.
     """
 
-    created = approvals_client.post(
-        "/approvals", json=_routed_payload(None, author=_APPROVER), headers=auth_headers
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client, auth_headers, _routed_payload(None, author=_APPROVER)
+    )
     assert created["agent_id"] is None
     assert created["route"] == "managers"
 
@@ -3162,11 +3187,11 @@ def test_a_route_absent_from_the_map_is_unresolvable_and_borrows_no_other_route(
         auth_headers,
         {"legal": {"resolution": _slack_resolution(_ELSEWHERE), "approvers": {"users": [_LISTED]}}},
     )
-    created = approvals_client.post(
-        "/approvals",
-        json=_routed_payload(agent_id, author=_APPROVER),
-        headers=auth_headers,
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client,
+        auth_headers,
+        _routed_payload(agent_id, author=_APPROVER),
+    )
 
     # The OTHER route's allowlist must not leak onto this one -- and the reason
     # proves the legal binding was never consulted in the first place.
@@ -3333,6 +3358,7 @@ class _ApprovalTelemetryProbe:
         *,
         attributes: Mapping[str, str] | None = None,
     ) -> None:
+        validate_record_metric(name, value, attributes=attributes)
         self.metrics.append(
             _ApprovalMetric(name, float(value), dict(attributes or {}))
         )
@@ -3352,21 +3378,33 @@ def _install_approval_telemetry(monkeypatch: pytest.MonkeyPatch) -> _ApprovalTel
     return probe
 
 
+@pytest.mark.usefixtures("fresh_agent_metric_labels")
+@pytest.mark.parametrize("agent_name", [None, "acme-metrics", "unbound"])
 def test_pending_age_resolved_and_expired_approval_metrics_are_bounded(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     runs_stream: str,
     monkeypatch: pytest.MonkeyPatch,
+    agent_name: str | None,
 ) -> None:
-    """One real record traverses each approval state required by the catalog."""
+    """Real approvals traverse resolution and sweeper expiry with their agent."""
 
     assert callable(operation_span)
     assert callable(record_metric)
     probe = _install_approval_telemetry(monkeypatch)
 
+    agent_id = None
+    if agent_name is not None:
+        agent = approvals_client.post(
+            "/agents",
+            json={"name": agent_name, "channel": {"kind": "slack", "address": "C0EXAMPLE1"}},
+            headers=auth_headers,
+        )
+        assert agent.status_code == 201, agent.text
+        agent_id = agent.json()["id"]
     resolved_record = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
+        "/approvals", json=_payload(agent_id=agent_id), headers=auth_headers
     ).json()
     pending = approvals_client.get(
         "/approvals", params={"status_filter": "pending"}, headers=auth_headers
@@ -3383,7 +3421,7 @@ def test_pending_age_resolved_and_expired_approval_metrics_are_bounded(
 
     approvals_client.post(
         "/approvals",
-        json=_payload(expires_in_seconds=1),
+        json=_payload(agent_id=agent_id, expires_in_seconds=1),
         headers=auth_headers,
     )
 
@@ -3418,11 +3456,16 @@ def test_pending_age_resolved_and_expired_approval_metrics_are_bounded(
     assert {"curie.approval.resolve", "curie.approval.expire"} <= set(probe.spans)
     assert all(
         set(point.attributes)
-        <= {"service.name", "operation", "role", "source", "outcome"}
+        <= {"service.name", "operation", "role", "source", "outcome", "agent"}
         for point in probe.metrics
     )
+    expected_agent = "unbound" if agent_name is None else (
+        "other" if agent_name == "unbound" else agent_name
+    )
+    assert all(point.attributes["agent"] == expected_agent for point in lifecycle)
     assert all(
         resolved_record["id"] not in point.attributes.values()
+        and (agent_id is None or agent_id not in point.attributes.values())
         for point in probe.metrics
     )
 
@@ -3433,6 +3476,7 @@ def test_pending_inventory_ignores_filtered_page_and_counts_more_than_200(
     clean_db: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reset_bounded_labels()
     probe = _install_approval_telemetry(monkeypatch)
     observed_at = datetime.now(UTC).replace(tzinfo=None)
     created_at = observed_at - timedelta(minutes=5)
@@ -3492,7 +3536,176 @@ def test_pending_inventory_ignores_filtered_page_and_counts_more_than_200(
         "service.name": "curie-api",
         "operation": "observe",
         "outcome": "pending",
+        "agent": "unbound",
     }
+
+
+@contextmanager
+def _captured_approval_metrics() -> Iterator[InMemoryMetricReader]:
+    from curie_telemetry import configure_meter_provider
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
+    reset_bounded_labels()
+    configure_meter_provider(provider)
+    try:
+        yield reader
+    finally:
+        reset_bounded_labels()
+        provider.shutdown()
+
+
+def _approval_gauge_values(reader: InMemoryMetricReader, name: str) -> dict[str, float]:
+    data = reader.get_metrics_data()
+    assert data is not None
+    return {
+        str(point.attributes["agent"]): float(point.value)
+        for resource in data.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics if metric.name == name
+        for point in metric.data.data_points
+    }
+
+
+def _observe_pending_snapshot(observed_at: datetime) -> None:
+    async def observe() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+            async with sessionmaker() as session:
+                await observe_pending_approvals(session, now=observed_at)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(observe())
+
+
+def test_pending_inventory_groups_agent_counts_oldest_age_and_clears_removed_agents(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del approvals_client, auth_headers
+    observed_at = datetime.now(UTC).replace(tzinfo=None)
+
+    async def seed() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+            async with sessionmaker() as session:
+                agents = [Agent(name="acme-a"), Agent(name="acme-b"), Agent(name="acme-idle")]
+                session.add_all(agents)
+                await session.flush()
+                for agent, ages in ((agents[0], (300, 120)), (agents[1], (60,)), (None, (180,))):
+                    for age in ages:
+                        session.add(Approval(
+                            agent_id=None if agent is None else agent.id,
+                            conversation_id=f"inventory-{uuid.uuid4().hex}",
+                            author="U0EXAMPLE1", summary="example approval",
+                            reply_kind="slack", reply_channel="C0EXAMPLE1",
+                            dedupe_key=uuid.uuid4().hex,
+                            created_at=observed_at - timedelta(seconds=age),
+                        ))
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    async def clear() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("DELETE FROM curie.approvals"))
+                await conn.execute(text("DELETE FROM curie.agents WHERE name = 'acme-b'"))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+    with _captured_approval_metrics() as reader:
+        probe = _install_approval_telemetry(monkeypatch)
+        _observe_pending_snapshot(observed_at)
+        expected_counts = {"acme-a": 2, "acme-b": 1, "acme-idle": 0, "unbound": 1}
+        expected_ages = {"acme-a": 300, "acme-b": 60, "acme-idle": 0, "unbound": 180}
+        assert _approval_gauge_values(reader, "curie.approval.pending") == expected_counts
+        assert _approval_gauge_values(reader, "curie.approval.pending.age") == expected_ages
+        for name in ("curie.approval.pending", "curie.approval.pending.age"):
+            points = [point for point in probe.metrics if point.name == name]
+            assert len(points) == len(expected_counts)
+            assert all(set(point.attributes) == {"service.name", "operation", "outcome", "agent"}
+                       for point in points)
+        asyncio.run(clear())
+        _observe_pending_snapshot(observed_at + timedelta(seconds=10))
+        assert _approval_gauge_values(reader, "curie.approval.pending") == dict.fromkeys(
+            expected_counts, 0
+        )
+        assert _approval_gauge_values(reader, "curie.approval.pending.age") == dict.fromkeys(
+            expected_ages, 0
+        )
+
+
+def test_pending_inventory_aggregates_reserved_invalid_and_overflow_agents_before_recording(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del approvals_client, auth_headers
+    observed_at = datetime.now(UTC).replace(tzinfo=None)
+    names = ["acme-overflow-a", "acme-overflow-b", "other", "unbound", "not a slug", "x" * 64]
+
+    async def seed() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+            async with sessionmaker() as session:
+                for index, name in enumerate(names):
+                    agent = Agent(name=name)
+                    session.add(agent)
+                    await session.flush()
+                    session.add(Approval(
+                        agent_id=agent.id, conversation_id=f"overflow-{index}",
+                        author="U0EXAMPLE1", summary="example approval",
+                        reply_kind="slack", reply_channel="C0EXAMPLE1",
+                        dedupe_key=f"overflow-{index}",
+                        created_at=observed_at - timedelta(seconds=60 * (index + 1)),
+                    ))
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+    with _captured_approval_metrics() as reader:
+        for index in range(32):
+            validate_record_metric("curie.agent.turn.completed", attributes={
+                "service.name": "curie-worker", "source": "worker", "outcome": "done",
+                "agent": f"acme-admitted-{index}",
+            })
+        probe = _install_approval_telemetry(monkeypatch)
+        _observe_pending_snapshot(observed_at)
+        counts = _approval_gauge_values(reader, "curie.approval.pending")
+        ages = _approval_gauge_values(reader, "curie.approval.pending.age")
+        assert counts["other"] == len(names)
+        assert ages["other"] == 360
+        assert sum(counts.values()) == len(names)
+        assert max(ages.values()) == 360
+        for name in ("curie.approval.pending", "curie.approval.pending.age"):
+            points = [point for point in probe.metrics if point.name == name
+                      and point.attributes.get("agent") == "other"]
+            assert len(points) == 1
+        assert counts["unbound"] == 0
+        assert ages["unbound"] == 0
+        assert not set(names).difference({"other", "unbound"}).intersection(counts)
+
+
+def test_empty_pending_inventory_exports_a_zero_unbound_sample(
+    approvals_client: TestClient,
+    clean_db: None,
+) -> None:
+    del approvals_client
+    with _captured_approval_metrics() as reader:
+        _observe_pending_snapshot(datetime.now(UTC).replace(tzinfo=None))
+        assert _approval_gauge_values(reader, "curie.approval.pending") == {"unbound": 0}
+        assert _approval_gauge_values(reader, "curie.approval.pending.age") == {"unbound": 0}
 
 
 # --- no re-raise after a rejection (#2885) -------------------------------------
@@ -3886,7 +4099,12 @@ def test_requester_terminal_continuation_keeps_display_without_granting_approval
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {"different-action": {"resolution": _slack_resolution("C0EXAMPLE1")}},
+    )
+    payload = _payload(author="U0EXAMPLE1", agent_id=agent_id)
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(
         parent["id"], status=terminal, resolved_by=None if terminal == "expired" else actor
@@ -4037,7 +4255,17 @@ def test_requester_gate_route_and_card_placement_do_not_identify_origin(
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1", route="first-gate", card_channel="C0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {
+            "first-gate": {"resolution": _slack_resolution("C0EXAMPLE1")},
+            "next-gate": {"resolution": _slack_resolution("C0EXAMPLE2")},
+        },
+    )
+    payload = _payload(
+        author="U0EXAMPLE1", agent_id=agent_id, route="first-gate", card_channel="C0EXAMPLE1"
+    )
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(parent["id"], status="approved", resolved_by="U0EXAMPLE2")
     child = _requester_create(
@@ -4064,7 +4292,12 @@ def test_requester_terminal_record_must_prove_the_expected_resume_actor(
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {"different-action": {"resolution": _slack_resolution("C0EXAMPLE1")}},
+    )
+    payload = _payload(author="U0EXAMPLE1", agent_id=agent_id)
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(parent["id"], status=status, resolved_by=resolver)
     child = _requester_create(approvals_client, auth_headers, {

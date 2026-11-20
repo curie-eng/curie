@@ -8,10 +8,12 @@ is never written. Existing sandboxes are not in these dicts and are not patched.
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
-from .quota import resource_vector
+from .quota import quantity_bytes, resource_vector
+from .types import DeliveredLimits
 
 _RUNNER_POOL_SUFFIX = "-runner-pool"
 _POOL_SUFFIX = "-pool"
@@ -60,6 +62,100 @@ def pod_resources(spec: dict[str, Any]) -> dict[str, str]:
             extra = Decimal(resource_vector({key: str(overhead)})[key])
             result[f"{side}.{dimension}"] = format(max(running + sidecars, peak) + extra, "f")
     return resource_vector(result)
+
+
+RUNNER_CONTAINER = "runner"
+
+
+def _regular_containers(pod_spec: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list):
+        return []
+    return [container for container in containers if isinstance(container, Mapping)]
+
+
+def _limit(container: Mapping[str, Any], dimension: str) -> object:
+    resources = container.get("resources")
+    limits = resources.get("limits") if isinstance(resources, Mapping) else None
+    return limits.get(dimension) if isinstance(limits, Mapping) else None
+
+
+def runner_memory_limit(pod_spec: Mapping[str, Any]) -> int | None:
+    """The runner container's ``limits.memory`` in bytes, or None.
+
+    ``pod_spec`` is the wire (camelCase) shape of a Pod spec or a template's
+    ``podTemplate.spec``.
+    """
+
+    for container in _regular_containers(pod_spec):
+        if container.get("name") == RUNNER_CONTAINER:
+            return quantity_bytes(_limit(container, "memory"))
+    return None
+
+
+def runner_ephemeral_storage_limit(pod_spec: Mapping[str, Any]) -> int | None:
+    """The runner container's own ``limits.ephemeral-storage`` in bytes, or None."""
+
+    for container in _regular_containers(pod_spec):
+        if container.get("name") == RUNNER_CONTAINER:
+            return quantity_bytes(_limit(container, "ephemeral-storage"))
+    return None
+
+
+def pod_ephemeral_storage_limit(pod_spec: Mapping[str, Any]) -> int | None:
+    """The sum of the regular containers' ``limits.ephemeral-storage``, or None.
+
+    That sum is the total the kubelet compares pod usage against. A container
+    without the limit adds nothing, as in the kubelet; an unparseable one makes
+    the whole sum unknown.
+    """
+
+    total = 0
+    found = False
+    for container in _regular_containers(pod_spec):
+        raw = _limit(container, "ephemeral-storage")
+        if raw is None:
+            continue
+        value = quantity_bytes(raw)
+        if value is None:
+            return None
+        total += value
+        found = True
+    return total if found else None
+
+
+def emptydir_size_limits(pod_spec: Mapping[str, Any]) -> dict[str, int]:
+    """Each emptyDir volume's ``sizeLimit`` in bytes, keyed by volume name.
+
+    A volume with no sizeLimit, or one that does not parse, has no entry.
+    """
+
+    volumes = pod_spec.get("volumes")
+    limits: dict[str, int] = {}
+    if not isinstance(volumes, list):
+        return limits
+    for volume in volumes:
+        if not isinstance(volume, Mapping):
+            continue
+        name = volume.get("name")
+        empty_dir = volume.get("emptyDir")
+        if not isinstance(name, str) or not isinstance(empty_dir, Mapping):
+            continue
+        size = quantity_bytes(empty_dir.get("sizeLimit"))
+        if size is not None:
+            limits[name] = size
+    return limits
+
+
+def spec_limits(pod_spec: Mapping[str, Any]) -> DeliveredLimits:
+    """The limits one pod spec enforces. ``max_turns`` is not a spec fact."""
+
+    return DeliveredLimits(
+        memory_bytes=runner_memory_limit(pod_spec),
+        ephemeral_storage_bytes=pod_ephemeral_storage_limit(pod_spec),
+        scratch_bytes=emptydir_size_limits(pod_spec),
+        max_turns=None,
+    )
 
 
 def resources_object_name(kind: str, name: str) -> str:

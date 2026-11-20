@@ -15,13 +15,14 @@ import pytest
 from aiohttp import web
 from curie_api import models
 from curie_api.db import SCHEMA, Base
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_protected_hooks.admission_records import DeliveryIdentity
 from curie_protected_hooks.atomic_admission import AtomicAdmission
 from curie_protected_hooks.execution_namespace import derive_lane_namespace
 from curie_worker.protected_nomination import HttpNominationSubmitter, NominationCapturingRunner
 from curie_worker.protected_run import ProtectedRuntime
-from curie_worker.reply_sink import HttpReplyAdapter, ReplySinkRouter
-from curie_worker.slack_sink import SlackReplyAdapter
+from curie_worker.reply_sink import ReplySinkRouter
 from redis.exceptions import ResponseError
 from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -119,7 +120,7 @@ def primary_postgres(tmp_path_factory):
             cid = cidfile.read_text().strip()
             info = json.loads(docker("inspect", cid).stdout)[0]
             assert info["Id"] == cid and info["Config"]["Labels"]["curie.test.owner"] == owner
-            docker("rm", "-f", cid)
+            docker("rm", "-f", "-v", cid)
             assert cid not in docker("ps", "-aq", "--no-trunc").stdout.splitlines()
             cidfile.unlink()
 
