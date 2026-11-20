@@ -304,10 +304,36 @@ class JiraOneTicket:
             self.drive()
         finally:
             try:
-                self.evidence["jira_requests"] = self.state()["requests"]
-            except (OSError, ojt.JiraStubError) as exc:
-                # A stub that stopped answering must not hide why the drive failed.
-                self.evidence["jira_requests_error"] = str(exc)
+                self.evidence.update(self.outcome())
+            except (OSError, ValueError, KeyError, ojt.JiraStubError) as exc:
+                # A stub or install that stopped answering must not hide why the drive failed.
+                self.evidence["outcome_error"] = str(exc)
+
+    def outcome(self) -> dict[str, Any]:
+        """What the ticket's records show at the end, pass or fail.
+
+        Request statuses and the factory's own comments as a reader sees them,
+        so a failed run says where the flow stopped. Every value is fixture
+        text or platform output about the fixture.
+        """
+
+        state = self.state()
+        found: dict[str, Any] = {"jira_requests": state["requests"]}
+        if not self.issue_id:
+            return found
+        observed = self.observe()
+        found["requests"] = [
+            {key: request.get(key) for key in ("id", "sequence", "status", "terminal_cause")}
+            for request in observed["requests"]
+        ]
+        found["status_comments"] = observed["notices"]
+        found["bot_comments"] = [
+            {"id": comment["id"], "text": comment["body"][:2000]}
+            for comment in ojt.comment_records(state, self.issue_id)
+            if comment["user"]["login"] == ojt.BOT_ACCOUNT_ID
+        ]
+        found["labels"] = ojt.issue_of(state, self.issue_id)["labels"]
+        return found
 
     def drive(self) -> None:
         bot = ojt.BOT_ACCOUNT_ID
