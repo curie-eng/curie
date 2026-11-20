@@ -462,9 +462,9 @@ ServiceAccount and the Kubernetes API authority it carries.
 
 - When an entry matches the agent being rendered and one of its hosted
   connectors, that connector's Deployment pod template carries
-  `serviceAccountName` set to the entry's name. Nothing else in the render
-  changes: the Service, both NetworkPolicies, the caller proxy and the
-  container hardening are the same.
+  `serviceAccountName` and its deprecated alias `serviceAccount`, both set to
+  the entry's name. Nothing else in the render changes: the Service, both
+  NetworkPolicies, the caller proxy and the container hardening are the same.
 - With no matching entry the render is byte-identical to a render without this
   setting, so enabling it for one connector rolls no other connector.
 - An entry naming a remote connector, an undeclared connector or another agent
@@ -483,9 +483,12 @@ ServiceAccount and the Kubernetes API authority it carries.
   characters), or two entries name the same agent and connector. The chart
   schema refuses the same shapes at render. The renderer also refuses a
   ServiceAccount name that is not a DNS-1123 subdomain.
-- Removing an entry removes `serviceAccountName` from the rendered Deployment,
-  and the reconciler's server-side apply drops the field, so the pod returns to
-  `default`.
+- Removing an entry removes both fields from the rendered Deployment, and the
+  reconciler's server-side apply drops both, so the pod returns to `default`.
+  Declaring the alias is what makes the removal work: the API server fills
+  `serviceAccount` from `serviceAccountName` on write, and an apply that never
+  declared the alias leaves it behind, unowned, to restore `serviceAccountName`
+  after the apply drops it.
 - The local tier runs no Kubernetes pods and ignores the setting.
 
 ## Implementations today
