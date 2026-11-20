@@ -80,11 +80,11 @@ def assert_slack_progress(
     """
 
     posts = list(posts)
+    in_channel = [post for post in posts if _field(post, "channel") == channel]
     roots = [
         post
-        for post in posts
+        for post in in_channel
         if _field(post, "method") == "chat.postMessage"
-        and _field(post, "channel") == channel
         and not _field(post, "thread_ts")
         and str(_field(post, "text") or "").startswith(SLACK_ROOT_PREFIX)
     ]
@@ -93,7 +93,7 @@ def assert_slack_progress(
     root_ts = _field(roots[0], "ts")
     thread = [
         post
-        for post in posts
+        for post in in_channel
         if _field(post, "method") == "chat.postMessage" and _field(post, "thread_ts") == root_ts
     ]
     if not thread:
@@ -101,7 +101,7 @@ def assert_slack_progress(
     card = thread[0]
     updates = [
         post
-        for post in posts
+        for post in in_channel
         if _field(post, "method") == "chat.update" and _field(post, "ts") == _field(card, "ts")
     ]
     if not updates:
@@ -111,5 +111,10 @@ def assert_slack_progress(
         raise ScenarioAssertionError(
             f"expected one ready reply in the root thread naming {pull_request_url}, "
             f"saw {len(ready)}"
+        )
+    extra = len(thread) - 1 - len(ready)
+    if extra:
+        raise ScenarioAssertionError(
+            f"expected one card in the root thread, saw {1 + extra} posts besides the ready reply"
         )
     return {"root": len(roots), "card": 1, "ready": len(ready)}

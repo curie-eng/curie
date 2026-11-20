@@ -1024,20 +1024,30 @@ class ScriptedRun:
         if self.jira_stub is not None:
             self.run_jira_one_ticket()
             return
+        self.run_publication(github)
+
+    def run_publication(self, github: Any) -> None:
+        """Bind Slack, label the issue, wait for the pull request, then the rest."""
+
         self.bind_slack()
+        self.label_issue(github)
+        self.wait_for_final()
+        self.run_scenarios(github)
+
+    def label_issue(self, github: Any) -> None:
         issue = self.stub._get("issue", 3815)
         issue["labels"] = [{"name": "factory"}]
         issue["updated_at"] = github._utc()
         self.stub._put("issue", 3815, issue)
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
-        self.wait_for_final()
-        self.run_scenarios(github)
 
     def bind_slack(self) -> None:
         """Bind the factory agent to the Slack channel the recorder stands in for."""
 
-        if self.slack is None:
+        if not self.gateway_enabled():
             return
+        if self.slack is None:
+            raise ScriptedScenarioError("the Slack recorder did not start")
         self.kubectl(
             "-n", self.namespace, "rollout", "status",
             "deployment/curie-channel-gateway", "--timeout=300s",
@@ -1060,8 +1070,10 @@ class ScriptedRun:
     def wait_for_slack_progress(self) -> None:
         """After the final issue comment: the progress card holds within 180 seconds."""
 
-        if self.slack is None:
+        if not self.gateway_enabled():
             return
+        if self.slack is None:
+            raise ScriptedScenarioError("the Slack recorder did not start")
         pull_request = self.evidence.get("pull_request")
         url = pull_request.get("html_url") if isinstance(pull_request, dict) else None
         if not url:
@@ -1072,11 +1084,16 @@ class ScriptedRun:
                 counts = scenario.assert_slack_progress(
                     self.slack.posts(), scenario.SLACK_CHANNEL, url
                 )
-                break
             except scenario.ScenarioAssertionError as exc:
                 if time.monotonic() >= deadline:
                     raise ScriptedScenarioError(f"Slack progress: {exc}") from None
-            time.sleep(2)
+                time.sleep(2)
+                continue
+            if time.monotonic() > deadline:
+                raise ScriptedScenarioError(
+                    f"Slack progress settled after {SLACK_PROGRESS_SECONDS} seconds"
+                )
+            break
         self.evidence["slack_posts"] = counts
 
     def run_scenarios(self, github: Any) -> None:

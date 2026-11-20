@@ -2413,7 +2413,9 @@ PULL_REQUEST = "https://192.0.2.1:8443/acme-corp/acme-bot/pull/2"
 ROOT_TEXT = sso.SLACK_ROOT_PREFIX + ": started"
 
 
-def _slack_run(ready: str | None = "root") -> list[lanes.SlackPost]:
+def _slack_run(
+    ready: str | None = "root", ready_channel: str = sso.SLACK_CHANNEL, extra_card: bool = False
+) -> list[lanes.SlackPost]:
     """Posts as a real SlackRecorder holds them: one root, one card, a ready reply.
 
     ``ready`` is the thread the ready reply lands in: ``root`` (correct), another
@@ -2423,8 +2425,8 @@ def _slack_run(ready: str | None = "root") -> list[lanes.SlackPost]:
     recorder = lanes.SlackRecorder()
     recorder.start()
 
-    def call(method: str, body: dict[str, Any]) -> Any:
-        body = {"channel": sso.SLACK_CHANNEL, **body}
+    def call(method: str, body: dict[str, Any], channel: str = sso.SLACK_CHANNEL) -> Any:
+        body = {"channel": channel, **body}
         return _slack_call(recorder, method, json.dumps(body).encode(), "application/json")
 
     try:
@@ -2433,11 +2435,13 @@ def _slack_run(ready: str | None = "root") -> list[lanes.SlackPost]:
         call("chat.update", {"ts": card["ts"], "text": "card, finished"})
         # Another scenario's thread: ignored.
         call("chat.postMessage", {"text": "Factory run: other", "thread_ts": "9.9"})
+        if extra_card:
+            call("chat.postMessage", {"text": "card again", "thread_ts": root["ts"]})
         if ready is not None:
             call("chat.postMessage", {
                 "text": f"Opened {PULL_REQUEST}",
                 "thread_ts": root["ts"] if ready == "root" else ready,
-            })
+            }, ready_channel)
         return recorder.posts()
     finally:
         recorder.close()
@@ -2517,6 +2521,65 @@ def test_the_run_binds_the_factory_agent_to_the_slack_channel_before_the_label(
     monkeypatch.setattr(fe, "http_json", lambda *_a, **_k: (409, {}))
     with pytest.raises(sk.ScriptedScenarioError, match="Slack binding returned HTTP 409"):
         run.bind_slack()
+
+
+def test_slack_progress_refuses_a_ready_reply_in_another_channel_or_a_second_card() -> None:
+    other = "C0EXAMPLE8"
+    with pytest.raises(sso.ScenarioAssertionError, match="ready reply"):
+        sso.assert_slack_progress(
+            _slack_run(ready_channel=other), sso.SLACK_CHANNEL, PULL_REQUEST
+        )
+    with pytest.raises(sso.ScenarioAssertionError, match="one card"):
+        sso.assert_slack_progress(_slack_run(extra_card=True), sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+def test_slack_progress_ignores_an_update_of_the_card_in_another_channel() -> None:
+    posts = [
+        lanes.SlackPost(p.method, "C0EXAMPLE8" if p.method == "chat.update" else p.channel,
+                        p.text, p.thread_ts, p.ts)
+        for p in _slack_run()
+    ]
+    with pytest.raises(sso.ScenarioAssertionError, match="never updated"):
+        sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+def test_a_settled_result_after_the_bound_is_late(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = _publication_run([])
+    snapshots = [[], _slack_run()]
+    run.slack.posts = lambda: snapshots.pop(0)  # type: ignore[union-attr]
+    clock = iter([0.0, 1.0, 181.0])
+    monkeypatch.setattr(
+        sk, "time", type("Clock", (), {"monotonic": staticmethod(lambda: next(clock)),
+                                       "sleep": staticmethod(lambda _s: None)})
+    )
+    with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+        run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
+
+
+def test_the_publication_install_fails_without_its_recorder() -> None:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    run.evidence["pull_request"] = {"html_url": PULL_REQUEST}
+    with pytest.raises(sk.ScriptedScenarioError, match="recorder did not start"):
+        run.wait_for_slack_progress()
+    with pytest.raises(sk.ScriptedScenarioError, match="recorder did not start"):
+        run.bind_slack()
+
+
+def test_the_publication_binds_slack_then_labels_then_waits_then_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    calls: list[str] = []
+    monkeypatch.setattr(run, "bind_slack", lambda: calls.append("bind"))
+    monkeypatch.setattr(run, "label_issue", lambda _github: calls.append("label"))
+    monkeypatch.setattr(run, "wait_for_final", lambda: calls.append("wait"))
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "wait_for_slack_progress", lambda: calls.append("slack"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+    run.router = lanes.LaneRouter({})
+    run.run_publication(None)
+    assert calls == ["bind", "label", "wait", "observe", "slack", "one-ticket"]
 
 
 def test_slack_progress_refuses_a_card_that_was_never_updated() -> None:
@@ -2620,11 +2683,12 @@ def test_the_scenarios_after_the_publication_scenario_call_the_one_ticket_scenar
     run.router = lanes.LaneRouter({})
     calls: list[str] = []
     monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "wait_for_slack_progress", lambda: calls.append("slack"))
     monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
 
     run.run_scenarios(None)
 
-    assert calls == ["observe", "one-ticket"]
+    assert calls == ["observe", "slack", "one-ticket"]
 
 
 def test_a_fixture_that_owns_its_agents_does_not_run_the_one_ticket_scenario(
