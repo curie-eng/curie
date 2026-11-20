@@ -34,9 +34,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from curie_runner import __main__ as boot
+from curie_runner.completion_contract import PUBLICATION_RECOVERY_EXPLANATION
 from curie_runner.issue_read import ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
 from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
-from curie_runner.tracker_result import PUBLICATION_RECOVERY_EXPLANATION
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _MODEL = "example-provider/units-model"
@@ -649,7 +649,7 @@ def test_a_publication_recovery_boot_is_ready_after_the_preflight_and_runs_no_mo
     # a turn sent to it answers offline. The implementation contract is the
     # liveness control: the same boot constructs and connects the model.
     recovery = kind == "publication_recovery"
-    contract = {"completion_contract": kind, "result_kinds": [], "session_usd_allowance": None}
+    contract = {"completion_contract": kind, "execution": None, "rule_proposal": False}
 
     async def scenario() -> None:
         async with _harness(tmp_path, monkeypatch, contract=contract) as h:

@@ -22,14 +22,15 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_api.crud import lineages as crud_lineages
 from curie_api.forges.types import PullRequestState
 from curie_api.models import ThreadPublicationLineage
+from curie_runner.completion_contract import ContractUnavailable, parse_contract
 from curie_runner.issue_read import CAPABILITY_HEADER
 from curie_runner.propose_rule import propose_rule_handler
-from curie_runner.tracker_result import parse_contract
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -162,6 +163,31 @@ def test_the_completion_contract_offer_parses_as_the_runner_reads_it(
     withheld = contract(client, run.capability)
     assert withheld.status_code == 200, withheld.text
     assert parse_contract(withheld.json()).rule_proposal is False
+
+
+def test_the_real_contract_answer_is_the_three_keys_the_runner_reads(
+    rules: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    client, api = rules
+    run = eligible_revision(client, api)
+
+    answer = contract(client, run.capability)
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    # The producer's answer is exactly what the runner's parser reads.
+    assert set(body) == {"completion_contract", "execution", "rule_proposal"}
+    parsed = parse_contract(body)
+    assert parsed.kind == "implementation"
+    assert parsed.execution is not None
+    assert parsed.execution.execution_fence == body["execution"]["execution_fence"]
+    assert parsed.rule_proposal is body["rule_proposal"] is True
+
+    # The counterexample: the same answer with a fence the runner refuses
+    # fails closed rather than parsing to an unbound implementation.
+    broken = {**body, "execution": {**body["execution"], "execution_fence": 0}}
+    with pytest.raises(ContractUnavailable) as caught:
+        parse_contract(broken)
+    assert caught.value.reason == "body_invalid"
 
 
 # 3. Route's stored candidate to settlement --------------------------------------
