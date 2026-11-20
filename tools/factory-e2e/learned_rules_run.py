@@ -68,6 +68,10 @@ OIDC_SECRET = "learned-rules-oidc-client"
 OIDC_SECRET_KEY = "clientSecret"
 STUB_ORIGIN = "https://stub.example.test"
 STUB_HOST = "stub.example.test"
+# The repository's secret scan refuses an issue reference qualified by owner and
+# repository name; review prompts name the ticket that way.
+REPOSITORY_REF = f"{lrs.REPOSITORY}#"
+REPOSITORY_REF_PLACEHOLDER = "<repository>#"
 POLL_SECONDS = 2.0
 
 
@@ -426,7 +430,8 @@ class LearnedRulesRun(sk.ScriptedRun):
         return [self.curie, "--json", "cluster", "--context", self.context, *argv]
 
     def replacements(self) -> dict[str, str]:
-        """The stub's real address, origin first, as transcripts and evidence spell it."""
+        """The stub's real address, origin first, as transcripts and evidence spell
+        it, and the fixture repository's owner-qualified issue reference."""
 
         host = str(self.stub.host)
         authority = f"[{host}]" if ":" in host else host
@@ -434,6 +439,7 @@ class LearnedRulesRun(sk.ScriptedRun):
             str(self.stub.base_url): STUB_ORIGIN,
             f"{authority}:{self.stub.port}": STUB_HOST,
             host: STUB_HOST,
+            REPOSITORY_REF: REPOSITORY_REF_PLACEHOLDER,
         }
 
     def scrub(self, value: Any) -> Any:

@@ -1066,3 +1066,39 @@ def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
     assert all(c["issue"] == lrs.TICKET_B for c in steps["e"]["captures"])
     stored = json.dumps(run.chain["steps"])
     assert stub.base_url not in stored and f"{stub.host}:{stub.port}" not in stored
+
+
+def _secret_scan_rule(rule_id: str) -> Any:
+    import re
+    import tomllib
+
+    config = tomllib.loads((REPO_ROOT / ".gitleaks.toml").read_text())
+    [rule] = [rule for rule in config["rules"] if rule["id"] == rule_id]
+    return re.compile(rule["regex"])
+
+
+def test_recording_scrub_leaves_nothing_the_secret_scan_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub: Any
+) -> None:
+    """A plan review prompt names the ticket owner-qualified; the committed
+    transcript must not, or the repository's secret scan refuses the push."""
+
+    args = fe.parse_args(
+        ["scripted", "--scenario", "learned-rules", "--transcript", str(_transcripts(tmp_path))]
+    )
+    run = lrr.LearnedRulesRun(args)
+    run.stub = stub
+    prompt = (
+        f"ISSUE LINK: {stub.base_url}/{REPO}/issues/3815\n\n"
+        f"ISSUE TEXT (ticket {REPO}#3815):\n# Add Kelvin temperature conversions"
+    )
+    exchange = {"lane_key": prompt, "ordinal": 0, "message": {"content": [{"text": prompt}]}}
+    try:
+        [scrubbed] = lrl.scrub_recording([exchange], run.replacements())
+    finally:
+        run.stub = None
+        run.cleanup()
+    text = json.dumps(scrubbed)
+    assert _secret_scan_rule("cross-repo-issue-ref").search(json.dumps(exchange))
+    assert not _secret_scan_rule("cross-repo-issue-ref").search(text)
+    assert "(ticket <repository>#3815)" in text and stub.base_url not in text
