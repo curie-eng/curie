@@ -8,6 +8,7 @@ an existing install sees, and the downgrade returns to that revision.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
 from _migration_support import (
@@ -19,7 +20,18 @@ from _migration_support import (
     stamped_revision,
 )
 from alembic import command
+from curie_api.config import get_settings
 from sqlalchemy.exc import IntegrityError
+from test_github_factory_review import _complete
+from test_github_plain_feedback import (
+    PATHS,
+    Pull,
+    _codes,
+    _own_pull_request,
+    _requests,
+    factory_github,
+    running_factory,
+)
 from test_memory_rules_migration import _agent, _lineage
 
 REVISION = "0186"
@@ -92,3 +104,56 @@ def test_the_count_is_never_negative(isolated_migration_db: IsolatedMigrationDb)
             {"id": lineage_id},
         )
     assert _counts(lineage_id) == (0, None)
+
+
+@pytest.mark.usefixtures("valkey")
+@pytest.mark.parametrize("path", PATHS)
+def test_a_pull_request_bound_before_the_upgrade_takes_plain_feedback_after_it(
+    isolated_migration_db: IsolatedMigrationDb,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    path: str,
+) -> None:
+    """The upgrade handoff, driven end to end. The release below 0186 binds a
+    factory pull request (its lineage insert names neither new column); after
+    the upgrade, the first plain comment on that same lineage goes through
+    production intake and starts a revision, counted once and uncapped.
+
+    Counterexample it rejects: a backfill that leaves an existing lineage at or
+    past the cap (or with a capped time) refuses this first comment.
+    """
+
+    isolated_migration_db.at(REVISION)
+    github = factory_github(monkeypatch, tmp_path)
+    try:
+        with running_factory(github, new_agent=True) as factory:
+            number, first = factory.work_item()
+
+        config = alembic_config()
+        command.downgrade(config, BELOW)
+        assert not ADDED & column_names(TABLE)
+        branch = f"curie/publication-acme-{number}"
+        head = github.push_head(branch)
+        pr = github.seed_pull(branch, "main")
+        lineage_id = _own_pull_request(
+            first["work_item_id"], pr, branch=branch, head=head, status="open"
+        )
+        command.upgrade(config, REVISION)
+        assert stamped_revision() == REVISION
+
+        with running_factory(github, new_agent=False) as factory:
+            _complete(factory.client, first["id"])
+            pull = Pull(pr, number, first["work_item_id"], lineage_id)
+            posted = factory.comment(pull, "Please rename the helper.")
+            responses = factory.deliver(path, posted)
+            if path == "webhook":
+                assert [r.json()["status"] for r in responses] == ["factory_admitted"], _codes(
+                    responses
+                )
+            rows = _requests(number)
+            assert len(rows) == 2
+            assert rows[1]["work_item_id"] == first["work_item_id"]
+            assert _counts(lineage_id) == (1, None)
+            assert not factory.notices(pull)
+    finally:
+        get_settings.cache_clear()

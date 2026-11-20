@@ -26,6 +26,7 @@ import json
 import sys
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -314,8 +315,9 @@ def _codes(responses: list[httpx.Response]) -> list[str]:
     return [_code(response) for response in responses]
 
 
-@pytest.fixture
-def factory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Factory]:
+def factory_github(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> GitHubRepositoryFake:
+    """Configure a polling GitHub factory whose every GitHub client reaches one fake."""
+
     for key, value in _poll_env(tmp_path, "poll").items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-intake-worker")
@@ -326,8 +328,16 @@ def factory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Factory
     github.grant(SECOND, "write")
     # Every GitHub client the API makes, the reconciler's included, reaches the fake.
     monkeypatch.setattr(httpx, "AsyncClient", _client_type(github))  # type: ignore[arg-type]
-    try:
-        with TestClient(create_app()) as client:
+    return github
+
+
+@contextmanager
+def running_factory(github: GitHubRepositoryFake, *, new_agent: bool) -> Iterator[Factory]:
+    """The API running against the configured database, optionally with a new
+    factory agent bound to the repository."""
+
+    with TestClient(create_app()) as client:
+        if new_agent:
             created = client.post(
                 "/agents",
                 headers={"X-API-Key": get_settings().api_key},
@@ -338,7 +348,15 @@ def factory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Factory
                 },
             )
             assert created.status_code == 201, created.text
-            yield Factory(client, github)
+        yield Factory(client, github)
+
+
+@pytest.fixture
+def factory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Factory]:
+    github = factory_github(monkeypatch, tmp_path)
+    try:
+        with running_factory(github, new_agent=True) as running:
+            yield running
     finally:
         get_settings.cache_clear()
 
