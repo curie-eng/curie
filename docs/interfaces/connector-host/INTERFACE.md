@@ -437,6 +437,52 @@ carries the value. The contract is under "Verified spent-grant header" below.
 The local tier runs no caller proxy, so no connector there receives the header,
 and a protected execution tool refuses every call there.
 
+### A connector's own ServiceAccount
+
+A hosted connector's pod runs as the namespace's `default` ServiceAccount unless
+the operator names another one for that agent's connector. A connector that
+authenticates to a cloud provider through workload identity federation, where
+its projected ServiceAccount token is exchanged for cloud credentials, must not
+share that identity with every other pod in the namespace that also runs as
+`default`.
+
+The mapping is operator configuration, never bundle content. The chart value
+`connectorServiceAccounts` is a list of entries, each with exactly three
+non-empty keys: `agent`, `connector` and `serviceAccountName`. The chart passes
+the list to the API as JSON in `CURIE_CONNECTOR_SERVICE_ACCOUNTS`. A bundle
+cannot choose a ServiceAccount: a cloud identity bound to a ServiceAccount is a
+credential, and a bundle field would let any agent's bundle in the namespace
+name another agent's federated ServiceAccount, or a Curie component's own
+ServiceAccount and the Kubernetes API authority it carries.
+
+- When an entry matches the agent being rendered and one of its hosted
+  connectors, that connector's Deployment pod template carries
+  `serviceAccountName` set to the entry's name. Nothing else in the render
+  changes: the Service, both NetworkPolicies, the caller proxy and the
+  container hardening are the same.
+- With no matching entry the render is byte-identical to a render without this
+  setting, so enabling it for one connector rolls no other connector.
+- An entry naming a remote connector, an undeclared connector or another agent
+  renders nothing and is not an error, because one installation-wide list serves
+  every agent.
+- The pod template does not set `automountServiceAccountToken`. Whether the
+  token is mounted is the named ServiceAccount's own setting, as it is for
+  `default` today.
+- Curie does not create, annotate or bind the ServiceAccount, and the worker
+  gains no RBAC. The operator creates it in the release namespace together with
+  its cloud federation. A missing ServiceAccount leaves the connector's
+  Deployment unable to create pods, reported as the connector not being ready.
+- The API refuses to boot when the JSON is malformed, an entry is not an object
+  with exactly the three string keys, a key is empty, a `serviceAccountName` is
+  not a Kubernetes ServiceAccount name (a DNS-1123 subdomain of at most 253
+  characters), or two entries name the same agent and connector. The chart
+  schema refuses the same shapes at render. The renderer also refuses a
+  ServiceAccount name that is not a DNS-1123 subdomain.
+- Removing an entry removes `serviceAccountName` from the rendered Deployment,
+  and the reconciler's server-side apply drops the field, so the pod returns to
+  `default`.
+- The local tier runs no Kubernetes pods and ignores the setting.
+
 ## Implementations today
 
 One production host plus a fake:
