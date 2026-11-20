@@ -767,7 +767,6 @@ async fn execute_jira_bitbucket(mut plan: Plan, opts: &QuickstartOpts) -> Result
         &plan.jira.binding_name,
         plan.label.as_deref(),
     );
-    // Publication policy must be `auto` before a tracker-result upload.
     for (args, step) in settings(plan) {
         run_self(&args, step, None, None).await?;
     }

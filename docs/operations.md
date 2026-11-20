@@ -2437,8 +2437,10 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
 
 `curie dev factory-e2e scripted --scenario publication` runs issue-to-PR on a
 disposable kind cluster with a GitHub stub and recorded model responses.
-Select `--scenario triage-to-pr` to run the triage handoff on the same install
-after publication passes, or `--scenario facts` to check admission facts.
+On the same install it then runs the one-ticket scenario and checks the factory
+Slack progress card against an in-process Slack recorder (one root post, one
+card with an update and one ready reply naming the pull request, recorded as
+`slack_posts`). Select `--scenario facts` to check admission facts.
 Scripted mode honors `CURIE_BIN`, including when `--build-images` builds the
 runner with that CLI.
 Every factory mode defaults to `curie` on PATH when `CURIE_BIN` is unset,

@@ -91,13 +91,17 @@ one consolidated PR review. It posts only after your authorization and reads
 the result back. Your conversation and local review notes stay local unless you
 approve their inclusion. Existing authenticated host tracker tools are required.
 
-To request factory work, the agent identifies the configured App mention and
-available factory ownership and intake evidence. On a supported factory-owned
-GitHub PR, fresh comments or submitted commented/changes-requested reviews with
-that mention can request a revision. It uses one actionable summary per round,
-then distinguishes posting from observed factory admission and publication.
-An ordinary comment, edited old comment or approval alone does not start work.
-Posting on an ordinary PR does not enroll it in the factory.
+To request factory work, the agent identifies the available factory ownership
+and intake evidence. On a supported factory-owned GitHub PR, no mention is
+needed: a fresh plain comment, inline review comment, or submitted
+commented/changes-requested review from an authorized reviewer requests a
+revision, and one submitted review is one revision. It uses one actionable
+summary per round, then distinguishes posting from observed factory admission
+and publication. On GitLab and Bitbucket the comment must still mention the
+configured factory identity. An edited old comment, an approval alone, or a
+pending review does not start work, and after 10 plain-comment revisions on one
+PR the factory asks for a mention. Posting on an ordinary PR does not enroll it
+in the factory.
 
 The factory retains its existing authority, review, testing and publication gates.
 Missing configuration or an unobserved acknowledgment is reported explicitly.

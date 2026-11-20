@@ -50,11 +50,18 @@ change. The same flow applies to each [supported pairing](../capabilities.md#wor
    the approved issue and add the label yourself. A label means selected for
    intake. The factory's status comment confirms admission.
 
-4. **Watch the issue.** State labels and the factory's status comment show
+4. **Answer the factory's questions.** If the ticket gains the
+   `curie-factory:questions` label and a numbered list of questions, answer
+   them in a plain comment on the same ticket. No mention and no relabel is
+   needed, and the label stays. The factory reads the whole thread and starts
+   again; it asks at most three rounds. Only someone who could have started the
+   ticket can answer, and an edited comment never counts.
+
+5. **Watch the issue.** State labels and the factory's status comment show
    progress. Follow its link to the pull request or merge request. Read the
    final `Status:` line after CI; an open change alone is not completion.
 
-5. **Verify the change.** Open its link and ask your coding agent:
+6. **Verify the change.** Open its link and ask your coding agent:
 
    ```text
    Walk me through this pull request or merge request and help me test it
@@ -66,9 +73,11 @@ change. The same flow applies to each [supported pairing](../capabilities.md#wor
    the example, run the `cmp` command in the change checkout. See
    [guided PR review](factory-pr-review.md).
 
-6. **Finish or revise.** Approve the feedback your coding agent proposes.
-   To request a factory revision, post it through the configured issue or
-   review route and mention the factory identity as that provider requires.
+7. **Finish or revise.** Approve the feedback your coding agent proposes.
+   To request a factory revision on GitHub, post it as a plain comment or as a
+   submitted Comment or Request changes review on the pull request; no mention
+   is needed, and an approving review starts none. On GitLab and
+   Bitbucket, mention the factory identity as that provider requires.
    Review the new change head. When satisfied, explicitly ask your agent to
    merge or use your team's merge process. Curie does not merge its own change.
 
