@@ -1177,9 +1177,11 @@ pub(crate) enum ClusterAction {
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
         /// Let the agent propose memory rules on or off
-        /// (`memory_rule_proposals`, #5796). Takes effect for the next
-        /// request's completion contract. A person still accepts any proposed
-        /// rule; the agent never activates one itself.
+        /// (`memory_rule_proposals`, #5796, #5801). A factory run reads it at
+        /// its next request's completion contract; any other agent at its next
+        /// session in a channel, where it also needs --memory-writes on. A
+        /// person still accepts any proposed rule; the agent never activates
+        /// one itself.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_rule_proposals: Option<String>,
         #[command(flatten)]
