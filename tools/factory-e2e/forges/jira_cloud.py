@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import base64
 import dataclasses
-import datetime as dt
 import json
 import math
 import os
@@ -196,22 +195,6 @@ def created_since_jql(project_key: str, account_id: str, minutes: int) -> str:
     return f'project = "{project_key}" AND creator = "{account_id}" AND created >= -{minutes}m'
 
 
-def jira_created_epoch(value: Any) -> float | None:
-    """A Jira ``created`` timestamp (``2026-11-20T08:15:30.123+0000``) as epoch seconds.
-
-    None when it cannot be parsed. Pure.
-    """
-
-    if not isinstance(value, str):
-        return None
-    for shape in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
-        try:
-            return dt.datetime.strptime(value, shape).timestamp()
-        except ValueError:
-            continue
-    return None
-
-
 def created_at_or_after(issues: Iterable[Any], since_epoch: float) -> int:
     """How many search results were created at or after ``since_epoch``. Pure.
 
@@ -221,7 +204,9 @@ def created_at_or_after(issues: Iterable[Any], since_epoch: float) -> int:
     count = 0
     for issue in issues:
         fields = issue.get("fields") if isinstance(issue, Mapping) else None
-        created = jira_created_epoch(fields.get("created") if isinstance(fields, Mapping) else None)
+        created = fe.jira_created_epoch(
+            fields.get("created") if isinstance(fields, Mapping) else None
+        )
         if created is None or created >= since_epoch:
             count += 1
     return count
@@ -449,7 +434,11 @@ class JiraCloudDriver:
         return listed
 
     def post_comment(self, issue_id: str, text: str) -> tuple[int, Any]:
-        """Post ``text`` as one plain paragraph comment by the labeler."""
+        """Post ``text`` as one plain paragraph comment by the labeler.
+
+        Returns ``(status, body)``; Jira's 201 body is the comment, whose
+        ``created`` is the instant Jira recorded it (``fe.jira_created_epoch``).
+        """
 
         return self._jira(
             "labeler", "POST", f"/issue/{issue_id}/comment", {"body": adf_paragraph(text)}

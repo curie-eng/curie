@@ -285,6 +285,7 @@ def _passing_obs() -> dict[str, Any]:
         "settled_s": 430.0,
         "pre_answer_read": "ok",
         "live_before_answer": [],
+        "pre_answer_usage": {"kind": "total", "total": "1.20"},
         "answer_s": 435.0,
         "second_request_s": 445.0,
         "answer_received_s": 450.0,
@@ -436,6 +437,11 @@ USAGE_AT_LEAST = (
 )
 USAGE_UNKNOWN = "Usage: implementer 12,000 tokens (cost unknown), total cost unknown"
 USAGE_NOT_REPORTED = "Usage: not reported for 1 run"
+# The asking request's terminal comment on the happy path: within the bound.
+USAGE_ASK = (
+    "Usage: implementer 400,000 tokens ($1.20), total $1.20 "
+    "(estimated from openrouter prices as of 2026-11-01)"
+)
 
 
 def test_judge_usage_lines_are_the_ones_usage_line_writes() -> None:
@@ -1377,6 +1383,12 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).isoformat()
 
 
+def _jira_time(epoch: float) -> str:
+    """Jira's ``created`` shape: ``2026-11-20T08:15:30.123+0000``."""
+
+    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+0000"
+
+
 REQUEST_1 = "11111111-1111-4111-8111-111111111111"
 REQUEST_2 = "22222222-2222-4222-8222-222222222222"
 
@@ -1401,8 +1413,22 @@ class _World:
         ends_after: float = 1200,
         investigating: bool = True,
         second_pull_after: float | None = None,
+        ask_usage: str | None = USAGE_ASK,
+        ask_terminal: bool = True,
+        post_takes: float = 0,
+        second_request_after: float = 8,
+        return_created: bool = True,
+        third_request_after: float | None = None,
+        late_usage: tuple[float, str] | None = None,
     ):
         self.clock = clock
+        self.ask_usage = ask_usage
+        self.ask_terminal = ask_terminal
+        self.post_takes = post_takes
+        self.second_request_after = second_request_after
+        self.return_created = return_created
+        self.third_request_after = third_request_after
+        self.late_usage = late_usage
         self.ends_after = ends_after
         self.investigating = investigating
         self.second_pull_after = second_pull_after
@@ -1441,14 +1467,23 @@ class _World:
     def bot_comments(self, key: str) -> list[dict[str, Any]]:
         assert key == ISSUE_KEY
         values = []
+        # The asking request's status comment: running, then (once the question
+        # ending settles) terminal, as factory_notices.py renders it.
+        first: list[dict[str, Any]] = []
         if self.investigating and self.since(self.labelled, 20):
-            values.append(
-                _comment(
-                    "10100",
-                    f"curie-execution-request:{REQUEST_1}",
-                    _paragraph(_text("Investigating this ticket. The factory will open a pull ")),
+            first.append(_paragraph(_text("Investigating this ticket. The factory will open a ")))
+        if self.ask_terminal and self.since(self.labelled, 405):
+            first.append(
+                _paragraph(
+                    _text(
+                        "Questions asked (round 1 of 3). Answer in a plain comment on this ticket."
+                    )
                 )
             )
+            if self.ask_usage is not None:
+                first.append(_paragraph(_text(self.ask_usage)))
+        if first:
+            values.append(_comment("10100", f"curie-execution-request:{REQUEST_1}", *first))
         if self.since(self.labelled, 400):
             values.append(
                 _comment(
@@ -1461,18 +1496,27 @@ class _World:
             blocks = [
                 _paragraph(_text("Answer received. The factory is working on this ticket again."))
             ]
+            if self.late_usage is not None and self.since(self.answered, self.late_usage[0]):
+                blocks.append(_paragraph(_text(self.late_usage[1])))
+            elif self.since(self.merged, 30):
+                blocks.append(_paragraph(_text(USAGE_AT_LEAST)))
             if self.since(self.merged, 30):
-                blocks += [
-                    _paragraph(_text(USAGE_AT_LEAST)),
-                    _paragraph(_text("Pull request merged: "), _text(PR_URL, href=PR_URL)),
-                ]
+                blocks.append(
+                    _paragraph(_text("Pull request merged: "), _text(PR_URL, href=PR_URL))
+                )
             values.append(_comment("10102", f"curie-execution-request:{REQUEST_2}", *blocks))
         return values
 
     def post_comment(self, issue_id: str, text: str) -> tuple[int, Any]:
+        """Jira records the comment at the instant the POST arrives; the response
+        returns ``post_takes`` seconds later, carrying that ``created``."""
+
         self.posted.append((issue_id, text))
         self.answered = self.clock()
-        return 201, {"id": "10200"}
+        self.clock.now += self.post_takes
+        if not self.return_created:
+            return 201, {"id": "10200"}
+        return 201, {"id": "10200", "created": _jira_time(self.answered)}
 
     def changes_opened(self) -> list[int]:
         found = [7] if self.since(self.answered, 1100) else []
@@ -1503,14 +1547,25 @@ class _World:
                 requests.append({"sequence": 2, "status": "completed", "created_at": _iso(0)})
             if self.settled_reads > 1 and self.final_read == "live":
                 requests.append({"sequence": 2, "status": "queued", "created_at": _iso(0)})
-        if self.since(self.answered, 8):
+        if self.since(self.answered, self.second_request_after):
             assert self.answered is not None
             ended = self.second_run_ends and self.since(self.answered, self.ends_after)
             requests.append(
                 {
                     "sequence": 2,
                     "status": "completed" if ended else "running",
-                    "created_at": _iso(self.answered + 8),
+                    "created_at": _iso(self.answered + self.second_request_after),
+                }
+            )
+        if self.third_request_after is not None and self.since(
+            self.answered, self.third_request_after
+        ):
+            assert self.answered is not None
+            requests.append(
+                {
+                    "sequence": 3,
+                    "status": "queued",
+                    "created_at": _iso(self.answered + self.third_request_after),
                 }
             )
         detail: dict[str, Any] = {"id": "wi-1", "requests": requests}
@@ -1700,3 +1755,271 @@ def test_judge_drive_does_not_merge_when_a_second_pull_request_appears_while_wai
     assert [pr["number"] for pr in obs["pull_requests"]] == [7, 8]
     assert obs["verdict"] == "failed"
     assert "2 pull requests opened, expected exactly 1" in obs["failures"]
+
+
+# --- the spend bound during the run (H1) ---------------------------------------------------
+
+OVER_BOUND = "Usage: implementer 9,000,000 tokens ($26.00), total $26.00"
+
+
+@pytest.mark.parametrize(
+    ("world", "kind", "message"),
+    [
+        (
+            {"ask_usage": OVER_BOUND},
+            "total",
+            "the asking request's estimated cost was $26.00 before the answer, over the 25 USD "
+            "bound; not answered",
+        ),
+        (
+            {"ask_usage": USAGE_UNKNOWN},
+            "unknown",
+            "the asking request's usage line read 'total cost unknown' before the answer; "
+            "not answered",
+        ),
+        (
+            {"ask_usage": USAGE_NOT_REPORTED},
+            "missing",
+            "the asking request's terminal status comment carried no usage total before the "
+            "answer; not answered",
+        ),
+        (
+            {"ask_usage": None},
+            "missing",
+            "the asking request's terminal status comment carried no usage total before the "
+            "answer; not answered",
+        ),
+        (
+            {"ask_terminal": False},
+            "missing",
+            "the asking request's terminal status comment carried no usage total before the "
+            "answer; not answered",
+        ),
+    ],
+)
+def test_judge_drive_never_answers_when_the_asking_usage_is_not_within_the_bound(
+    world: dict[str, Any], kind: str, message: str, tmp_path: Path
+) -> None:
+    # Fails with the pre-answer usage check reverted: the answer is posted.
+    p, w, _clock = _drive(tmp_path, **world)
+    obs = p.evidence["scenario"]
+    assert w.posted == [] and w.merges == []
+    assert obs["answer_s"] is None and obs["settled"] is True
+    assert obs["pre_answer_usage"]["kind"] == kind
+    if kind == "total":
+        assert obs["pre_answer_usage"]["total"] == "26.00"
+    assert obs["verdict"] == "failed"
+    assert message in obs["failures"], obs["failures"]
+
+
+def test_judge_drive_records_the_asking_usage_on_the_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fe, "_await_ending", _no_await_ending)
+    p, _w, _clock = _drive(tmp_path)
+    obs = p.evidence["scenario"]
+    assert obs["pre_answer_usage"] == {"kind": "total", "total": "1.20"}
+    assert obs["spend_stop"] is None and obs["verdict"] == "passed"
+
+
+def test_judge_drive_stops_before_the_merge_when_a_third_request_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fe, "_await_ending", _no_await_ending)
+    # An automatic successor queues a third request while the driver waits for
+    # the pull request (recorded at answer + 1100). Fails with the in-run check
+    # reverted: the driver keeps waiting and merges.
+    p, w, clock = _drive(tmp_path, third_request_after=600)
+    obs = p.evidence["scenario"]
+    assert w.posted and w.merges == []
+    assert obs["spend_stop"] == {"reason": "requests", "count": 3}
+    assert w.answered is not None and clock.now <= w.answered + 600 + otl.POLL_SECONDS
+    assert obs["verdict"] == "failed"
+    assert (
+        "the run was stopped after the answer: the work item showed 3 execution requests, "
+        "over the bound of 2" in obs["failures"]
+    )
+    assert "the merge failed" not in obs["failures"]
+
+
+@pytest.mark.parametrize(
+    ("line", "stop", "message"),
+    [
+        (
+            OVER_BOUND,
+            {"reason": "usage", "kind": "total", "total": "26.00"},
+            "a status comment's estimated cost is $26.00, over the 25 USD bound",
+        ),
+        (
+            USAGE_UNKNOWN,
+            {"reason": "usage", "kind": "unknown", "total": None},
+            "a status comment's usage line reads 'total cost unknown'",
+        ),
+    ],
+)
+def test_judge_drive_stops_when_the_usage_crosses_the_bound_after_the_answer(
+    line: str,
+    stop: dict[str, Any],
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fe, "_await_ending", _no_await_ending)
+    # Fails with the in-run check reverted: the run goes on to the merge.
+    p, w, clock = _drive(tmp_path, late_usage=(300, line))
+    obs = p.evidence["scenario"]
+    assert w.posted and w.merges == []
+    assert obs["spend_stop"] == stop
+    assert w.answered is not None and clock.now <= w.answered + 300 + otl.POLL_SECONDS
+    assert obs["verdict"] == "failed"
+    assert f"the run was stopped after the answer: {message}" in obs["failures"]
+
+
+def test_judge_rejects_a_pre_answer_usage_shape() -> None:
+    obs = _passing_obs()
+    del obs["pre_answer_usage"]
+    assert otl.judge(obs) == ["the asking request's usage was not read before the answer"]
+    obs["pre_answer_usage"] = {"kind": "at_least", "total": "25.50"}
+    assert otl.judge(obs) == [
+        "the asking request's estimated cost was at least $25.50 before the answer, over the "
+        "25 USD bound; not answered"
+    ]
+
+
+# --- the answer instant (H3) ----------------------------------------------------------------
+
+
+def test_judge_drive_measures_the_second_request_from_jiras_created_time(
+    tmp_path: Path,
+) -> None:
+    # The POST returns 29 s after Jira recorded the comment; the second request
+    # is created 205 s after that. Fails with the instant taken after the POST:
+    # 176 s, inside the bound.
+    p, w, _clock = _drive(tmp_path, post_takes=29, second_request_after=205)
+    obs = p.evidence["scenario"]
+    assert w.answered is not None and len(w.posted) == 1
+    assert obs["verdict"] == "failed"
+    assert "no second request after the answer" in obs["failures"], obs["failures"]
+    assert obs["answer_instant"] == "jira_created"
+    assert obs["answer_s"] == round(w.answered - p.labelled_at, 1)
+
+
+def test_judge_drive_takes_the_clock_before_the_post_without_jiras_created(
+    tmp_path: Path,
+) -> None:
+    p, w, _clock = _drive(tmp_path, post_takes=29, return_created=False)
+    obs = p.evidence["scenario"]
+    assert w.answered is not None
+    assert obs["answer_instant"] == "before_post"
+    assert obs["answer_s"] == round(w.answered - p.labelled_at, 1)
+
+
+def test_judge_jira_created_epoch_reads_jiras_shape() -> None:
+    at = datetime(2026, 11, 20, 8, 15, 30, 123000, tzinfo=UTC).timestamp()
+    assert fe.jira_created_epoch("2026-11-20T08:15:30.123+0000") == at
+    assert fe.jira_created_epoch("2026-11-20T04:15:30.123-0400") == at
+    assert fe.jira_created_epoch("2026-11-20T08:15:30+0000") == int(at)
+    assert fe.jira_created_epoch("yesterday") is None
+    assert fe.jira_created_epoch(None) is None
+
+
+# --- names_key (H4) -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("body", "names"),
+    [
+        ("Jira: ACME-12A", False),
+        ("Jira: ACME-123", False),
+        ("Jira: XACME-12", False),
+        ("Jira: X_ACME-12", False),
+        ("Jira: ACME-12_x", False),
+        # A following -digit is a different token, not this key.
+        ("Jira: ACME-12-1", False),
+        ("Jira: acme-12", False),
+        ("Jira: ACME-12.", True),
+        ("Jira: (ACME-12)", True),
+        ("Jira: ACME-12, ACME-13", True),
+        ("https://example.atlassian.net/browse/ACME-12", True),
+        ("branch ACME-12-add-rounding", True),
+        ("ACME-12", True),
+    ],
+)
+def test_judge_names_key_requires_the_whole_token(body: str, names: bool) -> None:
+    assert otl.names_key(body, "ACME-12") is names
+
+
+# --- private identifiers (H2) ---------------------------------------------------------------
+
+BUILDER = "acme-buildkit-remote7"
+
+
+def test_anonymize_the_buildx_builder_is_an_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    environ = {**_environ(tmp_path), "BUILDX_BUILDER": BUILDER}
+    ids = otl.load_identities(environ, fetch_myself=_fetch_myself, github_login=_no_login)
+    assert ids["builder"] == [BUILDER]
+    # factory_e2e.check_build_tools records it as a step fact.
+    evidence = {"steps": [{"step": "candidate build tools present", "builder": BUILDER}]}
+    text = otl.evidence_serializer(ids)(evidence)
+    assert BUILDER not in text and '"builder": "builder"' in text
+    raw = tmp_path / "raw.json"
+    raw.write_text(json.dumps(evidence))
+    code = otl.main(
+        ["check-clean", str(raw)],
+        environ=environ,
+        fetch_myself=_fetch_myself,
+        github_login=_no_login,
+    )
+    assert (code, capsys.readouterr().out) == (1, "identities found: builder\n")
+
+
+def test_anonymize_dockers_default_builder_is_not_an_identity(tmp_path: Path) -> None:
+    environ = {**_environ(tmp_path), "BUILDX_BUILDER": "default"}
+    ids = otl.load_identities(environ, fetch_myself=_fetch_myself, github_login=_no_login)
+    assert "builder" not in ids
+    assert otl.anonymize("default_branch on the default builder", ids) == (
+        "default_branch on the default builder"
+    )
+
+
+def test_anonymize_config_identities_name_the_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _preflight(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setenv("BUILDX_BUILDER", BUILDER)
+        assert otl.config_identities(p)["builder"] == [BUILDER]
+        monkeypatch.setenv("BUILDX_BUILDER", "default")
+        assert "builder" not in otl.config_identities(p)
+    finally:
+        fe.shutil.rmtree(p.workdir, ignore_errors=True)
+
+
+PRIVATE_SEGMENT = "acme-private-workspace-77"
+
+
+@pytest.mark.parametrize(
+    ("content", "read"),
+    [
+        (None, fe.read_answer_file),
+        ("", fe.read_answer_file),
+        ("@ada round half up", fe.read_answer_file),
+        (None, fe.parse_issue_file),
+        ("only a title", fe.parse_issue_file),
+    ],
+)
+def test_anonymize_file_refusals_name_the_basename_only(
+    content: str | None, read: Any, tmp_path: Path
+) -> None:
+    folder = tmp_path / PRIVATE_SEGMENT
+    folder.mkdir()
+    named = folder / "answer.md"
+    if content is not None:
+        named.write_text(content)
+    with pytest.raises(fe.ConfigError) as refused:
+        read(named)
+    text = str(refused.value)
+    assert PRIVATE_SEGMENT not in text and str(tmp_path) not in text
+    assert "answer.md" in text

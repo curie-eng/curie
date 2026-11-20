@@ -1189,15 +1189,19 @@ def parse_issue_file(path: Path) -> tuple[str, str]:
     """The scenario ticket: first non-blank line is the title (a leading
     Markdown heading marker is dropped), the rest is the body. Both required."""
 
+    # The file is named by its basename only: this runs before any log filter
+    # is installed, and a caller's directory can name their environment.
     try:
         text = path.read_text()
     except OSError as exc:
-        raise ConfigError(f"cannot read the issue file {path}: {exc.strerror}") from None
+        raise ConfigError(f"cannot read the issue file {path.name}: {exc.strerror}") from None
     lines = text.strip().splitlines()
     title = lines[0].lstrip("#").strip() if lines else ""
     body = "\n".join(lines[1:]).strip()
     if not title or not body:
-        raise ConfigError(f"the issue file {path} needs a title line followed by a non-empty body")
+        raise ConfigError(
+            f"the issue file {path.name} needs a title line followed by a non-empty body"
+        )
     return title, body
 
 
@@ -1210,7 +1214,8 @@ def read_answer_file(path: Path | None) -> str:
 
     Refused before anything is installed: a missing flag, an unreadable or
     empty file, or text that mentions anyone (the answer must start the next
-    request as a plain answer, not as a mention).
+    request as a plain answer, not as a mention). Every message names the file
+    by its basename only: this runs before any log filter is installed.
     """
 
     if path is None:
@@ -1220,11 +1225,13 @@ def read_answer_file(path: Path | None) -> str:
     try:
         text = path.read_text().strip()
     except OSError as exc:
-        raise ConfigError(f"cannot read the answer file {path}: {exc.strerror}") from None
+        raise ConfigError(f"cannot read the answer file {path.name}: {exc.strerror}") from None
     if not text:
-        raise ConfigError(f"the answer file {path} is empty")
+        raise ConfigError(f"the answer file {path.name} is empty")
     if _ANSWER_MENTION.search(text):
-        raise ConfigError(f"the answer file {path} mentions someone; the answer must be plain text")
+        raise ConfigError(
+            f"the answer file {path.name} mentions someone; the answer must be plain text"
+        )
     return text
 
 
@@ -1921,6 +1928,23 @@ def judge_cancel_running(obs: Mapping[str, Any]) -> list[str]:
 
 def _now_iso() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+
+
+def jira_created_epoch(value: Any) -> float | None:
+    """A Jira ``created`` timestamp (``2026-11-20T08:15:30.123+0000``) as epoch seconds.
+
+    None when it cannot be parsed. Pure. Shared by the Jira Cloud forge driver
+    and the one-ticket live driver.
+    """
+
+    if not isinstance(value, str):
+        return None
+    for shape in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return dt.datetime.strptime(value, shape).timestamp()
+        except ValueError:
+            continue
+    return None
 
 
 def _parse_time(value: Any) -> dt.datetime | None:

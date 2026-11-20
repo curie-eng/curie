@@ -12,7 +12,9 @@ an observation of plain numbers and booleans, each beat against its bound:
 1. ``Investigating this ticket.`` within 180 s of labelling;
 2. a question comment (marker ``curie-factory-questions:``) within 1800 s;
 3. the answer only after the issue carries ``curie-factory:questions`` and no
-   request is live, and no request live between that settlement and the answer;
+   request is live, no request live between that settlement and the answer,
+   and the asking request's terminal status comment carrying a usage total
+   within the cost bound;
 4. the second request within 180 s of the answer, and ``Answer received.``
    within 180 s;
 5. exactly one pull request within 3600 s of the answer, naming the Jira key and
@@ -21,6 +23,11 @@ an observation of plain numbers and booleans, each beat against its bound:
 7. the Jira status id unchanged (correction 2 of #5793), at most 2 requests,
    the factory's usage total at most 25 USD (correction 3), and no Jira issue
    created by the factory account.
+
+The request and cost bounds also hold during the run: after the answer, every
+poll of every later beat reads the work item and the bot's status comments, and
+a third request or a usage total over the bound (or ``total cost unknown``)
+stops the run at once, unmerged, so teardown removes the install and the spend.
 
 Every value that names the caller's environment (repository, accounts, App,
 Jira site, project, cloud, kube context, registry, binary paths, home) is an
@@ -76,6 +83,9 @@ POLL_SECONDS = 5
 # factory_questions.py ANSWER_RECEIVED_LINE start with these sentences.
 INVESTIGATING_LINE = "Investigating this ticket."
 ANSWER_RECEIVED_LINE = "Answer received."
+# factory_notices.py result_section: a questions-asked terminal comment's result
+# line is "Questions asked. ..." or "Questions asked (round N of M). ...".
+_QUESTIONS_ASKED = re.compile(r"^Questions asked[ .]")
 MERGED_LINE = "Pull request merged:"
 CITATION_PREFIX = "Answered on the ticket by "
 QUESTIONS_MARKER_PREFIX = "curie-factory-questions:"
@@ -228,12 +238,21 @@ def usage_total(text: str) -> tuple[str, Decimal | None]:
 
 
 def names_key(body: str | None, key: str) -> bool:
-    """The body names the Jira key as a whole token (``ACME-10`` does not name ``ACME-1``).
+    """The body names the Jira key as a whole token. Case-sensitive. Pure.
 
+    Before the key: no letter, digit, ``_`` or ``-`` (``XACME-12`` and
+    ``X_ACME-12`` are other keys). After it: no letter, digit or ``_``
+    (``ACME-123``, ``ACME-12A``), and no ``-`` followed by a digit:
+    ``ACME-12-1`` is a different token, while ``ACME-12-add-rounding`` (a branch
+    name) names the key. Punctuation, brackets and the end of a browse URL
+    (``ACME-12.``, ``(ACME-12)``, ``ACME-12,``, ``/browse/ACME-12``) do.
     The key part of ``one_ticket_jira.names_ticket``.
     """
 
-    return bool(key) and bool(re.search(rf"(?<![A-Z0-9-]){re.escape(key)}(?![0-9])", body or ""))
+    if not key:
+        return False
+    pattern = rf"(?<![A-Za-z0-9_-]){re.escape(key)}(?![A-Za-z0-9_]|-[0-9])"
+    return re.search(pattern, body or "") is not None
 
 
 def has_citation(body: str | None) -> bool:
@@ -310,6 +329,7 @@ def judge(obs: Mapping[str, Any]) -> list[str]:
             )
         elif pre_answer != "ok":
             failures.append("the work item was not read immediately before the answer")
+    failures.extend(_judge_pre_answer_usage(obs))
 
     second = _after(answer, obs.get("second_request_s"))
     if second is None:
@@ -341,12 +361,17 @@ def judge(obs: Mapping[str, Any]) -> list[str]:
         if pull.get("has_citation") is not True:
             failures.append(f"the pull request body has no line starting '{CITATION_PREFIX}'")
 
+    stop = obs.get("spend_stop")
+    stopped = False
+    if isinstance(stop, Mapping):
+        stopped = True
+        failures.append(_stop_message(stop))
     if obs.get("answered_run_ended") is False:
         failures.append(
             f"the answered run did not end within {ENDING_SECONDS} s of the pull request; "
             "not merged"
         )
-    elif obs.get("merge_ok") is not True:
+    elif obs.get("merge_ok") is not True and not stopped:
         failures.append("the merge failed")
     notice = _after(obs.get("merged_s"), obs.get("merged_notice_s"))
     if notice is None or notice > MERGED_NOTICE_SECONDS:
@@ -372,6 +397,55 @@ def judge(obs: Mapping[str, Any]) -> list[str]:
     elif created != 0:
         failures.append(f"the factory account created {created} Jira issues, expected 0")
     return failures
+
+
+def _judge_pre_answer_usage(obs: Mapping[str, Any]) -> list[str]:
+    """The asking request's usage, read before the answer was posted."""
+
+    usage = obs.get("pre_answer_usage")
+    if not isinstance(usage, Mapping):
+        if obs.get("answer_s") is None:
+            return []
+        return ["the asking request's usage was not read before the answer"]
+    kind = usage.get("kind")
+    if kind == "unknown":
+        return [
+            "the asking request's usage line read 'total cost unknown' before the answer; "
+            "not answered"
+        ]
+    missing = (
+        "the asking request's terminal status comment carried no usage total before the "
+        "answer; not answered"
+    )
+    if kind not in ("total", "at_least"):
+        return [missing]
+    try:
+        total = Decimal(str(usage.get("total")))
+    except InvalidOperation:
+        return [missing]
+    if total > COST_BOUND_USD:
+        lead = "at least " if kind == "at_least" else ""
+        return [
+            f"the asking request's estimated cost was {lead}${total} before the answer, "
+            f"over the {COST_BOUND_USD} USD bound; not answered"
+        ]
+    return []
+
+
+def _stop_message(stop: Mapping[str, Any]) -> str:
+    lead = "the run was stopped after the answer: "
+    if stop.get("reason") == "requests":
+        return (
+            f"{lead}the work item showed {stop.get('count')} execution requests, over the bound "
+            f"of {MAX_REQUESTS}"
+        )
+    if stop.get("kind") == "unknown":
+        return f"{lead}a status comment's usage line reads 'total cost unknown'"
+    at_least = "at least " if stop.get("kind") == "at_least" else ""
+    return (
+        f"{lead}a status comment's estimated cost is {at_least}${stop.get('total')}, over the "
+        f"{COST_BOUND_USD} USD bound"
+    )
 
 
 def _judge_usage(usage: Any) -> list[str]:
@@ -413,6 +487,7 @@ ROLE_ORDER = (
     "binary",
     "restore-url",
     "issue",
+    "builder",
     "home",
 )
 
@@ -432,6 +507,15 @@ def add_identity(identities: Identities, role: str, *values: Any) -> None:
         if item == "" or item in bucket:
             continue
         bucket.append(item)
+
+
+def add_builder(identities: Identities, name: str | None) -> None:
+    """BUILDX_BUILDER's value under ``builder``, unless it is Docker's built-in
+    ``default`` builder: that word is generic, and anonymizing it would rewrite
+    unrelated text such as ``default_branch``."""
+
+    if name is not None and name.strip().lower() != "default":
+        add_identity(identities, "builder", name)
 
 
 def _entries(identities: Mapping[str, Sequence[str | int]]) -> list[tuple[str, str, bool]]:
@@ -626,6 +710,8 @@ def load_identities(
             add_identity(ids, "binary", environ[variable])
     # The variable load_config reads into config.restore_webhook_url.
     add_identity(ids, "restore-url", environ.get(RESTORE_URL_VAR))
+    # factory_e2e.check_build_tools records the builder's name in the evidence.
+    add_builder(ids, environ.get("BUILDX_BUILDER"))
     add_identity(ids, "home", environ.get("HOME"))
     return {role: values for role, values in ids.items() if values}
 
@@ -856,6 +942,7 @@ def config_identities(p: Any) -> Identities:
         if "/" in str(binary or ""):
             add_identity(ids, "binary", binary)
     add_identity(ids, "restore-url", p.config.restore_webhook_url)
+    add_builder(ids, os.environ.get("BUILDX_BUILDER"))
     add_identity(ids, "home", os.environ.get("HOME"))
     return {role: values for role, values in ids.items() if values}
 
@@ -915,10 +1002,13 @@ def new_observation() -> dict[str, Any]:
         "settled_s": None,
         "pre_answer_read": None,
         "live_before_answer": [],
+        "pre_answer_usage": None,
         "answer_s": None,
+        "answer_instant": None,
         "second_request_s": None,
         "answer_received_s": None,
         "pull_requests": [],
+        "spend_stop": None,
         "answered_run_ended": None,
         "merge_ok": False,
         "merged_s": None,
@@ -977,6 +1067,50 @@ class _LiveRun:
     def comments(self) -> list[tuple[str | None, str]]:
         listed = self.driver.bot_comments(self.key) or []
         return [(comment_marker(c), comment_text(c)) for c in listed]
+
+    # -- the spend bound during the run --
+
+    def over_spend(
+        self, detail: Mapping[str, Any] | None, comments: Sequence[tuple[str | None, str]]
+    ) -> bool:
+        """Whether the run must stop now; the first reason is recorded in ``spend_stop``.
+
+        A work item with more than MAX_REQUESTS requests (an automatic successor
+        would start a third, workitems/lifecycle.py ``admit_automatic_successor``),
+        or any status comment whose Usage line totals over the bound or reads
+        ``total cost unknown``. An unreadable work item skips the count only.
+        """
+
+        if self.obs["spend_stop"] is not None:
+            return True
+        reason: dict[str, Any] | None = None
+        count = len(requests_of(detail)) if detail is not None else 0
+        if count > MAX_REQUESTS:
+            reason = {"reason": "requests", "count": count}
+        else:
+            for marker, text in comments:
+                if not (marker and marker.startswith(STATUS_MARKER_PREFIX)):
+                    continue
+                kind, total = usage_total(text)
+                if kind == "unknown" or (total is not None and total > COST_BOUND_USD):
+                    reason = {
+                        "reason": "usage",
+                        "kind": kind,
+                        "total": None if total is None else str(total),
+                    }
+                    break
+        if reason is None:
+            return False
+        self.obs["spend_stop"] = reason
+        self.note("the request or cost bound was crossed; stopping the run", **reason)
+        return True
+
+    def poll(self) -> tuple[Mapping[str, Any] | None, list[tuple[str | None, str]], bool]:
+        """One read of the work item and the comments after the answer, and the spend check."""
+
+        detail: Mapping[str, Any] | None = self.p.work_item_detail(self.work_item_id)
+        comments = self.comments()
+        return detail, comments, self.over_spend(detail, comments)
 
     # -- beats --
 
@@ -1068,6 +1202,8 @@ class _LiveRun:
         for marker, _text in self.comments():
             if marker and marker.startswith(STATUS_MARKER_PREFIX):
                 self.status_markers.add(marker)
+        if not self._asking_usage_within_bound(deadline):
+            return False
         # The last read before the post: it must be readable, hold the first
         # request and show none live, or no answer is posted (and no paid
         # second run starts).
@@ -1102,28 +1238,80 @@ class _LiveRun:
         ):
             self.note("an earlier beat failed (investigating line or question); not answering")
             return False
-        status, _ = self.driver.post_comment(self.issue_id, answer)
+        # The answer's instant is Jira's own record of the comment; without a
+        # readable one, the clock before the POST (the earliest it can be), so a
+        # slow POST never stretches the bounds measured from the answer.
+        posted_from = self.clock()
+        status, body = self.driver.post_comment(self.issue_id, answer)
         if status != 201:
             self.note("posting the answer failed", http_status=status)
             return False
-        self.answer_at = self.clock()
+        created = self.fe.jira_created_epoch(
+            body.get("created") if isinstance(body, Mapping) else None
+        )
+        self.answer_at = posted_from if created is None else created
+        self.obs["answer_instant"] = "before_post" if created is None else "jira_created"
         self.obs["answer_s"] = self.rel(self.answer_at)
         self.note("answer posted")
+        return True
+
+    def _asking_usage_within_bound(self, deadline: float) -> bool:
+        """The asking request's terminal status comment, read and bounded before the answer.
+
+        factory_notices.py ``_render`` writes the Usage line (``usage_line``,
+        cumulative over the WorkItem) into every terminal comment, questions
+        asked included, and ``usage_line`` returns a line whenever a run
+        started (``not reported for N runs`` when none reported). So the
+        asking request's terminal comment always carries one: a missing total
+        or ``total cost unknown`` refuses the answer (fail closed), as does a
+        total over the bound. The comment is awaited within ``deadline``: its
+        edit can trail the settlement the driver observed.
+        """
+
+        while True:
+            terminal: list[str] = []
+            for marker, text in self.comments():
+                if not (marker and marker.startswith(STATUS_MARKER_PREFIX)):
+                    continue
+                self.status_markers.add(marker)
+                if any(_QUESTIONS_ASKED.match(line.strip()) for line in text.splitlines()):
+                    terminal.append(text)
+            if terminal:
+                break
+            if self.clock() > deadline:
+                self.obs["pre_answer_usage"] = {"kind": "missing", "total": None}
+                self.note("the asking request's terminal status comment never appeared")
+                return False
+            self.sleep(POLL_SECONDS)
+        # More than one terminal comment is not expected; the worst one decides.
+        read = [usage_total(text) for text in terminal]
+        bad = [(kind, total) for kind, total in read if kind not in ("total", "at_least")]
+        kind, total = bad[0] if bad else max(read, key=lambda r: r[1] or Decimal(0))
+        self.obs["pre_answer_usage"] = {
+            "kind": kind,
+            "total": None if total is None else str(total),
+        }
+        if kind not in ("total", "at_least") or total is None or total > COST_BOUND_USD:
+            self.note("the asking request's usage is not within the bound; not answering")
+            return False
         return True
 
     def await_second_request(self) -> bool:
         assert self.answer_at is not None
         deadline = self.answer_at + max(SECOND_REQUEST_SECONDS, ANSWER_RECEIVED_SECONDS)
         while True:
+            detail, comments, stop = self.poll()
+            if stop:
+                return False
             if self.obs["second_request_s"] is None:
-                requests = requests_of(self.p.work_item_detail(self.work_item_id))
+                requests = requests_of(detail)
                 if len(requests) >= 2:
                     created = self.fe._parse_time(requests[1].get("created_at"))
                     at = created.timestamp() if created is not None else None
                     self.obs["second_request_s"] = self.rel(at)
                     self.note("second request created")
             if self.obs["answer_received_s"] is None:
-                for marker, text in self.comments():
+                for marker, text in comments:
                     if (
                         marker
                         and marker.startswith(STATUS_MARKER_PREFIX)
@@ -1149,7 +1337,10 @@ class _LiveRun:
         assert self.answer_at is not None
         deadline = self.answer_at + PULL_REQUEST_SECONDS
         while True:
-            detail = self.p.work_item_detail(self.work_item_id) or {}
+            read, _comments, stop = self.poll()
+            if stop:
+                return False
+            detail = read or {}
             pr = detail.get("pr")
             if isinstance(pr, dict) and pr.get("number"):
                 self.change = self.fe.ChangeRef(int(pr["number"]), str(pr.get("url") or ""))
@@ -1193,7 +1384,9 @@ class _LiveRun:
         deadline = (self.pr_recorded_at or self.clock()) + ENDING_SECONDS
         while True:
             read_at = self.clock()
-            detail = self.p.work_item_detail(self.work_item_id)
+            detail, _comments, stop = self.poll()
+            if stop:
+                return False
             # An ending read after the deadline does not count.
             if (
                 read_at <= deadline
@@ -1218,6 +1411,8 @@ class _LiveRun:
         if len(self.obs["pull_requests"]) != 1:
             self.note("the pull requests are not exactly one after the run ended; not merging")
             return
+        if self.poll()[2]:
+            return
         merge = self.driver.merge(self.change)
         merged_at = self.clock()
         self.obs["merge_ok"] = isinstance(merge, Mapping) and merge.get("merged") is True
@@ -1227,7 +1422,10 @@ class _LiveRun:
             return
         deadline = merged_at + MERGED_NOTICE_SECONDS
         while True:
-            for marker, text in self.comments():
+            # The notice is recorded from the same read before the spend check,
+            # so a stop on that read still keeps its usage in the evidence.
+            detail, comments = self.p.work_item_detail(self.work_item_id), self.comments()
+            for marker, text in comments:
                 if not (marker and marker.startswith(STATUS_MARKER_PREFIX)):
                     continue
                 if self.second_marker is not None and marker != self.second_marker:
@@ -1240,7 +1438,9 @@ class _LiveRun:
                         "total": None if total is None else str(total),
                     }
                     self.note("merged notice seen")
-                    return
+                    break
+            if self.over_spend(detail, comments) or self.obs["merged_notice_s"] is not None:
+                return
             if self.clock() > deadline:
                 self.note("no merged notice within the bound")
                 return
