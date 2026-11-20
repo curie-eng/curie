@@ -15,6 +15,7 @@ grep -q "set channelGateway.deploy=true or channelGateway.url" "$WORK/refused.er
 python3 - "$WORK" "$CHART" "$VALUES" <<'PYTHON'
 import base64
 import hashlib
+import json
 import pathlib
 from datetime import datetime, timezone
 import shutil
@@ -124,6 +125,9 @@ for bad in ("channelGateway.identityLookup.timeoutSeconds=0",
 
 def rendered_env(*sets):
     args = ["helm", "template", "acme", sys.argv[2], "-f", sys.argv[3]]
+    if sets and sets[0].startswith("--"):
+        args += list(sets)
+        sets = ()
     for value in sets:
         args += ["--set", value]
     rendered = subprocess.run(args, capture_output=True, text=True, check=True).stdout
@@ -138,37 +142,66 @@ def rendered_env(*sets):
     return rendered, envs
 
 
-# @spec GATEWAY-USER-EMAIL-8: a lookup-only Slack identity renders into the gateway alone.
-LOOKUP_ENV = ("CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY",
-              "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN")
-plain, _ = rendered_env("channelGateway.identityLookup.existingSecret=idp-gateway")
-for name in LOOKUP_ENV:
-    assert name not in plain, name + " rendered without a lookup Secret"
-rendered, envs = rendered_env("channelGateway.identityLookup.existingSecret=idp-gateway",
-                              "channelGateway.identityLookup.slackIdentity=directory",
-                              "channelGateway.identityLookup.slackBotTokenExistingSecret=directory-app")
+# @spec GATEWAY-USER-EMAIL-11: lookup identities render into the gateway alone.
+DECLARATION = "CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES"
+PREFIX = "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__"
+baseline, baseline_envs = rendered_env()
+assert DECLARATION not in baseline and PREFIX not in baseline
+_, empty_envs = rendered_env("--set-json", "channelGateway.lookupIdentities=[]")
+# Generated secrets differ between renders, so compare each workload's env shape.
+assert ({name: sorted(env) for name, env in empty_envs.items()}
+        == {name: sorted(env) for name, env in baseline_envs.items()}), \
+    "an empty lookupIdentities list changed a workload env"
+LOOKUPS = [{"name": "directory", "kind": "slack", "existingSecret": "directory-app"},
+           {"name": "people", "kind": "slack", "existingSecret": "people-app", "key": "bot"}]
+
+
+def lookup_render(entries, *sets):
+    args = ["helm", "template", "acme", sys.argv[2], "-f", sys.argv[3],
+            "--set-json", "channelGateway.lookupIdentities=" + json.dumps(entries)]
+    for value in sets:
+        args += ["--set", value]
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+result = lookup_render(LOOKUPS)
+assert result.returncode == 0, result.stderr
+envs = {}
+for item in yaml.safe_load_all(result.stdout):
+    if not item:
+        continue
+    spec = item.get("spec", {})
+    pod = spec.get("template", {}).get("spec") or spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec")
+    for container in (pod or {}).get("containers", []) + (pod or {}).get("initContainers", []):
+        envs[item["metadata"]["name"] + "/" + container["name"]] = {
+            entry["name"]: entry for entry in container.get("env", [])}
 gateway = envs["acme-curie-channel-gateway/channel-gateway"]
-assert gateway[LOOKUP_ENV[0]]["value"] == "directory"
-assert gateway[LOOKUP_ENV[1]]["valueFrom"] == {
-    "secretKeyRef": {"name": "directory-app", "key": "token"}}
+assert json.loads(gateway[DECLARATION]["value"]) == [
+    {"name": "directory", "kind": "slack", "token_env": PREFIX + "0"},
+    {"name": "people", "kind": "slack", "token_env": PREFIX + "1"}]
+assert gateway[PREFIX + "0"]["valueFrom"] == {"secretKeyRef": {"name": "directory-app", "key": "token"}}
+assert gateway[PREFIX + "1"]["valueFrom"] == {"secretKeyRef": {"name": "people-app", "key": "bot"}}
 for workload, env in envs.items():
     if workload != "acme-curie-channel-gateway/channel-gateway":
-        assert not set(LOOKUP_ENV) & env.keys(), workload + " received the lookup identity"
-assert rendered.count("directory-app") == 1, "the lookup Secret is referenced outside the gateway"
-_, keyed = rendered_env("channelGateway.identityLookup.slackIdentity=directory",
-                        "channelGateway.identityLookup.slackBotTokenExistingSecret=directory-app",
-                        "channelGateway.identityLookup.slackBotTokenKey=bot")
-assert keyed["acme-curie-channel-gateway/channel-gateway"][LOOKUP_ENV[1]]["valueFrom"] == {
-    "secretKeyRef": {"name": "directory-app", "key": "bot"}}
-for bad in (("channelGateway.identityLookup.slackBotTokenExistingSecret=directory-app",),
-            ("channelGateway.identityLookup.slackBotTokenExistingSecret=directory-app",
-             "channelGateway.identityLookup.slackIdentity=directory",
-             "channelGateway.identityLookup.slackBotTokenKey=")):
-    args = ["helm", "template", "acme", sys.argv[2], "-f", sys.argv[3]]
-    for value in bad:
-        args += ["--set", value]
-    result = subprocess.run(args, capture_output=True, text=True)
-    assert result.returncode != 0, " ".join(bad) + " was accepted"
+        assert not any(name == DECLARATION or name.startswith(PREFIX) for name in env), \
+            workload + " received a lookup identity"
+for secret in ("directory-app", "people-app"):
+    assert result.stdout.count(secret) == 1, secret + " is referenced outside the gateway"
+for bad in ([{"name": "directory", "kind": "ldap", "existingSecret": "directory-app"}],
+            [{"name": "Directory", "kind": "slack", "existingSecret": "directory-app"}],
+            [{"name": "directory", "kind": "slack", "existingSecret": ""}],
+            [{"name": "directory", "kind": "slack", "existingSecret": "directory-app", "key": ""}],
+            [{"name": "directory", "kind": "slack", "existingSecret": "directory-app", "extra": 1}],
+            [{"name": "default", "kind": "slack", "existingSecret": "directory-app"}],
+            [{"name": "curie-cluster-message", "kind": "slack", "existingSecret": "directory-app"}],
+            [LOOKUPS[0], dict(LOOKUPS[1], name="directory")]):
+    assert lookup_render(bad).returncode != 0, json.dumps(bad) + " was accepted"
+collision = subprocess.run(
+    ["helm", "template", "acme", sys.argv[2], "-f", sys.argv[3],
+     "--set-json", 'dispatcher.slack.identities=[{"name": "second", "appTokenExistingSecret": "second-slack", "botTokenExistingSecret": "second-slack"}]',
+     "--set-json", 'channelGateway.lookupIdentities=[{"name": "second", "kind": "slack", "existingSecret": "directory-app"}]'],
+    capture_output=True, text=True)
+assert collision.returncode != 0 and "declared Slack identity" in collision.stderr, collision.stderr
 
 print("PASS: unchanged pre-gateway Slack values render on install and upgrade; TLS, token custody and retained defaults are wired")
 PYTHON

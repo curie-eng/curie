@@ -1,6 +1,7 @@
-"""A lookup-only Slack identity serves the user email read and nothing else.
+"""A lookup identity's credential serves directory reads and nothing else.
 
-@spec GATEWAY-USER-EMAIL-7
+@spec GATEWAY-USER-EMAIL-7, GATEWAY-USER-EMAIL-8, GATEWAY-USER-EMAIL-9,
+GATEWAY-USER-EMAIL-10
 """
 
 import asyncio
@@ -12,17 +13,22 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
+from curie_channel_gateway.lookup_identities import LookupIdentities
 from curie_channel_gateway.request_replay import request_headers
 from curie_channel_gateway.slack import read_server
 from curie_channel_gateway.slack.tokens import SlackProviderConfig
+from curie_channel_gateway.token_custody import refuse_slack_tokens
 from curie_channel_gateway.user_email_client import GatewayUserEmailSettings
+from pydantic import TypeAdapter, ValidationError
 
 EMAIL = "lookup.secret-sentinel@example.test"
 SLACK_BASE = "https://slack.example.test/api/"
 AGENT_TOKEN = "xoxb-agent-default-example"
 SECOND_AGENT_TOKEN = "xoxb-agent-second-example"
 LOOKUP_TOKEN = "xoxb-lookup-only-example"
+PEOPLE_TOKEN = "xoxb-people-lookup-example"
 LOOKUP_NAME = "directory"
+LOOKUP_PREFIX = "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__"
 CALLERS = {
     "CURIE_CHANNEL_GATEWAY_API_TOKEN": "api-credential",
     "CURIE_CHANNEL_GATEWAY_WORKER_TOKEN": "worker-credential",
@@ -48,6 +54,7 @@ DECLARED = json.dumps(
         },
     ]
 )
+EMAIL_BODY = {"user_id": "U0EXAMPLE1", "workspace": "T0EXAMPLE1"}
 
 
 @pytest.fixture(autouse=True)
@@ -113,11 +120,18 @@ def constructed(monkeypatch):
     return seen
 
 
-def _configure_lookup(monkeypatch, name=LOOKUP_NAME, token=LOOKUP_TOKEN):
-    if name is not None:
-        monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY", name)
-    if token is not None:
-        monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN", token)
+def _declare(monkeypatch, *entries, tokens=None):
+    """Declare lookup identities; each gets LOOKUP_TOKEN unless tokens says otherwise."""
+
+    declared = [
+        {"name": name, "kind": kind, "token_env": f"{LOOKUP_PREFIX}{index}"}
+        for index, (name, kind) in enumerate(entries)
+    ]
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES", json.dumps(declared))
+    values = [LOOKUP_TOKEN] * len(entries) if tokens is None else tokens
+    for index, value in enumerate(values):
+        if value is not None:
+            monkeypatch.setenv(f"{LOOKUP_PREFIX}{index}", value)
 
 
 async def _gateway(scenario):
@@ -137,11 +151,114 @@ async def _post(client, caller, identity, operation, body):
     return response.status, await response.text()
 
 
-EMAIL_BODY = {"user_id": "U0EXAMPLE1", "workspace": "T0EXAMPLE1"}
+def _refused():
+    async def scenario(_client):
+        raise AssertionError("gateway started")
+
+    with pytest.raises(ValueError) as error:
+        asyncio.run(_gateway(scenario))
+    assert LOOKUP_TOKEN not in str(error.value)
+    return str(error.value)
+
+
+def _parse(value):
+    return TypeAdapter(LookupIdentities).validate_python(value)
+
+
+# Declaration parser (@spec GATEWAY-USER-EMAIL-7, GATEWAY-USER-EMAIL-9)
+
+
+def test_declaration_parses_name_kind_and_indexed_token_env():
+    (identity,) = _parse(
+        json.dumps([{"name": "directory", "kind": "slack", "token_env": f"{LOOKUP_PREFIX}0"}])
+    )
+    assert (identity.name, identity.kind, identity.token_env) == (
+        "directory",
+        "slack",
+        f"{LOOKUP_PREFIX}0",
+    )
+    assert _parse("[]") == ()
+    with pytest.raises(ValidationError):
+        identity.name = "other"
+
+
+def _entry(name="directory", kind="slack", token_env=f"{LOOKUP_PREFIX}0", **extra):
+    return {"name": name, "kind": kind, "token_env": token_env, **extra}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps([_entry(name="Directory")]),
+        json.dumps([_entry(name="directory_lookup")]),
+        json.dumps([_entry(name="d" * 41)]),
+        json.dumps([_entry(name="default")]),
+        json.dumps([_entry(name="curie-cluster-message")]),
+        json.dumps([_entry(token_env="SLACK_BOT_TOKEN")]),
+        json.dumps([_entry(token_env=f"{LOOKUP_PREFIX}01")]),
+        json.dumps([{"name": "directory", "kind": "slack"}]),
+        json.dumps([_entry(kind="")]),
+        json.dumps([_entry(scopes=["users:read"])]),
+        json.dumps([_entry(), _entry(token_env=f"{LOOKUP_PREFIX}1")]),
+        json.dumps([_entry(), _entry(name="people")]),
+        json.dumps(_entry()),
+        "not json",
+    ],
+    ids=[
+        "uppercase-name",
+        "underscore-name",
+        "long-name",
+        "default-name",
+        "cluster-message-name",
+        "unprefixed-token-env",
+        "padded-index",
+        "missing-token-env",
+        "blank-kind",
+        "extra-field",
+        "duplicate-name",
+        "duplicate-token-env",
+        "not-a-list",
+        "not-json",
+    ],
+)
+def test_declaration_refuses_a_malformed_entry(raw):
+    with pytest.raises(ValidationError):
+        _parse(raw)
+
+
+def test_gateway_config_refuses_a_malformed_declaration(monkeypatch):
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES", '[{"name": "Directory"}]')
+    with pytest.raises(ValueError):
+        read_server.GatewayConfig()
+
+
+# Boot refusals (@spec GATEWAY-USER-EMAIL-9)
+
+
+def test_gateway_refuses_an_unsupported_kind_and_names_the_supported_ones(monkeypatch, slack):
+    _declare(monkeypatch, (LOOKUP_NAME, "ldap"))
+    message = _refused()
+    assert "ldap" in message and "slack" in message
+
+
+def test_gateway_refuses_a_lookup_identity_named_like_a_declared_identity(monkeypatch, slack):
+    monkeypatch.setenv("CURIE_SLACK_IDENTITIES", DECLARED)
+    monkeypatch.setenv("CURIE_SLACK_BOT_TOKEN__1", SECOND_AGENT_TOKEN)
+    _declare(monkeypatch, ("second", "slack"))
+    assert "second" in _refused()
+
+
+@pytest.mark.parametrize("token", [None, "", "  "], ids=["unset", "empty", "blank"])
+def test_gateway_refuses_an_unset_or_blank_lookup_token(monkeypatch, slack, token):
+    _declare(monkeypatch, (LOOKUP_NAME, "slack"), tokens=[token])
+    assert f"{LOOKUP_PREFIX}0" in _refused()
+
+
+# Isolation (@spec GATEWAY-USER-EMAIL-8)
 
 
 def test_lookup_identity_reads_user_email_with_its_own_token(monkeypatch, slack, constructed):
-    _configure_lookup(monkeypatch)
+    _declare(monkeypatch, (LOOKUP_NAME, "slack"))
 
     async def scenario(client):
         identity = CALLERS["CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN"]
@@ -157,10 +274,28 @@ def test_lookup_identity_reads_user_email_with_its_own_token(monkeypatch, slack,
     asyncio.run(_gateway(scenario))
 
 
+def test_two_lookup_identities_each_read_with_their_own_token(monkeypatch, slack, constructed):
+    _declare(
+        monkeypatch,
+        (LOOKUP_NAME, "slack"),
+        ("people", "slack"),
+        tokens=[LOOKUP_TOKEN, PEOPLE_TOKEN],
+    )
+
+    async def scenario(client):
+        identity = CALLERS["CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN"]
+        for name, token in ((LOOKUP_NAME, LOOKUP_TOKEN), ("people", PEOPLE_TOKEN)):
+            status, _text = await _post(client, identity, name, "user_email", EMAIL_BODY)
+            assert status == 200
+            assert slack[-1].headers["Authorization"] == f"Bearer {token}"
+
+    asyncio.run(_gateway(scenario))
+
+
 def test_no_other_gateway_surface_receives_the_lookup_token(monkeypatch, slack, constructed):
     monkeypatch.setenv("CURIE_SLACK_IDENTITIES", DECLARED)
     monkeypatch.setenv("CURIE_SLACK_BOT_TOKEN__1", SECOND_AGENT_TOKEN)
-    _configure_lookup(monkeypatch)
+    _declare(monkeypatch, (LOOKUP_NAME, "slack"))
 
     async def scenario(client):
         api = CALLERS["CURIE_CHANNEL_GATEWAY_API_TOKEN"]
@@ -177,7 +312,13 @@ def test_no_other_gateway_surface_receives_the_lookup_token(monkeypatch, slack, 
     assert any(SECOND_AGENT_TOKEN in call for call in constructed["SlackReplyAdapter"])
 
 
-def test_without_a_lookup_identity_everything_is_unchanged(monkeypatch, slack, constructed):
+@pytest.mark.parametrize("declaration", [None, "[]"], ids=["absent", "empty"])
+def test_without_lookup_identities_everything_is_unchanged(
+    monkeypatch, slack, constructed, declaration
+):
+    if declaration is not None:
+        monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES", declaration)
+
     async def scenario(client):
         identity = CALLERS["CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN"]
         status, _text = await _post(client, identity, LOOKUP_NAME, "user_email", EMAIL_BODY)
@@ -193,47 +334,17 @@ def test_without_a_lookup_identity_everything_is_unchanged(monkeypatch, slack, c
     assert repr({"default": AGENT_TOKEN}) in reader
 
 
-@pytest.mark.parametrize(
-    ("name", "token", "declared"),
-    [
-        (LOOKUP_NAME, None, False),
-        (None, LOOKUP_TOKEN, False),
-        (LOOKUP_NAME, " ", False),
-        ("Directory", LOOKUP_TOKEN, False),
-        ("directory_lookup", LOOKUP_TOKEN, False),
-        ("d" * 41, LOOKUP_TOKEN, False),
-        ("default", LOOKUP_TOKEN, False),
-        ("curie-cluster-message", LOOKUP_TOKEN, False),
-        ("second", LOOKUP_TOKEN, True),
-    ],
-)
-def test_gateway_refuses_a_malformed_or_colliding_lookup_identity(
-    monkeypatch, slack, name, token, declared
-):
-    if declared:
-        monkeypatch.setenv("CURIE_SLACK_IDENTITIES", DECLARED)
-        monkeypatch.setenv("CURIE_SLACK_BOT_TOKEN__1", SECOND_AGENT_TOKEN)
-    _configure_lookup(monkeypatch, name=name, token=token)
-
-    async def scenario(_client):
-        raise AssertionError("gateway started")
-
-    with pytest.raises(ValueError) as error:
-        asyncio.run(_gateway(scenario))
-    assert LOOKUP_TOKEN not in str(error.value)
+# Custody (@spec GATEWAY-USER-EMAIL-10)
 
 
-def test_gateway_config_hides_the_lookup_token(monkeypatch):
-    _configure_lookup(monkeypatch)
-    config = read_server.GatewayConfig()
-    assert config.user_email_slack_identity == LOOKUP_NAME
-    assert config.user_email_slack_bot_token == LOOKUP_TOKEN
-    assert LOOKUP_TOKEN not in repr(config)
-
-
-def test_port_consumers_refuse_the_lookup_token(monkeypatch):
+@pytest.mark.parametrize("value", ["opaque-lookup-credential", LOOKUP_TOKEN])
+def test_port_consumers_refuse_the_lookup_token_prefix(monkeypatch, value):
     monkeypatch.delenv("SLACK_BOT_TOKEN")
+    with pytest.raises(ValueError):
+        refuse_slack_tokens({f"{LOOKUP_PREFIX}0": value})
+    monkeypatch.setenv(f"{LOOKUP_PREFIX}3", value)
+    with pytest.raises(ValueError):
+        refuse_slack_tokens({})
     monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_URL", "https://gateway.example.test")
-    _configure_lookup(monkeypatch, name=None)
     with pytest.raises(ValueError):
         GatewayUserEmailSettings()
