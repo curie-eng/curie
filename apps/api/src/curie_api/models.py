@@ -944,6 +944,12 @@ class ThreadPublicationLineage(Base):
     code_host_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
     code_host_pr_id: Mapped[str | None] = mapped_column(default=None)
     base_ref: Mapped[str | None] = mapped_column(default=None)
+    # Revisions started by GitHub review feedback that does not mention the
+    # factory, and when the first one past the cap was refused (#5794).
+    plain_feedback_revisions: Mapped[int] = mapped_column(server_default="0", default=0)
+    plain_feedback_capped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
