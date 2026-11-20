@@ -919,9 +919,7 @@ def answer_request_id(issue: TrackerIssueRef, comment_id: str) -> uuid.UUID:
 _ORDERED_COMMENT_ID = re.compile(r"[1-9][0-9]{0,18}")
 
 
-def ordered_comment_id(comment_id: str | None) -> int | None:
-    """A tracker comment id as its creation order, or None when it is not one."""
-
+def _comment_order(comment_id: str | None) -> int | None:
     if comment_id is None or not _ORDERED_COMMENT_ID.fullmatch(comment_id):
         return None
     return int(comment_id)
@@ -948,32 +946,11 @@ def _after_fence(
         return False
     if created_at.tzinfo is None or created_at.utcoffset() is None:
         return False
-    answer_order = ordered_comment_id(comment_id)
-    question_order = ordered_comment_id(question_comment_id)
+    answer_order = _comment_order(comment_id)
+    question_order = _comment_order(question_comment_id)
     if answer_order is not None and question_order is not None:
         return answer_order > question_order
     return created_at > answer_after
-
-
-def answered_closed_round(
-    row: FactoryQuestionRound, comment_id: str, created_at: datetime | None
-) -> bool:
-    """Whether a comment was made while ``row``'s last posted round was open.
-
-    For a round that is no longer ``outstanding`` or ``answered``: the comment
-    came after the round's question comment and no later than the round
-    ended (the row's last write, on the database clock). Such a comment was
-    an answer when it was made, so it is never also a mention (#5787
-    decision 4), even when a door first reads it after the round ended. A
-    comment with no creation time is not one.
-    """
-
-    if row.state in (OUTSTANDING, ANSWERED, POSTING) or row.comment_id is None:
-        return False
-    if not _after_fence(created_at, comment_id, row.answer_after, row.comment_id):
-        return False
-    assert created_at is not None
-    return created_at <= row.updated_at
 
 
 def _log_answer(

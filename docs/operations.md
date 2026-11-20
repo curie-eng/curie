@@ -1557,8 +1557,10 @@ by the poll pass, or in webhook mode by the work item reconciler. If the run
 ended before its question was recorded, its status comment says a reply does
 not restart the ticket. If the ticket's pull request was merged or closed
 before an answer's run started, that run ends without starting and its status
-comment says so. A comment refused because it came before the question was
-answered stays refused; it is not read again later as a mention. Otherwise a
+comment says so. A comment the webhook refused as an answer for who wrote it
+(a bot, or a person who could not have started the ticket) stays refused: a
+poll pass that lists it after the question round ended does not admit it as a
+mention, even if its author gained write permission since. Otherwise a
 later bounded execution requires a new issue comment that explicitly mentions
 that login and whose sender currently has write or admin permission; ordinary
 comments, edits, and events sent by the App do not execute work. Removing

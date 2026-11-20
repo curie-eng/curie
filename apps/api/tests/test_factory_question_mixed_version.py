@@ -934,10 +934,10 @@ _EXPECTED_USES = {
         "OUTSTANDING",
         "POSTING",
     },
-    # A comment between a round's question and that round's end is refused
-    # not_outstanding after the round clears (#5787) instead of being admitted
-    # as a mention. It reads the row and writes only the answer receipt; an
-    # older replica admits that comment as a mention, as before.
+    # After a round ends, a comment a webhook delivery refused as an answer
+    # for its author is refused again instead of being admitted as a mention
+    # (#5787). It reads the row state only and writes nothing; an older
+    # replica admits that comment as a mention, as before.
     "curie_api/github_factory.py": {
         "ADMITTED",
         "ANSWERED",
@@ -946,15 +946,12 @@ _EXPECTED_USES = {
         "COALESCED",
         "FactoryAnswerReceipt",
         "FactoryQuestionRound",
-        "NOT_OUTSTANDING",
         "OUTSTANDING",
         "POSTING",
         "QUESTION_POSTING",
         "QUEUED_FOLLOW_UP",
         "WORK_ITEM_CANCELLED",
         "admit_answer",
-        "answered_closed_round",
-        "ordered_comment_id",
     },
     "curie_api/routers/work_item_issue.py": {
         "ALREADY_ASKED",

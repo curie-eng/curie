@@ -68,7 +68,7 @@ from .github_factory_events import (
     event_repository,
     parse_factory_event,
 )
-from .github_review_audit import claim_review_delivery, settle_review_delivery
+from .github_review_audit import claim_review_delivery, comment_refusal, settle_review_delivery
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from .models import (
     AgentChannel,
@@ -952,41 +952,31 @@ class _AnswerOwner:
     owner: None = None
 
 
-async def _closed_round_answer(
-    row: FactoryQuestionRound,
-    item: WorkItem,
-    notice: FactoryNotice,
-    tracker: GitHubTracker | Callable[[], Awaitable[GitHubTracker]],
-    comment: Mapping[str, Any] | None,
-) -> WebhookResult | None:
-    """A comment on an issue whose round has ended: refused ``not_outstanding``
-    when it was made while that round was open, else None.
+# The answer refusals no later state of the round can lift: they judge who
+# wrote the comment.
+_IDENTITY_REFUSALS = frozenset({ANSWER_FROM_BOT, ANSWER_NOT_AUTHORIZED})
 
-    A comment one door refused as an answer (no receipt) can reach the other
-    door only after another answer's attempt ended the round; it was an
-    answer when it was made, so it never becomes a mention revision (#5787
-    decision 4). Only a comment GitHub numbers after the round's question
-    comment is read; its creation time comes from the factory's own read.
+
+async def _closed_round_answer(
+    session: AsyncSession, item: WorkItem, notice: FactoryNotice
+) -> WebhookResult | None:
+    """A comment on an issue whose round has ended: refused again when a
+    webhook delivery of it was refused as an answer for who wrote it, else
+    None.
+
+    That comment was an answer when it was made, so it never becomes a
+    mention revision (#5787 decision 4) when the poll pass first lists it
+    after another answer ended the round, however many rounds later. The
+    webhook's own recorded verdict decides, not a comparison of GitHub's
+    whole-second creation time with the round's end.
     """
 
-    question = factory_questions.ordered_comment_id(row.comment_id)
-    if question is None or notice.comment_id is None or notice.comment_id <= question:
+    if notice.comment_id is None:
         return None
-    if comment is None:
-        github = tracker if isinstance(tracker, GitHubTracker) else await tracker()
-        try:
-            comment = await github.issue_comment(notice.comment_id)
-        except NotFound:
-            return None
-        except ForgeError:
-            raise FeedbackUnavailable(COMMENT_UNAVAILABLE) from None
-    if comment.get("id") != notice.comment_id or _facts_request(comment.get("body")):
+    reason = await comment_refusal(session, notice.comment_id, _IDENTITY_REFUSALS)
+    if reason is None:
         return None
-    if not factory_questions.answered_closed_round(
-        row, str(notice.comment_id), parse_time(comment.get("created_at"))
-    ):
-        return None
-    return _refuse_answer(factory_questions.NOT_OUTSTANDING, item, notice)
+    return _refuse_answer(reason, item, notice)
 
 
 async def admit_answer_notice(
@@ -1062,7 +1052,7 @@ async def admit_answer_notice(
     if row is None:
         return None
     if row.state not in _ANSWERABLE:
-        return await _closed_round_answer(row, item, notice, tracker, comment)
+        return await _closed_round_answer(session, item, notice)
     if item.cancelled_at is not None:
         return _refuse_answer(factory_questions.WORK_ITEM_CANCELLED, item, notice)
     if (

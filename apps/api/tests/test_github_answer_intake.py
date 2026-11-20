@@ -37,7 +37,6 @@ import sys
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1361,11 +1360,13 @@ def test_a_recorded_round_status_never_says_its_questions_were_unrecorded(
 def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
     world: World, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """03-tu b: the webhook refuses a mention as an answer while the round is
-    open; another answer's attempt then ends the round. The poll pass, whose
-    cursor is behind, lists the refused comment: it was an answer when it was
-    made, so it is refused again and never becomes a mention revision. A
-    mention made after the round ended is still one."""
+    """03-tu b: the webhook refuses a mention as an answer while round 1 is
+    open, since its author may not answer. The author then gains write access,
+    another answer ends round 1, round 2 is asked and answered, and the run it
+    started ends. The poll pass, whose cursor is behind, lists the refused
+    comment: the webhook's verdict on who wrote it stands, so it never
+    becomes a mention revision. A mention made in the very second the round
+    ended is still one."""
 
     caplog.set_level(logging.INFO)
     number = 6235
@@ -1377,23 +1378,25 @@ def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
     answer = world.github.add_comment(number, ANSWER, user=WRITER)
     assert _deliver(world, "webhook", answer, number)["status"] == "factory_admitted"
     successor = _take_over(triage, _answer_id(triage, answer))
-    tr._finish(successor, "failed", "budget_exceeded")
+    asked = _ask(successor, ["Round 2: which file holds the rows?"])
+    assert asked.status_code == 200, asked.text
+    tr._finish(successor, "failed", "no_pull_request")
+    second = world.github.add_comment(number, ANSWER, user=WRITER)
+    assert _deliver(world, "webhook", second, number)["status"] == "factory_admitted"
+    last = _take_over(triage, _answer_id(triage, second))
+    tr._finish(last, "failed", "budget_exceeded")
     row = _round_row(triage.work_item_id)
-    assert row is not None and row["state"] == "cleared", row
+    assert row is not None and (row["state"], row["rounds_used"]) == ("cleared", 2), row
     before = _ids(triage)
 
-    _poll(world)
-
-    assert _ids(triage) == before
-    assert "not_outstanding" in _refusals(caplog, refused)
-    assert str(refused["id"]) not in _receipts(triage)
-
-    # GitHub's clock after the round ended: a new mention is a revision.
-    world.github.clock = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=2)
+    # GitHub's clock in the second the round ended, which it reports whole.
+    world.github.clock = row["updated_at"].replace(microsecond=0)
     later = world.github.add_comment(number, f"@{MENTION} also sort them.", user=WRITER)
 
     _poll(world)
 
+    assert "answer_not_authorized" in _refusals(caplog, refused)
+    assert str(refused["id"]) not in _receipts(triage)
     assert _ids(triage) == [*before, _mention_id(number, later)]
 
 
