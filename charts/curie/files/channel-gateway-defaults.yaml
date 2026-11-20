@@ -12,6 +12,9 @@ identityLookup:
   existingSecret: ''
   tokenKey: token
   timeoutSeconds: 5
+  slackIdentity: ''
+  slackBotTokenExistingSecret: ''
+  slackBotTokenKey: token
 readinessProbe:
   initialDelaySeconds: 1
   periodSeconds: 5

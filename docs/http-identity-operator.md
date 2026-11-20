@@ -55,7 +55,10 @@ gateway. The provider then asks the gateway for the sender's email with the
 lookup request's `native_id` and namespace `key`, through the
 [gateway user email lookup](../packages/channel-gateway/README.md#slack-user-email-lookup-for-identity-providers).
 An unknown user should be answered `unresolved`; a gateway error or timeout
-`unavailable`. The [chart installation reference](../charts/curie/README.md#http-identity-operator-files)
+`unavailable`. To keep `users:read.email` off every agent's Slack app, give the
+lookup a dedicated bot-token-only Slack app through
+`channelGateway.identityLookup.slackIdentity` and `slackBotTokenExistingSecret`,
+and set the provider's `CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` to that name. The [chart installation reference](../charts/curie/README.md#http-identity-operator-files)
 describes the protected files and activation wiring.
 
 ## Adopt and inspect

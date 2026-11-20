@@ -1772,10 +1772,24 @@ channelGateway:
   # CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN. Empty (the default) leaves the lookup
   # off. timeoutSeconds bounds each Slack users.info call. Restart the gateway
   # after rotating the Secret.
+  #
+  # By default the lookup reads users.info with a declared Slack identity's bot
+  # token, so that agent's app needs users:read.email. To keep that scope off
+  # every agent app, give the lookup its own Slack app (bot token only, scopes
+  # users:read and users:read.email, no Socket Mode, no events): set
+  # slackBotTokenExistingSecret to a Secret whose slackBotTokenKey holds that
+  # bot token, and slackIdentity to a name that is not a declared Slack
+  # identity. The provider then sets CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY to the
+  # same name. Only the gateway's user_email read receives this token; replies,
+  # reads, the dispatcher, API and worker never do. Empty (the default) changes
+  # nothing.
   identityLookup:
     existingSecret: ""
     tokenKey: token
     timeoutSeconds: 5
+    slackIdentity: ""
+    slackBotTokenExistingSecret: ""
+    slackBotTokenKey: token
   readinessProbe:
     initialDelaySeconds: 1
     periodSeconds: 5

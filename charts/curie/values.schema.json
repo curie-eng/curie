@@ -253,6 +253,16 @@
             "timeoutSeconds": {
               "type": "number",
               "exclusiveMinimum": 0
+            },
+            "slackIdentity": {
+              "type": "string"
+            },
+            "slackBotTokenExistingSecret": {
+              "type": "string"
+            },
+            "slackBotTokenKey": {
+              "type": "string",
+              "minLength": 1
             }
           }
         },

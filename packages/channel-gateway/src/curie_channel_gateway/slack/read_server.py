@@ -1,11 +1,18 @@
 """Standalone Slack gateway process; application services hold only caller credentials."""
 
 import logging
+import re
 import ssl
 from importlib.metadata import version
 from pathlib import Path
 
 import httpx
+from aci_protocol.slack_identities import (
+    IDENTITY_NAME_MAX_LENGTH,
+    IDENTITY_NAME_PATTERN,
+    declared_slack_identity_names,
+)
+from aci_protocol.turn import CLUSTER_MESSAGE_ADAPTER, DEFAULT_IDENTITY
 from aiohttp import web
 from curie_telemetry import bootstrap_service_telemetry
 from pydantic import Field
@@ -41,6 +48,14 @@ class GatewayConfig(BaseSettings):
     user_email_timeout_s: float = Field(
         default=5.0, gt=0, validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S"
     )
+    # Optional lookup-only Slack identity for the user_email read alone
+    # (@spec GATEWAY-USER-EMAIL-7).
+    user_email_slack_identity: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY"
+    )
+    user_email_slack_bot_token: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN", repr=False
+    )
     host: str = Field(default="0.0.0.0", validation_alias="CURIE_CHANNEL_GATEWAY_HOST")
     port: int = Field(default=8081, validation_alias="CURIE_CHANNEL_GATEWAY_PORT")
     allow_insecure_http: bool = Field(
@@ -68,8 +83,43 @@ def gateway_callers(config: GatewayConfig) -> dict[str, str]:
     return callers
 
 
+def user_email_tokens(
+    config: GatewayConfig, slack: SlackProviderConfig, tokens: dict[str, str]
+) -> dict[str, str]:
+    """The bot tokens the user_email read may use (@spec GATEWAY-USER-EMAIL-7).
+
+    The declared identities' tokens, plus the lookup-only identity when one is
+    configured. Only ``SlackUserEmails`` receives this mapping.
+    """
+
+    name = config.user_email_slack_identity
+    token = config.user_email_slack_bot_token
+    if not name and not token:
+        return tokens
+    if not name.strip() or not token.strip():
+        raise ValueError(
+            "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY and "
+            "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN must be set together"
+        )
+    if len(name) > IDENTITY_NAME_MAX_LENGTH or not re.fullmatch(IDENTITY_NAME_PATTERN, name):
+        raise ValueError(
+            "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY must match the Slack identity "
+            "name pattern"
+        )
+    reserved = {DEFAULT_IDENTITY, CLUSTER_MESSAGE_ADAPTER} | declared_slack_identity_names(
+        slack.slack_identities
+    )
+    if name in reserved:
+        raise ValueError(
+            "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY must not name a declared or "
+            "reserved Slack identity"
+        )
+    return {**tokens, name: token}
+
+
 async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.Application:
     tokens = slack_bot_tokens(slack)
+    email_tokens = user_email_tokens(config, slack, tokens)
     http = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
     sink = SlackReplyAdapter(
         tokens.get("default", ""),
@@ -101,7 +151,7 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
                 senders=SlackSenderIdentities(tokens, base_url=config.slack_api_base_url or None),
                 emails=SlackUserEmails(
                     http,
-                    tokens,
+                    email_tokens,
                     base_url=config.slack_api_base_url or None,
                     timeout_s=config.user_email_timeout_s,
                 ),

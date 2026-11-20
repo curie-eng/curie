@@ -2439,6 +2439,15 @@ bounds each Slack call. That caller can only read a user's email. Restart the
 gateway after rotating the Secret. See the
 [http identity operator guide](../../docs/http-identity-operator.md).
 
+The lookup reads Slack with a declared identity's bot token unless it has its
+own Slack app. `channelGateway.identityLookup.slackBotTokenExistingSecret`
+names a Secret whose `slackBotTokenKey` (default `token`) holds a bot token
+with `users:read` and `users:read.email` only, and
+`channelGateway.identityLookup.slackIdentity` names that lookup-only identity,
+which must not be a declared Slack identity. Only the gateway workload
+receives them, and only its user email read uses the token. The provider sets
+`CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` to the same name.
+
 An external gateway uses `channelGateway.url`; configure separate
 `channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,
 `channelGateway.tlsSecret` supplies `ca.crt` to callers. For a chart-deployed

@@ -104,6 +104,17 @@ spec:
             - name: CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S
               value: {{ $gateway.identityLookup.timeoutSeconds | quote }}
             {{- end }}
+            {{- with $gateway.identityLookup.slackBotTokenExistingSecret }}
+            # Optional lookup-only Slack identity: its bot token serves the
+            # user_email read and nothing else in the gateway.
+            - name: CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY
+              value: {{ required "channelGateway.identityLookup.slackIdentity must name the lookup-only Slack identity when slackBotTokenExistingSecret is set" $gateway.identityLookup.slackIdentity | quote }}
+            - name: CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ required "channelGateway.identityLookup.slackBotTokenKey must name the Secret key that holds the lookup bot token" $gateway.identityLookup.slackBotTokenKey | quote }}
+            {{- end }}
             {{- if $tlsSecret }}
             - name: CURIE_CHANNEL_GATEWAY_TLS_CERT
               value: /var/run/gateway-tls/tls.crt
