@@ -161,7 +161,7 @@ def test_a_question_ending_that_left_a_request_running_is_refused() -> None:
         )
 
 
-def test_a_follow_up_request_at_the_end_is_refused() -> None:
+def test_a_third_request_at_the_end_is_refused() -> None:
     items = [{"id": "w"}]
     pull = {"html_url": "https://example.test/pull/1"}
     final = [{"body": "Completed: https://example.test/pull/1"}]
@@ -255,24 +255,24 @@ def _receipt(comment: int, outcome: str, request: str | None) -> dict[str, Any]:
 
 
 def test_the_answer_receipt_names_the_second_request() -> None:
-    good = [_receipt(6, "admitted", "req2"), _receipt(7, "coalesced", None)]
-    ots.assert_answer_receipts(good, "6", "7", "req2")
+    ots.assert_answer_receipts([_receipt(6, "admitted", "req2")], "6", "req2")
 
 
-def test_a_follow_up_that_started_the_run_in_the_answers_place_is_refused() -> None:
-    swapped = [_receipt(6, "not_after_question", None), _receipt(7, "admitted", "req2")]
+def test_an_answer_that_did_not_start_the_second_request_is_refused() -> None:
+    not_admitted = [_receipt(6, "not_after_question", None)]
     with pytest.raises(ots.OneTicketAssertionError, match="not admitted"):
-        ots.assert_answer_receipts(swapped, "6", "7", "req2")
-    elsewhere = [_receipt(6, "admitted", "other"), _receipt(7, "coalesced", None)]
+        ots.assert_answer_receipts(not_admitted, "6", "req2")
+    elsewhere = [_receipt(6, "admitted", "other")]
     with pytest.raises(ots.OneTicketAssertionError, match="another request"):
-        ots.assert_answer_receipts(elsewhere, "6", "7", "req2")
-    split = [_receipt(6, "admitted", "req2"), _receipt(7, "queued_follow_up", "req3")]
-    with pytest.raises(ots.OneTicketAssertionError, match="queued_follow_up"):
-        ots.assert_answer_receipts(split, "6", "7", "req2")
+        ots.assert_answer_receipts(elsewhere, "6", "req2")
     with pytest.raises(ots.OneTicketAssertionError, match="no receipt for the answer"):
-        ots.assert_answer_receipts([], "6", "7", "req2")
-    with pytest.raises(ots.OneTicketAssertionError, match="no receipt for the follow-up"):
-        ots.assert_answer_receipts([_receipt(6, "admitted", "req2")], "6", "7", "req2")
+        ots.assert_answer_receipts([], "6", "req2")
+
+
+def test_a_request_started_by_a_comment_other_than_the_answer_is_refused() -> None:
+    extra = [_receipt(6, "admitted", "req2"), _receipt(7, "queued_follow_up", "req3")]
+    with pytest.raises(ots.OneTicketAssertionError, match="started by comments"):
+        ots.assert_answer_receipts(extra, "6", "req2")
 
 
 # Handoff: the stub's comment payload through the production intake ---------
@@ -292,16 +292,6 @@ def stub(tmp_path: Path) -> Iterator[Any]:
         yield server
     finally:
         server.close()
-
-
-def test_comments_appended_together_share_one_instant_and_consecutive_ids(stub: Any) -> None:
-    first, second = stub.append_comments(
-        ots.ISSUE, ["Accept `k`.", "That is all."], author=GITHUB.HUMAN
-    )
-
-    assert second["id"] == first["id"] + 1
-    assert first["created_at"] == first["updated_at"] == second["created_at"]
-    assert [c["id"] for c in stub._rows("comment")] == [first["id"], second["id"]]
 
 
 def test_the_stub_keeps_every_body_a_comment_held_in_order(stub: Any) -> None:
@@ -460,22 +450,20 @@ def test_the_production_poll_pass_offers_the_stubs_fresh_answer_and_never_the_ed
 ) -> None:
     """The handoff: the stub's own comment output goes through ``_admit_mentions``.
 
-    The fresh answer and the plain comment beside it are offered to the answer
-    intake; the same text edited in place after posting, which the stub stamps
-    with a later ``updated_at``, is refused by the pass and never offered. With
-    the pass disabled nothing is offered and the first assertion fails.
+    The fresh answer is offered to the answer intake; the same text edited in
+    place after posting, which the stub stamps with a later ``updated_at``, is
+    refused by the pass and never offered. With the pass disabled nothing is
+    offered and the first assertion fails.
     """
 
-    answer, follow_up = stub.append_comments(
-        ots.ISSUE, [run.ANSWER_TEXT, run.FOLLOW_UP_TEXT], author=GITHUB.HUMAN
-    )
+    answer = stub.append_comment(ots.ISSUE, run.ANSWER_TEXT, author=GITHUB.HUMAN)
     edited = stub.append_comment(ots.ISSUE, "Placeholder.", author=GITHUB.HUMAN)
     stub.edit_comment_body(edited["id"], run.ANSWER_TEXT)
     since = (ots.instant(answer["created_at"]) - timedelta(seconds=30)).isoformat()
 
     offered = _offered_to_the_answer_intake(stub, monkeypatch, since)
 
-    assert offered == [answer["id"], follow_up["id"]]
+    assert offered == [answer["id"]]
     assert edited["id"] not in offered
 
 

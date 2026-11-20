@@ -506,6 +506,8 @@ def test_successful_scenario_skips_pod_diagnostics(
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(kind.ScriptedRun, "execute", execute)
+    # This test is about diagnostics; its stubbed install has no scenario to run.
+    monkeypatch.setattr(kind.ScriptedRun, "runs_one_ticket", False)
     monkeypatch.setattr(kind.subprocess, "run", _with_curie_version_probe(command, candidate_curie))
 
     assert kind.main(kind.fe.parse_args(["scripted", "--scenario", "publication"])) == 0

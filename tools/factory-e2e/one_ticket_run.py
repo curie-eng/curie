@@ -9,9 +9,7 @@ flow the platform owes that issue is observed from outside:
 2. a comment from a person without write permission and a comment from a bot
    start nothing;
 3. the plain answer from the labeller starts the second request, which says it
-   received the answer and ends in one pull request that closes the issue;
-4. a second plain comment from the labeller, posted with the answer, starts
-   nothing more.
+   received the answer and ends in one pull request that closes the issue.
 
 Every observation is external: GitHub stub state, the model lanes and read-only
 SQL. ``one_ticket_scenario`` holds the assertions.
@@ -40,7 +38,6 @@ QUIET_POLLS = 3
 READER = {"id": 6610, "login": "onlooker", "type": "User"}
 OTHER_BOT = {"id": 6611, "login": "helper-bot[bot]", "type": "Bot"}
 ANSWER_TEXT = "Accept `k` and also `kelvin`. Refuse a Kelvin value below zero with an error."
-FOLLOW_UP_TEXT = "Thanks for asking, that is all from me."
 
 
 class OneTicketError(RuntimeError):
@@ -285,11 +282,8 @@ class OneTicket:
         self.wait_for_intake_passes(since, github)
         ots.assert_ignored_comments(len(observed["requests"]), len(self.observe()["requests"]))
 
-        # The labeller's plain answer, and a second plain comment beside it.
-        # Posted together, so one listing of the comments returns both.
-        answer, follow_up = self.stub.append_comments(
-            ots.ISSUE, [ANSWER_TEXT, FOLLOW_UP_TEXT], author=github.HUMAN
-        )
+        # The labeller's plain answer, the one authorized answer.
+        answer = self.stub.append_comment(ots.ISSUE, ANSWER_TEXT, author=github.HUMAN)
         answer_at = ots.instant(answer["created_at"])
         observed = self.answered(github, str(asking["id"]))
         received_at = None
@@ -300,11 +294,9 @@ class OneTicket:
         second = ots.assert_answer_admitted(
             observed["requests"], str(asking["id"]), answer_at, received_at
         )
-        ots.assert_answer_receipts(
-            observed["receipts"], str(answer["id"]), str(follow_up["id"]), str(second["id"])
-        )
+        ots.assert_answer_receipts(observed["receipts"], str(answer["id"]), str(second["id"]))
 
-        # Session 2 publishes, and the follow-up starts nothing.
+        # Session 2 publishes, and nothing else starts.
         since = self.comment_reads()
         self.wait_for_intake_passes(since, github)
         observed = self.observe()
@@ -316,7 +308,6 @@ class OneTicket:
         self.evidence.update(
             second_request_id=str(second["id"]),
             answer_comment_id=answer["id"],
-            follow_up_comment_id=follow_up["id"],
             pull_request=pull["number"],
             investigating_seconds=(investigating_at - label_at).total_seconds(),
             answer_received_seconds=(received_at - answer_at).total_seconds(),

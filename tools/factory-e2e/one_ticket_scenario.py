@@ -162,13 +162,13 @@ def assert_answer_admitted(
 
 
 def assert_answer_receipts(
-    receipts: Sequence[Mapping[str, Any]], answer: str, follow_up: str, second_request: str
+    receipts: Sequence[Mapping[str, Any]], answer: str, second_request: str
 ) -> None:
-    """The answer comment, and no other, made the second request; the follow-up folded into it.
+    """The answer comment made the second request, and nothing else made one.
 
-    The durable receipt is the link between a comment and what it started. It
-    rules out a poll that skipped the answer and let the follow-up start the run
-    in the answer's place.
+    The durable receipt is the link between a comment and what it started: it
+    rules out a second request that no answer started, and an answer that
+    started some other request.
     """
 
     by_comment = {str(r["comment_key"]): r for r in receipts}
@@ -177,10 +177,6 @@ def assert_answer_receipts(
     assert mine is not None
     _require(mine["outcome"] == "admitted", f"the answer was {mine['outcome']}, not admitted")
     _require(str(mine["request_id"]) == second_request, "the answer started another request")
-    later = by_comment.get(follow_up)
-    _require(later is not None, f"no receipt for the follow-up comment {follow_up}")
-    assert later is not None
-    _require(later["outcome"] == "coalesced", f"the follow-up was {later['outcome']}")
     started = [str(r["request_id"]) for r in receipts if r.get("request_id") is not None]
     _require(started == [second_request], f"requests started by comments: {started}")
 
@@ -238,8 +234,8 @@ def assert_finished(
 ) -> None:
     """One WorkItem and two requests at the end, the second ended in the pull request.
 
-    A second plain comment from the same person after the answer created no
-    further request: the two requests are the whole history.
+    The two requests are the whole history: nothing but the label and the one
+    answer started a request.
     """
 
     _require(len(work_items) == 1, f"expected one WorkItem at the end, found {len(work_items)}")

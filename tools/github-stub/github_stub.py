@@ -388,39 +388,26 @@ class GithubStub:
         concurrent creators cannot share an id or replace one another's row.
         """
 
-        return self._insert_batch(kind, [build])[0]
-
-    def _insert_batch(
-        self, kind: str, builds: list[Callable[[int], dict[str, Any]]]
-    ) -> list[dict[str, Any]]:
-        """Insert several new objects of one kind in one transaction, in order.
-
-        A listing sees all of them or none, never a split between two.
-        """
-
         connection = sqlite3.connect(self._database, timeout=30, isolation_level="IMMEDIATE")
         try:
             # A data-changing statement opens the write transaction. This matches
-            # no row, and the id read and the inserts then share that lock.
+            # no row, and the id read and the insert then share that lock.
             connection.execute("UPDATE objects SET kind=kind WHERE 0")
             current = connection.execute(
                 "SELECT COALESCE(MAX(id), 0) FROM objects WHERE kind=?", (kind,)
             ).fetchone()
-            made = []
-            for offset, build in enumerate(builds, start=1):
-                identifier = int(current[0]) + offset
-                body = build(identifier)
-                if int(body["id"]) != identifier:
-                    raise RuntimeError("allocated id does not match the stored object")
-                connection.execute(
-                    "INSERT INTO objects(kind, id, body) VALUES(?,?,?)",
-                    (kind, identifier, json.dumps(body)),
-                )
-                if kind == "comment":
-                    self._remember(connection, body)
-                made.append(body)
+            identifier = int(current[0]) + 1
+            body = build(identifier)
+            if int(body["id"]) != identifier:
+                raise RuntimeError("allocated id does not match the stored object")
+            connection.execute(
+                "INSERT INTO objects(kind, id, body) VALUES(?,?,?)",
+                (kind, identifier, json.dumps(body)),
+            )
+            if kind == "comment":
+                self._remember(connection, body)
             connection.commit()
-            return made
+            return body
         finally:
             # Close rolls back when commit did not run, releasing the write lock.
             connection.close()
@@ -628,46 +615,27 @@ class GithubStub:
         is later than its ``created_at`` as edited and never reads it as an answer.
         """
 
-        return self.append_comments(number, [body], author=author, app=app)[0]
-
-    def append_comments(
-        self,
-        number: int,
-        bodies: list[str],
-        *,
-        author: dict[str, Any],
-        app: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Append never-edited comments together: one transaction, one instant.
-
-        One listing of the issue's comments returns all of them or none, so a
-        poll never splits them.
-        """
-
         issue = self._get("issue", number)
         if issue is None:
             raise ValueError(f"issue {number} does not exist")
-        instant = _utc()
 
-        def row(text: str) -> Callable[[int], dict[str, Any]]:
-            def build(identifier: int) -> dict[str, Any]:
-                return {
-                    "id": identifier,
-                    "body": text,
-                    "issue_number": number,
-                    "user": author,
-                    "performed_via_github_app": app,
-                    "created_at": instant,
-                    "updated_at": instant,
-                    "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
-                    "html_url": (
-                        f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
-                    ),
-                }
+        def build(identifier: int) -> dict[str, Any]:
+            instant = _utc()
+            return {
+                "id": identifier,
+                "body": body,
+                "issue_number": number,
+                "user": author,
+                "performed_via_github_app": app,
+                "created_at": instant,
+                "updated_at": instant,
+                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
+                "html_url": (
+                    f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
+                ),
+            }
 
-            return build
-
-        return self._insert_batch("comment", [row(text) for text in bodies])
+        return self._insert_new("comment", build)
 
     def add_user(self, user: dict[str, Any], permission: str) -> dict[str, Any]:
         """Add a repository collaborator with ``permission``; returns the user."""
