@@ -277,6 +277,8 @@ def test_scripted_driver_records_the_curie_bin_it_used(
         assert run.command(run.curie, "build").strip() == str(candidate_curie)
 
     monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+    # This test is about the binary; its stubbed install has no scenario to run.
+    monkeypatch.setattr(sk.ScriptedRun, "runs_one_ticket", False)
 
     assert sk.main(_replay_args(tmp_path)) == 0
     evidence = _evidence(tmp_path)
@@ -308,6 +310,8 @@ def test_scripted_driver_resolves_relative_and_path_binaries(
         assert run.command(run.curie, "build").strip() == str(candidate_curie)
 
     monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+    # This test is about the binary; its stubbed install has no scenario to run.
+    monkeypatch.setattr(sk.ScriptedRun, "runs_one_ticket", False)
 
     assert sk.main(_replay_args(tmp_path)) == 0
     evidence = _evidence(tmp_path)
@@ -2936,3 +2940,138 @@ def test_replay_quiet_window_is_bounded_by_the_install_poll_interval(
         run.wait_for_intake_passes(0)
     expected = 4 * triage_run.REPLAY_POLLS * driver.tracker_poll_seconds
     assert expected <= now[0] < expected + driver.tracker_poll_seconds
+
+
+# one-ticket (#5788): the scenario runs on every replayed install, and its
+# verdict is the evidence file's ``one_ticket.result``.
+
+import one_ticket_run  # noqa: E402
+import one_ticket_scenario as ots  # noqa: E402
+
+
+@pytest.mark.parametrize("outcome", ["passed", "failed"])
+def test_the_one_ticket_verdict_reaches_the_evidence_file_and_the_exit_code(
+    outcome: str, candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+
+    def one_ticket_execute(self: one_ticket_run.OneTicket, _github: Any) -> None:
+        if outcome == "failed":
+            raise ots.OneTicketAssertionError("a second request after the bot comment")
+        self.evidence["result"] = "passed"
+
+    def execute(run: sk.ScriptedRun) -> None:
+        run.router = lanes.LaneRouter({})
+        run.run_one_ticket(None)
+
+    monkeypatch.setattr(one_ticket_run.OneTicket, "execute", one_ticket_execute)
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+
+    assert sk.main(_replay_args(tmp_path)) == (0 if outcome == "passed" else fe.EXIT_FAILED)
+    evidence = _evidence(tmp_path)
+    assert evidence["one_ticket"]["result"] == outcome
+    assert evidence["result"] == outcome
+    if outcome == "failed":
+        assert "second request after the bot comment" in evidence["error"]
+        assert evidence["one_ticket"]["error"] == "a second request after the bot comment"
+
+
+def test_the_scripted_command_fails_when_the_one_ticket_scenario_did_not_run(
+    candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.ScriptedRun, "execute", lambda _run: None)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+
+    evidence = _evidence(tmp_path)
+    assert evidence["result"] == "failed"
+    assert evidence["error"] == "the one-ticket scenario did not run"
+    assert "one_ticket" not in evidence
+
+
+def test_the_scripted_command_fails_when_the_one_ticket_scenario_did_not_pass(
+    candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+
+    def execute(run: sk.ScriptedRun) -> None:
+        run.one_ticket = one_ticket_run.OneTicket(run, lanes.LaneRouter({}))
+
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+    assert _evidence(tmp_path)["error"] == "the one-ticket scenario did not pass"
+
+
+@pytest.mark.parametrize(
+    ("argv", "required"),
+    [
+        (["scripted", "--scenario", "publication"], True),
+        (["scripted", "--scenario", "triage-to-pr"], True),
+        (["scripted", "--scenario", "publication", "--record"], False),
+        (["scripted", "--scenario", "facts"], False),
+    ],
+)
+def test_the_one_ticket_verdict_is_owed_by_every_replay_of_an_install_and_no_other_run(
+    argv: list[str], required: bool
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(argv))
+
+    assert run.one_ticket_required() is required
+    assert (run.one_ticket_verdict_error() is not None) is required
+
+
+def test_the_scenarios_after_the_publication_scenario_call_the_one_ticket_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The call site itself: removing the call from ``run_scenarios`` fails this test."""
+
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
+    run.router = lanes.LaneRouter({})
+    calls: list[str] = []
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+
+    run.run_scenarios(None)
+
+    assert calls == ["observe", "one-ticket"]
+
+
+def test_a_fixture_that_owns_its_agents_does_not_run_the_one_ticket_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from c4_admitted_kind import AdmittedKind
+
+    run = AdmittedKind(tmp_path, Path("curie"))
+    run.router = lanes.LaneRouter({})
+    calls: list[str] = []
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+
+    run.run_scenarios(None)
+
+    assert calls == ["observe"]
+    assert run.one_ticket_required() is False
+
+
+def test_only_the_scripted_command_runs_the_one_ticket_scenario_on_its_install() -> None:
+    # The c4 fixtures subclass ScriptedRun to provision their own agents and
+    # drive their own tickets; the one-ticket flow needs the agent execute makes
+    # and a free fixture repository, so it is theirs to skip.
+    from c4_admitted_kind import AdmittedKind
+    from test_c4_held_cancellation import HeldRun
+
+    assert sk.ScriptedRun.runs_one_ticket is True
+    assert AdmittedKind.runs_one_ticket is False
+    assert HeldRun.runs_one_ticket is False
+
+
+def test_the_publication_scenario_installs_the_one_ticket_lane_and_no_gateway() -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
+    assert not run.gateway_enabled()
+    assert run.one_ticket is None
+    model = sk._module("factory_model_script_one_ticket", MODEL_SCRIPT)
+    lane = one_ticket_run.build_lane(model)
+    assert (lane.agent, lane.issue) == (lanes.IMPLEMENTATION, ots.ISSUE)
+    assert lane.exchanges, "the transcript holds both sessions"
