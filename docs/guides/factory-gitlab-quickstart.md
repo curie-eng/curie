@@ -188,7 +188,11 @@ curie cluster work-items --agent dark-factory --context "$CURIE_CONTEXT" \
 In a new GitLab issue comment, mention the token user's username and state a
 specific change, for example `@factory-bot please add a tab-only name test`.
 Replace `factory-bot` with your actual token user. The author needs project
-write access. Ordinary comments and edits do not start work. Authorized merge
+write access. Outside an open question, ordinary comments and edits do not start
+work. When the factory has asked its numbered questions on the issue (the
+`curie-factory:questions` label), a plain comment from a Developer or higher
+answers them with no mention, and the factory reads the thread and starts
+again. Authorized merge
 request feedback mentioning the same user is also supported; discussion
 replies stay in their thread. Feedback publication requires fresh human
 approval even when initial publication was automatic. See

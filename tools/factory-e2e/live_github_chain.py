@@ -4,8 +4,8 @@
 shared preflight installed the candidate in a throwaway namespace. The judge
 and the evidence sanitizer live in ``live_github_chain_judge.py``; this module
 does the I/O and builds the judge's record from raw responses with pure
-functions the tests call directly (the split of ``triage_run.py`` and
-``triage_scenario.py``).
+functions the tests call directly (a driver module that does the I/O beside
+a judge module that decides).
 
 Order, each stage a step of the evidence:
 

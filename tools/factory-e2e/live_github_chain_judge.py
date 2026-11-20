@@ -7,8 +7,8 @@ returns one verdict per beat with reasons. It does no network, subprocess,
 cluster or file access: the driver (``live_github_chain.py``, a later part of
 #5808) fetches the GitHub API JSON, the CLI JSON output, the install records
 and the timings, passes them in as plain data and writes the verdicts out
-through :func:`sanitize_evidence`. The split follows ``triage_run.py`` (driver)
-and ``triage_scenario.py`` (judge).
+through :func:`sanitize_evidence`. The driver does the I/O and this module
+judges.
 
 The one public entry point is :func:`judge_chain`. It takes one record::
 

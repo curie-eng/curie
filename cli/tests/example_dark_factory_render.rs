@@ -352,3 +352,24 @@ fn the_release_workflow_publishes_the_layer_render_locks() {
     let release_needs = jobs["release"]["needs"].as_array().unwrap();
     assert!(release_needs.contains(&Value::String("dark-factory-runner-merge".into())));
 }
+
+/// `curie example` offers exactly the two bundles that remain; the separate
+/// triage flow the one-ticket flow replaced is no longer a subcommand.
+#[test]
+fn the_example_command_offers_only_the_remaining_bundles() {
+    let help = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args(["example", "--help"])
+        .output()
+        .expect("run curie example --help");
+    assert!(help.status.success());
+    let listing = String::from_utf8_lossy(&help.stdout);
+    let mut names: Vec<&str> = listing
+        .lines()
+        .skip_while(|line| !line.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["dark-factory", "help", "sre-bot"], "{listing}");
+}

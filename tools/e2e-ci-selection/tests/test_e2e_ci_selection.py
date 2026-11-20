@@ -5106,6 +5106,37 @@ def test_static_token_rotation_inputs_select_the_factory_runtime(tmp_path: Path,
     assert _outputs_of(output)["factory"] == "true"
 
 
+JIRA_ONE_TICKET_INPUTS = (
+    "tools/jira-stub/jira_stub.py",
+    "tools/jira-stub/tests/test_jira_stub.py",
+    "apps/api/tests/forge_fakes/jira.py",
+)
+
+
+@pytest.mark.parametrize("path", JIRA_ONE_TICKET_INPUTS)
+def test_jira_one_ticket_inputs_select_the_factory_runtime(tmp_path: Path, path: str) -> None:
+    """An edit confined to the Jira stub or its fake must run the jira-one-ticket leg."""
+
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["factory"] == "true"
+
+
+@pytest.mark.parametrize("path", JIRA_ONE_TICKET_INPUTS)
+def test_jira_one_ticket_inputs_select_nothing_without_their_prefixes(path: str) -> None:
+    """Negative control: with the entries removed these paths select no factory leg."""
+
+    selector = _load_selector_module()
+    kept = tuple(
+        prefix
+        for prefix in selector.FACTORY_PREFIXES
+        if prefix not in {"tools/jira-stub", "apps/api/tests/forge_fakes/jira.py"}
+    )
+    assert len(kept) == len(selector.FACTORY_PREFIXES) - 2
+    assert not selector._matches_scenario(path, kept)
+    assert selector._matches_scenario(path, selector.FACTORY_PREFIXES)
+
+
 @pytest.mark.parametrize(
     "path",
     (
@@ -5204,9 +5235,9 @@ def _misdirect_step_if(job: dict[str, Any]) -> None:
     _scripted_factory_step(job, "scenario")["if"] = "matrix.suite == 'initial-binding'"
 
 
-def _select_triage_in_factory_ci(job: dict[str, Any]) -> None:
+def _select_facts_in_factory_ci(job: dict[str, Any]) -> None:
     step = _scripted_factory_step(job, "scenario")
-    step["run"] = step["run"].replace("--scenario publication", "--scenario triage-to-pr")
+    step["run"] = step["run"].replace("--scenario publication", "--scenario facts")
 
 
 def _enable_fail_fast(job: dict[str, Any]) -> None:
@@ -5242,7 +5273,7 @@ def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
         _drop_leg,
         _drop_step_if,
         _misdirect_step_if,
-        _select_triage_in_factory_ci,
+        _select_facts_in_factory_ci,
         _enable_fail_fast,
         _unguard_evidence,
         _drop_jira_leg,

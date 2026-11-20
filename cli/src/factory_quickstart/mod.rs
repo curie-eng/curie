@@ -1838,8 +1838,7 @@ fn bundle_line(bundle: Option<&Path>, runner_image: Option<&str>) -> String {
 }
 
 /// The `cluster overrides`, `publication-policy` and `budget` argvs that
-/// precede a bundle upload, each with its progress step. The upload refuses
-/// a tracker-result bundle while publication policy is still `approve`.
+/// precede a bundle upload, each with its progress step.
 fn agent_settings(
     agent: &str,
     context: &str,
