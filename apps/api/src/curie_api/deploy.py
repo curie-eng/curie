@@ -24,11 +24,6 @@ from . import approver_tickets, bundles
 from .config import Settings, get_settings
 from .models import AgentVersion
 from .storage import ObjectStore
-from .tracker_result_declaration import (
-    DeclarationInvalid,
-    ResultDeclaration,
-    read_declaration,
-)
 
 
 class BundleInvalid(Exception):
@@ -190,22 +185,17 @@ def _bound_clause(bound: Iterable[str]) -> str:
     return f"bound routes are {_quoted(names)}" if names else "this agent binds no approval routes"
 
 
-def validate_archive(
-    data: bytes, settings: Settings | None = None
-) -> tuple[str, str, ResultDeclaration | None]:
-    """Validate an archive's bytes. Returns (extension, content_type, declaration).
+def validate_archive(data: bytes, settings: Settings | None = None) -> tuple[str, str]:
+    """Validate an archive's bytes. Returns (extension, content_type).
 
     Raises ``bundles.UnsupportedArchive`` if the bytes are not a zip/tar(.gz),
-    ``BundleInvalid`` if the plugin bundle fails validation, and (via
+    ``BundleInvalid`` if the plugin bundle fails validation (including one that
+    still carries the retired ``workflow/result.json``), and (via
     ``safe_extract``) ``bundles.UnsupportedArchive`` again if the archive
     exceeds the configured uncompressed-size or compression-ratio cap.
-    ``declaration`` is the bundle's valid tracker result declaration
-    (``workflow/result.json``), or None when it has none; a malformed
-    declaration is a ``BundleInvalid``.
     """
 
     settings = settings or get_settings()
-    declaration: ResultDeclaration | None = None
     with tempfile.TemporaryDirectory() as tmp:
         extension, content_type, result = bundles.extract_and_validate(
             data,
@@ -214,13 +204,9 @@ def validate_archive(
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        if result.valid:
-            # Cannot raise: `extract_and_validate` already reported any issue
-            # this declaration has, and the result is valid.
-            declaration = read_declaration(bundles.bundle_root(Path(tmp)))
     if not result.valid:
         raise BundleInvalid([e.model_dump() for e in result.errors])
-    return extension, content_type, declaration
+    return extension, content_type
 
 
 async def revalidate_stored_bundle(
@@ -257,12 +243,11 @@ async def revalidate_stored_bundle(
 
 def _stored_intake_refusals(
     data: bytes, settings: Settings
-) -> tuple[list[str], list[plugin_format.ValidationIssue], ResultDeclaration | None]:
+) -> tuple[list[str], list[plugin_format.ValidationIssue]]:
     """Blocking half of ``check_stored_bundle_intake``; run in a threadpool.
 
     One extraction answers both stored-bundle intake checks: the sealing key
-    custody reasons, and the tracker result declaration's issues or, when it
-    is valid, the declaration itself.
+    custody reasons, and the retired result declaration's issue.
     """
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -276,75 +261,37 @@ def _stored_intake_refusals(
         )
         root = plugin_format.bundle_root(dest)
         reasons = [issue.message for issue in bundles.sealing_key_custody_issues(root)]
-        try:
-            declaration = read_declaration(root)
-        except DeclarationInvalid as exc:
-            return reasons, list(exc.issues), None
-        return reasons, [], declaration
+        return reasons, bundles.retired_result_declaration_issues(root)
 
 
 async def check_stored_bundle_intake(
     store: ObjectStore, version: AgentVersion, settings: Settings | None = None
-) -> ResultDeclaration | None:
-    """Refuse a stored bundle that intake would now refuse; return its declaration.
+) -> None:
+    """Refuse a stored bundle that intake would now refuse.
 
     @spec ACTION-EXECUTOR-16: custody holds on every path that makes a version
-    the one that boots, not only on first upload. So does the tracker result
-    declaration (ADR 0277): a stored object's ``workflow/result.json`` is read
-    from its own bytes, so the caller judges and records the policy those
-    bytes declare, not one copied from elsewhere. Returns the valid
-    declaration, or None when the bundle has none or the version carries no
-    bundle yet (a no-op, like ``revalidate_stored_bundle``). Raises, in this
-    order: ``BundleTooLarge`` for stored bytes the current caps refuse
-    (ADR-0059 decision 3), ``SealingKeyCustody``, and ``BundleInvalid``
-    carrying the declaration's own ``tracker_result.*`` issues when it is
-    malformed.
+    the one that boots, not only on first upload. So does the retired result
+    declaration: a stored object that still carries ``workflow/result.json``
+    (stored by an earlier build) is refused rather than deployed as an
+    implementation agent. A no-op when the version carries no bundle yet, like
+    ``revalidate_stored_bundle``. Raises, in this order: ``BundleTooLarge`` for
+    stored bytes the current caps refuse (ADR-0059 decision 3),
+    ``SealingKeyCustody``, and ``BundleInvalid`` carrying the
+    ``bundle.result_declaration_retired`` issue.
     """
 
     if version.bundle_ref is None:
-        return None
+        return
     settings = settings or get_settings()
     data = await store.get(version.bundle_ref)
     try:
-        reasons, declaration_issues, declaration = await run_in_threadpool(
-            _stored_intake_refusals, data, settings
-        )
+        reasons, retired = await run_in_threadpool(_stored_intake_refusals, data, settings)
     except plugin_format.UnsupportedArchive as exc:
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
     if reasons:
         raise SealingKeyCustody("; ".join(reasons))
-    if declaration_issues:
-        raise BundleInvalid([issue.model_dump() for issue in declaration_issues])
-    return declaration
-
-
-def result_policy(declaration: ResultDeclaration) -> dict[str, Any]:
-    """The stored policy of a declaration: its kinds sorted, and its label."""
-
-    return {
-        "results": sorted(kind.value for kind in declaration.results),
-        "implementation_label": declaration.implementation_label,
-    }
-
-
-def apply_result_policy(version: AgentVersion, declaration: ResultDeclaration | None) -> None:
-    """Record on ``version`` the result policy its bundle declares (ADR 0277).
-
-    Every path that attaches or deploys a bundle calls this with the
-    declaration read from the very bytes the version points at, so the upload
-    route, git flow's clone and sibling paths and a stored object agree. A
-    bundle without a declaration clears the policy: the implementation
-    contract. The caller's commit writes it.
-    """
-
-    if declaration is None:
-        version.result_policy_schema_version = None
-        version.result_policy_digest = None
-        version.result_policy = None
-        return
-    version.result_policy_schema_version = declaration.schema_version
-    version.result_policy_digest = declaration.digest
-    version.result_policy = result_policy(declaration)
+    if retired:
+        raise BundleInvalid([issue.model_dump() for issue in retired])
 
 
 def _declared_route_map(data: bytes, settings: Settings) -> dict[str, str] | None:
@@ -516,19 +463,12 @@ async def store_bundle(
     data: bytes,
     extension: str,
     content_type: str,
-    *,
-    declaration: ResultDeclaration | None,
 ) -> BundleOut:
-    """Store validated bytes under the immutable key and record them.
-
-    ``declaration`` is the one ``validate_archive`` read from these bytes; its
-    result policy is recorded on ``version`` in the same commit as the bundle.
-    """
+    """Store validated bytes under the immutable key and record them."""
 
     key = f"bundles/{agent_id}/{version.id}{extension}"
     digest = hashlib.sha256(data).hexdigest()
     await store.put(key, data, content_type)
-    apply_result_policy(version, declaration)
     await crud_versions.attach_bundle(session, version, key, digest)
     return BundleOut(
         version_id=version.id,

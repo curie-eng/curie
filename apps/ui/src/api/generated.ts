@@ -5050,17 +5050,14 @@ export interface paths {
         put?: never;
         /**
          * Read Completion Contract
-         * @description The execution's completion contract; for a tracker result request, the
-         *     reservation of its one model session.
+         * @description The execution's completion contract.
          *
-         *     The first call for a tracker result request reads the source issue's
-         *     title and body, mints the request's grant and reserves the session; any
-         *     later call is 409 ``session_already_started``, so a second runner starts
-         *     no model. An implementation request reserves nothing and gets no grant.
-         *     A publication recovery request (#5429) passes the same fences as an
-         *     implementation request, reserves nothing, and is answered
-         *     ``publication_recovery`` with no execution binding, so its runner
-         *     constructs no model session.
+         *     An implementation request is answered with its ADR 0278 execution
+         *     binding. A publication recovery request (#5429) passes the same fences and
+         *     is answered ``publication_recovery`` with no execution binding, so its
+         *     runner constructs no model session. A capability that does not name its
+         *     WorkItem's issue, a cancelled WorkItem, and a request that can no longer
+         *     run are 409 ``invalid_context``.
          */
         post: operations["read_completion_contract_work_items_completion_contract_post"];
         delete?: never;
@@ -5143,33 +5140,6 @@ export interface paths {
          *     submitted text.
          */
         post: operations["post_rule_proposal_work_items_rule_proposal_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/work-items/tracker-result": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Submit Tracker Result
-         * @description Seal the execution's one tracker result and attempt its delivery once.
-         *
-         *     Refuses (409, nothing written) an implementation request, a request
-         *     whose session was never reserved, a second submission, a source issue
-         *     whose title or body changed since the reservation, and every grant fence
-         *     (`RefusalReason`); an invalid proposal is 422 with field paths and codes
-         *     only. An accepted result is answered with its delivery state after one
-         *     inline attempt; the WorkItem reconciler retries an owed one.
-         */
-        post: operations["submit_tracker_result_work_items_tracker_result_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8200,31 +8170,23 @@ export interface components {
         };
         /**
          * CompletionContractOut
-         * @description How the execution completes (ADR 0277, #5586): by a pull request
-         *     (``implementation``), by one delivered tracker result (``tracker_result``),
-         *     or by publishing a retained publication candidate with no model run
+         * @description How the execution completes: by a pull request (``implementation``), or
+         *     by publishing a retained publication candidate with no model run
          *     (``publication_recovery``, #5429).
          *
-         *     ``result_kinds`` are the kinds the deployed policy allows and
-         *     ``session_usd_allowance`` the per-session model allowance in USD (the
-         *     agent's dollar limit, else 5); both empty for ``implementation`` and
-         *     ``publication_recovery``. A ``publication_recovery`` answer also carries
-         *     no ``execution``: that process runs no model, so it waits for no requester
-         *     context.
+         *     ``execution`` is the ADR 0278 binding of an ``implementation`` execution.
+         *     A ``publication_recovery`` answer carries none: that process runs no
+         *     model, so it waits for no requester context.
          */
         CompletionContractOut: {
             /**
              * Completion Contract
              * @enum {string}
              */
-            completion_contract: "implementation" | "tracker_result" | "publication_recovery";
-            execution?: components["schemas"]["ExecutionBindingOut"] | null;
-            /** Result Kinds */
-            result_kinds: string[];
+            completion_contract: "implementation" | "publication_recovery";
+            execution: components["schemas"]["ExecutionBindingOut"] | null;
             /** Rule Proposal */
             rule_proposal: boolean;
-            /** Session Usd Allowance */
-            session_usd_allowance: number | null;
         };
         /**
          * ConnectorManifests
@@ -12896,11 +12858,6 @@ export interface components {
              * Format: uuid
              */
             agent_id: string;
-            /**
-             * Completion Contract
-             * @enum {string}
-             */
-            completion_contract: "implementation" | "tracker_result";
             context: components["schemas"]["FactoryContext"] | null;
             /** Conversation Id */
             conversation_id: string;
@@ -12914,7 +12871,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "tracker_result_no_revision" | "resource_gate_unmet" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
+            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "resource_gate_unmet" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -13520,42 +13477,6 @@ export interface components {
             kind: string;
             /** Scope Id */
             scope_id: string;
-        };
-        /**
-         * TrackerResultOut
-         * @description The accepted result after one inline delivery attempt.
-         *
-         *     ``state`` ``owed`` means the platform keeps retrying until the delivery
-         *     deadline. ``result_comment_url`` is the source issue's marked result
-         *     comment and ``ticket_url`` the published ticket, each once delivered.
-         */
-        TrackerResultOut: {
-            /** Result Comment Url */
-            result_comment_url: string | null;
-            /**
-             * Result Kind
-             * @enum {string}
-             */
-            result_kind: "ticket" | "findings";
-            /**
-             * State
-             * @enum {string}
-             */
-            state: "owed" | "delivered" | "failed";
-            /** Ticket Url */
-            ticket_url: string | null;
-        };
-        /**
-         * TrackerResultSubmission
-         * @description The runner result tool's call: one typed proposal, validated by the API
-         *     (`curie_api.factory_tracker_results.parse_proposal`).
-         */
-        TrackerResultSubmission: {
-            /**
-             * Proposal
-             * @description A ticket or findings proposal object.
-             */
-            proposal: unknown;
         };
         /** Transfer */
         Transfer: {
@@ -25480,41 +25401,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RuleProposalOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    submit_tracker_result_work_items_tracker_result_post: {
-        parameters: {
-            query?: never;
-            header?: {
-                "X-Curie-Issue-Read"?: string | null;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TrackerResultSubmission"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TrackerResultOut"];
                 };
             };
             /** @description Validation Error */

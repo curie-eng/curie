@@ -1427,59 +1427,74 @@ def test_malformed_bundle_push_is_rejected(
     assert deployments == []
 
 
-def test_dev_push_of_a_declared_bundle_under_auto_publication_records_its_policy(
+def test_push_refuses_a_retired_result_declaration(
     client: Any,
     auth_headers: dict[str, str],
     clean_db: None,
     trusted_clone_base: Path,
 ) -> None:
-    """The clone path stores the policy the cloned bytes declare (#5586).
+    """A dev push of a bundle that still carries `workflow/result.json` is rejected.
 
-    The same version row the upload route would write: the declaration's
-    schema version, its canonical digest and its sorted kinds and label.
+    Liveness: the next commit, which only deletes the file, deploys.
     """
 
     agent_id = _register_agent(client, auth_headers)
-    patched = client.patch(
-        f"/agents/{agent_id}", json={"publication_policy": "auto"}, headers=auth_headers
-    )
-    assert patched.status_code == 200, patched.text
-    declaration = '{"schema_version": 1, "contract": "tracker_result", "results": ["findings"]}'
     clone_url, sha = _build_bare_repo(
-        trusted_clone_base, REPO, {**VALID_FILES, "workflow/result.json": declaration}
+        trusted_clone_base, REPO, {**VALID_FILES, "workflow/result.json": "{}"}
     )
 
-    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    refused = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
 
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "deployed", resp.json()
-    (version,) = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+    assert refused.status_code == 200, refused.text
+    body = refused.json()
+    assert body["status"] == "rejected", body
+    assert "bundle.result_declaration_retired" in {e["code"] for e in body["errors"]}, body
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert deployments == []
 
-    async def _policy() -> dict[str, Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.connect() as conn:
-                row = (
-                    await conn.execute(
-                        text(
-                            "SELECT result_policy_schema_version, result_policy_digest, "
-                            "result_policy FROM curie.agent_versions WHERE id = :id"
-                        ),
-                        {"id": uuid.UUID(version["id"])},
-                    )
-                ).one()
-        finally:
-            await engine.dispose()
-        return dict(row._mapping)
+    work = trusted_clone_base / "_work" / REPO
+    (work / "workflow" / "result.json").unlink()
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "drop the retired declaration", cwd=work)
+    fixed = _git("rev-parse", "HEAD", cwd=work)
+    bare = trusted_clone_base / f"{REPO}.git"
+    _git("push", "--quiet", str(bare), "HEAD:refs/heads/dev", cwd=work)
 
-    digest = hashlib.sha256(
-        json.dumps(json.loads(declaration), sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    assert asyncio.run(_policy()) == {
-        "result_policy_schema_version": 1,
-        "result_policy_digest": digest,
-        "result_policy": {"results": ["findings"], "implementation_label": None},
-    }
+    accepted = _post(client, "push", _push_payload("refs/heads/dev", fixed, clone_url)).json()
+
+    assert accepted["status"] == "deployed", accepted
+
+
+def test_a_prod_promote_of_a_stored_retired_result_declaration_is_rejected(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """The reuse path re-checks the stored object, as `POST /deployments` does."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    _repoint_stored_bundle(
+        agent_id, dev["version_id"], {**VALID_FILES, "workflow/result.json": "{}"}
+    )
+
+    body = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert body["status"] == "rejected", body
+    assert [e["code"] for e in body["errors"]] == ["bundle.result_declaration_retired"], body
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["environment"] for d in deployments] == ["dev"], deployments
+    # Liveness: repointed at the bytes without the file, the same promote succeeds.
+    _repoint_stored_bundle(agent_id, dev["version_id"], dict(VALID_FILES))
+    promoted = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+    assert promoted["status"] == "promoted", promoted
 
 
 def test_signed_push_with_a_foreign_clone_url_is_rejected(
@@ -3543,7 +3558,7 @@ def test_a_prod_promote_of_a_stored_bundle_with_the_sealing_key_secret_ref_is_pr
 
 
 # --------------------------------------------------------------------------- #
-# #5585: a sibling promote re-checks the stored object's result declaration
+# #5804: a sibling promote refuses a stored retired result declaration
 # --------------------------------------------------------------------------- #
 
 
@@ -3586,17 +3601,18 @@ def _assert_prod_untouched(client: Any, auth_headers: dict[str, str], prod_id: s
     assert _work_item_count(prod_id) == 0
 
 
-def test_a_sibling_promote_of_a_malformed_stored_declaration_reports_it_before_routes(
+def test_a_sibling_promote_of_a_stored_result_declaration_is_refused_before_any_row(
     client: Any,
     auth_headers: dict[str, str],
     clean_db: None,
     trusted_clone_base: Path,
 ) -> None:
-    """A malformed declaration reports its own code, not the route join's.
+    """A retired declaration reports its own code, not the route join's.
 
     The stored object also declares the `ops` route, which only the dev agent
     binds, so a route join run first would answer `approval_routes.unbound`
-    for the prod agent and hide the declaration's validation error.
+    for the prod agent and hide the refusal. No prod version, deployment or
+    work item is written.
     """
 
     gated = _gated_files(TWO_TARGET_FILES, "ops")
@@ -3606,14 +3622,12 @@ def test_a_sibling_promote_of_a_malformed_stored_declaration_reports_it_before_r
     clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, gated)
     dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
     assert dev["status"] == "deployed", dev
-    _repoint_stored_bundle(
-        dev_id, str(dev["version_id"]), {**gated, "workflow/result.json": "[]"}
-    )
+    _repoint_stored_bundle(dev_id, str(dev["version_id"]), {**gated, "workflow/result.json": "{}"})
 
     prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
 
     assert prod["status"] == "rejected", prod
-    assert [e["code"] for e in prod["errors"]] == ["tracker_result.not_object"], prod
+    assert [e["code"] for e in prod["errors"]] == ["bundle.result_declaration_retired"], prod
     _assert_prod_untouched(client, auth_headers, prod_id)
 
 

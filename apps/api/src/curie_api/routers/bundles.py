@@ -116,9 +116,7 @@ async def upload_bundle(
         )
 
     try:
-        extension, content_type, declaration = await run_in_threadpool(
-            deploy.validate_archive, data
-        )
+        extension, content_type = await run_in_threadpool(deploy.validate_archive, data)
     except bundles.UnsupportedArchive as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except deploy.BundleInvalid as exc:
@@ -163,7 +161,7 @@ async def upload_bundle(
             ) from exc
 
     return await deploy.store_bundle(
-        store, session, agent_id, version, data, extension, content_type, declaration=declaration
+        store, session, agent_id, version, data, extension, content_type
     )
 
 

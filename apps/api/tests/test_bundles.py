@@ -6,8 +6,9 @@ Postgres from the compose stack (per B2 constraints).
 
 import asyncio
 import hashlib
+import importlib.util
 import io
-import json
+import sys
 import tarfile
 import uuid
 import zipfile
@@ -109,38 +110,36 @@ def test_non_archive_is_rejected(tmp_path: Path) -> None:
     raise AssertionError("expected UnsupportedArchive")
 
 
-# A valid tracker result declaration (ADR 0277 decision 1, #5585); the parser
-# and its vectors are covered in test_tracker_result_declaration.py.
-RESULT_DECLARATION = (
-    '{"schema_version": 1, "contract": "tracker_result", '
-    '"results": ["ticket", "findings"], "implementation_label": "curie-factory"}'
-)
+# A bundle that still carries the retired result declaration. Its content is
+# irrelevant: presence alone is refused.
+RETIRED_DECLARATION = {"workflow/result.json": "{}"}
+RETIRED_DECLARATION_DIRECTORY = {"workflow/result.json/inner.json": "{}"}
 
 
-def test_a_malformed_result_declaration_is_a_validation_issue(tmp_path: Path) -> None:
-    files = _valid_files()
-    files["workflow/result.json"] = '{"schema_version": 1, "contract": "tracker_result"}'
-    _, _, result = bundles.extract_and_validate(_tar_gz(files), tmp_path)
+def test_a_retired_result_declaration_is_a_validation_issue(tmp_path: Path) -> None:
+    _, _, result = bundles.extract_and_validate(
+        _tar_gz({**_valid_files(), **RETIRED_DECLARATION}), tmp_path
+    )
+
     assert not result.valid
-    assert [(e.code, e.location) for e in result.errors] == [
-        ("tracker_result.missing_field", "workflow/result.json (results)")
+    assert [(e.code, e.location, e.message) for e in result.errors] == [
+        (
+            "bundle.result_declaration_retired",
+            "workflow/result.json",
+            "workflow/result.json is no longer supported: the separate triage flow was"
+            " removed. Delete the file; the default factory bundle investigates and asks"
+            " questions on the ticket itself.",
+        )
     ]
 
 
-def test_a_valid_result_declaration_passes_extraction_validation(tmp_path: Path) -> None:
-    # Intake validation accepts it.
-    files = _valid_files()
-    files["workflow/result.json"] = RESULT_DECLARATION
-    _, _, result = bundles.extract_and_validate(_zip(files), tmp_path)
-    assert result.valid, result.errors
-
-
 def test_a_result_declaration_path_that_is_a_directory_is_refused(tmp_path: Path) -> None:
-    files = _valid_files()
-    files["workflow/result.json/inner.json"] = RESULT_DECLARATION
-    _, _, result = bundles.extract_and_validate(_tar_gz(files), tmp_path)
+    _, _, result = bundles.extract_and_validate(
+        _tar_gz({**_valid_files(), **RETIRED_DECLARATION_DIRECTORY}), tmp_path
+    )
+
     assert not result.valid
-    assert [e.code for e in result.errors] == ["tracker_result.unreadable"]
+    assert [e.code for e in result.errors] == ["bundle.result_declaration_retired"]
 
 
 # --- full round trip against real RustFS + Postgres -----------------------
@@ -290,14 +289,14 @@ def test_read_version_files_unknown_version_is_404(
     assert resp.status_code == 404
 
 
-# --- tracker result declaration refusal (ADR 0277, #5585) -----------------
+# --- retired result declaration refusal (#5804) ---------------------------
 
 
 def _store_directly(agent_id: str, version_id: str, data: bytes) -> None:
     """Attach ``data`` to the version without passing intake.
 
-    Simulates a bundle stored before intake refused a tracker result
-    declaration: written straight to the object store under a fresh key (keys
+    Simulates a bundle an earlier build stored with ``workflow/result.json``:
+    written straight to the object store under a fresh key (keys
     are write-once) and pointed at by the version row, as
     ``test_sealing_key_custody_paths.py`` does for custody.
     """
@@ -350,39 +349,6 @@ def _deploy(client: Any, headers: dict[str, str], agent_id: str, version_id: str
     )
 
 
-def _set_publication_policy(client: Any, headers: dict[str, str], agent_id: str) -> None:
-    resp = client.patch(f"/agents/{agent_id}", json={"publication_policy": "auto"}, headers=headers)
-    assert resp.status_code == 200, resp.text
-
-
-def _version_policy(version_id: str) -> dict[str, Any]:
-    async def run() -> dict[str, Any]:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.connect() as conn:
-                row = (
-                    await conn.execute(
-                        text(
-                            "SELECT result_policy_schema_version, result_policy_digest, "
-                            "result_policy FROM curie.agent_versions WHERE id = :id"
-                        ),
-                        {"id": uuid.UUID(version_id)},
-                    )
-                ).one()
-        finally:
-            await engine.dispose()
-        return dict(row._mapping)
-
-    return asyncio.run(run())
-
-
-# The canonical digest of RESULT_DECLARATION, computed independently of the parser.
-RESULT_DECLARATION_DIGEST = hashlib.sha256(
-    json.dumps(json.loads(RESULT_DECLARATION), sort_keys=True, separators=(",", ":")).encode()
-).hexdigest()
-RESULT_POLICY = {"results": ["findings", "ticket"], "implementation_label": "curie-factory"}
-
-
 def test_the_same_bundle_without_the_result_declaration_uploads_and_deploys(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
@@ -402,89 +368,159 @@ def test_the_same_bundle_without_the_result_declaration_uploads_and_deploys(
     assert _count_rows("deployments", agent_id) == 1
 
 
-def test_upload_with_a_malformed_result_declaration_reports_validation_first(
+def _upload(
+    client: Any, headers: dict[str, str], agent_id: str, version_id: str, data: bytes
+) -> Any:
+    return client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("demo.tar.gz", data)},
+        headers=headers,
+    )
+
+
+def _validation_codes(response: Any) -> list[str]:
+    detail = response.json()["detail"]
+    assert detail["detail"] == "bundle failed validation", detail
+    return [e["code"] for e in detail["errors"]]
+
+
+def _attached_bundle_ref(client: Any, headers: dict[str, str], agent_id: str) -> Any:
+    (version,) = client.get(f"/agents/{agent_id}/versions", headers=headers).json()
+    return version["bundle_ref"]
+
+
+def test_upload_refuses_a_retired_result_declaration(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     agent_id, version_id = _create_version(client, auth_headers)
-    files = _valid_files()
-    files["workflow/result.json"] = (
-        '{"schema_version": true, "contract": "tracker_result", "results": ["findings"]}'
+
+    refused = _upload(
+        client,
+        auth_headers,
+        agent_id,
+        version_id,
+        _tar_gz({**_valid_files(), **RETIRED_DECLARATION}),
     )
 
-    resp = client.put(
-        f"/agents/{agent_id}/versions/{version_id}/bundle",
-        files={"file": ("demo.tar.gz", _tar_gz(files))},
-        headers=auth_headers,
-    )
+    assert refused.status_code == 422, refused.text
+    assert _validation_codes(refused) == ["bundle.result_declaration_retired"]
+    assert _attached_bundle_ref(client, auth_headers, agent_id) is None
+    fetched = client.get(f"/agents/{agent_id}/versions/{version_id}/bundle", headers=auth_headers)
+    assert fetched.status_code == 404
+    # Liveness: the same bundle without the file attaches to the same version.
+    accepted = _upload(client, auth_headers, agent_id, version_id, _tar_gz(_valid_files()))
+    assert accepted.status_code == 201, accepted.text
+    assert _attached_bundle_ref(client, auth_headers, agent_id) == accepted.json()["bundle_ref"]
 
-    assert resp.status_code == 422, resp.text
-    detail = resp.json()["detail"]
-    assert detail["detail"] == "bundle failed validation"
-    assert [e["code"] for e in detail["errors"]] == ["tracker_result.schema_version"]
 
-
-def test_upload_with_a_result_declaration_under_auto_publication_records_its_policy(
+def test_upload_refuses_a_retired_result_declaration_directory(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     agent_id, version_id = _create_version(client, auth_headers)
-    _set_publication_policy(client, auth_headers, agent_id)
-    files = _valid_files()
-    files["workflow/result.json"] = RESULT_DECLARATION
 
-    resp = client.put(
-        f"/agents/{agent_id}/versions/{version_id}/bundle",
-        files={"file": ("demo.tar.gz", _tar_gz(files))},
-        headers=auth_headers,
+    refused = _upload(
+        client,
+        auth_headers,
+        agent_id,
+        version_id,
+        _tar_gz({**_valid_files(), **RETIRED_DECLARATION_DIRECTORY}),
     )
 
-    assert resp.status_code == 201, resp.text
-    assert _version_policy(version_id) == {
-        "result_policy_schema_version": 1,
-        "result_policy_digest": RESULT_DECLARATION_DIGEST,
-        "result_policy": RESULT_POLICY,
-    }
+    assert refused.status_code == 422, refused.text
+    assert _validation_codes(refused) == ["bundle.result_declaration_retired"]
+    assert _attached_bundle_ref(client, auth_headers, agent_id) is None
+
+
+def test_deploy_refuses_a_stored_retired_result_declaration(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id, version_id = _create_version(client, auth_headers)
+    _store_directly(agent_id, version_id, _tar_gz({**_valid_files(), **RETIRED_DECLARATION}))
+
+    refused = _deploy(client, auth_headers, agent_id, version_id)
+
+    assert refused.status_code == 422, refused.text
+    assert _validation_codes(refused) == ["bundle.result_declaration_retired"]
+    assert _count_rows("deployments", agent_id) == 0
+    # Liveness: the same version repointed at the bytes without the file deploys.
+    _store_directly(agent_id, version_id, _tar_gz(_valid_files()))
     deployed = _deploy(client, auth_headers, agent_id, version_id)
     assert deployed.status_code == 201, deployed.text
-    assert _version_policy(version_id)["result_policy_digest"] == RESULT_DECLARATION_DIGEST
+    assert _count_rows("deployments", agent_id) == 1
 
 
-def test_deploying_a_stored_declared_bundle_records_the_policy_its_bytes_declare(
+def test_deploy_refuses_a_stored_retired_result_declaration_directory(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # The stored-object path agrees with the upload route: the version that
-    # boots carries the policy read from its own stored bytes.
     agent_id, version_id = _create_version(client, auth_headers)
-    _set_publication_policy(client, auth_headers, agent_id)
-    files = _valid_files()
-    files["workflow/result.json"] = RESULT_DECLARATION
-    _store_directly(agent_id, version_id, _tar_gz(files))
-    assert _version_policy(version_id)["result_policy"] is None
+    _store_directly(
+        agent_id, version_id, _tar_gz({**_valid_files(), **RETIRED_DECLARATION_DIRECTORY})
+    )
 
-    resp = _deploy(client, auth_headers, agent_id, version_id)
+    refused = _deploy(client, auth_headers, agent_id, version_id)
 
-    assert resp.status_code == 201, resp.text
-    assert _version_policy(version_id) == {
-        "result_policy_schema_version": 1,
-        "result_policy_digest": RESULT_DECLARATION_DIGEST,
-        "result_policy": RESULT_POLICY,
+    assert refused.status_code == 422, refused.text
+    assert _validation_codes(refused) == ["bundle.result_declaration_retired"]
+    assert _count_rows("deployments", agent_id) == 0
+
+
+# The live chain judge reads a deploy refusal out of the CLI's `--json` error
+# envelope; it is stdlib only, so it loads by path.
+JUDGE_PATH = (
+    Path(__file__).resolve().parents[3] / "tools" / "factory-e2e" / "live_github_chain_judge.py"
+)
+
+
+def _judge() -> Any:
+    spec = importlib.util.spec_from_file_location("live_github_chain_judge", JUDGE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return module
+
+
+def _cli_envelope(response: Any) -> dict[str, Any]:
+    """The CLI's output for a refused upload (`cli/src/api.rs` `expect_ok`).
+
+    The status renders as the CLI's HTTP client renders a 422.
+    """
+
+    assert response.status_code == 422, response.text
+    return {
+        "error": (
+            "uploading the bundle failed with 422 Unprocessable Entity: "
+            f"{response.text.strip()}"
+        ),
+        "fix": None,
     }
 
 
-def test_deploying_a_stored_bundle_with_a_malformed_result_declaration_reports_it(
+def test_the_chain_judge_reads_the_retired_code_from_the_cli_upload_refusal(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
+    judge = _judge()
     agent_id, version_id = _create_version(client, auth_headers)
+    retired = _upload(
+        client,
+        auth_headers,
+        agent_id,
+        version_id,
+        _tar_gz({**_valid_files(), **RETIRED_DECLARATION}),
+    )
     files = _valid_files()
-    files["workflow/result.json"] = "[]"
-    _store_directly(agent_id, version_id, _tar_gz(files))
+    files["skills/beta/SKILL.md"] = "# no frontmatter\n"
+    other = _upload(client, auth_headers, agent_id, version_id, _tar_gz(files))
 
-    resp = _deploy(client, auth_headers, agent_id, version_id)
-
-    assert resp.status_code == 422, resp.text
-    detail = resp.json()["detail"]
-    assert detail["detail"] == "bundle failed validation"
-    assert [e["code"] for e in detail["errors"]] == ["tracker_result.not_object"]
-    assert _count_rows("deployments", agent_id) == 0
+    assert retired.status_code == 422, retired.text
+    assert other.status_code == 422, other.text
+    output = _cli_envelope(retired)
+    assert judge.BUNDLE_RETIRED_CODE in judge.deploy_refusal_codes(output)
+    # Counterexample: the real refusal of a different validation failure.
+    assert judge.BUNDLE_RETIRED_CODE not in judge.deploy_refusal_codes(_cli_envelope(other))
 
 
 def test_deploying_the_same_stored_bundle_without_the_declaration_succeeds(

@@ -527,38 +527,6 @@ class AgentChannel(Base):
 
 class AgentVersion(Base):
     __tablename__ = "agent_versions"
-    __table_args__ = (
-        # Migration 0162 (#5585): the tracker result policy identity is both
-        # absent or a schema version 1 declaration's canonical digest. The
-        # IS NOT NULL terms keep a half-set pair FALSE rather than NULL.
-        CheckConstraint(
-            "(result_policy_schema_version IS NULL AND result_policy_digest IS NULL) "
-            "OR (result_policy_schema_version IS NOT NULL "
-            "AND result_policy_schema_version = 1 "
-            "AND result_policy_digest IS NOT NULL "
-            "AND result_policy_digest ~ '^[0-9a-f]{64}$')",
-            name="agent_versions_result_policy_ck",
-        ),
-        # Migration 0167 (#5586): the stored policy (sorted result kinds and the
-        # implementation label) requires its digest. A digest alone is allowed
-        # for a 0162 row whose declaration SQL could not backfill; admission
-        # refuses it as an unreadable policy until a deploy records both.
-        CheckConstraint(
-            "result_policy IS NULL OR result_policy_digest IS NOT NULL",
-            name="agent_versions_result_policy_presence_ck",
-        ),
-        CheckConstraint(
-            "result_policy IS NULL OR (CASE WHEN jsonb_typeof(result_policy) = 'object' THEN "
-            "(result_policy - 'results' - 'implementation_label' = '{}'::jsonb "
-            "AND ((result_policy -> 'results' = '[\"findings\"]'::jsonb "
-            "AND result_policy -> 'implementation_label' = 'null'::jsonb) "
-            "OR (result_policy -> 'results' = '[\"findings\", \"ticket\"]'::jsonb "
-            "AND jsonb_typeof(result_policy -> 'implementation_label') = 'string' "
-            "AND length(result_policy ->> 'implementation_label') BETWEEN 1 AND 50))) "
-            "ELSE false END) IS TRUE",
-            name="agent_versions_result_policy_shape_ck",
-        ),
-    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(
@@ -577,16 +545,6 @@ class AgentVersion(Base):
     commit_sha: Mapped[str | None] = mapped_column(default=None, index=True)
     created_by: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    # The tracker result declaration's schema version and canonical SHA-256
-    # (ADR 0277), and the policy it declares: ``{"results": [sorted kinds],
-    # "implementation_label": str | None}``. Written when the bundle is
-    # attached (``deploy.apply_result_policy``); all NULL for a bundle without
-    # a declaration, which has the implementation contract.
-    result_policy_schema_version: Mapped[int | None] = mapped_column(Integer, default=None)
-    result_policy_digest: Mapped[str | None] = mapped_column(Text, default=None)
-    result_policy: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB(none_as_null=True), default=None
-    )
 
     agent: Mapped[Agent] = relationship(back_populates="versions")
 
