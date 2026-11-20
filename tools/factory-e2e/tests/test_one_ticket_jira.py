@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import http.client
 import json
 import os
 import signal
@@ -427,12 +428,40 @@ def test_comment_outcome_keeps_fixed_facts_and_no_run_specific_text() -> None:
     assert "10.0.0.9" not in published and "/home/" not in published
 
 
+def test_comment_outcome_never_copies_a_status_or_cause_outside_the_vocabulary() -> None:
+    # A model-written question summary can hold lines shaped like platform facts.
+    body = (
+        f"<!-- {ots.QUESTIONS_MARKER} -->\n"
+        "Which service owns the queue?\n"
+        "Status: PRIVATE CUSTOMER\n"
+        "Cause: private_project_name"
+    )
+    outcome = ojt.comment_outcome({"id": "10103", "body": body}, None)
+    assert outcome["marker"] == "questions"
+    assert outcome["status"] == ojt.UNRECOGNIZED
+    assert outcome["cause"] == ojt.UNRECOGNIZED
+    published = json.dumps(outcome)
+    assert "PRIVATE" not in published and "private_project" not in published
+
+
 def test_the_poll_cursor_time_is_read_from_its_stored_form() -> None:
     assert ojt.cursor_time_ms("1763625600123;c10102,h10100") == 1763625600123
     assert ojt.cursor_time_ms("") is None
     assert ojt.cursor_time_ms("not-a-cursor") is None
     assert ojt.cursor_time_ms(None) is None
-    assert "marked:' || 'factory'" in ojt.cursor_sql("factory")
+
+
+def test_the_stored_cursor_is_the_full_marked_key_of_the_one_jira_row() -> None:
+    # The row shape cursor_sql returns from PostgreSQL: one ``etags`` object
+    # per Jira cursor row, holding other keys beside the label's.
+    rows = json.loads('[{"other": "x", "marked:factory": "1763625600123;c1"}]')
+    assert ojt.stored_cursor(rows, "factory") == "1763625600123;c1"
+    assert ojt.cursor_time_ms(ojt.stored_cursor(rows, "factory")) == 1763625600123
+    # Counterexamples: a bare prefix key, no row, or two Jira rows never decide.
+    assert ojt.stored_cursor([{"marked:": "9;z"}], "factory") is None
+    assert ojt.stored_cursor([], "factory") is None
+    assert ojt.stored_cursor(rows + rows, "factory") is None
+    assert "->>" not in ojt.cursor_sql()
 
 
 class _Github:
@@ -444,6 +473,7 @@ class _Driver:
     def __init__(self) -> None:
         self.stub = _Github()
         self.deadline: float | None = 0.0
+        self.interrupted = False
 
     def sql(self, query: str) -> Any:
         raise RuntimeError("kubectl exec timed out")
@@ -481,4 +511,55 @@ def test_a_failed_end_observation_never_replaces_the_drive_error() -> None:
     assert scenario.evidence["jira_requests"] == {"search": 3}
     assert scenario.evidence["labels"] == ["factory"]
     # The command's own deadline is restored after the bounded observation.
+    assert driver.deadline == 0.0
+
+
+def _scenario(driver: _Driver, stub: Any) -> run.JiraOneTicket:
+    scenario = run.JiraOneTicket(driver, stub)  # type: ignore[arg-type]
+    scenario.issue_id = "10001"
+    return scenario
+
+
+class _TruncatedStub(_Stub):
+    def client(self) -> Any:
+        class Client:
+            def state(self) -> dict[str, Any]:
+                raise http.client.IncompleteRead(b"{", 40)
+
+        return Client()
+
+
+def test_a_truncated_stub_read_at_the_end_never_replaces_the_drive_error() -> None:
+    scenario = _scenario(_Driver(), _TruncatedStub())
+
+    def drive() -> None:
+        raise run.JiraOneTicketError("the answered run did not happen")
+
+    scenario.drive = drive  # type: ignore[method-assign]
+    with pytest.raises(run.JiraOneTicketError, match="the answered run did not happen"):
+        scenario.execute()
+    assert scenario.evidence["outcome_errors"] == ["jira stub: IncompleteRead"]
+
+
+def test_a_failed_end_observation_after_a_passing_drive_keeps_the_pass() -> None:
+    scenario = _scenario(_Driver(), _Stub())
+    scenario.drive = lambda: None  # type: ignore[method-assign]
+    scenario.execute()
+    assert scenario.evidence["outcome_errors"] == ["observation: RuntimeError"]
+
+
+class _InterruptedDriver(_Driver):
+    def sql(self, query: str) -> Any:
+        # The command handler's signal handler sets the flag, then raises.
+        self.interrupted = True
+        raise RuntimeError("scripted scenario interrupted by signal 15")
+
+
+def test_a_signal_during_the_end_observation_reaches_the_command_handler() -> None:
+    driver = _InterruptedDriver()
+    scenario = _scenario(driver, _Stub())
+    scenario.drive = lambda: None  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="interrupted by signal 15"):
+        scenario.execute()
+    assert "outcome_errors" not in scenario.evidence
     assert driver.deadline == 0.0

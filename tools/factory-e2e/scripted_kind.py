@@ -468,6 +468,8 @@ class ScriptedRun:
         # The one-ticket scenario runs on every replayed install, before triage.
         self.one_ticket: one_ticket_run.OneTicket | None = None
         # The jira-one-ticket scenario: its stub process and the scenario.
+        # A signal stopped the run: end-of-run diagnostics re-raise, never absorb.
+        self.interrupted = False
         self.jira_stub: jira_one_ticket_run.JiraStubProcess | None = None
         self.jira: jira_one_ticket_run.JiraOneTicket | None = None
         self.forward: subprocess.Popen[str] | None = None
@@ -2021,6 +2023,7 @@ def main(args: argparse.Namespace) -> int:
     def interrupted(signum: int, _frame: Any) -> None:
         nonlocal was_interrupted
         was_interrupted = True
+        run.interrupted = True
         raise ScriptedScenarioError(f"scripted scenario interrupted by signal {signum}")
 
     try:

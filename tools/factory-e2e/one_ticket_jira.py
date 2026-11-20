@@ -40,6 +40,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import one_ticket_scenario as ots
+from curie_internal.factory_cause import cause_text
 
 # The Jira fake's site identity (placeholders, never a real site or token).
 CLOUD_ID = "11111111-1111-1111-1111-111111111111"
@@ -362,19 +363,33 @@ def notices_sql(issue_id: str) -> str:
     )
 
 
-def cursor_sql(label: str) -> str:
-    """The Jira site's stored poll cursor for ``label``, read-only, as JSON text.
+def cursor_sql() -> str:
+    """Every Jira poll cursor row's ``etags`` object, read-only, as a JSON array.
 
-    The tracker intake saves it only after every notice of a page was applied
-    or deliberately refused (``factory_tracker_intake``), and its time is the
-    newest issue update the page held.
+    The tracker intake saves a label's cursor under ``etags["marked:<label>"]``
+    only after every notice of a page was applied or deliberately refused
+    (``factory_tracker_intake``), and its time is the newest issue update the
+    page held. The whole object is read and the key taken in Python, so no
+    JSON operator precedence decides which key is read.
     """
 
     return (
-        "SELECT to_json(coalesce((SELECT etags->>'marked:' || "
-        f"'{label}' FROM curie.factory_poll_cursors "
-        f"WHERE tracker_kind='jira_cloud' AND tracker_scope_id='{CLOUD_ID}'),''))"
+        "SELECT coalesce(json_agg(etags),'[]'::json) FROM curie.factory_poll_cursors "
+        "WHERE tracker_kind='jira_cloud'"
     )
+
+
+def stored_cursor(rows: Any, label: str) -> str | None:
+    """The one Jira cursor row's cursor for ``label``, or None.
+
+    The scenario installs one Jira tracker, so more than one cursor row is a
+    shape this reader refuses to guess about.
+    """
+
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return None
+    cursor = rows[0].get(f"marked:{label}")
+    return cursor if isinstance(cursor, str) else None
 
 
 def cursor_time_ms(cursor: Any) -> int | None:
@@ -394,6 +409,16 @@ def instant_ms(value: Any) -> int:
 
 _STATUS_LINE = re.compile(r"^Status: ([A-Z][A-Z ]*)$", re.MULTILINE)
 _CAUSE_LINE = re.compile(r"^Cause: ([a-z][a-z0-9_]*)$", re.MULTILINE)
+# The status pill labels the platform renders, and request statuses upper-cased
+# (its fallback label). Anything else in a ``Status:`` line is not a platform fact.
+KNOWN_STATUSES = frozenset(
+    {
+        "ANSWERED", "CANCELLED", "NEEDS HUMAN", "PUBLISHING", "QUEUED", "RETRYING",
+        "RUNNING", "STOPPING", "SUCCEEDED", "WAITING", "COMPLETED", "FAILED", "EXPIRED",
+    }
+)  # fmt: skip
+_UNKNOWN_CAUSE_TEXT = cause_text("")
+UNRECOGNIZED = "unrecognized"
 _KNOWN_LINES = (ots.INVESTIGATING_LINE, ots.ANSWER_RECEIVED_LINE, "Could not complete:")
 
 
@@ -402,7 +427,9 @@ def comment_outcome(record: Mapping[str, Any], pull_url: str | None) -> dict[str
 
     A status comment can quote run-specific URLs and worker-supplied detail,
     so only its marker kind, the platform's fixed lines it shows, its status
-    and cause codes, and whether it names the pull request are kept.
+    and cause codes, and whether it names the pull request are kept. A status or
+    cause outside the platform's vocabulary (model text can hold such a line) is
+    recorded as ``unrecognized``, never copied.
     """
 
     body = str(record["body"])
@@ -415,11 +442,19 @@ def comment_outcome(record: Mapping[str, Any], pull_url: str | None) -> dict[str
         marker = None
     status = _STATUS_LINE.search(body)
     cause = _CAUSE_LINE.search(body)
+    if status and status.group(1) not in KNOWN_STATUSES:
+        status_value: str | None = UNRECOGNIZED
+    else:
+        status_value = status.group(1) if status else None
+    if cause and cause_text(cause.group(1)) == _UNKNOWN_CAUSE_TEXT:
+        cause_value: str | None = UNRECOGNIZED
+    else:
+        cause_value = cause.group(1) if cause else None
     return {
         "id": str(record["id"]),
         "marker": marker,
         "lines": [line for line in _KNOWN_LINES if line in body],
-        "status": status.group(1) if status else None,
-        "cause": cause.group(1) if cause else None,
+        "status": status_value,
+        "cause": cause_value,
         "names_pull_request": bool(pull_url) and str(pull_url) in body,
     }

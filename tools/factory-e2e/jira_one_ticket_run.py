@@ -20,6 +20,7 @@ shapes ``one_ticket_scenario`` judges, and holds the Jira-only assertions.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -231,6 +232,7 @@ class JiraOneTicket:
         self.jira = stub.client()
         self.evidence: dict[str, Any] = {"scenario": "jira-one-ticket", "result": "failed"}
         self.issue_id = ""
+        self._outcome_step = ""
         self.baseline_pulls: list[int] = []
 
     # Observation -----------------------------------------------------------
@@ -313,7 +315,9 @@ class JiraOneTicket:
         """
 
         def decided(state: dict[str, Any]) -> bool:
-            stored = ojt.cursor_time_ms(self.driver.sql(ojt.cursor_sql(ots.LABEL)))
+            stored = ojt.cursor_time_ms(
+                ojt.stored_cursor(self.driver.sql(ojt.cursor_sql()), ots.LABEL)
+            )
             return stored is not None and stored >= after_ms
 
         self.wait("the intake's decision on the outsider's comment", decided)
@@ -380,29 +384,39 @@ class JiraOneTicket:
     def execute(self) -> None:
         try:
             self.drive()
-        finally:
-            self.record_outcome()
+        except BaseException:
+            # The drive's error stands whatever the end observation does.
+            with contextlib.suppress(BaseException):
+                self.record_outcome()
+            raise
+        self.record_outcome()
 
     def record_outcome(self) -> None:
         """Record what the ticket's records show at the end, pass or fail.
 
         Request statuses, status comment records and the factory's comments as
-        fixed facts, so a failed run says where the flow stopped. It never
-        raises: an observation that fails is named, and the drive's own error
-        stands. The SQL reads get their own short deadline, since the drive
-        may have spent the command's.
+        fixed facts, so a failed run says where the flow stopped. A failed
+        observation is named and never changes the verdict; only a signal that
+        stopped the run passes through, so the command handler sees it. The SQL
+        reads get their own short deadline, since the drive may have spent the
+        command's.
         """
 
+        self._outcome_step = "jira stub"
+        try:
+            self._record_outcome()
+        except Exception as exc:  # noqa: BLE001 - a diagnostic never decides the verdict
+            if self.driver.interrupted:
+                raise
+            self.evidence["outcome_errors"] = [f"{self._outcome_step}: {type(exc).__name__}"]
+
+    def _record_outcome(self) -> None:
         try:
             pulls = ots.new_pulls(self.github._rows("pull"), self.baseline_pulls)
         except (OSError, ValueError, KeyError, sqlite3.Error):
             pulls = []
         pull_url = str(pulls[0].get("html_url")) if len(pulls) == 1 else None
-        try:
-            state = self.state()
-        except (OSError, ValueError, ojt.JiraStubError) as exc:
-            self.evidence["outcome_errors"] = [f"jira stub: {type(exc).__name__}"]
-            return
+        state = self.state()
         self.evidence["jira_requests"] = state["requests"]
         if not self.issue_id:
             return
@@ -412,13 +426,11 @@ class JiraOneTicket:
             for comment in ojt.comment_records(state, self.issue_id)
             if comment["user"]["login"] == ojt.BOT_ACCOUNT_ID
         ]
+        self._outcome_step = "observation"
         previous = self.driver.deadline
         self.driver.deadline = time.monotonic() + OUTCOME_SECONDS
         try:
             observed = self.observe()
-        except Exception as exc:  # noqa: BLE001 - a diagnostic never replaces the drive's error
-            self.evidence["outcome_errors"] = [f"observation: {type(exc).__name__}"]
-            return
         finally:
             self.driver.deadline = previous
         self.evidence["requests"] = [
