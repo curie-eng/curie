@@ -106,53 +106,30 @@ def format_handoff(
 
 def fallback_summary(
     *,
-    status: str,
-    no_pull_request: bool,
-    retrying: bool = False,
     platform_checks: Sequence[tuple[str, str | None, str, str]] = (),
     agent_detail: str | None = None,
+    agent_answer: str | None = None,
 ) -> str:
-    """Keep platform facts separate from a bounded, attributed agent fallback."""
+    """Show only evidence absent from the recorded result when no handoff exists."""
 
     reason, question = _agent_failure_lines(agent_detail)
-    lines = ["## Run outcome"]
-    if no_pull_request:
-        lines.append("**No pull request was published.**")
-    if retrying:
-        action = "allow the recorded automatic retry to run."
-    elif status == "completed":
-        action = "review the published pull request or recorded answer."
-    elif status == "cancelled":
-        action = "review the cancellation before selecting this issue again."
-    elif reason is not None:
-        action = "resolve the agent-reported blocker below before retrying."
-    else:
-        action = "inspect the recorded cause and run evidence before retrying."
-    lines.extend(
-        [
-            "**Next owner:** unknown; no structured handoff was recorded.",
-            f"**Next action:** {action}",
-            (
-                f"**Human decision now:** {question} (agent reported)"
-                if question is not None
-                else "**Human decision now:** None recorded"
-            ),
-            *([f"**Agent-reported reason:** {reason}"] if reason is not None else []),
-            *(["**Recovery of uncommitted work:** unknown."] if status != "completed" else []),
-            "",
-            "### Verification against acceptance criteria",
-            "No acceptance-criterion results recorded; no structured handoff was saved.",
-            "",
-            "### Other verification observations",
-        ]
-    )
-    for check, command, state, source in platform_checks:
-        command_text = safe_tracker_line(command) if command else "not recorded"
-        lines.append(
-            f"- **{safe_tracker_line(check)}:** {state} ({source}) · **Command:** {command_text}"
-        )
-    if not platform_checks:
-        lines.append("No structured verification observations recorded.")
+    if not (reason or question or agent_answer or platform_checks):
+        return ""
+    lines = ["## Additional run evidence"]
+    if reason is not None:
+        lines.append(f"**Agent-reported reason:** {reason}")
+    if question is not None:
+        lines.append(f"**Human decision now:** {question} (agent reported)")
+    if agent_answer is not None:
+        lines.append(f"**Agent-reported answer:** {agent_answer}")
+    if platform_checks:
+        lines.extend(["", "### Platform verification observations"])
+        for check, command, state, source in platform_checks:
+            command_text = safe_tracker_line(command) if command else "not recorded"
+            lines.append(
+                f"- **{safe_tracker_line(check)}:** {state} ({source}) "
+                f"· **Command:** {command_text}"
+            )
     lines.append("")
     return "\n".join(lines)
 

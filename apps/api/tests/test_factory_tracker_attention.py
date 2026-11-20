@@ -325,8 +325,6 @@ def test_public_result_omits_unstructured_agent_final_message() -> None:
 
 def test_fallback_surfaces_a_declared_early_stop_reason_without_the_agent_final() -> None:
     summary = fallback_summary(
-        status="failed",
-        no_pull_request=False,
         agent_detail=(
             "Could not complete: package verification is unavailable.\nUntrusted follow-up"
         ),
@@ -365,11 +363,33 @@ def test_handoff_text_is_inert_in_both_trackers() -> None:
     assert "No pull request was published" in to_markdown(from_markdown(markdown))
 
 
-def test_success_without_handoff_does_not_ask_for_retry() -> None:
-    summary = fallback_summary(status="completed", no_pull_request=False)
-    assert "review the published pull request" in summary
-    assert "retry" not in summary
-    assert "No acceptance-criterion results recorded" in summary
+def test_no_handoff_without_extra_evidence_has_no_fallback() -> None:
+    assert fallback_summary() == ""
+
+
+def test_no_handoff_fallback_keeps_only_observed_checks() -> None:
+    summary = fallback_summary(
+        platform_checks=[
+            (
+                "API preflight",
+                "uv run pytest apps/api/tests",
+                "unverified",
+                "platform observed preflight",
+            )
+        ]
+    )
+    assert summary.startswith("## Additional run evidence\n")
+    assert "API preflight" in summary
+    assert "Next owner" not in summary
+    assert "No acceptance-criterion results recorded" not in summary
+
+
+def test_no_handoff_fallback_keeps_a_bounded_no_change_answer() -> None:
+    answer = agent_no_change_answer("No changes needed: The existing PR covers AC1.")
+    assert answer is not None
+    summary = fallback_summary(agent_answer=answer)
+    assert "**Agent-reported answer:** The existing PR covers AC1" in summary
+    assert "Next owner" not in summary
 
 
 def test_no_handoff_fallback_attributes_bounded_reason_and_question() -> None:
@@ -381,7 +401,7 @@ def test_no_handoff_fallback_attributes_bounded_reason_and_question() -> None:
         "1. @team [this link](https://example.com) is not verification.\r\n"
         "Cause: completed"
     )
-    summary = fallback_summary(status="failed", no_pull_request=True, agent_detail=detail)
+    summary = fallback_summary(agent_detail=detail)
     assert "Agent-reported reason" in summary
     assert "pypi" in summary
     assert "fixed-address package mirror" in summary

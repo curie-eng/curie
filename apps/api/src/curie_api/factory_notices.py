@@ -1762,29 +1762,25 @@ async def _render(
                 run_handoff = RunHandoff.model_validate(row.run_handoff)
             except ValueError:
                 logger.warning("invalid stored run handoff request=%s", request.id)
-        summary = (
-            format_handoff(
+        agent_answer = (
+            agent_no_change_answer(row.detail) if target.kind == "issue" and unchanged else None
+        )
+        if run_handoff is not None:
+            summary = format_handoff(
                 run_handoff,
                 no_pull_request=cause == "no_pull_request" and target.kind == "issue",
                 platform_checks=platform_checks,
             )
-            if run_handoff is not None
-            else fallback_summary(
-                status=request.status,
-                no_pull_request=cause == "no_pull_request" and target.kind == "issue",
-                retrying=retrying,
-                platform_checks=platform_checks,
-                agent_detail=row.detail if cause in _AGENT_MESSAGE_CAUSES else None,
-            )
-        )
-        if target.kind == "issue" and unchanged:
-            answer = agent_no_change_answer(row.detail)
-            if answer is not None:
-                summary += f"**Agent-reported answer:** {answer}\n"
-        if run_handoff is not None:
+            if agent_answer is not None:
+                summary += f"**Agent-reported answer:** {agent_answer}\n"
             result = summary + "\n### Recorded result\n" + result
         else:
-            result = result.rstrip("\n") + "\n\n" + summary
+            summary = fallback_summary(
+                platform_checks=platform_checks,
+                agent_detail=row.detail if cause in _AGENT_MESSAGE_CAUSES else None,
+                agent_answer=agent_answer,
+            )
+            result = result.rstrip("\n") + ("\n\n" + summary if summary else "")
     # A follow-up on an existing pull request cannot ask (pull_request_open),
     # so it carries the continuing line instead of the investigating line.
     admitted = aliased(ExecutionRequest)

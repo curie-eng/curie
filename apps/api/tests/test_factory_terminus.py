@@ -72,8 +72,8 @@ def _recorded_result(body: str) -> str:
         marker = "### Recorded result\n"
         assert body.count(marker) == 1
         return body.split(marker, 1)[1]
-    marker = "\n\n## Run outcome\n"
-    assert body.count(marker) == 1
+    marker = "\n\n## Additional run evidence\n"
+    assert body.count(marker) <= 1
     return body.split(marker, 1)[0]
 
 
