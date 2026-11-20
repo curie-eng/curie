@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Record shell observations and require them before submitting a ticket."""
+"""Record shell observations and ticket questions; enforce the ask and cite rules.
+
+Rules, per session:
+
+1. A Write, Edit, MultiEdit or NotebookEdit whose path, or a Bash command whose
+   text, names this hook, ``hooks.json`` or the hook's state is refused.
+2. Each completed Bash call is recorded as an observation.
+3. A ``get_issue`` result containing the factory question heading is recorded; a
+   result that is not a decodable ticket (an overflow notice, an oversize input) is
+   recorded as carrying it, and so is state lost to a checkout cleanup; a later
+   decodable ticket without the heading clears that overflow guess, never a heading
+   seen in a decoded ticket.
+4. A successful ``ask_questions`` call is recorded.
+5. ``mcp__curie__ask_questions`` is refused until one Bash observation exists.
+6. ``mcp__curie__publish_changes`` is refused after a recorded successful ask.
+7. ``mcp__curie__publish_changes`` is refused when a question heading was
+   recorded and the body's Decisions section has no line starting
+   ``Answered on the ticket by ``.
+
+Every other tool passes. The state lives in the checkout under
+``.curie/factory-investigation``, which the hook lists in the repository's
+``info/exclude`` so it never joins the publishable candidate.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +34,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +43,13 @@ MAX_INPUT = 2 * 1024 * 1024
 MAX_OUTPUT = 32 * 1024
 MAX_RUNS = 128
 MAX_STATE = 8 * 1024 * 1024
-RESULT_TOOL = "mcp__curie__submit_tracker_result"
-STATE_DIRECTORY = ".curie/factory-triage"
-READ_TOOLS = {"Read", "Glob", "Grep", "Skill", "TodoWrite", "ToolSearch", "WaitForMcpServers"}
+LOCK_SECONDS = 2
+ASK_TOOL = "mcp__curie__ask_questions"
+PUBLISH_TOOL = "mcp__curie__publish_changes"
+QUESTION_HEADING = "### Questions from the factory"
+CITATION = re.compile(r"^Answered on the ticket by \S")
+STATE_NAME = "factory-investigation"
+STATE_DIRECTORY = ".curie/" + STATE_NAME
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 
@@ -31,7 +58,7 @@ class Refusal(Exception):
 
 
 def expired(_signal: int, _frame: Any) -> None:
-    raise Refusal("The reproduction gate reached its internal deadline; try a bounded probe.")
+    raise Refusal("The investigation gate reached its internal deadline; try a bounded probe.")
 
 
 def decode(raw: bytes) -> dict[str, Any]:
@@ -94,10 +121,8 @@ def protected(text: str, cwd: Path) -> bool:
     return any(
         part in normalized
         for part in (
-            ".curie",
-            "factory-triage",
+            STATE_NAME,
             "reproduction_gate",
-            "hooks/",
             "hooks.json",
             "claude_plugin_root",
             root,
@@ -107,36 +132,16 @@ def protected(text: str, cwd: Path) -> bool:
 
 
 def mutation_guard(tool: str, inputs: dict[str, Any], cwd: Path) -> None:
-    if (
-        tool == RESULT_TOOL
-        or tool in READ_TOOLS
-        or tool.endswith(("__get_issue", "__report_progress"))
-    ):
-        return
+    """Rule 1: no edit or shell command may name the hook, its registration or its state."""
     if tool in EDIT_TOOLS:
         raw = inputs.get("file_path", inputs.get("notebook_path"))
         path = Path(required_text(raw, "edit path"))
-        target = (cwd / path).resolve()
-        if protected(str(target), cwd):
+        if protected(str((cwd / path).resolve()), cwd) or protected(str(path), cwd):
             raise Refusal("The hook, its configuration and its evidence state cannot be edited.")
-        if not target.is_relative_to(cwd) or ".git" in target.relative_to(cwd).parts:
-            raise Refusal("Investigation edits must stay in the checkout, outside git metadata.")
-        return
-    if tool == "Bash":
+    elif tool == "Bash":
         command = required_text(inputs.get("command"), "shell command")
         if protected(command, cwd):
             raise Refusal("This command names the hook or its evidence state; use a local probe.")
-        if inputs.get("run_in_background"):
-            raise Refusal("Reproduction commands must finish in the foreground.")
-        if re.search(r"\b(?:git\s+(?:push|remote)|gh|curl|wget|ssh|eval|exec)\b", command):
-            raise Refusal(
-                "Use local reproduction tools; direct publication and remote shell access "
-                "are refused."
-            )
-        return
-    raise Refusal(
-        "This investigation tool is not permitted; use the local shell or submit findings."
-    )
 
 
 def digest(value: dict[str, Any]) -> str:
@@ -187,17 +192,21 @@ def load(
             "base_revision": base_revision,
             "runs": [],
             "pending": {},
+            "question_heading": False,
+            "heading_unverified": False,
+            "asked": False,
         }
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_STATE:
-        raise Refusal(
-            "Reproduction state is missing or unreadable; run a fresh probe or submit findings."
-        )
+        raise Refusal("Investigation state is missing or unreadable; run a fresh probe.")
     state = decode(path.read_bytes())
     if (
         state.get("session") != session
         or state.get("workspace") != str(cwd)
         or not isinstance(state.get("runs"), list)
         or not isinstance(state.get("pending"), dict)
+        or type(state.get("question_heading")) is not bool
+        or type(state.get("asked")) is not bool
+        or type(state.get("heading_unverified", False)) is not bool
     ):
         raise Refusal("Reproduction state does not belong to this session and checkout.")
     if not isinstance(state.get("base_revision"), str) or not re.fullmatch(
@@ -234,7 +243,7 @@ def output(response: Any, *, failed: bool) -> tuple[int, str]:
     if failed:
         if not isinstance(response, str):
             raise Refusal("The failed shell call has no observable exit status.")
-        match = re.match(r"Exit code (\d+)\n", response)
+        match = re.match(r"Exit code (\d+)(?:\n|$)", response)
         if not match:
             raise Refusal("The failed shell call has no observable exit status.")
         return int(match.group(1)), response[match.end() :][:MAX_OUTPUT]
@@ -254,8 +263,10 @@ def record(state: dict[str, Any], event: str, data: dict[str, Any], cwd: Path) -
     call = required_text(data.get("tool_use_id"), "tool call identity")
     command = required_text(data["tool_input"].get("command"), "shell command")
     if event == "PreToolUse":
-        if len(state["pending"]) >= MAX_RUNS:
-            raise Refusal("Too many unfinished shell calls; submit findings.")
+        # A call another hook refused never completes; drop the oldest instead of
+        # refusing every later shell call.
+        while len(state["pending"]) >= MAX_RUNS:
+            state["pending"].pop(next(iter(state["pending"])))
         state["pending"][call] = {"command": command, **snapshot(cwd)}
         return
     before = state["pending"].pop(call, None)
@@ -277,33 +288,92 @@ def record(state: dict[str, Any], event: str, data: dict[str, Any], cwd: Path) -
     state["runs"] = state["runs"][-MAX_RUNS:]
 
 
-def check_ticket(state: dict[str, Any], proposal: dict[str, Any], cwd: Path) -> None:
-    reproduction = proposal.get("reproduction")
-    if not isinstance(reproduction, dict):
-        raise Refusal("A ticket needs a reproduction command, observed output and revision.")
-    command = required_text(reproduction.get("command"), "reproduction.command")
-    observed = required_text(reproduction.get("observed"), "reproduction.observed")
-    revision = required_text(reproduction.get("revision"), "reproduction.revision")
-    current = snapshot(cwd)
-    if revision != state["base_revision"]:
-        raise Refusal("The submitted revision differs from the investigated base revision.")
-    if current["revision"] != state["base_revision"]:
-        raise Refusal("The checkout revision differs from the investigated base revision.")
-    if not current["clean"]:
-        raise Refusal("Tracked files are modified at submission; revert candidate patches first.")
-    runs = [run for run in state["runs"] if run.get("command") == command]
-    if not runs:
-        raise Refusal("The reproduction command was not recorded in this session.")
-    runs = [run for run in runs if run.get("revision") == revision and run.get("clean") is True]
-    if not runs:
-        raise Refusal(
-            "The command was not recorded at this revision with tracked files unmodified."
-        )
-    if not any(
-        any(line.strip() and line in observed for line in run["output"].splitlines())
-        for run in runs
-    ):
-        raise Refusal("The observed result must quote a nonempty recorded output line verbatim.")
+def cited(body: Any) -> bool:
+    """Whether the body's Decisions section has a line citing an answer on the ticket."""
+    if not isinstance(body, str):
+        return False
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if line != "## Decisions":
+            continue
+        for entry in lines[index + 1 :]:
+            if entry.startswith("## "):
+                break
+            if CITATION.match(entry):
+                return True
+    return False
+
+
+def exclude_state(cwd: Path) -> None:
+    """Keep the state out of the publishable candidate through ``info/exclude``."""
+    info = Path(git(cwd, "rev-parse", "--git-path", "info/exclude"))
+    exclude = info if info.is_absolute() else cwd / info
+    pattern = f"/{STATE_DIRECTORY}/"
+    text = exclude.read_text("utf-8") if exclude.is_file() else ""
+    if pattern not in text.splitlines():
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "" if not text or text.endswith("\n") else "\n"
+        with exclude.open("a", encoding="utf-8") as handle:
+            handle.write(f"{prefix}{pattern}\n")
+
+
+def issue_ticket(response: Any) -> str | None:
+    """The ``ticket`` text of a ``get_issue`` result, or None when none can be decoded."""
+    texts: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for key in ("text", "content"):
+                collect(value.get(key))
+
+    collect(response)
+    for text in texts:
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("ticket"), str):
+            return payload["ticket"]
+    return None
+
+
+def note_ticket_read(state: dict[str, Any], ticket: str | None) -> None:
+    """Record what a ``get_issue`` result shows about the question heading.
+
+    A result that is not a decodable ticket (an overflow notice that replaced a large
+    body, or an unreadable result) cannot show whether the thread holds questions, so
+    it counts as holding them and publication needs the citation line. That guess is
+    kept apart from a heading seen in a decoded ticket: a later decodable ticket with
+    no heading clears the guess, never a heading that was seen.
+    """
+    if ticket is None:
+        if not state["question_heading"]:
+            state["question_heading"] = True
+            state["heading_unverified"] = True
+    elif QUESTION_HEADING in ticket:
+        state["question_heading"] = True
+        state["heading_unverified"] = False
+    elif state.get("heading_unverified") is True:
+        state["question_heading"] = False
+        state["heading_unverified"] = False
+
+
+def acquire(lock: Any) -> None:
+    """Wait briefly for a concurrent call of this hook, then refuse."""
+    waited = time.monotonic() + LOCK_SECONDS
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= waited:
+                raise Refusal("Another call holds the investigation state; retry it.") from None
+            time.sleep(0.02)
 
 
 def handle(data: dict[str, Any]) -> dict[str, Any]:
@@ -314,41 +384,98 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
         raise Refusal("Tool input must be an object.")
     if event not in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}:
         raise Refusal("Unknown hook event.")
-    if tool == RESULT_TOOL and event == "PreToolUse" and inputs.get("kind") == "findings":
-        return {}
     cwd = Path(required_text(data.get("cwd"), "checkout path")).resolve(strict=True)
+    # A shell `cd` moves the reported cwd into a subdirectory; the state and its
+    # exclude rule belong to the checkout root, so every event resolves it once.
+    cwd = Path(git(cwd, "rev-parse", "--show-toplevel")).resolve(strict=True)
     if event == "PreToolUse":
         mutation_guard(tool, inputs, cwd)
-    if tool != "Bash" and tool != RESULT_TOOL:
+    ticket = issue_ticket(data.get("tool_response")) if tool.endswith("get_issue") else None
+    read = event == "PostToolUse" and tool.endswith("get_issue")
+    response = data.get("tool_response")
+    asked = (
+        event == "PostToolUse"
+        and tool.endswith("ask_questions")
+        and not (isinstance(response, dict) and response.get("isError"))
+    )
+    gated = event == "PreToolUse" and tool in {ASK_TOOL, PUBLISH_TOOL}
+    if tool != "Bash" and not read and not asked and not gated:
         return {}
     session = required_text(
         os.environ.get("CURIE_SESSION_ID") or data.get("session_id"), "session identity"
     )
     directory = cwd / STATE_DIRECTORY
+    exclude_state(cwd)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if directory.is_symlink() or directory.resolve() != directory:
-        raise Refusal("Reproduction state cannot be redirected by a symlink.")
+        raise Refusal("Investigation state cannot be redirected by a symlink.")
     key = hashlib.sha256(session.encode("utf-8")).hexdigest()
     path = directory / f"{key}.json"
     lock_path = directory / f"{key}.lock"
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "r+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        create = tool == "Bash" and event == "PreToolUse"
-        anchor_directory = Path(git(cwd, "rev-parse", "--absolute-git-dir")) / "factory-triage"
+        acquire(lock)
+        anchor_directory = Path(git(cwd, "rev-parse", "--absolute-git-dir")) / STATE_NAME
         anchor_directory.mkdir(mode=0o700, exist_ok=True)
-        base_revision = load_base_revision(
-            anchor_directory / f"{key}.json", cwd, create=create and not path.exists()
-        )
-        state = load(path, session, cwd, create=create, base_revision=base_revision)
+        anchor = anchor_directory / f"{key}.json"
+        # The anchor lives in the git directory and outlives a checkout cleanup that
+        # removes the ignored state; its survival without the state means the state was
+        # lost, so the question heading it may have recorded counts as read.
+        lost = not path.exists() and anchor.exists()
+        base_revision = load_base_revision(anchor, cwd, create=not path.exists())
+        state = load(path, session, cwd, create=True, base_revision=base_revision)
+        if not path.exists():
+            state["question_heading"] = state["question_heading"] or lost
+            save(path, state)
         if tool == "Bash":
             record(state, event, data, cwd)
-            save(path, state)
-        elif event == "PreToolUse":
-            if inputs.get("kind") != "ticket":
-                raise Refusal("Submit exactly one typed ticket or findings proposal.")
-            check_ticket(state, inputs, cwd)
+        elif read:
+            note_ticket_read(state, ticket)
+        elif asked:
+            state["asked"] = True
+        elif tool == ASK_TOOL:
+            if not state["runs"]:
+                raise Refusal(
+                    "Investigate before asking: run at least one bounded shell probe "
+                    "that observes the current behaviour."
+                )
+            return {}
+        elif state["asked"]:
+            raise Refusal(
+                "This session asked questions on the ticket; end the session without "
+                "publishing. The next attempt reads the answers."
+            )
+        elif state["question_heading"] and not cited(inputs.get("body")):
+            raise Refusal(
+                "The ticket carries factory questions: add one Decisions entry per answer "
+                "relied on, starting `Answered on the ticket by <author>: <the decision>`."
+            )
+        else:
+            return {}
+        save(path, state)
     return {}
+
+
+def note_oversize_ticket_read(raw: bytes) -> None:
+    """Fail closed when a ticket read is too large to decode.
+
+    The runner returns a ticket of up to 4 MiB, so a real ``get_issue`` result can
+    exceed the input limit and its question heading could not be seen. The leading
+    top-level fields of the event name the session, checkout, event and tool; when
+    they say a ``get_issue`` result completed, record the heading as present, so
+    publication needs the citation line until the thread can be decoded.
+    """
+    head = raw.decode("utf-8", "replace")
+    fields: dict[str, str] = {}
+    for name in ("session_id", "cwd", "hook_event_name", "tool_name"):
+        found = re.search(rf'"{name}"\s*:\s*("(?:[^"\\]|\\.)*")', head)
+        if found:
+            fields[name] = json.loads(found.group(1))
+    if fields.get("hook_event_name") != "PostToolUse" or not fields.get(
+        "tool_name", ""
+    ).endswith("get_issue"):
+        return
+    handle({**fields, "tool_input": {}, "tool_response": QUESTION_HEADING})
 
 
 def main() -> None:
@@ -358,6 +485,7 @@ def main() -> None:
             signal.setitimer(signal.ITIMER_REAL, DEADLINE_SECONDS)
             raw = sys.stdin.buffer.read(MAX_INPUT + 1)
             if len(raw) > MAX_INPUT:
+                note_oversize_ticket_read(raw)
                 raise Refusal("The hook input exceeds its size limit.")
             result = handle(decode(raw))
         finally:
@@ -366,10 +494,10 @@ def main() -> None:
         reason = (
             str(exc)
             if isinstance(exc, Refusal)
-            else "The reproduction gate could not validate its input or state."
+            else "The investigation gate could not validate its input or state."
         )
         if isinstance(exc, subprocess.TimeoutExpired):
-            reason = "The reproduction gate reached its internal git deadline."
+            reason = "The investigation gate reached its internal git deadline."
         result = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",

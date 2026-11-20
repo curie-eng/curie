@@ -13,6 +13,12 @@
         "hooks": [
           {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
         ]
+      },
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|.*ask_questions|.*publish_changes",
+        "hooks": [
+          {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py", "timeout": 10}
+        ]
       }
     ],
     "PostToolUse": [
@@ -21,6 +27,12 @@
         "hooks": [
           {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
         ]
+      },
+      {
+        "matcher": "Bash|.*get_issue|.*ask_questions",
+        "hooks": [
+          {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py", "timeout": 10}
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -28,6 +40,12 @@
         "matcher": "Agent|Task|Bash",
         "hooks": [
           {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py", "timeout": 10}
         ]
       }
     ]

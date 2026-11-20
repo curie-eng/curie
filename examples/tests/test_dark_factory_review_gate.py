@@ -752,6 +752,50 @@ def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None
     assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
 
 
+ENTRY = (
+    "1. Keep integers. Rejected: floats, because the tests compare integers. "
+    "(plan) Evidence: tests."
+)
+
+
+def _cited(count: int) -> str:
+    return "".join(f"Answered on the ticket by a maintainer: decision {n}.\n" for n in range(count))
+
+
+@pytest.mark.parametrize(
+    ("body", "allowed"),
+    [
+        # One line per answer relied on: nine answers do not trip the seven-entry cap.
+        (f"## Decisions\n{ENTRY}\n{_cited(9)}", True),
+        (f"## Decisions\n{_cited(9)}", True),
+        (f"## Decisions\n{ENTRY}\n{_cited(1)}\n## Checklist\n1. Done.\n", True),
+        # The cap still holds for numbered decisions, and the None declaration is not
+        # mixed with citation lines.
+        (
+            "## Decisions\n"
+            + "\n".join(ENTRY.replace("1.", f"{n}.", 1) for n in range(1, 8))
+            + f"\n8. x. Rejected: y, because z. (plan) Evidence: w.\n{_cited(1)}",
+            False,
+        ),
+        (
+            "## Decisions\nNone: the change follows directly from the acceptance criteria.\n"
+            + _cited(1),
+            False,
+        ),
+        # A citation prefix alone or with no author text is not a citation line.
+        ("## Decisions\nAnswered on the ticket by \n", False),
+        (f"## Decisions\n{ENTRY}\n  {_cited(1)}", False),
+    ],
+)
+def test_publish_decisions_accepts_one_citation_line_per_answer(
+    session: Session, body: str, allowed: bool
+) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    decision = session.pre(PUBLISH, {"body": body})
+    assert decision["permissionDecision"] == ("allow" if allowed else "deny")
+
+
 ADVERSARIAL_ENTRY = "x. Rejected: y, because z. (nomatch) Evidence: w. "
 
 
@@ -2232,7 +2276,9 @@ def test_the_hook_phase_order_matches_phases_json(monkeypatch: pytest.MonkeyPatc
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     ids = [p["id"] for p in json.loads((BUNDLE / "progress" / "phases.json").read_text())["phases"]]
-    assert list(module.PHASE_ORDER) == ids
+    # #5790 added `investigate` without editing review_gate.py, which open #5348
+    # also edits; the gate never observes that phase, so its order skips it.
+    assert list(module.PHASE_ORDER) == [phase for phase in ids if phase != "investigate"]
 
 
 # --- #3851 criterion 4: a fresh execution driven through hooks.json -------------
@@ -2247,17 +2293,24 @@ class HooksJsonRuntime:
     A tool no matcher names never starts the hook. Allowed edits are applied to
     the checkout and allowed Bash commands really run in it, then the result
     event fires: ``PostToolUse`` on success, ``PostToolUseFailure`` otherwise.
+    Every registered hook runs, and ``dispatch`` returns the outputs of the
+    hook whose command names ``hook`` (the review gate unless asked), so these
+    assertions see the review gate alone while the investigation gate also runs.
     """
 
-    def __init__(self, session: Session, bundle: Path = BUNDLE) -> None:
+    def __init__(
+        self, session: Session, bundle: Path = BUNDLE, *, other_hooks: bool = True
+    ) -> None:
         self.session = session
         self.bundle = bundle
+        # A test that counts the review gate's own Git calls runs it alone.
+        self.other_hooks = other_hooks
         self.hooks = json.loads((bundle / "hooks" / "hooks.json").read_text())["hooks"]
         self.env = {**session.env, "CLAUDE_PLUGIN_ROOT": str(bundle)}
         self.invocations: list[tuple[str, str | None]] = []
 
     def dispatch(
-        self, event: str, tool: str | None = None, **fields: Any
+        self, event: str, tool: str | None = None, *, hook: str = "review_gate.py", **fields: Any
     ) -> list[dict[str, Any] | None]:
         outs: list[dict[str, Any] | None] = []
         for entry in self.hooks.get(event, []):
@@ -2265,8 +2318,10 @@ class HooksJsonRuntime:
             if matcher not in (None, "", "*"):
                 if tool is None or not re.fullmatch(matcher, tool):
                     continue
-            for hook in entry["hooks"]:
-                command = hook["command"].replace("${CLAUDE_PLUGIN_ROOT}", str(self.bundle))
+            for registered in entry["hooks"]:
+                if hook not in registered["command"] and not self.other_hooks:
+                    continue
+                command = registered["command"].replace("${CLAUDE_PLUGIN_ROOT}", str(self.bundle))
                 payload: dict[str, Any] = {
                     "session_id": "sess-fresh",
                     "hook_event_name": event,
@@ -2283,8 +2338,10 @@ class HooksJsonRuntime:
                     text=True,
                     env=self.env,
                     check=True,
-                    timeout=hook.get("timeout", 60),
+                    timeout=registered.get("timeout", 60),
                 )
+                if hook not in registered["command"]:
+                    continue
                 self.invocations.append((event, tool))
                 outs.append(json.loads(done.stdout) if done.stdout.strip() else None)
         return outs

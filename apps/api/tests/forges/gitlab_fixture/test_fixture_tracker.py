@@ -22,7 +22,7 @@ pytestmark = pytest.mark.anyio
 async def _start(tracker: Any) -> str:
     """The cursor of a first poll on a label no issue carries yet."""
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
     assert page.notices == ()
     cursor: str = page.cursor
     return cursor
@@ -48,7 +48,7 @@ async def test_tracker_reporter_label_is_refused_and_developer_label_admitted(
         fixture.label(by_reporter, label, "reporter")
         fixture.label(by_developer, label, "developer")
 
-        page = await tracker.poll_marked(cursor, running=())
+        page = await tracker.poll_marked(cursor, running=(), answering=())
 
         reporter_ref, developer_ref = (
             fixture.issue_ref(by_reporter),
@@ -88,7 +88,7 @@ async def test_tracker_label_by_the_bot_is_no_notice(fixture: Fixture) -> None:
             fixture.state["users"]["service_account"]["id"]
         ]
 
-        page = await tracker.poll_marked(cursor, running=())
+        page = await tracker.poll_marked(cursor, running=(), answering=())
 
         assert _on(page.notices, fixture.issue_ref(iid)) == []
 
@@ -103,7 +103,7 @@ async def test_tracker_relabel_yields_two_admissions(fixture: Fixture) -> None:
         fixture.label(iid, label, "developer", add=False)
         fixture.label(iid, label, "developer")
 
-        page = await tracker.poll_marked(cursor, running=())
+        page = await tracker.poll_marked(cursor, running=(), answering=())
 
         events = fixture.label_events(iid)
         adds = [f"label:{e['id']}" for e in events if e["action"] == "add"]
@@ -122,15 +122,15 @@ async def test_tracker_label_removal_cancels_with_its_event_id(fixture: Fixture)
         iid = fixture.open_issue(unique("removal"))
         ref = fixture.issue_ref(iid)
         fixture.label(iid, label, "developer")
-        first = await tracker.poll_marked(cursor, running=())
+        first = await tracker.poll_marked(cursor, running=(), answering=())
         assert [n.disposition for n in _on(first.notices, ref)] == [Disposition.ADMIT]
 
         fixture.label(iid, label, "developer", add=False)
         (removed,) = [e for e in fixture.label_events(iid) if e["action"] == "remove"]
 
         # From the label event in the window, and from the running issue's read.
-        second = await tracker.poll_marked(first.cursor, running=())
-        running = await tracker.poll_marked(first.cursor, running=(ref,))
+        second = await tracker.poll_marked(first.cursor, running=(), answering=())
+        running = await tracker.poll_marked(first.cursor, running=(ref,), answering=())
         for page in (second, running):
             (cancel,) = _on(page.notices, ref)
             assert _shape(cancel) == (
@@ -150,13 +150,13 @@ async def test_tracker_issue_close_cancels_with_its_state_event_id(fixture: Fixt
         iid = fixture.open_issue(unique("close"))
         ref = fixture.issue_ref(iid)
         fixture.label(iid, label, "developer")
-        first = await tracker.poll_marked(cursor, running=())
+        first = await tracker.poll_marked(cursor, running=(), answering=())
         assert [n.disposition for n in _on(first.notices, ref)] == [Disposition.ADMIT]
 
         fixture.close_issue(iid)
         (closed,) = [e for e in fixture.state_events(iid) if e["state"] == "closed"]
 
-        page = await tracker.poll_marked(first.cursor, running=(ref,))
+        page = await tracker.poll_marked(first.cursor, running=(ref,), answering=())
 
         (cancel,) = _on(page.notices, ref)
         assert _shape(cancel) == (
@@ -178,7 +178,7 @@ async def test_tracker_human_note_mentioning_the_bot_is_a_mention(fixture: Fixtu
         note = fixture.issue_note(iid, f"@{bot} please take another look")
         fixture.issue_note(iid, f"mail {bot}@example.invalid is not a mention")
 
-        page = await tracker.poll_marked(cursor, running=())
+        page = await tracker.poll_marked(cursor, running=(), answering=())
 
         (mention,) = _on(page.notices, fixture.issue_ref(iid))
         assert _shape(mention) == ("mention", f"note:{note}", fixture.actor("developer").id, label)
@@ -199,8 +199,8 @@ async def test_tracker_polling_one_cursor_twice_yields_the_same_notices(
         fixture.label(second_iid, label, "reporter")
         fixture.issue_note(second_iid, f"@{bot} ping")
 
-        once = await tracker.poll_marked(cursor, running=())
-        again = await tracker.poll_marked(cursor, running=())
+        once = await tracker.poll_marked(cursor, running=(), answering=())
+        again = await tracker.poll_marked(cursor, running=(), answering=())
 
         assert once == again
         own = [

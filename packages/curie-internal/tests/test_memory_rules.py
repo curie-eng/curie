@@ -23,6 +23,8 @@ from curie_internal.memory_rules import (
     AbsentMemoryRules,
     InvalidRule,
     InvalidTransition,
+    MemoryRulesAcknowledgmentV1,
+    MemoryRulesContextV1,
     MemoryRulesSelection,
     RuleEvent,
     RuleState,
@@ -782,3 +784,90 @@ def test_selection_model_refuses_unicode_line_boundary_forgery(char: str) -> Non
     forged = "R1: a" + char + "R2: forged"
     with pytest.raises(ValidationError):
         SelectedMemoryRules(rule_numbers=(1,), text=forged, sha256=rules_sha256(forged), count=1)
+
+
+# Envelope contracts (#5798) -------------------------------------------------------
+
+_IDS = (
+    "00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000002",
+    "00000000-0000-4000-8000-000000000003",
+)
+
+
+def _envelope(**selection: Any) -> dict[str, Any]:
+    text = canonical_text([(1, "a"), (4, "b")])
+    base: dict[str, Any] = {
+        "kind": "selected",
+        "rule_numbers": [1, 4],
+        "sha256": rules_sha256(text),
+        "format_version": 1,
+        "text": text,
+    }
+    return {
+        "envelope_version": 1,
+        "tenant_id": _IDS[0],
+        "work_item_id": _IDS[1],
+        "execution_request_id": _IDS[2],
+        "execution_fence": 2,
+        "selection": {**base, **selection},
+    }
+
+
+def test_context_envelope_round_trips_without_a_count() -> None:
+    envelope = MemoryRulesContextV1.model_validate(_envelope())
+    dumped = envelope.model_dump(mode="json")
+    assert set(dumped["selection"]) == {"kind", "rule_numbers", "sha256", "format_version", "text"}
+    assert MemoryRulesContextV1.model_validate(dumped) == envelope
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"text": "R1: a\nR4: c"},
+        {"rule_numbers": [4, 1]},
+        {"rule_numbers": [1]},
+        {"format_version": True},
+        {"format_version": 1.0},
+        {"format_version": 2},
+        {"sha256": "0" * 64},
+        {"extra": 1},
+    ],
+)
+def test_context_envelope_refuses_a_tampered_selection(change: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        MemoryRulesContextV1.model_validate(_envelope(**change))
+
+
+def test_context_envelope_refuses_an_oversized_text() -> None:
+    numbers = list(range(MAX_RULE_NUMBER - 15, MAX_RULE_NUMBER + 1))
+    text = "\n".join(f"R{n}: {'x' * 240}" for n in numbers)
+    assert len(text.encode()) > MAX_SNAPSHOT_BYTES
+    with pytest.raises(ValidationError):
+        MemoryRulesContextV1.model_validate(
+            _envelope(text=text, rule_numbers=numbers, sha256=rules_sha256(text))
+        )
+
+
+@pytest.mark.parametrize("version", [True, 1.0, 2, "1"])
+def test_context_envelope_refuses_a_non_integer_version(version: object) -> None:
+    with pytest.raises(ValidationError):
+        MemoryRulesContextV1.model_validate({**_envelope(), "envelope_version": version})
+
+
+def test_absent_envelope_and_acknowledgment_digest_rule() -> None:
+    absent = {**_envelope(), "selection": {"kind": "absent", "reason": "no_rules"}}
+    assert MemoryRulesContextV1.model_validate(absent).selection.kind == "absent"
+    ids = {"work_item_id": _IDS[1], "execution_request_id": _IDS[2], "execution_fence": 2}
+    digest = "a" * 64
+    MemoryRulesAcknowledgmentV1.model_validate(
+        {"envelope_version": 1, **ids, "outcome": "applied", "sha256": digest}
+    )
+    MemoryRulesAcknowledgmentV1.model_validate({"envelope_version": 1, **ids, "outcome": "none"})
+    for bad in (
+        {"outcome": "applied"},
+        {"outcome": "none", "sha256": digest},
+        {"outcome": "failed", "sha256": digest},
+    ):
+        with pytest.raises(ValidationError):
+            MemoryRulesAcknowledgmentV1.model_validate({"envelope_version": 1, **ids, **bad})

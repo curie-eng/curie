@@ -124,7 +124,7 @@ async def test_jira_poll_sends_the_exact_jql_fields_and_page_size() -> None:
     fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
 
     (search,) = fake.requests_of("search")
     assert (search.method, search.path) == ("POST", "/rest/api/3/search/jql")
@@ -141,7 +141,7 @@ async def test_jira_poll_a_binding_label_replaces_the_entry_label_in_the_jql() -
     fake.add_label(issue.id, "factory-fast", _human(fake))
     tracker = jira_tracker(fake, label="factory-fast")
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
 
     (search,) = fake.requests_of("search")
     assert search.json["jql"] == (
@@ -167,7 +167,7 @@ async def test_the_window_starts_120_seconds_before_the_largest_updated_in_the_b
     fake.add_label(latest.id, LABEL, human, at=t + 90_000)
     tracker = jira_tracker(fake)
 
-    page = await tracker.poll_marked(_cursor(t), running=())
+    page = await tracker.poll_marked(_cursor(t), running=(), answering=())
 
     (search,) = fake.requests_of("search")
     assert search.json["jql"] == (
@@ -187,7 +187,7 @@ async def test_jira_poll_reads_every_search_page() -> None:
         fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
 
     first, second = fake.requests_of("search")
     assert "nextPageToken" not in first.json
@@ -206,7 +206,7 @@ async def test_jira_poll_reads_every_changelog_page() -> None:
     added = fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
 
     assert [(n.issue, n.event_id) for n in _admits(page)] == [(fake.ref(issue), added)]
     assert len(fake.requests_of("changelog")) == 2
@@ -223,10 +223,10 @@ async def test_jira_poll_a_failed_second_search_page_is_unavailable_and_moves_no
     fake.fail_next("search", status=500, after=1)
 
     with pytest.raises(Unavailable):
-        await tracker.poll_marked("0;", running=())
+        await tracker.poll_marked("0;", running=(), answering=())
 
     # Liveness: the caller kept "0;"; polling it again sees every marking.
-    retry = await tracker.poll_marked("0;", running=())
+    retry = await tracker.poll_marked("0;", running=(), answering=())
     assert {n.issue for n in _admits(retry)} == {fake.ref(issue) for issue in issues}
 
 
@@ -252,12 +252,12 @@ async def test_jira_poll_a_throttled_or_unavailable_site_raises_without_sleeping
     fake.fail_next(kind, status=status, headers={"Retry-After": "30"})
 
     with pytest.raises(Unavailable):
-        await tracker.poll_marked("0;", running=())
+        await tracker.poll_marked("0;", running=(), answering=())
 
     assert [delay for delay in slept if delay > 0] == []
     assert len(fake.requests_of(kind)) == 1
     # Liveness: once the site answers, the same cursor admits.
-    retry = await tracker.poll_marked("0;", running=())
+    retry = await tracker.poll_marked("0;", running=(), answering=())
     assert [n.issue for n in _admits(retry)] == [fake.ref(issue)]
 
 
@@ -276,7 +276,7 @@ async def test_jira_poll_the_first_poll_emits_only_the_latest_add_per_issue() ->
     only = fake.add_label(once.id, LABEL, human)
     tracker = jira_tracker(fake)
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
 
     assert sorted((n.issue.issue_id, n.event_id) for n in page.notices) == sorted(
         [(str(relabelled.id), latest), (str(once.id), only)]
@@ -294,8 +294,8 @@ async def test_jira_poll_only_an_exact_label_add_is_a_notice() -> None:
     fake.add_label(issue.id, f"{LABEL}-fast", human)
     tracker = jira_tracker(fake)
 
-    page = await tracker.poll_marked(None, running=())
-    everything = await tracker.poll_marked("0;", running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
+    everything = await tracker.poll_marked("0;", running=(), answering=())
 
     assert [n.event_id for n in page.notices] == [exact]
     assert [n.event_id for n in everything.notices] == [exact]
@@ -326,8 +326,8 @@ async def test_jira_poll_adds_by_the_bot_an_app_or_a_customer_are_not_notices(
     added = fake.add_label(admitted.id, LABEL, human)
     tracker = jira_tracker(fake)
 
-    first = await tracker.poll_marked(None, running=())
-    windowed = await tracker.poll_marked("0;", running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
+    windowed = await tracker.poll_marked("0;", running=(), answering=())
 
     for page in (first, windowed):
         assert [(n.issue, n.event_id, n.actor) for n in page.notices] == [
@@ -345,8 +345,8 @@ async def test_jira_poll_the_same_cursor_twice_yields_the_same_page() -> None:
     tracker = jira_tracker(fake)
 
     for cursor in (None, "0;"):
-        first = await tracker.poll_marked(cursor, running=())
-        again = await tracker.poll_marked(cursor, running=())
+        first = await tracker.poll_marked(cursor, running=(), answering=())
+        again = await tracker.poll_marked(cursor, running=(), answering=())
         assert len(first.notices) == 2
         assert first.notices == again.notices
         assert first.cursor == again.cursor
@@ -363,7 +363,7 @@ async def test_jira_poll_a_human_comment_mentioning_the_bot_is_a_mention() -> No
     issue = fake.seed_issue("Ticket")
     fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     fake.advance(30)
 
     # The first comment id equals the label add's history id on purpose: they
@@ -376,7 +376,7 @@ async def test_jira_poll_a_human_comment_mentioning_the_bot_is_a_mention() -> No
     fake.add_comment(issue.id, app, adf_mention(BOT_ACCOUNT_ID, BOT_NAME))
     fake.add_comment(issue.id, fake.bot, adf_mention(BOT_ACCOUNT_ID, BOT_NAME))
 
-    page = await tracker.poll_marked(admitted.cursor, running=())
+    page = await tracker.poll_marked(admitted.cursor, running=(), answering=())
 
     mentions = [n for n in page.notices if n.disposition is Disposition.MENTION]
     assert [(n.issue, n.event_id, n.actor) for n in mentions] == [
@@ -385,7 +385,7 @@ async def test_jira_poll_a_human_comment_mentioning_the_bot_is_a_mention() -> No
     assert _admits(page) == []
     assert await tracker.verify_current(mentions[0]) is True
     # Delivered once: the returned cursor does not deliver it again.
-    later = await tracker.poll_marked(page.cursor, running=())
+    later = await tracker.poll_marked(page.cursor, running=(), answering=())
     assert later.notices == ()
 
 
@@ -433,7 +433,7 @@ async def test_an_empty_first_poll_returns_zero_cursor_and_later_marks_all_arriv
     human = _human(fake)
     tracker = jira_tracker(fake)
 
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     assert (start.notices, start.cursor) == ((), "0;")
     assert fake.requests_of("server_info") == []
 
@@ -441,18 +441,18 @@ async def test_an_empty_first_poll_returns_zero_cursor_and_later_marks_all_arriv
     first = fake.add_label(issue.id, LABEL, human)
     fake.remove_label(issue.id, LABEL, human)
     second = fake.add_label(issue.id, LABEL, human)
-    page = await tracker.poll_marked(start.cursor, running=())
+    page = await tracker.poll_marked(start.cursor, running=(), answering=())
     assert sorted(n.event_id for n in _admits(page)) == sorted([first, second])
-    assert (await tracker.poll_marked(page.cursor, running=())).notices == ()
+    assert (await tracker.poll_marked(page.cursor, running=(), answering=())).notices == ()
 
     fake.advance(20)
     other = fake.seed_issue("Labelled once")
     added = fake.add_label(other.id, LABEL, human)
-    once = await tracker.poll_marked(page.cursor, running=())
-    again = await tracker.poll_marked(page.cursor, running=())
+    once = await tracker.poll_marked(page.cursor, running=(), answering=())
+    again = await tracker.poll_marked(page.cursor, running=(), answering=())
     assert [(n.issue, n.event_id) for n in once.notices] == [(fake.ref(other), added)]
     assert once.notices == again.notices
-    assert (await tracker.poll_marked(once.cursor, running=())).notices == ()
+    assert (await tracker.poll_marked(once.cursor, running=(), answering=())).notices == ()
     assert fake.requests_of("server_info") == []
 
 
@@ -467,15 +467,15 @@ async def test_a_late_indexed_add_inside_the_overlap_is_delivered_once() -> None
     fake.add_label(seen.id, LABEL, human, at=t)
     tracker = jira_tracker(fake)
 
-    first = await tracker.poll_marked(None, running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
     assert [n.issue for n in first.notices] == [fake.ref(seen)]
     assert _cursor_time(first.cursor) == t
 
     fake.set_indexed(late.id, True)
-    second = await tracker.poll_marked(first.cursor, running=())
+    second = await tracker.poll_marked(first.cursor, running=(), answering=())
     assert [(n.issue, n.event_id) for n in second.notices] == [(fake.ref(late), late_add)]
 
-    third = await tracker.poll_marked(second.cursor, running=())
+    third = await tracker.poll_marked(second.cursor, running=(), answering=())
     assert third.notices == ()
 
 
@@ -486,12 +486,12 @@ async def test_overlap_ids_older_than_the_window_are_dropped_from_the_cursor() -
     early = fake.seed_issue("Early")
     early_add = fake.add_label(early.id, LABEL, human, at=START_MS + 60_000)
     tracker = jira_tracker(fake)
-    first = await tracker.poll_marked(None, running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
     assert early_add in _cursor_ids(first.cursor)
 
     later = fake.seed_issue("Ten minutes later")
     later_add = fake.add_label(later.id, LABEL, human, at=START_MS + 660_000)
-    second = await tracker.poll_marked(first.cursor, running=())
+    second = await tracker.poll_marked(first.cursor, running=(), answering=())
 
     assert [n.event_id for n in second.notices] == [later_add]
     assert _cursor_time(second.cursor) == START_MS + 660_000
@@ -506,7 +506,7 @@ async def test_a_cursor_that_does_not_parse_raises_value_error(cursor: str) -> N
     tracker = jira_tracker(fake)
 
     with pytest.raises(ValueError):
-        await tracker.poll_marked(cursor, running=())
+        await tracker.poll_marked(cursor, running=(), answering=())
     assert fake.requests_of("search") == []
 
 
@@ -519,7 +519,7 @@ async def test_initial_label_admits_creator_at_creation() -> None:
     fake.seed_issue("Already done", creator=creator, labels=[LABEL], status="Done")
     tracker = jira_tracker(fake)
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
 
     assert len(page.notices) == 1
     [notice] = page.notices
@@ -541,14 +541,14 @@ async def test_initial_label_identity_survives_cursor_sweep_unrelated_edits_and_
     creator, reporter = _human(fake), _human(fake, 2)
     issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
     tracker = jira_tracker(fake)
-    first = await tracker.poll_marked(None, running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
     [notice] = first.notices
     request_id = notice_request_id(notice)
 
-    repeated = await tracker.poll_marked(None, running=())
+    repeated = await tracker.poll_marked(None, running=(), answering=())
     assert repeated == first
-    assert (await tracker.poll_marked(first.cursor, running=())).notices == ()
-    overlap = await tracker.poll_marked(_cursor(issue.created_ms), running=())
+    assert (await tracker.poll_marked(first.cursor, running=(), answering=())).notices == ()
+    overlap = await tracker.poll_marked(_cursor(issue.created_ms), running=(), answering=())
     assert overlap.notices == first.notices
 
     fake.advance(30)
@@ -556,8 +556,8 @@ async def test_initial_label_identity_survives_cursor_sweep_unrelated_edits_and_
     fake.edit_reporter(issue.id, reporter, reporter)
     fake.move_issue_logged(issue.id, "MOVED-21", reporter)
     assert issue.creator == creator and issue.reporter == reporter
-    assert (await tracker.poll_marked(first.cursor, running=())).notices == ()
-    [swept] = (await tracker.poll_marked(None, running=())).notices
+    assert (await tracker.poll_marked(first.cursor, running=(), answering=())).notices == ()
+    [swept] = (await tracker.poll_marked(None, running=(), answering=())).notices
     assert swept.issue.display_key == "MOVED-21"
     assert (swept.event_id, swept.actor, swept.occurred_at) == (
         notice.event_id,
@@ -582,11 +582,11 @@ async def test_initial_label_late_indexing_same_millisecond_and_cursor_namespace
     late = fake.seed_issue("Index catches up", creator=creator, labels=[LABEL], indexed=False)
     assert seen.created_ms == late.created_ms
     tracker = jira_tracker(fake)
-    first = await tracker.poll_marked(None, running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
     [original] = first.notices
     fake.set_indexed(late.id, True)
 
-    second = await tracker.poll_marked(first.cursor, running=())
+    second = await tracker.poll_marked(first.cursor, running=(), answering=())
     [indexed] = second.notices
     assert indexed.issue == fake.ref(late)
     assert indexed.event_id != original.event_id
@@ -598,13 +598,13 @@ async def test_initial_label_late_indexing_same_millisecond_and_cursor_namespace
     added = fake.add_label(conventional.id, LABEL, creator)
     mention = fake.add_comment(seen.id, creator, adf_mention(BOT_ACCOUNT_ID, BOT_NAME))
     fake.add_label(seen.id, "unrelated", creator)
-    page = await tracker.poll_marked(second.cursor, running=())
+    page = await tracker.poll_marked(second.cursor, running=(), answering=())
     assert str(seen.id) == added == mention
     assert {(n.disposition, n.event_id) for n in page.notices} == {
         (Disposition.MENTION, mention),
         (Disposition.ADMIT, added),
     }
-    assert (await tracker.poll_marked(page.cursor, running=())).notices == ()
+    assert (await tracker.poll_marked(page.cursor, running=(), answering=())).notices == ()
 
 
 @pytest.mark.anyio
@@ -613,7 +613,7 @@ async def test_initial_label_window_uses_creation_time_and_expires_overlap_ids()
     creator = _human(fake)
     old = fake.seed_issue("Old creation", creator=creator, labels=[LABEL])
     tracker = jira_tracker(fake)
-    first = await tracker.poll_marked(None, running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
     fake.advance(600)
     boundary = fake.seed_issue("At overlap boundary", creator=creator, labels=[LABEL])
     fake.advance(119)
@@ -621,16 +621,20 @@ async def test_initial_label_window_uses_creation_time_and_expires_overlap_ids()
     assert latest.created_ms - boundary.created_ms == 120_000
     fake.edit_summary(old.id, "Updated into search window", creator)
 
-    windowed = await tracker.poll_marked(_cursor(latest.created_ms), running=())
+    windowed = await tracker.poll_marked(_cursor(latest.created_ms), running=(), answering=())
     assert {n.issue for n in windowed.notices} == {fake.ref(boundary), fake.ref(latest)}
     assert f"i{old.id}:{old.created_ms}" not in windowed.cursor.split(";", 1)[1].split(",")
-    assert (await tracker.poll_marked(windowed.cursor, running=())).notices == ()
-    assert {n.issue for n in (await tracker.poll_marked("0;", running=())).notices} == {
+    assert (await tracker.poll_marked(windowed.cursor, running=(), answering=())).notices == ()
+    assert {
+        n.issue for n in (await tracker.poll_marked("0;", running=(), answering=())).notices
+    } == {
         fake.ref(old),
         fake.ref(boundary),
         fake.ref(latest),
     }
-    assert {n.issue for n in (await tracker.poll_marked(first.cursor, running=())).notices} == {
+    assert {
+        n.issue for n in (await tracker.poll_marked(first.cursor, running=(), answering=())).notices
+    } == {
         fake.ref(boundary),
         fake.ref(latest),
     }
@@ -644,7 +648,7 @@ async def test_initial_label_malformed_cursor_is_rejected_before_http(token: str
     fake = JiraFake()
     tracker = jira_tracker(fake)
     with pytest.raises(ValueError):
-        await tracker.poll_marked(_cursor(START_MS, token), running=())
+        await tracker.poll_marked(_cursor(START_MS, token), running=(), answering=())
     assert fake.requests == []
 
 
@@ -656,7 +660,7 @@ async def test_initial_label_removal_done_and_deletion_invalidate_saved_notice(c
     issue = fake.seed_issue("Will leave intake", creator=creator, labels=[LABEL])
     neighbor = fake.seed_issue("Still eligible", creator=creator, labels=[LABEL])
     tracker = jira_tracker(fake)
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
     notices = {n.issue.issue_id: n for n in page.notices}
     original = notices[str(issue.id)]
     if change == "remove":
@@ -668,12 +672,14 @@ async def test_initial_label_removal_done_and_deletion_invalidate_saved_notice(c
 
     assert await tracker.verify_current(original) is False
     assert await tracker.verify_current(notices[str(neighbor.id)]) is True
-    assert [n.issue for n in (await tracker.poll_marked(None, running=())).notices] == [
-        fake.ref(neighbor)
-    ]
+    assert [
+        n.issue for n in (await tracker.poll_marked(None, running=(), answering=())).notices
+    ] == [fake.ref(neighbor)]
     if change != "delete":
         assert await tracker.marking_actor(original.issue, LABEL) is None
-        cancellations = await tracker.poll_marked(page.cursor, running=[original.issue])
+        cancellations = await tracker.poll_marked(
+            page.cursor, running=[original.issue], answering=()
+        )
         assert [(n.issue, n.disposition) for n in cancellations.notices] == [
             (original.issue, Disposition.CANCEL)
         ]
@@ -685,13 +691,13 @@ async def test_initial_label_real_readd_supersedes_creation_with_its_author() ->
     creator, relabeller = _human(fake), _human(fake, 2)
     issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
     tracker = jira_tracker(fake)
-    [original] = (await tracker.poll_marked(None, running=())).notices
+    [original] = (await tracker.poll_marked(None, running=(), answering=())).notices
     fake.edit_summary(issue.id, "Unrelated history on first page", creator)
     fake.remove_label(issue.id, LABEL, creator)
     real = fake.add_label(issue.id, LABEL, relabeller)
 
     for cursor in (None, "0;", original.cursor):
-        [notice] = _admits(await tracker.poll_marked(cursor, running=()))
+        [notice] = _admits(await tracker.poll_marked(cursor, running=(), answering=()))
         assert (notice.event_id, notice.actor) == (real, relabeller.actor)
         assert notice_request_id(notice) != notice_request_id(original)
         assert await tracker.verify_current(notice) is True
@@ -711,7 +717,7 @@ async def test_initial_label_nonhuman_real_add_never_restores_creator(author_typ
     )
     issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
     tracker = jira_tracker(fake)
-    [original] = (await tracker.poll_marked(None, running=())).notices
+    [original] = (await tracker.poll_marked(None, running=(), answering=())).notices
     fake.remove_label(issue.id, LABEL, creator)
     fake.add_label(issue.id, LABEL, by)
     neighbor = fake.seed_issue("Human real add", creator=creator)
@@ -719,7 +725,8 @@ async def test_initial_label_nonhuman_real_add_never_restores_creator(author_typ
 
     for cursor in (None, "0;", original.cursor):
         assert [
-            (n.issue, n.event_id) for n in _admits(await tracker.poll_marked(cursor, running=()))
+            (n.issue, n.event_id)
+            for n in _admits(await tracker.poll_marked(cursor, running=(), answering=()))
         ] == [(fake.ref(neighbor), added)]
     assert await tracker.verify_current(original) is False
     assert await tracker.marking_actor(fake.ref(issue), LABEL) != creator.actor
@@ -748,7 +755,7 @@ async def test_initial_label_malformed_real_add_metadata_never_restores_creator(
     creator, relabeller = _human(fake), _human(fake, 2)
     issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
     tracker = jira_tracker(fake)
-    [original] = (await tracker.poll_marked(None, running=())).notices
+    [original] = (await tracker.poll_marked(None, running=(), answering=())).notices
     history = _label_add_response(issue, relabeller)
     if value is ...:
         history.pop(field)
@@ -758,7 +765,7 @@ async def test_initial_label_malformed_real_add_metadata_never_restores_creator(
 
     for cursor in (None, "0;"):
         fake.fail_next("changelog", status=200, body=_changelog_page(history))
-        page = await tracker.poll_marked(cursor, running=())
+        page = await tracker.poll_marked(cursor, running=(), answering=())
         assert [n.issue for n in page.notices] == [fake.ref(neighbor)]
     fake.fail_next("changelog", status=200, body=_changelog_page(history))
     assert await tracker.verify_current(original) is False
@@ -788,11 +795,11 @@ async def test_initial_label_unreadable_history_defers_and_same_cursor_recovers(
     creator = _human(fake)
     issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
     tracker = jira_tracker(fake)
-    [original] = (await tracker.poll_marked(None, running=())).notices
+    [original] = (await tracker.poll_marked(None, running=(), answering=())).notices
 
     fake.fail_next("changelog", status=200, body=_changelog_page(history))
     with pytest.raises(Unavailable):
-        await tracker.poll_marked("0;", running=())
+        await tracker.poll_marked("0;", running=(), answering=())
     fake.fail_next("changelog", status=200, body=_changelog_page(history))
     with pytest.raises(Unavailable):
         await tracker.verify_current(original)
@@ -800,7 +807,7 @@ async def test_initial_label_unreadable_history_defers_and_same_cursor_recovers(
     with pytest.raises(Unavailable):
         await tracker.marking_actor(fake.ref(issue), LABEL)
 
-    [recovered] = (await tracker.poll_marked("0;", running=())).notices
+    [recovered] = (await tracker.poll_marked("0;", running=(), answering=())).notices
     assert recovered.event_id == original.event_id
     assert await tracker.verify_current(recovered) is True
     assert await tracker.marking_actor(fake.ref(issue), LABEL) == creator.actor
@@ -819,8 +826,8 @@ async def test_initial_label_incomplete_history_page_defers_and_recovers(
     fake.fail_next("changelog", status=200, body=page)
 
     with pytest.raises(Unavailable):
-        await tracker.poll_marked("0;", running=())
-    [recovered] = (await tracker.poll_marked("0;", running=())).notices
+        await tracker.poll_marked("0;", running=(), answering=())
+    [recovered] = (await tracker.poll_marked("0;", running=(), answering=())).notices
     assert recovered.event_id == f"creation:{issue.id}:{issue.created_ms}"
     assert await tracker.verify_current(recovered) is True
 
@@ -836,8 +843,8 @@ async def test_initial_label_failed_later_history_page_defers_and_same_cursor_re
     fake.fail_next("changelog", after=1, status=503)
 
     with pytest.raises(Unavailable):
-        await tracker.poll_marked("0;", running=())
-    [recovered] = (await tracker.poll_marked("0;", running=())).notices
+        await tracker.poll_marked("0;", running=(), answering=())
+    [recovered] = (await tracker.poll_marked("0;", running=(), answering=())).notices
     assert recovered.event_id == f"creation:{issue.id}:{issue.created_ms}"
     assert await tracker.verify_current(recovered) is True
 
@@ -868,7 +875,7 @@ async def test_initial_label_missing_or_malformed_metadata_never_uses_reporter(
     issue = fake.seed_issue("Malformed creation", creator=creator, reporter=creator, labels=[LABEL])
     neighbor = fake.seed_issue("Valid creation", creator=creator, labels=[LABEL])
     tracker = jira_tracker(fake)
-    first = await tracker.poll_marked(None, running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
     original = next(n for n in first.notices if n.issue == fake.ref(issue))
     malformed = _issue_response(issue)
     if value is ...:
@@ -880,15 +887,179 @@ async def test_initial_label_missing_or_malformed_metadata_never_uses_reporter(
         status=200,
         body={"issues": [malformed, _issue_response(neighbor)], "isLast": True},
     )
-    assert [n.issue for n in (await tracker.poll_marked(None, running=())).notices] == [
-        fake.ref(neighbor)
-    ]
+    assert [
+        n.issue for n in (await tracker.poll_marked(None, running=(), answering=())).notices
+    ] == [fake.ref(neighbor)]
     fake.fail_next("issue", status=200, body=malformed)
     assert await tracker.marking_actor(fake.ref(issue), LABEL) is None
     fake.fail_next("issue", status=200, body=malformed)
     assert await tracker.verify_current(original) is False
-    assert {n.issue for n in (await tracker.poll_marked(None, running=())).notices} == {
+    assert {
+        n.issue for n in (await tracker.poll_marked(None, running=(), answering=())).notices
+    } == {
         fake.ref(issue),
         fake.ref(neighbor),
     }
     assert fake.writes == 0
+
+
+# Answers (#5789 decisions 1 to 3 and 6) -------------------------------------------
+#
+# A comment's ``author`` is a UserDetails bean whose ``accountType`` is
+# ``atlassian`` for a person, ``app`` for an app or bot and ``customer`` for a
+# service desk customer
+# (https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/#api-rest-api-3-issue-issueidorkey-comment-get).
+# An issue's ``status.statusCategory.key`` is ``done`` once it is resolved
+# (https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-get).
+
+
+def _answers(page: NoticePage) -> list[MarkedNotice]:
+    return [n for n in page.notices if n.disposition is Disposition.ANSWER]
+
+
+def _mentions(page: NoticePage) -> list[MarkedNotice]:
+    return [n for n in page.notices if n.disposition is Disposition.MENTION]
+
+
+def _comment_time(fake: JiraFake, comment_id: str) -> datetime:
+    return datetime.fromtimestamp(fake.comment(comment_id).created_ms / 1000, UTC)
+
+
+@pytest.mark.anyio
+async def test_jira_poll_answer_a_mention_on_an_answering_issue_is_one_answer_and_no_mention() -> (
+    None
+):
+    fake = JiraFake()
+    human = _human(fake)
+    asked = fake.seed_issue("Asked")
+    quiet = fake.seed_issue("Not asked")
+    for issue in (asked, quiet):
+        fake.add_label(issue.id, LABEL, human)
+    tracker = jira_tracker(fake)
+    start = await tracker.poll_marked(None, running=(), answering=())
+    fake.advance(30)
+    on_asked = fake.add_comment(
+        asked.id, human, adf_mention(BOT_ACCOUNT_ID, BOT_NAME, before="Use the blue one ")
+    )
+    on_quiet = fake.add_comment(quiet.id, human, adf_mention(BOT_ACCOUNT_ID, BOT_NAME))
+
+    page = await tracker.poll_marked(start.cursor, running=(), answering=(fake.ref(asked),))
+
+    assert [(n.issue, n.event_id, n.actor, n.marker) for n in _answers(page)] == [
+        (fake.ref(asked), on_asked, human.actor, LABEL)
+    ]
+    assert [(n.issue, n.event_id) for n in _mentions(page)] == [(fake.ref(quiet), on_quiet)]
+    (answer,) = _answers(page)
+    assert answer.occurred_at == _comment_time(fake, on_asked)
+    assert answer.occurred_at is not None and answer.occurred_at.tzinfo is not None
+    assert _admits(page) == []
+    later = await tracker.poll_marked(page.cursor, running=(), answering=(fake.ref(asked),))
+    assert later.notices == ()
+
+
+@pytest.mark.anyio
+async def test_jira_poll_answer_only_a_persons_plain_comment_on_an_answering_issue() -> None:
+    fake = JiraFake()
+    human = _human(fake)
+    app = fake.add_user(
+        "557058:00000000-0000-4000-8000-0000000000a1", "Automation", account_type="app"
+    )
+    issue = fake.seed_issue("Ticket")
+    fake.add_label(issue.id, LABEL, human)
+    tracker = jira_tracker(fake)
+    start = await tracker.poll_marked(None, running=(), answering=())
+    fake.advance(30)
+    plain = fake.add_comment(issue.id, human, "Use the blue one.")
+    fake.add_comment(issue.id, app, "Automation says hello.")
+    fake.add_comment(issue.id, fake.bot, "Status: WORKING")
+
+    answering = await tracker.poll_marked(start.cursor, running=(), answering=(fake.ref(issue),))
+    elsewhere = await tracker.poll_marked(start.cursor, running=(), answering=())
+
+    assert [(n.event_id, n.actor) for n in answering.notices] == [(plain, human.actor)]
+    assert _answers(answering)[0].occurred_at == _comment_time(fake, plain)
+    assert elsewhere.notices == ()
+
+
+@pytest.mark.anyio
+async def test_jira_poll_answer_the_first_poll_delivers_answers_only_on_answering_issues() -> None:
+    """A label whose first page held an issue saves no cursor and polls as a
+    first poll again, so a first poll delivers an answering issue's comments,
+    read in full past the window floor; a plain comment elsewhere stays
+    unread and a mention is only remembered."""
+
+    fake = JiraFake()
+    human = _human(fake)
+    asked = fake.seed_issue("Asked")
+    quiet = fake.seed_issue("Not asked")
+    for issue in (asked, quiet):
+        fake.add_label(issue.id, LABEL, human)
+    early = fake.add_comment(asked.id, human, "An early answer.")
+    fake.add_comment(quiet.id, human, "A plain comment.")
+    fake.add_comment(quiet.id, human, adf_mention(BOT_ACCOUNT_ID, BOT_NAME))
+    # Hours later, so the early answer is below the first poll's floor.
+    fake.advance(6 * 3600)
+    late = fake.add_comment(asked.id, human, "The answer.")
+    fake.add_comment(asked.id, fake.bot, "Status: WORKING")
+    tracker = jira_tracker(fake)
+
+    first = await tracker.poll_marked(None, running=(), answering=(fake.ref(asked),))
+
+    assert [(n.issue, n.event_id, n.actor) for n in _answers(first)] == [
+        (fake.ref(asked), early, human.actor),
+        (fake.ref(asked), late, human.actor),
+    ]
+    assert _answers(first)[1].occurred_at == _comment_time(fake, late)
+    assert _mentions(first) == []
+    assert len(_admits(first)) == 2
+    unasked = await tracker.poll_marked(None, running=(), answering=())
+    assert _answers(unasked) == [] and _mentions(unasked) == []
+    again = await tracker.poll_marked(first.cursor, running=(), answering=(fake.ref(asked),))
+    assert again.notices == ()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change", ["label_removed", "done", "comment_deleted"])
+async def test_jira_poll_answer_is_current_only_while_labelled_open_and_standing(
+    change: str,
+) -> None:
+    fake = JiraFake()
+    human = _human(fake)
+    issue = fake.seed_issue("Ticket")
+    fake.add_label(issue.id, LABEL, human)
+    tracker = jira_tracker(fake)
+    start = await tracker.poll_marked(None, running=(), answering=())
+    fake.advance(30)
+    comment = fake.add_comment(issue.id, human, "Use the blue one.")
+    page = await tracker.poll_marked(start.cursor, running=(), answering=(fake.ref(issue),))
+    (answer,) = _answers(page)
+    assert await tracker.verify_current(answer) is True
+
+    if change == "label_removed":
+        fake.remove_label(issue.id, LABEL, human)
+    elif change == "done":
+        fake.set_status(issue.id, "Done", human)
+    else:
+        fake.delete_comment(comment)
+
+    assert await tracker.verify_current(answer) is False
+
+
+@pytest.mark.anyio
+async def test_jira_poll_answer_is_not_current_for_another_author_or_issue() -> None:
+    fake = JiraFake()
+    human, other = _human(fake), _human(fake, 2)
+    issue = fake.seed_issue("Ticket")
+    neighbor = fake.seed_issue("Neighbor")
+    for seeded in (issue, neighbor):
+        fake.add_label(seeded.id, LABEL, human)
+    tracker = jira_tracker(fake)
+    start = await tracker.poll_marked(None, running=(), answering=())
+    fake.advance(30)
+    fake.add_comment(issue.id, human, "Use the blue one.")
+    page = await tracker.poll_marked(start.cursor, running=(), answering=(fake.ref(issue),))
+    (answer,) = _answers(page)
+    assert await tracker.verify_current(answer) is True
+
+    assert await tracker.verify_current(replace(answer, actor=other.actor)) is False
+    assert await tracker.verify_current(replace(answer, issue=fake.ref(neighbor))) is False

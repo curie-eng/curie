@@ -1099,10 +1099,35 @@ class RunnerClient:
         The envelope carries the pinned text, so nothing here logs a body.
         """
 
+        return await self._post_context(
+            f"{base_url}/v1/requester-context", envelope, token=token, timeout_s=timeout_s
+        )
+
+    async def deliver_memory_rules_context(
+        self,
+        base_url: str,
+        envelope: bytes,
+        *,
+        token: str | None,
+        timeout_s: float,
+    ) -> tuple[int, dict[str, object] | None]:
+        """POST the learned rules envelope (#5798); ``(status, JSON or None)``.
+
+        Never raises on an HTTP answer: the caller decides what a refusal means.
+        The envelope carries the pinned rule text, so nothing here logs a body.
+        """
+
+        return await self._post_context(
+            f"{base_url}/v1/memory-rules-context", envelope, token=token, timeout_s=timeout_s
+        )
+
+    async def _post_context(
+        self, url: str, envelope: bytes, *, token: str | None, timeout_s: float
+    ) -> tuple[int, dict[str, object] | None]:
         headers = dict(_auth_headers(token) or {})
         headers["Content-Type"] = "application/json"
         async with self._session.post(
-            f"{base_url}/v1/requester-context",
+            url,
             data=envelope,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=timeout_s),

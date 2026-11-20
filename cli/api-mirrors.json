@@ -75,6 +75,10 @@
           "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. Admission selection metadata is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
         },
         {
+          "field": "memory_rules",
+          "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. The learned rules pinned at admission (#5798) are exposed by the API and are outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
           "field": "requester_principal_id",
           "why": "cli/src/commands/work.rs reads requester display text and execution ownership. It does not consume the admission requester reference exposed by the API."
         },
@@ -138,6 +142,10 @@
         {
           "field": "coding_instructions_evidence",
           "why": "cli/src/commands/work.rs does not apply or acknowledge coding instructions. Per-request selection evidence is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "memory_rules_evidence",
+          "why": "cli/src/commands/work.rs does not apply or acknowledge learned rules. Per-request learned rules evidence (#5798) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
         },
         {
           "field": "retry_of_request_id",
@@ -387,6 +395,31 @@
     {
       "struct": "MemoryGuidance",
       "schema": "MemoryGuidanceOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRuleDecider",
+      "schema": "MemoryRuleDecider",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRule",
+      "schema": "MemoryRuleOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRuleScope",
+      "schema": "MemoryRuleScopeOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRules",
+      "schema": "MemoryRulesOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRuleChange",
+      "schema": "MemoryRuleDecisionOut",
       "omissions": []
     },
     {
@@ -967,6 +1000,11 @@
       "struct": "CodingInstructionsWrite",
       "schema": "CodingInstructionsWrite",
       "omissions": []
+    },
+    {
+      "struct": "MemoryRuleDecision",
+      "schema": "MemoryRuleDecision",
+      "omissions": []
     }
   ],
   "requests": [
@@ -1221,6 +1259,24 @@
       "struct": "CodingInstructionsWrite",
       "method": "put",
       "path": "/coding-instructions"
+    },
+    {
+      "function": "accept_memory_rule",
+      "struct": "MemoryRuleDecision",
+      "method": "post",
+      "path": "/agents/{agent_id}/memory/rules/{rule_id}/accept"
+    },
+    {
+      "function": "reject_memory_rule",
+      "struct": "MemoryRuleDecision",
+      "method": "post",
+      "path": "/agents/{agent_id}/memory/rules/{rule_id}/reject"
+    },
+    {
+      "function": "remove_memory_rule",
+      "struct": "MemoryRuleDecision",
+      "method": "post",
+      "path": "/agents/{agent_id}/memory/rules/{rule_id}/remove"
     }
   ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",

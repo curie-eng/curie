@@ -47,18 +47,9 @@ fn renders_exact_bundle_with_explicit_target_and_one_json_object() {
             assert_eq!(rendered, *embedded, "{name}");
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(out.join("hooks/reproduction_gate.py"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0o111
-        );
-    }
+    // The reproduction gate moved to the dark factory bundle; the triage
+    // render writes no hook.
+    assert!(!out.join("hooks").exists());
 }
 
 #[test]

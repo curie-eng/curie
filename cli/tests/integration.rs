@@ -152,6 +152,7 @@ mod mail_channel_health;
 mod memory_add;
 mod memory_facts;
 mod memory_guidance_clap_wiring;
+mod memory_rules;
 mod message_argv;
 mod message_ephemeral_ports;
 mod model_provider_registry;

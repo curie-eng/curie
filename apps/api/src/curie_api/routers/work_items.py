@@ -12,7 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 
 from curie_api.workitems.lifecycle import RetryConditionFact, WorkItemConflict, WorkItemOutcome
 
-from .. import personal_execution, requester_instruction_context, workitem_dispatch
+from .. import (
+    memory_rules_context,
+    personal_execution,
+    requester_instruction_context,
+    workitem_dispatch,
+)
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import LivenessSessionDep, SessionDep
@@ -720,5 +725,41 @@ async def acknowledge_requester_context(
 
     result = await requester_instruction_context.accept_acknowledgment(session, request_id, body)
     if isinstance(result, requester_instruction_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return {"evidence": result}
+
+
+# Learned rules (#5798), delivered beside the requester envelope ---------------------
+
+
+@router.post("/requests/{request_id}/memory-rules-context")
+async def read_memory_rules_context(
+    request_id: uuid.UUID,
+    body: memory_rules_context.ContextBody,
+    session: SessionDep,
+    response: Response,
+) -> dict[str, Any]:
+    """The running request's version 1 learned rules envelope, for the current fence."""
+
+    response.headers["Cache-Control"] = "no-store"
+    result = await memory_rules_context.read_envelope(
+        session, request_id, runtime_epoch=body.runtime_epoch
+    )
+    await session.rollback()
+    if isinstance(result, memory_rules_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return result
+
+
+@router.post("/requests/{request_id}/memory-rules-context/acknowledgment")
+async def acknowledge_memory_rules_context(
+    request_id: uuid.UUID,
+    body: memory_rules_context.AcknowledgmentBody,
+    session: SessionDep,
+) -> dict[str, Any]:
+    """Accept the relayed acknowledgment only for the current request and fence."""
+
+    result = await memory_rules_context.accept_acknowledgment(session, request_id, body)
+    if isinstance(result, memory_rules_context.Refused):
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
     return {"evidence": result}

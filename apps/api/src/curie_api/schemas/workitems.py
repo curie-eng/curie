@@ -182,6 +182,16 @@ class CodingInstructionsMetadata(BaseModel):
     format_version: Literal[1] | None = None
 
 
+class MemoryRulesMetadata(BaseModel):
+    """The learned rules pinned at admission (#5798): numbers and digest, never the text."""
+
+    state: Literal["absent", "selected"]
+    count: int = 0
+    rule_numbers: list[int] = Field(default_factory=list)
+    sha256: str | None = None
+    format_version: Literal[1] | None = None
+
+
 class WorkItemRequestOut(BaseModel):
     """Operator view of one ExecutionRequest (#2577). Built from an explicit
     allowlist dict, never from an ORM row, so no runtime-owner field leaks."""
@@ -205,6 +215,8 @@ class WorkItemRequestOut(BaseModel):
     enrollment_generation: int | None = None
     coding_instructions_selection_id: uuid.UUID | None = None
     coding_instructions_evidence: Literal["none", "pending", "applied", "failed"] = "none"
+    # Whether this request's runner loaded the WorkItem's pinned learned rules (#5798).
+    memory_rules_evidence: Literal["none", "pending", "applied", "failed"] = "none"
     # Automatic retry lineage (ADR 0269): the request this one retries, and
     # whether it was admitted after owner loss or after an ordinary failure.
     retry_of_request_id: uuid.UUID | None
@@ -389,6 +401,7 @@ class WorkItemOutcomeOut(BaseModel):
     enrollment_generation: int | None = None
     requester_principal_id: uuid.UUID | None = None
     coding_instructions: CodingInstructionsMetadata
+    memory_rules: MemoryRulesMetadata
     # The WorkItem's lifetime automatic retry allowance (ADR 0269): slots spent
     # by owner loss and ordinary failures together, and the limit.
     automatic_retries_used: int

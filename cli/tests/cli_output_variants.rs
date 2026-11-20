@@ -44,9 +44,10 @@ use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
     ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, HookFireOutput,
-    HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
-    ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, SubscriptionOutput,
-    SubscriptionVerb, VersionsOutput, WakeKeyOutput, WorkItemsOutput,
+    HookOutput, KillOutput, MemoryChannel, MemoryOutput, MemoryRulesOutput, OverridesOutput,
+    PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
+    SkillApprovalsOutput, SubscriptionOutput, SubscriptionVerb, VersionsOutput, WakeKeyOutput,
+    WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -615,6 +616,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 source: "operator".to_string(),
                 fresh_session_required: true,
                 message_verb: "local".to_string(),
+            },
+        ],
+    );
+    m.insert(
+        "MemoryRulesOutput",
+        samples![
+            "DryRun" => MemoryRulesOutput::DryRun(plan()),
+            "Rules" => MemoryRulesOutput::Rules(
+                curie::api::parse_memory_rules(memory_rules_vector("list"))
+                    .expect("the recorded rule list parses"),
+            ),
+            "Changed" => MemoryRulesOutput::Changed {
+                verb: curie::commands::MemoryRuleVerb::Accept,
+                change: Box::new(
+                    curie::api::parse_memory_rule_change(memory_rules_vector("accept"))
+                        .expect("the recorded accept parses"),
+                ),
             },
         ],
     );
@@ -1317,4 +1335,13 @@ fn every_variant_sample_validates_against_its_mapped_schema() {
         "only {checked} variant samples validated; the registry has shrunk unexpectedly \
          and the gate would pass vacuously"
     );
+}
+
+/// One recorded API response from `tests/vectors/memory-rules-responses.json`.
+fn memory_rules_vector(key: &str) -> serde_json::Value {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/memory-rules-responses.json"
+    ))
+    .expect("the memory rules vector is JSON");
+    vector[key].clone()
 }
