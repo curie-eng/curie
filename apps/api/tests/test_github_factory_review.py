@@ -14,6 +14,9 @@ https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
 https://docs.github.com/en/rest/pulls/comments#get-a-review-comment-for-a-pull-request
 https://docs.github.com/en/rest/pulls/reviews#get-a-review-for-a-pull-request
 https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+Review feedback is admitted per submitted review (#5794), which also reads the
+review's comments; inline comments name their review as pull_request_review_id:
+https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
 The reply side is covered in test_factory_terminus.py:
 https://docs.github.com/en/rest/pulls/comments#create-a-reply-for-a-review-comment
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
@@ -93,12 +96,15 @@ def _pr_url(pr: int) -> str:
 
 
 class ReviewGitHubAPI(GitHubAPI):
-    """Adds the pull request and feedback reads the review verifier makes."""
+    """Adds the pull request and feedback reads the review verifier makes, and
+    the review's comment listing review admission makes (REST shapes, upper
+    case review states)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.pulls: dict[int, dict[str, Any]] = {}
         self.feedback: dict[str, dict[str, Any]] = {}
+        self.review_comments: dict[str, list[dict[str, Any]]] = {}
 
     def open_pull(self, pr: int) -> None:
         repo = {"id": REPO_ID, "full_name": REPO}
@@ -114,6 +120,11 @@ class ReviewGitHubAPI(GitHubAPI):
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path in self.review_comments:
+            page = int(request.url.params.get("page", "1"))
+            size = int(request.url.params.get("per_page", "30"))
+            listed = self.review_comments[path][(page - 1) * size : page * size]
+            return httpx.Response(200, json=listed)
         if path in self.feedback:
             return httpx.Response(200, json=self.feedback[path])
         prefix = f"/repos/{REPO}/pulls/"
@@ -136,8 +147,14 @@ def _feedback_event(
     app: dict[str, Any] | None = None,
     installation_id: int = INSTALLATION_ID,
     state: str = "open",
+    review_id: int | None = None,
+    review_state: str = "COMMENTED",
 ) -> tuple[dict[str, Any], int]:
-    """Build one signed-payload shape and register the provider's current copy."""
+    """Build one signed-payload shape and register the provider's current copy.
+
+    An inline comment belongs to the submitted review ``review_id`` (a new one
+    in ``review_state`` by default), which the App reads with its comments.
+    """
 
     fid = feedback_id if feedback_id is not None else next(_FEEDBACK)
     author = user if user is not None else _sender()
@@ -177,18 +194,35 @@ def _feedback_event(
         current["issue_url"] = f"{api_base}/repos/{REPO}/issues/{pr}"
         api.feedback[f"/repos/{REPO}/issues/comments/{fid}"] = current
     elif event == "pull_request_review_comment":
+        review = review_id if review_id is not None else fid + 500000
         feedback.update(
             {
                 "commit_id": HEAD,
                 "path": "src/acme/helper.py",
                 "line": 12,
-                "pull_request_review_id": fid + 500000,
+                "pull_request_review_id": review,
             }
         )
         current = copy.deepcopy(feedback)
         current["pull_request_url"] = f"{api_base}/repos/{REPO}/pulls/{pr}"
         payload.update({"pull_request": pull, "comment": feedback})
         api.feedback[f"/repos/{REPO}/pulls/comments/{fid}"] = current
+        review_path = f"/repos/{REPO}/pulls/{pr}/reviews/{review}"
+        api.feedback.setdefault(
+            review_path,
+            {
+                "id": review,
+                "body": "",
+                "user": dict(author),
+                "state": review_state,
+                "commit_id": HEAD,
+                "submitted_at": "2026-09-20T10:00:00Z",
+                "author_association": "MEMBER",
+                "html_url": f"{_pr_url(pr)}#pullrequestreview-{review}",
+                "pull_request_url": f"{api_base}/repos/{REPO}/pulls/{pr}",
+            },
+        )
+        api.review_comments.setdefault(f"{review_path}/comments", []).append(copy.deepcopy(current))
     else:
         feedback.update(
             {
@@ -197,9 +231,14 @@ def _feedback_event(
                 "submitted_at": "2026-09-20T10:00:00Z",
             }
         )
+        # The REST read names the state in upper case; the webhook in lower.
         current = copy.deepcopy(feedback)
+        current["state"] = "CHANGES_REQUESTED"
+        current["pull_request_url"] = f"{api_base}/repos/{REPO}/pulls/{pr}"
         payload.update({"action": "submitted", "pull_request": pull, "review": feedback})
-        api.feedback[f"/repos/{REPO}/pulls/{pr}/reviews/{fid}"] = current
+        review_path = f"/repos/{REPO}/pulls/{pr}/reviews/{fid}"
+        api.feedback[review_path] = current
+        api.review_comments.setdefault(f"{review_path}/comments", [])
     return payload, fid
 
 
@@ -400,15 +439,30 @@ def _owned(client: TestClient, api: ReviewGitHubAPI) -> tuple[int, int, dict[str
     return number, pr, first
 
 
-def _reply_target(event: str, pr: int, fid: int) -> dict[str, Any]:
-    """Where the revision's status reply lands, as admission stores it (#3831)."""
+def _feedback_link(event: str, pr: int, fid: int) -> str:
+    """The URL a revision stores for feedback ``fid``.
 
-    thread = event == "pull_request_review_comment"
+    Review feedback is admitted per submitted review (#5794): an inline comment
+    of `_feedback_event` stores its review's URL, whichever piece came first.
+    """
+
+    if event == "pull_request_review_comment":
+        return f"{_pr_url(pr)}#pullrequestreview-{fid + 500000}"
+    return f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
+
+
+def _reply_target(event: str, pr: int, fid: int) -> dict[str, Any]:
+    """Where the revision's status reply lands, as admission stores it (#3831).
+
+    A submitted review, its inline comments included, is answered in the pull
+    request conversation (#5794).
+    """
+
     return {
-        "reply_target_kind": "review_thread" if thread else "pull_request",
+        "reply_target_kind": "pull_request",
         "reply_target_pr_number": str(pr),
-        "reply_target_comment_id": str(fid) if thread else None,
-        "reply_target_url": f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}",
+        "reply_target_comment_id": None,
+        "reply_target_url": _feedback_link(event, pr, fid),
     }
 
 
@@ -438,7 +492,7 @@ def test_authorized_mention_admits_the_next_request_on_the_same_work_item(
     assert revision["work_item_id"] == first["work_item_id"]
     assert revision["status"] == "waiting"
     objective = revision["objective"]
-    assert objective.splitlines()[0] == f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
+    assert objective.splitlines()[0] == _feedback_link(event, pr, fid)
     assert _mention() in objective
     assert revision["reply_kind"] == "github"
     assert revision["reply_address"] == REPO
@@ -520,9 +574,10 @@ def test_review_objective_carries_latest_succeeded_pull_request_body(
     )
     assert "Start the revision pipeline only when the comment asks for a change." in prose
     provenance = json.loads(last_line)
-    assert provenance["body"] == question
+    # The inline comment's review is submitted with no text of its own.
+    assert provenance["body"] == ""
     assert provenance["sender"] == SENDER
-    assert provenance["path"] == "src/acme/helper.py"
+    assert provenance["comments"] == [{"path": "src/acme/helper.py", "line": 12, "body": question}]
     assert revision["requester"] == f"github:{SENDER_ID}:{SENDER}"
     assert _stored_reply_target(revision) == _reply_target("pull_request_review_comment", pr, fid)
     if publication_body is None:
@@ -720,13 +775,30 @@ def test_app_slug_mention_on_a_factory_pr_is_admitted_once(
     assert len(_requests(number)) == 2
 
 
-def test_ordinary_comment_without_the_mention_is_ignored(
+def test_ordinary_comment_without_the_mention_admits_one_revision(
     factory: tuple[TestClient, ReviewGitHubAPI],
 ) -> None:
+    """A plain comment on a factory pull request asks for a revision (#5794)."""
+
     client, api = factory
-    number, pr, _first = _owned(client, api)
-    payload, _ = _feedback_event(api, "issue_comment", pr, "looks fine to me, thanks")
-    _refused(client, number, "issue_comment", payload, "ordinary_comment")
+    number, pr, first = _owned(client, api)
+    payload, fid = _feedback_event(api, "issue_comment", pr, "please rename the helper")
+
+    response = _post(client, "issue_comment", payload)
+    replay = _post(client, "issue_comment", payload)
+
+    assert response.json()["status"] == "factory_admitted", response.text
+    assert replay.json()["status"] == "factory_duplicate", replay.text
+    rows = _requests(number)
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert rows[1]["work_item_id"] == first["work_item_id"]
+    assert rows[1]["objective"].splitlines()[0] == _feedback_link("issue_comment", pr, fid)
+    assert _stored_reply_target(rows[1]) == _reply_target("issue_comment", pr, fid)
+    assert _rows(
+        "SELECT plain_feedback_revisions FROM curie.thread_publication_lineages "
+        "WHERE pr_number = :pr",
+        {"pr": pr},
+    ) == [{"plain_feedback_revisions": 1}]
 
 
 def test_bot_sender_is_refused(factory: tuple[TestClient, ReviewGitHubAPI]) -> None:
@@ -857,9 +929,7 @@ def test_review_mention_during_live_run_waits_then_becomes_next_request(
     revision = rows[1]
     assert revision["status"] == "queued"
     assert revision["work_item_id"] == first["work_item_id"]
-    assert revision["objective"].splitlines()[0] == (
-        f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
-    )
+    assert revision["objective"].splitlines()[0] == _feedback_link(event, pr, fid)
     assert _stored_reply_target(revision) == _reply_target(event, pr, fid)
     assert (
         len(
@@ -955,27 +1025,19 @@ def test_review_admission_survives_work_item_version_change_during_verification(
     _own_pull_request(first["work_item_id"], pr)
     _mark_running(client, first["id"])
     payload, fid = _feedback_event(api, "issue_comment", pr, _mention())
-    verify = github_factory_review.verify_feedback_truth
+    verify = github_factory_review.verify_feedback_in_repository
     bumped = False
 
     async def verify_with_version_change(
         feedback: Any,
         lineage: Any,
+        verified: Any,
         *,
         settings: Any,
         client: httpx.AsyncClient,
-        credentials: github_app.GitHubCredentials,
-        api_url: str,
     ) -> str:
         nonlocal bumped
-        head = await verify(
-            feedback,
-            lineage,
-            settings=settings,
-            client=client,
-            credentials=credentials,
-            api_url=api_url,
-        )
+        head = await verify(feedback, lineage, verified, settings=settings, client=client)
         if bumped:
             return head
         bumped = True
@@ -990,7 +1052,9 @@ def test_review_admission_survives_work_item_version_change_during_verification(
             await engine.dispose()
         return head
 
-    monkeypatch.setattr(github_factory_review, "verify_feedback_truth", verify_with_version_change)
+    monkeypatch.setattr(
+        github_factory_review, "verify_feedback_in_repository", verify_with_version_change
+    )
 
     response = _post(client, "issue_comment", payload)
     replay = _post(client, "issue_comment", payload, delivery=str(uuid.uuid4()))

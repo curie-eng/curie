@@ -172,7 +172,7 @@ def test_upgrade_downgrade_upgrade_and_every_object_exists(
     assert stamped_revision() == BELOW
     assert "memory_rule_proposals" not in column_names("agents")
     assert "memory_rules_state" not in column_names("work_items")
-    command.upgrade(config, "head")
+    command.upgrade(config, REVISION)
     assert stamped_revision() == REVISION
 
     assert _default("agents", "memory_rule_proposals") == ("NO", "false")

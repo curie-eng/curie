@@ -550,8 +550,15 @@ def test_multi_repo_review_feedback_routes_for_each_repository(
         assert str(revision["agent_id"]) == agent_id
         assert revision["status"] == "waiting"
         assert revision["reply_address"] == repo
+        # Review feedback is admitted per submitted review (#5794): an inline
+        # comment's revision names its review, not the comment.
+        anchor = (
+            f"pullrequestreview-{payload['comment']['pull_request_review_id']}"
+            if event == "pull_request_review_comment"
+            else FRAGMENTS[event].format(id=fid)
+        )
         assert revision["objective"].splitlines()[0] == (
-            f"https://github.com/{repo}/pull/{pr}#{FRAGMENTS[event].format(id=fid)}"
+            f"https://github.com/{repo}/pull/{pr}#{anchor}"
         )
 
 
