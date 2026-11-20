@@ -164,6 +164,7 @@ tools/factory-e2e/tests/test_kind_images.py
 tools/factory-e2e/tests/test_live_github_chain.py
 tools/factory-e2e/tests/test_live_github_chain_driver.py
 tools/factory-e2e/tests/test_live_github_chain_pending.py
+tools/factory-e2e/tests/test_one_ticket_jira.py
 tools/factory-e2e/tests/test_one_ticket_scenario.py
 tools/factory-e2e/tests/test_personal_owner_enforcement.py
 tools/factory-e2e/tests/test_personal_profile.py

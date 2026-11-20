@@ -30,7 +30,9 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import factory_e2e as fe
+import jira_one_ticket_run
 import kind_images
+import one_ticket_jira
 import one_ticket_run
 import one_ticket_scenario
 import scripted_lanes
@@ -57,6 +59,14 @@ RECORD_REQUEST_RESERVE_USD = 2.0
 RECORD_ATTEMPTS = 3
 # The gateway sends this to the in-process Slack recorder only; it is no credential.
 SCRIPTED_SLACK_BOT_TOKEN = "xoxb-0000000000-scripted-example"
+# The jira-one-ticket install's tracker, binding and the Secret of its token.
+JIRA_SCENARIO = "jira-one-ticket"
+JIRA_TRACKER = "jira-stub"
+JIRA_BINDING = "jira-stub-binding"
+JIRA_SECRET_NAME = "jira-stub-token"
+FIXTURE_REPOSITORY = "acme-corp/acme-bot"
+# The GitHub stub's id for the fixture repository.
+FIXTURE_REPOSITORY_ID = "4401"
 
 
 class ScriptedScenarioError(RuntimeError):
@@ -84,6 +94,17 @@ def validate_configuration(args: argparse.Namespace) -> None:
             raise fe.ConfigError("only the publication scenario supports recording")
         if not os.environ.get("CURIE_FACTORY_RECORD_KEY"):
             raise fe.ConfigError("recording requires CURIE_FACTORY_RECORD_KEY")
+    elif args.scenario == JIRA_SCENARIO:
+        # The scenario replays the one-ticket transcript on the Jira channel.
+        loader = Path(__file__).resolve().parents[2] / "tools/model-script/model_script.py"
+        try:
+            jira_one_ticket_run.transcript_for_jira(
+                _module("factory_model_script_check", loader).load_transcript(
+                    one_ticket_run.TRANSCRIPT
+                )
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise fe.ConfigError(f"the one-ticket transcript is unusable on Jira: {exc}") from None
     elif not Path(args.transcript).is_file():
         raise fe.ConfigError(
             f"transcript {args.transcript} is missing; use scripted --scenario publication --record"
@@ -168,6 +189,60 @@ def scripted_values(
         )
         values.setdefault("worker", {})["slackApiBaseUrl"] = slack_api_base_url
     return values
+
+
+def add_jira_tracker(values: dict[str, Any], *, api_url: str, host: str) -> None:
+    """One Jira Cloud tracker and its binding to the fixture repository.
+
+    The entries have the shape ``curie factory quickstart --tracker jira-cloud
+    --code-host github`` writes (its Jira Cloud module):
+    a ``static_token`` credential with the bot's email as username, the bot's
+    accountId as the mention, the binding scoped to the site's cloudId, and an
+    allowlist start authority. The GitHub tracker stays beside it, since the
+    chart pairs a GitHub code host with a GitHub tracker; no GitHub issue is
+    labelled on this install.
+    """
+
+    factory = values["factory"]
+    code_host = factory["codeHosts"][0]["name"]
+    factory["trackers"].append(
+        {
+            "name": JIRA_TRACKER,
+            "kind": "jira_cloud",
+            "host": host,
+            "apiUrl": api_url,
+            "label": one_ticket_scenario.LABEL,
+            "mention": one_ticket_jira.BOT_ACCOUNT_ID,
+            "pollIntervalSeconds": TRACKER_POLL_SECONDS,
+            "credential": {
+                "type": "static_token",
+                "username": one_ticket_jira.BOT_EMAIL,
+                "existingSecret": JIRA_SECRET_NAME,
+                "existingSecretKey": "token",
+            },
+        }
+    )
+    alias = FIXTURE_REPOSITORY.rsplit("/", 1)[1]
+    factory["bindings"] = [
+        {
+            "name": JIRA_BINDING,
+            "tracker": JIRA_TRACKER,
+            "trackerScopeId": one_ticket_jira.CLOUD_ID,
+            "repos": [
+                {
+                    "alias": alias,
+                    "codeHost": code_host,
+                    "projectId": FIXTURE_REPOSITORY_ID,
+                    "path": FIXTURE_REPOSITORY,
+                }
+            ],
+            "defaultRepo": alias,
+            "startAuthority": {
+                "type": "allowlist",
+                "accounts": [one_ticket_jira.LABELLER["account_id"]],
+            },
+        }
+    ]
 
 
 def publication_stub_egress_policy(policies: dict[str, Any], clone_base: str) -> dict[str, Any]:
@@ -392,6 +467,11 @@ class ScriptedRun:
         self.triage_error: str | None = None
         # The one-ticket scenario runs on every replayed install, before triage.
         self.one_ticket: one_ticket_run.OneTicket | None = None
+        # The jira-one-ticket scenario: its stub process and the scenario.
+        # A signal stopped the run: end-of-run diagnostics re-raise, never absorb.
+        self.interrupted = False
+        self.jira_stub: jira_one_ticket_run.JiraStubProcess | None = None
+        self.jira: jira_one_ticket_run.JiraOneTicket | None = None
         self.forward: subprocess.Popen[str] | None = None
         self.cluster_attempted = False
         self.registry_attempted = False
@@ -420,6 +500,9 @@ class ScriptedRun:
 
     def gateway_enabled(self) -> bool:
         return self.args.scenario == "triage-to-pr"
+
+    def jira_enabled(self) -> bool:
+        return bool(self.args.scenario == JIRA_SCENARIO)
 
     def check_disk(self, stage: str, *, required_bytes: int = 30 * 1024**3) -> None:
         free = shutil.disk_usage("/").free
@@ -742,12 +825,35 @@ class ScriptedRun:
             issue_file=ISSUE,
         )
         self.stub.start()
+        if self.jira_enabled():
+            # The Jira stub's certificate is signed by the GitHub stub's run CA,
+            # which the install already trusts through its CA config map.
+            self.jira_stub = jira_one_ticket_run.JiraStubProcess(
+                self.workdir / "jira",
+                callback,
+                self.stub.ca_file,
+                self.stub.root / "ca.key",
+            )
+            self.jira_stub.start(self.env)
+            self.evidence["jira_stub_port"] = self.jira_stub.port
         # Intake starts polling at install. Keep the human issue unlabelled
         # until the bound agent, bundle and automatic publication policy exist.
         issue = self.stub._get("issue", 3815)
         issue["labels"] = []
         self.stub._put("issue", 3815, issue)
-        if self.args.scenario != "facts":
+        if self.jira_enabled():
+            # One factory agent on one Jira ticket: the one-ticket transcript,
+            # keyed on the Jira channel, is the whole script.
+            transcript = self.workdir / "one-ticket-jira.json"
+            model.dump_transcript(
+                transcript,
+                jira_one_ticket_run.transcript_for_jira(
+                    model.load_transcript(one_ticket_run.TRANSCRIPT)
+                ),
+            )
+            self.model = model.ModelScript(transcript, host=callback)
+            self.model.start()
+        elif self.args.scenario != "facts":
             self.model = model.ModelScript(
                 Path(self.args.transcript), record=self.args.record, host=callback
             )
@@ -805,6 +911,20 @@ class ScriptedRun:
             runner_image=runner_image,
             slack_api_base_url=None if self.slack is None else self.slack.base_url,
         )
+        if self.jira_stub is not None:
+            token_file = self.workdir / "jira-token"
+            token_file.write_text(one_ticket_jira.BOT_TOKEN)
+            token_file.chmod(0o600)
+            self.kubectl(
+                "-n",
+                self.namespace,
+                "create",
+                "secret",
+                "generic",
+                JIRA_SECRET_NAME,
+                f"--from-file=token={token_file}",
+            )
+            add_jira_tracker(values, api_url=self.jira_stub.api_url, host=self.jira_stub.netloc)
         if self.args.scenario == "facts":
             for component in ("api", "worker", "ui"):
                 values[component]["image"]["tag"] = f"facts-{self.run_id}"
@@ -903,6 +1023,9 @@ class ScriptedRun:
         )
         self.kubectl("apply", "-f", str(stub_policy))
         self.deploy(registry_ref)
+        if self.jira_stub is not None:
+            self.run_jira_one_ticket()
+            return
         issue = self.stub._get("issue", 3815)
         issue["labels"] = [{"name": "factory"}]
         issue["updated_at"] = github._utc()
@@ -927,11 +1050,21 @@ class ScriptedRun:
         transcript, so neither scripts a lane for it.
         """
 
-        return self.runs_one_ticket and self.args.scenario != "facts" and not self.args.record
+        return (
+            self.runs_one_ticket
+            and self.args.scenario not in {"facts", JIRA_SCENARIO}
+            and not self.args.record
+        )
 
     def one_ticket_verdict_error(self) -> str | None:
         """Why the command cannot pass: the scenario was skipped, not reached, or did not pass."""
 
+        if self.jira_enabled():
+            if self.jira is None:
+                return "the jira-one-ticket scenario did not run"
+            if self.jira.evidence.get("result") != "passed":
+                return "the jira-one-ticket scenario did not pass"
+            return None
         if not self.one_ticket_required():
             return None
         if self.one_ticket is None:
@@ -951,6 +1084,27 @@ class ScriptedRun:
             detail, _ = fe.redact_agent_text(str(exc), self.secrets)
             self.one_ticket.evidence["error"] = detail or type(exc).__name__
             raise ScriptedScenarioError(f"one-ticket: {detail or type(exc).__name__}") from None
+
+    def run_jira_one_ticket(self) -> None:
+        """The Jira one-ticket scenario, the only scenario on its install."""
+
+        assert self.jira_stub is not None
+        self.jira = jira_one_ticket_run.JiraOneTicket(self, self.jira_stub)
+        try:
+            self.jira.execute()
+        except (RuntimeError, AssertionError, OSError, ValueError, KeyError) as exc:
+            detail, _ = fe.redact_agent_text(str(exc), self.secrets)
+            self.jira.evidence["error"] = detail or type(exc).__name__
+            raise ScriptedScenarioError(
+                f"jira-one-ticket: {detail or type(exc).__name__}"
+            ) from None
+
+    def agent_channel(self) -> dict[str, str]:
+        """The factory agent's channel: its Jira binding, or the fixture repository."""
+
+        if self.jira_enabled():
+            return {"kind": jira_one_ticket_run.CHANNEL_KIND, "address": JIRA_BINDING}
+        return {"kind": "github", "address": FIXTURE_REPOSITORY}
 
     def run_triage_to_pr(self, github: Any) -> None:
         """The second scenario, on this install, after the first one passed."""
@@ -1214,8 +1368,8 @@ class ScriptedRun:
             headers={"X-API-Key": api_key},
             body={
                 "name": "factory-e2e",
-                "repo_full_name": "acme-corp/acme-bot",
-                "channel": {"kind": "github", "address": "acme-corp/acme-bot"},
+                "repo_full_name": FIXTURE_REPOSITORY,
+                "channel": self.agent_channel(),
             },
         )
         if status != 201:
@@ -1629,6 +1783,16 @@ class ScriptedRun:
                 sqlite3.Error,
             ) as exc:
                 errors.append(str(exc))
+        if self.jira_stub is not None:
+            try:
+                teardown = self.jira_stub.close()
+                self.evidence["jira_stub_teardown"] = teardown
+                if not teardown["exited"]:
+                    errors.append("the Jira stub process is still running")
+                if teardown["listening"]:
+                    errors.append(f"owned endpoint still listens on port {teardown['port']}")
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                errors.append(str(exc))
         if self.slack is not None:
             try:
                 self.slack.close()
@@ -1666,9 +1830,11 @@ class ScriptedRun:
                 if not audited:
                     errors.append(str(exc))
             try:
-                self.evidence[field] = (
-                    service.unexpected if service is self.model else service.unknown_requests
-                )
+                audit = service.unexpected if service is self.model else service.unknown_requests
+                # A model audit entry carries the turn's input text. The Jira
+                # leg uploads its evidence publicly, so it records the count.
+                public = service is self.model and self.jira_enabled()
+                self.evidence[field] = len(audit) if public else audit
                 port = service.port
                 host = service.host
                 with socket.socket() as sock:
@@ -1857,6 +2023,7 @@ def main(args: argparse.Namespace) -> int:
     def interrupted(signum: int, _frame: Any) -> None:
         nonlocal was_interrupted
         was_interrupted = True
+        run.interrupted = True
         raise ScriptedScenarioError(f"scripted scenario interrupted by signal {signum}")
 
     try:
@@ -1920,6 +2087,8 @@ def main(args: argparse.Namespace) -> int:
             triage_path.write_text((recorded or "{}") + "\n")
         if run.one_ticket is not None:
             run.evidence[one_ticket_scenario.EVIDENCE_KEY] = run.one_ticket.evidence
+        if run.jira is not None:
+            run.evidence[one_ticket_jira.EVIDENCE_KEY] = run.jira.evidence
         run.evidence["result"] = "passed" if result == 0 else "failed"
         if run.install_started is not None and "elapsed_seconds" not in run.evidence:
             run.evidence["elapsed_seconds"] = time.monotonic() - run.install_started
