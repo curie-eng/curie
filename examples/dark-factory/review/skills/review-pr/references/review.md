@@ -107,6 +107,31 @@ instead of hiding important fields in one cell. If the current client renders
 wide tables poorly, use one compact model block with labeled Before, After
 and Why lines per change instead.
 
+For **each new database table**, add an inventory linked to its defining diff.
+State why the table exists and which components write and read it. List **every
+column**, including IDs and timestamps, in source order:
+
+| Column | Type | Nullability and default | Key or constraint | Purpose |
+| --- | --- | --- | --- | --- |
+| `column_name` | Database type | `NOT NULL`; default or `none` | PK, FK, unique, check or `none` | Meaning and reader |
+
+Below that table, list table-level primary and foreign keys, unique and check
+constraints, indexes and relationships that are not clear from a single column.
+Link the migration or model definition and affected writer or reader. If a
+property is not established by the diff, mark it unknown rather than infer it.
+For many columns, use a separate compact table per new database table; do not
+replace the inventory with a table name or a summary of only selected columns.
+
+For **each new API** (HTTP endpoint, RPC method or GraphQL operation), add a
+compact labeled block linked to its route or operation definition. Give the
+method and path or operation name; purpose and intended consumer; path, query
+and body inputs with types and requiredness; success status and response shape;
+documented error statuses or outcomes; and authentication and authorization.
+Link request/response schemas and contract tests when present. Mark contracts
+that the diff does not establish as unknown, and distinguish a new public
+contract from an internal helper or a generated client for an existing API.
+State explicitly when the PR adds no new tables or APIs.
+
 For persistent changes, follow the table with a numbered rollout: migration
 order relative to application deployment, what happens to existing rows,
 backfill or default behavior, old and new reader or writer compatibility, and

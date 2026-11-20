@@ -73,7 +73,11 @@ that makes the result clearer:
 6. **Algorithms and data.** Explain significant decision rules, ordering,
    retries, complexity or state transitions, including whether an algorithm is
    new or changed. Describe new or changed data models and API or storage
-   contracts. Show schema changes in a compact before and after table: linked
+   contracts. Inventory every new table with all its columns, types, nullability,
+   defaults, keys, constraints and relationships; explain its purpose. Inventory
+   every new API with its method and path or operation, inputs, outputs, errors,
+   authorization, consumers and purpose. Link each inventory to the current diff.
+   Show schema changes in a compact before and after table: linked
    model or contract, changed fields and types, constraints or indexes, why
    the change exists and affected readers. For persistent data, follow the table
    with numbered migration steps covering existing records, compatibility,

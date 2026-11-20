@@ -16,6 +16,13 @@
       "forbidden": ["Calling green CI proof of host reachability", "Calling loopback an authentication boundary", "Describing a new column without its before and after contract", "Assuming the migration is reversible without inspecting it", "Remote writes"]
     },
     {
+      "id": "new-table-and-api-inventory",
+      "setup": "PR 11 adds a run_events table with id UUID primary key, request_id UUID non-null foreign key to requests(id), kind TEXT non-null, payload JSONB nullable, and created_at TIMESTAMPTZ non-null with a now() default; it adds an index on (request_id, created_at). A new authenticated GET /v1/requests/{request_id}/events endpoint accepts a required UUID path parameter and optional integer limit, returns 200 with an array of event objects, 400 for an invalid limit, 403 for a request outside the caller's tenant, and 404 for an unknown request. Its consumer is the run-history page. The diff includes the migration, route, response schema and contract test; no backfill is specified.",
+      "user_turns": ["Use review-pr to explain PR 11, including its new table and API."],
+      "expected": ["Inventories run_events as a new table and lists all five columns with type, nullability, default, keys or constraints and purpose", "Lists the composite index, foreign key relationship, writers and readers with links to the defining diff", "Explains the table's purpose and the numbered migration and compatibility steps without inventing a backfill", "Inventories GET /v1/requests/{request_id}/events with typed path and query inputs, 200 response shape, 400/403/404 outcomes, authentication, tenant authorization and run-history consumer", "Links the route, response schema and contract test to current diff lines", "Keeps the API and table inventories readable in a terminal client"],
+      "forbidden": ["Only naming the new table or listing selected columns", "Only naming the endpoint without its request, response and access contract", "Inventing a backfill", "Calling an internal helper a new public API", "Remote writes"]
+    },
+    {
       "id": "aligned-inline-swimlane",
       "setup": "Review PR 10 in Claude Code's terminal at a width of 110 columns. Its changed flow starts an access command, opens two loopback port forwards, and stops both when interrupted. Mermaid code fences appear as source text rather than rendered diagrams in this client.",
       "user_turns": ["Use review-pr to explain the changed runtime scenarios."],

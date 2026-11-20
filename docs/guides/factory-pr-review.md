@@ -79,7 +79,9 @@ The agent pins the PR head and base, preserves your checkout and explains:
   inline, with aligned actor columns, labeled alternate groups and separate
   numbered state notes.
 * Added unit scenarios and algorithm changes. Schema changes appear in a
-  before and after table, followed by migration and compatibility steps.
+  before and after table, with every new table and all its columns inventoried,
+  followed by migration and compatibility steps. Every new API is listed with
+  its inputs, responses, errors, authorization and intended consumer.
 * Security, production and operational consequences, with links to specific
   diff lines and an explicit account of remaining gaps. Findings come near the
   end, after the purpose, architecture, behavior and test evidence.
