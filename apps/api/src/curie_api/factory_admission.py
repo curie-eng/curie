@@ -66,7 +66,11 @@ def ignored(code: str) -> WebhookResult:
 
 
 async def cancel_work_item(
-    session: AsyncSession, item: WorkItem, *, cause: CancellationCause = "issue_cancelled"
+    session: AsyncSession,
+    item: WorkItem,
+    *,
+    cause: CancellationCause = "issue_cancelled",
+    retain_personal_resume: bool = False,
 ) -> WebhookResult:
     """Cancel ``item``, retrying once at the version a stale read reports.
 
@@ -74,7 +78,11 @@ async def cancel_work_item(
     """
 
     result = await workitem_dispatch.cancel(
-        session, work_item_id=item.id, expected_version=item.version, cause=cause
+        session,
+        work_item_id=item.id,
+        expected_version=item.version,
+        cause=cause,
+        retain_personal_resume=retain_personal_resume,
     )
     if isinstance(result, WorkItemConflict) and result.code == "stale_version":
         if result.work_item_version is None:
@@ -84,6 +92,7 @@ async def cancel_work_item(
             work_item_id=item.id,
             expected_version=result.work_item_version,
             cause=cause,
+            retain_personal_resume=retain_personal_resume,
         )
     if isinstance(result, WorkItemConflict):
         return ignored(result.code)

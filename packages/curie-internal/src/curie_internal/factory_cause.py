@@ -6,6 +6,13 @@ The API status comment and the worker Slack progress lane both import
 
 from __future__ import annotations
 
+PERSONAL_RESUME_RUNTIME_LIVE = "Curie is still stopping the previous run. Try again shortly."
+PERSONAL_RESUME_STEPS = (
+    "The owner can reconnect or replace the enrollment on the Claude plan page if needed. "
+    "To resume, the owner can remove and reapply the issue's trigger label, or mention the app "
+    "in the run's Slack thread if the run has an open pull request."
+)
+
 # The operator-facing sentence for each terminus cause (#3073). The raw code
 # still appears on the comment, but never as its headline.
 _CAUSE_TEXT = {
@@ -107,13 +114,11 @@ _CAUSE_TEXT = {
     # Personal Claude execution (#5377, ADR 0268 section 3).
     "enrollment_fenced": (
         "the run was stopped because its owner replaced or disconnected their personal "
-        "Claude enrollment. The work is kept; the owner reconnects or replaces the "
-        "enrollment, then resumes it."
+        f"Claude enrollment. The work is kept. {PERSONAL_RESUME_STEPS}"
     ),
     "authentication_required": (
         "the owner's personal Claude grant was missing or refused by the model provider. "
-        "The work is kept; the owner reconnects or replaces the personal Claude "
-        "enrollment, then resumes it."
+        f"The work is kept. {PERSONAL_RESUME_STEPS}"
     ),
     "issue_cancelled": "the request was cancelled.",
     "issue_deleted": "the tracker issue no longer exists.",

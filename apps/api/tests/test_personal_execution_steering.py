@@ -27,6 +27,7 @@ import pytest
 import test_factory_slack_runtime as runtime
 from curie_api.models import DEFAULT_TENANT_ID
 from test_factory_slack_runtime import OwnerTuple, Person, SteeringStack
+from test_personal_execution_revalidation import _confirm_resume_teardown, _resume_requests
 
 # Enrollment generation for the default-tenant writer. Not 1, so it is not a
 # default generation.
@@ -93,3 +94,40 @@ def test_a_personal_work_item_of_another_tenant_refuses_a_steer_resolved_in_the_
     assert runtime.owner_tuples(run.work_item_id) == owned
     assert runtime.runnable_requests() == set()
     runtime._assert_no_sandbox(stack)
+
+
+def test_owner_slack_steer_resumes_at_current_generation_after_teardown(
+    steering: SteeringStack,
+) -> None:
+    owner = steering.person()
+    other = steering.person()
+    _enroll(owner, generation=1)
+    _enroll(other)
+    run = steering.open_steered_run(owner=runtime._owner(owner.principal_id))
+    support.finish_failed(run.request_id, run.epoch, cause="authentication_required")
+    runtime._set_enrollment(owner.principal_id, generation=2, active=True)
+    old: OwnerTuple = (DEFAULT_TENANT_ID, "personal", owner.principal_id, 1)
+    before = _resume_requests(run.work_item_id)
+
+    another = steering.steer_queued(other.slack_user, "Please resume.", thread_ts=run.root_ts)
+    runtime._api_refused(another, "admission_refused", "owner_mismatch")
+    refused = steering.steer_queued(owner.slack_user, "Please resume.", thread_ts=run.root_ts)
+    runtime._api_refused(refused, "admission_refused", "runtime_live")
+    assert "try again shortly" in refused.edits[-1].text.lower()
+    assert runtime.owner_tuples(run.work_item_id) == {run.work_item_id: old, run.request_id: old}
+    assert _resume_requests(run.work_item_id) == before
+
+    _confirm_resume_teardown(run.request_id)
+    [before] = _resume_requests(run.work_item_id)
+    resumed = steering.steer_queued(owner.slack_user, "Please resume.", thread_ts=run.root_ts)
+    runtime._admitted(resumed)
+    predecessor, successor = _resume_requests(run.work_item_id)
+    assert predecessor == before
+    assert (successor["enrollment_generation"], successor["status"]) == (2, "waiting")
+    new: OwnerTuple = (DEFAULT_TENANT_ID, "personal", owner.principal_id, 2)
+    assert runtime.owner_tuples(run.work_item_id) == {
+        run.work_item_id: new,
+        run.request_id: old,
+        successor["id"]: new,
+    }
+    runtime._assert_no_sandbox(steering)

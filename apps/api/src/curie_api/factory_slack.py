@@ -487,9 +487,8 @@ async def _owner_facts(
 
     A personal WorkItem names the sender as its owner, in the tenant `_resolve`
     resolved the sender in, at the generation the sender is enrolled at now
-    (held ``FOR SHARE`` until the admission commits). Admission then refuses
-    another principal whatever its code host access (``owner_mismatch``), a
-    WorkItem bound to an older generation (``enrollment_generation_mismatch``),
+    (a snapshot until admission locks and checks the enrollment). Admission
+    refuses another principal whatever its code host access (``owner_mismatch``),
     an inactive or missing enrollment (``enrollment_inactive``; 0 is never a
     generation) and another tenant's WorkItem (``owner_tenant_mismatch``).
 
@@ -501,16 +500,13 @@ async def _owner_facts(
 
     if item.model_auth_mode != "personal":
         return installation_mode, None
-    enrolled = (
-        await session.execute(
-            select(PersonalClaudeEnrollment.generation)
-            .where(
-                PersonalClaudeEnrollment.tenant_id == DEFAULT_TENANT_ID,
-                PersonalClaudeEnrollment.principal_id == principal_id,
-            )
-            .with_for_update(read=True)
-        )
-    ).scalar_one_or_none()
+    enrollment = select(PersonalClaudeEnrollment.generation).where(
+        PersonalClaudeEnrollment.tenant_id == DEFAULT_TENANT_ID,
+        PersonalClaudeEnrollment.principal_id == principal_id,
+    )
+    if item.owner_principal_id != principal_id or item.tenant_id != DEFAULT_TENANT_ID:
+        enrollment = enrollment.with_for_update(read=True)
+    enrolled = await session.scalar(enrollment)
     generation = 0 if enrolled is None else int(enrolled)
     return "personal", OwnerContext(DEFAULT_TENANT_ID, principal_id, generation)
 
@@ -593,7 +589,14 @@ async def _admit(
         join_transaction_mode="create_savepoint",
         expire_on_commit=False,
     ) as admission:
-        result = await workitem_dispatch.admit_revision(admission, facts)
+        result = await workitem_dispatch.admit_for_verified_owner(
+            admission,
+            facts,
+            work_item_id=item.id,
+            principal_id=principal_id,
+            admit=workitem_dispatch.admit_revision,
+        )
+        await admission.commit()
     if not isinstance(result, WorkItemOutcome) and result.code == "identity_mismatch":
         committed = await _committed_request(session, facts.request_id, run.work_item_id)
         if committed is not None:

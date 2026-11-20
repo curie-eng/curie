@@ -57,6 +57,7 @@ from ..models import (
     new_card_token,
 )
 from ..personal_execution import (
+    OWNER_RESUME_CAUSES,
     ModelAuthMode,
     OwnerMismatchCode,
     OwnerTuple,
@@ -132,13 +133,10 @@ AUTOMATIC_RETRY_JITTER = 0.2
 # Started terminal statuses whose runtime teardown an enrollment fence can owe
 # (#5377). A force-settled ``cancelled`` request owes one too, by its own path.
 TEARDOWN_TERMINAL_STATUSES = ("completed", "failed", "expired")
-# A personal request ending with one of these is resumed by its owner after a
-# replace or reconnect, so its WorkItem keeps its transcript (#5377). A personal
-# request whose start deferrals ran out (``start_failed``, #5378) is resumed the
-# same way, after reconnect and revalidation.
-_RESUMABLE_PERSONAL_CAUSES = frozenset(
-    {"enrollment_fenced", "authentication_required", "start_failed"}
-)
+# Keep the transcript for owner resume by verified re-label or via an app
+# mention in the Slack thread when the run has an open pull request. A personal
+# start failure also keeps it (#5378).
+_RESUMABLE_PERSONAL_CAUSES = OWNER_RESUME_CAUSES | {"start_failed"}
 
 
 @dataclass(frozen=True)
@@ -595,8 +593,10 @@ async def settle_terminal(
     pending relabel continues the WorkItem, so its transcript survives. So
     does a personal request stopped by an enrollment fence or ending
     authentication-required on an uncancelled WorkItem (#5377, ADR 0268
-    section 3): its owner resumes it after a replace or reconnect. A personal
-    request that ended ``start_failed`` keeps it too (#5378).
+    section 3): after a replace or reconnect the owner can remove and reapply
+    the trigger label, or mention the app in the Slack thread if the run has an
+    open pull request. A personal request that ended ``start_failed`` keeps
+    the transcript too (#5378).
     """
 
     if request.terminal_at is None:
@@ -2741,6 +2741,7 @@ async def request_cancellation(
     work_item_id: uuid.UUID,
     expected_work_item_version: int,
     cause: CancellationCause = "issue_cancelled",
+    retain_personal_resume: bool = False,
 ) -> WorkItemResult:
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
@@ -2750,6 +2751,8 @@ async def request_cancellation(
     if work_item.cancelled_at is not None:
         active = await lock_active_request(session, work_item_id)
         await _cancel_queued_requests(session, work_item_id, await database_now(session), cause)
+        if active is None and not retain_personal_resume:
+            await transcripts.expire_for_work_item(session, work_item)
         if work_item.readmit_request_id is None:
             return await outcome(session, work_item, active, replayed=True)
         # The last label action wins: an unlabel drops a pending relabel.
@@ -2854,9 +2857,19 @@ async def request_cancellation(
         active = await reload_request(session, active.id)
     work_item = await reload_work_item(session, work_item_id)
     if active is None:
+        retain = False
+        if retain_personal_resume and work_item.model_auth_mode == "personal":
+            latest_cause = await session.scalar(
+                select(ExecutionRequest.terminal_cause)
+                .where(ExecutionRequest.work_item_id == work_item_id)
+                .order_by(ExecutionRequest.sequence.desc())
+                .limit(1)
+            )
+            retain = latest_cause in OWNER_RESUME_CAUSES
         # Nothing is left to run, so the cancelled WorkItem is terminal now. A
-        # waiting or running request expires the transcript when it settles.
-        await transcripts.expire_for_work_item(session, work_item)
+        # verified unlabel can be the first half of an owner's re-label.
+        if not retain:
+            await transcripts.expire_for_work_item(session, work_item)
     return await outcome(session, work_item, active)
 
 

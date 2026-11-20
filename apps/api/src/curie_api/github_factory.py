@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import httpx
+from curie_internal.factory_cause import PERSONAL_RESUME_RUNTIME_LIVE
 from fastapi import HTTPException
 from sqlalchemy import cast, func, select, text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -80,7 +81,12 @@ from .models import (
     PersonalClaudeEnrollment,
     WorkItem,
 )
-from .personal_execution import ModelAuthMode, OwnerContext, existing_work_item_refusal
+from .personal_execution import (
+    ContextConflict,
+    ModelAuthMode,
+    OwnerContext,
+    existing_work_item_refusal,
+)
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
 
@@ -331,7 +337,7 @@ async def work_item_for(session: AsyncSession, issue: TrackerIssueRef) -> WorkIt
 
 
 def admission_result(
-    result: WorkItemOutcome | WorkItemConflict | DispatchConflict,
+    result: WorkItemOutcome | WorkItemConflict | DispatchConflict | ContextConflict,
     request_id: uuid.UUID,
 ) -> WebhookResult:
     if isinstance(result, WorkItemOutcome):
@@ -536,7 +542,7 @@ class Selected:
     outcome: WebhookResult
     notice_reason: str | None = None
     publication_url: str | None = None
-    result: WorkItemOutcome | WorkItemConflict | DispatchConflict | None = None
+    result: WorkItemOutcome | WorkItemConflict | DispatchConflict | ContextConflict | None = None
 
 
 async def admit_selection(
@@ -550,6 +556,7 @@ async def admit_selection(
     client: httpx.AsyncClient,
     reconcile_only: bool = False,
     publications: factory_rediscovery.PassPublications | None = None,
+    verified_relabel_principal: uuid.UUID | None = None,
 ) -> Selected:
     """The trusted-selection half of admission, shared by every path (#5588 decision 7).
 
@@ -589,6 +596,7 @@ async def admit_selection(
         return Selected(ignored("work_item_present"))
     if existing is None and selection.disposition == "admit":
         facts = replace(facts, requester_principal_id=selection.principal, owner=selection.owner)
+    result: WorkItemOutcome | WorkItemConflict | DispatchConflict | ContextConflict
     # Dispatch helpers commit between WorkItem creation and request creation.
     # Keep those commits inside savepoints so the caller's issue lock remains
     # held until admission and delivery settlement commit together.
@@ -599,6 +607,15 @@ async def admit_selection(
     ) as admission:
         if selection.disposition == "mention":
             result = await workitem_dispatch.admit_revision(admission, facts)
+        elif existing is not None and verified_relabel_principal is not None:
+            result = await workitem_dispatch.admit_for_verified_owner(
+                admission,
+                facts,
+                work_item_id=existing.id,
+                principal_id=verified_relabel_principal,
+                admit=workitem_dispatch.readmit,
+            )
+            await admission.commit()
         else:
             result = await workitem_dispatch.readmit(admission, facts)
         if existing is None and isinstance(result, WorkItemOutcome):
@@ -612,6 +629,18 @@ async def admit_selection(
                 settings=settings,
             )
         outcome = admission_result(result, facts.request_id)
+    if isinstance(result, ContextConflict):
+        if result.code == "enrollment_inactive":
+            return Selected(outcome, notice_reason=result.code, result=result)
+        if result.code == "runtime_live":
+            try:
+                await verified.tracker.marked_comments.upsert_marked(
+                    ReplyTarget.on_issue(verified.tracker.issue(selection.issue_number)),
+                    f"curie-factory-resume:{selection.request_id}",
+                    f"{PERSONAL_RESUME_RUNTIME_LIVE} Remove and reapply the trigger label.",
+                )
+            except ForgeError:
+                raise FeedbackUnavailable("label_refusal_unavailable") from None
     if selection.disposition == "admit" and isinstance(result, DispatchConflict):
         reason: str | None = None
         if result.code == "personal_owner_required":
@@ -653,6 +682,7 @@ async def admit_notice(
     # again (a fresh admission) or kept (ADR 0186 decision 5).
     existing = await work_item_for(session, notice_issue(notice, registry))
     principal: uuid.UUID | None = None
+    verified_relabel_principal: uuid.UUID | None = None
     owner: OwnerContext | None = None
     if notice.disposition == "admit":
         issue = notice_issue(notice, registry)
@@ -679,7 +709,13 @@ async def admit_notice(
             return ignored("delegated_output")
         if reason is None:
             reason = await verified.tracker.label_permission(notice)
-        if reason is None and existing is None and agent_id is not None:
+        can_resume = (
+            existing is not None
+            and existing.model_auth_mode == "personal"
+            and not reconcile_only
+            and _same_notice_identity(existing, notice, registry)
+        )
+        if reason is None and agent_id is not None and (existing is None or can_resume):
             from .factory_slack import resolve_github_requester
 
             principal = await resolve_github_requester(
@@ -688,8 +724,13 @@ async def admit_notice(
                 tracker_host=issue.host,
                 account_id=notice.sender_id,
             )
-            owner = None
-            if principal is not None and settings.factory_model_auth_mode == "personal":
+            if can_resume:
+                verified_relabel_principal = principal
+            if (
+                existing is None
+                and principal is not None
+                and settings.factory_model_auth_mode == "personal"
+            ):
                 enrollment = await session.scalar(
                     select(PersonalClaudeEnrollment).where(
                         PersonalClaudeEnrollment.principal_id == principal,
@@ -742,6 +783,7 @@ async def admit_notice(
         client=client,
         reconcile_only=reconcile_only,
         publications=publications,
+        verified_relabel_principal=verified_relabel_principal,
     )
     if selected.notice_reason is not None:
         await factory_intake_notices.record_notice(
@@ -829,7 +871,9 @@ async def cancel_notice(
         )
         if admitting is None or notice.label != admitting:
             return ignored("label_not_admitting")
-    return await cancel_work_item(session, item)
+    return await cancel_work_item(
+        session, item, retain_personal_resume=notice.action == "unlabeled"
+    )
 
 
 # Answers to the factory's questions (#5787) -----------------------------------

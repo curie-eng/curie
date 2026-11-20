@@ -2813,9 +2813,13 @@ Status reports `teardown` with two counts. `pending_runtimes` is the owner's
 older-generation requests whose runtime teardown the worker has not confirmed.
 `pending_custody_cleanup` is the owner's custody entries still being staged or
 retired. A disconnect is complete when both are zero. A WorkItem fenced this
-way does not resume on its own: it continues only through an explicit
-revalidation under the owner's current generation, which starts a fresh
-process once the earlier runtime has been confirmed torn down.
+way keeps its work. Once the owner has an active enrollment and the worker
+has confirmed teardown, the owner can remove and reapply the issue's trigger
+label using their linked GitHub account. If the run has an open pull request,
+the owner can also mention the app in the run's Slack thread. Admission
+revalidates the enrollment and starts a fresh process at its current
+generation. If teardown is still pending, try the same trigger again shortly.
+If the issue has no trigger label yet, apply it once.
 
 Operators turn the feature on with one chart value:
 
@@ -2879,7 +2883,9 @@ a start attempt.
 When a personal run finishes `failed` with `authentication_required` and the
 owner's enrollment is still active at that run's generation, the worker sends
 the owner one Slack direct message for that principal and generation. The
-message names the issue and says the work is kept. It includes one button,
+message names the issue and tells the owner to remove and reapply its
+trigger label or, if the run has an open pull request, mention the app in its
+Slack thread. It includes one button,
 Reconnect your Claude plan, to `<Console origin>/settings/claude-plan`. Set
 the worker environment `CURIE_CONSOLE_ORIGIN` from the chart value
 `console.origin` to that console origin. An empty origin still sends the
@@ -3377,7 +3383,7 @@ A person steers a run by explicitly mentioning the app in that run's Slack threa
 1. `POST /identity/admin/{tenant_id}/code-host-links` with `principal_id`, `code_host_kind` (`github`), `host` (for example `github.com`), the numeric `account_id`, and `created_by_principal_id`. An account already actively linked answers 409 `link_exists`.
 2. `POST /identity/admin/{tenant_id}/links/{link_id}/revoke` ends a link. A revoked link, a disabled principal or a lost write permission refuses a mention that was queued before the change.
 
-A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `FACTORY_MODEL_AUTH_MODE=personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
+A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. If the run stopped because the owner's grant was refused or the enrollment was fenced, the owner can restore their enrollment and mention the app in the run's Slack thread when the pull request is open. Admission revalidates the enrollment and the revision runs at its current generation. If the earlier runtime is still stopping, the owner sees `runtime_live` and can try the mention again shortly. The owner can also remove and reapply the issue's trigger label via their linked GitHub account, including when the run has no pull request. Steering refuses a different owner with `owner_mismatch`, a disconnected enrollment with `enrollment_inactive`, other work bound to an older generation with `enrollment_generation_mismatch`, and a WorkItem of another tenant with `owner_tenant_mismatch`. These reasons appear under `admission_refused`. On an installation with `FACTORY_MODEL_AUTH_MODE=personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
 
 The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, and for each top-level human mention whose text links an issue, before its dedupe claim, so the worker can verify the sender and the exact message. On a test installation it also stores one for a declared test driver's marked action in that driver's channel, at root or in a thread; that receipt is version 2 and names the declared bot user and bot id, never the event's user. Steering reads only a person's thread receipt and refuses any other; root receipts and version 2 receipts serve kickoff. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
 

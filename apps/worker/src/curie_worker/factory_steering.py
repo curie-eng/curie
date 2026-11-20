@@ -81,6 +81,7 @@ from channel_protocol import (
     ReplyPost,
     ReplyTarget,
 )
+from curie_internal.factory_cause import PERSONAL_RESUME_RUNTIME_LIVE
 from curie_internal.issue_links import find_issue_links
 from curie_internal.slack_mention_receipt import (
     MalformedMentionReceiptError,
@@ -292,6 +293,8 @@ def render_reply(
     headline = _HEADLINES.get(outcome, _FALLBACK_HEADLINE)
     if outcome == ADMITTED and replayed:
         headline = "This revision was already queued."
+    elif outcome == "admission_refused" and reason == "runtime_live":
+        headline = PERSONAL_RESUME_RUNTIME_LIVE
     lines = [headline]
     if outcome == ADMITTED and pull_request_url:
         lines.append(f"Pull request: {_plain(pull_request_url)}")

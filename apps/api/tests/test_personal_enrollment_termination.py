@@ -19,8 +19,11 @@ protocol. Postgres is real, the worker routes are driven over HTTP, and lease
 expiry is written with SQL rather than waited for.
 """
 
+# ruff: noqa: F811  (the shared fixtures are imported, then requested)
+
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from collections.abc import Iterator
@@ -30,7 +33,7 @@ from uuid import UUID
 import httpx
 import personal_execution_support as support
 import pytest
-from curie_api import workitem_dispatch
+from curie_api import personal_enrollments, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest, PersonalClaudeEnrollment, WorkItem
@@ -39,8 +42,27 @@ from curie_api.workitems import lifecycle
 from curie_api.workitems.lifecycle import EnrollmentFence, WorkItemOutcome
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake, no_external_calls
+from forge_fakes.github import LABEL, _issue_event, _post
+from personal_enrollment_support import (
+    GRANT_NAMESPACE,
+    REPLACEMENT,
+    STAGE_LEASE_SECONDS,
+    FakeCustodyStore,
+)
 from sqlalchemy import select, text, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from test_personal_execution_admission import (
+    DEFAULT_TENANT,
+    GitHubFactory,
+    _github_items,
+    github_factory,  # noqa: F401
+    owned_rows,  # noqa: F401
+)
+from test_personal_execution_revalidation import (
+    _confirm_resume_teardown,
+    _github_personal_failure,
+    _resume_requests,
+)
 
 WORKER_TOKEN = "personal-enrollment-termination-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
@@ -995,6 +1017,75 @@ def test_issue_cancellation_supersedes_an_enrollment_fence(
 
 
 # --- revalidation and resume -----------------------------------------------------------
+
+
+def test_replace_racing_owner_github_relabel_admits_only_the_newest_generation(
+    github_factory: GitHubFactory, owned_rows: None
+) -> None:
+    number = 58884
+    client, github, item_id, failed_id, _ = _github_personal_failure(github_factory, number)
+    _confirm_resume_teardown(failed_id)
+    [predecessor] = _resume_requests(item_id)
+    [item] = _github_items(number)
+    owner = item["owner_principal_id"]
+    github.advance_label_event(number)
+    relabel = _issue_event("labeled", number, label={"name": LABEL})
+
+    async def race(session: AsyncSession) -> httpx.Response:
+        header = await personal_enrollments._lock_owner(session, DEFAULT_TENANT, owner)
+        assert header is not None and header.generation == 2
+        holder = await session.scalar(text("SELECT pg_backend_pid()"))
+        custody = personal_enrollments.Custody(
+            async_sessionmaker(
+                await session.connection(),
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            ),
+            FakeCustodyStore(),
+            GRANT_NAMESPACE,
+            STAGE_LEASE_SECONDS,
+        )
+        async with asyncio.TaskGroup() as tasks:
+            resume = tasks.create_task(asyncio.to_thread(_post, client, "issues", relabel))
+            try:
+                # Observe the admission's distinct backend blocked on the held write.
+                async with asyncio.timeout(4):
+                    while not await session.scalar(
+                        text(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                            "WHERE :holder = ANY(pg_blocking_pids(pid)))"
+                        ),
+                        {"holder": holder},
+                    ):
+                        assert not resume.done(), "the resume never waited for the replacement"
+                replaced = await personal_enrollments.write(
+                    custody,
+                    tenant_id=DEFAULT_TENANT,
+                    principal_id=owner,
+                    intent="replace",
+                    expected_version=header.version,
+                    token=REPLACEMENT,
+                )
+                assert isinstance(replaced, personal_enrollments.EnrollmentStatus), replaced
+                assert replaced.generation == 3
+                await session.commit()
+            finally:
+                if session.in_transaction():
+                    await session.rollback()
+            return await asyncio.wait_for(resume, timeout=5)
+
+    resumed = support.with_session(race)
+
+    observed = _resume_requests(item_id)
+    assert observed[0] == predecessor
+    [item] = _github_items(number)
+    if resumed.json()["status"] == "factory_admitted":
+        assert item["enrollment_generation"] == 3
+        assert [request["enrollment_generation"] for request in observed] == [1, 3]
+    else:
+        assert resumed.json()["errors"] == [{"code": "stale_version"}], resumed.text
+        assert item["enrollment_generation"] == 1
+        assert observed == [predecessor]
 
 
 def test_revalidation_refuses_until_confirmed_then_binds_once(

@@ -17,12 +17,12 @@ ExecutionRequest snapshots it at insertion.
 3. Facts arriving for an existing WorkItem never change its tuple. Service
    facts reuse it; personal facts without an owner reuse it only when it is
    already personal; an explicit owner must equal it after full validation.
-4. Only ``revalidate`` moves ``enrollment_generation``, under compare-and-set
+4. Only the revalidation core moves ``enrollment_generation``, under compare-and-set
    versions, once no runtime of the WorkItem can still be live. The owner never
    changes.
 
-The functions here read and lock rows in the caller's transaction and never
-commit, except ``revalidate``, which owns its transaction.
+The functions here read and lock rows in the caller's transaction.
+The internal worker route uses ``revalidate``, which owns its transaction.
 """
 
 from __future__ import annotations
@@ -78,6 +78,7 @@ OWNER_COLUMNS = frozenset(
 _LIVE_STATUSES = ("running", "cancellation_requested")
 # Requests revalidation rebinds; a terminal snapshot keeps the generation it ran under.
 _REBOUND_STATUSES = ("queued", "waiting")
+OWNER_RESUME_CAUSES = frozenset({"authentication_required", "enrollment_fenced"})
 
 
 @dataclass(frozen=True)
@@ -401,11 +402,6 @@ async def read_context(
     )
 
 
-async def _conflict(session: AsyncSession, code: ContextConflictCode) -> ContextConflict:
-    await session.commit()
-    return ContextConflict(code)
-
-
 def _runtime_proven_gone(row: ExecutionRequest) -> bool:
     """Whether a started request carries worker-recorded termination evidence.
 
@@ -426,6 +422,14 @@ def _runtime_proven_gone(row: ExecutionRequest) -> bool:
         and bool(row.termination_observation.strip())
         and row.teardown_unconfirmed_at is None
     )
+
+
+@dataclass(frozen=True)
+class _ExpectedRevalidation:
+    request_id: uuid.UUID
+    work_item_version: int
+    request_version: int
+    enrollment_version: int
 
 
 async def revalidate(
@@ -461,9 +465,60 @@ async def revalidate(
         .execution_options(populate_existing=True)
     )
     if work_item is None or not _scoped(work_item, tenant_id=tenant_id, agent_id=agent_id):
-        return await _conflict(session, "not_found")
-    if work_item.owner_principal_id != owner_principal_id:
-        return await _conflict(session, "owner_mismatch")
+        result: Revalidated | ContextConflict = ContextConflict("not_found")
+    elif work_item.owner_principal_id != owner_principal_id:
+        result = ContextConflict("owner_mismatch")
+    else:
+        result = await _revalidate_locked(
+            session,
+            work_item,
+            expected=_ExpectedRevalidation(
+                request_id,
+                expected_work_item_version,
+                expected_request_version,
+                expected_enrollment_version,
+            ),
+        )
+    await session.commit()
+    return result
+
+
+async def revalidate_for_owner_admission(
+    session: AsyncSession, work_item: WorkItem
+) -> Revalidated | ContextConflict | None:
+    """Check a locked personal WorkItem for resume by its verified owner."""
+
+    cause = await session.scalar(
+        select(ExecutionRequest.terminal_cause)
+        .where(ExecutionRequest.work_item_id == work_item.id)
+        .order_by(ExecutionRequest.sequence.desc())
+        .limit(1)
+    )
+    if cause not in OWNER_RESUME_CAUSES:
+        return None
+    header = (
+        await session.execute(
+            select(PersonalClaudeEnrollment.generation, PersonalClaudeEnrollment.active).where(
+                PersonalClaudeEnrollment.tenant_id == work_item.tenant_id,
+                PersonalClaudeEnrollment.principal_id == work_item.owner_principal_id,
+            )
+        )
+    ).one_or_none()
+    if header is None or not header.active:
+        return ContextConflict("enrollment_inactive")
+    if header.generation == work_item.enrollment_generation:
+        return None
+    return await _revalidate_locked(session, work_item)
+
+
+async def _revalidate_locked(
+    session: AsyncSession,
+    work_item: WorkItem,
+    *,
+    expected: _ExpectedRevalidation | None = None,
+) -> Revalidated | ContextConflict:
+    """Rebind under the caller's WorkItem lock, then request and enrollment locks."""
+
     requests = list(
         await session.scalars(
             select(ExecutionRequest)
@@ -473,11 +528,15 @@ async def revalidate(
             .execution_options(populate_existing=True)
         )
     )
-    named = next((row for row in requests if row.id == request_id), None)
+    named = requests[-1] if requests else None
+    if expected is not None:
+        named = next((row for row in requests if row.id == expected.request_id), None)
     if named is None:
-        return await _conflict(session, "not_found")
-    if work_item.version != expected_work_item_version or named.version != expected_request_version:
-        return await _conflict(session, "stale_version")
+        return ContextConflict("not_found")
+    if expected is not None and (
+        work_item.version != expected.work_item_version or named.version != expected.request_version
+    ):
+        return ContextConflict("stale_version")
     now = cast(datetime, await session.scalar(select(func.clock_timestamp())))
     if any(
         row.status in _LIVE_STATUSES
@@ -490,7 +549,7 @@ async def revalidate(
         or (row.started_at is not None and not _runtime_proven_gone(row))
         for row in requests
     ):
-        return await _conflict(session, "runtime_live")
+        return ContextConflict("runtime_live")
     enrollment = await session.scalar(
         select(PersonalClaudeEnrollment)
         .where(
@@ -501,17 +560,17 @@ async def revalidate(
         .execution_options(populate_existing=True)
     )
     if enrollment is None or not enrollment.active:
-        return await _conflict(session, "enrollment_inactive")
-    if enrollment.version != expected_enrollment_version:
-        return await _conflict(session, "stale_version")
+        return ContextConflict("enrollment_inactive")
+    if expected is not None and enrollment.version != expected.enrollment_version:
+        return ContextConflict("stale_version")
     previous = work_item.enrollment_generation
     assert previous is not None
     if enrollment.generation == previous:
-        return await _conflict(session, "generation_current")
+        return ContextConflict("generation_current")
 
     work_item_version: int | None = await session.scalar(
         update(WorkItem)
-        .where(WorkItem.id == work_item.id, WorkItem.version == expected_work_item_version)
+        .where(WorkItem.id == work_item.id, WorkItem.version == work_item.version)
         .values(
             enrollment_generation=enrollment.generation,
             version=WorkItem.version + 1,
@@ -536,7 +595,7 @@ async def revalidate(
         select(ExecutionRequest.version).where(ExecutionRequest.id == named.id)
     )
     assert request_version is not None
-    result = Revalidated(
+    return Revalidated(
         work_item_id=work_item.id,
         request_id=named.id,
         previous_generation=previous,
@@ -545,5 +604,3 @@ async def revalidate(
         request_version=request_version,
         enrollment_version=enrollment.version,
     )
-    await session.commit()
-    return result
