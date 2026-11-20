@@ -163,13 +163,22 @@ def _human(value: Any) -> tuple[int, str]:
 
 
 def parse_feedback(
-    event: str, payload: Any, delivery_id: str, *, github_html_base: str
+    event: str,
+    payload: Any,
+    delivery_id: str,
+    *,
+    github_html_base: str,
+    allow_empty_review: bool = False,
 ) -> UnverifiedFeedback:
     """Retain actionable human feedback claims or return an explicit refusal.
 
     Actions/fields follow the provider's webhook-event documentation:
     https://docs.github.com/en/webhooks/webhook-events-and-payloads
     ``issue_comment`` also covers ordinary issues, which cannot own a PR lineage.
+
+    ``allow_empty_review`` parses a submitted review with a blank or null body
+    as body ``""``: the factory admits a review whole, and its inline comments
+    may carry all of it (#5794). Every other blank body is refused.
     """
 
     definition = _REVIEW_EVENTS.get(event)
@@ -215,7 +224,13 @@ def parse_feedback(
         raise FeedbackIgnored("unauthorized_association")
     feedback_id = _positive(feedback.get("id"), "invalid_feedback")
     body = feedback.get("body")
-    if not isinstance(body, str) or not body.strip():
+    if (
+        allow_empty_review
+        and event == "pull_request_review"
+        and (body is None or (isinstance(body, str) and not body.strip()))
+    ):
+        body = ""
+    elif not isinstance(body, str) or not body.strip():
         raise FeedbackIgnored("empty_feedback")
     if len(body) > _MAX_FEEDBACK_LENGTH:
         raise FeedbackIgnored("feedback_too_large")
@@ -254,6 +269,9 @@ def parse_feedback(
         }:
             raise FeedbackIgnored("non_actionable_review")
         created = _instant(feedback.get("submitted_at"), "invalid_feedback_time")
+        # A submitted review is its own batch key; its inline comments name it
+        # as pull_request_review_id.
+        review_id = feedback_id
     else:
         created = _instant(feedback.get("created_at"), "invalid_feedback_time")
         updated = _instant(feedback.get("updated_at"), "invalid_feedback_time")

@@ -9,6 +9,8 @@ https://docs.github.com/en/rest/issues/events#list-issue-events
 https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository
 https://docs.github.com/en/rest/pulls/comments#list-review-comments-in-a-repository
 https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request
+https://docs.github.com/en/rest/pulls/reviews#get-a-review-for-a-pull-request
+https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
 https://docs.github.com/en/rest/git/refs#get-a-reference
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
 https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
@@ -117,6 +119,12 @@ def _feedback_request_id(event: str, feedback_id: int) -> uuid.UUID:
     identity = f"{REPO_ID}:{event}:{feedback_id}"
     event_id = f"github-feedback-{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
     return uuid.uuid5(uuid.NAMESPACE_URL, event_id)
+
+
+def _review_request_id(pull: int, review_id: int) -> uuid.UUID:
+    """Every piece of one submitted review admits under its review (#5794)."""
+
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"curie-review:{REPO_ID}:{pull}:{review_id}")
 
 
 def _body_digest(payload: dict[str, Any]) -> str:
@@ -236,8 +244,20 @@ class PollGitHub:
         self.comments[comment_id] = comment
         return comment
 
-    def add_review_comment(self, pr: int, comment_id: int, body: str) -> dict[str, Any]:
+    def add_review_comment(
+        self, pr: int, comment_id: int, body: str, *, review_id: int | None = None
+    ) -> dict[str, Any]:
+        """An inline comment of submitted review ``review_id``.
+
+        GitHub creates every inline comment inside a review, which the reviews
+        listing then shows; an unknown review is submitted as COMMENTED with
+        no text of its own, as a single inline comment is.
+        """
+
         stamp = _iso(datetime.now(UTC))
+        review = review_id if review_id is not None else comment_id + 500000
+        if review not in self.reviews:
+            self.add_review(pr, review, "", state="COMMENTED")
         comment = {
             "id": comment_id,
             "body": body,
@@ -249,23 +269,26 @@ class PollGitHub:
             "commit_id": HEAD,
             "path": "src/acme/helper.py",
             "line": 12,
-            "pull_request_review_id": comment_id + 500000,
+            "pull_request_review_id": review,
             "html_url": f"https://github.com/{REPO}/pull/{pr}#discussion_r{comment_id}",
             "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/{pr}",
         }
         self.review_comments[comment_id] = comment
         return comment
 
-    def add_review(self, pr: int, review_id: int, body: str) -> dict[str, Any]:
+    def add_review(
+        self, pr: int, review_id: int, body: str, *, state: str = "CHANGES_REQUESTED"
+    ) -> dict[str, Any]:
         review = {
             "id": review_id,
             "pr": pr,
             "body": body,
             "user": _user(),
             "commit_id": HEAD,
-            "state": "CHANGES_REQUESTED",
+            "state": state,
             "submitted_at": _iso(datetime.now(UTC)),
             "html_url": f"https://github.com/{REPO}/pull/{pr}#pullrequestreview-{review_id}",
+            "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/{pr}",
             "author_association": "MEMBER",
             "performed_via_github_app": None,
         }
@@ -479,10 +502,24 @@ class PollGitHub:
                     if review.get("pr") == pr
                 ]
                 return self._page(request, "reviews", owned)
-            review_id = int(review_tail.strip("/"))
+            review_text, _, comments_tail = review_tail.strip("/").partition("/")
+            review_id = int(review_text)
             review = self.reviews.get(review_id)
             if review is None or review.get("pr") != pr:
                 return httpx.Response(404, json={"message": "missing fixture"})
+            if comments_tail == "comments":
+                # https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
+                listed = sorted(
+                    (
+                        comment
+                        for comment in self.review_comments.values()
+                        if comment.get("pull_request_review_id") == review_id
+                    ),
+                    key=lambda comment: comment["id"],
+                )
+                size = int(request.url.params.get("per_page", "30"))
+                page = int(request.url.params.get("page", "1"))
+                return httpx.Response(200, json=listed[(page - 1) * size : page * size])
             return httpx.Response(200, json=_public_review(review))
         if path.startswith(f"{root}/pulls/"):
             tail = path.rsplit("/", 1)[1]
@@ -1138,9 +1175,7 @@ def test_poll_defers_one_unreadable_issue_and_continues_other_intake(
     assert cancelled[0]["cancelled_at"] is not None
     assert cancelled[0]["terminal_cause"] == "issue_cancelled"
     assert _mention_request_id(comment_id) in {row["id"] for row in _requests(mentioned)}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in _requests(reviewed)
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in _requests(reviewed)}
     del github.failures[path]
     github.close_issue(unavailable)
 
@@ -1232,9 +1267,7 @@ def test_poll_retries_permission_failure_after_events_and_continues_other_intake
     mentioned_rows = _requests(mentioned)
     reviewed_rows = _requests(reviewed)
     assert _mention_request_id(comment_id) in {row["id"] for row in mentioned_rows}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in reviewed_rows
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in reviewed_rows}
     github.permission_failures.remove(unavailable)
 
     _run_once(github)
@@ -1309,9 +1342,7 @@ def test_poll_prunes_persisted_etags_for_cancelled_issues_and_closed_lineages(
     healthy_rows = _requests(healthy)
     assert len(healthy_rows) == 3
     assert _mention_request_id(comment_id) in {row["id"] for row in healthy_rows}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in healthy_rows
-    }
+    assert _review_request_id(healthy_pull, review_id) in {row["id"] for row in healthy_rows}
 
 
 def test_stale_issue_conditional_read_still_cancels_after_an_issue_changes(
@@ -1707,8 +1738,9 @@ def test_poll_admits_review_feedback_once(
     rows = _requests(number)
     assert len(rows) == 3
     found = {row["id"] for row in rows}
-    assert _feedback_request_id("pull_request_review_comment", comment_id) in found
-    assert _feedback_request_id("pull_request_review", review_id) in found
+    # The inline comment's own review and the separate review: one request each.
+    assert _review_request_id(pull, comment_id + 500000) in found
+    assert _review_request_id(pull, review_id) in found
     assert _requests(pull) == []
 
     _run_once(github)
@@ -1907,9 +1939,7 @@ def test_webhook_of_a_polled_review_stays_one_request(
     review_id = 74111
     review = github.add_review(pull, review_id, f"@{MENTION} please rename the helper")
     _run_once(github)
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in _requests(number)
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in _requests(number)}
     count = len(_requests(number))
     before = _delivery_ids()
     payload = {
