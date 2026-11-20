@@ -439,6 +439,9 @@ def serve(args: argparse.Namespace) -> int:
             lifespan="off",
             log_level="warning",
             access_log=False,
+            # Clients of an install hold keep-alive connections; SIGTERM ends
+            # the stub within this bound rather than waiting on them.
+            timeout_graceful_shutdown=5,
             ssl_keyfile=str(key),
             ssl_certfile=str(cert),
         )
