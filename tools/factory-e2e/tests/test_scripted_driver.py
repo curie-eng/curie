@@ -2454,6 +2454,71 @@ def test_slack_progress_refuses_a_missing_or_misthreaded_ready_post() -> None:
             sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
 
 
+class _RecordedSlack:
+    """Stands in for the run's recorder with the posts a real SlackRecorder held."""
+
+    def __init__(self, posts: list[lanes.SlackPost]) -> None:
+        self._posts = posts
+
+    def posts(self) -> list[lanes.SlackPost]:
+        return self._posts
+
+
+def _publication_run(posts: list[lanes.SlackPost]) -> sk.ScriptedRun:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    run.slack = _RecordedSlack(posts)  # type: ignore[assignment]
+    run.evidence["pull_request"] = {"html_url": PULL_REQUEST}
+    return run
+
+
+def test_the_run_records_the_slack_post_counts_in_its_evidence() -> None:
+    run = _publication_run(_slack_run())
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
+
+
+def test_the_run_fails_when_the_ready_reply_lands_outside_the_root_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sk, "SLACK_PROGRESS_SECONDS", 0)
+    run = _publication_run(_slack_run(ready="9.9"))
+    with pytest.raises(sk.ScriptedScenarioError, match="Slack progress: .*ready reply"):
+        run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
+
+
+def test_a_run_without_the_gateway_does_not_wait_for_slack() -> None:
+    run = sk.ScriptedRun(_gateway_argv("jira-one-ticket"))
+    run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
+
+
+def test_the_run_binds_the_factory_agent_to_the_slack_channel_before_the_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _publication_run([])
+    run.evidence["agent_id"] = "agent-example"
+    run.env.update(CURIE_API_URL="http://api.example.com", CURIE_API_KEY="example-key")
+    calls: list[tuple[str, str, Any]] = []
+
+    def http_json(method: str, url: str, **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        calls.append((method, url, kwargs["body"]))
+        return 200, {}
+
+    monkeypatch.setattr(fe, "http_json", http_json)
+    monkeypatch.setattr(run, "kubectl", lambda *_args, **_kwargs: "")
+    run.bind_slack()
+    assert calls == [
+        ("POST", "http://api.example.com/agents/agent-example/channels",
+         {"kind": "slack", "address": sso.SLACK_CHANNEL}),
+        ("PATCH", "http://api.example.com/agents/agent-example",
+         {"factory_slack_channel": sso.SLACK_CHANNEL}),
+    ]
+    monkeypatch.setattr(fe, "http_json", lambda *_a, **_k: (409, {}))
+    with pytest.raises(sk.ScriptedScenarioError, match="Slack binding returned HTTP 409"):
+        run.bind_slack()
+
+
 def test_slack_progress_refuses_a_card_that_was_never_updated() -> None:
     posts = [p for p in _slack_run() if p.method != "chat.update"]
     with pytest.raises(sso.ScenarioAssertionError, match="never updated"):
