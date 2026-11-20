@@ -773,6 +773,24 @@
         }
       }
     },
+    "connectorServiceAccounts": {
+      "type": "array",
+      "description": "Operator-named ServiceAccounts for hosted connectors, rendered into the API as CURIE_CONNECTOR_SERVICE_ACCOUNTS. The API refuses the same shapes at boot, and also refuses a repeated agent and connector pair.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent", "connector", "serviceAccountName"],
+        "properties": {
+          "agent": {"type": "string", "pattern": "\\S"},
+          "connector": {"type": "string", "pattern": "\\S"},
+          "serviceAccountName": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+          }
+        }
+      }
+    },
     "e2eConnectorIdentity": {
       "type": "object",
       "description": "End to end connector identity on a test cluster (ADR 0176 decision 4, issue #3243).",

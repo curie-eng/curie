@@ -146,6 +146,7 @@ api:
   CURIE_CONNECTOR_PROXY_IMAGE: worker.image
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY: worker.image.pullPolicy
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS: worker.imagePullSecrets
+  CURIE_CONNECTOR_SERVICE_ACCOUNTS: connectorServiceAccounts
   CURIE_DELIVERY_BUDGET_S: worker.deliveryBudgetSeconds
   CURIE_E2E_BUILDER_IMAGE: e2eConnector.builderImage
   CURIE_E2E_BUILD_CACHE_REPO: e2eConnector.buildCacheRepo

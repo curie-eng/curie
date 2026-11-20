@@ -66,7 +66,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-86 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+85 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 `CodingInstructionsOutput` in `cli/src/commands/coding_instructions.rs` reports the owner
 profile and whether this deployment applies it to factory runs, or a dry-run plan.
@@ -158,7 +158,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   result. This syntactic inventory does not prove that every verb returns a
   `CliOutput` or honors the one-object JSON contract.
 2. **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 86 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 85 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
   against real `to_json()` output across 86 tests in `cli/tests/json_contract.rs`.

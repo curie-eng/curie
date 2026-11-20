@@ -39,7 +39,7 @@ from curie_internal.driver_declaration import (
 )
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
-from plugin_format.connector_render import ConnectorProxy, GrantStore
+from plugin_format.connector_render import ConnectorProxy, GrantStore, is_service_account_name
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -1011,6 +1011,16 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME", "connector_grant_store_secret_name"
         ),
     )
+    # The operator's ServiceAccount for one agent's hosted connector, as the
+    # JSON list the chart renders from `connectorServiceAccounts`. Contract:
+    # docs/interfaces/connector-host/INTERFACE.md, "A connector's own
+    # ServiceAccount". Validated at boot by `_validate_connector_service_accounts`.
+    connector_service_accounts: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_SERVICE_ACCOUNTS", "connector_service_accounts"
+        ),
+    )
     e2e_connector_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),
@@ -1109,6 +1119,57 @@ class Settings(BaseSettings):
                 if name.strip()
             ),
         )
+
+    def _connector_service_account_map(self) -> dict[tuple[str, str], str]:
+        """``(agent, connector) -> ServiceAccount`` from the operator's list.
+
+        Raises ``ValueError`` naming ``CURIE_CONNECTOR_SERVICE_ACCOUNTS`` on any
+        entry the renderer could not use.
+        """
+
+        env = "CURIE_CONNECTOR_SERVICE_ACCOUNTS"
+        raw = self.connector_service_accounts.strip()
+        if not raw:
+            return {}
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError:
+            raise ValueError(f"{env} is not valid JSON") from None
+        if not isinstance(entries, list):
+            raise ValueError(f"{env} must be a JSON list of entries")
+        keys = {"agent", "connector", "serviceAccountName"}
+        mapping: dict[tuple[str, str], str] = {}
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or set(entry) != keys:
+                raise ValueError(
+                    f"{env} entry {index} must be an object with exactly the keys "
+                    "agent, connector and serviceAccountName"
+                )
+            if not all(isinstance(entry[key], str) and entry[key].strip() for key in keys):
+                raise ValueError(f"{env} entry {index} has an empty or non-string value")
+            account = entry["serviceAccountName"]
+            if not is_service_account_name(account):
+                raise ValueError(
+                    f"{env} entry {index} serviceAccountName {account!r} is not a Kubernetes "
+                    "ServiceAccount name (a DNS-1123 subdomain of at most 253 characters)"
+                )
+            pair = (entry["agent"], entry["connector"])
+            if pair in mapping:
+                raise ValueError(
+                    f"{env} names agent {pair[0]!r} connector {pair[1]!r} more than once"
+                )
+            mapping[pair] = account
+        return mapping
+
+    def connector_service_accounts_for(self, agent: str) -> dict[str, str]:
+        """The operator-named ServiceAccount of each of ``agent``'s connectors
+        that has one, keyed by connector name."""
+
+        return {
+            connector: account
+            for (owner, connector), account in self._connector_service_account_map().items()
+            if owner == agent
+        }
 
     def connector_grant_store(self) -> GrantStore:
         """Where the caller proxy spends grants: a credential-free address and
@@ -1231,6 +1292,13 @@ class Settings(BaseSettings):
             self.connector_proxy()
         except ValueError as exc:
             raise ValueError(f"the connector caller proxy is misconfigured: {exc}") from None
+        return self
+
+    @model_validator(mode="after")
+    def _validate_connector_service_accounts(self) -> "Settings":
+        # At boot, not at the first render: a list the renderer cannot use
+        # would otherwise surface as a 500 on every connector deploy.
+        self._connector_service_account_map()
         return self
 
     @model_validator(mode="after")

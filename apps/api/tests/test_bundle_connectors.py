@@ -1120,6 +1120,85 @@ def test_the_route_renders_a_valkey_url_the_secret_agrees_with(
     assert (ref["name"], ref["key"]) == (_GRANT_STORE_SECRET, "valkeyPassword")
 
 
+# An operator-named ServiceAccount for one agent's hosted connector
+# (docs/interfaces/connector-host/INTERFACE.md, "A connector's own
+# ServiceAccount"). The route reads the mapping from the API settings, and only
+# the matching agent's matching connector carries it.
+_HOSTED_AND_STORAGE = HOSTED + (
+    "  storage:\n"
+    "    image: ghcr.io/acme-corp/storage-mcp:1.0.0\n"
+    "    secrets: [STORAGE_TOKEN]\n"
+)
+
+
+def _pod_accounts(manifests: list[dict[str, Any]]) -> dict[str, str | None]:
+    return {
+        _connector_of(o): o["spec"]["template"]["spec"].get("serviceAccountName")
+        for o in manifests
+        if o["kind"] == "Deployment"
+    }
+
+
+def test_the_route_names_the_operator_service_account_on_that_connector_alone(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "CURIE_CONNECTOR_SERVICE_ACCOUNTS",
+        json.dumps(
+            [
+                {
+                    "agent": "acme-bot",
+                    "connector": "storage",
+                    "serviceAccountName": "acme-bot-storage",
+                },
+                # Another agent's entry for the same connector name renders nothing here.
+                {
+                    "agent": "acme-other",
+                    "connector": "grafana",
+                    "serviceAccountName": "acme-other-grafana",
+                },
+            ]
+        ),
+    )
+    get_settings.cache_clear()
+    body = _rendered(client, auth_headers, _bundle(tmp_path, _HOSTED_AND_STORAGE))
+    assert _pod_accounts(body["manifests"]) == {"grafana": None, "storage": "acme-bot-storage"}
+
+
+def test_the_route_names_no_service_account_without_the_setting(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CURIE_CONNECTOR_SERVICE_ACCOUNTS", raising=False)
+    get_settings.cache_clear()
+    body = _rendered(client, auth_headers, _bundle(tmp_path, _HOSTED_AND_STORAGE))
+    assert _pod_accounts(body["manifests"]) == {"grafana": None, "storage": None}
+
+
+def test_render_connector_manifests_names_the_mapped_connector_alone(tmp_path: Path) -> None:
+    manifests = bundles.render_connector_manifests(
+        bundles.read_connectors(_bundle(tmp_path, _HOSTED_AND_STORAGE)),
+        release=RELEASE,
+        agent=AGENT,
+        namespace=NAMESPACE,
+        app_name=APP_NAME,
+        secret_name=SECRET_NAME,
+        proxy=_api_proxy(),
+        # An undeclared connector in the mapping is not an error.
+        service_accounts={"storage": "acme-bot-storage", "absent": "acme-bot-absent"},
+    )
+    assert _pod_accounts(manifests) == {"grafana": None, "storage": "acme-bot-storage"}
+
+
 # --------------------------------------------------------------------------- #
 # The probed restore verb joins the connector's gated set
 # (ACTION-EXECUTOR-8, ACTION-EXECUTOR-13; plan task 6)

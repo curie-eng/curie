@@ -102,12 +102,11 @@ const NO_ISSUES_ID: u64 = 1235;
 const MISSING_PATH: &str = "factory-fixture/nested/missing";
 
 const TRIGGER_LABEL: &str = "curie-factory";
-const STATE_LABELS: [&str; 5] = [
+const STATE_LABELS: [&str; 4] = [
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
-    "curie-factory:triaged",
 ];
 
 const BOT_USER: u64 = 42;
@@ -1283,7 +1282,6 @@ fn factory_quickstart_gitlab_creates_every_label_on_the_first_run_and_none_on_th
             "curie-factory:needs-human".to_string(),
             "curie-factory:pr-open".to_string(),
             "curie-factory:queued".to_string(),
-            "curie-factory:triaged".to_string(),
         ],
         "only the missing labels are created: {}",
         run.all()

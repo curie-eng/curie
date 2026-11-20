@@ -28,7 +28,15 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   router keeps `require_api_key`; a scoped token is rejected everywhere
   else, including `/approvals/{id}/resolve`. Do not collapse the state router
   back onto `require_api_key`, and do not extend scoped-token acceptance to
-  another router without a new ADR.
+  another router without a new ADR. ADR 0287 decision 7 (#5801) amends ADR
+  0188 with one capability: the per turn memory write credential proposes
+  one learned rule per turn, in its own binding scope or the agent scope,
+  at `POST /agents/{agent_id}/state/_rules`, and a scoped sandbox credential
+  reads the accepted rules at `GET` on the same path. Both live on
+  `rules_router` (`memory_rule_channel.py`), included before `router`, which
+  answers 403 for another agent's validly signed credential. Accept, reject
+  and remove stay on the memory router, out of reach of every sandbox
+  credential.
 - **The `channels` ingress router is the SECOND such exception (ADR-0096
   decision 3, #1459).** `POST /channels/turns` accepts EITHER the platform key
   OR a `chn` token (`channel_token.py`) scoped to the binding row named in the

@@ -1,0 +1,127 @@
+# Private override for an isolated local stack with a real Dex beside the API.
+#
+# Every value comes from the env file `curie dev oidc-e2e -- local-env` writes;
+# source it, then run from the checkout root:
+#
+#   set -a; . "$ENV_FILE"; set +a
+#   curie local up --build -f "$PWD/compose.dev.yaml" -f "$PWD/tools/oidc-e2e/compose.local-oidc.yaml"
+#   curie local down -f "$PWD/compose.dev.yaml" -f "$PWD/tools/oidc-e2e/compose.local-oidc.yaml"
+#
+# - Every service of compose.dev.yaml stays, the host-networked worker included.
+#   The worker is rebound to this project's published stores, API, gateway and
+#   runner network, which is what `validate_isolated_override` in
+#   cli/src/local.rs checks before `curie local up` starts anything.
+# - The API, Postgres, Valkey and the object store publish on 127.0.0.1 at the
+#   env file's ports. Full-profile services publish nothing, so no default
+#   2xxxx port of another stack is taken. The gateway runs on the host network
+#   at CURIE_LOCAL_GATEWAY_PORT and talks to the reply stub at
+#   CURIE_LOCAL_STUB_PORT.
+# - Every curie image carries CURIE_LOCAL_IMAGE_TAG, the tag `--build` writes.
+# - Dex runs `dex serve` in the curie-api network namespace and listens on the
+#   Dex port itself, so one issuer, http://localhost:<dex port>/dex, works for
+#   the host and for the API alike. Its config is the env file's
+#   CURIE_LOCAL_OIDC_DEX_CONFIG, inline (Compose 2.23.1 or later). The
+#   `!override` and `!reset` tags need Compose 2.24.4 or later.
+# - The channel gateway still listens on the host network (0.0.0.0), because the
+#   API container reaches it through host.docker.internal, so a loopback-only
+#   listener is not possible. Its bearer tokens are therefore per-fixture secrets:
+#   CURIE_CHANNEL_GATEWAY_API_TOKEN and CURIE_CHANNEL_GATEWAY_WORKER_TOKEN are
+#   required here, the file carries fresh random values, and no public
+#   development default token reaches the gateway, the API or the worker.
+# - A missing variable stops Compose before anything starts.
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:${CURIE_LOCAL_POSTGRES_PORT:?run local-env and source its file}:5432"
+
+  valkey:
+    ports: !override
+      - "127.0.0.1:${VALKEY_PORT:?run local-env and source its file}:6379"
+
+  rustfs:
+    ports: !override
+      - "127.0.0.1:${CURIE_LOCAL_OIDC_S3_PORT:?run local-env and source its file}:9000"
+
+  clickhouse:
+    ports: !reset []
+  langfuse-web:
+    ports: !reset []
+  otel-collector:
+    ports: !reset []
+  ollama:
+    ports: !reset []
+
+  curie-migrate:
+    image: ghcr.io/curie-eng/curie-api:${CURIE_LOCAL_IMAGE_TAG:?run local-env and source its file}
+
+  curie-api:
+    image: ghcr.io/curie-eng/curie-api:${CURIE_LOCAL_IMAGE_TAG:?run local-env and source its file}
+    ports: !override
+      - "127.0.0.1:${CURIE_LOCAL_OIDC_API_PORT:?run local-env and source its file}:8000"
+      - "127.0.0.1:${CURIE_LOCAL_OIDC_DEX_PORT:?run local-env and source its file}:${CURIE_LOCAL_OIDC_DEX_PORT:?run local-env and source its file}"
+    environment:
+      CURIE_CHANNEL_GATEWAY_URL: http://host.docker.internal:${CURIE_LOCAL_GATEWAY_PORT:?run local-env and source its file}
+      CURIE_CHANNEL_GATEWAY_PORT: ${CURIE_LOCAL_GATEWAY_PORT:?run local-env and source its file}
+      CURIE_CHANNEL_GATEWAY_TOKEN: ${CURIE_CHANNEL_GATEWAY_API_TOKEN:?run local-env and source its file}
+      CURIE_OIDC_ISSUER: ${CURIE_LOCAL_OIDC_ISSUER:?run local-env and source its file}
+      CURIE_OIDC_AUDIENCE: ${CURIE_LOCAL_OIDC_AUDIENCE:?run local-env and source its file}
+      CURIE_OIDC_JWKS_URL: ${CURIE_LOCAL_OIDC_JWKS_URL:?run local-env and source its file}
+      CURIE_OIDC_CLIENT_SECRET: ${CURIE_LOCAL_OIDC_CLIENT_SECRET:?run local-env and source its file}
+      CURIE_OIDC_REDIRECT_URI: ${CURIE_LOCAL_OIDC_REDIRECT_URI:?run local-env and source its file}
+      CURIE_OIDC_SCOPES: ${CURIE_LOCAL_OIDC_SCOPES:?run local-env and source its file}
+      CURIE_OIDC_ADMIT_ALL_AUTHENTICATED: ${CURIE_LOCAL_OIDC_ADMIT_ALL_AUTHENTICATED:?run local-env and source its file}
+
+  curie-ui:
+    image: ghcr.io/curie-eng/curie-ui:${CURIE_LOCAL_IMAGE_TAG:?run local-env and source its file}
+    ports: !reset []
+
+  curie-worker:
+    build:
+      args:
+        BASE_TAG: ${CURIE_LOCAL_IMAGE_TAG:?run local-env and source its file}
+    environment:
+      CURIE_RUNNER_IMAGE: ghcr.io/curie-eng/curie-runner:${CURIE_LOCAL_IMAGE_TAG:?run local-env and source its file}
+      DATABASE_URL: postgresql+asyncpg://postgres:${CURIE_LOCAL_POSTGRES_PASSWORD:-postgres}@${CURIE_LOCAL_POSTGRES_HOST:?run local-env and source its file}:${CURIE_LOCAL_POSTGRES_PORT:?run local-env and source its file}/postgres
+      VALKEY_HOST: ${VALKEY_HOST:?run local-env and source its file}
+      VALKEY_PORT: ${VALKEY_PORT:?run local-env and source its file}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:?run local-env and source its file}
+      CURIE_API_URL: ${CURIE_API_URL:?run local-env and source its file}
+      CURIE_CHANNEL_GATEWAY_URL: http://localhost:${CURIE_LOCAL_GATEWAY_PORT:?run local-env and source its file}
+      CURIE_CHANNEL_GATEWAY_TOKEN: ${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:?run local-env and source its file}
+      CURIE_DOCKER_NETWORK: ${CURIE_DOCKER_NETWORK:?run local-env and source its file}
+      # The default points at the shared stack's collector on the host; this
+      # stack publishes none, so the host-networked worker exports nothing.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ""
+
+  curie-gateway-replay-perms:
+    image: ghcr.io/curie-eng/curie-dispatcher:${CURIE_LOCAL_IMAGE_TAG:?run local-env and source its file}
+
+  curie-channel-gateway:
+    image: ghcr.io/curie-eng/curie-dispatcher:${CURIE_LOCAL_IMAGE_TAG:?run local-env and source its file}
+    environment:
+      CURIE_CHANNEL_GATEWAY_PORT: ${CURIE_LOCAL_GATEWAY_PORT:?run local-env and source its file}
+      CURIE_CHANNEL_GATEWAY_API_TOKEN: ${CURIE_CHANNEL_GATEWAY_API_TOKEN:?run local-env and source its file}
+      CURIE_CHANNEL_GATEWAY_WORKER_TOKEN: ${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:?run local-env and source its file}
+      SLACK_API_BASE_URL: http://localhost:${CURIE_LOCAL_STUB_PORT:?run local-env and source its file}/api/
+
+  curie-dispatcher:
+    image: ghcr.io/curie-eng/curie-dispatcher:${CURIE_LOCAL_IMAGE_TAG:?run local-env and source its file}
+
+  dex:
+    profiles: [core, full]
+    image: ${CURIE_LOCAL_OIDC_DEX_IMAGE:?run local-env and source its file}
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    network_mode: "service:curie-api"
+    depends_on: [curie-api]
+    configs:
+      - source: local_oidc_dex
+        target: /etc/dex/config.yaml
+    restart: unless-stopped
+
+configs:
+  local_oidc_dex:
+    content: ${CURIE_LOCAL_OIDC_DEX_CONFIG:?run local-env and source its file}
+
+networks:
+  curie_runner:
+    name: "${COMPOSE_PROJECT_NAME:?run local-env and source its file}_runner"

@@ -164,6 +164,7 @@ tools/factory-e2e/tests/test_kind_images.py
 tools/factory-e2e/tests/test_live_github_chain.py
 tools/factory-e2e/tests/test_live_github_chain_driver.py
 tools/factory-e2e/tests/test_live_github_chain_pending.py
+tools/factory-e2e/tests/test_one_ticket_jira.py
 tools/factory-e2e/tests/test_one_ticket_scenario.py
 tools/factory-e2e/tests/test_personal_owner_enforcement.py
 tools/factory-e2e/tests/test_personal_profile.py
@@ -200,6 +201,7 @@ tools/identity-e2e/tests/test_requester_expiry_checks.py
 tools/identity-e2e/tests/test_requester_handoff_checks.py
 tools/identity-e2e/tests/test_restore_log_privacy.py
 tools/identity-e2e/tests/test_stored_card_checks.py
+tools/oidc-e2e/tests/test_local_modes.py
 tools/p0-closes-ci/tests/test_p0_closes_ci.py
 tools/preflight/tests/test_full_preflight.py
 tools/preflight/tests/test_preflight.py

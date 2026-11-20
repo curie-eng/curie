@@ -120,10 +120,14 @@ def close_line(sha256: str) -> str:
     return f"{SECTION_CLOSE} sha256={sha256}>>>"
 
 
-def rules_section(count: int, sha256: str, text: str) -> str:
-    """The prompt section: delimiters, framing, then the canonical rule lines."""
+def rules_section(count: int, sha256: str, text: str, *, framing: str = FRAMING) -> str:
+    """The prompt section: delimiters, framing, then the canonical rule lines.
 
-    return "\n".join((open_line(count, sha256), FRAMING, "", text, close_line(sha256)))
+    ``framing`` is the factory's repository framing unless a caller names
+    another (a channel's or agent's accepted rules, #5801).
+    """
+
+    return "\n".join((open_line(count, sha256), framing, "", text, close_line(sha256)))
 
 
 def parse_envelope(raw: bytes, binding: ExecutionBinding) -> Applied | NoneSelected:

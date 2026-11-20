@@ -604,7 +604,6 @@ async fn execute_gitlab(
     .await?;
     // A label-less rerun keeps the surface the agent already holds (#4620).
     let kept = surface_to_keep(&held, "gitlab", &plan.facts.path, plan.label.as_deref());
-    // Publication policy must be `auto` before a tracker-result upload.
     for (args, step) in settings(plan) {
         run_self(&args, step, None, None).await?;
     }

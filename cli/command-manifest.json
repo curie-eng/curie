@@ -7290,7 +7290,7 @@
             },
             {
               "global": false,
-              "help": "Let the agent propose memory rules on or off (`memory_rule_proposals`, #5796). Takes effect for the next request's completion contract. A person still accepts any proposed rule; the agent never activates one itself",
+              "help": "Let the agent propose memory rules on or off (`memory_rule_proposals`, #5796, #5801). A factory run reads it at its next request's completion contract; any other agent at its next session in a channel, where it also needs --memory-writes on. A person still accepts any proposed rule; the agent never activates one itself",
               "id": "memory_rule_proposals",
               "long": "memory-rule-proposals",
               "positional": false,
@@ -9274,7 +9274,19 @@
             },
             {
               "global": false,
-              "help": "Accept this proposed rule. Needs --expected-version and --session-file",
+              "help": "With --rules, show only the agent scope rules (not a channel's or a repository's). `--channel KIND=ADDRESS` with --rules selects one bound channel instead",
+              "id": "agent_scope",
+              "long": "agent-scope",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Accept this proposed rule. With --channel KIND=ADDRESS or --agent-scope the rule must be in that scope or nothing is sent. Needs --expected-version and --session-file",
               "id": "accept",
               "long": "accept",
               "positional": false,
@@ -11396,35 +11408,6 @@
                   "help": "Directory to write the bundle into. Must not exist or be empty",
                   "id": "out",
                   "long": "out",
-                  "positional": false,
-                  "required": true
-                }
-              ],
-              "hidden": false,
-              "name": "render"
-            }
-          ]
-        },
-        {
-          "about": "Work with the factory-triage example bundle",
-          "hidden": false,
-          "name": "factory-triage",
-          "subcommands": [
-            {
-              "about": "Render an offline investigation bundle into a new or empty directory",
-              "args": [
-                {
-                  "global": false,
-                  "id": "out",
-                  "long": "out",
-                  "positional": false,
-                  "required": true
-                },
-                {
-                  "global": false,
-                  "help": "Another agent's implementation trigger label on the same repository",
-                  "id": "implementation_label",
-                  "long": "implementation-label",
                   "positional": false,
                   "required": true
                 }

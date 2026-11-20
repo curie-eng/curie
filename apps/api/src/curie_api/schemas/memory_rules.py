@@ -64,13 +64,72 @@ class MemoryRulesOut(BaseModel):
 
 class MemoryRuleDecisionOut(BaseModel):
     rule: MemoryRuleOut
-    applies_from: Literal["next_ticket"] = Field(
+    applies_from: Literal["next_ticket", "next_session"] = Field(
         description=(
-            "The decision is recorded now and takes effect at the next ticket's "
-            "admission once admission reads learned rules (#5798); a running request "
-            "keeps the rules it was admitted with."
+            "When the decision takes effect. `next_ticket` for a repository scope rule: "
+            "at the next ticket's admission; a running request keeps the rules it was "
+            "admitted with. `next_session` for an agent or binding scope rule: at the "
+            "next session start of the agent; a running session keeps the rules it "
+            "loaded (#5801)."
         )
     )
+
+
+class ChannelRuleProposalIn(BaseModel):
+    """A non-factory turn's one learned rule proposal (#5801, ADR 0287 decision 7).
+
+    Exactly these fields; any other body is refused 422 ``invalid_body`` with
+    nothing echoed. ``scope`` picks the credential's own channel (the default)
+    or the whole agent. The scope key, the proposer, the source turn and the
+    state come from the per turn credential and the server, never from the body.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
+
+    rule: str = Field(description="The rule, one line of at most 240 UTF-8 bytes.")
+    reason: str = Field(description="Why it should always apply, at most 240 UTF-8 bytes.")
+    scope: Literal["channel", "agent"] = Field(
+        default="channel",
+        description="`channel`: the credential's own binding. `agent`: every channel.",
+    )
+
+
+class ChannelRuleOut(BaseModel):
+    """One accepted rule a session loads at its start."""
+
+    id: UUID
+    scope_kind: Literal["agent", "binding"]
+    scope_key: str
+    scope_label: str
+    number: int
+    text: str
+    accepted_at: datetime
+
+
+class ChannelRulesOut(BaseModel):
+    """The accepted rules a non-factory session loads at its start (#5801)."""
+
+    proposals_enabled: bool = Field(
+        description="Whether the agent may propose rules (`memory_rule_proposals`)."
+    )
+    rules: list[ChannelRuleOut] = Field(
+        description=(
+            "Accepted rules of the agent scope, then of the credential's binding scope, "
+            "each ordered by acceptance, at most 16 per scope."
+        )
+    )
+
+
+class ChannelRuleRefusalDetail(BaseModel):
+    """A coded refusal of the state router's learned rule routes."""
+
+    code: str
+    message: str
+    fix: str
+
+
+class ChannelRuleRefusal(BaseModel):
+    detail: ChannelRuleRefusalDetail
 
 
 class MemoryRuleRefusalDetail(BaseModel):
