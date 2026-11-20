@@ -2366,7 +2366,7 @@ class ApiHop:
     """The worker's API base URL: forwards to the live API, records each answer.
 
     ``drop_next_answer`` resets the worker's connection after the live API
-    answered the next steering call, the error a connection reset after the
+    answered the next call on the named route, the error a connection reset after the
     server replied surfaces as. The route ran and committed; only the answer is
     lost.
     """
@@ -2376,11 +2376,12 @@ class ApiHop:
         self.url = ""
         self.exchanges: list[tuple[str, int, Any]] = []
         self.dropped: list[tuple[int, Any]] = []
-        self._drop = 0
+        self._drop_path: str | None = None
         self._client: httpx.AsyncClient | None = None
 
-    def drop_next_answer(self) -> None:
-        self._drop += 1
+    def drop_next_answer(self, path: str) -> None:
+        assert self._drop_path is None, "the previous drop is still armed"
+        self._drop_path = path
 
     def steer_answers(self) -> list[tuple[int, Any]]:
         return [(status, body) for path, status, body in self.exchanges if path == STEER_PATH]
@@ -2397,8 +2398,8 @@ class ApiHop:
             parsed: Any = json.loads(content) if content else None
         except ValueError:
             parsed = None
-        if request.path == STEER_PATH and self._drop:
-            self._drop -= 1
+        if request.path == self._drop_path:
+            self._drop_path = None
             self.dropped.append((upstream.status_code, parsed))
             assert request.transport is not None
             request.transport.abort()
@@ -3041,9 +3042,9 @@ class SteeringStack(Stack):
         return Delivery(event_id, delivery_id, message_ts, placeholder, event["text"])
 
     def queued_mention(
-        self, user: str, text_: str, *, thread_ts: str, receipt: bool = True
+        self, user: str, text_: str, *, thread_ts: str | None = None, receipt: bool = True
     ) -> Delivery:
-        """One threaded human mention handed to the worker at the queue boundary.
+        """One human mention handed to the worker at the queue boundary.
 
         The inputs a native delivery leaves for the worker, built by the
         production code that writes them, without the Bolt envelope or the
@@ -3069,14 +3070,16 @@ class SteeringStack(Stack):
             "channel": CHANNEL,
             "text": f"<@{FACTORY_BOT_USER}> {text_}",
             "ts": message_ts,
-            "thread_ts": thread_ts,
             "team": TEAM,
             "user": user,
             "user_team": TEAM,
         }
+        if thread_ts is not None:
+            event["thread_ts"] = thread_ts
+        root_ts = thread_ts or message_ts
         body = {"type": "event_callback", "event_id": event_id, "team_id": TEAM, "event": event}
         posted = WebClient(token=self.factory_token, base_url=self.slack.base_url).chat_postMessage(
-            channel=CHANNEL, thread_ts=thread_ts, text=self.dispatcher_config.placeholder_text
+            channel=CHANNEL, thread_ts=root_ts, text=self.dispatcher_config.placeholder_text
         )
         placeholder = str(posted["ts"])
         if receipt:
@@ -3089,7 +3092,7 @@ class SteeringStack(Stack):
                     delivery_id=delivery_id,
                     channel_identity=minted_adapter(self.identity),
                     channel=CHANNEL,
-                    root_ts=thread_ts,
+                    root_ts=root_ts,
                     message_ts=message_ts,
                     user_id=user,
                     body=event["text"],
@@ -3102,7 +3105,7 @@ class SteeringStack(Stack):
             self.dispatcher_config,
             QueuedTurn(
                 event_id=delivery_id,
-                conversation_id=thread_ts,
+                conversation_id=root_ts,
                 author=user,
                 text=text_,
                 source=TurnSource.SLACK,
@@ -3200,7 +3203,7 @@ class SteeringStack(Stack):
         replies = len(self.api_hop.steer_answers())
         calls = len(self.slack.calls)
         self.github.pause_next_permission()
-        delivery = self.mention(user, text_, thread_ts=thread_ts)
+        delivery = self.queued_mention(user, text_, thread_ts=thread_ts)
         future = self.client.portal.start_task_soon(_consume_one, self.steerer)
         try:
             assert self.github.permission_entered.wait(20), "the permission read never started"
@@ -3851,8 +3854,8 @@ def _lose_one_admission(stack: SteeringStack, writer: Person, run: SteerRun) -> 
     not confirmed, never inviting a resend.
     """
 
-    stack.api_hop.drop_next_answer()
-    lost = stack.steer(writer.slack_user, "Please rename the helper.", thread_ts=run.root_ts)
+    stack.api_hop.drop_next_answer(STEER_PATH)
+    lost = stack.steer_queued(writer.slack_user, "Please rename the helper.", thread_ts=run.root_ts)
     delivery = lost.delivery
     expected_id = stack.expected_request_id(delivery)
     # The route really ran and committed; the worker never read its answer.
