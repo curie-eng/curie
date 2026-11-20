@@ -1,0 +1,29 @@
+{
+  "_comment": "Copied from the head of #5859: MemoryRulesMetadata in apps/api/src/curie_api/schemas/workitems.py (the work item detail's memory_rules field; the CLI work-items projection leaves it out, cli/api-mirrors.json) and applied_line/annotate in apps/api/src/curie_api/memory_rules_context.py, run on a fake digest. Refresh when #5859 changes.",
+  "metadata_fields": [
+    "state",
+    "count",
+    "rule_numbers",
+    "sha256",
+    "format_version"
+  ],
+  "selected": {
+    "state": "selected",
+    "count": 1,
+    "rule_numbers": [
+      1
+    ],
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "format_version": 1
+  },
+  "absent": {
+    "state": "absent",
+    "count": 0,
+    "rule_numbers": [],
+    "sha256": null,
+    "format_version": null
+  },
+  "applied_line": "Learned rules: in force; rules:R1; sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "pull_body_before": "Closes #13\n\nAsk the factory: comment on this pull request.\nRequester preferences: applied; sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "pull_body_annotated": "Closes #13\n\nAsk the factory: comment on this pull request.\nLearned rules: in force; rules:R1; sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nRequester preferences: applied; sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+}

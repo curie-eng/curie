@@ -12,6 +12,7 @@ identityLookup:
   existingSecret: ''
   tokenKey: token
   timeoutSeconds: 5
+lookupIdentities: []
 readinessProbe:
   initialDelaySeconds: 1
   periodSeconds: 5
