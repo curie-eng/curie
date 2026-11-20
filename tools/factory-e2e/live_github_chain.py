@@ -350,6 +350,7 @@ def before_run(p: fe.Preflight) -> None:
 
     chain = chain_of(p)
     chain.reader_id = reader_account_id(os.environ)
+    install_sanitizer(p, config_identifiers(p))
     readiness = check_readiness(
         p.config.actor_token,
         repo_root=p.repo_root,
@@ -582,11 +583,49 @@ def evidence_serializer(identifiers: judge.Identifiers) -> Callable[[dict[str, A
     return serialize
 
 
+def config_identifiers(p: fe.Preflight) -> dict[str, list[str | int]]:
+    """The raw identifiers the configuration alone names, before any account read.
+
+    ``before_run`` installs the sanitizer with these, so the install, bundle
+    and teardown logs of a run that fails before ``drive`` are sanitized too.
+    """
+
+    full_name = p.config.repo
+    owner, name = full_name.split("/", 1)
+    slug = p.config.mention
+    ids: dict[str, list[str | int]] = {
+        "fixture-repo": [full_name, name, owner],
+        "app": [str(p.config.app_id), slug, f"{slug}[bot]", int(p.config.installation_id)],
+        "namespace": [p.namespace, p.release],
+        "context": [p.config.kube_context],
+    }
+    host = registry_host(p.config.layer_registry)
+    if host:
+        ids["registry"] = [host]
+    return ids
+
+
+_INSTALLED_FILTERS: list[Callable[[str], str]] = []
+
+
 def install_sanitizer(p: fe.Preflight, identifiers: judge.Identifiers) -> None:
-    """Evidence and every later log line pass through the judge's sanitizer."""
+    """Evidence and every later log line pass through the judge's sanitizer.
+
+    A later call replaces the filter an earlier one installed (the full set
+    read in ``drive`` replaces the configuration's set of ``before_run``).
+    """
 
     p.evidence_serializer = evidence_serializer(identifiers)
-    fe.LOG_FILTERS.append(lambda text: judge.sanitize_log(text, identifiers))
+    for old in _INSTALLED_FILTERS:
+        if old in fe.LOG_FILTERS:
+            fe.LOG_FILTERS.remove(old)
+    _INSTALLED_FILTERS.clear()
+
+    def sanitize(text: str) -> str:
+        return judge.sanitize_log(text, identifiers)
+
+    _INSTALLED_FILTERS.append(sanitize)
+    fe.LOG_FILTERS.append(sanitize)
 
 
 # --------------------------------------------------------------------------

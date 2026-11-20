@@ -214,6 +214,39 @@ def test_wiring_stop_mode_records_the_unready_candidate_and_goes_on(
     assert any("readiness not met" in s["step"] for s in written["steps"])
 
 
+def test_wiring_a_run_failing_before_drive_prints_and_writes_no_raw_identifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A live stop-mode run failed building the bundle's runner layer, after the
+    # install and before drive: its logs named the kube context and the App id.
+    _main_env(monkeypatch, tmp_path, CURIE_FACTORY_READER_ACCOUNT_ID="1002")
+    _not_ready(monkeypatch)
+    _Recorder(monkeypatch)
+    seen: dict[str, str] = {}
+
+    def check_tools(p: fe.Preflight) -> None:
+        seen["namespace"] = p.namespace
+        fe.log(f"lock context-{p.config.kube_context} and app-{p.config.app_id} for {REPO}")
+        raise fe.PreflightFailed(f"curie build failed in {p.namespace} on {p.config.kube_context}")
+
+    monkeypatch.setattr(fe.Preflight, "check_tools", check_tools)
+    evidence = tmp_path / "evidence.json"
+
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+
+    assert code == fe.EXIT_FAILED
+    err = capsys.readouterr().err
+    written = evidence.read_text()
+    raw = [seen["namespace"], "ctx-fake", "4242", REPO, "fixture-app"]
+    for text in (err, written):
+        assert not [value for value in raw if value in text], text
+    assert "lock context-<context> and app-<app> for <fixture-repo>" in err
+    assert "curie build failed in <namespace> on <context>" in json.loads(written)["error"]
+    assert len(fe.LOG_FILTERS) == 1
+
+
 def _stub_preflight_steps(
     p: fe.Preflight, monkeypatch: pytest.MonkeyPatch, order: list[str]
 ) -> None:
