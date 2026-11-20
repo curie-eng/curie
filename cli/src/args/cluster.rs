@@ -1227,11 +1227,16 @@ pub(crate) enum ClusterAction {
     ///
     /// With neither flag this inspects. The agent must already hold exactly
     /// one Slack binding with an identity for the channel; add it first with
-    /// `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>`. Binding it is
-    /// a separate decision because it also makes the agent answer there.
+    /// `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>`, or, when the
+    /// channel is bound under several identities, remove the extra with
+    /// `curie cluster surfaces <agent> --remove slack=<CHANNEL_ID> --adapter
+    /// <identity>`. Binding it is a separate decision because it also makes
+    /// the agent answer there.
     ///
-    /// `--no-slack-channel` clears only the configured progress channel. A
-    /// thread that a Slack kickoff started keeps its own progress either way.
+    /// `--no-slack-channel` clears the configured progress channel: the
+    /// progress lane stops rooting runs there and stops replying and editing
+    /// cards in the threads it already rooted. A thread that a Slack kickoff
+    /// started keeps its own progress either way.
     FactoryProgress {
         /// Agent name or id.
         agent: String,

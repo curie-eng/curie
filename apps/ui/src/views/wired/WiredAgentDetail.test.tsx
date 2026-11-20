@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect } from "react";
@@ -522,6 +522,43 @@ describe("WiredAgentDetail — factory progress channel", () => {
       expect(await screen.findByTestId("factory-progress-error")).toHaveTextContent(
         "This agent has 2 Slack bindings for C0EXAMPLE1",
       );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("WiredAgentDetail — factory progress hints use the agent id", () => {
+  it("never puts the agent name in a copyable command, so an apostrophe cannot break the shell", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
+      init?.method === "PATCH"
+        ? new Response(JSON.stringify({ detail: { code: "factory_slack_channel_unbound" } }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          })
+        : new Response("{}", { status: 404, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      vi.mocked(getAgents).mockResolvedValue([{ ...AGENT, name: "acme's-bot", channels: [] }]);
+      renderDetail();
+
+      const input = await screen.findByTestId("factory-progress-input");
+      await user.type(input, "C0EXAMPLE1");
+      await user.click(screen.getByTestId("factory-progress-save"));
+      await screen.findByTestId("factory-progress-error");
+
+      const root = input.parentElement!.parentElement!;
+      const hints = within(root)
+        .getAllByRole("button", { name: /^Copy command:/ })
+        .map((b) => b.getAttribute("aria-label") ?? "");
+      // Two set commands plus the two add-surface commands.
+      expect(hints).toHaveLength(4);
+      for (const hint of hints) {
+        expect(hint).not.toContain("acme");
+        expect(hint).toContain(" a1");
+      }
     } finally {
       vi.unstubAllGlobals();
     }

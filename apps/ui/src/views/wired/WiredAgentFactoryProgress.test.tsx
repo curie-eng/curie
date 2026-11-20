@@ -49,7 +49,7 @@ function Harness({
   return (
     <StoreProvider>
       <StoreProbe env={env} />
-      <WiredAgentFactoryProgress agentId="a1" agentName="deal-desk" channel={channel} channels={channels} onSaved={onSaved} />
+      <WiredAgentFactoryProgress agentId="a1" channel={channel} channels={channels} onSaved={onSaved} />
     </StoreProvider>
   );
 }
@@ -129,8 +129,8 @@ describe("WiredAgentFactoryProgress", () => {
     expect(screen.getByTestId("toast-probe")).toHaveTextContent("Progress channel cleared");
   });
 
-  const SURFACES_CLUSTER = "Copy command: curie cluster surfaces deal-desk --add slack=C0EXAMPLE1";
-  const SURFACES_LOCAL = "Copy command: curie local surfaces deal-desk --add slack=C0EXAMPLE1";
+  const SURFACES_CLUSTER = "Copy command: curie cluster surfaces a1 --add slack=C0EXAMPLE1";
+  const SURFACES_LOCAL = "Copy command: curie local surfaces a1 --add slack=C0EXAMPLE1";
 
   async function saveUnbound(props: { env?: "prod" | "dev"; channels?: ChannelBinding[] }) {
     const user = userEvent.setup();
@@ -144,15 +144,39 @@ describe("WiredAgentFactoryProgress", () => {
     return error;
   }
 
-  it("explains an unbound 409 for either cause when the bindings are unknown", async () => {
+  const LIST_MESSAGE =
+    "This agent needs exactly one Slack binding for C0EXAMPLE1, and the bindings this page shows do not explain why it has not. " +
+    "List the agent's current bindings and make sure exactly one Slack binding for C0EXAMPLE1 remains, then set it here.";
+  const LIST_CLUSTER = "Copy command: curie cluster surfaces a1";
+  const LIST_LOCAL = "Copy command: curie local surfaces a1";
+
+  function expectListHintOnly() {
+    expect(screen.getByRole("button", { name: LIST_CLUSTER })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: LIST_LOCAL })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: SURFACES_CLUSTER })).toBeNull();
+    expect(screen.queryByRole("button", { name: SURFACES_LOCAL })).toBeNull();
+    for (const b of screen.getAllByRole("button", { name: /surfaces/ })) {
+      expect(b.getAttribute("aria-label")).not.toContain("--add");
+    }
+  }
+
+  it("lists the bindings, with no add hint, when the bindings are unknown", async () => {
     const error = await saveUnbound({});
-    expect(error).toHaveTextContent(
-      "This agent needs exactly one Slack binding for C0EXAMPLE1, and it has none or more than one identity there. " +
-        "Add the channel as a surface if it has none, or remove the extra identity if it has several.",
-    );
+    expect(error).toHaveTextContent(LIST_MESSAGE);
     expect(error).not.toHaveTextContent("Conflict");
-    expect(screen.getByRole("button", { name: SURFACES_CLUSTER })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: SURFACES_LOCAL })).toBeInTheDocument();
+    expectListHintOnly();
+  });
+
+  it("lists the bindings, with no add hint, when the snapshot shows exactly one matching Slack binding", async () => {
+    const error = await saveUnbound({
+      channels: [
+        { kind: "slack", address: "C0EXAMPLE1" },
+        { kind: "slack", address: "C0EXAMPLE9" },
+      ],
+    });
+    expect(error).toHaveTextContent(LIST_MESSAGE);
+    expect(error).not.toHaveTextContent("Add the channel as a surface");
+    expectListHintOnly();
   });
 
   it("tells the user to add the surface when no Slack binding matches the channel", async () => {
@@ -167,6 +191,8 @@ describe("WiredAgentFactoryProgress", () => {
     );
     expect(screen.getByRole("button", { name: SURFACES_CLUSTER })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: SURFACES_LOCAL })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LIST_CLUSTER })).toBeNull();
+    expect(screen.queryByRole("button", { name: LIST_LOCAL })).toBeNull();
   });
 
   it("tells the user to remove the extra identity when two Slack bindings match, with no add hint", async () => {
@@ -183,12 +209,14 @@ describe("WiredAgentFactoryProgress", () => {
     expect(error).not.toHaveTextContent("Add the channel as a surface");
     expect(screen.queryByRole("button", { name: SURFACES_CLUSTER })).toBeNull();
     expect(screen.queryByRole("button", { name: SURFACES_LOCAL })).toBeNull();
+    expect(screen.queryByRole("button", { name: LIST_CLUSTER })).toBeNull();
+    expect(screen.queryByRole("button", { name: LIST_LOCAL })).toBeNull();
   });
 
   it("shows both surfaces commands whatever the console environment", async () => {
     for (const env of ["prod", "dev"] as const) {
       fetchMock.mockReset();
-      const { unmount } = render(<Harness channel={null} onSaved={vi.fn()} env={env} />);
+      const { unmount } = render(<Harness channel={null} onSaved={vi.fn()} env={env} channels={[]} />);
       const user = userEvent.setup();
       fetchMock.mockResolvedValue(jsonResponse(409, UNBOUND_BODY));
       await user.type(screen.getByTestId("factory-progress-input"), "C0EXAMPLE1");
@@ -280,10 +308,10 @@ describe("WiredAgentFactoryProgress", () => {
   it("offers both set commands, labelled, with the stack note", () => {
     render(<Harness channel={null} onSaved={vi.fn()} />);
     expect(
-      screen.getByRole("button", { name: "Copy command: curie cluster factory-progress deal-desk" }),
+      screen.getByRole("button", { name: "Copy command: curie cluster factory-progress a1" }),
     ).toHaveTextContent("cluster");
     expect(
-      screen.getByRole("button", { name: "Copy command: curie local factory-progress deal-desk" }),
+      screen.getByRole("button", { name: "Copy command: curie local factory-progress a1" }),
     ).toHaveTextContent("local");
     expect(screen.getByTestId("factory-progress-stack-note")).toHaveTextContent(
       "Run the one for the stack serving this Console",
@@ -302,8 +330,8 @@ describe("WiredAgentFactoryProgress", () => {
     const prod = names("prod");
     const dev = names("dev");
     expect(prod).toEqual([
-      "Copy command: curie cluster factory-progress deal-desk",
-      "Copy command: curie local factory-progress deal-desk",
+      "Copy command: curie cluster factory-progress a1",
+      "Copy command: curie local factory-progress a1",
     ]);
     expect(dev).toEqual(prod);
   });
@@ -315,7 +343,7 @@ describe("WiredAgentFactoryProgress", () => {
     for (const stack of ["cluster", "local"]) {
       expect(
         screen.getByRole("button", {
-          name: `Copy command: curie ${stack} factory-progress deal-desk --slack-channel C0EXAMPLE9`,
+          name: `Copy command: curie ${stack} factory-progress a1 --slack-channel C0EXAMPLE9`,
         }),
       ).toBeInTheDocument();
     }

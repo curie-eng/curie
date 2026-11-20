@@ -16,9 +16,12 @@ type ProgressError = {
   message: string;
   // The channel the failed write named, so the unbound hint adds that exact one.
   channel: string | null;
-  // How many of the agent's Slack bindings name that channel, when the caller
-  // passed the agent's bindings; null when unknown.
-  slackBindings: number | null;
+  // Which copyable hint the refusal gets. "add" only when the page's snapshot
+  // of the agent's bindings shows none for the channel (the one case it can
+  // explain). "list" when the snapshot shows one or is absent, since it cannot
+  // explain the refusal and the bindings may have changed since the page loaded.
+  // "none" when two or more show (remove the extra) or there is nothing to name.
+  hint: "add" | "list" | "none";
 };
 
 // Both stacks are shown for every hint: the DEV/PROD toggle only picks which
@@ -32,13 +35,11 @@ const HELPER_STYLE = { fontSize: 10.5, color: C.muted, maxWidth: 360, textAlign:
 // agent-detail header column beside the model field and follows its pattern.
 export function WiredAgentFactoryProgress({
   agentId,
-  agentName,
   channel,
   channels,
   onSaved,
 }: {
   agentId: string;
-  agentName: string;
   channel: string | null;
   channels?: readonly ChannelBinding[];
   onSaved: () => void;
@@ -74,18 +75,24 @@ export function WiredAgentFactoryProgress({
           next === null || !channels
             ? null
             : channels.filter((b) => b.kind === "slack" && b.address === next).length;
-        const message =
-          slackBindings !== null && slackBindings >= 2
-            ? `This agent has ${slackBindings} Slack bindings for ${next}, one per Slack identity, and it needs exactly one. Remove the extra identity, then set it here.`
-            : slackBindings === 0
-              ? `This agent has no Slack binding for ${next}. Add the channel as a surface first, then set it here.`
-              : e.message;
-        setError({ kind: "unbound", message, channel: next, slackBindings });
+        let message: string;
+        let hint: ProgressError["hint"];
+        if (slackBindings !== null && slackBindings >= 2) {
+          message = `This agent has ${slackBindings} Slack bindings for ${next}, one per Slack identity, and it needs exactly one. Remove the extra identity, then set it here.`;
+          hint = "none";
+        } else if (slackBindings === 0) {
+          message = `This agent has no Slack binding for ${next}. Add the channel as a surface first, then set it here.`;
+          hint = "add";
+        } else {
+          message = `This agent needs exactly one Slack binding for ${next ?? "that channel"}, and the bindings this page shows do not explain why it has not. List the agent's current bindings and make sure exactly one Slack binding for ${next ?? "that channel"} remains, then set it here.`;
+          hint = next === null ? "none" : "list";
+        }
+        setError({ kind: "unbound", message, channel: next, hint });
       } else if (e instanceof FactorySlackChannelError && e.code === "invalid") {
-        setError({ kind: "format", message: SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE, channel: next, slackBindings: null });
+        setError({ kind: "format", message: SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE, channel: next, hint: "none" });
       } else {
         const message = e instanceof ApiError || e instanceof Error ? e.message : String(e);
-        setError({ kind: "other", message: `Could not update progress channel: ${message}`, channel: next, slackBindings: null });
+        setError({ kind: "other", message: `Could not update progress channel: ${message}`, channel: next, hint: "none" });
       }
     } finally {
       setBusy(false);
@@ -100,12 +107,12 @@ export function WiredAgentFactoryProgress({
         kind: "format",
         message: `Enter a Slack channel id, or use Clear to stop posting progress. ${SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE}`,
         channel: null,
-        slackBindings: null,
+        hint: "none",
       });
       return;
     }
     if (!SLACK_PROGRESS_CHANNEL_RE.test(trimmed)) {
-      setError({ kind: "format", message: SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE, channel: trimmed, slackBindings: null });
+      setError({ kind: "format", message: SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE, channel: trimmed, hint: "none" });
       return;
     }
     void write(trimmed);
@@ -155,11 +162,11 @@ export function WiredAgentFactoryProgress({
         />
         <CliHint
           label="cluster"
-          command={cliCommand("cluster.factory-progress", { agent: agentName, "slack-channel": hintChannel })}
+          command={cliCommand("cluster.factory-progress", { agent: agentId, "slack-channel": hintChannel })}
         />
         <CliHint
           label="local"
-          command={cliCommand("local.factory-progress", { agent: agentName, "slack-channel": hintChannel })}
+          command={cliCommand("local.factory-progress", { agent: agentId, "slack-channel": hintChannel })}
         />
       </div>
       <div data-testid="factory-progress-stack-note" style={HELPER_STYLE}>
@@ -171,16 +178,22 @@ export function WiredAgentFactoryProgress({
           style={{ fontSize: 11, color: C.destructive, maxWidth: 360, textAlign: "right", lineHeight: 1.4 }}
         >
           {error.message}
-          {error.kind === "unbound" && error.channel && !(error.slackBindings !== null && error.slackBindings >= 2) ? (
+          {error.kind === "unbound" && error.channel && error.hint === "add" ? (
             <div style={{ display: "flex", justifyContent: "flex-end", flexWrap: "wrap" }}>
               <CliHint
                 label="cluster"
-                command={cliCommand("cluster.surfaces", { agent: agentName, add: `slack=${error.channel}` })}
+                command={cliCommand("cluster.surfaces", { agent: agentId, add: `slack=${error.channel}` })}
               />
               <CliHint
                 label="local"
-                command={cliCommand("local.surfaces", { agent: agentName, add: `slack=${error.channel}` })}
+                command={cliCommand("local.surfaces", { agent: agentId, add: `slack=${error.channel}` })}
               />
+            </div>
+          ) : null}
+          {error.kind === "unbound" && error.hint === "list" ? (
+            <div style={{ display: "flex", justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <CliHint label="cluster" command={cliCommand("cluster.surfaces", { agent: agentId })} />
+              <CliHint label="local" command={cliCommand("local.surfaces", { agent: agentId })} />
             </div>
           ) : null}
         </div>
