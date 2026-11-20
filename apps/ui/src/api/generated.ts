@@ -13862,11 +13862,11 @@ export interface components {
         /** Verification */
         Verification: {
             /** Acceptance Criteria */
-            acceptance_criteria?: string[];
+            acceptance_criteria: string[];
             /** Check */
             check: string;
             /** Command */
-            command?: string | null;
+            command: string;
             /**
              * Source
              * @constant

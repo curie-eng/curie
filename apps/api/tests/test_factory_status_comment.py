@@ -3436,6 +3436,22 @@ def test_an_unchanged_follow_up_is_answered_without_a_checklist(
     (live_comment,) = _marked(sink, revision)
     assert "Running" in live_comment["body"]
     assert "No progress note reported" in live_comment["body"]
+    incomplete = client.post(
+        f"/v1/work-item-progress/{revision}/handoff",
+        headers={"X-API-Key": progress_token(revision)},
+        json={
+            "next_owner": "human",
+            "next_action": "Review the feedback answer",
+            "verification": [
+                {
+                    "check": "Existing decision covers the feedback",
+                    "state": "unverified",
+                    "source": "agent_reported",
+                }
+            ],
+        },
+    )
+    assert incomplete.status_code == 422
     handoff = client.post(
         f"/v1/work-item-progress/{revision}/handoff",
         headers={"X-API-Key": progress_token(revision)},

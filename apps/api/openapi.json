@@ -20180,11 +20180,14 @@
         "properties": {
           "acceptance_criteria": {
             "items": {
+              "pattern": "^AC[1-9][0-9]*$",
               "type": "string"
             },
             "maxItems": 10,
+            "minItems": 1,
             "title": "Acceptance Criteria",
-            "type": "array"
+            "type": "array",
+            "uniqueItems": true
           },
           "check": {
             "maxLength": 100,
@@ -20193,17 +20196,10 @@
             "type": "string"
           },
           "command": {
-            "anyOf": [
-              {
-                "maxLength": 240,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Command"
+            "maxLength": 240,
+            "minLength": 1,
+            "title": "Command",
+            "type": "string"
           },
           "source": {
             "const": "agent_reported",
@@ -20223,8 +20219,10 @@
         },
         "required": [
           "check",
+          "command",
           "state",
-          "source"
+          "source",
+          "acceptance_criteria"
         ],
         "title": "Verification",
         "type": "object"

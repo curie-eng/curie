@@ -4,57 +4,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from curie_internal.factory_run_handoff import RunHandoff as RunHandoff
 
 from .factory_comment_text import redact_factory_comment
 from .factory_no_change import no_change_marker_line
-
-
-class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class Finding(_Strict):
-    summary: str = Field(min_length=1, max_length=160)
-    owner: Literal["agent", "human", "platform", "unknown"]
-    next_step: str = Field(min_length=1, max_length=160)
-    source: Literal["agent_reported"]
-
-
-class Verification(_Strict):
-    check: str = Field(min_length=1, max_length=100)
-    command: str | None = Field(default=None, min_length=1, max_length=240)
-    state: Literal["passed", "failed", "unverified", "not_run"]
-    source: Literal["agent_reported"]
-    acceptance_criteria: list[str] = Field(default_factory=list, max_length=10)
-
-    @field_validator("acceptance_criteria")
-    @classmethod
-    def _criterion_ids(cls, value: list[str]) -> list[str]:
-        if any(not re.fullmatch(r"AC[1-9][0-9]*", item) for item in value):
-            raise ValueError("acceptance criteria must use numbered AC identifiers")
-        if len(value) != len(set(value)):
-            raise ValueError("acceptance criteria must not repeat within one check")
-        return value
-
-
-class RunHandoff(_Strict):
-    next_owner: Literal["agent", "human", "platform", "unknown"]
-    next_action: str = Field(min_length=1, max_length=200)
-    human_decision: str | None = Field(default=None, min_length=1, max_length=200)
-    later_gate: str | None = Field(default=None, min_length=1, max_length=200)
-    findings: list[Finding] = Field(default_factory=list, max_length=10)
-    verification: list[Verification] = Field(default_factory=list, max_length=20)
-
-    @field_validator("next_action", "human_decision", "later_gate")
-    @classmethod
-    def _nonblank(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
-            raise ValueError("handoff text must not be blank")
-        return value
-
 
 _MARKDOWN = re.compile(r"([\\`*_{}\[\]()#+.!|>])")
 _CUSTOMER_IDENTIFIER = re.compile(

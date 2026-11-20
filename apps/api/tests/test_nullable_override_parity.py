@@ -84,7 +84,7 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.routers.identity_connect",
         "curie_api.routers.identity_operator",
         "curie_api.factory_progress",
-        "curie_api.factory_run_handoff",
+        "curie_internal.factory_run_handoff",
         "curie_api.factory_usage",
         "curie_api.schemas.action_executions",
         "curie_api.hook_source_policy_schemas",

@@ -274,6 +274,7 @@ def test_typed_handoff_is_bounded_and_source_labelled() -> None:
                 "verification": [
                     {
                         "check": "Python tests",
+                        "command": "uv run pytest",
                         "state": "passed",
                         "source": "agent_reported",
                         "acceptance_criteria": ["AC1", "AC1"],
@@ -438,7 +439,13 @@ def test_terminal_summary_keeps_markers_and_cause_in_jira() -> None:
             "next_owner": "agent",
             "next_action": "Resolve the parser choice",
             "verification": [
-                {"check": "Python", "state": "unverified", "source": "agent_reported"}
+                {
+                    "check": "Python",
+                    "command": "uv run pytest",
+                    "state": "unverified",
+                    "source": "agent_reported",
+                    "acceptance_criteria": ["AC1"],
+                }
             ],
         }
     )

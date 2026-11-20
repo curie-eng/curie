@@ -20,6 +20,8 @@ from typing import Any
 import aiohttp
 from aci_protocol import BootEnv
 from claude_agent_sdk import SdkMcpTool, tool
+from curie_internal.factory_run_handoff import RunHandoff
+from pydantic import ValidationError
 
 from .tool_names import PROGRESS_TOOL, RUN_HANDOFF_TOOL
 
@@ -267,51 +269,7 @@ def build_progress_tool(
 def build_run_handoff_tool(client: ProgressClient) -> SdkMcpTool[Any]:
     """Optional, request-bound structured evidence submitted before a run ends."""
 
-    def text(maximum: int) -> dict[str, Any]:
-        return {"type": "string", "minLength": 1, "maxLength": maximum}
-
-    finding = {
-        "type": "object",
-        "properties": {
-            "summary": text(160),
-            "owner": {"type": "string", "enum": ["agent", "human", "platform", "unknown"]},
-            "next_step": text(160),
-            "source": {"type": "string", "const": "agent_reported"},
-        },
-        "required": ["summary", "owner", "next_step", "source"],
-        "additionalProperties": False,
-    }
-    verification = {
-        "type": "object",
-        "properties": {
-            "check": text(100),
-            "command": text(240),
-            "state": {"type": "string", "enum": ["passed", "failed", "unverified", "not_run"]},
-            "source": {"type": "string", "const": "agent_reported"},
-            "acceptance_criteria": {
-                "type": "array",
-                "items": {"type": "string", "pattern": "^AC[1-9][0-9]*$"},
-                "minItems": 1,
-                "maxItems": 10,
-                "uniqueItems": True,
-            },
-        },
-        "required": ["check", "command", "state", "source", "acceptance_criteria"],
-        "additionalProperties": False,
-    }
-    schema = {
-        "type": "object",
-        "properties": {
-            "next_owner": {"type": "string", "enum": ["agent", "human", "platform", "unknown"]},
-            "next_action": text(200),
-            "human_decision": text(200),
-            "later_gate": text(200),
-            "findings": {"type": "array", "items": finding, "maxItems": 10},
-            "verification": {"type": "array", "items": verification, "maxItems": 20},
-        },
-        "required": ["next_owner", "next_action"],
-        "additionalProperties": False,
-    }
+    schema = RunHandoff.model_json_schema(mode="validation")
 
     @tool(
         RUN_HANDOFF_TOOL,
@@ -325,6 +283,10 @@ def build_run_handoff_tool(client: ProgressClient) -> SdkMcpTool[Any]:
         schema,
     )
     async def report_run_handoff(args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            RunHandoff.model_validate(args)
+        except ValidationError:
+            return _error("Run handoff was not recorded (invalid fields). Correct and retry.")
         status = await client.post(args, suffix="/handoff")
         if status == 201:
             return {"content": [{"type": "text", "text": "run handoff recorded"}]}
