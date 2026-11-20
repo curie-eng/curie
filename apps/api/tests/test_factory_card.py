@@ -213,7 +213,8 @@ def test_the_card_escapes_the_issue_title_and_shows_the_note_in_italics(
     assert "<script>alert(1)</script>" in text  # decoded text content, never markup
     assert "RUNNING" in text
     style = _style(root)
-    (holder,) = [e for e in root.iter() if (e.text or "").strip() == note.strip()]
+    (holder,) = [e for e in root.iter() if note in (e.text or "")]
+    assert (holder.text or "").startswith("Agent update ")
     assert _is_italic(holder, style)
 
 
@@ -248,7 +249,7 @@ def test_a_card_with_a_kickback_badges_the_plan_arc(admitted: Any) -> None:  # n
     assert "round 2 of 3" in _all_text(after)
 
 
-def test_platform_wait_ci_keeps_the_latest_agent_note_in_the_card(admitted: Any) -> None:  # noqa: F811
+def test_platform_wait_ci_attributes_the_last_note_without_repeating_it(admitted: Any) -> None:  # noqa: F811
     client, github, _sink = admitted
     number = 9808
     _label(client, github, number)
@@ -289,8 +290,11 @@ def test_platform_wait_ci_keeps_the_latest_agent_note_in_the_card(admitted: Any)
     assert response.status_code == 200, response.text
     root = _parse(response.text)
     assert "current" in _classes(_stage(root, "wait_ci"))
-    (holder,) = [element for element in root.iter() if (element.text or "") == note]
-    assert _is_italic(holder, _style(root))
+    text = _all_text(root)
+    assert "Waiting · CI" in text
+    assert "Platform wait recorded" in text
+    assert "last agent note" in text
+    assert note not in text
 
 
 @pytest.mark.parametrize(
@@ -635,7 +639,8 @@ def test_staged_header_uses_recorded_activity_and_the_declared_reviewer() -> Non
     assert "last tool Bash" in text
     assert "anthropic/claude-opus-5.5" in text
     assert "loop cap 3" in text
-    (holder,) = [element for element in root.iter() if (element.text or "") == note]
+    (holder,) = [element for element in root.iter() if note in (element.text or "")]
+    assert (holder.text or "").startswith("Agent update ")
     assert _is_italic(holder, _style(root))
 
 

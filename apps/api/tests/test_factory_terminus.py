@@ -67,6 +67,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 
+def _recorded_result(body: str) -> str:
+    assert body.startswith("## Run outcome\n")
+    marker = "### Recorded result\n"
+    assert body.count(marker) == 1
+    return body.split(marker, 1)[1]
+
+
 def test_completed_issue_comment_body_requires_pull_request_url() -> None:
     with pytest.raises(ValueError, match="requires its pull request URL"):
         result_section("completed", pr_url=None)
@@ -505,7 +512,7 @@ def test_capacity_wait_expiry_posts_one_comment(admitted: Any) -> None:
     assert notices[0]["posted_at"] is not None
     assert sink.posts == 1
     body = sink.comments[0]["body"]
-    assert body.startswith("Could not complete:")
+    assert _recorded_result(body).startswith("Could not complete:")
     assert "Cause: capacity_wait_expired" in body
     assert marker_for(row["id"]) in body
     assert FINAL_MARKER in body
@@ -611,7 +618,7 @@ def test_admission_unavailable_deferral_preserves_deadline_and_neutral_surfaces(
     assert notices[0]["posted_at"] is not None
     body = sink.comments[0]["body"]
     neutral = "sandbox admission did not complete before the wait expired."
-    assert body.startswith(f"Could not complete: {neutral}")
+    assert _recorded_result(body).startswith(f"Could not complete: {neutral}")
     assert "Cause: capacity_wait_expired" in body
     assert "no runner capacity" not in body
     assert "no sandbox capacity" not in body
@@ -884,7 +891,7 @@ def test_approval_create_failure_posts_terminal_issue_notice_and_clears_running_
 
     assert _request(number)["terminal_cause"] == "approval_create_failed"
     assert sink.posts == 1
-    assert sink.comments[0]["body"].startswith("Could not complete:")
+    assert _recorded_result(sink.comments[0]["body"]).startswith("Could not complete:")
     assert "curie:running" not in sink.issue_labels[number]
     assert "curie-factory:needs-human" in sink.issue_labels[number]
 
@@ -914,7 +921,7 @@ def test_approval_create_failure_after_first_publication_ends_ci_fix_round(
     _reconcile()
 
     assert _request(number)["terminal_cause"] == "approval_create_failed"
-    assert sink.comments[0]["body"].startswith("Could not complete:")
+    assert _recorded_result(sink.comments[0]["body"]).startswith("Could not complete:")
     assert "curie:running" not in sink.issue_labels[number]
 
 
@@ -945,7 +952,7 @@ def test_credit_exhausted_finish_comments_the_redacted_provider_message(
     _reconcile()
     assert sink.posts == 1
     body = sink.comments[0]["body"]
-    assert body.startswith("Could not complete: the model provider refused")
+    assert _recorded_result(body).startswith("Could not complete: the model provider refused")
     assert "Provider message: model error: unknown: API Error: 402 requires more credits" in body
     assert key not in body
 
@@ -954,10 +961,10 @@ def test_credit_exhausted_finish_comments_the_redacted_provider_message(
     ("number", "cause"),
     [(9291, "early_stop"), (9292, "no_pull_request"), (9300, "revision_unchanged")],
 )
-def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
+def test_an_unpublished_finish_stores_the_agents_redacted_last_message(
     admitted: Any, number: int, cause: str
 ) -> None:
-    """#3128: the agent's final message survives on the notice row and the comment."""
+    """#3128: the final survives on the row; the issue presents platform facts."""
 
     client, github, sink = admitted
     _label(client, github, number)
@@ -987,9 +994,9 @@ def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
     _reconcile()
     assert sink.posts == 1
     body = sink.comments[0]["body"]
-    assert body.startswith("Could not complete:")
-    assert "Agent's last message:" in body
-    assert "I read the issue and stopped." in body
+    assert _recorded_result(body).startswith("Could not complete:")
+    assert "Agent's last message:" not in body
+    assert "I read the issue and stopped." not in body
     assert key not in body
     assert f"Cause: {cause}" in body
     # The model's copy of the final marker is broken; the platform's own is the
@@ -2014,7 +2021,8 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
         "No changes needed: the open pull request already covers this request: "
         f"https://github.com/{REPO}/pull/{pr}"
     ) in body
-    assert detail.strip() in body
+    assert "**Agent-reported answer:** the existing tests already cover this request" in body
+    assert detail.strip() not in body
     assert "Could not complete:" not in body
     assert "NEEDS HUMAN" not in body
     assert "Cause:" not in body
@@ -2072,10 +2080,9 @@ def _assert_lead_in_unchanged_completion(
         "No changes needed: the open pull request already covers this request: "
         f"https://github.com/{REPO}/pull/{pr}"
     ) in body
-    assert "Agent's last message:" in body
-    for line in detail.strip().splitlines():
-        if line:
-            assert line in body
+    assert "Agent's last message:" not in body
+    assert "**Agent-reported answer:** the existing tests already cover this request" in body
+    assert "The recorded decision already covers this request." not in body
     assert "Could not complete:" not in body
     assert "NEEDS HUMAN" not in body
     assert "Cause:" not in body
@@ -2782,7 +2789,9 @@ def test_factory_notices_publication_unrecorded_finish_comments_its_details_once
 
     assert sink.posts == 1
     body = _assert_one_final_comment([comment["body"] for comment in sink.comments], row["id"])
-    assert body.startswith(f"Could not complete: {_PUBLICATION_UNRECORDED_SENTENCE}\n")
+    assert _recorded_result(body).startswith(
+        f"Could not complete: {_PUBLICATION_UNRECORDED_SENTENCE}\n"
+    )
     assert f"Details: {detail}" in body
     assert "Provider message:" not in body
     assert "Cause: publication_unrecorded" in body

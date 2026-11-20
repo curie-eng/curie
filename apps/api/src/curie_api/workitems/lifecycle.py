@@ -25,6 +25,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from .. import factory_questions, factory_retry_policy, memory_rules_admission, transcripts
 from ..config import get_settings
+from ..factory_no_change import no_change_marker_line
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
 from ..factory_retry_policy import Disposition, DispositionKind, RetryFacts, RetrySafety
 from ..factory_tracker_result_delivery import DeliveryOrigin, DeliveryState, seal_platform_findings
@@ -1311,14 +1312,7 @@ def _has_no_change_marker(detail: str | None) -> bool:
     line does not count, and "No changes needed because" does not count.
     """
 
-    if not detail:
-        return False
-    marker = "No changes needed:"
-    for line in detail.splitlines():
-        candidate = line.lstrip().lstrip(">*_").lstrip()
-        if candidate.startswith(marker):
-            return True
-    return False
+    return no_change_marker_line(detail) is not None
 
 
 async def _unchanged_follow_up(

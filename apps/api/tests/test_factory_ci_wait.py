@@ -3085,7 +3085,7 @@ def test_plan_gated_private_branch_rules_403_completes_like_no_rules(admitted: A
     _reconcile()
 
     assert _terminal(number) == ("completed", "completed")
-    assert _body(sink, published["id"]).startswith("Completed:")
+    assert _recorded_result(_body(sink, published["id"])).startswith("Completed:")
 
 
 def test_plan_gated_private_rules_still_require_classic_protection(admitted: Any) -> None:

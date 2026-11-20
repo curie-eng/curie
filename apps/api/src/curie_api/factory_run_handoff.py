@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .factory_comment_text import redact_factory_comment
+from .factory_no_change import no_change_marker_line
 
 
 class _Strict(BaseModel):
@@ -231,12 +232,13 @@ def _agent_failure_lines(detail: str | None) -> tuple[str | None, str | None]:
 def agent_no_change_answer(detail: str | None) -> str | None:
     """Extract one bounded, inert answer from a declared no-change final."""
 
-    if not detail:
+    marker = no_change_marker_line(detail)
+    if marker is None:
         return None
-    first = detail.replace("\r\n", "\n").replace("\r", "\n").split("\n", 1)[0].strip()
-    if not first.startswith("No changes needed:"):
-        return None
-    rendered = safe_tracker_line(first.removeprefix("No changes needed:").strip())
+    answer = marker.removeprefix("No changes needed:").strip()
+    if answer.startswith("** "):
+        answer = answer[3:]
+    rendered = safe_tracker_line(answer)
     if not rendered:
         return None
     return rendered if len(rendered) <= 240 else rendered[:237].rstrip() + "..."

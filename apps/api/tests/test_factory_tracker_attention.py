@@ -101,6 +101,21 @@ def test_no_change_answer_is_bounded_and_ignores_following_lines() -> None:
     assert agent_no_change_answer("An unrelated final") is None
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "No changes needed: existing tests cover this.",
+        "> No changes needed: existing tests cover this.",
+        "**No changes needed:** existing tests cover this.",
+        "_No changes needed: existing tests cover this.",
+    ],
+)
+def test_no_change_answer_uses_the_completion_marker_rules(marker: str) -> None:
+    assert agent_no_change_answer(f"Earlier context.\n\n{marker}") == (
+        r"existing tests cover this\."
+    )
+
+
 def test_omitted_human_decision_is_not_attributed_to_agent() -> None:
     handoff = RunHandoff.model_validate(
         {"next_owner": "agent", "next_action": "Continue", "verification": []}

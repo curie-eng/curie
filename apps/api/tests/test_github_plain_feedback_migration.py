@@ -35,6 +35,7 @@ from test_github_plain_feedback import (
 from test_memory_rules_migration import _agent, _lineage
 
 REVISION = "0186"
+CURRENT_APP_REVISION = "0187"
 BELOW = "0185"
 TABLE = "thread_publication_lineages"
 COUNT_CHECK = "thread_publication_lineages_plain_feedback_revisions_ck"
@@ -123,7 +124,9 @@ def test_a_pull_request_bound_before_the_upgrade_takes_plain_feedback_after_it(
     past the cap (or with a capped time) refuses this first comment.
     """
 
-    isolated_migration_db.at(REVISION)
+    # The current API reads run handoffs from 0187. Seed the work item there,
+    # then make its publication lineage at the pre-0186 schema boundary.
+    isolated_migration_db.at(CURRENT_APP_REVISION)
     github = factory_github(monkeypatch, tmp_path)
     try:
         with running_factory(github, new_agent=True) as factory:
@@ -140,6 +143,9 @@ def test_a_pull_request_bound_before_the_upgrade_takes_plain_feedback_after_it(
         )
         command.upgrade(config, REVISION)
         assert stamped_revision() == REVISION
+        assert _counts(lineage_id) == (0, None)
+        command.upgrade(config, CURRENT_APP_REVISION)
+        assert stamped_revision() == CURRENT_APP_REVISION
 
         with running_factory(github, new_agent=False) as factory:
             _complete(factory.client, first["id"])
