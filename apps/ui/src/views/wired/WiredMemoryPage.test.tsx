@@ -448,6 +448,32 @@ describe("WiredMemoryPage actions (#5800)", () => {
       expect(screen.queryByTestId("memory-rules-error")).toBeNull();
     });
 
+    it("judges the refresh by the newest reload when an older one resolves last", async () => {
+      const a = rule({ id: "ra", text: "rule a", version: 1 });
+      const b = rule({ id: "rb", text: "rule b", version: 1 });
+      let releaseOlder!: (v: MemoryRules) => void;
+      const older = new Promise<MemoryRules>((resolve) => (releaseOlder = resolve));
+      vi.mocked(listMemoryRules)
+        .mockResolvedValueOnce(list(a, b))
+        .mockReturnValueOnce(older) // the reload after rule a's refused accept
+        .mockRejectedValue(unavailable()); // the newer reload, after rule b's accept
+      vi.mocked(acceptMemoryRule)
+        .mockRejectedValueOnce(refusal(409, "memory_rules.stale_version"))
+        .mockResolvedValueOnce({ rule: { ...b, state: "accepted" as const }, applies_from: "next_ticket" });
+      renderPage();
+
+      const cards = await screen.findAllByTestId("memory-rule");
+      await userEvent.click(within(cards[0]).getByRole("button", { name: "Accept" }));
+      await userEvent.click(within(screen.getAllByTestId("memory-rule")[1]).getByRole("button", { name: "Accept" }));
+      expect(await screen.findByText("The change was saved, but the list could not be refreshed.")).toBeInTheDocument();
+      // The older read answers last, successfully; the screen still shows the first list.
+      await act(async () => {
+        releaseOlder(list(a, b));
+      });
+      expect(await screen.findByText("This rule changed. The list could not be refreshed.")).toBeInTheDocument();
+      expect(screen.queryByText("This rule changed. The list was refreshed.")).toBeNull();
+    });
+
     it("still reports a failure of the first load on the page", async () => {
       vi.mocked(listMemoryRules).mockRejectedValue(unavailable());
       renderPage();

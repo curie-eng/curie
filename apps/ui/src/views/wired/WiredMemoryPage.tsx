@@ -197,30 +197,46 @@ function MemoryBody({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
   const newest = useRef(0);
+  const latest = useRef<Promise<boolean>>(Promise.resolve(true));
   // One refusal per rule, shown on its card; a note per section after a Dismiss
   // or a Remove (neither has an undo).
   const [refusals, setRefusals] = useState<Record<string, { text: string; scopeKey: string }>>({});
   const [notes, setNotes] = useState<Record<string, { proposed?: string; inForce?: string }>>({});
 
-  // Resolves true when the list was read. A reload the person did not ask for
-  // (after an action) passes `report: false`: its failure belongs to the action
-  // that caused it, not to the page.
-  const load = useCallback(async (report = true): Promise<boolean> => {
-    // Only the newest request's answer is applied: two decisions in a row start
-    // two reloads, and the older one may read before the second decision lands.
-    const mine = ++newest.current;
-    try {
-      const fresh = await listMemoryRules(agentId);
-      if (mine === newest.current) {
-        setData(fresh);
-        setError(null);
+  // Resolves true when the list on screen is the one this call (or a newer one)
+  // read. A reload the person did not ask for (after an action) passes
+  // `report: false`: its failure belongs to the action that caused it, not to the
+  // page.
+  const load = useCallback(
+    async (report = true): Promise<boolean> => {
+      // Only the newest request's answer is applied: two decisions in a row start
+      // two reloads, and the older one may read before the second decision lands.
+      const mine = ++newest.current;
+      const run = (async () => {
+        try {
+          const fresh = await listMemoryRules(agentId);
+          if (mine === newest.current) {
+            setData(fresh);
+            setError(null);
+          }
+          return true;
+        } catch (e) {
+          if (report && mine === newest.current) setError(e instanceof Error ? e.message : String(e));
+          return false;
+        }
+      })();
+      latest.current = run;
+      await run;
+      // An older read that finished after a newer one started was discarded, so
+      // whether the list on screen is fresh is the newest read's result.
+      for (;;) {
+        const current = latest.current;
+        const ok = await current;
+        if (current === latest.current) return ok;
       }
-      return true;
-    } catch (e) {
-      if (report && mine === newest.current) setError(e instanceof Error ? e.message : String(e));
-      return false;
-    }
-  }, [agentId]);
+    },
+    [agentId],
+  );
 
   useEffect(() => {
     void load();
