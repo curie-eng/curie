@@ -794,6 +794,7 @@ def test_connect_plan_captures_slack_names_through_gateway(migrated: None, provi
     run(body)
 
 
+@pytest.mark.parametrize("connect_browser", ["", "fenced"], indirect=True)
 def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) -> None:
     import re
 
@@ -825,6 +826,7 @@ def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) ->
 @pytest.mark.parametrize(
     "bad", ["origin", "missing_origin", "null_origin", "csrf", "token", "session"]
 )
+@pytest.mark.parametrize("connect_browser", ["", "fenced"], indirect=True)
 def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str) -> None:
     import re
 
@@ -853,6 +855,7 @@ def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str)
     assert browser_links(tenant_id) == []
 
 
+@pytest.mark.parametrize("connect_browser", ["", "fenced"], indirect=True)
 def test_connect_confirm_page_referrer_policy_is_strict_origin(connect_browser) -> None:
     """#5836. no-referrer makes a browser send Origin null. strict-origin does not."""
 
@@ -980,6 +983,7 @@ def test_connect_plan_page_style_matches_its_csp_hash(connect_plan_browser) -> N
     assert '<p class="warning">Confirm only if this is your own Slack account.' in page.text
 
 
+@pytest.mark.parametrize("connect_browser", ["", "fenced"], indirect=True)
 def test_oidc_callback_returns_to_confirmation_and_preserves_verified_claim(
     connect_browser,
 ) -> None:
@@ -1092,11 +1096,13 @@ def test_configuration_change_revokes_outstanding_connection(migrated: None, bad
     run(body)
 
 
+@pytest.mark.parametrize("connect_browser", ["", "fenced"], indirect=True)
 def test_form_parser_errors_are_private_and_do_not_link(connect_browser) -> None:
-    from curie_api.auth import CONSOLE_SESSION_COOKIE
+    from curie_api.routers.identity_connect import PROOF_COOKIE
 
-    client, raw, tenant_id, _, session_token, _ = connect_browser
-    client.cookies.set(CONSOLE_SESSION_COOKIE, session_token)
+    client, raw, tenant_id, _, proof, _ = connect_browser
+    # Signed in with the connect proof, so the fenced app reaches the form parser too.
+    client.cookies.set(PROOF_COOKIE, proof)
     path = f"/identity/connect/{raw}"
     client.get(path)
     response = client.post(f"{path}/confirm", data={}, headers={"Origin": "https://testserver"})
@@ -1342,6 +1348,7 @@ def test_actual_proxy_prefix_is_preserved_through_connect_oidc_and_confirm(conne
     assert ("UALICE001", principal_id) in browser_links(tenant_id)
 
 
+@pytest.mark.parametrize("connect_browser", ["", "fenced"], indirect=True)
 def test_connect_browser_proof_is_private_scoped_and_rechecks_deactivation(connect_browser):
     from curie_api.routers.identity_connect import CSRF_COOKIE, PROOF_COOKIE
 
@@ -1580,3 +1587,42 @@ def test_oidc_callback_with_lapsed_connect_link_refuses_privately(
     cleared = " ".join(response.headers.get_list("set-cookie"))
     assert "__Host-curie_identity_connect=" in cleared and "Max-Age=0" in cleared
     assert client.get(path).status_code == 400
+
+
+@pytest.mark.parametrize("connect_browser", ["fenced"], indirect=True)
+@pytest.mark.parametrize(
+    ("accept", "with_link", "page"),
+    [("text/html", True, True), (None, True, False), ("text/html", False, False)],
+)
+def test_oidc_callback_cancelled_from_a_connect_link_is_a_page_for_browsers(
+    connect_browser, accept: str | None, with_link: bool, page: bool
+) -> None:
+    """Cancelling at the IdP (error=access_denied) ends on the refusal page, not raw JSON."""
+    from urllib.parse import parse_qs, urlsplit
+
+    import httpx
+    from curie_api.routers.identity_connect import CONNECT_COOKIE, PRIVATE_HEADERS
+
+    client, raw, _, _, _, _ = connect_browser
+    if with_link:
+        assert client.get(f"/identity/connect/{raw}").status_code == 200
+    assert (client.cookies.get(CONNECT_COOKIE) is not None) is with_link
+    login = client.get("/console/oidc/login", follow_redirects=False)
+    assert login.status_code == 302
+    with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
+        authorized = browser.get(login.headers["location"])
+    state = parse_qs(urlsplit(authorized.headers["location"]).query)["state"][0]
+    response = client.get(
+        f"/console/oidc/callback?error=access_denied&state={state}",
+        headers={"Accept": accept} if accept else {},
+        follow_redirects=False,
+    )
+    assert response.status_code == 401
+    if page:
+        assert response.headers["content-type"].startswith("text/html")
+        assert "<title>This link can't be used</title>" in response.text
+        for name, value in PRIVATE_HEADERS.items():
+            assert response.headers[name] == value
+    else:
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.json() == {"detail": "OIDC login failed"}
