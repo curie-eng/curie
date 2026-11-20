@@ -40,7 +40,6 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import one_ticket_scenario as ots
-from curie_internal.factory_cause import cause_text
 
 # The Jira fake's site identity (placeholders, never a real site or token).
 CLOUD_ID = "11111111-1111-1111-1111-111111111111"
@@ -417,7 +416,21 @@ KNOWN_STATUSES = frozenset(
         "RUNNING", "STOPPING", "SUCCEEDED", "WAITING", "COMPLETED", "FAILED", "EXPIRED",
     }
 )  # fmt: skip
-_UNKNOWN_CAUSE_TEXT = cause_text("")
+# The terminal causes the one-ticket flow can show, each one the platform's cause
+# table explains (a test keeps them in step). The driver runs under the system
+# interpreter, so it cannot import that table.
+KNOWN_CAUSES = frozenset(
+    {
+        "questions_asked", "question_rounds_exhausted", "execution_deadline",
+        "capacity_wait_expired", "start_failed", "owner_lost", "issue_cancelled",
+        "issue_deleted", "runner_timeout", "runner_escalated", "runner_error",
+        "runner_failed", "model_error", "model_unreachable", "max_turns", "early_stop",
+        "no_pull_request", "pull_request_not_adopted", "publication_denied",
+        "publication_expired", "publication_failed", "publication_refused",
+        "ci_failed", "ci_timeout", "ci_unverified", "merge_conflict", "pr_closed",
+        "unclassified",
+    }
+)  # fmt: skip
 UNRECOGNIZED = "unrecognized"
 _KNOWN_LINES = (ots.INVESTIGATING_LINE, ots.ANSWER_RECEIVED_LINE, "Could not complete:")
 
@@ -446,7 +459,7 @@ def comment_outcome(record: Mapping[str, Any], pull_url: str | None) -> dict[str
         status_value: str | None = UNRECOGNIZED
     else:
         status_value = status.group(1) if status else None
-    if cause and cause_text(cause.group(1)) == _UNKNOWN_CAUSE_TEXT:
+    if cause and cause.group(1) not in KNOWN_CAUSES:
         cause_value: str | None = UNRECOGNIZED
     else:
         cause_value = cause.group(1) if cause else None

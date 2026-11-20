@@ -444,6 +444,13 @@ def test_comment_outcome_never_copies_a_status_or_cause_outside_the_vocabulary()
     assert "PRIVATE" not in published and "private_project" not in published
 
 
+def test_every_known_cause_is_one_the_platform_explains() -> None:
+    from curie_internal.factory_cause import cause_text
+
+    unknown = cause_text("")
+    assert sorted(c for c in ojt.KNOWN_CAUSES if cause_text(c) == unknown) == []
+
+
 def test_the_poll_cursor_time_is_read_from_its_stored_form() -> None:
     assert ojt.cursor_time_ms("1763625600123;c10102,h10100") == 1763625600123
     assert ojt.cursor_time_ms("") is None
