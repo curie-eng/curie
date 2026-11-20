@@ -190,18 +190,36 @@ def closing_pulls(pulls: Iterable[Mapping[str, Any]], issue: int) -> list[Mappin
     return [pull for pull in pulls if pattern.search(pull.get("body") or "")]
 
 
-def assert_one_pull_request(
-    pulls: Sequence[Mapping[str, Any]], issue: int, before: int
-) -> Mapping[str, Any]:
-    """Session 2 opened one pull request, and it closes this issue."""
+def new_pulls(pulls: Iterable[Mapping[str, Any]], before: Iterable[int]) -> list[Mapping[str, Any]]:
+    """The pull requests whose numbers were not there before the scenario began."""
 
+    known = set(before)
+    return [pull for pull in pulls if int(pull["number"]) not in known]
+
+
+def assert_no_new_pulls(pulls: Iterable[Mapping[str, Any]], before: Iterable[int]) -> None:
+    """Nothing was opened yet: a run that asked its questions published nothing."""
+
+    opened = sorted(int(pull["number"]) for pull in new_pulls(pulls, before))
+    _require(not opened, f"pull requests opened before the answer: {opened}")
+
+
+def assert_one_pull_request(
+    pulls: Sequence[Mapping[str, Any]], issue: int, before: Iterable[int]
+) -> Mapping[str, Any]:
+    """Session 2 opened exactly one new pull request, and that one closes this issue.
+
+    The closing reference is read from the new pull request itself, so an older
+    pull request edited to name the issue cannot stand in for it.
+    """
+
+    opened = new_pulls(pulls, before)
+    _require(len(opened) == 1, f"expected one new pull request, found {len(opened)}")
     _require(
-        len(pulls) == before + 1,
-        f"expected one new pull request, found {len(pulls) - before}",
+        bool(closing_pulls(opened, issue)),
+        f"the new pull request is not one closing #{issue}",
     )
-    closing = closing_pulls(pulls, issue)
-    _require(len(closing) == 1, f"expected one pull request closing #{issue}, found {len(closing)}")
-    return closing[0]
+    return opened[0]
 
 
 def assert_no_factory_issues(before: Iterable[int], issues: Iterable[Mapping[str, Any]]) -> None:

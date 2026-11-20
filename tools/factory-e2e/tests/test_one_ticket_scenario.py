@@ -89,8 +89,8 @@ def test_each_flow_point_passes_on_the_valid_shape() -> None:
     ots.assert_answer_admitted(
         [asking, second], str(asking["id"]), T0, T0 + timedelta(seconds=ots.RESPONSE_SECONDS)
     )
-    pull = {"body": f"Closes #{ots.ISSUE}", "html_url": "https://example.test/pull/1"}
-    assert ots.assert_one_pull_request([pull], ots.ISSUE, 0) is pull
+    pull = {"number": 1, "body": f"Closes #{ots.ISSUE}", "html_url": "https://example.test/pull/1"}
+    assert ots.assert_one_pull_request([pull], ots.ISSUE, []) is pull
     ots.assert_no_factory_issues([3815, ots.ISSUE], [{"number": 3815}, {"number": ots.ISSUE}])
 
 
@@ -100,12 +100,12 @@ def test_a_second_factory_created_issue_is_refused() -> None:
 
 
 def test_a_pull_request_without_the_closing_reference_is_refused() -> None:
-    bare = {"body": f"Fixes the ticket #{ots.ISSUE}", "html_url": "u"}
+    bare = {"number": 1, "body": f"Fixes the ticket #{ots.ISSUE}", "html_url": "u"}
     with pytest.raises(ots.OneTicketAssertionError, match="closing #3911"):
-        ots.assert_one_pull_request([bare], ots.ISSUE, 0)
-    other = {"body": "Closes #39110", "html_url": "u"}
+        ots.assert_one_pull_request([bare], ots.ISSUE, [])
+    other = {"number": 1, "body": "Closes #39110", "html_url": "u"}
     with pytest.raises(ots.OneTicketAssertionError, match="closing #3911"):
-        ots.assert_one_pull_request([other], ots.ISSUE, 0)
+        ots.assert_one_pull_request([other], ots.ISSUE, [])
 
 
 def test_a_second_request_after_the_bot_comment_is_refused() -> None:
@@ -199,14 +199,27 @@ def test_a_question_comment_from_someone_else_is_refused() -> None:
 
 
 def test_an_extra_pull_request_is_refused() -> None:
-    pull = {"body": f"Closes #{ots.ISSUE}", "html_url": "u"}
-    other = {"body": "Unrelated", "html_url": "v"}
+    pull = {"number": 2, "body": f"Closes #{ots.ISSUE}", "html_url": "u"}
+    other = {"number": 3, "body": "Unrelated", "html_url": "v"}
     with pytest.raises(ots.OneTicketAssertionError, match="found 2"):
-        ots.assert_one_pull_request([pull, other], ots.ISSUE, 0)
+        ots.assert_one_pull_request([pull, other], ots.ISSUE, [1])
     with pytest.raises(ots.OneTicketAssertionError, match="found 0"):
-        ots.assert_one_pull_request([], ots.ISSUE, 0)
+        ots.assert_one_pull_request([], ots.ISSUE, [])
     with pytest.raises(ots.OneTicketAssertionError, match="found 2"):
-        ots.assert_one_pull_request([pull, {**pull, "html_url": "w"}], ots.ISSUE, 0)
+        ots.assert_one_pull_request([pull, {**pull, "number": 4}], ots.ISSUE, [])
+
+
+def test_an_older_pull_request_edited_to_close_the_issue_cannot_stand_in() -> None:
+    older = {"number": 1, "body": f"Closes #{ots.ISSUE}", "html_url": "u"}
+    unrelated = {"number": 2, "body": "Unrelated", "html_url": "v"}
+    with pytest.raises(ots.OneTicketAssertionError, match="not one closing"):
+        ots.assert_one_pull_request([older, unrelated], ots.ISSUE, [1])
+
+
+def test_a_pull_request_opened_before_the_answer_is_refused() -> None:
+    ots.assert_no_new_pulls([{"number": 1}], [1])
+    with pytest.raises(ots.OneTicketAssertionError, match="before the answer: \\[2\\]"):
+        ots.assert_no_new_pulls([{"number": 1}, {"number": 2}], [1])
 
 
 def test_a_line_seen_before_its_cause_is_refused() -> None:

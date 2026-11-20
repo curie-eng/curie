@@ -104,15 +104,16 @@ class OneTicket:
         self.router = router
         self.evidence: dict[str, Any] = {"scenario": "one-ticket", "result": "failed"}
         self.baseline_issues: list[int] = []
-        self.baseline_pulls = 0
+        self.baseline_pulls: list[int] = []
 
     # Observation -----------------------------------------------------------
 
     def check_boundaries(self) -> None:
         if self.driver.model.unexpected:
-            raise OneTicketError(f"unexpected model request: {self.driver.model.unexpected[0]}")
+            # Only the count: an audit entry carries the model's input text.
+            raise OneTicketError(f"{len(self.driver.model.unexpected)} unexpected model requests")
         if self.router.unrouted:
-            raise OneTicketError(f"unrouted model request: {self.router.unrouted[0]}")
+            raise OneTicketError(f"{len(self.router.unrouted)} unrouted model requests")
         if self.stub.unknown_requests:
             raise OneTicketError("unsupported stub request")
 
@@ -196,7 +197,7 @@ class OneTicket:
         # The ticket itself is the one issue the factory must not add to.
         self.baseline_issues = [int(row["number"]) for row in self.stub._rows("issue")]
         self.baseline_issues.append(ots.ISSUE)
-        self.baseline_pulls = len(self.stub._rows("pull"))
+        self.baseline_pulls = [int(row["number"]) for row in self.stub._rows("pull")]
         issue = self.stub._issue(ots.ISSUE, title, body, [ots.LABEL])
         issue["user"] = github.HUMAN
         self.stub._put("issue", ots.ISSUE, issue)
@@ -274,6 +275,7 @@ class OneTicket:
         investigating_at = self.line_at(str(asking["id"]), ots.INVESTIGATING_LINE, bot)
         ots.assert_first_response(label_at, investigating_at)
         ots.assert_one_question_comment(self.comments(), ots.ISSUE, bot)
+        ots.assert_no_new_pulls(self.stub._rows("pull"), self.baseline_pulls)
         self.evidence.update(work_item_id=str(item["id"]), asking_request_id=str(asking["id"]))
 
         # Comments that are not answers start nothing.
