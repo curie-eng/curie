@@ -952,28 +952,31 @@ class _AnswerOwner:
     owner: None = None
 
 
-# The answer refusals no later state of the round can lift: they judge who
-# wrote the comment.
-_IDENTITY_REFUSALS = frozenset({ANSWER_FROM_BOT, ANSWER_NOT_AUTHORIZED})
+# The answer refusals no later state can lift: they judge who wrote the
+# comment, or the ticket as it stood when the comment was decided.
+_STANDING_REFUSALS = frozenset(
+    {ANSWER_FROM_BOT, ANSWER_NOT_AUTHORIZED, TICKET_CLOSED, TRIGGER_LABEL_ABSENT}
+)
 
 
 async def _closed_round_answer(
     session: AsyncSession, item: WorkItem, notice: FactoryNotice
 ) -> WebhookResult | None:
     """A comment on an issue whose round has ended: refused again when a
-    webhook delivery of it was refused as an answer for who wrote it, else
-    None.
+    webhook delivery of it was refused as an answer, for who wrote it or for
+    a closed or unlabelled ticket, else None.
 
     That comment was an answer when it was made, so it never becomes a
     mention revision (#5787 decision 4) when the poll pass first lists it
-    after another answer ended the round, however many rounds later. The
-    webhook's own recorded verdict decides, not a comparison of GitHub's
-    whole-second creation time with the round's end.
+    after another answer ended the round, however many rounds later, even
+    if its author has since gained permission or the ticket was reopened or
+    labelled again. The webhook's own recorded verdict decides, not a
+    comparison of GitHub's whole-second creation time with the round's end.
     """
 
     if notice.comment_id is None:
         return None
-    reason = await comment_refusal(session, notice.comment_id, _IDENTITY_REFUSALS)
+    reason = await comment_refusal(session, notice.comment_id, _STANDING_REFUSALS)
     if reason is None:
         return None
     return _refuse_answer(reason, item, notice)

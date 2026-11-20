@@ -1357,24 +1357,35 @@ def test_a_recorded_round_status_never_says_its_questions_were_unrecorded(
     assert QUESTIONS_UNRECORDED_LINE.strip() not in body
 
 
+@pytest.mark.parametrize("refusal", ["answer_not_authorized", "ticket_closed"])
 def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
-    world: World, caplog: pytest.LogCaptureFixture
+    world: World, caplog: pytest.LogCaptureFixture, refusal: str
 ) -> None:
     """03-tu b: the webhook refuses a mention as an answer while round 1 is
-    open, since its author may not answer. The author then gains write access,
-    another answer ends round 1, round 2 is asked and answered, and the run it
-    started ends. The poll pass, whose cursor is behind, lists the refused
-    comment: the webhook's verdict on who wrote it stands, so it never
-    becomes a mention revision. A mention made in the very second the round
-    ended is still one."""
+    open: its author may not answer, or a person closed the ticket. Then the
+    author gains write access, or the ticket is reopened before any
+    cancellation applied; another answer ends round 1, round 2 is asked and
+    answered, and the run it started ends. The poll pass, whose cursor is
+    behind, lists the refused comment: the webhook's verdict stands, so it
+    never becomes a mention revision. A mention made in the very second the
+    round ended is still one."""
 
     caplog.set_level(logging.INFO)
-    number = 6235
+    number = 6235 if refusal == "answer_not_authorized" else 6238
     triage = _outstanding(world, number)
-    refused = world.github.add_comment(number, f"@{MENTION} replace the rows.", user=READER)
+    author = READER if refusal == "answer_not_authorized" else WRITER
+    if refusal == "ticket_closed":
+        # GET an issue answers state closed
+        # (https://docs.github.com/en/rest/issues/issues#get-an-issue); no
+        # closed delivery reaches the factory before the reopen.
+        world.github.planted_issues[number] = PlantedIssue(state="closed", labels=(LABEL,))
+    refused = world.github.add_comment(number, f"@{MENTION} replace the rows.", user=author)
     response = _post(world.client, "issue_comment", _payload(refused, number))
-    assert _code(response.json()) == "answer_not_authorized", response.text
-    world.github.grant(READER, "write")
+    assert _code(response.json()) == refusal, response.text
+    if refusal == "answer_not_authorized":
+        world.github.grant(READER, "write")
+    else:
+        del world.github.planted_issues[number]
     answer = world.github.add_comment(number, ANSWER, user=WRITER)
     assert _deliver(world, "webhook", answer, number)["status"] == "factory_admitted"
     successor = _take_over(triage, _answer_id(triage, answer))
@@ -1395,7 +1406,7 @@ def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
 
     _poll(world)
 
-    assert "answer_not_authorized" in _refusals(caplog, refused)
+    assert refusal in _refusals(caplog, refused)
     assert str(refused["id"]) not in _receipts(triage)
     assert _ids(triage) == [*before, _mention_id(number, later)]
 
