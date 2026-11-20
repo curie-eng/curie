@@ -98,6 +98,7 @@ def _admit(
         comment_id=comment_id,
         created_at=created_at,
         requester=requester,
+        fingerprint="a" * 64,
     )
 
     async def go() -> AnswerOutcome:
@@ -255,6 +256,7 @@ def test_admits_nothing_when_the_snapshot_write_fails_and_the_caller_commits(
         comment_id=comment_id,
         created_at=created_at,
         requester=REQUESTER,
+        fingerprint="a" * 64,
     )
 
     async def careless_caller() -> None:
@@ -292,7 +294,7 @@ def test_coalesce_a_second_answer_before_the_request_starts(
 
     assert second == AnswerOutcome("coalesced", None, False)
     assert _requests(triage.work_item_id) == requests
-    assert _receipts(triage.work_item_id)[second_id] == ("coalesced", None)
+    assert _receipts(triage.work_item_id)[second_id] == ("coalesced", first.request_id)
     row = _round_row(triage.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"]) == ("answered", first.request_id)
@@ -370,7 +372,7 @@ def test_follow_up_queues_once_behind_the_running_answered_request(
     row = _round_row(triage.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"]) == ("answered", follow_up)
-    assert _receipts(triage.work_item_id)[fourth_id] == ("coalesced", None)
+    assert _receipts(triage.work_item_id)[fourth_id] == ("coalesced", follow_up)
 
 
 # Criterion 4: an answer while the asking request is still finishing -----------------

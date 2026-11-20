@@ -39,6 +39,7 @@ from curie_api.forges.gitlab.transport import (
 )
 from curie_api.forges.types import (
     Actor,
+    AnswerComment,
     Disposition,
     LinkedIssue,
     MarkedNotice,
@@ -47,6 +48,7 @@ from curie_api.forges.types import (
     RepositoryRef,
     SourceContent,
     TicketLabels,
+    TicketRead,
     TrackerIssueRef,
 )
 
@@ -583,6 +585,40 @@ class GitLabTracker:
             and (not mention or self._mention.search(body) is not None)
         )
 
+    @staticmethod
+    def _answer_comment(note: Mapping[str, Any]) -> AnswerComment | None:
+        actor = actor_of(note.get("author"))
+        comment_id, body = note.get("id"), note.get("body")
+        if (
+            note.get("system") is not False
+            or actor is None
+            or type(comment_id) is not int
+            or comment_id <= 0
+            or not isinstance(body, str)
+        ):
+            return None
+        return AnswerComment.unedited(
+            str(comment_id),
+            actor.id,
+            parse_time(note.get("created_at")),
+            parse_time(note.get("updated_at")),
+            body,
+            source=body,
+        )
+
+    async def read_answer_comment(
+        self, issue: TrackerIssueRef, comment_id: str
+    ) -> AnswerComment | None:
+        if not comment_id.isdecimal():
+            return None
+        path = self._issue_path(issue)
+        try:
+            note = await self._transport.get_object(f"{path}/notes/{comment_id}")
+        except NotFound:
+            return None
+        answer = self._answer_comment(note)
+        return answer if answer is not None and answer.comment_id == comment_id else None
+
     async def marking_actor(self, issue: TrackerIssueRef, marker: str) -> Actor | None:
         path = self._issue_path(issue)
         if marker not in _labels(await self._transport.get_object(path)):
@@ -623,7 +659,7 @@ class GitLabTracker:
 
     # Tickets and labels -----------------------------------------------------------
 
-    async def read_ticket(self, issue: TrackerIssueRef) -> str:
+    async def read_ticket(self, issue: TrackerIssueRef) -> TicketRead:
         """Decision 12: title, description, then the newest 100 non-system notes,
         oldest first (#5789 decision 7); when there were more, a line after the
         description says the earlier ones were not read. GitLab markdown
@@ -635,10 +671,10 @@ class GitLabTracker:
         path = self._issue_path(issue)
         payload = await self._transport.get_object(path)
         title = payload.get("title")
-        parts = [f"# {title if isinstance(title, str) else ''}"]
+        ticket = [f"# {title if isinstance(title, str) else ''}"]
         description = payload.get("description")
         if isinstance(description, str) and description:
-            parts.append(description)
+            ticket.append(description)
         notes: list[dict[str, Any]] = []
         more = False
         async for page in self._transport.pages(
@@ -653,6 +689,8 @@ class GitLabTracker:
                 notes.append(note)
             if more:
                 break
+        parts = []
+        answers = []
         if more:
             parts.append(EARLIER_COMMENTS)
         for note in reversed(notes):
@@ -663,7 +701,14 @@ class GitLabTracker:
                 heading += f" at {created}"
             body = note.get("body")
             parts.append(f"{heading}\n\n{body}" if isinstance(body, str) and body else heading)
-        return "\n\n".join(parts) + "\n"
+            answer = self._answer_comment(note)
+            if answer is not None:
+                answers.append(answer)
+        return TicketRead(
+            ticket="\n\n".join(ticket) + "\n",
+            thread_context="\n\n".join(parts) + "\n" if parts else "",
+            answer_comments=tuple(answers),
+        )
 
     async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
         """The issue's ``title`` and ``description`` fields from one issue read,

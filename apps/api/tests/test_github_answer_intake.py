@@ -90,6 +90,7 @@ from test_factory_question_ending import (
     _take_over,
 )
 from test_factory_terminus import _reconcile
+from test_publications import _execute
 
 PATHS = ("webhook", "poll")
 TOKEN = "ghs_answer_intake_fixture"
@@ -150,8 +151,24 @@ def world(comments: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
     github.grant(WRITER, "write")
     github.grant(MAINTAINER, "maintain")
     github.grant(READER, "read")
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        numeric_path = f"/repositories/{REPO_ID}/issues/"
+        if request.method == "GET" and request.url.path.startswith(numeric_path):
+            number_path = request.url.path.removeprefix(numeric_path)
+            url = request.url.copy_with(path=f"/repos/{REPO}/issues/{number_path}")
+            request = httpx.Request("GET", url, headers=request.headers)
+            response = await github.handle_async(request)
+            if number_path.isdecimal() and response.status_code == 200:
+                issue = response.json()
+                issue.setdefault("title", "Keep the report format")
+                issue.setdefault("body", "Export all report rows.")
+                return httpx.Response(200, json=issue)
+            return response
+        return await github.handle_async(request)
+
     with TestClient(create_app()) as client:
-        external = httpx.AsyncClient(transport=httpx.MockTransport(github.handle_async))
+        external = httpx.AsyncClient(transport=httpx.MockTransport(handle))
         client.app.state.http_client = external
         created = client.post(
             "/agents",
@@ -566,8 +583,74 @@ def test_coalesce_two_answers_before_the_start(world: World, path: str) -> None:
     assert _request(started)["status"] == "waiting"
     assert _receipts(triage) == {
         str(first["id"]): ("admitted", started),
-        str(second["id"]): ("coalesced", None),
+        str(second["id"]): ("coalesced", started),
     }
+
+
+def _run_issue(triage: tr._Triage) -> dict[str, Any]:
+    response = triage.client.post(
+        "/work-items/issue-read", headers={"X-Curie-Issue-Read": triage.capability}
+    )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_issue_read_separates_exact_answers_from_thread_context(world: World, path: str) -> None:
+    number = 6280
+    asking = _outstanding(world, number)
+    exact = "Keep the original filename.\n\n  Include λ.  "
+    start = world.github.add_comment(number, exact, user=WRITER)
+    _deliver(world, path, start, number)
+    folded = world.github.add_comment(number, "Keep the header row.", user=MAINTAINER)
+    _deliver(world, path, folded, number)
+    reader = world.github.add_comment(number, exact, user=READER)
+    _deliver(world, path, reader, number)
+    _deliver(world, path, start, number)
+    run_id = _answer_id(asking, start)
+    assert _ids(asking) == [asking.request_id, run_id]
+    run = _take_over(asking, run_id)
+
+    read = _run_issue(run)
+    assert read["answer_attempt"] is True
+    assert read["has_question_history"] is True
+    assert read["admitted_answers"] == [
+        {"comment_id": str(start["id"]), "author_id": str(WRITER["id"]), "text": exact},
+        {
+            "comment_id": str(folded["id"]),
+            "author_id": str(MAINTAINER["id"]),
+            "text": folded["body"],
+        },
+    ]
+    assert read["thread_context"].count(exact) == 2
+    assert exact not in read["ticket"]
+
+    unrelated = _run_issue(_running(world, number + 1))
+    assert unrelated["answer_attempt"] is False
+    assert unrelated["admitted_answers"] == []
+    assert exact not in unrelated["thread_context"]
+
+
+@pytest.mark.parametrize("change", ["edit", "missing_author", "legacy_receipt"])
+def test_issue_read_withholds_an_unproven_answer(world: World, change: str) -> None:
+    number = 6282
+    asking = _outstanding(world, number)
+    comment = _admits(world, "webhook", asking, number)
+    request = _answer_id(asking, comment)
+    if change == "edit":
+        world.github.edit_comment(comment["id"], "Use the updated filename.")
+    elif change == "missing_author":
+        comment["user"].pop("id")
+    else:
+        _execute(
+            "UPDATE curie.factory_answer_receipts SET answer_fingerprint = NULL "
+            "WHERE request_id = :id",
+            {"id": request},
+        )
+    read = _run_issue(_take_over(asking, request))
+    assert read["answer_attempt"] is True
+    assert read["admitted_answers"] == []
+    assert comment["body"] in read["thread_context"]
 
 
 @pytest.mark.parametrize("path", PATHS)
@@ -576,7 +659,7 @@ def test_follow_up_queues_behind_the_running_answer(world: World, path: str) -> 
     triage = _outstanding(world, number)
     first = _admits(world, path, triage, number)
     running = _answer_id(triage, first)
-    _take_over(triage, running)
+    running_turn = _take_over(triage, running)
     assert _request(running)["status"] == "running"
     third = world.github.add_comment(number, "One more detail.", user=WRITER)
 
@@ -589,6 +672,9 @@ def test_follow_up_queues_behind_the_running_answer(world: World, path: str) -> 
     assert _request(running)["status"] == "running"
     assert _request(follow_up)["status"] == "queued"
     assert _receipts(triage)[str(third["id"])] == ("queued_follow_up", follow_up)
+    assert [a["comment_id"] for a in _run_issue(running_turn)["admitted_answers"]] == [
+        str(first["id"])
+    ]
 
 
 # Criterion 6: a mention is an answer while a question is open; facts keep theirs ------

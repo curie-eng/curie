@@ -1029,12 +1029,21 @@ async def _to_answer_core(
         await session.rollback()
         raise _AnswerAwaitsQuestion("its question round ended after the poll's snapshot")
     issue = notice.issue
+    comment_id = mention_comment_id(issue.kind, notice.event_id)
+    answer = await tracker.read_answer_comment(issue, comment_id)
+    if (
+        answer is None
+        or answer.author_id != notice.actor.id
+        or answer.created_at != notice.occurred_at
+    ):
+        return
     facts = factory_questions.AnswerFacts(
         work_item_id=work_item_id,
         issue=issue,
-        comment_id=mention_comment_id(issue.kind, notice.event_id),
-        created_at=notice.occurred_at,
+        comment_id=comment_id,
+        created_at=answer.created_at,
         requester=f"{tracker.kind}:{notice.actor.id}:{notice.actor.login}",
+        fingerprint=answer.fingerprint,
     )
     try:
         await factory_questions.admit_answer(session, facts)

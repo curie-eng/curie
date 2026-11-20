@@ -5,8 +5,8 @@ worker injects the API's issue read route and an execution scoped capability
 naming that WorkItem's issue, on whichever tracker holds it. When both are
 present the runner mounts ``get_issue`` on the ``curie`` server; the tool takes
 no arguments, presents the capability, and the API reads the ticket with its
-own tracker credential and answers it as markdown. The capability never
-reaches model text, tool results or logs.
+own tracker credential and identifies any verified answers for this run. The
+capability never reaches model text, tool results or logs.
 """
 
 from __future__ import annotations
@@ -31,7 +31,8 @@ _MAX_RESPONSE_BYTES = 4_194_304
 
 _DESCRIPTION = (
     "Read the issue this factory run was started for, from whichever tracker "
-    "holds it, as markdown with its comments, plus this execution's deadline. "
+    "holds it, as markdown with separate thread context, verified admitted "
+    "answers, and this execution's deadline. "
     "Takes no arguments: only this run's own issue can be read."
 )
 _SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}

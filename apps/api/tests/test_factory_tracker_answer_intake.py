@@ -573,13 +573,43 @@ def _two_answers_in_one_pass(
 
     expected = _answer_id(intake.ref(issue), first)
     assert _ids(work_item_id) == [*before, expected]
-    assert _receipts(work_item_id) == {first: ("admitted", expected), second: ("coalesced", None)}
+    assert _receipts(work_item_id) == {
+        first: ("admitted", expected),
+        second: ("coalesced", expected),
+    }
     assert _round_state(work_item_id) == ("answered", expected)
     return issue, work_item_id, before, expected
 
 
 def test_two_answers_in_one_pass_coalesce_into_one_request(intake: Intake) -> None:
-    _two_answers_in_one_pass(intake)
+    issue, _, _, request = _two_answers_in_one_pass(intake)
+    outsider = intake.jira.add_user(MEMBER_ID, "Report Reader")
+    intake.jira.add_comment(issue.id, outsider, ANSWER_TEXT)
+    intake.poll()
+    _start(intake, request)
+    token = _mint(intake.client, request)
+    external = httpx.AsyncClient(
+        transport=_ByHost(intake.jira, intake.github, intake.dc, dc_down=False)
+    )
+    original = intake.client.app.state.http_client
+    intake.client.app.state.http_client = external
+    try:
+        read = _read_issue(intake.client, token)
+    finally:
+        intake.client.app.state.http_client = original
+        intake.client.portal.call(external.aclose)
+    assert read["thread_context"].count(ANSWER_TEXT) == 2
+    assert read["answer_attempt"] is True
+    assert [(a["author_id"], a["text"]) for a in read["admitted_answers"]] == [
+        (STARTER_ID, ANSWER_TEXT),
+        (STARTER_ID, "Keep the header row too."),
+    ]
+
+
+def _read_issue(client: Any, token: str) -> dict[str, Any]:
+    response = client.post("/work-items/issue-read", headers={"X-Curie-Issue-Read": token})
+    assert response.status_code == 200, response.text
+    return dict(response.json())
 
 
 def test_an_answer_while_the_answer_runs_queues_one_follow_up(intake: Intake) -> None:
@@ -598,7 +628,7 @@ def test_an_answer_while_the_answer_runs_queues_one_follow_up(intake: Intake) ->
     fourth = intake.jira.add_comment(issue.id, intake.starter, "And trim trailing spaces.")
     intake.poll()
     assert _ids(work_item_id) == [*before, running, follow_up]
-    assert _receipts(work_item_id)[fourth] == ("coalesced", None)
+    assert _receipts(work_item_id)[fourth] == ("coalesced", follow_up)
     assert _status(running) == ("running", None)
     assert _round_state(work_item_id) == ("answered", follow_up)
 
@@ -1220,6 +1250,11 @@ def test_answer_plain_reply_after_a_first_polls_snapshot_is_admitted_on_gitlab(
 
     gl.reconcile()
 
-    _assert_admitted(work_item_id, gitlab.issue_ref(iid), str(reply), [first])
+    answered = _assert_admitted(work_item_id, gitlab.issue_ref(iid), str(reply), [first])
     gl.reconcile()
     assert len(_ids(work_item_id)) == 2
+    gl.start_request(gitlab.client, answered)
+    read = _read_issue(gitlab.client, _mint(gitlab.client, answered))
+    assert read["admitted_answers"] == [
+        {"comment_id": str(reply), "author_id": str(backend.developer.id), "text": ANSWER_TEXT}
+    ]

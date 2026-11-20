@@ -6,15 +6,14 @@ Rules, per session:
 1. A Write, Edit, MultiEdit or NotebookEdit whose path, or a Bash command whose
    text, names this hook, ``hooks.json`` or the hook's state is refused.
 2. Each completed Bash call is recorded as an observation.
-3. A ``get_issue`` result containing the factory question heading is recorded; a
-   result that is not a decodable ticket (an overflow notice, an oversize input) is
-   recorded as carrying it, and so is state lost to a checkout cleanup; a later
-   decodable ticket without the heading clears that overflow guess, never a heading
-   seen in a decoded ticket.
+3. A ``get_issue`` result with platform question history is recorded. An
+   unreadable result requires the same citation until a decoded result
+   establishes there was no question. State lost to checkout cleanup also
+   requires a citation.
 4. A successful ``ask_questions`` call is recorded.
 5. ``mcp__curie__ask_questions`` is refused until one Bash observation exists.
 6. ``mcp__curie__publish_changes`` is refused after a recorded successful ask.
-7. ``mcp__curie__publish_changes`` is refused when a question heading was
+7. ``mcp__curie__publish_changes`` is refused when question history was
    recorded and the body's Decisions section has no line starting
    ``Answered on the ticket by ``.
 
@@ -45,8 +44,8 @@ MAX_RUNS = 128
 MAX_STATE = 8 * 1024 * 1024
 LOCK_SECONDS = 2
 ASK_TOOL = "mcp__curie__ask_questions"
+ISSUE_TOOL = "mcp__curie__get_issue"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
-QUESTION_HEADING = "### Questions from the factory"
 CITATION = re.compile(r"^Answered on the ticket by \S")
 STATE_NAME = "factory-investigation"
 STATE_DIRECTORY = ".curie/" + STATE_NAME
@@ -317,8 +316,8 @@ def exclude_state(cwd: Path) -> None:
             handle.write(f"{prefix}{pattern}\n")
 
 
-def issue_ticket(response: Any) -> str | None:
-    """The ``ticket`` text of a ``get_issue`` result, or None when none can be decoded."""
+def issue_question_history(response: Any) -> bool | None:
+    """Read the platform's question history field from the tool result."""
     texts: list[str] = []
 
     def collect(value: Any) -> None:
@@ -338,24 +337,17 @@ def issue_ticket(response: Any) -> str | None:
         except ValueError:
             continue
         if isinstance(payload, dict) and isinstance(payload.get("ticket"), str):
-            return payload["ticket"]
+            value = payload.get("has_question_history")
+            return value if isinstance(value, bool) else None
     return None
 
 
-def note_ticket_read(state: dict[str, Any], ticket: str | None) -> None:
-    """Record what a ``get_issue`` result shows about the question heading.
-
-    A result that is not a decodable ticket (an overflow notice that replaced a large
-    body, or an unreadable result) cannot show whether the thread holds questions, so
-    it counts as holding them and publication needs the citation line. That guess is
-    kept apart from a heading seen in a decoded ticket: a later decodable ticket with
-    no heading clears the guess, never a heading that was seen.
-    """
-    if ticket is None:
+def note_ticket_read(state: dict[str, Any], has_questions: bool | None) -> None:
+    if has_questions is None:
         if not state["question_heading"]:
             state["question_heading"] = True
             state["heading_unverified"] = True
-    elif QUESTION_HEADING in ticket:
+    elif has_questions:
         state["question_heading"] = True
         state["heading_unverified"] = False
     elif state.get("heading_unverified") is True:
@@ -390,8 +382,7 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
     cwd = Path(git(cwd, "rev-parse", "--show-toplevel")).resolve(strict=True)
     if event == "PreToolUse":
         mutation_guard(tool, inputs, cwd)
-    ticket = issue_ticket(data.get("tool_response")) if tool.endswith("get_issue") else None
-    read = event == "PostToolUse" and tool.endswith("get_issue")
+    read = event == "PostToolUse" and tool == ISSUE_TOOL
     response = data.get("tool_response")
     asked = (
         event == "PostToolUse"
@@ -430,7 +421,7 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
         if tool == "Bash":
             record(state, event, data, cwd)
         elif read:
-            note_ticket_read(state, ticket)
+            note_ticket_read(state, issue_question_history(response))
         elif asked:
             state["asked"] = True
         elif tool == ASK_TOOL:
@@ -460,7 +451,7 @@ def note_oversize_ticket_read(raw: bytes) -> None:
     """Fail closed when a ticket read is too large to decode.
 
     The runner returns a ticket of up to 4 MiB, so a real ``get_issue`` result can
-    exceed the input limit and its question heading could not be seen. The leading
+    exceed the input limit and its question history could not be seen. The leading
     top-level fields of the event name the session, checkout, event and tool; when
     they say a ``get_issue`` result completed, record the heading as present, so
     publication needs the citation line until the thread can be decoded.
@@ -471,11 +462,9 @@ def note_oversize_ticket_read(raw: bytes) -> None:
         found = re.search(rf'"{name}"\s*:\s*("(?:[^"\\]|\\.)*")', head)
         if found:
             fields[name] = json.loads(found.group(1))
-    if fields.get("hook_event_name") != "PostToolUse" or not fields.get(
-        "tool_name", ""
-    ).endswith("get_issue"):
+    if fields.get("hook_event_name") != "PostToolUse" or fields.get("tool_name") != ISSUE_TOOL:
         return
-    handle({**fields, "tool_input": {}, "tool_response": QUESTION_HEADING})
+    handle({**fields, "tool_input": {}})
 
 
 def main() -> None:

@@ -846,6 +846,7 @@ ANSWER_OUTCOMES: Final = (
 # The outcomes whose receipt names the request the comment created; that
 # request's status comment leads with `ANSWER_RECEIVED_LINE`.
 ANSWER_STARTED_OUTCOMES: Final = (ADMITTED, QUEUED_FOLLOW_UP)
+ANSWER_RECEIPT_OUTCOMES: Final = (*ANSWER_STARTED_OUTCOMES, COALESCED)
 ANSWER_RECEIVED_LINE: Final = "Answer received. The factory is working on this ticket again."
 # A pending request in one of these has not started, so the attempt it starts
 # reads every answer made before it does.
@@ -860,7 +861,7 @@ class AnswerFacts:
     author is a human and not the factory, and that the ticket is labelled and
     open. ``created_at`` is the tracker's own creation time of the comment;
     ``requester`` is the author in the ``<tracker kind>:<actor id>:<login>``
-    form the mention paths write. The comment's text is never carried.
+    form the mention paths write. Only the fingerprint crosses into admission.
     """
 
     work_item_id: uuid.UUID
@@ -868,6 +869,7 @@ class AnswerFacts:
     comment_id: str
     created_at: datetime | None
     requester: str
+    fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -1034,7 +1036,9 @@ async def _admit(session: AsyncSession, facts: AnswerFacts) -> AnswerOutcome:
         .execution_options(populate_existing=True)
     )
     if receipt is not None:
-        stored = AnswerOutcome(receipt.outcome, receipt.request_id, True)
+        stored = AnswerOutcome(
+            receipt.outcome, None if receipt.outcome == COALESCED else receipt.request_id, True
+        )
         await session.commit()
         _log_answer(
             stored.outcome, work_item.id, facts.comment_id, stored.request_id, replayed=True
@@ -1048,9 +1052,12 @@ async def _admit(session: AsyncSession, facts: AnswerFacts) -> AnswerOutcome:
             comment_key=facts.comment_id,
             outcome=outcome.outcome,
             request_id=outcome.request_id,
+            answer_fingerprint=facts.fingerprint if outcome.request_id is not None else None,
         )
     )
     await session.commit()
+    if outcome.outcome == COALESCED:
+        outcome = AnswerOutcome(COALESCED, None, False)
     _log_answer(outcome.outcome, work_item.id, facts.comment_id, outcome.request_id)
     return outcome
 
@@ -1099,7 +1106,7 @@ async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts
         else None
     )
     if startable is not None:
-        result = AnswerOutcome(COALESCED, None, False)
+        result = AnswerOutcome(COALESCED, startable, False)
     else:
         pending = answer_request_id(work_item.tracker_issue, facts.comment_id)
         registry = forges_registry(get_settings())

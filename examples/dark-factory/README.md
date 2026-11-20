@@ -233,12 +233,12 @@ when the report trails it, and `curie_gate` lines record refusals.
 
 A second hook, [`hooks/reproduction_gate.py`](hooks/reproduction_gate.py),
 enforces the ask and cite rules without blocking the build. It records each
-completed Bash call as an observation, a `get_issue` result that contains a
-`### Questions from the factory` heading, and each successful
+completed Bash call as an observation, the `has_question_history` field in the
+platform's `get_issue` result, and each successful
 `ask_questions` call. It refuses `mcp__curie__ask_questions` until the session
 has one Bash observation, refuses `mcp__curie__publish_changes` after a
 successful ask in the same session, and refuses publication when the ticket
-carried a question heading and the Decisions section has no line starting
+has question history and the Decisions section has no line starting
 `Answered on the ticket by `. The decisions parser accepts those lines beside the
 numbered entries and does not count them toward its seven. It also refuses an edit or Bash command that
 names the hook, `hooks.json` or its state. The state lives in the checkout
@@ -282,8 +282,10 @@ out-of-credits cause and the review is not retried.
   checks that it names this execution and the WorkItem's issue, reads the
   ticket through its tracker (on GitHub with the App installation token
   minted fresh per read, so runs longer than one hour keep reading; on GitLab
-  or Jira Cloud with the tracker's own credential), and returns it as markdown with
-  its comments, its link, the execution's absolute UTC `execution_deadline`
+  or Jira Cloud with the tracker's own credential), and returns the issue description
+  and its discussion in separate fields. On an answer attempt, `admitted_answers`
+  identifies the replies whose content still matches a receipt for this execution.
+  The response also carries the issue link, the execution's absolute UTC `execution_deadline`
   and total duration in seconds as `execution_seconds`. It stores nothing.
   The sandbox holds no tracker credential at all.
   A failed or capped review produces the short `Could not complete:` handoff,

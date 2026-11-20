@@ -472,7 +472,8 @@ async def test_read_ticket_is_title_description_then_human_notes_oldest_first(
     fake.issue_note(iid, WRITER, "changed the description", system=True)
     fake.issue_note(iid, OUTSIDER, "note-second")
 
-    text = await gitlab_tracker(fake).read_ticket(fake.issue_ref(iid))
+    ticket = await gitlab_tracker(fake).read_ticket(fake.issue_ref(iid))
+    text = ticket.ticket + "\n" + ticket.thread_context
 
     assert text.startswith("# Fix the widget")
     assert description in text
@@ -498,7 +499,8 @@ async def test_read_ticket_keeps_the_newest_100_notes_oldest_first(
         if n % 40 == 0:
             fake.issue_note(iid, WRITER, f"system-{n:03d}", system=True)
 
-    text = await gitlab_tracker(fake).read_ticket(fake.issue_ref(iid))
+    ticket = await gitlab_tracker(fake).read_ticket(fake.issue_ref(iid))
+    text = ticket.ticket + "\n" + ticket.thread_context
 
     first = count - 99
     rendered = [line for line in text.splitlines() if line.startswith("note-")]

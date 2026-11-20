@@ -355,7 +355,7 @@ async def test_a_github_work_item_tracker_mints_only_on_a_request_for_its_instal
         assert tracker.issue_url(GITHUB_ISSUE).endswith(f"/{REPO}/issues/{ISSUE_NUMBER}")
         assert mints.calls == [] and requests == []
         ticket = await tracker.read_ticket(GITHUB_ISSUE)
-    assert ticket.startswith("# Add a flag\n\nIt prints the plan.")
+    assert ticket.ticket.startswith("# Add a flag\n\nIt prints the plan.")
     assert mints.calls and all(
         call == (GITHUB_REPOSITORY, INSTALLATION, 5.0) for call in mints.calls
     )
@@ -391,7 +391,7 @@ async def test_a_jira_work_item_tracker_is_its_binding_tracker(mints: _Mints) ->
             f"Jira: {issue.display_key} {jira_fake.SITE}/browse/{issue.display_key}"
         )
         ticket = await tracker.read_ticket(issue)
-    assert ticket.startswith("# Widget parser drops the last field")
+    assert ticket.ticket.startswith("# Widget parser drops the last field")
     # The Jira token is the tracker's own; no GitHub installation is minted.
     assert mints.calls == []
 

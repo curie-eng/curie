@@ -69,6 +69,7 @@ from curie_api.forges.ports import TrackerFacts
 from curie_api.forges.types import (
     GITHUB,
     Actor,
+    AnswerComment,
     Disposition,
     LinkedIssue,
     MarkedNotice,
@@ -77,6 +78,7 @@ from curie_api.forges.types import (
     RepositoryRef,
     SourceContent,
     TicketLabels,
+    TicketRead,
     TrackerComment,
     TrackerIssueRef,
     body_sha256,
@@ -132,6 +134,7 @@ class IssueComment:
     author: str | None
     created_at: str | None
     body: str
+    answer: AnswerComment | None
 
 
 @dataclass(frozen=True)
@@ -401,6 +404,30 @@ class GitHubTracker:
         if comment is None:
             raise Unavailable("comment")
         return comment
+
+    def answer_comment(self, number: int, value: Mapping[str, Any]) -> AnswerComment | None:
+        comment = self.facts_comment(value)
+        if comment is None or comment.issue != self.issue(number) or comment.actor is None:
+            return None
+        return AnswerComment.unedited(
+            str(comment.id),
+            comment.actor.id,
+            parse_time(value.get("created_at")),
+            comment.updated_at,
+            comment.body,
+            source=comment.body,
+        )
+
+    async def read_answer_comment(
+        self, issue: TrackerIssueRef, comment_id: str
+    ) -> AnswerComment | None:
+        number = self._number(issue)
+        if not comment_id.isdecimal():
+            return None
+        try:
+            return self.answer_comment(number, await self.issue_comment(int(comment_id)))
+        except NotFound:
+            return None
 
     async def issue_comment(self, comment_id: int) -> dict[str, Any]:
         """One issue comment as GitHub answers it now, through the installation
@@ -736,16 +763,20 @@ class GitHubTracker:
             return False
         return permission.get("permission") in ("write", "admin")
 
-    async def read_ticket(self, issue: TrackerIssueRef) -> str:
+    async def read_ticket(self, issue: TrackerIssueRef) -> TicketRead:
         content = await self.read_issue_content(self._number(issue))
-        parts = [f"# {content.title}", content.body]
+        parts: list[str] = []
         if content.earlier_comments_omitted:
             parts.append("_Earlier comments were not read._")
         for comment in content.comments:
             author = comment.author or "unknown"
             when = f" at {comment.created_at}" if comment.created_at else ""
             parts.append(f"## Comment by {author}{when}\n\n{comment.body}")
-        return "\n\n".join(parts) + "\n"
+        return TicketRead(
+            ticket=f"# {content.title}\n\n{content.body}\n",
+            thread_context="\n\n".join(parts) + "\n" if parts else "",
+            answer_comments=tuple(c.answer for c in content.comments if c.answer is not None),
+        )
 
     async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
         """The issue's title and body from one issue read, never its comments.
@@ -1209,6 +1240,7 @@ class GitHubTracker:
                         author=_login(comment.get("user")),
                         created_at=created if isinstance(created, str) else None,
                         body=_text(comment.get("body")),
+                        answer=self.answer_comment(number, comment),
                     )
                 )
         except (httpx.HTTPError, ValueError):

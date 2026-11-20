@@ -6,8 +6,8 @@ tracker's `Tracker.read_ticket`, for every tracker kind: a GitHub issue with
 an App installation token minted fresh on every read, only for the
 installation the WorkItem recorded, so a run longer than the token's one hour
 lifetime keeps reading; a Jira issue with the tracker's own credential.
-Nothing is parsed, modelled or stored: the ticket is returned as the
-tracker's markdown.
+The tracker returns the issue description and discussion as Markdown, along
+with the comment fingerprints used to prove which replies this run can rely on.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from .config import Settings
 from .forges.errors import ForgeError
 from .forges.registry import forges_registry
 from .forges.trackers import tracker_for_work_item
-from .forges.types import GITHUB, RepositoryRef, TrackerIssueRef
+from .forges.types import GITHUB, RepositoryRef, TicketRead, TrackerIssueRef
 from .github_app import GitHubAppError
 from .models import MAX_EXECUTION_DEADLINE_SECONDS, ExecutionRequest, WorkItem
 
@@ -112,7 +112,7 @@ async def read_issue_authority(
 
 async def read_issue(
     authority: IssueReadAuthority, *, settings: Settings, client: httpx.AsyncClient
-) -> str:
+) -> TicketRead:
     """The WorkItem's ticket as markdown, through its own tracker.
 
     A GitHub issue is addressed by its repository's numeric id, so a rename or

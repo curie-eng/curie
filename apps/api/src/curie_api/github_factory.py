@@ -1118,12 +1118,16 @@ async def admit_answer_notice(
     )
     if label is not None and label not in state.labels:
         return _refuse_answer(TRIGGER_LABEL_ABSENT, item, notice, actor_id)
+    answer = github.answer_comment(notice.issue_number, comment)
+    if answer is None:
+        return _refuse_answer("unverified_answer_content", item, notice, actor_id)
     facts = factory_questions.AnswerFacts(
         work_item_id=item.id,
         issue=issue,
         comment_id=str(notice.comment_id),
-        created_at=parse_time(comment.get("created_at")),
+        created_at=answer.created_at,
         requester=f"github:{actor_id}:{actor_login}",
+        fingerprint=answer.fingerprint,
     )
     # The answer core commits and rolls back its own session; in a savepoint
     # the issue lock and the webhook's delivery audit stay in the caller's
