@@ -37,6 +37,7 @@ import sys
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -49,11 +50,13 @@ import test_factory_tracker_results as tr
 from curie_api import factory_questions
 from curie_api.config import get_settings
 from curie_api.factory_facts_schema import REQUEST_MARKER
+from curie_api.factory_notices import ANSWER_PULL_REQUEST_ENDED_SENTENCE
 from curie_api.factory_poll_intake import poll_once
+from curie_api.factory_questions import QUESTIONS_LABEL, QUESTIONS_UNRECORDED_LINE
 from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_factory_events import FactoryNotice
 from curie_api.main import create_app
-from curie_api.workitem_dispatch import DispatchConflict, acquire
+from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
@@ -73,13 +76,24 @@ from forge_fakes.github import (
     _post,
     _signature,
     fake_installation_tokens,
+    issue_event,
 )
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,
     comments,
 )
 from redis.asyncio import Redis
-from test_factory_question_ending import _ask, _request, _requests, _round_row, _take_over
+from sqlalchemy import text
+from test_factory_question_ending import (
+    _ask,
+    _request,
+    _requests,
+    _round_row,
+    _state_labels,
+    _status_body,
+    _take_over,
+)
+from test_factory_terminus import _reconcile
 
 PATHS = ("webhook", "poll")
 TOKEN = "ghs_answer_intake_fixture"
@@ -1138,3 +1152,278 @@ def test_refused_retained_service_item_in_personal_mode(
     assert _refusals(caplog, comment) == {"personal_owner_required"}
     assert _ids(triage) == [triage.request_id]
     assert _receipts(triage) == {}
+
+
+# Answer-path true-ups (#5786, #5787) ----------------------------------------------------
+
+
+def _bind_pull_request(triage: tr._Triage, status: str) -> None:
+    """The WorkItem's pull request lineage, as a publication leaves it and the
+    merge record (`crud.lineages.mark_publication_lineage_terminal`) moves it."""
+
+    async def go() -> None:
+        async with triage.client.app.state.sessionmaker() as session:
+            item = (
+                await session.execute(
+                    text(
+                        "SELECT agent_id, conversation_id, repository_path, base_commit "
+                        "FROM curie.work_items WHERE id = :id"
+                    ),
+                    {"id": triage.work_item_id},
+                )
+            ).one()
+            version_id, deployment_id, lineage_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+            await session.execute(
+                text(
+                    "INSERT INTO curie.agent_versions (id, agent_id, version_label, created_by) "
+                    "VALUES (:id, :agent, 'v1', 'fixture')"
+                ),
+                {"id": version_id, "agent": item.agent_id},
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO curie.deployments (id, agent_id, version_id, environment, "
+                    "status) VALUES (:id, :agent, :version, CAST('dev' AS curie.environment), "
+                    "'active')"
+                ),
+                {"id": deployment_id, "agent": item.agent_id, "version": version_id},
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO curie.thread_publication_lineages (id, agent_id, "
+                    "deployment_id, conversation_id, repo_full_name, base_sha, branch, "
+                    "pr_number, pr_url, head_sha, status) VALUES (:id, :agent, :deployment, "
+                    ":conversation, :repo, :base, :branch, 41, :url, :head, :status)"
+                ),
+                {
+                    "id": lineage_id,
+                    "agent": item.agent_id,
+                    "deployment": deployment_id,
+                    "conversation": item.conversation_id,
+                    "repo": item.repository_path,
+                    "base": item.base_commit or "1" * 40,
+                    "branch": f"curie/publication-{lineage_id.hex}",
+                    "url": f"https://github.com/{item.repository_path}/pull/41",
+                    "head": "2" * 40,
+                    "status": status,
+                },
+            )
+            await session.execute(
+                text(
+                    "UPDATE curie.work_items SET publication_lineage_id = :lineage WHERE id = :id"
+                ),
+                {"lineage": lineage_id, "id": triage.work_item_id},
+            )
+            await session.commit()
+
+    triage.client.portal.call(go)
+
+
+def _acquired(world: World, request_id: uuid.UUID) -> int:
+    """The worker acquires the request for a start; returns its generation."""
+
+    async def go() -> int:
+        async with world.client.app.state.sessionmaker() as session:
+            generation = int(
+                await session.scalar(
+                    text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+                    {"id": request_id},
+                )
+            )
+            acquired = await acquire(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=world.client.app.state.http_client,
+            )
+            assert not isinstance(acquired, DispatchConflict), acquired
+            return generation
+
+    return int(world.client.portal.call(go))
+
+
+def _not_started(world: World, request_id: uuid.UUID, generation: int) -> Any:
+    """The worker's report that the turn did not start, as it sends it when
+    worker start refuses a terminal pull request (``kernel/completion.py``)."""
+
+    async def go() -> Any:
+        async with world.client.app.state.sessionmaker() as session:
+            return await defer(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=generation,
+                reason="not_started:done",
+                capacity=False,
+                start_failure_detail=None,
+            )
+
+    return world.client.portal.call(go)
+
+
+@pytest.mark.parametrize("pull_request", ["merged", "open"])
+def test_answer_follow_up_on_a_merged_pull_request_ends_with_its_status(
+    world: World, pull_request: str
+) -> None:
+    """02b: a person merges the ticket's pull request while the answer's
+    request waits. Its first refused start ends it ``start_failed`` with a
+    sentence saying so, the round clears and the questions label goes. On an
+    open pull request (the counterexample) the same refusal only defers."""
+
+    number = 6230 if pull_request == "merged" else 6231
+    triage = _outstanding(world, number)
+    _reconcile()
+    assert QUESTIONS_LABEL in _state_labels(world.sink, number)
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+    assert _deliver(world, "webhook", comment, number)["status"] == "factory_admitted"
+    answered = _answer_id(triage, comment)
+    generation = _acquired(world, answered)
+    # Worker start's lineage read records the merge, then refuses the turn.
+    _bind_pull_request(triage, pull_request)
+
+    deferred = _not_started(world, answered, generation)
+
+    request = _request(answered)
+    row = _round_row(triage.work_item_id)
+    assert row is not None
+    if pull_request == "open":
+        assert deferred.terminal_cause is None
+        assert request["status"] == "waiting"
+        assert row["state"] == "answered"
+        return
+    assert deferred.terminal_cause == "start_failed"
+    assert (request["status"], request["terminal_cause"]) == ("failed", "start_failed")
+    assert row["state"] == "cleared"
+    _reconcile()
+    body = _status_body(world.sink, answered)
+    assert f"Could not complete: {ANSWER_PULL_REQUEST_ENDED_SENTENCE}" in body
+    assert "Cause: start_failed" in body
+    assert _state_labels(world.sink, number) == set()
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_posting_window_answer_after_the_asker_exits_is_named_on_its_status(
+    world: World, path: str
+) -> None:
+    """03-tu a: GitHub stores the question comment and answers 502; the reply
+    comes while the round reads ``posting``; the asker never records the
+    question and ends without a pull request. No round takes the reply, so
+    the asker's status comment says replies to its questions restart nothing."""
+
+    number = 6232 if path == "webhook" else 6233
+    triage = _running(world, number)
+    world.github.store_then_fail = 502
+    assert _ask(triage).status_code == 503
+    world.github.tick()
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+    payload = _payload(comment, number)
+    delivery = str(uuid.uuid4())
+    if path == "webhook":
+        deferred = _post(world.client, "issue_comment", payload, delivery=delivery)
+        assert deferred.status_code == 503, deferred.text
+    else:
+        _poll(world)
+    assert _retry_keys() == {f"answer-retry:{comment['id']}"}
+
+    tr._finish(triage, "failed", "no_pull_request")
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["comment_id"]) == ("cleared", None)
+    if path == "webhook":
+        redelivered = _post(world.client, "issue_comment", payload, delivery=delivery)
+        assert redelivered.status_code == 200, redelivered.text
+    else:
+        _poll(world)
+    _reconcile()
+
+    assert _retry_keys() == set()
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+    body = _status_body(world.sink, triage.request_id)
+    assert QUESTIONS_UNRECORDED_LINE.strip() in body
+
+
+def test_a_recorded_round_status_never_says_its_questions_were_unrecorded(
+    world: World,
+) -> None:
+    """Counterexample: an asker whose round was recorded keeps the question ending."""
+
+    triage = _outstanding(world, 6234)
+    _reconcile()
+
+    body = _status_body(world.sink, triage.request_id)
+    assert "Questions asked (round 1 of 3)" in body
+    assert QUESTIONS_UNRECORDED_LINE.strip() not in body
+
+
+def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """03-tu b: the webhook refuses a mention as an answer while the round is
+    open; another answer's attempt then ends the round. The poll pass, whose
+    cursor is behind, lists the refused comment: it was an answer when it was
+    made, so it is refused again and never becomes a mention revision. A
+    mention made after the round ended is still one."""
+
+    caplog.set_level(logging.INFO)
+    number = 6235
+    triage = _outstanding(world, number)
+    refused = world.github.add_comment(number, f"@{MENTION} replace the rows.", user=READER)
+    response = _post(world.client, "issue_comment", _payload(refused, number))
+    assert _code(response.json()) == "answer_not_authorized", response.text
+    world.github.grant(READER, "write")
+    answer = world.github.add_comment(number, ANSWER, user=WRITER)
+    assert _deliver(world, "webhook", answer, number)["status"] == "factory_admitted"
+    successor = _take_over(triage, _answer_id(triage, answer))
+    tr._finish(successor, "failed", "budget_exceeded")
+    row = _round_row(triage.work_item_id)
+    assert row is not None and row["state"] == "cleared", row
+    before = _ids(triage)
+
+    _poll(world)
+
+    assert _ids(triage) == before
+    assert "not_outstanding" in _refusals(caplog, refused)
+    assert str(refused["id"]) not in _receipts(triage)
+
+    # GitHub's clock after the round ended: a new mention is a revision.
+    world.github.clock = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=2)
+    later = world.github.add_comment(number, f"@{MENTION} also sort them.", user=WRITER)
+
+    _poll(world)
+
+    assert _ids(triage) == [*before, _mention_id(number, later)]
+
+
+@pytest.mark.parametrize("ended", ["closed", "unlabeled"])
+def test_poll_pass_that_finds_the_close_and_an_answer_refuses_the_answer(
+    world: World, caplog: pytest.LogCaptureFixture, ended: str
+) -> None:
+    """03-tu c: one poll pass discovers the issue closed (or unlabelled) by a
+    person and a plain answer made before it. The answer is refused for the
+    ticket's state (#5787 criterion 4), not dropped unseen by the
+    cancellation, and the WorkItem is still cancelled in the same pass."""
+
+    caplog.set_level(logging.INFO)
+    number = 6236 if ended == "closed" else 6237
+    triage = _outstanding(world, number)
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+    world.github.planted_issues[number] = PlantedIssue(
+        state="closed" if ended == "closed" else "open",
+        labels=(LABEL,) if ended == "closed" else (),
+        events=[issue_event(ended, event_id=880000 + number, label=LABEL)],
+    )
+
+    _poll(world)
+
+    expected = "ticket_closed" if ended == "closed" else "trigger_label_absent"
+    assert _refusals(caplog, comment) == {expected}
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+    (item,) = _rows(
+        "SELECT cancelled_at FROM curie.work_items WHERE id = :id", {"id": triage.work_item_id}
+    )
+    assert item["cancelled_at"] is not None
+    assert _round_row(triage.work_item_id) is None

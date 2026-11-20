@@ -952,6 +952,43 @@ class _AnswerOwner:
     owner: None = None
 
 
+async def _closed_round_answer(
+    row: FactoryQuestionRound,
+    item: WorkItem,
+    notice: FactoryNotice,
+    tracker: GitHubTracker | Callable[[], Awaitable[GitHubTracker]],
+    comment: Mapping[str, Any] | None,
+) -> WebhookResult | None:
+    """A comment on an issue whose round has ended: refused ``not_outstanding``
+    when it was made while that round was open, else None.
+
+    A comment one door refused as an answer (no receipt) can reach the other
+    door only after another answer's attempt ended the round; it was an
+    answer when it was made, so it never becomes a mention revision (#5787
+    decision 4). Only a comment GitHub numbers after the round's question
+    comment is read; its creation time comes from the factory's own read.
+    """
+
+    question = factory_questions.ordered_comment_id(row.comment_id)
+    if question is None or notice.comment_id is None or notice.comment_id <= question:
+        return None
+    if comment is None:
+        github = tracker if isinstance(tracker, GitHubTracker) else await tracker()
+        try:
+            comment = await github.issue_comment(notice.comment_id)
+        except NotFound:
+            return None
+        except ForgeError:
+            raise FeedbackUnavailable(COMMENT_UNAVAILABLE) from None
+    if comment.get("id") != notice.comment_id or _facts_request(comment.get("body")):
+        return None
+    if not factory_questions.answered_closed_round(
+        row, str(notice.comment_id), parse_time(comment.get("created_at"))
+    ):
+        return None
+    return _refuse_answer(factory_questions.NOT_OUTSTANDING, item, notice)
+
+
 async def admit_answer_notice(
     session: AsyncSession,
     settings: Settings,
@@ -1022,8 +1059,10 @@ async def admit_answer_notice(
         .where(FactoryQuestionRound.work_item_id == item.id)
         .execution_options(populate_existing=True)
     )
-    if row is None or row.state not in _ANSWERABLE:
+    if row is None:
         return None
+    if row.state not in _ANSWERABLE:
+        return await _closed_round_answer(row, item, notice, tracker, comment)
     if item.cancelled_at is not None:
         return _refuse_answer(factory_questions.WORK_ITEM_CANCELLED, item, notice)
     if (

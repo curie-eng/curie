@@ -770,6 +770,40 @@ async def rows_an_older_replica_settled(
     return list(ids)
 
 
+# A request whose question comment was written but never recorded (the tracker
+# stored it and its response was lost) ends without the question ending; its
+# status comment says so, since the round takes no answer (#5787).
+QUESTIONS_UNRECORDED_LINE: Final = (
+    "This run's questions could not be recorded, so a reply to them does not "
+    "restart this ticket. Add the label again to start a new run.\n"
+)
+
+
+async def question_unrecorded(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
+) -> bool:
+    """Whether ``request_id`` ended with its question comment unrecorded.
+
+    Its round was still ``posting`` when it settled, so settlement cleared it
+    with no question comment id: an answer made in that window was deferred
+    and then finds no round. A round refused for the cap can have no comment
+    id too; its count is at the cap, a posting round's is below it. The
+    caller excludes the question ending.
+    """
+
+    row = await session.scalar(
+        select(FactoryQuestionRound).where(FactoryQuestionRound.work_item_id == work_item_id)
+    )
+    if (
+        row is None
+        or row.asking_request_id != request_id
+        or row.state != CLEARED
+        or row.comment_id is not None
+    ):
+        return False
+    return row.rounds_used < ROUND_LIMIT
+
+
 async def asked_round(
     session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
 ) -> int | None:
@@ -851,6 +885,24 @@ class AnswerNotAdmitted(Exception):
         super().__init__(f"factory answer not admitted: {code}")
 
 
+async def answer_started(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
+) -> bool:
+    """Whether an answer comment created ``request_id`` (decision 5): a
+    receipt of an answer-started outcome names it."""
+
+    found = await session.scalar(
+        select(FactoryAnswerReceipt.comment_key)
+        .where(
+            FactoryAnswerReceipt.work_item_id == work_item_id,
+            FactoryAnswerReceipt.request_id == request_id,
+            FactoryAnswerReceipt.outcome.in_(ANSWER_STARTED_OUTCOMES),
+        )
+        .limit(1)
+    )
+    return found is not None
+
+
 def answer_request_id(issue: TrackerIssueRef, comment_id: str) -> uuid.UUID:
     """The id of the request an answer comment creates (decision 4.4).
 
@@ -867,7 +919,9 @@ def answer_request_id(issue: TrackerIssueRef, comment_id: str) -> uuid.UUID:
 _ORDERED_COMMENT_ID = re.compile(r"[1-9][0-9]{0,18}")
 
 
-def _comment_order(comment_id: str | None) -> int | None:
+def ordered_comment_id(comment_id: str | None) -> int | None:
+    """A tracker comment id as its creation order, or None when it is not one."""
+
     if comment_id is None or not _ORDERED_COMMENT_ID.fullmatch(comment_id):
         return None
     return int(comment_id)
@@ -894,11 +948,32 @@ def _after_fence(
         return False
     if created_at.tzinfo is None or created_at.utcoffset() is None:
         return False
-    answer_order = _comment_order(comment_id)
-    question_order = _comment_order(question_comment_id)
+    answer_order = ordered_comment_id(comment_id)
+    question_order = ordered_comment_id(question_comment_id)
     if answer_order is not None and question_order is not None:
         return answer_order > question_order
     return created_at > answer_after
+
+
+def answered_closed_round(
+    row: FactoryQuestionRound, comment_id: str, created_at: datetime | None
+) -> bool:
+    """Whether a comment was made while ``row``'s last posted round was open.
+
+    For a round that is no longer ``outstanding`` or ``answered``: the comment
+    came after the round's question comment and no later than the round
+    ended (the row's last write, on the database clock). Such a comment was
+    an answer when it was made, so it is never also a mention (#5787
+    decision 4), even when a door first reads it after the round ended. A
+    comment with no creation time is not one.
+    """
+
+    if row.state in (OUTSTANDING, ANSWERED, POSTING) or row.comment_id is None:
+        return False
+    if not _after_fence(created_at, comment_id, row.answer_after, row.comment_id):
+        return False
+    assert created_at is not None
+    return created_at <= row.updated_at
 
 
 def _log_answer(
