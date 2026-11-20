@@ -918,7 +918,7 @@ fn is_memory_fact_id(id: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn memory_channel(channel: Option<String>) -> Result<Option<MemoryChannel>> {
+pub fn memory_channel(channel: Option<String>) -> Result<Option<MemoryChannel>> {
     channel
         .map(|selection| {
             let (kind, address) = selection.split_once('=').ok_or_else(|| {

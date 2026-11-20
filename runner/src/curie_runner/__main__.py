@@ -64,6 +64,12 @@ from .attachments import (
     read_status,
     reconcile,
 )
+from .channel_memory_rules import (
+    ChannelRules,
+    is_work_item_run,
+    load_channel_rules,
+    rules_url,
+)
 from .config import (
     ALLOW_TOKENLESS_ENV,
     RunnerConfig,
@@ -91,7 +97,10 @@ from .harness.claude.approval import (
 from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
-from .harness.claude.propose_rule_tool import wrap_propose_rule_handler
+from .harness.claude.propose_rule_tool import (
+    wrap_channel_propose_rule_handler,
+    wrap_propose_rule_handler,
+)
 from .harness.claude.question_tool import wrap_questions_handler
 from .harness.claude.requester_guard import build_learned_rules_guard, build_subagent_guard
 from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
@@ -158,6 +167,7 @@ from .progress import (
     factory_progress_requested,
     resolve_progress,
 )
+from .propose_rule import channel_propose_rule_handler
 from .publication_precheck import PublicationPrecheck
 from .redact import collect_held_secrets, install_stdout_redaction, register_held_secrets
 from .requester_context import BLOCKED_EXPLANATION as REQUESTER_BLOCKED_EXPLANATION
@@ -818,6 +828,7 @@ def build_runner(
     memory_facts_preamble: str | None = None,
     memory_guidance: str | None = None,
     scope: ProviderScope | None = None,
+    channel_rules: ChannelRules | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -836,6 +847,11 @@ def build_runner(
 
     ``scope`` is the boot credential's provider scope (#5426), derived before
     the harness rewrote the env; None in fake model mode.
+
+    ``channel_rules`` is the session start read of the accepted standing rules
+    for a run with no work item (#5801); None when boot did not read them. A
+    run holding the ``wir`` capability ignores it: its rules are pinned at
+    admission and its ``propose_rule`` is the factory's.
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -975,7 +991,11 @@ def build_runner(
             ),
             progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
             rules_preamble=(
-                rules_gate.applied.section() if rules_gate.applied is not None else None
+                rules_gate.applied.section()
+                if rules_gate.applied is not None
+                else channel_rules_in_force.section
+                if channel_rules_in_force is not None
+                else None
             ),
             requester_preamble=(
                 requester_gate.applied.section(learned_rules=rules_gate.applied is not None)
@@ -1105,6 +1125,23 @@ def build_runner(
     # The GitHub factory issue read (ADR 0187) is present only for an execution
     # with a WorkItem whose worker injected the route and capability.
     issue_read = resolve_issue_read(os.environ)
+    # The accepted standing rules of a run with no work item (#5801). A factory
+    # run (``wir`` or the work-item progress URL, which survives a failed
+    # issue-read mint) never uses them: its rules and its ``propose_rule`` come
+    # from the completion contract and the admission pin.
+    channel_rules_in_force = channel_rules if not is_work_item_run(os.environ) else None
+    # The channel ``propose_rule`` mounts beside the memory tools only, and only
+    # when the session start read offered it. It writes with the turn's own
+    # credential, so with no turn credential it refuses without a request.
+    channel_rules_url = rules_url(config.session.memory_ref)
+    channel_rule_handler = (
+        channel_propose_rule_handler(channel_rules_url, turn_write_token)
+        if memory_tools_mounted
+        and channel_rules_in_force is not None
+        and channel_rules_in_force.proposals_enabled
+        and channel_rules_url is not None
+        else None
+    )
     progress_activity = ProgressActivity()
     progress_activity.model = config.model
     # Per-model token usage for the run's cost line (#3223): reported whenever
@@ -1409,7 +1446,16 @@ def build_runner(
                 ),
                 tracker_result_tool=tracker_result_tool,
                 question_tool=question_tool,
-                propose_rule_tool=propose_rule_tool,
+                # The factory's tool when the contract offered it; otherwise the
+                # channel one (#5801). The two never coexist: the channel one
+                # exists only without the ``wir`` capability.
+                propose_rule_tool=(
+                    propose_rule_tool
+                    if propose_rule_tool is not None
+                    else wrap_channel_propose_rule_handler(channel_rule_handler)
+                    if channel_rule_handler is not None
+                    else None
+                ),
             )
 
         platform_servers: dict[str, Any] = {
@@ -2014,6 +2060,24 @@ class _BootFetches:
     # build_runner parameters they feed.
     memory_facts_preamble: str | None = None
     memory_guidance: str | None = None
+    # The accepted standing rules of a run with no work item (#5801).
+    channel_rules: ChannelRules | None = None
+
+
+def _channel_rules_source(config: RunnerConfig, fake_model: bool) -> tuple[str, str] | None:
+    """The ``state/_rules`` URL and boot memory token to read, or None.
+
+    Read only on the real model path, with a memory ref and the boot memory
+    token, and never on a WorkItem run: ``wir`` capability or progress URL (#5801).
+    """
+
+    if fake_model or is_work_item_run(os.environ):
+        return None
+    url = rules_url(config.session.memory_ref)
+    token = os.environ.get(MEMORY_TOKEN_ENV) or None
+    if url is None or token is None:
+        return None
+    return url, token
 
 
 async def _load_boot_fetches(
@@ -2030,6 +2094,8 @@ async def _load_boot_fetches(
     history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
     facts: tuple[str | None, str | None] = (None, None)
     capability: McpToolCapabilityProbe | None = None
+    channel_rules: ChannelRules | None = None
+    channel_rules_source = _channel_rules_source(config, fake_model)
     derived = derive_mcp_servers(
         config.session.plugin_dir,
         release=config.connector_release,
@@ -2057,6 +2123,11 @@ async def _load_boot_fetches(
         nonlocal facts
         facts = await _load_memory_facts(config)
 
+    async def load_rules() -> None:
+        nonlocal channel_rules
+        if channel_rules_source is not None:
+            channel_rules = await load_channel_rules(*channel_rules_source)
+
     async def probe() -> None:
         nonlocal capability
         capability = await probe_mcp_tool_capability(
@@ -2069,6 +2140,7 @@ async def _load_boot_fetches(
         tg.start_soon(load_memory)
         tg.start_soon(load_history)
         tg.start_soon(load_facts)
+        tg.start_soon(load_rules)
         if not fake_model:
             tg.start_soon(probe)
 
@@ -2087,6 +2159,7 @@ async def _load_boot_fetches(
         history_capacity_exceeded=history[2],
         memory_facts_preamble=facts[0],
         memory_guidance=facts[1],
+        channel_rules=channel_rules,
     )
 
 
@@ -2260,6 +2333,7 @@ def _serve() -> None:
         memory_facts_preamble=fetches.memory_facts_preamble,
         memory_guidance=fetches.memory_guidance,
         scope=boot_scope,
+        channel_rules=fetches.channel_rules,
     )
 
     def publication_proposal() -> tuple[str | None, str | None]:

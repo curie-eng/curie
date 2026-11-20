@@ -11,7 +11,12 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from ...propose_rule import PROPOSE_RULE_DESCRIPTION, PROPOSE_RULE_SCHEMA
+from ...propose_rule import (
+    CHANNEL_PROPOSE_RULE_DESCRIPTION,
+    CHANNEL_PROPOSE_RULE_SCHEMA,
+    PROPOSE_RULE_DESCRIPTION,
+    PROPOSE_RULE_SCHEMA,
+)
 from ...tool_names import PROPOSE_RULE_TOOL
 from ...tracker_result import ResultHandler
 
@@ -20,3 +25,12 @@ def wrap_propose_rule_handler(handler: ResultHandler) -> SdkMcpTool[Any]:
     """The SDK tool around a rule proposal handler."""
 
     return tool(PROPOSE_RULE_TOOL, PROPOSE_RULE_DESCRIPTION, PROPOSE_RULE_SCHEMA)(handler)
+
+
+def wrap_channel_propose_rule_handler(handler: ResultHandler) -> SdkMcpTool[Any]:
+    """The SDK tool around a channel rule proposal handler (#5801): the same
+    name, with the channel description and the optional ``scope`` argument."""
+
+    return tool(PROPOSE_RULE_TOOL, CHANNEL_PROPOSE_RULE_DESCRIPTION, CHANNEL_PROPOSE_RULE_SCHEMA)(
+        handler
+    )
