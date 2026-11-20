@@ -110,6 +110,7 @@ from .routers import (
     identity_me,
     identity_operator,
     memory,
+    memory_rules,
     observability,
     personal_enrollments,
     provider_installations,
@@ -757,6 +758,8 @@ def create_app(
     app.include_router(state.released_router)
     app.include_router(thread_attachments.internal_router)
     app.include_router(memory.router)
+    app.include_router(memory_rules.router)
+    app.include_router(memory_rules.decision_router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
     app.include_router(approval_recovery.router)

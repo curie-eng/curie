@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from .. import factory_questions, factory_retry_policy, transcripts
+from .. import factory_questions, factory_retry_policy, memory_rules_admission, transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
 from ..factory_retry_policy import Disposition, DispositionKind, RetryFacts, RetrySafety
@@ -39,6 +39,7 @@ from ..forges.errors import ForgeError
 from ..forges.registry import forges_registry
 from ..forges.trackers import comment_prefix, issue_link, reply_route
 from ..forges.types import RepositoryRef, TrackerIssueRef
+from ..memory_rules_admission import MemoryRulesEvidence, MemoryRulesUnavailable
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
@@ -71,7 +72,7 @@ from ..requester_instruction_admission import (
     request_selection_columns,
     selection_columns,
 )
-from ..schemas.workitems import CodingInstructionsMetadata
+from ..schemas.workitems import CodingInstructionsMetadata, MemoryRulesMetadata
 from . import resource_gate
 
 if TYPE_CHECKING:
@@ -107,6 +108,9 @@ ConflictCode = Literal[
     "resource_gate_unmet",
     # An explicit personal owner that differs from the WorkItem it raced to (#5376).
     OwnerMismatchCode,
+    # The repository's accepted learned rules cannot be pinned within their
+    # bounds (#5798); admission writes nothing.
+    "memory_rules_unavailable",
 ]
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
@@ -395,6 +399,7 @@ class WorkItemSnapshot:
     enrollment_generation: int | None
     requester_principal_id: uuid.UUID | None
     coding_instructions: CodingInstructionsMetadata
+    memory_rules: MemoryRulesMetadata
 
 
 @dataclass(frozen=True)
@@ -417,6 +422,7 @@ class ExecutionRequestSnapshot:
     enrollment_generation: int | None
     coding_instructions_selection_id: uuid.UUID | None
     coding_instructions_evidence: EvidenceState
+    memory_rules_evidence: MemoryRulesEvidence
 
 
 @dataclass(frozen=True)
@@ -438,7 +444,7 @@ class WorkItemConflict:
 WorkItemResult = WorkItemOutcome | WorkItemConflict
 
 
-def _work_item_snapshot(row: WorkItem) -> WorkItemSnapshot:
+def _work_item_snapshot(row: WorkItem, memory_rule_numbers: Sequence[int]) -> WorkItemSnapshot:
     return WorkItemSnapshot(
         id=row.id,
         tracker_issue=row.tracker_issue,
@@ -456,6 +462,7 @@ def _work_item_snapshot(row: WorkItem) -> WorkItemSnapshot:
         enrollment_generation=row.enrollment_generation,
         requester_principal_id=row.requester_principal_id,
         coding_instructions=metadata(row),
+        memory_rules=memory_rules_admission.metadata(row, memory_rule_numbers),
     )
 
 
@@ -478,6 +485,7 @@ def _request_snapshot(row: ExecutionRequest) -> ExecutionRequestSnapshot:
         enrollment_generation=row.enrollment_generation,
         coding_instructions_selection_id=row.coding_instructions_selection_id,
         coding_instructions_evidence=evidence(row.coding_instructions_evidence),
+        memory_rules_evidence=memory_rules_admission.evidence(row.memory_rules_evidence),
     )
 
 
@@ -488,8 +496,12 @@ async def outcome(
     *,
     replayed: bool = False,
 ) -> WorkItemOutcome:
+    numbers: Sequence[int] = ()
+    if work_item.memory_rules_state == "selected":
+        pinned = await memory_rules_admission.rule_numbers(session, [work_item.id])
+        numbers = pinned.get(work_item.id, ())
     result = WorkItemOutcome(
-        work_item=_work_item_snapshot(work_item),
+        work_item=_work_item_snapshot(work_item, numbers),
         request=_request_snapshot(request) if request is not None else None,
         replayed=replayed,
     )
@@ -946,7 +958,17 @@ async def create_or_get_work_item(
     current = await session.scalar(select(WorkItem.id).where(*for_tracker_issue(issue)))
     coding_values: dict[str, Any] = {}
     selected = None
+    memory_values: dict[str, Any] = {}
+    memory_selected = None
     if current is None:
+        # Pinned once, at the first admission (#5798): a WorkItem an admission
+        # reuses keeps the rules it pinned.
+        try:
+            memory_values, memory_selected = await memory_rules_admission.selection_columns(
+                session, agent_id=agent_id, repository=repository
+            )
+        except MemoryRulesUnavailable:
+            return await _conflict(session, "memory_rules_unavailable")
         coding_values, selected = await selection_columns(
             session, agent_id=agent_id, principal_id=requester_principal_id
         )
@@ -957,6 +979,7 @@ async def create_or_get_work_item(
             id=new_id,
             **owner_values,
             **coding_values,
+            **memory_values,
             **work_item_identity_values(issue, repository),
             code_host_installation_id=code_host_installation_id,
             agent_id=agent_id,
@@ -983,9 +1006,14 @@ async def create_or_get_work_item(
             inserted_id = await session.scalar(statement)
             if inserted_id is not None:
                 await add_snapshot(session, work_item_id=inserted_id, selection=selected)
+                await memory_rules_admission.add_snapshot(
+                    session, work_item_id=inserted_id, selection=memory_selected
+                )
                 await session.flush()
     except IntegrityError:
         return await _conflict(session, "identity_mismatch")
+    except MemoryRulesUnavailable:
+        return await _conflict(session, "memory_rules_unavailable")
 
     work_item = await session.scalar(
         select(WorkItem)
@@ -1075,6 +1103,9 @@ async def _insert_waiting_request(
                 result_policy_digest=result_policy_digest,
                 **snapshot_columns(work_item),
                 **request_selection_columns(work_item),
+                **memory_rules_admission.request_selection_columns(
+                    work_item, completion_contract=completion_contract
+                ),
                 **(columns or {}),
             )
         )
@@ -1225,6 +1256,11 @@ async def create_revision_request(
                     version=1,
                     **snapshot_columns(work_item),
                     **request_selection_columns(work_item),
+                    # A queued mention is an implementation request: it is stored to
+                    # run under the default contract when it is promoted.
+                    **memory_rules_admission.request_selection_columns(
+                        work_item, completion_contract=CONTRACT_IMPLEMENTATION
+                    ),
                     **snapshot,
                 )
             )

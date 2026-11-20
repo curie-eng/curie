@@ -571,14 +571,18 @@ class Disposition(enum.StrEnum):
     ADMIT = "admit"
     CANCEL = "cancel"
     MENTION = "mention"
+    ANSWER = "answer"
 
 
 @dataclass(frozen=True)
 class MarkedNotice:
-    """One marking on a tracker issue: a label applied or removed, or a mention.
+    """One marking on a tracker issue: a label applied or removed, a mention,
+    or an answer (a person's comment on an issue with a factory question,
+    mention or not; never an admission or a cancellation).
 
     ``event_id`` is the tracker's immutable id for the event (a GitHub timeline
-    event id, a webhook delivery id, or a comment id for a mention). ``cursor``
+    event id, a webhook delivery id, or a comment id for a mention or an
+    answer; GitLab namespaces a note as ``note:<id>``). ``cursor``
     is the opaque poll position just after this notice. ``occurred_at`` is when
     the tracker says the event happened, or None when it reported no usable
     time; admission treats None as unknown and decides fail-closed (#4629).

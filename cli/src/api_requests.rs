@@ -406,3 +406,10 @@ pub struct WorkItemRetryRequest {
     pub reason: String,
     pub request_id: uuid::Uuid,
 }
+
+/// Request body of `POST /agents/{id}/memory/rules/{rule_id}/accept`, `/reject`
+/// and `/remove` (`MemoryRuleDecision`, #5797): the version the person read.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRuleDecision {
+    pub expected_version: i64,
+}

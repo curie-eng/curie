@@ -51,7 +51,7 @@ import hashlib
 import itertools
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -302,6 +302,7 @@ class GitLabAPI:
         self._failed_pages: dict[tuple[str, int], int] = {}
         self._transport_errors = 0
         self._scripted: list[_Scripted] = []
+        self._before: list[tuple[str, str, Callable[[], None]]] = []
         self._throttle: dict[str, Any] | None = None
         self.add_user(ROOT, admin=True, token=ROOT_TOKEN, scopes=("api", "sudo"))
         self.add_user(BOT, token=TOKEN, scopes=("api", "write_repository"))
@@ -431,6 +432,23 @@ class GitLabAPI:
         self._scripted.append(
             _Scripted(status, default if body is None else body, dict(headers or {}), path, method)
         )
+
+    def before_next(self, action: Callable[[], None], *, method: str, path: str) -> None:
+        """Run ``action`` once, just before the next ``method`` request to API
+        ``path`` (exact) is answered: something a person or another process
+        does while the caller is between two of its reads. Only the served
+        fake (`gitlab_lifecycle.serve_fake`) runs it, on a worker thread, so
+        the fake keeps answering while ``action`` runs."""
+
+        self._before.append((method, path, action))
+
+    def take_before(self, request: httpx.Request) -> Callable[[], None] | None:
+        own = self.api_path(request)
+        for index, (method, path, action) in enumerate(self._before):
+            if method == request.method and path == own:
+                del self._before[index]
+                return action
+        return None
 
     def throttle(
         self,

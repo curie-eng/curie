@@ -39,7 +39,7 @@ from curie_api.schemas.publications import (
 )
 from curie_api.schemas.workspaces import RepositoryCredentialOut
 
-from .. import factory_ci, factory_progress, requester_instruction_context
+from .. import factory_ci, factory_progress, memory_rules_context, requester_instruction_context
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
@@ -532,6 +532,17 @@ async def create_publication(
     session: SessionDep,
     response: Response,
 ) -> PublicationOut:
+    # #5798: only the platform writes the learned rules line. Refused before any
+    # other work, so a patch problem never masks the reserved line.
+    if memory_rules_context.carries_annotation(data.body):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.learned_rules_annotation_reserved",
+                "message": "a line starting with 'Learned rules:' is written only "
+                "by the platform; remove it and publish again",
+            },
+        )
     try:
         patch = data.decoded_patch()
     except ValueError as exc:
@@ -674,6 +685,12 @@ async def create_publication(
         digest = await requester_instruction_context.applied_digest(session, work_item_request_id)
         if digest is not None:
             annotated = requester_instruction_context.annotate(data.body or "", digest)
+            data = data.model_copy(update={"body": annotated})
+        # The learned rules line (#5798), from the same acknowledged record, goes
+        # immediately before the requester line, which stays last.
+        applied = await memory_rules_context.applied_rules(session, work_item_request_id)
+        if applied is not None:
+            annotated = memory_rules_context.annotate(data.body or "", applied)
             data = data.model_copy(update={"body": annotated})
 
     async def metadata_check() -> None:

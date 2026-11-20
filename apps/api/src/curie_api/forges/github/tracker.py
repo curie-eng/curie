@@ -555,8 +555,11 @@ class GitHubTracker:
         )
 
     def _mention_notice(
-        self, comment: Any, cursor: str, app_slug: str | None
+        self, comment: Any, cursor: str, app_slug: str | None, answering: Collection[int]
     ) -> MarkedNotice | None:
+        """A mention, or on an ``answering`` issue number any comment by a
+        person as an answer (#5789 decision 8): one comment, one notice."""
+
         if not isinstance(comment, dict) or comment.get("performed_via_github_app") is not None:
             return None
         comment_id = _positive_int(comment.get("id"))
@@ -567,7 +570,6 @@ class GitHubTracker:
             comment_id is None
             or not isinstance(body, str)
             or not body.strip()
-            or not mentions_factory(body, self.mention, app_slug)
             or not isinstance(issue_url, str)
             # A pull request conversation comment is review feedback, not a marking.
             or (isinstance(html_url, str) and "/pull/" in html_url)
@@ -578,12 +580,15 @@ class GitHubTracker:
         sender = human_actor({"user": comment.get("user")})
         if number is None or sender is None:
             return None
+        answer = number in answering
+        if not answer and not mentions_factory(body, self.mention, app_slug):
+            return None
         return MarkedNotice(
             issue=self.issue(number),
-            marker=f"@{self.mention}",
+            marker=self.label if answer else f"@{self.mention}",
             actor=Actor(str(sender[0]), sender[1]),
             event_id=str(comment_id),
-            disposition=Disposition.MENTION,
+            disposition=Disposition.ANSWER if answer else Disposition.MENTION,
             cursor=cursor,
             occurred_at=parse_time(comment.get("created_at")),
         )
@@ -611,9 +616,21 @@ class GitHubTracker:
         return self._event_notice({**event, "issue": {"number": number}}, cursor)
 
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         events_after, comments_after = _parse_cursor(cursor)
+        answers = {
+            int(issue.issue_id)
+            for issue in answering
+            if issue.kind == GITHUB
+            and issue.host == self.host
+            and issue.scope_id == str(self.repository_id)
+            and issue.issue_id.isdigit()
+        }
         # Read every listing before returning any notice or cursor.
         events = await self._pages(f"{self._repo_path}/issues/events", {})
         comments = await self._pages(
@@ -642,7 +659,9 @@ class GitHubTracker:
             if comment_id is None:
                 continue
             newest_comment = max(newest_comment, comment_id)
-            notice = self._mention_notice(comment, f"{newest_event}:{comment_id}", app_slug)
+            notice = self._mention_notice(
+                comment, f"{newest_event}:{comment_id}", app_slug, answers
+            )
             if notice is not None:
                 notices.append(notice)
         next_cursor = f"{newest_event}:{newest_comment}"
@@ -666,6 +685,8 @@ class GitHubTracker:
             return state == "closed" or self.label not in names
         if state != "open":
             return False
+        if notice.disposition is Disposition.ANSWER and self.label not in names:
+            return False
         if notice.disposition is Disposition.ADMIT:
             if self.label not in names:
                 return False
@@ -685,7 +706,10 @@ class GitHubTracker:
             and isinstance(user, dict)
             and str(user.get("id")) == notice.actor.id
             and isinstance(body, str)
-            and mentions_factory(body, self.mention, await self.app_slug())
+            and (
+                notice.disposition is Disposition.ANSWER
+                or mentions_factory(body, self.mention, await self.app_slug())
+            )
         )
 
     async def marking_actor(self, issue: TrackerIssueRef, marker: str) -> Actor | None:

@@ -2924,6 +2924,145 @@ Limits:
    publication gates. Those come from the platform, the bundle and the
    repository, which take precedence in that order.
 
+### Accepted learned rules
+
+A learned rule is a one-line instruction that a person who can merge to a repository
+accepted after a review comment suggested it ([ADR 0287](adr/0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md)).
+When the first request of a factory WorkItem is admitted, admission reads the
+repository's accepted rules, oldest acceptance first, and pins their numbers, canonical
+text and digest to the WorkItem in the same transaction as the requester selection. A
+rule accepted or removed afterwards changes the next WorkItem for that repository, never
+one already admitted: every request of the WorkItem (revision, repair, retry, recovery),
+and a relabel that reuses the WorkItem, keeps the pin. The WorkItem read shows
+`memory_rules` with the state, count, rule numbers, digest and format version, and never
+the text.
+
+A repository scope that would not fit its bounds (more than 16 accepted rules, or a
+canonical text over 4096 bytes) refuses admission with `409 memory_rules_unavailable` and
+writes nothing; the accept route keeps a scope inside both bounds, so this is a backstop.
+
+Delivery runs beside the requester delivery and never inside its envelope, once per
+execution, before the first model turn:
+
+1. The worker reads the version 1 envelope from
+   `POST /v1/internal/work-items/requests/{request_id}/memory-rules-context` for the
+   request's current fence.
+2. The worker posts it to the runner's `POST /v1/memory-rules-context`. The runner checks
+   the execution its completion contract names, the version, the 4096 byte bound and that
+   the digest is the SHA-256 of the text, and acknowledges before it builds the model
+   session. The session waits for both this and the requester acknowledgment.
+3. The worker relays the acknowledgment to
+   `POST /v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment`.
+
+The request's `memory_rules_evidence` records the outcome: `none`, `pending`, `applied` or
+`failed`. Any failure fails the request before model work with the reason in its terminal
+detail: the runner's `wrong_execution`, `wrong_fence`, `unsupported_version`, `too_large`,
+`digest_mismatch`, `malformed_envelope` and `unsupported_format`, `runner_unacknowledged`
+for a runner that never answered, `runner_refused` for a refusal without a usable reason,
+and `memory_rules_unavailable` when the stored snapshot no longer matches its digest.
+
+The implementer's system prompt carries the rules between two delimiter lines, after the
+bundle prompt and model line and before the requester preferences. The section states
+the order of authority, strongest first: platform safety and operator controls and the
+bundle's mandatory rules, the repository's own instruction files, the learned rules, then
+the requester's personal preferences. A learned rule cannot add tools, skills,
+credentials, egress, grants or budget, change acceptance criteria, or remove review and
+publication gates. Reviewer sessions never receive the section, and the runner refuses an
+`Agent` or `Task` call that carries a delimiter line or a pinned rule line.
+
+A pull request published for a request whose evidence is `applied` carries one line,
+`Learned rules: in force; rules:R1,R4; sha256:<digest>`, immediately before the
+`Requester preferences:` line. It names rule numbers and a digest, never text, and says
+"in force", not "followed". A publication body that already carries a line starting
+with `Learned rules:` is refused with `publication.learned_rules_annotation_reserved`
+before any other work.
+
+Only a request under the implementation completion contract is served the rules: a request
+under any other contract (the separate triage path) carries `memory_rules_evidence` `none`
+and is served an absent envelope. The rule text rides the implementer's system prompt, so
+the conversation transcript and its native checkpoint can retain it, under the transcript's
+own access controls and expiry and not the WorkItem snapshot's, as for requester
+preferences. A rule removed after a WorkItem was admitted can therefore remain in that
+WorkItem's snapshot and in its recorded transcript until they expire.
+
+### Learned rules
+
+A learned rule is a one-line rule an agent proposes, for example after a
+merged pull request. A proposed rule applies only after a person accepts it.
+Accepting or removing a rule changes only stored rows. The decision is
+recorded now and takes effect at the next ticket's admission once admission
+reads learned rules (#5798); a running request keeps the rules it was admitted
+with. Every decision answers `"applies_from": "next_ticket"`.
+
+The routes:
+
+1. `GET /agents/{agent_id}/memory/rules` lists the agent's `proposed`,
+   `accepted`, `rejected` and `removed` rules, ordered by scope and number,
+   with each scope's `in_force_count` (its accepted rules) and
+   `in_force_limit`. It takes the platform key or a console session, like the
+   rest of the memory API. Filter with `state`, `scope_kind` and `scope_key`;
+   any other state is refused with 422.
+2. `POST /agents/{agent_id}/memory/rules/{rule_id}/accept`, `.../reject` and
+   `.../remove` take the body `{"expected_version": N}`, the version the
+   person last read. Accept and reject act on a proposed rule, remove on an
+   accepted one. Each records who decided and when, bumps the version, and
+   writes one audit event.
+
+Only a signed-in person decides. The action routes accept a principal console
+session from the console's own origin and refuse the platform key, an
+`Authorization` header and every other credential with 401. The person's
+tenant must own the agent.
+
+The write access rule: for a rule in a repository scope, the person needs an
+active link to a GitHub account on that repository's host, and that account
+must have `write`, `maintain` or `admin` permission on the repository when
+they act. The API reads the account's current login by its immutable id,
+resolves the repository by the immutable id stored in the rule's scope, and
+only then reads the permission. It never uses the repository path stored on
+the rule, so after a rename a writer on a different repository at the old path
+cannot decide the original's rules. An operator links a person with
+`POST /identity/admin/{tenant_id}/code-host-links`. Rules in agent or binding
+scope cannot be decided through these routes yet.
+
+Each scope holds at most 16 accepted rules, and their delivered text, one
+`R<number>: <text>` line per rule, must stay within 4096 bytes. Long rules with
+large numbers can reach the byte bound before the count bound. Accept checks
+both under a lock on the agent row, so two concurrent accepts cannot pass the
+cap together. Reject and remove never meet either bound.
+
+Coded refusals carry `detail` with `code`, `message` and `fix`; OpenAPI
+declares that body as `MemoryRuleRefusal`:
+
+1. 403 `memory_rules.write_access_required`: no linked account on the host,
+   the account cannot write to the repository, or the link was revoked or
+   changed while GitHub was being read.
+2. 403 `memory_rules.write_access_unverifiable`: the scope is not a GitHub
+   repository keyed by its numeric id on a configured code host, its id now
+   answers for another repository or none, or the person has more than one
+   linked account on the host.
+3. 403 `memory_rules.scope_not_supported`: an agent or binding scope rule.
+4. 404 `memory_rules.not_found`: no such agent or rule for this person.
+5. 409 `memory_rules.stale_version` (with `current_version`),
+   `memory_rules.invalid_transition`, `memory_rules.scope_full` (with
+   `limit`) and `memory_rules.snapshot_full` (with `limit_bytes`).
+6. 503 `memory_rules.code_host_unavailable` when GitHub cannot be read, and
+   `memory_rules.unavailable` when the database cannot. Nothing changes; retry.
+7. 422 `memory_rules.invalid_request` for a malformed query, path or body.
+
+A refused credential (401) or console origin (403) is a plain `detail` string
+instead, declared as `MemoryRuleAuthRefusal`. A principal disabled, or whose
+tenant was suspended, while GitHub was being read is refused under the
+identity fence with the same 401 as a dead session, and nothing changes.
+
+From the CLI, `curie cluster memory <agent> --rules` lists rules over the
+cluster connection; add `--rule-state STATE` or `--scope-key KEY` to filter,
+and `--json` for the API object. `curie cluster memory <agent> --accept RULE_ID
+--expected-version N --session-file PATH` decides one rule, and `--reject` and
+`--remove` take the same arguments. The session file holds only the console
+session cookie value and must be readable by its owner alone (mode 0600 or
+stricter). Acting never sends the platform key. `--dry-run` prints the request
+it would send without sending it.
+
 ### Driving the deployed agent
 
 ```bash

@@ -797,6 +797,35 @@ class WorkItemDispatchClient:
             raise WorkItemTransportError("requester context acknowledgment was unusable")
         return str(evidence)
 
+    async def memory_rules_context(
+        self, request_id: uuid.UUID, *, runtime_epoch: int
+    ) -> dict[str, Any]:
+        """The running request's learned rules envelope (#5798)."""
+
+        return await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/memory-rules-context",
+            {"runtime_epoch": runtime_epoch},
+        )
+
+    async def acknowledge_memory_rules_context(
+        self,
+        request_id: uuid.UUID,
+        *,
+        runtime_epoch: int,
+        acknowledgment: dict[str, Any] | None,
+        reason: str | None,
+    ) -> str:
+        """Relay the runner's learned rules acknowledgment, or the worker's failure."""
+
+        body = await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
+            {"runtime_epoch": runtime_epoch, "acknowledgment": acknowledgment, "reason": reason},
+        )
+        evidence = body.get("evidence")
+        if evidence not in ("none", "applied", "failed"):
+            raise WorkItemTransportError("learned rules acknowledgment was unusable")
+        return str(evidence)
+
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             response = await self._client.post(

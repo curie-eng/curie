@@ -11971,6 +11971,432 @@
         "title": "MemoryProvenanceOut",
         "type": "object"
       },
+      "MemoryRuleAuthRefusal": {
+        "description": "A refused credential or console origin: one plain reason string.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "MemoryRuleAuthRefusal",
+        "type": "object"
+      },
+      "MemoryRuleDecider": {
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "principal_id": {
+            "format": "uuid",
+            "title": "Principal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "principal_id",
+          "display_name"
+        ],
+        "title": "MemoryRuleDecider",
+        "type": "object"
+      },
+      "MemoryRuleDecision": {
+        "additionalProperties": false,
+        "description": "The body of an accept, reject or remove: the version the person saw.",
+        "properties": {
+          "expected_version": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "title": "MemoryRuleDecision",
+        "type": "object"
+      },
+      "MemoryRuleDecisionOut": {
+        "properties": {
+          "applies_from": {
+            "const": "next_ticket",
+            "description": "The decision is recorded now and takes effect at the next ticket's admission once admission reads learned rules (#5798); a running request keeps the rules it was admitted with.",
+            "title": "Applies From",
+            "type": "string"
+          },
+          "rule": {
+            "$ref": "#/components/schemas/MemoryRuleOut"
+          }
+        },
+        "required": [
+          "rule",
+          "applies_from"
+        ],
+        "title": "MemoryRuleDecisionOut",
+        "type": "object"
+      },
+      "MemoryRuleOut": {
+        "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
+          "accepted_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryRuleDecider"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "number": {
+            "title": "Number",
+            "type": "integer"
+          },
+          "proposed_at": {
+            "format": "date-time",
+            "title": "Proposed At",
+            "type": "string"
+          },
+          "proposed_by": {
+            "title": "Proposed By",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "rejected_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rejected At"
+          },
+          "rejected_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryRuleDecider"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "removed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Removed At"
+          },
+          "removed_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryRuleDecider"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scope_key": {
+            "title": "Scope Key",
+            "type": "string"
+          },
+          "scope_kind": {
+            "enum": [
+              "agent",
+              "binding",
+              "repository"
+            ],
+            "title": "Scope Kind",
+            "type": "string"
+          },
+          "scope_label": {
+            "title": "Scope Label",
+            "type": "string"
+          },
+          "source_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Url"
+          },
+          "state": {
+            "enum": [
+              "proposed",
+              "accepted",
+              "rejected",
+              "removed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "number",
+          "label",
+          "scope_kind",
+          "scope_key",
+          "scope_label",
+          "state",
+          "text",
+          "reason",
+          "source_url",
+          "proposed_by",
+          "proposed_at",
+          "accepted_by",
+          "accepted_at",
+          "rejected_by",
+          "rejected_at",
+          "removed_by",
+          "removed_at",
+          "version"
+        ],
+        "title": "MemoryRuleOut",
+        "type": "object"
+      },
+      "MemoryRuleRefusal": {
+        "description": "Every coded learned rule refusal, a malformed request's 422 included.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/MemoryRuleRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "MemoryRuleRefusal",
+        "type": "object"
+      },
+      "MemoryRuleRefusalDetail": {
+        "description": "A coded refusal: ``code`` is ``memory_rules.<name>``.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "current_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Version"
+          },
+          "fix": {
+            "title": "Fix",
+            "type": "string"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          },
+          "limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Bytes"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "fix"
+        ],
+        "title": "MemoryRuleRefusalDetail",
+        "type": "object"
+      },
+      "MemoryRuleScopeOut": {
+        "properties": {
+          "in_force_count": {
+            "title": "In Force Count",
+            "type": "integer"
+          },
+          "scope_key": {
+            "title": "Scope Key",
+            "type": "string"
+          },
+          "scope_kind": {
+            "enum": [
+              "agent",
+              "binding",
+              "repository"
+            ],
+            "title": "Scope Kind",
+            "type": "string"
+          },
+          "scope_label": {
+            "title": "Scope Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_kind",
+          "scope_key",
+          "scope_label",
+          "in_force_count"
+        ],
+        "title": "MemoryRuleScopeOut",
+        "type": "object"
+      },
+      "MemoryRulesMetadata": {
+        "description": "The learned rules pinned at admission (#5798): numbers and digest, never the text.",
+        "properties": {
+          "count": {
+            "default": 0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "format_version": {
+            "anyOf": [
+              {
+                "const": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Format Version"
+          },
+          "rule_numbers": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Rule Numbers",
+            "type": "array"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "state": {
+            "enum": [
+              "absent",
+              "selected"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "MemoryRulesMetadata",
+        "type": "object"
+      },
+      "MemoryRulesOut": {
+        "properties": {
+          "in_force_limit": {
+            "title": "In Force Limit",
+            "type": "integer"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRuleOut"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "scopes": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRuleScopeOut"
+            },
+            "title": "Scopes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "rules",
+          "scopes",
+          "in_force_limit"
+        ],
+        "title": "MemoryRulesOut",
+        "type": "object"
+      },
       "MemoryTraceBackOut": {
         "description": "The learned-from trace-back for one memory entry (#266).\n\nResolves an entry's recorded provenance into the concrete session and source\ntraces the lesson was learned from -- the answer to \"how did it learn that?\".",
         "properties": {
@@ -20138,6 +20564,9 @@
             "title": "Id",
             "type": "string"
           },
+          "memory_rules": {
+            "$ref": "#/components/schemas/MemoryRulesMetadata"
+          },
           "model_auth_mode": {
             "default": "service",
             "enum": [
@@ -20305,6 +20734,7 @@
           "ci",
           "requests",
           "coding_instructions",
+          "memory_rules",
           "automatic_retries_used",
           "automatic_retry_limit"
         ],
@@ -20536,6 +20966,17 @@
               }
             ],
             "title": "Last Start Failure Detail"
+          },
+          "memory_rules_evidence": {
+            "default": "none",
+            "enum": [
+              "none",
+              "pending",
+              "applied",
+              "failed"
+            ],
+            "title": "Memory Rules Evidence",
+            "type": "string"
           },
           "model_auth_mode": {
             "default": "service",
@@ -25655,6 +26096,580 @@
           }
         },
         "summary": "Put Memory Guidance",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/agents/{agent_id}/memory/rules": {
+      "get": {
+        "description": "The agent's proposed, accepted, rejected and removed rules, by scope and number.",
+        "operationId": "list_rules_agents__agent_id__memory_rules_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "proposed",
+                    "accepted",
+                    "rejected",
+                    "removed"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "agent",
+                    "binding",
+                    "repository"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRulesOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "No platform key or live console session"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "Console session origin rejected"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.not_found`"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.invalid_request`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.unavailable`"
+          }
+        },
+        "summary": "List Rules",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/agents/{agent_id}/memory/rules/{rule_id}/accept": {
+      "post": {
+        "description": "Accept a proposed rule. The decision is recorded now and takes effect at the\nnext ticket's admission once admission reads learned rules (#5798); a running\nrequest keeps the rules it was admitted with.",
+        "operationId": "accept_rule_agents__agent_id__memory_rules__rule_id__accept_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Rule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryRuleDecision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleDecisionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "Not an active principal's console session, or another credential sent"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 403 Accept Rule Agents  Agent Id  Memory Rules  Rule Id  Accept Post"
+                }
+              }
+            },
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.not_found`"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule`"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.invalid_request`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.code_host_unavailable` or `memory_rules.unavailable`"
+          }
+        },
+        "summary": "Accept Rule",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/agents/{agent_id}/memory/rules/{rule_id}/reject": {
+      "post": {
+        "description": "Reject a proposed rule; it never applies.",
+        "operationId": "reject_rule_agents__agent_id__memory_rules__rule_id__reject_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Rule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryRuleDecision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleDecisionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "Not an active principal's console session, or another credential sent"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 403 Reject Rule Agents  Agent Id  Memory Rules  Rule Id  Reject Post"
+                }
+              }
+            },
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.not_found`"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule`"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.invalid_request`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.code_host_unavailable` or `memory_rules.unavailable`"
+          }
+        },
+        "summary": "Reject Rule",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/agents/{agent_id}/memory/rules/{rule_id}/remove": {
+      "post": {
+        "description": "Remove an accepted rule. The decision is recorded now and takes effect at the\nnext ticket's admission once admission reads learned rules (#5798); a running\nrequest keeps the rules it was admitted with.",
+        "operationId": "remove_rule_agents__agent_id__memory_rules__rule_id__remove_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Rule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryRuleDecision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleDecisionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "Not an active principal's console session, or another credential sent"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 403 Remove Rule Agents  Agent Id  Memory Rules  Rule Id  Remove Post"
+                }
+              }
+            },
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.not_found`"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule`"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.invalid_request`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.code_host_unavailable` or `memory_rules.unavailable`"
+          }
+        },
+        "summary": "Remove Rule",
         "tags": [
           "memory"
         ]
@@ -39309,6 +40324,150 @@
           }
         },
         "summary": "Hold Work Item For Approval",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context": {
+      "post": {
+        "description": "The running request's version 1 learned rules envelope, for the current fence.",
+        "operationId": "read_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContextBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Memory Rules Context V1 Internal Work Items Requests  Request Id  Memory Rules Context Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Memory Rules Context",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment": {
+      "post": {
+        "description": "Accept the relayed acknowledgment only for the current request and fence.",
+        "operationId": "acknowledge_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_acknowledgment_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcknowledgmentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Acknowledge Memory Rules Context V1 Internal Work Items Requests  Request Id  Memory Rules Context Acknowledgment Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acknowledge Memory Rules Context",
         "tags": [
           "internal-work-items"
         ]
