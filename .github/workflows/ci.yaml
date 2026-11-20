@@ -3700,7 +3700,6 @@ jobs:
           path: target/factory-e2e/scripted-*.json
           if-no-files-found: warn
       - name: Upload scripted Jira one-ticket evidence
-        continue-on-error: true
         if: always() && matrix.suite == 'jira-one-ticket'
         uses: actions/upload-artifact@v7
         with:
