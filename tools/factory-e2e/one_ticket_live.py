@@ -303,6 +303,11 @@ def judge(obs: Mapping[str, Any]) -> list[str]:
             failures.append("the work item could not be read immediately before the answer")
         elif pre_answer == "no_request":
             failures.append("the work item showed no request immediately before the answer")
+        elif pre_answer == "extra_request":
+            failures.append(
+                "the work item showed more than the one asking request immediately before "
+                "the answer"
+            )
         elif pre_answer != "ok":
             failures.append("the work item was not read immediately before the answer")
 
@@ -980,9 +985,10 @@ class _LiveRun:
 
         def before_label(issue_id: str, key: str) -> None:
             # The issue id is in the driver's own failure messages (the label
-            # PUT below): an identity from here on.
+            # PUT below), and the key names the issue whole: both are identities
+            # from here on (another key of the project still loses the project).
             identities = self.p.scenario_options.get("identities") or {}
-            add_identity(identities, "issue", issue_id)
+            add_identity(identities, "issue", issue_id, key)
             install_sanitizer(self.p, identities)
             status, issue = self.driver.issue_fields(issue_id)
             found = status_id(issue) if status == 200 else None
@@ -1080,7 +1086,22 @@ class _LiveRun:
             self.obs["live_before_answer"] = live
             self.note("a request was live before the answer; not answering")
             return False
+        if len(requests_of(final)) != 1:
+            self.obs["pre_answer_read"] = "extra_request"
+            self.note("more than the asking request existed before the answer; not answering")
+            return False
         self.obs["pre_answer_read"] = "ok"
+        # A broken earlier beat stops the run before the next paid model call.
+        investigating = self.obs["investigating_s"]
+        question = self.obs["question_s"]
+        if (
+            investigating is None
+            or investigating > INVESTIGATING_SECONDS
+            or question is None
+            or question > QUESTION_SECONDS
+        ):
+            self.note("an earlier beat failed (investigating line or question); not answering")
+            return False
         status, _ = self.driver.post_comment(self.issue_id, answer)
         if status != 201:
             self.note("posting the answer failed", http_status=status)
@@ -1143,6 +1164,12 @@ class _LiveRun:
                 self.note("no pull request within the bound")
                 break
             self.sleep(POLL_SECONDS)
+        self.obs["pull_requests"] = self._list_pull_requests()
+        return self.change is not None
+
+    def _list_pull_requests(self) -> list[dict[str, Any]]:
+        """Every pull request the run opened, as the judge reads them."""
+
         pulls: list[dict[str, Any]] = []
         repo = self.p.config.repo
         for number in self.driver.changes_opened():
@@ -1158,20 +1185,26 @@ class _LiveRun:
                     "has_citation": has_citation(body),
                 }
             )
-        self.obs["pull_requests"] = pulls
-        return self.change is not None
+        return pulls
 
     def await_answered_run_ending(self) -> bool:
         """At least two requests and none live, within ENDING_SECONDS of the pull request."""
 
         deadline = (self.pr_recorded_at or self.clock()) + ENDING_SECONDS
         while True:
+            read_at = self.clock()
             detail = self.p.work_item_detail(self.work_item_id)
-            if detail is not None and len(requests_of(detail)) >= 2 and not live_statuses(detail):
+            # An ending read after the deadline does not count.
+            if (
+                read_at <= deadline
+                and detail is not None
+                and len(requests_of(detail)) >= 2
+                and not live_statuses(detail)
+            ):
                 self.obs["answered_run_ended"] = True
                 self.note("the answered run ended")
                 return True
-            if self.clock() > deadline:
+            if read_at > deadline or self.clock() > deadline:
                 self.obs["answered_run_ended"] = False
                 self.note(f"the answered run did not end within {ENDING_SECONDS} s; not merging")
                 return False
@@ -1179,6 +1212,11 @@ class _LiveRun:
 
     def merge_and_await_notice(self) -> None:
         if not self.await_answered_run_ending():
+            return
+        # Recount after the run ended: a second pull request must not be merged past.
+        self.obs["pull_requests"] = self._list_pull_requests()
+        if len(self.obs["pull_requests"]) != 1:
+            self.note("the pull requests are not exactly one after the run ended; not merging")
             return
         merge = self.driver.merge(self.change)
         merged_at = self.clock()

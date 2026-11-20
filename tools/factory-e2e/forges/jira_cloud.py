@@ -68,6 +68,8 @@ STATUS_PROPERTY = "curie.factory"
 COMMENT_PAGE_SIZE = 100
 COMMENT_LIST_IDS_LIMIT = 1000
 MAX_COMMENT_PAGES = 1000
+# Pages of the enhanced JQL search followed before failing closed.
+MAX_SEARCH_PAGES = 10
 # The tracker label `curie factory quickstart --tracker jira-cloud` writes.
 QUICKSTART_LABEL = "curie-factory"
 # The tracker poll interval the quickstart leaves at its default; the
@@ -464,16 +466,23 @@ class JiraCloudDriver:
 
         minutes = max(1, math.ceil((time.time() - since_epoch) / 60) + 1)
         jql = created_since_jql(self.site.project_key, self.site.bot_account_id, minutes)
-        status, found = self._jira(
-            "labeler",
-            "POST",
-            "/search/jql",
-            {"jql": jql, "fields": ["created"], "maxResults": 100},
-        )
-        issues = found.get("issues") if isinstance(found, dict) else None
-        if status != 200 or not isinstance(issues, list):
-            return None
-        return created_at_or_after(issues, since_epoch)
+        issues: list[Any] = []
+        token: str | None = None
+        for _ in range(MAX_SEARCH_PAGES):
+            request: dict[str, Any] = {"jql": jql, "fields": ["created"], "maxResults": 100}
+            if token is not None:
+                request["nextPageToken"] = token
+            status, found = self._jira("labeler", "POST", "/search/jql", request)
+            page = found.get("issues") if isinstance(found, dict) else None
+            if status != 200 or not isinstance(page, list):
+                return None
+            issues.extend(page)
+            following = found.get("nextPageToken")
+            if found.get("isLast") is True or not isinstance(following, str) or not following:
+                return created_at_or_after(issues, since_epoch)
+            token = following
+        # More pages remain past the bound: a partial count could read 0.
+        return None
 
     # -- tracker evidence --
 

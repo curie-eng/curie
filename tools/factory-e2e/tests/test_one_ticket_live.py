@@ -1126,6 +1126,8 @@ class _FakeJira:
         self.calls: list[dict[str, Any]] = []
         self.search_status = 200
         self.search_issues: list[dict[str, Any]] = []
+        # Recorded-shape pages keyed by the request's nextPageToken ("" is the first).
+        self.search_pages: dict[str, dict[str, Any]] | None = None
         self.label_status = 204
 
     def __call__(
@@ -1162,6 +1164,9 @@ class _FakeJira:
         if method == "POST" and route == "/search/jql":
             if self.search_status != 200:
                 return self.search_status, {"errorMessages": ["bad"]}
+            if self.search_pages is not None:
+                page = self.search_pages.get((body or {}).get("nextPageToken", ""))
+                return (200, page) if page is not None else (400, {"errorMessages": ["bad"]})
             return 200, {"issues": self.search_issues, "isLast": True}
         raise AssertionError(f"unexpected Jira call {method} {path}")
 
@@ -1274,6 +1279,38 @@ def test_driver_factory_created_issues_counts_only_issues_created_since_the_run(
         fe.shutil.rmtree(p.workdir, ignore_errors=True)
 
 
+def test_driver_factory_created_issues_follows_next_page_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver, fake, p = _driver(tmp_path, monkeypatch)
+    since = datetime(2026, 11, 20, 8, 30, tzinfo=UTC).timestamp()
+    old = _search_hit("10040", "2026-11-20T08:15:30.123+0000")
+    mine = _search_hit("10041", "2026-11-20T08:45:10.000+0000")
+    try:
+        # Fails with single-page reading: the in-run issue is on page 2.
+        fake.search_pages = {
+            "": {"issues": [old], "nextPageToken": "tok-2", "isLast": False},
+            "tok-2": {"issues": [mine], "isLast": True},
+        }
+        assert driver.factory_created_issues(since) == 1
+        bodies = [c["body"] for c in fake.calls if c["path"] == "/search/jql"]
+        assert "nextPageToken" not in bodies[0] and bodies[1]["nextPageToken"] == "tok-2"
+        # A page that cannot be read fails closed.
+        fake.search_pages = {"": {"issues": [old], "nextPageToken": "gone", "isLast": False}}
+        assert driver.factory_created_issues(since) is None
+        # More pages than the bound fail closed.
+        fake.search_pages = {
+            "": {"issues": [], "nextPageToken": "t0", "isLast": False},
+            **{
+                f"t{n}": {"issues": [], "nextPageToken": f"t{n + 1}", "isLast": False}
+                for n in range(50)
+            },
+        }
+        assert driver.factory_created_issues(since) is None
+    finally:
+        fe.shutil.rmtree(p.workdir, ignore_errors=True)
+
+
 def test_anonymize_issue_id_is_an_identity_before_the_label(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1292,7 +1329,7 @@ def test_anonymize_issue_id_is_an_identity_before_the_label(
         assert "10042" in str(refused.value)
         shown = fe.filtered(str(refused.value))
         assert "10042" not in shown and "issue" in shown, shown
-        assert p.scenario_options["identities"]["issue"] == ["10042"]
+        assert p.scenario_options["identities"]["issue"] == ["10042", ISSUE_KEY]
         assert p.scenario_options["identities"]["status"] == [STATUS_ID]
     finally:
         fe.shutil.rmtree(p.workdir, ignore_errors=True)
@@ -1355,8 +1392,20 @@ class _World:
     forge = "jira_cloud"
     pairing = "jira_cloud+github"
 
-    def __init__(self, clock: _Clock, *, final_read: str = "ok", second_run_ends: bool = True):
+    def __init__(
+        self,
+        clock: _Clock,
+        *,
+        final_read: str = "ok",
+        second_run_ends: bool = True,
+        ends_after: float = 1200,
+        investigating: bool = True,
+        second_pull_after: float | None = None,
+    ):
         self.clock = clock
+        self.ends_after = ends_after
+        self.investigating = investigating
+        self.second_pull_after = second_pull_after
         self.final_read = final_read
         self.second_run_ends = second_run_ends
         self.labelled: float | None = None
@@ -1392,7 +1441,7 @@ class _World:
     def bot_comments(self, key: str) -> list[dict[str, Any]]:
         assert key == ISSUE_KEY
         values = []
-        if self.since(self.labelled, 20):
+        if self.investigating and self.since(self.labelled, 20):
             values.append(
                 _comment(
                     "10100",
@@ -1426,7 +1475,10 @@ class _World:
         return 201, {"id": "10200"}
 
     def changes_opened(self) -> list[int]:
-        return [7] if self.since(self.answered, 1100) else []
+        found = [7] if self.since(self.answered, 1100) else []
+        if self.second_pull_after is not None and self.since(self.answered, self.second_pull_after):
+            found.append(8)
+        return found
 
     def merge(self, change: Any) -> dict[str, Any]:
         self.merges.append(change)
@@ -1446,11 +1498,14 @@ class _World:
             self.settled_reads += 1
             if self.settled_reads > 1 and self.final_read == "unreadable":
                 return None
+            if self.settled_reads > 1 and self.final_read == "extra":
+                requests[0]["status"] = "completed"
+                requests.append({"sequence": 2, "status": "completed", "created_at": _iso(0)})
             if self.settled_reads > 1 and self.final_read == "live":
                 requests.append({"sequence": 2, "status": "queued", "created_at": _iso(0)})
         if self.since(self.answered, 8):
             assert self.answered is not None
-            ended = self.second_run_ends and self.since(self.answered, 1200)
+            ended = self.second_run_ends and self.since(self.answered, self.ends_after)
             requests.append(
                 {
                     "sequence": 2,
@@ -1502,7 +1557,10 @@ class _FakePreflight:
         return self.world.detail()
 
     def as_actor(self, method: str, path: str) -> tuple[int, Any]:
-        assert (method, path) == ("GET", f"/repos/{REPO}/pulls/7")
+        assert method == "GET" and path in (
+            f"/repos/{REPO}/pulls/7",
+            f"/repos/{REPO}/pulls/8",
+        )
         return 200, self.world.pull()
 
     def model_usage(self) -> float:
@@ -1534,7 +1592,11 @@ def test_judge_drive_end_to_end_passes_on_the_happy_path(
     assert obs["usage"] == {"kind": "at_least", "total": "3.10"}
     assert obs["request_count"] == 2 and obs["status_id_unchanged"] is True
     # The run's identities, the issue id among them, are in the sanitizer.
-    assert p.scenario_options["identities"]["issue"] == ["10042"]
+    assert p.scenario_options["identities"]["issue"] == ["10042", ISSUE_KEY]
+    # The run's own key is anonymized whole; another key of the project is not.
+    plain = {"own": f"see {ISSUE_KEY}", "other": f"{PROJECT}-99"}
+    cleaned = otl.anonymize(plain, p.scenario_options["identities"])
+    assert cleaned == {"own": "see issue", "other": "project-99"}
     text = p.evidence_serializer(p.evidence)
     assert otl.find_identities(text, p.scenario_options["identities"]) == []
 
@@ -1582,3 +1644,59 @@ def test_judge_drive_does_not_merge_a_run_that_never_ends(
     assert world.answered is not None
     # The wait is the module's own bound after the pull request, not the harness's.
     assert clock.now <= world.answered + 1100 + otl.ENDING_SECONDS + 2 * otl.POLL_SECONDS
+
+
+def test_judge_drive_never_answers_when_the_investigating_line_never_appeared(
+    tmp_path: Path,
+) -> None:
+    # Fails with the beats check before the post reverted: the answer is posted.
+    p, world, _clock = _drive(tmp_path, investigating=False)
+    obs = p.evidence["scenario"]
+    assert world.posted == [] and world.merges == []
+    assert obs["question_s"] is not None and obs["investigating_s"] is None
+    assert obs["answer_s"] is None and obs["verdict"] == "failed"
+    assert (
+        f"no '{otl.INVESTIGATING_LINE}' status line within "
+        f"{otl.INVESTIGATING_SECONDS} s of labelling" in obs["failures"]
+    )
+
+
+def test_judge_drive_never_answers_when_the_final_read_holds_two_requests(
+    tmp_path: Path,
+) -> None:
+    # Fails with the extra-request check reverted: the answer is posted.
+    p, world, _clock = _drive(tmp_path, final_read="extra")
+    obs = p.evidence["scenario"]
+    assert world.posted == [] and world.merges == []
+    assert obs["pre_answer_read"] == "extra_request" and obs["answer_s"] is None
+    assert obs["verdict"] == "failed"
+    assert (
+        "the work item showed more than the one asking request immediately before the answer"
+        in obs["failures"]
+    )
+
+
+def test_judge_drive_does_not_merge_an_ending_observed_past_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fe, "_await_ending", _no_await_ending)
+    # Terminal only just after the module's ending bound of the recorded pull
+    # request (recorded within one poll of answer + 1100). Fails with the read-time
+    # deadline check reverted: the read that first shows it ended is accepted.
+    p, world, _clock = _drive(tmp_path, ends_after=1100 + otl.ENDING_SECONDS + 3)
+    obs = p.evidence["scenario"]
+    assert world.merges == []
+    assert obs["answered_run_ended"] is False and obs["merge_ok"] is False
+
+
+def test_judge_drive_does_not_merge_when_a_second_pull_request_appears_while_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fe, "_await_ending", _no_await_ending)
+    # Fails with the recount reverted: the first listing's one pull request is merged.
+    p, world, _clock = _drive(tmp_path, second_pull_after=1150)
+    obs = p.evidence["scenario"]
+    assert world.merges == []
+    assert [pr["number"] for pr in obs["pull_requests"]] == [7, 8]
+    assert obs["verdict"] == "failed"
+    assert "2 pull requests opened, expected exactly 1" in obs["failures"]
