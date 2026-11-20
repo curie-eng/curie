@@ -1344,6 +1344,10 @@
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
           "/agents/{agent_id}/memory/guidance",
+          "/agents/{agent_id}/memory/rules",
+          "/agents/{agent_id}/memory/rules/{rule_id}/accept",
+          "/agents/{agent_id}/memory/rules/{rule_id}/reject",
+          "/agents/{agent_id}/memory/rules/{rule_id}/remove",
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
@@ -1540,6 +1544,8 @@
           "/v1/internal/work-items/issue-read/context",
           "/v1/internal/work-items/requests/{request_id}/requester-context",
           "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
+          "/v1/internal/work-items/requests/{request_id}/memory-rules-context",
+          "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/channel-read/context",
@@ -1562,6 +1568,7 @@
           "/work-items/completion-contract",
           "/work-items/issue-read",
           "/work-items/questions",
+          "/work-items/rule-proposal",
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
@@ -1593,7 +1600,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 10000
+      "cardinality_bound": 10280
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1628,6 +1635,10 @@
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
           "/agents/{agent_id}/memory/guidance",
+          "/agents/{agent_id}/memory/rules",
+          "/agents/{agent_id}/memory/rules/{rule_id}/accept",
+          "/agents/{agent_id}/memory/rules/{rule_id}/reject",
+          "/agents/{agent_id}/memory/rules/{rule_id}/remove",
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
@@ -1824,6 +1835,8 @@
           "/v1/internal/work-items/issue-read/context",
           "/v1/internal/work-items/requests/{request_id}/requester-context",
           "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
+          "/v1/internal/work-items/requests/{request_id}/memory-rules-context",
+          "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/channel-read/context",
@@ -1846,6 +1859,7 @@
           "/work-items/completion-contract",
           "/work-items/issue-read",
           "/work-items/questions",
+          "/work-items/rule-proposal",
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
@@ -1877,7 +1891,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 10000
+      "cardinality_bound": 10280
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1912,6 +1926,10 @@
           "/agents/{agent_id}/kill",
           "/agents/{agent_id}/memory",
           "/agents/{agent_id}/memory/guidance",
+          "/agents/{agent_id}/memory/rules",
+          "/agents/{agent_id}/memory/rules/{rule_id}/accept",
+          "/agents/{agent_id}/memory/rules/{rule_id}/reject",
+          "/agents/{agent_id}/memory/rules/{rule_id}/remove",
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
@@ -2108,6 +2126,8 @@
           "/v1/internal/work-items/issue-read/context",
           "/v1/internal/work-items/requests/{request_id}/requester-context",
           "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
+          "/v1/internal/work-items/requests/{request_id}/memory-rules-context",
+          "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/channel-read/context",
@@ -2130,6 +2150,7 @@
           "/work-items/completion-contract",
           "/work-items/issue-read",
           "/work-items/questions",
+          "/work-items/rule-proposal",
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
@@ -2154,7 +2175,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 2000
+      "cardinality_bound": 2056
     },
     "curie.background.loop": {
       "type": "counter",

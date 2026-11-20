@@ -91,8 +91,9 @@ from .harness.claude.approval import (
 from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
+from .harness.claude.propose_rule_tool import wrap_propose_rule_handler
 from .harness.claude.question_tool import wrap_questions_handler
-from .harness.claude.requester_guard import build_subagent_guard
+from .harness.claude.requester_guard import build_learned_rules_guard, build_subagent_guard
 from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
@@ -137,6 +138,9 @@ from .memory_facts import (
     format_facts_preamble,
     resolve_facts_store,
 )
+from .memory_rules_context import Failed as RulesFailed
+from .memory_rules_context import MemoryRulesContextGate, blocked_explanation
+from .memory_rules_context import attach_gate as attach_rules_gate
 from .otel import RunTracer, build_tracer_provider
 from .platform_slack.capability import ChannelReadTurn, url_origin
 from .plugin import (
@@ -684,6 +688,7 @@ def _compose_system_prompt(
     progress_preamble: str | None = None,
     facts_preamble: str | None = None,
     guidance_preamble: str | None = None,
+    rules_preamble: str | None = None,
     requester_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
@@ -709,6 +714,10 @@ def _compose_system_prompt(
     The requester's pinned coding instructions (ADR 0278) follow the stable
     bundle prefix and model identity, between their two delimiter lines. Absent,
     the prompt is byte-identical to what it was before the section existed.
+
+    The accepted learned rules for the repository (#5798) sit between the model
+    identity and the requester section, so the order on the page is the order
+    of authority both sections state. Absent, the prompt is byte-identical too.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
@@ -724,6 +733,7 @@ def _compose_system_prompt(
             progress_preamble,
             base,
             model_preamble,
+            rules_preamble,
             requester_preamble,
             attachment_preamble,
         )
@@ -964,8 +974,13 @@ def build_runner(
                 else format_attachment_preamble(attachment_view)
             ),
             progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
+            rules_preamble=(
+                rules_gate.applied.section() if rules_gate.applied is not None else None
+            ),
             requester_preamble=(
-                requester_gate.applied.section() if requester_gate.applied is not None else None
+                requester_gate.applied.section(learned_rules=rules_gate.applied is not None)
+                if requester_gate.applied is not None
+                else None
             ),
             facts_preamble=memory_facts_preamble,
             guidance_preamble=(
@@ -1216,6 +1231,8 @@ def build_runner(
     bound_contract = BoundContract(IMPLEMENTATION)
     # ADR 0278 (#5592): the worker's requester context envelope, decided once.
     requester_gate = RequesterContextGate()
+    # #5798: the worker's learned rules envelope, decided once, beside it.
+    rules_gate = MemoryRulesContextGate()
     observed_readonly_tools: frozenset[str] = frozenset()
 
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
@@ -1312,7 +1329,7 @@ def build_runner(
                     # Only a boot that can bind an execution can apply a
                     # requester section (ADR 0278); any other boot is unchanged.
                     build_subagent_guard(requester_gate) if issue_read is not None else None,
-                    None,
+                    build_learned_rules_guard(rules_gate) if issue_read is not None else None,
                 ),
             ),
             tool_access,
@@ -1354,6 +1371,7 @@ def build_runner(
         def curie_server(
             tracker_result_tool: SdkMcpTool[Any] | None = None,
             question_tool: SdkMcpTool[Any] | None = None,
+            propose_rule_tool: SdkMcpTool[Any] | None = None,
         ) -> McpSdkServerConfig:
             return build_approval_server(
                 approval_gate,
@@ -1391,6 +1409,7 @@ def build_runner(
                 ),
                 tracker_result_tool=tracker_result_tool,
                 question_tool=question_tool,
+                propose_rule_tool=propose_rule_tool,
             )
 
         platform_servers: dict[str, Any] = {
@@ -1423,9 +1442,13 @@ def build_runner(
             )
             # An implementation contract mounts ``ask_questions`` (#5785) the
             # same way; ``bind_completion_contract`` sets at most one of the two.
+            # Either contract may also mount ``propose_rule`` (ADR 0287, #5796)
+            # when the API offered it; the binding never sets it for the fake.
             session_platform_servers = (
                 platform_servers
-                if bound.result_handler is None and bound.question_handler is None
+                if bound.result_handler is None
+                and bound.question_handler is None
+                and bound.rule_handler is None
                 else {
                     **platform_servers,
                     APPROVAL_SERVER_NAME: curie_server(
@@ -1437,6 +1460,11 @@ def build_runner(
                         (
                             wrap_questions_handler(bound.question_handler)
                             if bound.question_handler is not None
+                            else None
+                        ),
+                        (
+                            wrap_propose_rule_handler(bound.rule_handler)
+                            if bound.rule_handler is not None
                             else None
                         ),
                     ),
@@ -1526,6 +1554,8 @@ def build_runner(
             # Answers a delivery still waiting when the start never bound one.
             if not requester_gate.bound:
                 requester_gate.bind(None)
+            if not rules_gate.bound:
+                rules_gate.bind(None)
 
     async def _initialize() -> None:
         # Runs in the runner's shared start task after the listener binds
@@ -1562,7 +1592,9 @@ def build_runner(
             # which could still block the model. Any failure blocks the model.
             reason: str | None = None
             try:
-                bound_contract = await bind_completion_contract(issue_read)
+                bound_contract = await bind_completion_contract(
+                    issue_read, fake_model=fake_model
+                )
             except ContractUnavailable as exc:
                 reason = exc.reason
             except Exception:  # noqa: BLE001 - the contract gate fails closed
@@ -1586,14 +1618,18 @@ def build_runner(
                     "completion contract tracker_result result_kinds=%s",
                     ",".join(bound_contract.contract.result_kinds),
                 )
+            if reason is None and bound_contract.rule_handler is not None:
+                logger.info("completion contract offers propose_rule")
         if preflight_block is not None:
             # Blocked before any model session: the start answers offline with
             # its explanation, and the worker leaves the request's evidence.
             requester_gate.block()
+            rules_gate.block()
             execution = None
         else:
             execution = bound_contract.contract.execution
             requester_gate.bind(execution)
+            rules_gate.bind(execution)
         if issue_read is None:
             await initialize_session()
 
@@ -1603,6 +1639,12 @@ def build_runner(
             outcome = await requester_gate.wait()
             if isinstance(outcome, RequesterFailed):
                 preflight_block = REQUESTER_BLOCKED_EXPLANATION
+                # Blocked before any model session: a learned rules envelope
+                # still to come is answered as such, never acknowledged.
+                rules_gate.block()
+            elif isinstance(rules_outcome := await rules_gate.wait(), RulesFailed):
+                # The session waits for both acknowledgments (#5798).
+                preflight_block = blocked_explanation(rules_outcome.reason)
         if build_real_options is not None:
             real_options = build_real_options(compose_system_prompt(verification), bound_contract)
 
@@ -1743,6 +1785,7 @@ def build_runner(
         cwd=workspace_cwd,
     )
     attach_gate(runner, requester_gate)
+    attach_rules_gate(runner, rules_gate)
     return runner
 
 

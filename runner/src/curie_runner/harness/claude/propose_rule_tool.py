@@ -1,0 +1,22 @@
+"""The Claude SDK tool ``propose_rule`` (ADR 0287, #5796).
+
+`curie_runner.propose_rule` owns the schema, the description and the handler
+and stays free of the SDK (ADR 0140); this module only wraps that handler as
+the SDK tool the ``curie`` platform server mounts.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from claude_agent_sdk import SdkMcpTool, tool
+
+from ...propose_rule import PROPOSE_RULE_DESCRIPTION, PROPOSE_RULE_SCHEMA
+from ...tool_names import PROPOSE_RULE_TOOL
+from ...tracker_result import ResultHandler
+
+
+def wrap_propose_rule_handler(handler: ResultHandler) -> SdkMcpTool[Any]:
+    """The SDK tool around a rule proposal handler."""
+
+    return tool(PROPOSE_RULE_TOOL, PROPOSE_RULE_DESCRIPTION, PROPOSE_RULE_SCHEMA)(handler)

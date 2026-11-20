@@ -304,6 +304,12 @@
       "version": "2.2"
     },
     {
+      "result": "MemoryRulesOutput",
+      "kind": "CliOutput",
+      "schema": "memory-rules.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "MessageDryRunOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
@@ -367,7 +373,7 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "3.1"
+      "version": "4.0"
     },
     {
       "result": "PreflightOutput",

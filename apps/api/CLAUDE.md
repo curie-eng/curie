@@ -91,8 +91,9 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   (`Tracker.read_ticket`; a GitHub issue with an App installation token
   freshly minted only for the recorded installation) and returns it as
   markdown with its link. It stores nothing.
-  The same capability authorizes exactly two sibling routes (ADR 0277,
-  #5586), each repeating the issue check before and after any tracker call.
+  The same capability authorizes exactly four sibling routes (ADR 0277,
+  #5586; #5785; ADR 0287, #5796), each repeating the issue check before and
+  after any tracker call.
   `POST /work-items/completion-contract` answers the execution's completion
   contract; for a `tracker_result` request the first call reads the source
   issue's title and body, mints the request's one grant
@@ -104,6 +105,32 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   refuses an implementation request (`not_tracker_result`), a second result
   (`result_already_submitted`) and a source whose title or body changed
   (`source_fingerprint_changed`), writing nothing.
+  `POST /work-items/questions` posts the execution's numbered questions as one
+  marked comment on its own ticket (#5785). `POST /work-items/rule-proposal`
+  stores the execution's one learned rule candidate (`memory_rule_lifecycle`):
+  only a revision admitted from reviewer feedback, of an agent with
+  `memory_rule_proposals` on, on an open pull request lineage of a WorkItem
+  that is not cancelled, may propose, and only while its execution is the
+  live one the issue read route accepts (else 403 `rule_proposal_not_eligible`),
+  once per request (409 `rule_already_proposed`); a database failure is 503
+  `rule_proposal_unavailable` and never logs the text. The agent, repository scope,
+  source request, lineage and URL and the proposer come from the capability
+  and the stored request; the body is exactly `rule` and `reason`, read after
+  the capability, and no refusal or log line echoes it. The completion
+  contract's `rule_proposal` answers the same eligibility, and its 409
+  refusals carry `rule_proposal: false`. Every terminal
+  lineage write (the `crud/lineages.py` writers and the worker's
+  `PostgresPublicationStore.mark_lineage_terminal`) settles that lineage's
+  candidates in its own transaction through the one shared
+  `curie_internal.memory_rules.settle_lineage_candidates`, and the lineage
+  reconciler's pass settles any terminal lineage still holding a candidate
+  (one an older replica recorded during a rolling upgrade). Every API process
+  also runs that sweep as its own task (`start_rule_settlement`), whatever
+  `CURIE_WORK_ITEM_RECONCILER_ENABLED`, the factory or the forge pass interval
+  say; `memory_rule_settlement_interval_s` has no off value. Every proposal and
+  settlement holds the agent row `FOR KEY SHARE` (or, on the publication
+  advance, the WorkItem row) before its request and lineage locks, the order
+  agent deletion takes; settlement itself never locks the agent row.
   State and other scoped credentials do not authorize these routes, and `wir`
   authorizes no other route.
 - **Channel read is a scoped credential exception (ADR 0100, #2877).**

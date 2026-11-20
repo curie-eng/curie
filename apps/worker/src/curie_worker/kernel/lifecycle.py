@@ -45,6 +45,7 @@ from ..binding import (
 from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease
 from ..hook_runs import HookRunOutcome, HookRunReason, HookRunRecorderError, retry_expiry
+from ..memory_rules_context import MemoryRulesContextRefused
 from ..reply_sink import (
     TargetRoute,
 )
@@ -1489,9 +1490,10 @@ async def _process_event(
                 return
             except failures._WorkItemDeferred:
                 return
-            except RequesterContextRefused as exc:
-                # ADR 0278 (#5592): no model work without the acknowledged
-                # requester context. The started request fails with the reason.
+            except (RequesterContextRefused, MemoryRulesContextRefused) as exc:
+                # ADR 0278 (#5592) and #5798: no model work without the
+                # acknowledged requester context and learned rules. The started
+                # request fails with the reason of the first refused delivery.
                 release_order()
                 refused_run = (
                     self._work_item_runs.get(owned_work_item_id)
@@ -2259,11 +2261,15 @@ async def _settle_personal_refusal(
 
 
 async def _settle_requester_refusal(
-    self: Kernel, run: WorkItemRun, exc: RequesterContextRefused, event_id: str
+    self: Kernel,
+    run: WorkItemRun,
+    exc: RequesterContextRefused | MemoryRulesContextRefused,
+    event_id: str,
 ) -> None:
-    """Fail a started request whose requester context was refused (ADR 0278)."""
+    """Fail a started request whose requester context (ADR 0278) or learned
+    rules (#5798) were refused."""
 
-    logger.info("requester context refused for %s: %s", event_id, exc.reason)
+    logger.info("%s refused for %s: %s", type(exc).__name__, event_id, exc.reason)
     try:
         await run.finish(
             outcome="failed",

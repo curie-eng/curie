@@ -83,6 +83,14 @@ class CompletionContractOut(BaseModel):
     result_kinds: list[str]
     session_usd_allowance: float | None
     execution: ExecutionBindingOut | None = None
+    # Whether this execution may propose one learned rule (#5796, ADR 0287):
+    # true exactly when the request is a revision admitted from reviewer
+    # feedback, its agent has ``memory_rule_proposals`` on, its WorkItem's
+    # pull request lineage is open and the WorkItem is not cancelled, at the
+    # time of the call. Always false for ``publication_recovery``. The runner
+    # mounts ``propose_rule`` only when it is true. A permanent field: later
+    # narrowings of this answer keep it, with this meaning.
+    rule_proposal: bool
 
 
 class TrackerResultSubmission(BaseModel):
@@ -123,6 +131,29 @@ class QuestionsSubmission(BaseModel):
         default=None,
         description="1 to 10 questions, each 1 to 1,000 characters with no blank line.",
     )
+
+
+class RuleProposalSubmission(BaseModel):
+    """The runner ``propose_rule`` tool's call (#5796): one standing rule for the
+    repository and why it is general, each one line of at most 240 UTF-8 bytes
+    with no reserved heading or section marker. Exactly these two string
+    fields; any other body is refused 422 ``invalid_body`` with nothing echoed.
+    The agent, scope, source and proposer come from the capability and the
+    stored request, never from the body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule: str = Field(description="The rule, one sentence of at most 240 UTF-8 bytes.")
+    reason: str = Field(
+        description="Why the feedback states a general rule, at most 240 UTF-8 bytes."
+    )
+
+
+class RuleProposalOut(BaseModel):
+    """A stored proposal: a hidden candidate, shown to a person only after the
+    pull request merges."""
+
+    status: Literal["candidate"]
 
 
 class QuestionsOut(BaseModel):
@@ -182,6 +213,16 @@ class CodingInstructionsMetadata(BaseModel):
     format_version: Literal[1] | None = None
 
 
+class MemoryRulesMetadata(BaseModel):
+    """The learned rules pinned at admission (#5798): numbers and digest, never the text."""
+
+    state: Literal["absent", "selected"]
+    count: int = 0
+    rule_numbers: list[int] = Field(default_factory=list)
+    sha256: str | None = None
+    format_version: Literal[1] | None = None
+
+
 class WorkItemRequestOut(BaseModel):
     """Operator view of one ExecutionRequest (#2577). Built from an explicit
     allowlist dict, never from an ORM row, so no runtime-owner field leaks."""
@@ -205,6 +246,8 @@ class WorkItemRequestOut(BaseModel):
     enrollment_generation: int | None = None
     coding_instructions_selection_id: uuid.UUID | None = None
     coding_instructions_evidence: Literal["none", "pending", "applied", "failed"] = "none"
+    # Whether this request's runner loaded the WorkItem's pinned learned rules (#5798).
+    memory_rules_evidence: Literal["none", "pending", "applied", "failed"] = "none"
     # Automatic retry lineage (ADR 0269): the request this one retries, and
     # whether it was admitted after owner loss or after an ordinary failure.
     retry_of_request_id: uuid.UUID | None
@@ -389,6 +432,7 @@ class WorkItemOutcomeOut(BaseModel):
     enrollment_generation: int | None = None
     requester_principal_id: uuid.UUID | None = None
     coding_instructions: CodingInstructionsMetadata
+    memory_rules: MemoryRulesMetadata
     # The WorkItem's lifetime automatic retry allowance (ADR 0269): slots spent
     # by owner loss and ordinary failures together, and the limit.
     automatic_retries_used: int

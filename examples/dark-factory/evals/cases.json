@@ -3,7 +3,7 @@
   "cases": [
     {
       "id": "names-the-issue-read-tool",
-      "input": "Which exact tool do you call to read the GitHub issue a factory run gives you? Reply with only its identifier.",
+      "input": "Which exact tool do you call to read the ticket a factory run gives you? Reply with only its identifier.",
       "grader": {
         "kind": "contains",
         "expected": "get_issue",

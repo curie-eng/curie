@@ -725,6 +725,48 @@ def test_a_publication_recovery_answer_carrying_anything_else_is_refused(
     assert _refusal(_Api([(200, answer)]), delay=_no_delay).reason == reason
 
 
+# --- The rule proposal offer (ADR 0287, #5796) -----------------------------------
+
+
+@pytest.mark.parametrize("answer", [IMPLEMENTATION, TRACKER], ids=["implementation", "tracker"])
+@pytest.mark.parametrize(
+    ("offer", "offered"),
+    [
+        pytest.param({"rule_proposal": True}, True, id="true"),
+        pytest.param({"rule_proposal": False}, False, id="false"),
+        pytest.param({}, False, id="absent"),
+        pytest.param({"rule_proposal": None}, False, id="null"),
+        pytest.param({"rule_proposal": "true"}, False, id="string"),
+        pytest.param({"rule_proposal": 1}, False, id="one"),
+        pytest.param({"rule_proposal": {"on": True}}, False, id="object"),
+    ],
+)
+def test_only_json_true_offers_a_rule_proposal_and_nothing_else_blocks_the_run(
+    answer: dict[str, Any], offer: dict[str, Any], offered: bool
+) -> None:
+    # Absent reads false, so a runner newer than its API mounts nothing; a
+    # malformed value reads false too and never fails the contract.
+    contract = _fetch(_Api([(200, {**answer, **offer})]))
+    assert contract.rule_proposal is offered
+    assert contract.kind == answer["completion_contract"]
+
+
+def test_a_publication_recovery_answer_with_rule_proposal_false_parses() -> None:
+    # The API always sends the field now; for this kind it is false.
+    assert _fetch(_Api([(200, {**RECOVERY, "rule_proposal": False})])).publication_recovery
+
+
+@pytest.mark.parametrize("value", [True, "false", 0])
+def test_a_publication_recovery_answer_offering_a_rule_proposal_is_refused(value: Any) -> None:
+    answer = {**RECOVERY, "rule_proposal": value}
+    assert _refusal(_Api([(200, answer)]), delay=_no_delay).reason == REASON_BODY_INVALID
+
+
+def test_the_rule_proposal_route_sits_beside_the_issue_read_route() -> None:
+    urls = sibling_urls("https://api.example:8443/v1/runner/work-items/issue-read")
+    assert urls.rule_proposal == "https://api.example:8443/v1/runner/work-items/rule-proposal"
+
+
 def test_a_transient_status_then_success_returns_the_contract() -> None:
     waits: list[float] = []
 

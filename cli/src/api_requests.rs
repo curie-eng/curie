@@ -185,6 +185,8 @@ pub struct AgentUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_partitions: Option<BTreeMap<String, HookPartitionInput>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_rule_proposals: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_writes: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Option<String>>,
@@ -405,4 +407,11 @@ pub struct WorkItemRetryRequest {
     pub expected_version: u64,
     pub reason: String,
     pub request_id: uuid::Uuid,
+}
+
+/// Request body of `POST /agents/{id}/memory/rules/{rule_id}/accept`, `/reject`
+/// and `/remove` (`MemoryRuleDecision`, #5797): the version the person read.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRuleDecision {
+    pub expected_version: i64,
 }

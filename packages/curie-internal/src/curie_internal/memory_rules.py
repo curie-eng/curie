@@ -3,8 +3,28 @@
 A learned rule is a one-line, bounded text that a person accepts. It is later
 delivered to a model, so the text must never be able to forge platform text:
 no line breaks, no reserved headings, no section markers. This module is pure.
-Apart from ``select_memory_rules`` at the end, which reads one scope through the
-caller's session, it performs no IO and touches no database.
+Apart from ``select_memory_rules`` and ``settle_lineage_candidates`` at the end,
+which read and write through the caller's session or connection, it performs no
+IO and touches no database.
+
+``settle_lineage_candidates`` is the one settlement of a pull request lineage's
+rule candidates (ADR 0287 decision 5, #5796). Every writer of a terminal
+lineage state calls it inside the transaction of that write: the API's
+``crud.lineages`` writers through ``curie_api.memory_rule_lifecycle`` and the
+worker's ``PostgresPublicationStore.mark_lineage_terminal`` directly. The API's
+lineage reconciler also sweeps terminal lineages that still hold candidates,
+which a writer from before this feature left unsettled. A new terminal lineage
+writer must call it too.
+
+Lock order. Settlement takes no agent row lock: agent deletion locks the agent
+row first and then, through its cascades, the lineage and the rule rows, so a
+settlement that locked the agent after its caller's lineage write could
+deadlock with it. Instead every caller holds the owning agent row ``FOR KEY
+SHARE`` (or, on the publication advance, the WorkItem row, which deletion locks
+second) before it writes the lineage, so deletion and settlement serialize on
+that first row. Settlement then locks the lineage's ``candidate`` rows ``FOR
+UPDATE`` in one fixed order, and a promotion takes the transaction advisory
+lock of its scope (``rule_number_lock_key``) to allocate the number.
 
 Arithmetic fact: the snapshot byte bound can bind before the count bound does.
 Sixteen rules of 240 bytes with small rule numbers still fit (about 3.9 KiB),
@@ -18,14 +38,23 @@ bound and the snapshot byte bound.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+from sqlalchemy import RowMapping
 from sqlalchemy import text as sql_text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 MAX_RULE_BYTES = 240
 MAX_ACCEPTED_PER_SCOPE = 16
@@ -285,6 +314,88 @@ def selected_from_rules(rules: Sequence[tuple[int, str]]) -> SelectedMemoryRules
     )
 
 
+ENVELOPE_VERSION: Literal[1] = 1
+MAX_EXECUTION_FENCE = 9_223_372_036_854_775_807
+
+
+def _version(value: object) -> int:
+    # Strict ``Literal[1]`` accepts ``True`` and ``1.0``; refuse anything but an int.
+    if type(value) is not int or value != 1:
+        raise ValueError("invalid_version")
+    return value
+
+
+def _uuid(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("invalid_identifier")
+    try:
+        if str(UUID(value)) != value:
+            raise ValueError("invalid_identifier")
+    except (ValueError, AttributeError):
+        raise ValueError("invalid_identifier") from None
+    return value
+
+
+EnvelopeVersion = Annotated[Literal[1], BeforeValidator(_version)]
+Identifier = Annotated[str, BeforeValidator(_uuid)]
+Fence = Annotated[int, Field(strict=True, ge=1, le=MAX_EXECUTION_FENCE)]
+
+
+class MemoryRulesSelectedV1(_Contract):
+    """The pinned rules as delivered: ``count`` is derived, so the wire omits it.
+
+    The model revalidates the numbers, every rule line, the snapshot byte bound and
+    the digest against the text, so a tampered or truncated envelope is refused.
+    """
+
+    kind: Literal["selected"] = "selected"
+    rule_numbers: list[int] = Field(max_length=MAX_ACCEPTED_PER_SCOPE)
+    sha256: Digest
+    format_version: EnvelopeVersion = FORMAT_VERSION
+    text: str = Field(repr=False)
+
+    @model_validator(mode="after")
+    def _valid_selection(self) -> Self:
+        if any(type(number) is not int for number in self.rule_numbers):
+            raise ValueError("invalid_selected_rules")
+        SelectedMemoryRules(
+            rule_numbers=tuple(self.rule_numbers),
+            text=self.text,
+            sha256=self.sha256,
+            count=len(self.rule_numbers),
+        )
+        return self
+
+
+MemoryRulesEnvelopeSelection = Annotated[
+    MemoryRulesSelectedV1 | AbsentMemoryRules, Field(discriminator="kind")
+]
+
+
+class MemoryRulesContextV1(_Contract):
+    envelope_version: EnvelopeVersion = ENVELOPE_VERSION
+    tenant_id: Identifier
+    work_item_id: Identifier
+    execution_request_id: Identifier
+    execution_fence: Fence
+    selection: MemoryRulesEnvelopeSelection
+
+
+class MemoryRulesAcknowledgmentV1(_Contract):
+    envelope_version: EnvelopeVersion = ENVELOPE_VERSION
+    work_item_id: Identifier
+    execution_request_id: Identifier
+    execution_fence: Fence
+    outcome: Literal["none", "applied", "failed"]
+    sha256: Digest | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def _digest_when_applied(self) -> Self:
+        if (self.outcome == "applied") != (self.sha256 is not None):
+            raise ValueError("invalid_acknowledgment_digest")
+        return self
+
+
 SCOPE_KINDS = ("agent", "binding", "repository")
 
 
@@ -322,3 +433,139 @@ async def select_memory_rules(
     if not rows:
         return AbsentMemoryRules(reason="no_rules")
     return selected_from_rules([(row[0], row[1]) for row in rows])
+
+
+_SAFE_SCHEMA = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
+_PLATFORM_ACTOR = "platform"
+_NUMBER_LOCK_DOMAIN = b"curie.memory_rules.number"
+
+
+def rule_number_lock_key(agent_id: UUID, scope_kind: str, scope_key: str) -> int:
+    """The ``pg_advisory_xact_lock`` key that serializes number allocation in one scope.
+
+    The key is the first 8 bytes, read as a big-endian signed integer, of the
+    SHA-256 of ``curie.memory_rules.number``, the agent id's canonical text,
+    the scope kind and the scope key, each followed by a NUL byte (NUL cannot
+    occur in any of them). A collision between two scopes only makes them wait
+    for each other; it never shares a number, which the scope's unique index
+    still guards.
+    """
+
+    digest = hashlib.sha256()
+    parts = (_NUMBER_LOCK_DOMAIN, str(agent_id).encode(), scope_kind.encode(), scope_key.encode())
+    for part in parts:
+        digest.update(part)
+        digest.update(b"\x00")
+    return int.from_bytes(digest.digest()[:8], "big", signed=True)
+
+
+async def _settle_one(
+    connection: AsyncSession | AsyncConnection,
+    schema: str,
+    row: RowMapping,
+    event: RuleEvent,
+    *,
+    number: int | None = None,
+) -> bool:
+    to_state = next_state("candidate", event)
+    changed = (
+        await connection.execute(
+            sql_text(
+                f'UPDATE "{schema}".memory_rules SET state = :to_state, number = :number, '
+                "version = version + 1, updated_at = clock_timestamp() "
+                "WHERE id = :id AND state = 'candidate' RETURNING id"
+            ),
+            {"to_state": to_state, "number": number, "id": row["id"]},
+        )
+    ).first()
+    if changed is None:
+        return False
+    await connection.execute(
+        sql_text(
+            f'INSERT INTO "{schema}".memory_rule_events '
+            "(rule_id, tenant_id, agent_id, event, from_state, to_state, actor_kind, actor) "
+            "VALUES (:rule_id, :tenant_id, :agent_id, :event, 'candidate', :to_state, "
+            "'platform', :actor)"
+        ),
+        {
+            "rule_id": row["id"],
+            "tenant_id": row["tenant_id"],
+            "agent_id": row["agent_id"],
+            "event": event,
+            "to_state": to_state,
+            "actor": _PLATFORM_ACTOR,
+        },
+    )
+    return True
+
+
+async def settle_lineage_candidates(
+    connection: AsyncSession | AsyncConnection,
+    *,
+    lineage_id: UUID,
+    terminal_state: str,
+    schema: str = "curie",
+) -> int:
+    """Promote, supersede or discard a lineage's rule candidates; the count changed.
+
+    Runs inside the caller's transaction, after its terminal lineage write and
+    before its commit; it never commits or rolls back. The caller already holds
+    the owning agent row ``FOR KEY SHARE`` or the WorkItem row (module
+    docstring). The lineage's ``candidate`` rows are locked ``FOR UPDATE`` in
+    one order, so a concurrent second settlement waits for the first and then
+    finds none. ``merged`` promotes the newest candidate (by ``proposed_at``,
+    then ``id``) to ``proposed`` with the next free number in its scope,
+    allocated under the scope's transaction advisory lock, and supersedes every
+    older one; ``closed`` discards every candidate. Only ``candidate`` rows
+    change, so a second pass changes nothing. Each change bumps ``version`` and
+    ``updated_at`` and writes one ``memory_rule_events`` row with actor kind
+    ``platform``. Returns how many candidates changed.
+    """
+
+    if terminal_state not in ("merged", "closed"):
+        raise ValueError("terminal publication lineage state is invalid")
+    if not _SAFE_SCHEMA.fullmatch(schema):
+        raise ValueError("memory rule schema is invalid")
+    candidates = (
+        (
+            await connection.execute(
+                sql_text(
+                    "SELECT id, tenant_id, agent_id, scope_kind, scope_key "
+                    f'FROM "{schema}".memory_rules '
+                    "WHERE source_lineage_id = :lineage AND state = 'candidate' "
+                    "ORDER BY proposed_at DESC, id DESC FOR UPDATE"
+                ),
+                {"lineage": lineage_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    if not candidates:
+        return 0
+    if terminal_state == "closed":
+        return sum([await _settle_one(connection, schema, row, "discard") for row in candidates])
+    newest, older = candidates[0], candidates[1:]
+    # Numbers are allocated per agent scope under the scope's advisory lock, so
+    # two promotions in one scope never take the same number.
+    await connection.execute(
+        sql_text("SELECT pg_advisory_xact_lock(:key)"),
+        {
+            "key": rule_number_lock_key(
+                newest["agent_id"], newest["scope_kind"], newest["scope_key"]
+            )
+        },
+    )
+    highest = (
+        await connection.execute(
+            sql_text(
+                f'SELECT max(number) FROM "{schema}".memory_rules '
+                "WHERE agent_id = :agent AND scope_kind = :kind AND scope_key = :key"
+            ),
+            {"agent": newest["agent_id"], "kind": newest["scope_kind"], "key": newest["scope_key"]},
+        )
+    ).scalar()
+    changed = [await _settle_one(connection, schema, row, "supersede") for row in older]
+    current = highest if isinstance(highest, int) else 0
+    changed.append(await _settle_one(connection, schema, newest, "promote", number=current + 1))
+    return sum(changed)

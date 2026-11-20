@@ -1517,12 +1517,12 @@ def test_tracker_poll_admits_the_app_slug_once_and_refuses_status_and_lookalike_
                 own_login=own_login,
                 page_size=10,
             )
-            first = await tracker.poll_marked(None, running=())
+            first = await tracker.poll_marked(None, running=(), answering=())
             admitted = [
                 notice for notice in first.notices if notice.disposition is Disposition.MENTION
             ]
             assert {int(notice.event_id) for notice in admitted} == {73211, 73212}
-            again = await tracker.poll_marked(first.cursor, running=())
+            again = await tracker.poll_marked(first.cursor, running=(), answering=())
             repeated = [
                 notice for notice in again.notices if notice.disposition is Disposition.MENTION
             ]

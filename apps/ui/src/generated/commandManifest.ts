@@ -7145,6 +7145,18 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Let the agent propose memory rules on or off (`memory_rule_proposals`, #5796). Takes effect for the next request's completion contract. A person still accepts any proposed rule; the agent never activates one itself",
+              "id": "memory_rule_proposals",
+              "long": "memory-rule-proposals",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -9086,6 +9098,74 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "List learned rules (`GET /agents/{id}/memory/rules`)",
+              "id": "rules",
+              "long": "rules",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "With --rules, show only rules in this state: proposed, accepted, rejected or removed",
+              "id": "rule_state",
+              "long": "rule-state",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "With --rules, show only rules of this exact scope key",
+              "id": "scope_key",
+              "long": "scope-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Accept this proposed rule. Needs --expected-version and --session-file",
+              "id": "accept",
+              "long": "accept",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Reject this proposed rule. Needs --expected-version and --session-file",
+              "id": "reject",
+              "long": "reject",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove this accepted rule. Needs --expected-version and --session-file",
+              "id": "remove",
+              "long": "remove",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Version of the rule to change, as `--rules` reports it",
+              "id": "expected_version",
+              "long": "expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session. Used by --accept, --reject and --remove, which never send the platform key. With --rules it lists with the session instead of the platform key",
+              "id": "session_file",
+              "long": "session-file",
+              "positional": false,
               "required": false
             }
           ],

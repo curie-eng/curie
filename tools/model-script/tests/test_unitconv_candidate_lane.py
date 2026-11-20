@@ -26,7 +26,7 @@ CONTRACT = REPO_ROOT / "examples" / "dark-factory" / "verification" / "contract.
 DIFF_LANE = "You are the diff reviewer"
 PLAN_LANE = "You are the plan reviewer"
 # The implementing lane's Bash call that runs the checks right before the diff review.
-COMMIT_ORDINAL = 14
+COMMIT_ORDINAL = 15
 
 
 def _module() -> Any:

@@ -18,9 +18,6 @@ const RealLogs = lazy(() =>
 const RealCost = lazy(() =>
   import("./obs/RealCost").then((m) => ({ default: m.RealCost })),
 );
-const RealMemory = lazy(() =>
-  import("./obs/RealMemory").then((m) => ({ default: m.RealMemory })),
-);
 const RealApprovals = lazy(() =>
   import("./obs/RealApprovals").then((m) => ({ default: m.RealApprovals })),
 );
@@ -33,7 +30,6 @@ const TABS: [ObsTab, string][] = [
   ["metrics", "Metrics"],
   ["logs", "Logs"],
   ["approvals", "Approvals"],
-  ["memory", "Memory"],
   ["usage", "Usage"],
   ["cost", "Cost"],
 ];
@@ -52,9 +48,6 @@ export function Observability() {
       break;
     case "logs":
       content = <RealLogs />;
-      break;
-    case "memory":
-      content = <RealMemory />;
       break;
     case "usage":
       content = <WiredUsage />;

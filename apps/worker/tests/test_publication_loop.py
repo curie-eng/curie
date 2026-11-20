@@ -130,12 +130,24 @@ async def publication_store() -> AsyncIterator[tuple[AsyncEngine, str, PostgresP
             await connection.execute(
                 text(
                     f'CREATE TABLE "{schema}".thread_publication_lineages ('
-                    "id uuid PRIMARY KEY, version integer NOT NULL DEFAULT 1, "
+                    "id uuid PRIMARY KEY, agent_id uuid, version integer NOT NULL DEFAULT 1, "
                     "branch text NOT NULL, pr_number integer, pr_url text, head_sha text, "
                     "repository_project_id text, code_host_pr_id text, "
                     "base_sha text NOT NULL, status text NOT NULL DEFAULT 'open', "
                     "latest_revision integer NOT NULL DEFAULT 1, "
                     "updated_at timestamp NOT NULL DEFAULT now())"
+                )
+            )
+            # The rows the terminal write's rule settlement locks and reads
+            # (#5796); these lineages name no agent and hold no rule candidates.
+            await connection.execute(
+                text(f'CREATE TABLE "{schema}".agents (id uuid PRIMARY KEY)')
+            )
+            await connection.execute(
+                text(
+                    f'CREATE TABLE "{schema}".memory_rules ('
+                    "id uuid PRIMARY KEY, tenant_id uuid, agent_id uuid, scope_kind text, "
+                    "scope_key text, source_lineage_id uuid, state text, proposed_at timestamptz)"
                 )
             )
             await connection.execute(

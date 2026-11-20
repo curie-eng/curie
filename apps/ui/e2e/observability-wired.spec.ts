@@ -311,10 +311,11 @@ test("Runs list and detail expose manifest-derived local and cluster query hints
   ).toBeVisible();
 });
 
-// Wired Memory tab (#869): the GET/PUT/DELETE /agents/{id}/memory endpoint is
-// live and already consumed on the agent detail page; the tab reuses that panel
-// behind an agent selector. Stub the agents list + the per-agent memory log.
-test("Memory tab lists an agent's learned memory with provenance and supports delete", async ({ page }) => {
+// Wired Memory page, Facts sub-tab (#869, #5800): the GET/PUT/DELETE
+// /agents/{id}/memory endpoint is live and already consumed on the agent detail
+// page; the Facts sub-tab reuses that panel behind an agent selector. Stub the
+// agents list + the per-agent memory log.
+test("Memory Facts lists an agent's learned memory with provenance and supports delete", async ({ page }) => {
   const agent = { id: "ag-mem", name: "deal-desk", channels: [{ kind: "slack", address: "#revenue-ops" }], created_at: "2026-07-05T00:00:00Z" };
   await page.route(/\/api\/agents(\?.*)?$/, (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([agent]) }),
@@ -348,8 +349,8 @@ test("Memory tab lists an agent's learned memory with provenance and supports de
   );
 
   await page.goto("/?api=1");
-  await page.getByRole("navigation").getByText("Observability", { exact: true }).click();
-  await page.getByRole("button", { name: "Memory" }).click();
+  await page.getByRole("navigation").getByText("Memory", { exact: true }).click();
+  await page.getByRole("button", { name: "Facts", exact: true }).click();
 
   // The agent selector is present and the learned memory panel rendered.
   await expect(page.getByTestId("memory-agent-select")).toBeVisible();

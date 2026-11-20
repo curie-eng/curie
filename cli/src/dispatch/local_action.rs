@@ -589,7 +589,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             api_key,
             dry_run,
         } => emit(
-            commands::overrides_with_memory_writes(
+            commands::overrides_with_memory_flags(
                 AgentActionOpts {
                     api_url,
                     api_key,
@@ -612,6 +612,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     clear_runner_resources,
                 )?,
                 commands::memory_writes_flag(memory_writes.as_deref()),
+                None,
             )
             .await?,
         ),
