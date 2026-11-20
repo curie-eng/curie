@@ -2717,16 +2717,20 @@ reconnect. See `docs/operations.md`, "Personal Claude enrollment".
 ### Factory model auth mode
 
 `factory.modelAuthMode` (default `service`) selects the installation's model
-auth mode: `service` runs every WorkItem on the installation's model
-credential, and `personal` runs each one on its owner's enrolled personal
-Claude subscription. `curie cluster factory --model-auth-mode personal` writes
+auth mode for new work: in `service` new WorkItems are admitted to run on the
+installation's model credential, and in `personal` each new one is admitted to
+run on its owner's enrolled personal Claude subscription. An execution request
+already created keeps the mode it recorded, so changing the value does not
+move existing work. `curie cluster factory --model-auth-mode personal` writes
 it. The chart renders it as `FACTORY_MODEL_AUTH_MODE` into both the API and the
 worker from one helper, so the two cannot disagree. Any other value fails the
 render, and so does setting `FACTORY_MODEL_AUTH_MODE` through `api.extraEnv` or
 `worker.extraEnv`, even with an equal value. Personal mode needs the Kubernetes
 sandbox substrate: a personal render whose `worker.extraEnv` sets
 `CURIE_SANDBOX_SUBSTRATE` to anything but `kubernetes` fails, because the
-worker would refuse to start. Only a literal value is accepted there: a
+worker would refuse to start. The literal is compared as the worker reads it,
+with surrounding whitespace trimmed and case ignored, so ` Kubernetes `
+passes. Only a literal value is accepted there: a
 `valueFrom` entry cannot be verified before the worker starts, and an empty
 value is a worker startup error, so both are refused in personal mode. The API
 and the worker read their settings case-insensitively, so an `extraEnv` entry

@@ -1098,8 +1098,11 @@ fn refuse_personal_mode_substrate(
 /// mode-only change. It skips App registration, preflight, the intake gate and
 /// every GitHub entry, so a GitLab-only or intake-disabled release keeps its
 /// intake exactly as recorded. Repository updates are excluded by clap and
-/// [`repository_updates_input`].
-fn model_auth_mode_only(opts: &FactoryIntakeOpts) -> Option<&str> {
+/// [`repository_updates_input`]. The dispatcher asks this before it resolves
+/// a webhook secret from the environment, so an exported
+/// `CURIE_GITHUB_WEBHOOK_SECRET` never turns a mode-only run into an intake
+/// run; `--webhook-secret-file` is an intake option there.
+pub fn model_auth_mode_only(opts: &FactoryIntakeOpts) -> Option<&str> {
     let mode = opts.model_auth_mode.as_deref()?;
     let other = !opts.repos.is_empty()
         || opts.all_installed_repos
@@ -1129,20 +1132,21 @@ async fn set_model_auth_mode_only(
     if opts.common.dry_run {
         let placeholder = Path::new("<private-values-file>");
         let timeout = effective_helm_timeout(opts.timeout_seconds, None);
-        let mut lines = vec![model_auth_mode_plan_note(&mode)];
-        lines.push("# writes only factory.modelAuthMode; intake settings are unchanged".into());
-        lines.extend(
-            intake_commands(&opts, placeholder, timeout)
-                .iter()
-                .map(|c| c.display()),
-        );
+        let lines = vec![
+            model_auth_mode_plan_note(&mode),
+            "# writes only factory.modelAuthMode; intake settings are unchanged; the upgrade \
+             changes the api and worker pod templates, so Helm rolls them"
+                .into(),
+            helm_upgrade(&opts.common, &opts.chart, placeholder, timeout).display(),
+        ];
         return Ok(Box::new(FactoryIntakeOutput::DryRun(
             crate::ui::DryRunPlan { lines },
         )));
     }
+    // Helm alone: the upgrade changes the api and worker pod templates, so
+    // Helm rolls them, and no rollout restart can fail on an api that this
+    // release does not deploy (api.deploy=false).
     require_on_path("helm")?;
-    require_on_path("kubectl")?;
-    let fence = crate::factory_quickstart::Observation::intake_fence(&opts.common)?;
     let Some(recorded) = fetch_release_values(&opts.common).await? else {
         return Err(CliError::usage(format!(
             "release {} was not found in namespace {}",
@@ -1158,9 +1162,6 @@ async fn set_model_auth_mode_only(
     };
     let ui = crate::ui::ui();
     let cl = ui.checklist();
-    if let Some(fence) = &fence {
-        fence.recheck().await?;
-    }
     let file =
         crate::ops::SecretValuesFileGuard::private_document(&model_auth_mode_only_values(&mode))?;
     let cmd = crate::ops::quickstart_marked_release_write(&helm_upgrade(
@@ -1185,24 +1186,6 @@ async fn set_model_auth_mode_only(
         .into());
     }
     step.done("set");
-    let fullname = crate::ops::release_fullname(&opts.common.namespace, &opts.common.release).await;
-    for cmd in crate::github_app::rollout_commands(&opts.common.namespace, &fullname) {
-        ui.plumbing(&format!("+ {}", cmd.display()));
-        let step = cl.step(&format!(
-            "rolling {} to pick up the model auth mode",
-            opts.common.release
-        ));
-        let (ok, _, stderr) = run_capture(&cmd).await?;
-        if !ok {
-            step.fail("failed");
-            return Err(CliError::failure(format!(
-                "api rollout failed after the model auth mode was set: {}",
-                stderr.trim()
-            ))
-            .into());
-        }
-        step.done("rolled");
-    }
     Ok(Box::new(FactoryIntakeOutput::ModelAuthModeSet { mode }))
 }
 
@@ -3476,6 +3459,10 @@ metadata:
             assert!(
                 !lines.iter().any(|l| l.contains("toolchain inference")),
                 "a mode-only run skips the intake preflight: {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.contains("kubectl")),
+                "Helm rolls the pods; a mode-only run plans no kubectl rollout: {lines:?}"
             );
         }
     }

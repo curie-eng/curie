@@ -327,7 +327,12 @@ intake options, the usual intake configuration runs and also writes the mode.
 Omitting the flag keeps the recorded mode. Personal mode needs the Kubernetes
 sandbox substrate: the command refuses, before any Helm write, a release whose
 `worker.extraEnv` sets `CURIE_SANDBOX_SUBSTRATE` to anything but the literal
-`kubernetes`, including a `valueFrom` entry or an empty value.
+`kubernetes` (whitespace trimmed, case ignored), including a `valueFrom` entry
+or an empty value. A mode only change runs no kubectl rollout: the upgrade
+changes the API and worker pod templates, so Helm rolls those pods, and a
+release without an API Deployment (`api.deploy=false`) is fine. Changing the
+mode governs new admissions; an execution request already created keeps the
+mode it recorded.
 `curie cluster status` prints `factory model auth mode: <mode>`, and its JSON
 carries `factory_model_auth_mode`. A release upgraded with retained values from
 a chart without the key shows the literal of a retained `FACTORY_MODEL_AUTH_MODE`

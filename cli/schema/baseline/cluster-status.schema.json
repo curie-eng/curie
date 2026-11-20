@@ -266,7 +266,7 @@
           }
         },
         "factory_model_auth_mode": {
-          "description": "The installation's model auth mode, `factory.modelAuthMode` from the computed release values: `service` or `personal`. When the computed values lack the key (a release upgraded with retained values from an older chart), the literal of a retained `FACTORY_MODEL_AUTH_MODE` entry in `api.extraEnv` or `worker.extraEnv`, else `service`, which the chart renders. Null when the computed values are unavailable or a retained entry holds a value the services refuse.",
+          "description": "The installation's model auth mode, `factory.modelAuthMode` from the computed release values: `service` or `personal`. When the computed values lack the key (a release upgraded with retained values from an older chart), the literal of a retained `FACTORY_MODEL_AUTH_MODE` entry (name in any case) in `api.extraEnv` or `worker.extraEnv`, else `service`, which the chart renders. Null when the computed values are unavailable, the API and worker entries disagree, or a retained entry holds a value the services refuse.",
           "type": [
             "string",
             "null"

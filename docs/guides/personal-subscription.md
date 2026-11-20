@@ -321,7 +321,8 @@ On a cluster, `factory.modelAuthMode` is the only switch. The chart renders it
 as `FACTORY_MODEL_AUTH_MODE` into both the API and the worker, and refuses the
 variable in `api.extraEnv` or `worker.extraEnv`. A personal release whose
 `worker.extraEnv` sets `CURIE_SANDBOX_SUBSTRATE` to anything but the literal
-`kubernetes` (a `valueFrom` entry or an empty value included) is refused by `curie cluster factory --model-auth-mode personal` and by the
+`kubernetes`, compared with whitespace trimmed and case ignored (a `valueFrom`
+entry or an empty value included), is refused by `curie cluster factory --model-auth-mode personal` and by the
 chart render, before anything is applied. A worker started in personal mode
 on another substrate anyway refuses to start with
 `personal_mode_requires_kubernetes: FACTORY_MODEL_AUTH_MODE=personal needs CURIE_SANDBOX_SUBSTRATE=kubernetes`.

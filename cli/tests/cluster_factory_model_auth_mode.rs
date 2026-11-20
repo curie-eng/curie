@@ -30,8 +30,13 @@ esac
 exit 0
 "#;
 
+// A mode-only run needs no kubectl: Helm rolls the api and worker pods. A
+// rollout call fails, as it would on a release without an api Deployment.
 const STUB_KUBECTL: &str = r#"#!/bin/sh
 echo "kubectl $*" >> "$STUB_DIR/calls.log"
+case "$1 $2 $3" in
+  *rollout*) echo "Error from server (NotFound): deployments.apps not found" >&2; exit 1 ;;
+esac
 exit 0
 "#;
 
@@ -58,6 +63,10 @@ impl Stub {
     }
 
     fn run(&self, mode: &str, extra: &[&str]) -> Output {
+        self.run_with_env(mode, extra, &[])
+    }
+
+    fn run_with_env(&self, mode: &str, extra: &[&str], envs: &[(&str, &str)]) -> Output {
         let chart = Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie");
         let path =
             std::env::join_paths([self.dir.join("bin"), "/bin".into(), "/usr/bin".into()]).unwrap();
@@ -72,6 +81,7 @@ impl Stub {
             .env("HOME", self.dir.join("home"))
             .env("CURIE_CONFIG_DIR", self.dir.join("home/.config/curie"))
             .env("STUB_DIR", &self.dir)
+            .envs(envs.iter().copied())
             .output()
             .expect("run curie")
     }
@@ -201,4 +211,76 @@ fn model_auth_mode_alone_refuses_a_missing_release_and_an_unverifiable_substrate
         service.applied(),
         Some(serde_json::json!({"factory": {"modelAuthMode": "service"}}))
     );
+}
+
+/// An exported webhook secret is not an intake option: `--model-auth-mode`
+/// alone stays mode-only, so a GitLab-only release is not sent to GitHub App
+/// registration and a disabled intake is not re-enabled.
+#[test]
+fn model_auth_mode_alone_ignores_an_exported_webhook_secret() {
+    let secret = [(
+        "CURIE_GITHUB_WEBHOOK_SECRET",
+        "example-webhook-secret-value",
+    )];
+    let gitlab = Stub::new(Some(gitlab_only()));
+    let output = gitlab.run_with_env("personal", &[], &secret);
+    assert!(
+        output.status.success(),
+        "stdout {}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({"factory_model_auth_mode": "personal"})
+    );
+    assert_eq!(
+        gitlab.applied(),
+        Some(serde_json::json!({"factory": {"modelAuthMode": "personal"}}))
+    );
+
+    let disabled = Stub::new(Some(serde_json::json!({
+        "api": {"githubAppId": "7001", "githubAppExistingSecret": "acme-app"},
+        "factory": {"enabled": false},
+    })));
+    let output = disabled.run_with_env("service", &[], &secret);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let applied = disabled
+        .applied()
+        .expect("helm upgrade received a values file");
+    assert_eq!(
+        applied,
+        serde_json::json!({"factory": {"modelAuthMode": "service"}})
+    );
+    assert!(
+        !applied.to_string().contains("example-webhook-secret-value"),
+        "{applied}"
+    );
+}
+
+/// A release that does not deploy the api still takes a mode-only write:
+/// Helm rolls the pods, and no kubectl rollout runs that could fail on the
+/// absent api Deployment.
+#[test]
+fn model_auth_mode_alone_succeeds_without_an_api_deployment() {
+    let mut recorded = gitlab_only();
+    recorded["api"] = serde_json::json!({"deploy": false});
+    let stub = Stub::new(Some(recorded));
+    let output = stub.run("personal", &[]);
+    assert!(
+        output.status.success(),
+        "stdout {}\nstderr {}\ncalls:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        stub.calls()
+    );
+    assert_eq!(
+        stub.applied(),
+        Some(serde_json::json!({"factory": {"modelAuthMode": "personal"}}))
+    );
+    assert!(!stub.calls().contains("kubectl"), "{}", stub.calls());
 }

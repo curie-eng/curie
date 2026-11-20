@@ -2862,7 +2862,10 @@ chart README section "Factory model auth mode" has the file and the
 worker refuses to start with `personal_mode_requires_kubernetes` unless
 `CURIE_SANDBOX_SUBSTRATE` is `kubernetes`; the chart and `curie cluster
 factory` refuse a personal release whose `worker.extraEnv` selects another
-substrate before anything is applied. The worker also refuses every turn that has no owner (a plain run, a cron
+substrate before anything is applied. They compare the literal as the worker
+does, with whitespace trimmed and case ignored, and refuse a `valueFrom` entry
+or an empty value. Changing the mode governs new admissions; an execution
+request already created keeps the mode it recorded. The worker also refuses every turn that has no owner (a plain run, a cron
 or webhook hook, an eval) with `personal_owner_required` before any claim. The
 protected hook lane is configured only from its provisioned `process.json`, so
 it does not read this setting and never runs WorkItem requests. In

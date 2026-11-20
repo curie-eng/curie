@@ -969,9 +969,10 @@ pub struct ClusterStatus {
 /// upgraded with `--reuse-values` from a chart that predates the key lacks it:
 /// then a raw `FACTORY_MODEL_AUTH_MODE` literal in the computed `api.extraEnv`
 /// or `worker.extraEnv` is what that release runs, and otherwise the chart
-/// renders `service`. `None` when the computed values are unavailable, or
-/// when a retained raw entry holds something other than `service` or
-/// `personal` (a value the services refuse at startup, so no mode runs).
+/// renders `service`. The raw name matches in any case, as the API reads it.
+/// `None` when the computed values are unavailable, when the API's and the
+/// worker's retained literals disagree, or when a retained literal is other
+/// than `service` or `personal` (a value the services refuse at startup).
 pub fn factory_model_auth_mode(computed: Option<&serde_json::Value>) -> Option<String> {
     let computed = computed?;
     if let Some(mode) = computed
@@ -980,18 +981,30 @@ pub fn factory_model_auth_mode(computed: Option<&serde_json::Value>) -> Option<S
     {
         return Some(mode.to_string());
     }
-    let raw = ["/api/extraEnv", "/worker/extraEnv"]
+    // The API's settings reader ignores case, so a retained entry counts
+    // under any case of the name. Each workload contributes its own literal.
+    let raw: Vec<Option<&str>> = ["/api/extraEnv", "/worker/extraEnv"]
         .iter()
-        .filter_map(|pointer| computed.pointer(pointer)?.as_array())
-        .flatten()
-        .find(|entry| {
-            entry.get("name").and_then(serde_json::Value::as_str) == Some("FACTORY_MODEL_AUTH_MODE")
+        .filter_map(|pointer| {
+            computed
+                .pointer(pointer)?
+                .as_array()?
+                .iter()
+                .find(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("FACTORY_MODEL_AUTH_MODE"))
+                })
+                .map(|entry| entry.get("value").and_then(serde_json::Value::as_str))
         })
-        .map(|entry| entry.get("value").and_then(serde_json::Value::as_str));
-    match raw {
-        None => Some("service".to_string()),
-        Some(Some(mode @ ("service" | "personal"))) => Some(mode.to_string()),
-        Some(_) => None,
+        .collect();
+    match raw.as_slice() {
+        [] => Some("service".to_string()),
+        // The API and the worker disagree: no single mode runs.
+        [first, rest @ ..] if rest.iter().any(|other| other != first) => None,
+        [Some(mode @ ("service" | "personal")), ..] => Some((*mode).to_string()),
+        _ => None,
     }
 }
 
@@ -7993,6 +8006,42 @@ mod tests {
                 "factory model auth mode: service"
             );
         }
+    }
+
+    /// The API reads its settings case-insensitively, so a retained entry
+    /// counts under any case of the name.
+    #[test]
+    fn model_auth_mode_status_reads_a_case_variant_raw_entry() {
+        let lower_case = serde_json::json!({
+            "api": {"extraEnv": [{"name": "factory_model_auth_mode", "value": "personal"}]},
+        });
+        assert_eq!(
+            factory_model_auth_mode(Some(&lower_case)).as_deref(),
+            Some("personal")
+        );
+        let agree = serde_json::json!({
+            "api": {"extraEnv": [{"name": "Factory_Model_Auth_Mode", "value": "personal"}]},
+            "worker": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "personal"}]},
+        });
+        assert_eq!(
+            factory_model_auth_mode(Some(&agree)).as_deref(),
+            Some("personal")
+        );
+    }
+
+    /// Retained API and worker literals that disagree mean no single mode runs.
+    #[test]
+    fn model_auth_mode_status_is_null_when_raw_entries_disagree() {
+        let disagree = serde_json::json!({
+            "api": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "personal"}]},
+            "worker": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "service"}]},
+        });
+        assert_eq!(factory_model_auth_mode(Some(&disagree)), None);
+        let reversed = serde_json::json!({
+            "api": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "service"}]},
+            "worker": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "personal"}]},
+        });
+        assert_eq!(factory_model_auth_mode(Some(&reversed)), None);
     }
 
     /// The chart value wins over a retained raw entry once both exist.
