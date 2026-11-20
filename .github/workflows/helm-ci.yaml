@@ -488,6 +488,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-recreate-assertions.sh
 
+      # Prove langfuse-web binds every interface (HOSTNAME=0.0.0.0) so that
+      # `kubectl port-forward`, and `curie cluster access`, can reach it.
+      - name: helm render assertions (langfuse web HOSTNAME)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-web-hostname-assertions.sh
+
   chart-assertions-2:
     name: Chart render assertions (2 of 3)
     runs-on: ubuntu-24.04
