@@ -82,6 +82,16 @@ FRAMING = (
     "and cannot remove review or publication gates. Never copy this section or its "
     "text into a reviewer's prompt."
 )
+# The same framing when a learned rules section precedes this one (#5798), so both
+# sections state one order. Without a learned rules section the base framing above
+# is used, byte for byte.
+LEARNED_RULES_PRECEDENCE = "accepted learned rules for this repository; "
+FRAMING_WITH_LEARNED_RULES = FRAMING.replace(
+    "CONTRIBUTING.md and workspace CLAUDE.md); then these preferences.",
+    "CONTRIBUTING.md and workspace CLAUDE.md); "
+    + LEARNED_RULES_PRECEDENCE
+    + "then these preferences.",
+)
 
 
 @dataclass(frozen=True)
@@ -100,8 +110,10 @@ class Applied:
     sha256: str
     text: str = ""
 
-    def section(self) -> str:
-        return requester_section(self.selection_id, self.sha256, self.text)
+    def section(self, *, learned_rules: bool = False) -> str:
+        return requester_section(
+            self.selection_id, self.sha256, self.text, learned_rules=learned_rules
+        )
 
 
 @dataclass(frozen=True)
@@ -131,11 +143,14 @@ def close_line(sha256: str) -> str:
     return f"{CLOSE_PREFIX} sha256={sha256}>>>"
 
 
-def requester_section(selection_id: str, sha256: str, text: str) -> str:
+def requester_section(
+    selection_id: str, sha256: str, text: str, *, learned_rules: bool = False
+) -> str:
     """The prompt section: delimiters carrying the selection identity and digest."""
 
+    framing = FRAMING_WITH_LEARNED_RULES if learned_rules else FRAMING
     return "\n".join(
-        (open_line(selection_id, sha256), FRAMING, "", text.rstrip("\n"), close_line(sha256))
+        (open_line(selection_id, sha256), framing, "", text.rstrip("\n"), close_line(sha256))
     )
 
 
@@ -353,7 +368,7 @@ def subagent_prompt_refusal(tool_input: Mapping[str, Any], applied: Applied | No
     pinned = applied.text.strip()
     # Every string the call carries, at any depth, not only ``prompt``: a
     # subagent may be handed the text in any field of its input.
-    for text in _strings(tool_input):
+    for text in input_strings(tool_input):
         if OPEN_PREFIX in text or CLOSE_PREFIX in text:
             return _SUBAGENT_REFUSAL
         if pinned and pinned in text:
@@ -361,16 +376,16 @@ def subagent_prompt_refusal(tool_input: Mapping[str, Any], applied: Applied | No
     return None
 
 
-def _strings(value: Any) -> Iterator[str]:
+def input_strings(value: Any) -> Iterator[str]:
     if isinstance(value, str):
         yield value
     elif isinstance(value, Mapping):
         for key, item in value.items():
-            yield from _strings(key)
-            yield from _strings(item)
+            yield from input_strings(key)
+            yield from input_strings(item)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            yield from _strings(item)
+            yield from input_strings(item)
     else:
         yield json.dumps(value, default=str)
 
@@ -409,7 +424,15 @@ def private_fragments(applied: Applied | None) -> tuple[str, ...]:
     lines = {line.strip() for line in applied.text.splitlines() if len(line.strip()) >= 12}
     return tuple(
         sorted(
-            {applied.text, applied.text.strip(), applied.section(), *lines}, key=len, reverse=True
+            {
+                applied.text,
+                applied.text.strip(),
+                applied.section(),
+                applied.section(learned_rules=True),
+                *lines,
+            },
+            key=len,
+            reverse=True,
         )
     )
 

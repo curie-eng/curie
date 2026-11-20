@@ -806,6 +806,7 @@ class FakeRunner:
                 web.post("/v1/interrupt", self._interrupt),
                 web.post("/v1/timeout", self._timeout),
                 web.post("/v1/requester-context", self._requester_context),
+                web.post("/v1/memory-rules-context", self._memory_rules_context),
             ]
         )
         # Envelopes posted before a first turn (ADR 0278), in order.
@@ -813,6 +814,12 @@ class FakeRunner:
         # When set, the requester context route answers this status and body
         # instead of acknowledging, as a refusing or older runner would.
         self.requester_context_answer: tuple[int, dict[str, Any]] | None = None
+        # Learned rules envelopes posted before a first turn (#5798), in order.
+        self.memory_rules_contexts: list[dict[str, Any]] = []
+        # When set, the learned rules route answers this status and body.
+        self.memory_rules_context_answer: tuple[int, dict[str, Any]] | None = None
+        # Each context post in arrival order, with how many turns had opened.
+        self.context_posts: list[tuple[str, int]] = []
         self.turn_active = False
         self.turn_epoch: str | None = None
         self._turn_lock = asyncio.Lock()
@@ -880,9 +887,25 @@ class FakeRunner:
 
         envelope = await request.json()
         self.requester_contexts.append(envelope)
+        self.context_posts.append(("requester", len(self.opened)))
         if self.requester_context_answer is not None:
             status, body = self.requester_context_answer
             return web.json_response(body, status=status)
+        return self._acknowledge(envelope)
+
+    async def _memory_rules_context(self, request: web.Request) -> web.Response:
+        """Acknowledge the learned rules like the real runner (#5798)."""
+
+        envelope = await request.json()
+        self.memory_rules_contexts.append(envelope)
+        self.context_posts.append(("memory_rules", len(self.opened)))
+        if self.memory_rules_context_answer is not None:
+            status, body = self.memory_rules_context_answer
+            return web.json_response(body, status=status)
+        return self._acknowledge(envelope)
+
+    @staticmethod
+    def _acknowledge(envelope: dict[str, Any]) -> web.Response:
         selection = envelope.get("selection") or {}
         ack: dict[str, Any] = {
             "envelope_version": 1,

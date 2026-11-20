@@ -200,6 +200,35 @@ class Api:
                 "reason": None,
             }
             return httpx.Response(200, json={"evidence": "none"})
+        if path.endswith("/memory-rules-context"):
+            # The learned rules envelope beside the requester context (#5798).
+            assert self.running and self.start_grant is not None
+            assert body == {"runtime_epoch": self.start_grant["runtime_epoch"]}
+            return httpx.Response(
+                200,
+                json={
+                    "envelope_version": 1,
+                    "tenant_id": str(TENANT_ID),
+                    "work_item_id": str(self.request_id),
+                    "execution_request_id": str(self.request_id),
+                    "execution_fence": self.start_grant["runtime_epoch"],
+                    "selection": {"kind": "absent", "reason": "no_rules"},
+                },
+            )
+        if path.endswith("/memory-rules-context/acknowledgment"):
+            assert self.running and self.start_grant is not None
+            assert body == {
+                "runtime_epoch": self.start_grant["runtime_epoch"],
+                "acknowledgment": {
+                    "envelope_version": 1,
+                    "work_item_id": str(self.request_id),
+                    "execution_request_id": str(self.request_id),
+                    "execution_fence": self.start_grant["runtime_epoch"],
+                    "outcome": "none",
+                },
+                "reason": None,
+            }
+            return httpx.Response(200, json={"evidence": "none"})
         if path.endswith("/issue-read/context"):
             self.run = self.kernel._work_item_runs[self.request_id]
             return httpx.Response(

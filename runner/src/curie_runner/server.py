@@ -64,6 +64,11 @@ from . import ui_evidence
 from .executor import EXECUTOR_MODE, ExecuteRefusal, Executor
 from .executor import RUNNER_MODE_ENV as RUNNER_MODE_ENV
 from .final_answer import FINAL_ANSWER_HEADER
+from .memory_rules_context import CONTEXT_PATH as MEMORY_RULES_CONTEXT_PATH
+from .memory_rules_context import MAX_ENVELOPE_BYTES as MEMORY_RULES_MAX_ENVELOPE_BYTES
+from .memory_rules_context import NOT_SERVED as MEMORY_RULES_NOT_SERVED
+from .memory_rules_context import MemoryRulesContextGate
+from .memory_rules_context import attached_gate as attached_memory_rules_gate
 from .requester_context import (
     CONTEXT_PATH,
     MAX_ENVELOPE_BYTES,
@@ -103,6 +108,8 @@ _GATED_PATHS = frozenset(
         "/v1/status",
         # ADR 0278: the worker's requester context envelope.
         CONTEXT_PATH,
+        # #5798: the worker's learned rules envelope.
+        MEMORY_RULES_CONTEXT_PATH,
         # @spec ACTION-EXECUTOR-6: served only in executor mode; an ordinary
         # runner answers 404 behind the same bearer.
         "/v1/execute",
@@ -125,6 +132,8 @@ CHECKPOINT_AUTHENTICATED: web.AppKey[bool] = web.AppKey("checkpoint_authenticate
 CHECKPOINT_WORKSPACE: web.AppKey[object] = web.AppKey("checkpoint_workspace", object)
 # The process's one requester context gate (ADR 0278), or None: route answers 404.
 REQUESTER_CONTEXT: web.AppKey[object] = web.AppKey("requester_context", object)
+# The process's one learned rules context gate (#5798), or None: route answers 404.
+MEMORY_RULES_CONTEXT: web.AppKey[object] = web.AppKey("memory_rules_context", object)
 
 
 class _StatusAttestation(TypedDict):
@@ -198,6 +207,7 @@ def create_app(
     *,
     ui_evidence_workspace: Path | None = None,
     requester_context: RequesterContextGate | None = None,
+    memory_rules_context: MemoryRulesContextGate | None = None,
 ) -> web.Application:
     """Build the aiohttp application that starts ``runner`` in the background.
 
@@ -230,6 +240,11 @@ def create_app(
     app[REQUESTER_CONTEXT] = (
         requester_context if requester_context is not None else attached_gate(runner)
     )
+    app[MEMORY_RULES_CONTEXT] = (
+        memory_rules_context
+        if memory_rules_context is not None
+        else attached_memory_rules_gate(runner)
+    )
     # An identity-bearing response exists only when middleware above enforces a
     # non-empty bearer. Tokenless apps (dev flag or in-process tests) keep both
     # status routes probe-only.
@@ -253,6 +268,7 @@ def create_app(
             web.post("/v1/ui-evidence/index", _ui_evidence_index),
             web.post("/v1/ui-evidence/image", _ui_evidence_image),
             web.post("/v1/requester-context", _requester_context),
+            web.post("/v1/memory-rules-context", _memory_rules_context),
         ]
     )
     app.on_startup.append(_on_startup)
@@ -274,6 +290,7 @@ _EXECUTOR_REFUSED_ROUTES = (
     "/v1/ui-evidence/index",
     "/v1/ui-evidence/image",
     CONTEXT_PATH,
+    MEMORY_RULES_CONTEXT_PATH,
 )
 
 
@@ -694,6 +711,31 @@ async def _requester_context(request: web.Request) -> web.Response:
         async for chunk in request.content.iter_any():
             raw.extend(chunk)
             if len(raw) > MAX_ENVELOPE_BYTES:
+                oversized = True
+                break
+    status, body = await gate.deliver(bytes(raw), oversized=oversized)
+    return web.json_response(body, status=status)
+
+
+async def _memory_rules_context(request: web.Request) -> web.Response:
+    """Decide the worker's learned rules context envelope (#5798).
+
+    Answers the version 1 acknowledgment; a refused envelope is still a 200
+    with outcome ``failed`` and its reason, and the start then blocks offline.
+    """
+
+    gate = request.app[MEMORY_RULES_CONTEXT]
+    if not isinstance(gate, MemoryRulesContextGate):
+        return web.json_response({"error": MEMORY_RULES_NOT_SERVED}, status=404)
+    raw = bytearray()
+    oversized = (
+        request.content_length is not None
+        and request.content_length > MEMORY_RULES_MAX_ENVELOPE_BYTES
+    )
+    if not oversized:
+        async for chunk in request.content.iter_any():
+            raw.extend(chunk)
+            if len(raw) > MEMORY_RULES_MAX_ENVELOPE_BYTES:
                 oversized = True
                 break
     status, body = await gate.deliver(bytes(raw), oversized=oversized)

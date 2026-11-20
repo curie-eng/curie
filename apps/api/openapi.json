@@ -11971,6 +11971,59 @@
         "title": "MemoryProvenanceOut",
         "type": "object"
       },
+      "MemoryRulesMetadata": {
+        "description": "The learned rules pinned at admission (#5798): numbers and digest, never the text.",
+        "properties": {
+          "count": {
+            "default": 0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "format_version": {
+            "anyOf": [
+              {
+                "const": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Format Version"
+          },
+          "rule_numbers": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Rule Numbers",
+            "type": "array"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "state": {
+            "enum": [
+              "absent",
+              "selected"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "MemoryRulesMetadata",
+        "type": "object"
+      },
       "MemoryTraceBackOut": {
         "description": "The learned-from trace-back for one memory entry (#266).\n\nResolves an entry's recorded provenance into the concrete session and source\ntraces the lesson was learned from -- the answer to \"how did it learn that?\".",
         "properties": {
@@ -20138,6 +20191,9 @@
             "title": "Id",
             "type": "string"
           },
+          "memory_rules": {
+            "$ref": "#/components/schemas/MemoryRulesMetadata"
+          },
           "model_auth_mode": {
             "default": "service",
             "enum": [
@@ -20305,6 +20361,7 @@
           "ci",
           "requests",
           "coding_instructions",
+          "memory_rules",
           "automatic_retries_used",
           "automatic_retry_limit"
         ],
@@ -20536,6 +20593,17 @@
               }
             ],
             "title": "Last Start Failure Detail"
+          },
+          "memory_rules_evidence": {
+            "default": "none",
+            "enum": [
+              "none",
+              "pending",
+              "applied",
+              "failed"
+            ],
+            "title": "Memory Rules Evidence",
+            "type": "string"
           },
           "model_auth_mode": {
             "default": "service",
@@ -39309,6 +39377,150 @@
           }
         },
         "summary": "Hold Work Item For Approval",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context": {
+      "post": {
+        "description": "The running request's version 1 learned rules envelope, for the current fence.",
+        "operationId": "read_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContextBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Memory Rules Context V1 Internal Work Items Requests  Request Id  Memory Rules Context Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Memory Rules Context",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment": {
+      "post": {
+        "description": "Accept the relayed acknowledgment only for the current request and fence.",
+        "operationId": "acknowledge_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_acknowledgment_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcknowledgmentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Acknowledge Memory Rules Context V1 Internal Work Items Requests  Request Id  Memory Rules Context Acknowledgment Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acknowledge Memory Rules Context",
         "tags": [
           "internal-work-items"
         ]
