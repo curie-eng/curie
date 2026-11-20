@@ -233,14 +233,23 @@ def test_sourced_env_file_matches_every_value(env_file: Path, values: dict[str, 
 # --- the merged compose config ------------------------------------------------------
 
 
+# The render needs the docker CLI and nothing else from the caller. compose.dev.yaml forwards
+# provider credentials from the caller's environment into the worker, so none may reach it.
+RENDER_ENV = ("PATH", "HOME", "DOCKER_CONFIG", "XDG_CONFIG_HOME")
+
+
+def require(condition: bool, message: str) -> None:
+    """Fail with `message` alone: a bare `assert` would also print the merged config, and the
+    service environments in it carry whatever the caller's shell forwards."""
+
+    if not condition:
+        raise AssertionError(message)
+
+
 def render(env_path: Path, profiles: Sequence[str]) -> dict[str, Any]:
     """`docker compose -f compose.dev.yaml -f overlay config --format json`, env file sourced."""
 
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("COMPOSE_", "CURIE_", "VALKEY_", "S3_", "SLACK_", "OTEL_"))
-    }
+    env = {key: os.environ[key] for key in RENDER_ENV if key in os.environ}
     argv = ["docker", "compose", "-f", str(COMPOSE_DEV), "-f", str(OVERLAY)]
     for profile in profiles:
         argv += ["--profile", profile]
@@ -253,7 +262,8 @@ def render(env_path: Path, profiles: Sequence[str]) -> dict[str, Any]:
         cwd=REPO_ROOT,
         env=env,
     )
-    assert proc.returncode == 0, f"compose config failed: {proc.stderr.strip()}"
+    if proc.returncode != 0:
+        raise AssertionError(f"compose config failed: {proc.stderr.strip()}")
     config: dict[str, Any] = json.loads(proc.stdout)
     return config
 
@@ -266,16 +276,19 @@ def environment(config: Mapping[str, Any], service: str) -> dict[str, str]:
 
 
 def assert_isolated(config: Mapping[str, Any], values: Mapping[str, str]) -> None:
-    """Each condition of `validate_isolated_override`, plus AC13's port and Dex checks."""
+    """Each condition of `validate_isolated_override`, plus AC13's port and Dex checks.
+
+    Every check goes through `require`, so a failure names the condition and never prints a
+    service environment."""
 
     services = config["services"]
-    assert config["name"] == values["COMPOSE_PROJECT_NAME"]
-    assert "curie-worker" in services, "the worker is turned off"
+    require(config["name"] == values["COMPOSE_PROJECT_NAME"], "the project name is not rebound")
+    require("curie-worker" in services, "the worker is turned off")
     gateway_port = int(values["CURIE_LOCAL_GATEWAY_PORT"])
 
     worker = environment(config, "curie-worker")
     postgres = f"@{values['CURIE_LOCAL_POSTGRES_HOST']}:{values['CURIE_LOCAL_POSTGRES_PORT']}/"
-    assert postgres in worker.get("DATABASE_URL", ""), "worker DATABASE_URL is not rebound"
+    require(postgres in worker.get("DATABASE_URL", ""), "worker DATABASE_URL is not rebound")
     for key in (
         "VALKEY_HOST",
         "VALKEY_PORT",
@@ -283,64 +296,83 @@ def assert_isolated(config: Mapping[str, Any], values: Mapping[str, str]) -> Non
         "CURIE_API_URL",
         "CURIE_DOCKER_NETWORK",
     ):
-        assert worker.get(key) == values[key], f"worker {key} is not rebound"
-    assert port_of(worker.get("CURIE_CHANNEL_GATEWAY_URL", "")) == gateway_port, (
-        "worker CURIE_CHANNEL_GATEWAY_URL is not this project's gateway"
+        require(worker.get(key) == values[key], f"worker {key} is not rebound")
+    require(
+        port_of(worker.get("CURIE_CHANNEL_GATEWAY_URL", "")) == gateway_port,
+        "worker CURIE_CHANNEL_GATEWAY_URL is not this project's gateway",
     )
 
     api = environment(config, "curie-api")
-    assert port_of(api.get("CURIE_CHANNEL_GATEWAY_URL", "")) == gateway_port, (
-        "curie-api CURIE_CHANNEL_GATEWAY_URL is not this project's gateway"
+    require(
+        port_of(api.get("CURIE_CHANNEL_GATEWAY_URL", "")) == gateway_port,
+        "curie-api CURIE_CHANNEL_GATEWAY_URL is not this project's gateway",
     )
 
     gateway = environment(config, "curie-channel-gateway")
-    assert gateway.get("CURIE_CHANNEL_GATEWAY_PORT") == str(gateway_port), (
-        "the gateway does not listen on CURIE_LOCAL_GATEWAY_PORT"
+    require(
+        gateway.get("CURIE_CHANNEL_GATEWAY_PORT") == str(gateway_port),
+        "the gateway does not listen on CURIE_LOCAL_GATEWAY_PORT",
     )
     stub = int(values["CURIE_LOCAL_STUB_PORT"])
     slack = gateway.get("SLACK_API_BASE_URL", "")
-    assert port_of(slack) == stub and f"localhost:{stub}" in slack, (
-        "the gateway's SLACK_API_BASE_URL is not CURIE_LOCAL_STUB_PORT"
+    require(
+        port_of(slack) == stub and f"localhost:{stub}" in slack,
+        "the gateway's SLACK_API_BASE_URL is not CURIE_LOCAL_STUB_PORT",
     )
 
-    assert config["networks"]["curie_runner"]["name"] == values["CURIE_DOCKER_NETWORK"], (
-        "networks.curie_runner.name is not this project's runner network"
+    require(
+        config["networks"]["curie_runner"]["name"] == values["CURIE_DOCKER_NETWORK"],
+        "networks.curie_runner.name is not this project's runner network",
     )
 
     tag = values["CURIE_LOCAL_IMAGE_TAG"]
     for name, service in services.items():
         image = service.get("image") or ""
         if "ghcr.io/curie-eng/" in image:
-            assert image.endswith(f":{tag}"), f"{name} pins {image} without {tag}"
-    assert worker.get("CURIE_RUNNER_IMAGE", "").endswith(f":{tag}")
-    assert (services["curie-worker"].get("build") or {}).get("args", {}).get("BASE_TAG") == tag
+            require(image.endswith(f":{tag}"), f"{name} pins an image without {tag}")
+    require(
+        worker.get("CURIE_RUNNER_IMAGE", "").endswith(f":{tag}"),
+        "worker CURIE_RUNNER_IMAGE does not carry CURIE_LOCAL_IMAGE_TAG",
+    )
+    build_args = (services["curie-worker"].get("build") or {}).get("args", {})
+    require(build_args.get("BASE_TAG") == tag, "the worker build BASE_TAG is not the image tag")
 
     allowed = {int(values[name]) for name in oidc_e2e.LOCAL_PORT_VARIABLES}
     published: set[int] = set()
     for name, service in services.items():
         for port in service.get("ports") or []:
-            assert port.get("host_ip") == "127.0.0.1", f"{name} publishes beyond loopback"
-            assert int(port["published"]) in allowed, f"{name} publishes a port not in the file"
+            require(port.get("host_ip") == "127.0.0.1", f"{name} publishes beyond loopback")
+            require(int(port["published"]) in allowed, f"{name} publishes a port not in the file")
             published.add(int(port["published"]))
-    assert published == allowed, "a host port of the env file is not published"
+    require(published == allowed, "a host port of the env file is not published")
     api_ports = {
         (int(port["published"]), int(port["target"])) for port in services["curie-api"]["ports"]
     }
     dex_port = int(values["CURIE_LOCAL_OIDC_DEX_PORT"])
-    assert api_ports == {(int(values["CURIE_LOCAL_OIDC_API_PORT"]), 8000), (dex_port, dex_port)}
+    require(
+        api_ports == {(int(values["CURIE_LOCAL_OIDC_API_PORT"]), 8000), (dex_port, dex_port)},
+        "curie-api does not publish exactly its API and Dex ports",
+    )
 
-    assert services["dex"].get("network_mode") == "service:curie-api"
-    assert services["dex"].get("image") == PTO.DEX_IMAGE
+    require(
+        services["dex"].get("network_mode") == "service:curie-api",
+        "dex does not share the API's network",
+    )
+    require(services["dex"].get("image") == PTO.DEX_IMAGE, "dex runs another image")
     issuer = dex_config(values)["issuer"]
-    assert api.get("CURIE_OIDC_ISSUER") == issuer, "curie-api CURIE_OIDC_ISSUER is not Dex's"
-    assert api.get("CURIE_OIDC_REDIRECT_URI") == values["CURIE_API_URL"] + "/console/oidc/callback"
-    assert api.get("CURIE_OIDC_CLIENT_SECRET") == values["CURIE_LOCAL_OIDC_CLIENT_SECRET"]
-    assert api.get("CURIE_OIDC_JWKS_URL") == issuer + "/keys"
-    assert api.get("CURIE_OIDC_AUDIENCE") == PTO.OIDC_CLIENT_ID
-    assert api.get("CURIE_OIDC_SCOPES") == PTO.OIDC_SCOPES
-    assert api.get("CURIE_OIDC_ADMIT_ALL_AUTHENTICATED") == "true"
+    redirect = values["CURIE_API_URL"] + "/console/oidc/callback"
+    for key, expected in (
+        ("CURIE_OIDC_ISSUER", issuer),
+        ("CURIE_OIDC_REDIRECT_URI", redirect),
+        ("CURIE_OIDC_CLIENT_SECRET", values["CURIE_LOCAL_OIDC_CLIENT_SECRET"]),
+        ("CURIE_OIDC_JWKS_URL", issuer + "/keys"),
+        ("CURIE_OIDC_AUDIENCE", PTO.OIDC_CLIENT_ID),
+        ("CURIE_OIDC_SCOPES", PTO.OIDC_SCOPES),
+        ("CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "true"),
+    ):
+        require(api.get(key) == expected, f"curie-api {key} is not the local Dex's")
     content = config["configs"]["local_oidc_dex"]["content"]
-    assert json.loads(content) == dex_config(values), "Dex reads a different config"
+    require(json.loads(content) == dex_config(values), "Dex reads a different config")
 
 
 @needs_compose
@@ -373,7 +405,8 @@ def test_gateway_tokens_reach_the_three_services(env_file: Path, values: dict[st
     assert environment(config, "curie-api")["CURIE_CHANNEL_GATEWAY_TOKEN"] == api_token
     assert environment(config, "curie-worker")["CURIE_CHANNEL_GATEWAY_TOKEN"] == worker_token
     for service in ("curie-channel-gateway", "curie-api", "curie-worker"):
-        assert not set(DEV_TOKENS) & set(environment(config, service).values())
+        leaked = set(DEV_TOKENS) & set(environment(config, service).values())
+        require(not leaked, f"{service} carries a public development token")
 
 
 @needs_compose
@@ -386,6 +419,40 @@ def test_a_missing_gateway_token_fails_the_render(
     with pytest.raises(AssertionError) as caught:
         render(broken, ("core",))
     assert name in str(caught.value)
+
+
+PROVIDER_CREDENTIAL = "sk-provider-credential-marker-7d3e91"
+FORWARDED_CREDENTIALS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CURIE_CREDENTIALS")
+
+
+@needs_compose
+def test_a_caller_credential_never_reaches_the_render_or_a_failure(
+    env_file: Path, values: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """compose.dev.yaml forwards these names from the caller's shell into the worker."""
+
+    for name in FORWARDED_CREDENTIALS:
+        monkeypatch.setenv(name, PROVIDER_CREDENTIAL)
+    config = render(env_file, ("core",))
+    assert PROVIDER_CREDENTIAL not in json.dumps(config)
+    assert_isolated(config, values)
+    # Every way assert_isolated can fail: the message names the condition, not the config.
+    for label, mutate in MUTATIONS.items():
+        broken = copy.deepcopy(config)
+        mutate(broken)
+        with pytest.raises(AssertionError) as caught:
+            assert_isolated(broken, values)
+        assert PROVIDER_CREDENTIAL not in str(caught.value), label
+    # A failure on a config that carries a credential still does not print it. The config is
+    # small so that even an introspected `in` check would show the whole services mapping.
+    leaky = {
+        "name": values["COMPOSE_PROJECT_NAME"],
+        "services": {"curie-api": {"environment": {"ANTHROPIC_API_KEY": PROVIDER_CREDENTIAL}}},
+    }
+    with pytest.raises(AssertionError) as caught:
+        assert_isolated(leaky, values)
+    assert "worker is turned off" in str(caught.value)
+    assert PROVIDER_CREDENTIAL not in str(caught.value)
 
 
 def _set_env(service: str, key: str, value: str) -> Callable[[dict[str, Any]], None]:

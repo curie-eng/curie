@@ -408,6 +408,35 @@ def test_closed_turn_is_refused(client: Any, auth_headers: dict[str, str], clean
     _accepted_proposal(_propose(client, aid, _writer(aid)))
 
 
+def test_turn_closed_while_the_proposal_is_in_flight_is_refused(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The turn ends after the route's first check, while the proposal awaits its locks."""
+
+    from curie_api import memory_rule_channel
+    from curie_api.routers.state import _closed_turn_key
+
+    aid = _agent(client, auth_headers)
+    turn = _turn()
+    writer = _writer(aid, turn=turn)
+    real_lock = memory_rule_channel.lock_rule_owner
+
+    async def lock_then_close(session: Any, agent_id: uuid.UUID) -> bool:
+        locked = await real_lock(session, agent_id)
+        await client.app.state.valkey.set(_closed_turn_key(agent_id, turn), "1", ex=60)
+        return bool(locked)
+
+    monkeypatch.setattr(memory_rule_channel, "lock_rule_owner", lock_then_close)
+    _refused_plain(_propose(client, aid, writer), 403, TURN_ENDED)
+    assert _stored(aid) == ([], [])
+    # Liveness: the same hook on a turn that stays open stores the proposal.
+    monkeypatch.setattr(memory_rule_channel, "lock_rule_owner", real_lock)
+    _accepted_proposal(_propose(client, aid, _writer(aid)))
+
+
 def test_second_proposal_in_one_turn_is_refused(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:

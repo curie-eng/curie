@@ -1804,6 +1804,10 @@ async def propose_rule(
             proposed_by=principal.sender,
             rule=body.rule,
             reason=body.reason,
+            # The turn may end while the body arrives or the locks are awaited.
+            ensure_open=lambda: _check_turn_open(
+                principal, agent_id, MEMORY_NAMESPACE, request, path
+            ),
         )
     except (ProposalRefused, InvalidRule) as refused:
         # The agent, the turn, the outcome and byte counts: never the text.

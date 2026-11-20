@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final, Literal
@@ -125,8 +126,13 @@ async def propose_channel_rule(
     proposed_by: str,
     rule: str,
     reason: str,
+    ensure_open: Callable[[], Awaitable[None]],
 ) -> ProposedRule:
     """Store the turn's one rule as ``proposed`` with its ``propose`` event, committed.
+
+    ``ensure_open`` is awaited immediately before the row is added, after every
+    lock and read this function waits on, and raises to refuse a turn the worker
+    has reported ended meanwhile (the exception propagates after a rollback).
 
     Raises ``ProposalRefused`` (``rule_proposal_not_eligible`` when the agent is
     gone or its ``memory_rule_proposals`` is off; ``rule_already_proposed`` for
@@ -170,6 +176,11 @@ async def propose_channel_rule(
                 MemoryRule.scope_key == scope.key,
             )
         )
+        try:
+            await ensure_open()
+        except BaseException:
+            await _rollback_quietly(session)
+            raise
         state: RuleState = "proposed"
         number = (highest or 0) + 1
         row = MemoryRule(
