@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { C } from "../../tokens";
 import { Button, Card, Chip, CliHint, Notice, SectionTitle } from "../../primitives";
 import { cliCommand } from "../../primitives/cliCommand";
@@ -43,9 +43,8 @@ interface RepositoryScope {
 
 // The login part of `github:<id>:<login>`; null when the author is not in that form.
 export function authorOf(proposedBy: string): string | null {
-  const parts = proposedBy.split(":");
-  const login = parts.slice(2).join(":");
-  return parts.length >= 3 && login ? login : null;
+  const m = /^github:[^:\s]+:([^:\s]+)$/.exec(proposedBy);
+  return m ? m[1] : null;
 }
 
 // The pull request number of the source comment's URL, across the code hosts the
@@ -70,7 +69,7 @@ function safeHref(url: string | null): string | null {
 
 // The refusal sentences of the learned rule routes; an unlisted code shows the
 // API's own message (for example write_access_unverifiable).
-export function refusalText(error: unknown, repository: string): string {
+export function refusalText(error: unknown, repository: string, limit: number): string {
   if (error instanceof MemoryRuleRefusal) {
     switch (error.code) {
       case "memory_rules.write_access_required":
@@ -78,7 +77,7 @@ export function refusalText(error: unknown, repository: string): string {
       case "memory_rules.stale_version":
         return "This rule changed. The list was refreshed.";
       case "memory_rules.scope_full":
-        return `${repository} already has ${error.limit ?? 16} rules in force. Remove one first.`;
+        return `${repository} already has ${error.limit ?? limit} rules in force. Remove one first.`;
       case "memory_rules.code_host_unavailable":
         return "The code host could not be reached. Nothing changed.";
       default:
@@ -189,18 +188,25 @@ function MemoryBody({
 }) {
   const [data, setData] = useState<MemoryRules | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
+  const newest = useRef(0);
   // One refusal per rule, shown on its card; a note per section after a Dismiss
   // or a Remove (neither has an undo).
   const [refusals, setRefusals] = useState<Record<string, string>>({});
-  const [notes, setNotes] = useState<{ proposed?: string; inForce?: string }>({});
+  const [notes, setNotes] = useState<Record<string, { proposed?: string; inForce?: string }>>({});
 
   const load = useCallback(async () => {
+    // Only the newest request's answer is applied: two decisions in a row start
+    // two reloads, and the older one may read before the second decision lands.
+    const mine = ++newest.current;
     try {
-      setData(await listMemoryRules(agentId));
-      setError(null);
+      const fresh = await listMemoryRules(agentId);
+      if (mine === newest.current) {
+        setData(fresh);
+        setError(null);
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (mine === newest.current) setError(e instanceof Error ? e.message : String(e));
     }
   }, [agentId]);
 
@@ -216,24 +222,36 @@ function MemoryBody({
   const proposed = inScope.filter((r) => r.state === "proposed");
   const inForce = inScope.filter((r) => r.state === "accepted");
   const repository = scope?.label ?? "";
+  // A refusal belongs on its card; when the refreshed list no longer shows that
+  // rule (another person already decided it), it is shown here so it is not lost.
+  const shown = new Set([...proposed, ...inForce].map((r) => r.id));
+  const orphanRefusals = Object.entries(refusals).filter(([id]) => !shown.has(id));
 
   const act = async (action: Action, rule: MemoryRule) => {
-    setBusyId(rule.id);
+    setBusy((b) => new Set(b).add(rule.id));
     setRefusals((r) => {
       const { [rule.id]: _drop, ...rest } = r;
       return rest;
     });
     try {
       await DECIDE[action](agentId, rule.id, rule.version);
-      if (action === "reject") setNotes((n) => ({ ...n, proposed: "Dismissed" }));
-      if (action === "remove") setNotes((n) => ({ ...n, inForce: "Removed" }));
+      if (action === "reject") {
+        setNotes((n) => ({ ...n, [rule.scope_key]: { ...n[rule.scope_key], proposed: "Dismissed" } }));
+      }
+      if (action === "remove") {
+        setNotes((n) => ({ ...n, [rule.scope_key]: { ...n[rule.scope_key], inForce: "Removed" } }));
+      }
     } catch (e) {
-      setRefusals((r) => ({ ...r, [rule.id]: refusalText(e, repository) }));
+      setRefusals((r) => ({ ...r, [rule.id]: refusalText(e, repository, data?.in_force_limit ?? 16) }));
     } finally {
       // Every outcome reloads: a stale version, an invalid transition and a
       // success all leave the list different from what the person saw.
       await load();
-      setBusyId(null);
+      setBusy((b) => {
+        const rest = new Set(b);
+        rest.delete(rule.id);
+        return rest;
+      });
     }
   };
 
@@ -307,13 +325,18 @@ function MemoryBody({
               {error}
             </div>
           ) : null}
+          {orphanRefusals.map(([id, text]) => (
+            <div key={id} role="alert" data-testid="memory-rule-refusal" style={{ ...meta, color: C.destructive, marginBottom: 12 }}>
+              {text}
+            </div>
+          ))}
           {!data && !error ? (
             <Notice>Loading learned rules…</Notice>
           ) : data && !scope ? (
             <Notice>No repository has learned rules for this agent yet.</Notice>
           ) : data ? (
             <>
-              <RuleSection title="Proposed" count={proposed.length} note={notes.proposed} empty="Nothing waiting for review.">
+              <RuleSection title="Proposed" count={proposed.length} note={notes[scope.key]?.proposed} empty="Nothing waiting for review.">
                 {proposed.map((rule) => (
                   <RuleCard key={rule.id} rule={rule} refusal={refusals[rule.id]}>
                     <div style={{ display: "flex", gap: 18, flexWrap: "wrap", ...meta }}>
@@ -325,36 +348,20 @@ function MemoryBody({
                         label="Accept"
                         variant="primary"
                         size="sm"
-                        disabled={busyId === rule.id}
+                        disabled={busy.has(rule.id)}
                         onClick={() => void act("accept", rule)}
-                      />
-                      <CliHint
-                        command={cliCommand("cluster.memory", {
-                          agent: agentName,
-                          accept: rule.id,
-                          "expected-version": String(rule.version),
-                          "session-file": SESSION_FILE,
-                        })}
                       />
                       <Button
                         label="Dismiss"
                         size="sm"
-                        disabled={busyId === rule.id}
+                        disabled={busy.has(rule.id)}
                         onClick={() => void act("reject", rule)}
-                      />
-                      <CliHint
-                        command={cliCommand("cluster.memory", {
-                          agent: agentName,
-                          reject: rule.id,
-                          "expected-version": String(rule.version),
-                          "session-file": SESSION_FILE,
-                        })}
                       />
                     </div>
                   </RuleCard>
                 ))}
               </RuleSection>
-              <RuleSection title="In force" count={inForce.length} note={notes.inForce} empty="No rules yet.">
+              <RuleSection title="In force" count={inForce.length} note={notes[scope.key]?.inForce} empty="No rules yet.">
                 {inForce.map((rule) => (
                   <RuleCard key={rule.id} rule={rule} refusal={refusals[rule.id]}>
                     <div style={{ color: C.text2, fontSize: 12.5 }}>
@@ -367,16 +374,8 @@ function MemoryBody({
                         label="Remove"
                         variant="danger"
                         size="sm"
-                        disabled={busyId === rule.id}
+                        disabled={busy.has(rule.id)}
                         onClick={() => void act("remove", rule)}
-                      />
-                      <CliHint
-                        command={cliCommand("cluster.memory", {
-                          agent: agentName,
-                          remove: rule.id,
-                          "expected-version": String(rule.version),
-                          "session-file": SESSION_FILE,
-                        })}
                       />
                     </div>
                   </RuleCard>
@@ -390,10 +389,6 @@ function MemoryBody({
     </>
   );
 }
-
-// The CLI reads the console session cookie from a private file, so the hint
-// carries a placeholder path and the console never shows a cookie value.
-const SESSION_FILE = "<session-file>";
 
 function RuleSection({
   title,

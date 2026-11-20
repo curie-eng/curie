@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { readFileSync } from "node:fs";
@@ -146,6 +146,14 @@ describe("WiredMemoryPage layout (#5800)", () => {
     expect(screen.getByText("No rules yet.")).toBeInTheDocument();
   });
 
+  it("treats an author that is not github:<id>:<login> as unknown even with a valid source", async () => {
+    vi.mocked(listMemoryRules).mockResolvedValue(
+      list(rule({ proposed_by: "gitlab:7:someone", source_url: "https://github.com/acme-corp/acme-bot/pull/12" })),
+    );
+    renderPage();
+    expect(await screen.findByRole("link", { name: "the source comment" })).toBeInTheDocument();
+  });
+
   it("falls back to 'the source comment' when the author or the number cannot be parsed", async () => {
     vi.mocked(listMemoryRules).mockResolvedValue(
       list(rule({ proposed_by: "someone", source_url: "https://example.test/comment" })),
@@ -286,7 +294,12 @@ describe("WiredMemoryPage actions (#5800)", () => {
     ["409 stale version", refusal(409, "memory_rules.stale_version"), "This rule changed. The list was refreshed."],
     [
       "409 scope full",
-      refusal(409, "memory_rules.scope_full", "full", 16),
+      refusal(409, "memory_rules.scope_full", "full", 7),
+      `${REPO} already has 7 rules in force. Remove one first.`,
+    ],
+    [
+      "409 scope full without a limit in the refusal uses the list's limit",
+      refusal(409, "memory_rules.scope_full", "full", null),
       `${REPO} already has 16 rules in force. Remove one first.`,
     ],
     ["503 code host", refusal(503, "memory_rules.code_host_unavailable"), "The code host could not be reached. Nothing changed."],
@@ -308,6 +321,61 @@ describe("WiredMemoryPage actions (#5800)", () => {
     expect(screen.getByRole("button", { name: "Dismiss" })).toBeEnabled();
     // Every refusal reloads the list.
     expect(vi.mocked(listMemoryRules).mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("keeps the refusal when the refreshed list no longer shows the rule", async () => {
+    // Another person dismissed the proposal after this page loaded: the accept is
+    // refused as stale, and the reload takes the rule out of Proposed.
+    vi.mocked(listMemoryRules)
+      .mockResolvedValueOnce(list(proposed()))
+      .mockResolvedValue(list({ ...proposed(), state: "rejected", version: 5 }));
+    vi.mocked(acceptMemoryRule).mockRejectedValue(refusal(409, "memory_rules.stale_version"));
+    renderPage();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    expect(await screen.findByText("Nothing waiting for review.")).toBeInTheDocument();
+    expect(screen.getByTestId("memory-rule-refusal")).toHaveTextContent("This rule changed. The list was refreshed.");
+  });
+
+  it("applies only the newest reload when two decisions overlap", async () => {
+    const a = rule({ id: "ra", text: "rule a", version: 1 });
+    const b = rule({ id: "rb", text: "rule b", version: 1 });
+    const acceptedA = { ...a, state: "accepted" as const, version: 2, accepted_by: { principal_id: "p", display_name: "Acme Owner" }, accepted_at: "2026-11-18T10:31:00Z" };
+    const acceptedB = { ...b, state: "accepted" as const, version: 2, accepted_by: { principal_id: "p", display_name: "Acme Owner" }, accepted_at: "2026-11-18T10:32:00Z" };
+    let releaseOlder!: (v: MemoryRules) => void;
+    const older = new Promise<MemoryRules>((resolve) => (releaseOlder = resolve));
+    vi.mocked(listMemoryRules)
+      .mockResolvedValueOnce(list(a, b))
+      .mockReturnValueOnce(older) // the reload after the first decision, read before the second landed
+      .mockResolvedValue(list(acceptedA, acceptedB)); // the reload after the second decision
+    vi.mocked(acceptMemoryRule).mockResolvedValue({ rule: acceptedA, applies_from: "next_ticket" });
+    renderPage();
+
+    const cards = await screen.findAllByTestId("memory-rule");
+    await userEvent.click(within(cards[0]).getByRole("button", { name: "Accept" }));
+    // The other card stays usable while the first decision's reload is pending.
+    expect(within(screen.getAllByTestId("memory-rule")[1]).getByRole("button", { name: "Accept" })).toBeEnabled();
+    await userEvent.click(within(screen.getAllByTestId("memory-rule")[1]).getByRole("button", { name: "Accept" }));
+    await waitFor(() => expect(screen.getAllByText(/Accepted by Acme Owner/)).toHaveLength(2));
+    // The older answer arrives last and must not bring the proposals back.
+    await act(async () => {
+      releaseOlder(list(a, b));
+    });
+    expect(screen.getAllByText(/Accepted by Acme Owner/)).toHaveLength(2);
+    expect(screen.getByText("Nothing waiting for review.")).toBeInTheDocument();
+  });
+
+  it("keeps the Dismissed and Removed notes with the repository they were made in", async () => {
+    const other = rule({ id: "r9", scope_key: "github:github.com:9", scope_label: "acme-corp/other", text: "other repo rule" });
+    vi.mocked(listMemoryRules).mockResolvedValue(list(rule({ id: "ra", text: "first repo rule" }), other));
+    vi.mocked(rejectMemoryRule).mockResolvedValue({ rule: rule({ id: "ra" }), applies_from: "next_ticket" });
+    renderPage();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+    expect(await screen.findByText("Dismissed")).toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByTestId("memory-repository-select"), "github:github.com:9");
+    expect(await screen.findByText("other repo rule")).toBeInTheDocument();
+    expect(screen.queryByText("Dismissed")).toBeNull();
   });
 
   it("409 invalid transition reloads without leaving the page in a busy state", async () => {
@@ -352,6 +420,8 @@ describe("page helpers", () => {
     expect(authorOf("github:6601:octocat")).toBe("octocat");
     expect(authorOf("octocat")).toBeNull();
     expect(authorOf("github:6601:")).toBeNull();
+    expect(authorOf("gitlab:7:someone")).toBeNull();
+    expect(authorOf("a:b:c:d")).toBeNull();
     expect(pullRequestNumberOf("https://github.com/o/r/pull/12#discussion_r5")).toBe("12");
     expect(pullRequestNumberOf("https://gitlab.test/o/r/-/merge_requests/7")).toBe("7");
     expect(pullRequestNumberOf("https://example.test/x")).toBeNull();

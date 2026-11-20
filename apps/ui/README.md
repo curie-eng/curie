@@ -135,7 +135,7 @@ honest `ComingSoon` stub (Usage, Settings).
   Accept, Dismiss and Remove against `POST .../rules/{rule_id}/{accept,reject,remove}`
   (each sends the rule's `version` as `expected_version`, then reloads), refusals
   shown on the rule's card, and the order of authority. Facts sub-tab: the
-  `WiredAgentMemory` panel (`GET/PUT/DELETE /agents/{id}/memory`) that the
+  `WiredAgentMemory` panel (`GET /agents/{id}/memory`, `PUT` and `DELETE /agents/{id}/memory/{index}`) that the
   Observability Memory tab used to carry; edits/deletes take effect at the
   agent's next session boot.
 - Approvals tab (Observability > Approvals): the operator visibility + resolve
@@ -263,8 +263,8 @@ Config reference: `.env.example`.
 
 - Onboarding uses the classic create-agent modal (template picker + skill.md
   editor + Deploy), not the interview wizard (deferred).
-- The Memory page's Facts sub-tab is wired to `GET/PUT/DELETE /agents/{id}/memory`
-  (#869), reusing the `WiredAgentMemory` panel from the agent detail page behind
+- The Memory page's Facts sub-tab is wired to `GET /agents/{id}/memory` and
+  `PUT`/`DELETE /agents/{id}/memory/{index}` (#869), reusing the `WiredAgentMemory` panel from the agent detail page behind
   an agent selector. The ACI (Agent Container Interface) `memory_ref` seam
   stays in the contract.
 

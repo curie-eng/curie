@@ -316,6 +316,14 @@ describe("console/CLI parity registry (#280)", () => {
     }
   });
 
+  it("maps every learned rule action to the cluster memory command", () => {
+    for (const id of ["memory-rules-list", "memory-rule-accept", "memory-rule-dismiss", "memory-rule-remove"]) {
+      const action = WIRED_ACTIONS.find((candidate) => candidate.id === id);
+      expect(action, `missing wired action: ${id}`).toBeDefined();
+      expect(action && "command" in action.mapping ? action.mapping.command : undefined).toBe("cluster.memory");
+    }
+  });
+
   it("records organization sign-in as a console gap tracked by issue 5559", () => {
     const action = WIRED_ACTIONS.find((candidate) => candidate.id === "console-oidc-sign-in");
     expect(action?.label).toBe("Sign in with your organization");

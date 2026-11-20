@@ -144,8 +144,10 @@ test("Memory page shows the design, accepts a proposed rule and removes it again
   // Proposed: one card with every line of the design; In force: empty.
   const card = page.getByTestId("memory-rule");
   await expect(page.getByRole("heading", { name: "Proposed" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Proposed" }).locator("..").getByText("1", { exact: true })).toBeVisible();
   await expect(card).toHaveCount(1);
   await expect(card.getByText("Run the formatter before every commit.")).toBeVisible();
+  await expect(card.getByText("Learned from", { exact: false })).toBeVisible();
   await expect(card.getByRole("link", { name: "octocat's comment on #12" })).toHaveAttribute(
     "href",
     "https://github.com/acme-corp/acme-bot/pull/12",
@@ -181,6 +183,7 @@ test("Memory page shows the design, accepts a proposed rule and removes it again
   // Remove leaves the note and the empty text; the rule stays removed.
   await page.getByRole("button", { name: "Remove", exact: true }).click();
   await expect(page.getByText("Removed", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /undo|restore/i })).toHaveCount(0);
   await expect(page.getByText("No rules yet.")).toBeVisible();
   expect(posts[1]).toEqual({ action: "remove", body: { expected_version: 2 } });
 
@@ -251,5 +254,7 @@ test("Observability no longer has a Memory tab", async ({ page }) => {
   await page.goto("/?api=1");
   await page.getByRole("navigation").getByText("Observability", { exact: true }).click();
   await expect(page.getByRole("button", { name: "Traces", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Memory", exact: true })).toHaveCount(0);
+  // The sidebar's own Memory item stays; only the Observability tabs lost theirs.
+  await expect(page.getByRole("navigation").getByRole("button", { name: "Memory" })).toHaveCount(1);
+  await expect(page.locator(".app-main").getByRole("button", { name: "Memory", exact: true })).toHaveCount(0);
 });
