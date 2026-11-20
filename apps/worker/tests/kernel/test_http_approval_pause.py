@@ -30,9 +30,16 @@ from curie_worker.approvals import (
 from curie_worker.binding import GRANT_ARGUMENTS_ENV, GRANT_TOOL_ENV
 from curie_worker.capacity_wait import WAIT_REPLY_REF_FIELD
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
-from curie_worker.delivery_lease import DeliveryLeaseStore, LeaseLostError
+from curie_worker.delivery_lease import (
+    DeliveryBudget,
+    DeliveryLease,
+    DeliveryLeaseStore,
+    LeaseLostError,
+    unfenced_lease,
+)
 from curie_worker.identity_authority import TurnAuthorityUnavailable
 from curie_worker.kernel import constants, identity
+from curie_worker.kernel.lifecycle import _lease_still_held
 from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
@@ -679,6 +686,46 @@ def test_the_ticket_refusal_notice_leaves_the_relay_to_its_own_settlement(
             await h.kernel._notice_after_refusal(event, TICKET_RETRY_REPLY)
             texts = [text for _, _, text in h.sink.updates]
             assert texts == ([TICKET_RETRY_REPLY] if told else [])
+
+    asyncio.run(run())
+
+
+def _fenced_lease(*, window_s: float, lost: bool = False) -> DeliveryLease:
+    lease = DeliveryLease(
+        stream="s", group="g", entry_id="1-0", owner="owner-a", generation=1,
+        budget=DeliveryBudget(
+            deadline_ms=60_000, anchor_server_ms=0, anchor_monotonic=time.monotonic(),
+        ),
+    )
+    lease.local_deadline_monotonic = time.monotonic() + window_s
+    if lost:
+        lease.lost.set()
+    return lease
+
+
+@pytest.mark.parametrize(
+    ("make_lease", "may_send"),
+    [
+        (lambda: None, True),
+        (unfenced_lease, True),
+        (lambda: _fenced_lease(window_s=60), True),
+        (lambda: _fenced_lease(window_s=60, lost=True), False),
+        (lambda: _fenced_lease(window_s=-1), False),
+    ],
+    ids=["leaseless-caller", "no-lease-store", "fenced-held", "fenced-lost", "fenced-expired"],
+)
+def test_the_ticket_notice_follows_the_kernels_lease_convention(
+    make_lease: Any, may_send: bool,
+) -> None:
+    """ADR 0288 decision 3: the notice is gated exactly as the specs state.
+
+    A fenced lease must be neither lost nor past its confirmed window. A
+    leaseless direct caller and a consumer without a lease store carry no
+    fence, and the kernel already treats each as the delivery's only owner.
+    """
+
+    async def run() -> None:
+        assert _lease_still_held(make_lease()) is may_send
 
     asyncio.run(run())
 

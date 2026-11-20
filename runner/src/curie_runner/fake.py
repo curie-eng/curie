@@ -726,6 +726,9 @@ class FakeModelSession:
         self._refused_ids = set()
         self._pending_refusals = []
         self._denied_ids = set()
+        # A tool's result arrives in the turn that called it, as on the real
+        # CLI, so a name noted for PostToolUse never outlives its turn.
+        self._tool_names = {}
 
     async def interrupt(self) -> None:
         self.interrupts += 1
@@ -789,17 +792,23 @@ class FakeModelSession:
         """Note scripted tool names, and run the PostToolUse hook over their results.
 
         A result whose call this turn refused or denied never ran, so the real
-        CLI runs no PostToolUse hook for it, and neither does this fake. Without
-        an injected hook nothing is noted, and each noted name is dropped when
-        its result arrives, so a long session keeps no state for this.
+        CLI runs no PostToolUse hook for it, and neither does this fake: such a
+        call's name is never noted. Names are forgotten at the next ``query``,
+        so a call a halt or an interrupting denial cut off cannot be observed
+        from a result scripted for a later turn. Without an injected hook
+        nothing is noted, and each noted name is dropped when its result
+        arrives.
         """
 
         if self._post_tool_use_hook is None:
             return
         if isinstance(message, AssistantMessage):
             for block in message.content:
-                if isinstance(block, ToolUseBlock):
-                    self._tool_names[block.id] = block.name
+                if not isinstance(block, ToolUseBlock):
+                    continue
+                if block.id in self._refused_ids or block.id in self._denied_ids:
+                    continue
+                self._tool_names[block.id] = block.name
             return
         if not isinstance(message, UserMessage):
             return

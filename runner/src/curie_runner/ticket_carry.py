@@ -8,14 +8,14 @@ part of it (long repeated runs are the usual casualty). The API then refuses the
 approval and nothing tells the requester why.
 
 This module mitigates that without giving the runner any authority. It
-remembers the well-formed tickets a hosted connector returned
-in this conversation, reading their claims WITHOUT trusting them. When the
-model calls that connector's gated tool with a damaged copy, it puts back the
-ticket the copy was taken from, identified by evidence in the copy itself: a
-damaged copy starts with its source's exact ``cat1.<payload>.`` (the signature
-was damaged) or ends with its exact ``.<signature>`` (the payload was damaged).
-The source must be the one remembered ticket matching the copy this way, must
-name this connector and tool, and must have been issued for exactly the other
+remembers the well-formed tickets a hosted connector returned in this
+conversation, reading their claims WITHOUT trusting them. When the model calls
+that connector's gated tool with a damaged copy, it puts back the unique
+matching ticket that connector returned, found by evidence in the copy itself:
+a damaged copy starts with its source's exact ``cat1.<payload>.`` (the
+signature was damaged) or ends with its exact ``.<signature>`` (the payload was
+damaged). The source must be the one remembered ticket matching the copy this
+way, must name this connector and tool, and must claim exactly the other
 arguments of this call.
 
 The result is the unique remembered string (identical observations count

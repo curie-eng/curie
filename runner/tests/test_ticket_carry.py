@@ -294,6 +294,47 @@ def test_the_session_final_carries_the_exact_ticket_on_the_fake_tier() -> None:
 # --- creation: every case outside the rule leaves the model's call alone -----------
 
 
+@pytest.mark.parametrize("how", ["disallowed", "after-an-interrupting-denial"])
+def test_the_fake_never_observes_a_result_for_a_call_that_never_ran(how: str) -> None:
+    # The real CLI runs PostToolUse only for a call that executed. A call the
+    # fake stopped never ran, so a result scripted for it in a later turn must
+    # not reach the hook either.
+    observed: list[str | None] = []
+
+    async def post(_hook_input: Any, tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        observed.append(tool_use_id)
+        return {}
+
+    stopped = ToolUseBlock(id="x1", name=_PREPARE, input={})
+    options: dict[str, Any]
+    if how == "disallowed":
+        first = [AssistantMessage(content=[stopped], model="m")]
+        options = {"disallowed_tools": [_PREPARE]}
+    else:
+        denied = ToolUseBlock(id="d1", name="mcp__other__deny", input={})
+        first = [AssistantMessage(content=[denied, stopped], model="m")]
+
+        async def deny_first(name: str, _input: Any, _context: Any) -> Any:
+            if name == "mcp__other__deny":
+                return PermissionResultDeny(message="no", interrupt=True)
+            return PermissionResultAllow()
+
+        options = {"can_use_tool": deny_first}
+    result = ToolResultBlock(tool_use_id="x1", content=_reply(_ticket(_ARGS)))
+    later = [UserMessage(content=[result])]
+    scripts = iter([first, later])
+    session = FakeModelSession(lambda: next(scripts), post_tool_use_hook=post, **options)
+
+    async def run() -> None:
+        for text in ("first turn", "second turn"):
+            await session.query(text)
+            async for _ in session.receive_turn():
+                pass
+
+    anyio.run(run)
+    assert observed == []
+
+
 def _held_arguments(gate: ApprovalGate, model_call: dict[str, Any]) -> dict[str, Any] | None:
     _decide(gate, _GATED, model_call)
     return gate.pending_granted_arguments
