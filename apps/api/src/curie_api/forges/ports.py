@@ -129,10 +129,21 @@ class Tracker(Protocol):
         ...
 
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         """Every marking since ``cursor``, plus a cancellation for any ``running``
         issue whose marker is gone, and the cursor to poll from next.
+
+        ``answering`` names the issues whose WorkItem has an outstanding or
+        answered factory question. On each of them every new comment by a
+        person, with or without a mention, is a `Disposition.ANSWER` notice
+        whose ``occurred_at`` is the comment's creation time and whose
+        ``event_id`` identifies the comment; it is never also a mention.
+        Elsewhere only a comment that mentions the factory is a notice.
 
         A listing that cannot be read to its end raises `Unavailable` and
         yields no cursor, so the caller's stored cursor stays where it is.

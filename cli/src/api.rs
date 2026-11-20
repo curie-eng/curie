@@ -1099,6 +1099,140 @@ pub struct MemoryEntry {
     pub provenance: MemoryProvenance,
 }
 
+/// Who accepted, rejected or removed a learned rule (`MemoryRuleDecider`, #5797).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRuleDecider {
+    pub principal_id: uuid::Uuid,
+    #[serde(deserialize_with = "present_or_null")]
+    pub display_name: Option<String>,
+}
+
+/// Where a learned rule applies (`MemoryRuleOut.scope_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRuleScopeKind {
+    Agent,
+    Binding,
+    Repository,
+}
+
+/// A listed learned rule's state (`MemoryRuleOut.state`); the list never
+/// returns candidate, superseded or discarded rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRuleState {
+    Proposed,
+    Accepted,
+    Rejected,
+    Removed,
+}
+
+/// One learned rule (`MemoryRuleOut`). Clocks stay the strings the API sent.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRule {
+    pub id: uuid::Uuid,
+    pub number: i64,
+    pub label: String,
+    pub scope_kind: MemoryRuleScopeKind,
+    pub scope_key: String,
+    pub scope_label: String,
+    pub state: MemoryRuleState,
+    pub text: String,
+    pub reason: String,
+    #[serde(deserialize_with = "present_or_null")]
+    pub source_url: Option<String>,
+    pub proposed_by: String,
+    pub proposed_at: String,
+    #[serde(deserialize_with = "present_or_null")]
+    pub accepted_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub accepted_at: Option<String>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub rejected_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub rejected_at: Option<String>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub removed_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub removed_at: Option<String>,
+    pub version: i64,
+}
+
+/// One scope the rule list covers (`MemoryRuleScopeOut`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRuleScope {
+    pub scope_kind: MemoryRuleScopeKind,
+    pub scope_key: String,
+    pub scope_label: String,
+    pub in_force_count: i64,
+}
+
+/// `GET /agents/{id}/memory/rules` (`MemoryRulesOut`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRules {
+    pub rules: Vec<MemoryRule>,
+    pub scopes: Vec<MemoryRuleScope>,
+    pub in_force_limit: i64,
+}
+
+/// When a decision takes effect (`MemoryRuleDecisionOut.applies_from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum MemoryRuleAppliesFrom {
+    #[serde(rename = "next_ticket")]
+    NextTicket,
+}
+
+/// An accept, reject or remove answer (`MemoryRuleDecisionOut`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRuleChange {
+    pub rule: MemoryRule,
+    pub applies_from: MemoryRuleAppliesFrom,
+}
+
+/// Validate a learned rule list against its API shape; a body that does not
+/// match names the first field that differs.
+pub fn parse_memory_rules(body: serde_json::Value) -> Result<MemoryRules> {
+    parse_memory_rules_body(body, "GET /agents/{id}/memory/rules", "a learned rule list")
+}
+
+/// Validate an accept, reject or remove answer against its API shape.
+pub fn parse_memory_rule_change(body: serde_json::Value) -> Result<MemoryRuleChange> {
+    parse_memory_rules_body(
+        body,
+        "POST /agents/{id}/memory/rules/{rule_id}/<action>",
+        "a learned rule change",
+    )
+}
+
+/// A field the API always sends, `null` when it has no value: `null` decodes
+/// to `None`, and a missing key is refused (serde would otherwise read it as
+/// `None`, since a custom deserializer turns off the implicit default).
+fn present_or_null<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+fn parse_memory_rules_body<T: serde::de::DeserializeOwned>(
+    body: serde_json::Value,
+    operation: &str,
+    resource: &str,
+) -> Result<T> {
+    serde_path_to_error::deserialize(body).map_err(|err| {
+        let path = err.path().to_string();
+        let inner = err.into_inner();
+        anyhow::Error::from(
+            crate::exit::CliError::failure(format!(
+                "{operation} answered with a body that is not {resource} \
+                 (at `{path}`: {inner}); the platform release may not match this CLI"
+            ))
+            .with_fix("use a CLI matching the release"),
+        )
+    })
+}
+
 /// A row from the existing state routes (`StateEntryOut`). The memory command
 /// validates the open value only after selecting a canonical fact key.
 #[derive(Debug, Clone, Deserialize)]
@@ -4702,6 +4836,50 @@ impl ApiClient {
             .context("decoding memory list")
     }
 
+    /// List an agent's learned rules: `GET /agents/{id}/memory/rules`,
+    /// validated against its API shape.
+    pub async fn list_memory_rules(
+        &self,
+        agent_id: &str,
+        state: Option<&str>,
+        scope_key: Option<&str>,
+    ) -> Result<MemoryRules> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(state) = state {
+            query.push(("state", state));
+        }
+        if let Some(scope_key) = scope_key {
+            query.push(("scope_key", scope_key));
+        }
+        let response = self
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/memory/rules", self.base_url))
+                    .query(&query)
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/memory/rules",
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = if status.is_redirection() {
+                String::new()
+            } else {
+                response.text().await.unwrap_or_default()
+            };
+            return Err(memory_rules_refusal(
+                "GET /agents/{id}/memory/rules",
+                status,
+                &body,
+            ));
+        }
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .context("decoding the learned rule list")?;
+        parse_memory_rules(body)
+    }
+
     /// Append an operator-authored memory record: `POST /agents/{id}/memory`.
     pub async fn create_memory(&self, agent_id: &str, content: &str) -> Result<MemoryEntry> {
         let resp = self
@@ -6418,6 +6596,73 @@ fn coding_instructions_refusal(
     .into()
 }
 
+/// A learned rule refusal. The API's `detail` carries `code`, `message` and
+/// `fix`; the error says `<code>: <message>` and its fix is the API's.
+fn memory_rules_refusal(operation: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    use crate::exit::ExitClass::{Failure, Transient};
+
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let detail = value.as_ref().and_then(|value| value.get("detail"));
+    let text = |key: &str| {
+        detail
+            .and_then(|detail| detail.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    if let Some(code) = text("code") {
+        let message = text("message").unwrap_or_else(|| format!("HTTP {status}"));
+        let fix = text("fix").unwrap_or_else(|| "check the request, then retry".to_string());
+        return crate::exit::CliError {
+            message: format!("{code}: {message}"),
+            fix: Some(fix),
+            class: if matches!(status.as_u16(), 502..=504) {
+                Transient
+            } else {
+                Failure
+            },
+        }
+        .into();
+    }
+    let (class, problem, fix) = match status.as_u16() {
+        401 => (
+            Failure,
+            "the platform refused the credential (HTTP 401)".to_string(),
+            ENROLLMENT_SESSION_FIX.to_string(),
+        ),
+        403 => (
+            Failure,
+            "the platform refused the session or request origin (HTTP 403)".to_string(),
+            ENROLLMENT_ORIGIN_FIX.to_string(),
+        ),
+        502..=504 => (
+            Transient,
+            format!("the platform API is temporarily unavailable (HTTP {status})"),
+            "retry once the platform API is available".to_string(),
+        ),
+        _ if status.is_redirection() => (
+            Failure,
+            format!("the endpoint answered {status} with a redirect, which this CLI never follows"),
+            "point --api-url at the platform API's own address".to_string(),
+        ),
+        404 if is_unrouted(status, body) => (
+            Failure,
+            "this platform release does not serve learned rules".to_string(),
+            "upgrade the release, or use a CLI matching it".to_string(),
+        ),
+        _ => (
+            Failure,
+            format!("the platform answered HTTP {status}"),
+            "check the agent, the rule id and the arguments, then retry".to_string(),
+        ),
+    };
+    crate::exit::CliError {
+        message: format!("{operation} failed: {problem}"),
+        fix: Some(fix),
+        class,
+    }
+    .into()
+}
+
 /// The `detail.code` of an owner enrollment refusal, when it is one the
 /// contract defines. Any other body is dropped, never echoed.
 fn allowlisted_enrollment_code(body: &str) -> Option<&'static str> {
@@ -6693,6 +6938,137 @@ impl OwnerApiClient {
             coding_instructions_refusal,
         )
         .await
+    }
+
+    /// The agent `identifier` names (name or id), found with the session cookie.
+    pub async fn find_agent(&self, identifier: &str) -> Result<Agent> {
+        let request = self
+            .http
+            .get(format!("{}/agents", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        let agents: Vec<Agent> = self
+            .exchange(
+                request,
+                "GET /agents",
+                "an agent list",
+                memory_rules_refusal,
+            )
+            .await?;
+        match_agent(agents, identifier).map_err(anyhow::Error::new)
+    }
+
+    /// `GET /agents/{id}/memory/rules` with the session cookie.
+    pub async fn list_memory_rules(
+        &self,
+        agent_id: &str,
+        state: Option<&str>,
+        scope_key: Option<&str>,
+    ) -> Result<MemoryRules> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(state) = state {
+            query.push(("state", state));
+        }
+        if let Some(scope_key) = scope_key {
+            query.push(("scope_key", scope_key));
+        }
+        let request = self
+            .http
+            .get(format!("{}/agents/{agent_id}/memory/rules", self.base_url))
+            .query(&query)
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        let body = self
+            .exchange::<serde_json::Value>(
+                request,
+                "GET /agents/{id}/memory/rules",
+                "the learned rule list",
+                memory_rules_refusal,
+            )
+            .await?;
+        parse_memory_rules(body)
+    }
+
+    /// `POST /agents/{id}/memory/rules/{rule_id}/accept` with the version the
+    /// caller read, the answer validated against its API shape.
+    pub async fn accept_memory_rule(
+        &self,
+        agent_id: &str,
+        rule_id: &str,
+        body: &crate::api_requests::MemoryRuleDecision,
+    ) -> Result<MemoryRuleChange> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/accept",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
+        let answer = self
+            .exchange::<serde_json::Value>(
+                request,
+                "POST /agents/{id}/memory/rules/{rule_id}/accept",
+                "a learned rule change",
+                memory_rules_refusal,
+            )
+            .await?;
+        parse_memory_rule_change(answer)
+    }
+
+    /// `POST /agents/{id}/memory/rules/{rule_id}/reject` with the version the
+    /// caller read, the answer validated against its API shape.
+    pub async fn reject_memory_rule(
+        &self,
+        agent_id: &str,
+        rule_id: &str,
+        body: &crate::api_requests::MemoryRuleDecision,
+    ) -> Result<MemoryRuleChange> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/reject",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
+        let answer = self
+            .exchange::<serde_json::Value>(
+                request,
+                "POST /agents/{id}/memory/rules/{rule_id}/reject",
+                "a learned rule change",
+                memory_rules_refusal,
+            )
+            .await?;
+        parse_memory_rule_change(answer)
+    }
+
+    /// `POST /agents/{id}/memory/rules/{rule_id}/remove` with the version the
+    /// caller read, the answer validated against its API shape.
+    pub async fn remove_memory_rule(
+        &self,
+        agent_id: &str,
+        rule_id: &str,
+        body: &crate::api_requests::MemoryRuleDecision,
+    ) -> Result<MemoryRuleChange> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/remove",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
+        let answer = self
+            .exchange::<serde_json::Value>(
+                request,
+                "POST /agents/{id}/memory/rules/{rule_id}/remove",
+                "a learned rule change",
+                memory_rules_refusal,
+            )
+            .await?;
+        parse_memory_rule_change(answer)
     }
 
     async fn exchange<T: serde::de::DeserializeOwned>(

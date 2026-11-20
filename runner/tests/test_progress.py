@@ -39,6 +39,7 @@ _ROUND_CAPS_REPORT_KEYS = frozenset({"phase", "round", "accepted"})
 TOKEN = "sbx.example-progress-token.signature"
 BUNDLE_PHASES = [
     "read_issue",
+    "investigate",
     "pin_criteria",
     "plan",
     "plan_review",
@@ -86,7 +87,7 @@ class _Recorder:
 # --- the phase declaration ---------------------------------------------------
 
 
-def test_the_dark_factory_bundle_declares_nine_phases_and_three_loops() -> None:
+def test_the_dark_factory_bundle_declares_ten_phases_and_three_loops() -> None:
     declared = load_phase_declaration(BUNDLE)
     assert declared is not None
     assert [phase["id"] for phase in declared["phases"]] == BUNDLE_PHASES
@@ -96,8 +97,9 @@ def test_the_dark_factory_bundle_declares_nine_phases_and_three_loops() -> None:
         ("implement", "wait_ci", 3),
     ]
     assert [(stage["id"], stage["phases"]) for stage in declared["stages"]] == [
-        ("read_issue", ["read_issue", "pin_criteria"]),
-        ("plan", ["plan"]),
+        ("read_issue", ["read_issue"]),
+        ("investigate", ["investigate"]),
+        ("plan", ["pin_criteria", "plan"]),
         ("plan_review", ["plan_review"]),
         ("implement", ["failing_test", "implement"]),
         ("review_diff", ["review_diff"]),

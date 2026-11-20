@@ -354,6 +354,10 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/kill",
     "/agents/{agent_id}/memory",
     "/agents/{agent_id}/memory/guidance",
+    "/agents/{agent_id}/memory/rules",
+    "/agents/{agent_id}/memory/rules/{rule_id}/accept",
+    "/agents/{agent_id}/memory/rules/{rule_id}/reject",
+    "/agents/{agent_id}/memory/rules/{rule_id}/remove",
     "/agents/{agent_id}/memory/{index}",
     "/agents/{agent_id}/memory/{index}/provenance",
     "/agents/{agent_id}/resume",
@@ -566,6 +570,9 @@ _HTTP_OPERATIONS = [
     # Requester coding instructions delivery and acknowledgment (#5592).
     "/v1/internal/work-items/requests/{request_id}/requester-context",
     "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
+    # Learned rules delivery and acknowledgment (#5798).
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context",
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
     # Factory Slack run steering (#5414) and kickoff (#5380).
     "/v1/internal/factory-slack/steer",
     "/v1/internal/factory-slack/kickoff",

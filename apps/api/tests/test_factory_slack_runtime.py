@@ -141,7 +141,7 @@ DECLARATION: dict[str, Any] = {
     ],
     "loops": [{"start": "implement", "review": "review_diff", "cap": 3}],
 }
-# The dark factory bundle's own progress declaration: the card's seven steps.
+# The dark factory bundle's own progress declaration: the card's eight steps.
 STAGED_DECLARATION: dict[str, Any] = json.loads(
     (
         Path(__file__).resolve().parents[3]
@@ -5260,7 +5260,7 @@ def test_progress_card_configured_thread_gets_a_one_line_root_and_the_card_as_fi
 
     The card post is a plain line the first pass replaces, through
     ``chat.update`` on that same ts, with the rendered card: the header, the
-    issue, who started it, the bundle's seven steps and the elapsed time.
+    issue, who started it, the bundle's eight steps and the elapsed time.
     """
 
     number = next(_ISSUES)
@@ -5700,7 +5700,7 @@ def test_progress_card_kickoff_run_edits_its_placeholder_through_to_finished(
     """AC1: a kickoff run that reports every declared phase and opens a pull
     request leaves exactly two bot messages in its thread: the dispatcher's
     placeholder as the first reply, edited into the finished card with the
-    seven steps done and the pull request button, and one ready reply that
+    eight steps done and the pull request button, and one ready reply that
     mentions the sender. Nothing the bot sends carries a phase line, the old
     admitted reply, a run outcome line or a JSON object."""
 
@@ -5758,7 +5758,7 @@ def test_progress_card_kickoff_run_edits_its_placeholder_through_to_finished(
     body = blocks[1]["text"]["text"]
     assert f"Started by <@{person.slack_user}>" in body
     checklist = [line for line in body.splitlines() if line.startswith(":")]
-    assert [line.split(" _")[0] for line in checklist[:7]] == [
+    assert [line.split(" _")[0] for line in checklist[: len(STAGED_DECLARATION["stages"])]] == [
         f":white_check_mark: {stage['label']}" for stage in STAGED_DECLARATION["stages"]
     ]
     assert f":tada: *Done.* Opened pull request #{pull}: Factory change. CI passed." in body

@@ -1,0 +1,1 @@
+{"tool":"mcp__curie__report_progress","input":{"phase":"pin_criteria","note":"{\"command\":\"python3 -m pytest tests/test_calc.py -q\",\"exit_status\":1,\"output\":\"AssertionError: expected 5, got -1\",\"reproduced\":true,\"unsafe_instructions\":\"none\"}"}}

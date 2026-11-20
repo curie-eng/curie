@@ -53,6 +53,7 @@ from curie_internal.turn_queue import to_stream_fields
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
 from curie_runner.issue_read import resolve_issue_read
+from curie_runner.memory_rules_context import MemoryRulesContextGate
 from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
 from curie_runner.requester_context import RequesterContextGate
 from curie_runner.server import create_app as create_runner_app
@@ -230,6 +231,7 @@ def _real_runner_app(
 
     session = FakeModelSession(script_factory=script)
     gate = RequesterContextGate()
+    rules_gate = MemoryRulesContextGate()
     booting = asyncio.Lock()
     app = create_runner_app(
         SessionRunner(
@@ -243,6 +245,7 @@ def _real_runner_app(
             provider_scope=provider_scope,
         ),
         requester_context=gate,
+        memory_rules_context=rules_gate,
     )
 
     @web.middleware
@@ -253,7 +256,8 @@ def _real_runner_app(
                 # The runner process boots after its claim: it reports its
                 # verification preflight when asked to, then reads its
                 # completion contract through the issue read capability in its
-                # environment and serves the requester context of that execution.
+                # environment and serves the requester context and the learned
+                # rules of that execution.
                 env = boot_env() or {}
                 if preflight is not None:
                     workspace, bundle = preflight
@@ -262,6 +266,7 @@ def _real_runner_app(
                     )
                 contract = await bind_completion_contract(resolve_issue_read(env))
                 gate.bind(contract.contract.execution)
+                rules_gate.bind(contract.contract.execution)
         response: web.StreamResponse = await handler(request)
         return response
 
