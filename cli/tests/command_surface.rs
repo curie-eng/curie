@@ -868,10 +868,24 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
         let extra: Vec<_> = cluster.iter().filter(|f| !local.contains(*f)).collect();
         let mut extra: Vec<&str> = extra.iter().map(|f| f.as_str()).collect();
         extra.sort_unstable();
+        let mut expected = vec!["--context", "--namespace", "--release"];
+        if verb == "memory" {
+            // The learned rule flags are cluster only: no session login exists locally (#5797).
+            expected.extend([
+                "--accept",
+                "--expected-version",
+                "--reject",
+                "--remove",
+                "--rule-state",
+                "--rules",
+                "--scope-key",
+                "--session-file",
+            ]);
+        }
+        expected.sort_unstable();
         assert_eq!(
-            extra,
-            ["--context", "--namespace", "--release"],
-            "cluster {verb} should add exactly --context/--namespace/--release"
+            extra, expected,
+            "cluster {verb} should add exactly {expected:?}"
         );
     }
 }

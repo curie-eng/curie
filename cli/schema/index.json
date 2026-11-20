@@ -304,6 +304,12 @@
       "version": "2.2"
     },
     {
+      "result": "MemoryRulesOutput",
+      "kind": "CliOutput",
+      "schema": "memory-rules.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "MessageDryRunOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
