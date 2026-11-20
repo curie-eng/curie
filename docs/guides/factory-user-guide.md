@@ -74,8 +74,9 @@ change. The same flow applies to each [supported pairing](../capabilities.md#wor
    [guided PR review](factory-pr-review.md).
 
 7. **Finish or revise.** Approve the feedback your coding agent proposes.
-   To request a factory revision on GitHub, post it as a plain comment or a
-   submitted review on the pull request; no mention is needed. On GitLab and
+   To request a factory revision on GitHub, post it as a plain comment or as a
+   submitted Comment or Request changes review on the pull request; no mention
+   is needed, and an approving review starts none. On GitLab and
    Bitbucket, mention the factory identity as that provider requires.
    Review the new change head. When satisfied, explicitly ask your agent to
    merge or use your team's merge process. Curie does not merge its own change.

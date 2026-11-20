@@ -30,6 +30,7 @@ import copy
 import json
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -247,6 +248,9 @@ class SlackPost:
     text: str | None
     thread_ts: str | None
     ts: str
+    # time.monotonic() when the recorder received the call, so a scenario judges
+    # a deadline by when Slack was told, not by when the scenario looked.
+    received_at: float = 0.0
 
 
 class SlackRecorder:
@@ -317,6 +321,7 @@ class SlackRecorder:
                     "text": body.get("text"),
                     "thread_ts": body.get("thread_ts"),
                     "ts": body.get("ts") if method == "chat.update" else ts,
+                    "received_at": time.monotonic(),
                 }
             )
         payload: dict[str, Any] = {"ok": True}
@@ -347,6 +352,7 @@ class SlackRecorder:
                 call["text"],
                 call["thread_ts"],
                 str(call["ts"]),
+                float(call["received_at"]),
             )
             for call in calls
             if call["method"] in {"chat.postMessage", "chat.update"}

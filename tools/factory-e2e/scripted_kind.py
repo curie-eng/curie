@@ -1092,7 +1092,14 @@ class ScriptedRun:
                     raise ScriptedScenarioError(f"Slack progress: {exc}") from None
                 time.sleep(2)
                 continue
-            if time.monotonic() > deadline:
+            # Judged by when the recorder received the last call, never by when
+            # this loop happened to look: a slow observation must not fail a
+            # run whose posts were on time, nor pass one whose posts were late.
+            last = max(
+                (p.received_at for p in self.slack.posts() if p.channel == scenario.SLACK_CHANNEL),
+                default=0.0,
+            )
+            if last > deadline:
                 raise ScriptedScenarioError(
                     f"Slack progress settled after {SLACK_PROGRESS_SECONDS} seconds"
                 )

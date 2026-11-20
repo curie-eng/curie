@@ -103,9 +103,11 @@ and [outcome measurement](measuring-factory-outcomes.md).
 
 ## Let the factory propose rules, and accept them
 
-After a merged pull request the factory can propose a one-line rule for the
-repository, such as a convention reviewers corrected. Proposals are off by
-default. Turn them on for the agent:
+The factory can propose a one-line rule for the repository, such as a
+convention reviewers corrected. A proposal exists only if the agent has
+proposals on and a review-driven revision of an open factory pull request
+offers it; merging an ordinary pull request alone creates nothing to accept.
+Proposals are off by default. Turn them on for the agent:
 
 ```bash
 curie cluster overrides dark-factory --memory-rule-proposals on \
@@ -113,10 +115,14 @@ curie cluster overrides dark-factory --memory-rule-proposals on \
   --release "$CURIE_RELEASE"
 ```
 
-The setting takes effect for the next request. A proposed rule does nothing
+The setting takes effect for the next request. While a pull request is open,
+a reviewer's reusable feedback starts a revision, and that revision may
+propose one rule. The rule stays hidden as a candidate until the pull request
+is merged; closing the pull request discards it. A proposed rule does nothing
 until a person accepts it: sign in to the console and open the **Memory** page,
-choose the agent and its repository, and under **Learned rules** accept,
-dismiss or later remove a rule. The person needs a console login linked to a
+choose the agent and its repository, and under **Learned rules** open
+**Proposed** and accept or dismiss the rule. Later you can remove an accepted
+rule. The person needs a console login linked to a
 GitHub account with write access to that repository; the platform
 administrator creates that link (see
 [learned rules](../operations.md#learned-rules)). Each repository holds at most

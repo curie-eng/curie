@@ -7,6 +7,7 @@ kind scenario remains the proof that the product completes an issue.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import fcntl
 import json
 import os
@@ -2475,6 +2476,13 @@ def _publication_run(posts: list[lanes.SlackPost]) -> sk.ScriptedRun:
     return run
 
 
+def test_the_recorder_stamps_each_post_with_its_receive_time() -> None:
+    before = time.monotonic()
+    posts = _slack_run()
+    after = time.monotonic()
+    assert posts and all(before <= post.received_at <= after for post in posts)
+
+
 def test_the_run_records_the_slack_post_counts_in_its_evidence() -> None:
     run = _publication_run(_slack_run())
     run.wait_for_slack_progress()
@@ -2543,29 +2551,61 @@ def test_slack_progress_ignores_an_update_of_the_card_in_another_channel() -> No
         sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
 
 
-def test_a_settled_result_after_the_bound_is_late(monkeypatch: pytest.MonkeyPatch) -> None:
-    run = _publication_run([])
-    snapshots = [[], _slack_run()]
-    run.slack.posts = lambda: snapshots.pop(0)  # type: ignore[union-attr]
-    clock = iter([0.0, 1.0, 181.0])
+def _received_at(posts: list[lanes.SlackPost], seconds: float) -> list[lanes.SlackPost]:
+    """The same posts as the recorder received them ``seconds`` after the final comment."""
+
+    return [dataclasses.replace(post, received_at=seconds) for post in posts]
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch, now: float) -> None:
     monkeypatch.setattr(
-        sk, "time", type("Clock", (), {"monotonic": staticmethod(lambda: next(clock)),
+        sk, "time", type("Clock", (), {"monotonic": staticmethod(lambda: now),
                                        "sleep": staticmethod(lambda _s: None)})
     )
+
+
+def test_a_settled_result_after_the_bound_is_late(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = _publication_run(_received_at(_slack_run(), 181.0))
+    run.final_comment_at = 0.0
+    _clock(monkeypatch, 182.0)
     with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
         run.wait_for_slack_progress()
     assert "slack_posts" not in run.evidence
 
 
+def test_posts_received_on_time_pass_however_late_the_run_looks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorder had everything one second after the final comment; the check ran at 181."""
+
+    run = _publication_run(_received_at(_slack_run(), 1.0))
+    run.final_comment_at = 0.0
+    _clock(monkeypatch, 181.0)
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
+
+
+def test_identical_posts_are_judged_by_their_receive_time_not_the_check_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for received, passes in ((179.0, True), (181.0, False)):
+        run = _publication_run(_received_at(_slack_run(), received))
+        run.final_comment_at = 0.0
+        _clock(monkeypatch, 400.0)
+        if passes:
+            run.wait_for_slack_progress()
+            assert "slack_posts" in run.evidence
+        else:
+            with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+                run.wait_for_slack_progress()
+
+
 def test_the_bound_starts_at_the_final_comment_not_at_the_slack_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run = _publication_run(_slack_run())
+    run = _publication_run(_received_at(_slack_run(), 190.0))
     run.final_comment_at = 0.0
-    monkeypatch.setattr(
-        sk, "time", type("Clock", (), {"monotonic": staticmethod(lambda: 190.0),
-                                       "sleep": staticmethod(lambda _s: None)})
-    )
+    _clock(monkeypatch, 190.0)
     with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
         run.wait_for_slack_progress()
 

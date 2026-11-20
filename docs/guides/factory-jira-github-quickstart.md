@@ -259,8 +259,9 @@ adding a tab-only name test. Jira must store a real mention of the factory
 account's `accountId`; plain text resembling a mention is insufficient. Outside
 an open question, ordinary comments and comment edits do not start work.
 
-On GitHub, an authorized reviewer's plain pull request comment or submitted
-review starts a revision with no mention. It checks the author's repository
+On GitHub, an authorized reviewer's plain pull request comment, or a submitted
+Comment or Request changes review, starts a revision with no mention. An
+approving review starts none. It checks the author's repository
 write access, independently of the Jira start allowlist. Feedback publication requires fresh human approval even when
 initial publication was automatic. See
 [GitHub review feedback](../operations.md#accepting-review-feedback-from-github).

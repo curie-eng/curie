@@ -178,12 +178,20 @@ provide the equivalent provider-specific steps.
    and starts again. It asks at most three rounds per ticket. Edits, bot
    comments and comments older than the question never answer it. On the pull
    request, an authorized reviewer's plain
-   comment starts a revision on GitHub, with no mention. One submitted review
-   is one revision (its body and all its inline comments together), and an
-   approving review starts none unless a comment mentions the factory. Each
+   comment starts a revision on GitHub, with no mention. So does a submitted
+   Comment or Request changes review, and one submitted review is one revision
+   (its body and all its inline comments together). An approving review starts
+   none unless a comment mentions the factory. Each
    pull request allows 10 plain-comment revisions; the factory then posts one
    notice and a mention, such as `@<app-slug>`, is required. A mention always
    works and is not counted. GitLab and Bitbucket still require the mention.
+   To teach the factory a rule it keeps, turn on learned-rule proposals
+   (`curie cluster overrides <agent> --memory-rule-proposals on`), give
+   reusable feedback on an open factory pull request, and merge the revised
+   pull request. A person with write access to the repository, signed in to
+   the console, then opens Memory, Learned rules, Proposed and chooses
+   Accept. The rule applies from the next ticket; see the
+   [admin guide](guides/factory-admin-guide.md#let-the-factory-propose-rules-and-accept-them).
    Outside an open question, a later issue comment must explicitly mention the
    configured App login to start work; ordinary issue comments and edits do
    not. Feedback publication requires a new human approval even where initial
