@@ -592,6 +592,7 @@ export function WiredAgentDetail() {
             agentId={agent.id}
             agentName={agent.name}
             channel={agent.factory_slack_channel ?? null}
+            channels={agent.channels ?? []}
             onSaved={refetch}
           />
         </div>

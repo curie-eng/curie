@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.curietech.ai/cli/factory-progress/v1.json",
   "title": "curie <tier> factory-progress --json",
-  "description": "The agent-facing payload of `curie <tier> factory-progress <agent>`: the dry-run plan, or the Slack channel one agent's factory runs post progress to, as the API stored it. `factory_slack_channel` is null when factory runs post no Slack progress. `changed` is false for an inspect and true when this invocation wrote.",
+  "description": "The agent-facing payload of `curie <tier> factory-progress <agent>`: the dry-run plan, or the Slack channel one agent's factory runs post progress to, as the API stored it. `factory_slack_channel` is the configured progress channel, and null when none is configured. `changed` is false for an inspect and true when this invocation wrote.",
   "$defs": {
     "dryRun": {
       "type": "object",

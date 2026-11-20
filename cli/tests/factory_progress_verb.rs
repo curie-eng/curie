@@ -27,12 +27,29 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
 }
 
-/// One agent as `AgentOut` reads it, with the progress channel as given.
+/// One agent as `AgentOut` reads it, with the progress channel as given and
+/// exactly one Slack binding for [`CHANNEL`].
 fn agent_value(channel: Option<&str>) -> serde_json::Value {
+    agent_value_bound(channel, &["default"])
+}
+
+/// One agent whose Slack bindings for [`CHANNEL`] carry these identities, one
+/// binding per identity. An empty list leaves the agent bound to a different
+/// channel only, so the channel under test has no binding at all.
+fn agent_value_bound(channel: Option<&str>, identities: &[&str]) -> serde_json::Value {
+    let mut channels: Vec<serde_json::Value> = identities
+        .iter()
+        .map(|adapter| serde_json::json!({"kind": "slack", "address": CHANNEL, "adapter": adapter}))
+        .collect();
+    if channels.is_empty() {
+        channels.push(
+            serde_json::json!({"kind": "slack", "address": "C0EXAMPLE9", "adapter": "default"}),
+        );
+    }
     serde_json::json!({
         "id": AGENT_ID,
         "name": AGENT_NAME,
-        "channels": [{"kind": "slack", "address": CHANNEL, "adapter": "default"}],
+        "channels": channels,
         "repo_full_name": null,
         "deploy_notifications": false,
         "behavior_packs": null,
@@ -63,6 +80,15 @@ enum Patch {
 /// The PATCH answer reflects what the body asked to be stored, so the CLI's
 /// report is what the API answered, not what the CLI sent.
 fn api(initial: Option<&'static str>, patch: Patch) -> MockServer {
+    api_bound(initial, patch, &["default"])
+}
+
+/// [`api`] with the agent's Slack binding identities for [`CHANNEL`] chosen.
+fn api_bound(
+    initial: Option<&'static str>,
+    patch: Patch,
+    identities: &'static [&'static str],
+) -> MockServer {
     let stored: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(initial.map(str::to_string)));
     serve(move |req| {
         let (method, path) = (req.method.as_str(), req.path.as_str());
@@ -70,7 +96,8 @@ fn api(initial: Option<&'static str>, patch: Patch) -> MockServer {
         match method {
             "GET" if path == "/agents" => Response::json(
                 200,
-                &serde_json::Value::Array(vec![agent_value(current.as_deref())]).to_string(),
+                &serde_json::Value::Array(vec![agent_value_bound(current.as_deref(), identities)])
+                    .to_string(),
             ),
             "PATCH" if path == format!("/agents/{AGENT_ID}") => match &patch {
                 Patch::Refuse(status, body) => Response::json(*status, body),
@@ -81,7 +108,10 @@ fn api(initial: Option<&'static str>, patch: Patch) -> MockServer {
                         *stored.lock().unwrap() = value.as_str().map(str::to_string);
                     }
                     let now = stored.lock().unwrap().clone();
-                    Response::json(200, &agent_value(now.as_deref()).to_string())
+                    Response::json(
+                        200,
+                        &agent_value_bound(now.as_deref(), identities).to_string(),
+                    )
                 }
             },
             _ => Response::json(405, r#"{"detail":"unexpected request"}"#),
@@ -367,7 +397,7 @@ fn clear_human_line_says_none_after_a_write() {
     assert_eq!(run.code, 0, "{}", run.output());
     assert!(
         run.stdout.contains(&format!(
-            "factory progress channel for {AGENT_NAME} now: none (factory runs post no Slack progress)"
+            "factory progress channel for {AGENT_NAME} now: none (no progress channel configured)"
         )),
         "{}",
         run.output()
@@ -377,12 +407,13 @@ fn clear_human_line_says_none_after_a_write() {
 #[test]
 fn unbound_names_the_exact_surfaces_command_for_the_tier() {
     for tier in TIERS {
-        let server = api(
+        let server = api_bound(
             None,
             Patch::Refuse(
                 409,
                 r#"{"detail":{"code":"factory_slack_channel_unbound"}}"#,
             ),
+            &[],
         );
         let run = run(&tier_args(
             tier,
@@ -427,6 +458,98 @@ fn unbound_names_the_exact_surfaces_command_for_the_tier() {
                 .all(|r| !r.path.contains("/channels")),
             "{tier}: the binding is never created for the operator"
         );
+    }
+}
+
+const UNBOUND_BODY: &str = r#"{"detail":{"code":"factory_slack_channel_unbound"}}"#;
+
+/// Run a set against an agent with these identities and return the output.
+fn unbound_run(tier: &str, identities: &'static [&'static str]) -> Run {
+    let server = api_bound(None, Patch::Refuse(409, UNBOUND_BODY), identities);
+    let run = run(&tier_args(
+        tier,
+        &server.base_url,
+        &["--slack-channel", CHANNEL],
+    ));
+    assert_eq!(run.code, 1, "{tier}: a failure: {}", run.output());
+    assert_eq!(patches(&server).len(), 1, "{tier}: one PATCH only");
+    run
+}
+
+fn unbound_target_sentence(tier: &str) -> &'static str {
+    if tier == "local" {
+        "against the same --api-url as this command"
+    } else {
+        "against the same cluster target (the same --context, --namespace and --release, or --api-url) as this command"
+    }
+}
+
+#[test]
+fn unbound_with_no_matching_binding_says_to_add_one_and_to_reuse_the_target() {
+    for tier in TIERS {
+        let run = unbound_run(tier, &[]);
+        let out = run.output();
+        assert!(
+            out.contains(&format!(
+                "agent {AGENT_NAME} has no Slack binding for channel {CHANNEL}"
+            )),
+            "{tier}: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "curie {tier} surfaces {AGENT_NAME} --add slack={CHANNEL}"
+            )),
+            "{tier}: {out}"
+        );
+        assert!(out.contains(unbound_target_sentence(tier)), "{tier}: {out}");
+    }
+}
+
+#[test]
+fn unbound_with_two_matching_bindings_says_to_remove_the_extra_one() {
+    for tier in TIERS {
+        let run = unbound_run(tier, &["default", "second"]);
+        let out = run.output();
+        assert!(
+            out.contains(&format!(
+                "agent {AGENT_NAME} has 2 Slack bindings for channel {CHANNEL} (one per identity); exactly one is required"
+            )),
+            "{tier}: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "curie {tier} surfaces {AGENT_NAME} --remove slack={CHANNEL} --adapter <identity>"
+            )),
+            "{tier}: {out}"
+        );
+        assert!(
+            !out.contains("--add slack="),
+            "{tier}: two bindings must not be told to add a third: {out}"
+        );
+        assert!(out.contains(unbound_target_sentence(tier)), "{tier}: {out}");
+    }
+}
+
+#[test]
+fn unbound_with_one_matching_binding_still_refused_gets_the_generic_message() {
+    for tier in TIERS {
+        let run = unbound_run(tier, &["default"]);
+        let out = run.output();
+        assert!(
+            out.contains(&format!(
+                "without exactly one Slack binding with an identity for channel {CHANNEL}"
+            )),
+            "{tier}: {out}"
+        );
+        assert!(
+            !out.contains("no Slack binding for channel") && !out.contains("--add slack="),
+            "{tier}: a bound channel is not reported as unbound: {out}"
+        );
+        assert!(
+            out.contains(&format!("curie {tier} surfaces {AGENT_NAME}")),
+            "{tier}: {out}"
+        );
+        assert!(out.contains(unbound_target_sentence(tier)), "{tier}: {out}");
     }
 }
 
@@ -509,7 +632,7 @@ fn status_renders_none_when_the_channel_is_null_or_absent() {
     assert_eq!(human.code, 0, "{}", human.output());
     assert!(
         human.stdout.contains(&format!(
-            "factory progress channel for {AGENT_NAME}: none (factory runs post no Slack progress)"
+            "factory progress channel for {AGENT_NAME}: none (no progress channel configured)"
         )),
         "{}",
         human.output()

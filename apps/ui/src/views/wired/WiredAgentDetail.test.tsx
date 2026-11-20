@@ -490,6 +490,42 @@ describe("WiredAgentDetail — factory progress channel", () => {
     expect(screen.getByTestId("factory-progress-current")).toHaveTextContent("Posting progress to C0EXAMPLE1");
     expect(screen.getByTestId("model-input")).toBeInTheDocument();
   });
+
+  it("passes the agent's Slack bindings so a duplicate-identity 409 says to remove one", async () => {
+    const user = userEvent.setup();
+    // A fresh Response per call: only the progress PATCH gets the real 409 body.
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
+      init?.method === "PATCH"
+        ? new Response(JSON.stringify({ detail: { code: "factory_slack_channel_unbound" } }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          })
+        : new Response("{}", { status: 404, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      vi.mocked(getAgents).mockResolvedValue([
+        {
+          ...AGENT,
+          channels: [
+            { kind: "slack", address: "C0EXAMPLE1", adapter: "default" },
+            { kind: "slack", address: "C0EXAMPLE1", adapter: "second" },
+          ],
+        },
+      ]);
+      renderDetail();
+
+      const input = await screen.findByTestId("factory-progress-input");
+      await user.type(input, "C0EXAMPLE1");
+      await user.click(screen.getByTestId("factory-progress-save"));
+
+      expect(await screen.findByTestId("factory-progress-error")).toHaveTextContent(
+        "This agent has 2 Slack bindings for C0EXAMPLE1",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("WiredAgentDetail — bundle tree (item 4)", () => {

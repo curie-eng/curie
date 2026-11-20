@@ -3671,7 +3671,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Stop posting factory progress to Slack",
+              "help": "Clear the configured progress channel",
               "id": "no_slack_channel",
               "long": "no-slack-channel",
               "positional": false,
@@ -3713,7 +3713,7 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie local surfaces <agent> --add slack=<CHANNEL_ID>`. Binding it is a separate decision because it also makes the agent answer there.",
+          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie local surfaces <agent> --add slack=<CHANNEL_ID>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears only the configured progress channel. A thread that a Slack kickoff started keeps its own progress either way.",
           "name": "factory-progress"
         },
         {
@@ -7423,7 +7423,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Stop posting factory progress to Slack",
+              "help": "Clear the configured progress channel",
               "id": "no_slack_channel",
               "long": "no-slack-channel",
               "positional": false,
@@ -7488,7 +7488,7 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>`. Binding it is a separate decision because it also makes the agent answer there.",
+          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears only the configured progress channel. A thread that a Slack kickoff started keeps its own progress either way.",
           "name": "factory-progress"
         },
         {

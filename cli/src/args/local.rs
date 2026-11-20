@@ -739,13 +739,16 @@ pub(crate) enum LocalAction {
     /// one Slack binding with an identity for the channel; add it first with
     /// `curie local surfaces <agent> --add slack=<CHANNEL_ID>`. Binding it is
     /// a separate decision because it also makes the agent answer there.
+    ///
+    /// `--no-slack-channel` clears only the configured progress channel. A
+    /// thread that a Slack kickoff started keeps its own progress either way.
     FactoryProgress {
         /// Agent name or id.
         agent: String,
         /// Post progress to this Slack channel id (public C..., private G...).
         #[arg(long, value_name = "CHANNEL_ID", conflicts_with = "no_slack_channel")]
         slack_channel: Option<String>,
-        /// Stop posting factory progress to Slack.
+        /// Clear the configured progress channel.
         #[arg(long)]
         no_slack_channel: bool,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]

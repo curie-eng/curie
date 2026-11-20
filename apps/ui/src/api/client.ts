@@ -430,7 +430,7 @@ export const SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE =
 
 /**
  * A failed `factory_slack_channel` write, classified so the console can say what
- * to do next: `unbound` (409, the agent has no Slack binding for that channel),
+ * to do next: `unbound` (409, the agent does not have exactly one Slack binding for that channel),
  * `invalid` (422 pattern failure), or `other`.
  */
 export class FactorySlackChannelError extends ApiError {
@@ -490,7 +490,7 @@ export async function setFactorySlackChannel(
     throw new FactorySlackChannelError(
       resp.status,
       "unbound",
-      `This agent has no Slack binding for ${channel ?? "that channel"}. Add the channel as a surface first, then set it here.`,
+      `This agent needs exactly one Slack binding for ${channel ?? "that channel"}, and it has none or more than one identity there. Add the channel as a surface if it has none, or remove the extra identity if it has several.`,
     );
   }
   if (resp.status === 422 && isPatternFailureBody(body)) {

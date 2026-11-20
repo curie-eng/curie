@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { useEffect } from "react";
 import { WiredAgentFactoryProgress } from "./WiredAgentFactoryProgress";
 import { StoreProvider, useStore } from "../../state/store";
-import type { AgentOut } from "../../api/client";
+import type { AgentOut, ChannelBinding } from "../../api/client";
 
 const UNBOUND_BODY = { detail: { code: "factory_slack_channel_unbound" } };
 const PATTERN_BODY = {
@@ -39,15 +39,17 @@ function Harness({
   channel,
   onSaved,
   env = "prod",
+  channels,
 }: {
   channel: string | null;
   onSaved: () => void;
   env?: "prod" | "dev";
+  channels?: ChannelBinding[];
 }) {
   return (
     <StoreProvider>
       <StoreProbe env={env} />
-      <WiredAgentFactoryProgress agentId="a1" agentName="deal-desk" channel={channel} onSaved={onSaved} />
+      <WiredAgentFactoryProgress agentId="a1" agentName="deal-desk" channel={channel} channels={channels} onSaved={onSaved} />
     </StoreProvider>
   );
 }
@@ -127,38 +129,75 @@ describe("WiredAgentFactoryProgress", () => {
     expect(screen.getByTestId("toast-probe")).toHaveTextContent("Progress channel cleared");
   });
 
-  it("explains an unbound 409 and shows the cluster surfaces command in prod", async () => {
+  const SURFACES_CLUSTER = "Copy command: curie cluster surfaces deal-desk --add slack=C0EXAMPLE1";
+  const SURFACES_LOCAL = "Copy command: curie local surfaces deal-desk --add slack=C0EXAMPLE1";
+
+  async function saveUnbound(props: { env?: "prod" | "dev"; channels?: ChannelBinding[] }) {
     const user = userEvent.setup();
     const onSaved = vi.fn();
     fetchMock.mockResolvedValue(jsonResponse(409, UNBOUND_BODY));
-    render(<Harness channel={null} onSaved={onSaved} env="prod" />);
-
+    render(<Harness channel={null} onSaved={onSaved} {...props} />);
     await user.type(screen.getByTestId("factory-progress-input"), "C0EXAMPLE1");
     await user.click(screen.getByTestId("factory-progress-save"));
-
     const error = await screen.findByTestId("factory-progress-error");
+    expect(onSaved).not.toHaveBeenCalled();
+    return error;
+  }
+
+  it("explains an unbound 409 for either cause when the bindings are unknown", async () => {
+    const error = await saveUnbound({});
+    expect(error).toHaveTextContent(
+      "This agent needs exactly one Slack binding for C0EXAMPLE1, and it has none or more than one identity there. " +
+        "Add the channel as a surface if it has none, or remove the extra identity if it has several.",
+    );
+    expect(error).not.toHaveTextContent("Conflict");
+    expect(screen.getByRole("button", { name: SURFACES_CLUSTER })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: SURFACES_LOCAL })).toBeInTheDocument();
+  });
+
+  it("tells the user to add the surface when no Slack binding matches the channel", async () => {
+    const error = await saveUnbound({
+      channels: [
+        { kind: "slack", address: "C0EXAMPLE9" },
+        { kind: "github", address: "C0EXAMPLE1" },
+      ],
+    });
     expect(error).toHaveTextContent(
       "This agent has no Slack binding for C0EXAMPLE1. Add the channel as a surface first, then set it here.",
     );
-    expect(error).not.toHaveTextContent("Conflict");
-    expect(
-      screen.getByRole("button", { name: "Copy command: curie cluster surfaces deal-desk --add slack=C0EXAMPLE1" }),
-    ).toBeInTheDocument();
-    expect(onSaved).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: SURFACES_CLUSTER })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: SURFACES_LOCAL })).toBeInTheDocument();
   });
 
-  it("shows the local surfaces command in dev", async () => {
-    const user = userEvent.setup();
-    fetchMock.mockResolvedValue(jsonResponse(409, UNBOUND_BODY));
-    render(<Harness channel={null} onSaved={vi.fn()} env="dev" />);
+  it("tells the user to remove the extra identity when two Slack bindings match, with no add hint", async () => {
+    const error = await saveUnbound({
+      channels: [
+        { kind: "slack", address: "C0EXAMPLE1", adapter: "default" },
+        { kind: "slack", address: "C0EXAMPLE1", adapter: "second" },
+      ],
+    });
+    expect(error).toHaveTextContent(
+      "This agent has 2 Slack bindings for C0EXAMPLE1, one per Slack identity, and it needs exactly one. " +
+        "Remove the extra identity, then set it here.",
+    );
+    expect(error).not.toHaveTextContent("Add the channel as a surface");
+    expect(screen.queryByRole("button", { name: SURFACES_CLUSTER })).toBeNull();
+    expect(screen.queryByRole("button", { name: SURFACES_LOCAL })).toBeNull();
+  });
 
-    await user.type(screen.getByTestId("factory-progress-input"), "C0EXAMPLE1");
-    await user.click(screen.getByTestId("factory-progress-save"));
-
-    await screen.findByTestId("factory-progress-error");
-    expect(
-      screen.getByRole("button", { name: "Copy command: curie local surfaces deal-desk --add slack=C0EXAMPLE1" }),
-    ).toBeInTheDocument();
+  it("shows both surfaces commands whatever the console environment", async () => {
+    for (const env of ["prod", "dev"] as const) {
+      fetchMock.mockReset();
+      const { unmount } = render(<Harness channel={null} onSaved={vi.fn()} env={env} />);
+      const user = userEvent.setup();
+      fetchMock.mockResolvedValue(jsonResponse(409, UNBOUND_BODY));
+      await user.type(screen.getByTestId("factory-progress-input"), "C0EXAMPLE1");
+      await user.click(screen.getByTestId("factory-progress-save"));
+      await screen.findByTestId("factory-progress-error");
+      expect(screen.getByRole("button", { name: SURFACES_CLUSTER })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: SURFACES_LOCAL })).toBeInTheDocument();
+      unmount();
+    }
   });
 
   it("renders the format message for a server 422 pattern failure", async () => {
@@ -238,27 +277,47 @@ describe("WiredAgentFactoryProgress", () => {
     expect(sentPatch(1).body).toEqual({ factory_slack_channel: "C0EXAMPLE2" });
   });
 
-  it("offers the set command for the console environment", () => {
-    const { unmount } = render(<Harness channel={null} onSaved={vi.fn()} env="prod" />);
+  it("offers both set commands, labelled, with the stack note", () => {
+    render(<Harness channel={null} onSaved={vi.fn()} />);
     expect(
       screen.getByRole("button", { name: "Copy command: curie cluster factory-progress deal-desk" }),
-    ).toBeInTheDocument();
-    unmount();
-
-    render(<Harness channel={null} onSaved={vi.fn()} env="dev" />);
+    ).toHaveTextContent("cluster");
     expect(
       screen.getByRole("button", { name: "Copy command: curie local factory-progress deal-desk" }),
-    ).toBeInTheDocument();
+    ).toHaveTextContent("local");
+    expect(screen.getByTestId("factory-progress-stack-note")).toHaveTextContent(
+      "Run the one for the stack serving this Console",
+    );
+  });
+
+  it("shows the same commands whether the console toggle is dev or prod", () => {
+    const names = (env: "prod" | "dev") => {
+      const { unmount } = render(<Harness channel={null} onSaved={vi.fn()} env={env} />);
+      const found = screen
+        .getAllByRole("button", { name: /^Copy command:/ })
+        .map((b) => b.getAttribute("aria-label"));
+      unmount();
+      return found;
+    };
+    const prod = names("prod");
+    const dev = names("dev");
+    expect(prod).toEqual([
+      "Copy command: curie cluster factory-progress deal-desk",
+      "Copy command: curie local factory-progress deal-desk",
+    ]);
+    expect(dev).toEqual(prod);
   });
 
   it("includes the typed channel in the set command once it is valid", async () => {
     const user = userEvent.setup();
     render(<Harness channel={null} onSaved={vi.fn()} env="prod" />);
     await user.type(screen.getByTestId("factory-progress-input"), "C0EXAMPLE9");
-    expect(
-      screen.getByRole("button", {
-        name: "Copy command: curie cluster factory-progress deal-desk --slack-channel C0EXAMPLE9",
-      }),
-    ).toBeInTheDocument();
+    for (const stack of ["cluster", "local"]) {
+      expect(
+        screen.getByRole("button", {
+          name: `Copy command: curie ${stack} factory-progress deal-desk --slack-channel C0EXAMPLE9`,
+        }),
+      ).toBeInTheDocument();
+    }
   });
 });

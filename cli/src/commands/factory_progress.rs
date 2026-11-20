@@ -98,7 +98,7 @@ pub fn factory_progress_summary(
     changed: bool,
 ) -> String {
     let verb = if changed { " now" } else { "" };
-    let value = factory_slack_channel.unwrap_or("none (factory runs post no Slack progress)");
+    let value = factory_slack_channel.unwrap_or("none (no progress channel configured)");
     format!("factory progress channel for {agent}{verb}: {value}")
 }
 
@@ -296,7 +296,7 @@ mod tests {
         );
         assert_eq!(
             factory_progress_summary("acme-bot", None, false),
-            "factory progress channel for acme-bot: none (factory runs post no Slack progress)"
+            "factory progress channel for acme-bot: none (no progress channel configured)"
         );
         assert_eq!(
             factory_progress_summary("acme-bot", Some("C0EXAMPLE1"), true),
@@ -304,7 +304,7 @@ mod tests {
         );
         assert_eq!(
             factory_progress_summary("acme-bot", None, true),
-            "factory progress channel for acme-bot now: none (factory runs post no Slack progress)"
+            "factory progress channel for acme-bot now: none (no progress channel configured)"
         );
     }
 }
