@@ -110,11 +110,27 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "investigating-late",
-        [("beat_a/comments/0/created_at", at(4))],
+        [("beat_a/investigating/comment/created_at", at(4))],
         "beat_a",
         "investigating comment came late",
     ),
-    ("no-investigating", [("beat_a/comments/0/body", "Working.")], "beat_a", "no investigating"),
+    (
+        "no-investigating",
+        [("beat_a/investigating/comment/body", "Working.")],
+        "beat_a",
+        "no investigating",
+    ),
+    (
+        # The lead never appeared in any read from label time on: the later
+        # snapshot cannot stand in for it.
+        "investigating-never-observed",
+        [
+            ("beat_a/investigating", None),
+            ("beat_a/comments/0/body", "Investigating this ticket."),
+        ],
+        "beat_a",
+        "no investigating",
+    ),
     (
         "questions-late",
         [("beat_a/comments/1/created_at", at(31))],
@@ -448,7 +464,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "accepted-by-another-principal",
-        [("beat_e/writer_command/output/accepted_by/principal_id", "principal-reader")],
+        [("beat_e/writer_command/output/rule/accepted_by/principal_id", "principal-reader")],
         "beat_e",
         "not accepted by the writer principal",
     ),
@@ -576,7 +592,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "removal-ended-accepted",
-        [("beat_g/remove_command/output/state", "accepted")],
+        [("beat_g/remove_command/output/rule/state", "accepted")],
         "beat_g",
         "did not end removed",
     ),
@@ -654,6 +670,22 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "in force version changed",
     ),
     (
+        # The serving deployment was deactivated: nothing serves afterwards.
+        "no-serving-version-after-the-refused-deploy",
+        [("beat_h/retired_bundle/version_after", None)],
+        "beat_h",
+        "no serving version after",
+    ),
+    (
+        "no-serving-version-before-the-refused-deploy",
+        [
+            ("beat_h/retired_bundle/version_before", None),
+            ("beat_h/retired_bundle/version_after", None),
+        ],
+        "beat_h",
+        "no serving version before",
+    ),
+    (
         "usage-delta-at-the-cap",
         [("usage/samples/8/usage", 60.0)],
         "spend",
@@ -670,7 +702,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     (
         "request-still-active-at-the-60-second-deadline",
         [
-            ("beat_a/quiet_snapshot/requests/0/finished_at", at(7)),
+            ("beat_a/quiet_snapshot/requests/0/terminal_at", at(7)),
             ("beat_a/quiet_snapshot/observed_at", at(7, 10)),
         ],
         "beat_a",
@@ -748,9 +780,9 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
             ("beat_e/rule_before/id", "rule-id-9"),
             ("beat_e/reader_command/rule_id", "rule-id-9"),
             ("beat_e/writer_command/rule_id", "rule-id-9"),
-            ("beat_e/writer_command/output/id", "rule-id-9"),
+            ("beat_e/writer_command/output/rule/id", "rule-id-9"),
             ("beat_g/remove_command/rule_id", "rule-id-9"),
-            ("beat_g/remove_command/output/id", "rule-id-9"),
+            ("beat_g/remove_command/output/rule/id", "rule-id-9"),
         ],
         "beat_e",
         "not the promoted rule",
@@ -769,7 +801,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "writer-accept-changed-another-rule",
-        [("beat_e/writer_command/output/id", "rule-id-9")],
+        [("beat_e/writer_command/output/rule/id", "rule-id-9")],
         "beat_e",
         "changed another rule",
     ),
@@ -781,19 +813,19 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "removal-changed-another-rule",
-        [("beat_g/remove_command/output/id", "rule-id-9")],
+        [("beat_g/remove_command/output/rule/id", "rule-id-9")],
         "beat_g",
         "removal changed another rule",
     ),
     (
         "removal-by-the-reader",
-        [("beat_g/remove_command/output/removed_by/principal_id", "principal-reader")],
+        [("beat_g/remove_command/output/rule/removed_by/principal_id", "principal-reader")],
         "beat_g",
         "not removed by the writer principal",
     ),
     (
         "removal-after-ticket-c-was-labelled",
-        [("beat_g/remove_command/output/removed_at", at(95))],
+        [("beat_g/remove_command/output/rule/removed_at", at(95))],
         "beat_g",
         "after ticket C was labelled",
     ),
@@ -851,6 +883,287 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "spend",
         "not measured at: ['after_c']",
     ),
+    (
+        "request-waiting-after-questions",
+        [("beat_a/quiet_snapshot/requests/0/status", "waiting")],
+        "beat_a",
+        "queued or running",
+    ),
+    (
+        "no-answer-acknowledgment",
+        [("beat_b/ticket_comments/0/body", "Investigating this ticket.\n\nStatus: RUNNING")],
+        "beat_b",
+        "acknowledges the answer",
+    ),
+    (
+        "acknowledgment-older-than-the-answer",
+        [("beat_b/ticket_comments/0/updated_at", at(9))],
+        "beat_b",
+        "acknowledges the answer",
+    ),
+    (
+        "acknowledgment-by-the-writer",
+        [("beat_b/ticket_comments/0/user", {"login": "fixture-writer", "id": 9000001})],
+        "beat_b",
+        "acknowledges the answer",
+    ),
+    (
+        "reply-names-the-old-head",
+        [("beat_c/pull_comments/0/body", lambda s: s.replace("b" * 40, "a" * 40))],
+        "beat_c",
+        "names the revision commit",
+    ),
+    (
+        "reply-older-than-the-review",
+        [
+            ("beat_c/pull_comments/0/created_at", at(29)),
+            ("beat_c/pull_comments/0/updated_at", at(29)),
+        ],
+        "beat_c",
+        "names the revision commit",
+    ),
+    (
+        "revision-head-has-no-check-run",
+        [("beat_c/revision_checks/check_runs/check_runs", [])],
+        "beat_c",
+        "no check run",
+    ),
+    (
+        "revision-check-run-failed",
+        [("beat_c/revision_checks/check_runs/check_runs/0/conclusion", "failure")],
+        "beat_c",
+        "not passing",
+    ),
+    (
+        "revision-check-run-still-running",
+        [
+            ("beat_c/revision_checks/check_runs/check_runs/0/status", "in_progress"),
+            ("beat_c/revision_checks/check_runs/check_runs/0/conclusion", None),
+        ],
+        "beat_c",
+        "not completed",
+    ),
+    (
+        "revision-combined-status-failed",
+        [
+            ("beat_c/revision_checks/status/state", "failure"),
+            ("beat_c/revision_checks/status/total_count", 1),
+        ],
+        "beat_c",
+        "combined status",
+    ),
+    (
+        "checks-read-for-the-old-head",
+        [("beat_c/revision_checks/sha", "a" * 40)],
+        "beat_c",
+        "another commit",
+    ),
+    (
+        "ticket-a-open-after-the-merge",
+        [("beat_d/issue_after_merge/state", "open"), ("beat_d/issue_after_merge/closed_at", None)],
+        "beat_d",
+        "not closed after the merge",
+    ),
+    (
+        "ticket-a-closed-late",
+        [("beat_d/issue_after_merge/closed_at", at(51))],
+        "beat_d",
+        "not closed with the merge",
+    ),
+    (
+        "ticket-a-closed-before-the-merge",
+        [("beat_d/issue_after_merge/closed_at", at(44))],
+        "beat_d",
+        "not closed with the merge",
+    ),
+    (
+        "no-merge-notice-on-ticket-a",
+        [("beat_d/ticket_comments_after_merge/0/body", lambda s: s.split("\n")[0])],
+        "beat_d",
+        "names the merged pull request",
+    ),
+    (
+        "merge-notice-names-another-pull-request",
+        [
+            (
+                "beat_d/ticket_comments_after_merge/0/body",
+                lambda s: s.replace("/pull/12", "/pull/99"),
+            )
+        ],
+        "beat_d",
+        "names the merged pull request",
+    ),
+    (
+        "merge-notice-older-than-the-merge",
+        [("beat_d/ticket_comments_after_merge/0/updated_at", at(44))],
+        "beat_d",
+        "names the merged pull request",
+    ),
+    (
+        "conflicting-float-assert-equal-beside-a-correct-one",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, '        self.assertEqual(convert(1, "C", "De"), 148.5)'],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-float-assert-not-equal-with-an-exponent",
+        [("beat_f/diff_added_lines", lambda ls: [*ls, "        self.assertNotEqual(x, 1e-3)"])],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        # The reviewer's example: the float sits in a variable, beside a valid
+        # assertAlmostEqual(..., places=6) the passing diff already adds.
+        "conflicting-float-assert-equal-through-a-variable",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    "        expected = 33.0",
+                    "        self.assertEqual(actual, expected)",
+                ],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-float-assert-equal-through-a-negative-variable",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, "        low = -1.5e2", "        self.assertNotEqual(low, got)"],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        # The reviewer's example: an exact equality on the fixture converter's
+        # float result, beside the compliant assertAlmostEqual(..., places=6)
+        # the passing diff already adds.
+        "conflicting-assert-equal-on-the-converter-result",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, '        self.assertEqual(convert(0, "c", "de"), 150)'],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-assert-equal-on-the-package-converter",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, '        self.assertEqual(unitconv.convert(0, "c", "de"), 150)'],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-assert-equal-on-an-imported-converter-alias",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    "from unitconv.convert import UnknownUnit, convert as conv",
+                    *ls,
+                    '        self.assertNotEqual(conv(0, "c", "de"), 150)',
+                ],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "deploy-refused-at-the-connector-lock-preflight",
+        [
+            (
+                "beat_h/retired_bundle/output",
+                {
+                    "error": "connectors.yaml declares a runner layer, but connectors.lock.yaml "
+                    "records no runner image for it. Build it before deploying.",
+                    "fix": "run `curie build --plugin-dir retired-bundle` and redeploy",
+                },
+            )
+        ],
+        "beat_h",
+        "deploy refusal is not",
+    ),
+    (
+        # A name bound to the converter's float result, then compared exactly.
+        "conflicting-assert-equal-on-a-name-bound-to-the-converter",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    '        actual = convert(100, "c", "de")',
+                    "        self.assertEqual(actual, 0)",
+                ],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-assert-equal-on-a-name-bound-to-the-package-converter",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    '        actual = unitconv.convert(100, "c", "de")',
+                    "        self.assertEqual(actual, 0)",
+                ],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        # Every check run skipped, with no commit status: nothing executed.
+        "revision-check-runs-all-skipped",
+        [("beat_c/revision_checks/check_runs/check_runs/0/conclusion", "skipped")],
+        "beat_c",
+        "executed with a success conclusion",
+    ),
+    (
+        "revision-check-runs-read-short",
+        [("beat_c/revision_checks/check_runs/total_count", 65)],
+        "beat_c",
+        "read 1 of 65 check runs",
+    ),
+    (
+        "revision-commit-status-not-success",
+        [
+            ("beat_c/revision_checks/status/state", "success"),
+            ("beat_c/revision_checks/status/total_count", 1),
+            ("beat_c/revision_checks/status/statuses", [{"context": "ci", "state": "error"}]),
+        ],
+        "beat_c",
+        "combined status",
+    ),
+    (
+        "conflicting-bare-float-assert",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, "        assert convert(0, 'c', 'de') == 150.0"],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
     *[
         (f"teardown-{key}-unverified", [(f"teardown/{key}", False)], "teardown", key)
         for key in judge.TEARDOWN_KEYS
@@ -882,13 +1195,13 @@ def test_judge_rejects_each_broken_shape(
 @pytest.mark.parametrize(
     "edits",
     [
-        [("beat_a/comments/0/created_at", at(3))],  # exactly the 180 s bound
+        [("beat_a/investigating/comment/created_at", at(3))],  # exactly the 180 s bound
         [("beat_e/reader_command/output/error", "memory_rules.write_access_unverifiable: x")],
         [("beat_e/reader_permission", "read"), ("beat_e/reader_command/elapsed_seconds", 60)],
         [("usage/samples/8/usage", 59.99)],
         [("attempt", 2)],
         [("beat_g/remove_command/elapsed_seconds", 61)],
-        [("beat_a/quiet_snapshot/requests/0/finished_at", at(6))],
+        [("beat_a/quiet_snapshot/requests/0/terminal_at", at(6))],
         [("beat_f/diff_added_lines", ['self.assertAlmostEqual(f(")"), 2, places=6)  # places=7'])],
         [
             (
@@ -905,6 +1218,67 @@ def test_judge_rejects_each_broken_shape(
         ],
         [("beat_c/requests/2/tool_notes", [{"tool": "propose_rule"}])],
         [("beat_f/diff_added_lines", ["self.assertAlmostEqual(f(1), (2.0), places = 6)"])],
+        # Liveness: an integer assertEqual, and floats only in strings and comments.
+        [("beat_f/diff_added_lines", lambda ls: [*ls, "        self.assertEqual(len(rows), 3)"])],
+        # Liveness: assertEqual on a call that is not the fixture converter.
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    '        self.assertEqual(self.convert_label("c"), "C")',
+                    "        self.assertEqual(parser.convert(1), 1)",
+                ],
+            )
+        ],
+        # Liveness: a name bound to a call that is not the converter stays allowed.
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    '        actual = parser.convert(100, "c", "de")',
+                    "        rows = len(actual)",
+                    "        self.assertEqual(rows, 0)",
+                    "        self.assertEqual(actual, 0)",
+                ],
+            )
+        ],
+        # Liveness: a successful check run beside a skipped one.
+        [
+            (
+                "beat_c/revision_checks/check_runs",
+                lambda c: {
+                    "total_count": 2,
+                    "check_runs": [
+                        *c["check_runs"],
+                        {**c["check_runs"][0], "id": 32, "name": "docs", "conclusion": "skipped"},
+                    ],
+                },
+            )
+        ],
+        # Liveness: a name assigned an integer stays allowed.
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    "        expected = 33",
+                    "        self.assertEqual(count, expected)",
+                ],
+            )
+        ],
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, '        self.assertEqual(label, "1.5")  # assertEqual(x, 2.5)'],
+            )
+        ],
+        # Liveness: the acknowledgment as first posted, never edited.
+        [
+            ("beat_b/ticket_comments/0/updated_at", None),
+            ("beat_b/ticket_comments/0/created_at", at(10, 40)),
+        ],
     ],
     ids=[
         "bound-is-inclusive",
@@ -920,12 +1294,122 @@ def test_judge_rejects_each_broken_shape(
         "refusal-code-at-any-depth",
         "tool-note-as-mapping",
         "nested-parens-and-spacing",
+        "integer-assert-equal",
+        "assert-equal-on-another-call",
+        "name-bound-to-another-call",
+        "success-beside-skipped-check-run",
+        "integer-variable-assert-equal",
+        "floats-only-in-strings-and-comments",
+        "acknowledgment-never-edited",
     ],
 )
 def test_judge_still_accepts_the_valid_neighbour_of_each_bound(
     edits: list[tuple[str, Any]],
 ) -> None:
     assert failed_beats(broken(*edits)) == {}
+
+
+def _beat_a_reasons(record: dict[str, Any]) -> tuple[str, ...]:
+    return judge.judge_beat("beat_a", record).reasons
+
+
+def test_question_request_liveness_the_pass_record_passes_beat_a() -> None:
+    # Liveness: ticket A's one request ended completed with cause questions_asked.
+    request = PASSING["beat_a"]["quiet_snapshot"]["requests"][0]
+    assert (request["status"], request["terminal_cause"]) == ("completed", "questions_asked")
+    assert _beat_a_reasons(copy.deepcopy(PASSING)) == ()
+
+
+def test_question_request_history_empty_fails_beat_a() -> None:
+    reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests", [])))
+    assert "the quiet snapshot holds no request of ticket A" in reasons
+
+
+@pytest.mark.parametrize(
+    ("status", "cause"),
+    [("completed", "completed"), ("failed", "execution_deadline"), ("failed", "owner_lost")],
+)
+def test_question_request_that_ended_another_way_fails_beat_a(status: str, cause: str) -> None:
+    reasons = _beat_a_reasons(
+        broken(
+            ("beat_a/quiet_snapshot/requests/0/status", status),
+            ("beat_a/quiet_snapshot/requests/0/terminal_cause", cause),
+        )
+    )
+    assert any("did not end completed with cause questions_asked" in r for r in reasons), reasons
+
+
+def test_question_request_is_the_newest_request_of_ticket_a() -> None:
+    # An earlier request that asked, followed by one that ended another way, fails.
+    first = PASSING["beat_a"]["quiet_snapshot"]["requests"][0]
+    later = {**first, "id": "request-later", "created_at": at(5, 1), "terminal_cause": "completed"}
+    reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests", [first, later])))
+    assert "a request of ticket A started after its question request" in reasons, reasons
+
+
+ASKER = PASSING["beat_a"]["quiet_snapshot"]["requests"][0]["id"]
+
+
+def _asked_by(request_id: str) -> tuple[str, Any]:
+    return ("beat_a/comments/1/body", lambda body: body.replace(ASKER, request_id))
+
+
+def test_question_request_failed_asker_with_a_later_questions_asked_request_fails() -> None:
+    # Counterexample: the marker names a request that failed; a later request
+    # ended completed with questions_asked, so the newest request alone passes.
+    asker = {
+        **PASSING["beat_a"]["quiet_snapshot"]["requests"][0],
+        "status": "failed",
+        "terminal_at": at(4, 50),
+        "terminal_cause": "execution_deadline",
+    }
+    later = {
+        **asker,
+        "id": "00000000-0000-4000-8000-000000000a52",
+        "created_at": at(4, 55),
+        "status": "completed",
+        "terminal_at": at(5, 5),
+        "terminal_cause": judge.QUESTIONS_ASKED,
+    }
+    reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests", [asker, later])))
+    assert any("did not end completed with cause questions_asked" in r for r in reasons), reasons
+
+
+def test_question_request_marker_naming_no_known_request_fails() -> None:
+    reasons = _beat_a_reasons(broken(_asked_by("00000000-0000-4000-8000-0000000000ff")))
+    assert "the questions comment's marker names no request of ticket A" in reasons, reasons
+
+
+def test_question_request_marker_without_a_request_id_fails() -> None:
+    edit = ("beat_a/comments/1/body", lambda body: body.replace(ASKER, "11"))
+    reasons = _beat_a_reasons(broken(edit))
+    assert "the questions comment's marker names no request of ticket A" in reasons, reasons
+
+
+def test_question_request_marker_posted_by_the_product_binds_its_asker() -> None:
+    # Liveness: the GitHub adapter's own marked body naming the asker, which
+    # completed with questions_asked, passes.
+    import uuid
+
+    from curie_api.factory_questions import marker_for
+    from curie_api.forges.github.comments import GitHubMarkedComments
+
+    asker = uuid.UUID("00000000-0000-4000-8000-000000000a53")
+    body = GitHubMarkedComments.embed(marker_for(asker), "1. How many places?")
+    record = broken(
+        ("beat_a/comments/1/body", body),
+        ("beat_a/quiet_snapshot/requests/0/id", str(asker)),
+    )
+    assert _beat_a_reasons(record) == ()
+
+
+def test_terminal_at_old_finished_at_shape_fails_beat_a_with_a_reason() -> None:
+    def old_shape(request: dict[str, Any]) -> dict[str, Any]:
+        kept = {k: v for k, v in request.items() if k not in ("terminal_at", "terminal_cause")}
+        return {**kept, "finished_at": request["terminal_at"]}
+
+    reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests/0", old_shape)))
+    assert reasons == ("a quiet snapshot request lacks ['terminal_at', 'terminal_cause']",)
 
 
 def test_a_missing_or_malformed_section_fails_its_beat_without_raising() -> None:
@@ -952,6 +1436,12 @@ def test_verdict_evidence_is_plain_json() -> None:
     evidence = judge.judge_chain(broken(("attempt", 3))).evidence()
     assert json.loads(json.dumps(evidence)) == evidence
     assert evidence["passed"] is False and evidence["attempt"] == 3
+
+
+def test_answer_received_line_mirrors_the_product() -> None:
+    import curie_api.factory_questions as questions
+
+    assert judge.ANSWER_RECEIVED_LINE == questions.ANSWER_RECEIVED_LINE
 
 
 def test_fixture_texts_equal_the_judges_constants() -> None:

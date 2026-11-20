@@ -35,10 +35,34 @@ are each isolated in one small named constant or parser below, marked
 :data:`TOOL_NOTES_KEY` (#5794, #5796), :data:`RULES_KEY`,
 :func:`refusal_code`, :func:`accepted_rule_of` (#5797), :func:`work_item_rules_of`
 and :data:`LEARNED_RULES_LINE` (#5798), :func:`deploy_refusal_codes` (#5804)
-and :data:`ACTIVE_REQUEST_STATES`. Requests carry ``work_item_id`` and ``finished_at``
-(None while active) so the judge can tie evidence to ticket A's work item and
-read the requests active at the 60 second mark; usage samples are labelled
+and :data:`ACTIVE_REQUEST_STATES`. Requests carry the product's own
+``execution_requests`` keys (the ``request_view`` names): ``work_item_id``,
+``terminal_at`` (None while active) and ``terminal_cause``, so the judge can tie
+evidence to ticket A's work item, read the requests active at the 60 second mark
+and see that the question request ended :data:`QUESTIONS_ASKED`; usage samples are labelled
 :data:`SPEND_SAMPLE_LABELS`; label events use GitHub's timeline shape.
+
+Fields the driver part added to the record, each read as GitHub returns it:
+
+1. ``beat_b["ticket_comments"]``: ticket A's issue comments, read after the pull
+   request opened. One App comment must hold :data:`ANSWER_RECEIVED_LINE` and be
+   created or updated (status comments are edited in place) at or after the
+   answer. ``beat_b["open_pulls"][i]["html_url"]`` is the pull request's URL.
+2. ``beat_c["pull_comments"]``: the pull request's conversation comments. One App
+   comment created or updated at or after the review's ``submitted_at`` must name
+   the revision head ``beat_c["pull_after"]["head"]["sha"]`` in full.
+3. ``beat_c["revision_checks"]``: ``{"sha", "check_runs", "status"}``, the check
+   runs (every page, collected to ``total_count``) and the combined status of
+   that head as GitHub returns them. Green is every check run read, every one
+   ``completed``, at least one with conclusion ``success`` and none with a
+   conclusion other than ``success``, ``skipped`` or ``neutral``; and either no
+   commit status at all or every commit status ``success``.
+4. ``beat_d["issue_after_merge"]`` (ticket A, read after the merge: ``state`` and
+   ``closed_at``) must be closed within :data:`PROMOTION_WITHIN` of the merge, and
+   ``beat_d["ticket_comments_after_merge"]`` must hold an App comment with
+   :data:`MERGED_NOTICE_PREFIX` and the pull request URL.
+5. ``beat_f["diff_added_lines"]`` must add no float assertion other than
+   ``assertAlmostEqual(..., places=6)``: see :func:`float_equality_assertions`.
 """
 
 from __future__ import annotations
@@ -68,8 +92,26 @@ MAX_ATTEMPTS = 2
 # --- Texts the beats name ----------------------------------------------------
 STATUS_COMMENT_PREFIX = "Investigating this ticket."
 QUESTIONS_MARKER = "curie-factory-questions:"
+# The questions comment's marker as the GitHub adapter posts it: the asking
+# request's UUID after the prefix (``curie_api.factory_questions.marker_for``),
+# in a hidden HTML comment (``GitHubMarkedComments.embed``); a test pins both.
+QUESTIONS_MARKER_LINE = re.compile(
+    "<!-- "
+    + re.escape(QUESTIONS_MARKER)
+    + r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) -->"
+)
 QUESTIONS_LABEL = "curie-factory:questions"
 ANSWERED_PREFIX = "Answered on the ticket by "
+# Mirror of curie_api.factory_questions.ANSWER_RECEIVED_LINE (a test pins equality):
+# the first line of the status comment of a request an answer started.
+ANSWER_RECEIVED_LINE = "Answer received. The factory is working on this ticket again."
+# Mirror of the line curie_api.factory_notices writes once the pull request merged.
+MERGED_NOTICE_PREFIX = "Pull request merged: "
+# Check run conclusions (GitHub REST check runs): ``success`` is green; a run
+# ``skipped`` or ``neutral`` did not execute a check, so it neither satisfies
+# nor fails the head; every other conclusion fails it.
+PASSING_CONCLUSION = "success"
+NEUTRAL_CONCLUSIONS = frozenset({"skipped", "neutral"})
 LEARNED_PREFIX = "Learned rules:"
 REQUESTER_PREFIX = "Requester preferences:"
 # Fixture texts, equal to the files under fixtures/live-github-chain/ (a test
@@ -99,8 +141,15 @@ READER_REFUSAL_CODES = frozenset(
 )
 # ASSUMED (#5804 decision 3): the stable bundle refusal code.
 BUNDLE_RETIRED_CODE = "bundle.result_declaration_retired"
-# ASSUMED: request states that mean a run is queued or in progress.
-ACTIVE_REQUEST_STATES = frozenset({"queued", "running"})
+# Request states that mean a run is queued or in progress: the live states of
+# ``execution_requests_status_ck`` (models.py); ``waiting`` is queued on capacity.
+ACTIVE_REQUEST_STATES = frozenset({"queued", "waiting", "running", "cancellation_requested"})
+# Mirror of curie_api.factory_questions.QUESTIONS_ASKED (a test pins equality):
+# the terminal cause of a ``completed`` request that posted questions.
+QUESTIONS_ASKED = "questions_asked"
+# The keys of one request record the judge reads, each a column of
+# ``execution_requests`` and a key of ``request_view`` (a test pins both).
+REQUEST_KEYS = ("id", "work_item_id", "status", "created_at", "terminal_at", "terminal_cause")
 UNBOUND_LABEL_PREFIX = "factory-unbound-"
 # One model usage sample before beat (a) and one after each beat (decision 8).
 SPEND_SAMPLE_LABELS = ("before_a", *(f"after_{beat}" for beat in "abcdefgh"))
@@ -213,7 +262,12 @@ def review_url(repository_url: str, pull_number: Any, review_id: Any) -> str:
 
 
 def request_tool_names(request: Mapping[str, Any]) -> list[str]:
-    """ASSUMED (#5796): the tool names of a request's recorded tool notes."""
+    """The tool names a request's turns recorded in the thread transcript.
+
+    The driver reads them from the stored transcript of the work item's thread
+    (``live_github_chain.request_tool_calls``); a stored rule proposal row is
+    no record of the call.
+    """
 
     names = []
     for note in request.get(TOOL_NOTES_KEY) or []:
@@ -244,9 +298,14 @@ def refusal_code(output: Mapping[str, Any]) -> str:
 
 
 def accepted_rule_of(output: Mapping[str, Any]) -> Mapping[str, Any]:
-    """ASSUMED (#5797): the action's JSON is the changed rule item (plus ``applies_from``)."""
+    """The changed rule of an accept, reject or remove's JSON.
 
-    return output
+    #5852 (``cli/src/commands/memory_rules.rs``) prints the API's
+    ``MemoryRuleDecisionOut``: ``{"rule": {...}, "applies_from": "next_ticket"}``.
+    """
+
+    rule: Mapping[str, Any] = output["rule"]
+    return rule
 
 
 def principal_of(actor: Mapping[str, Any] | None) -> str:
@@ -262,8 +321,19 @@ def work_item_rules_of(work_item: Mapping[str, Any]) -> Mapping[str, Any]:
     return rules
 
 
+_BUNDLE_CODE = re.compile(r"(?<![\w.])bundle\.[a-z][a-z0-9_]*(?![\w.])")
+
+
 def deploy_refusal_codes(output: Any) -> set[str]:
-    """ASSUMED (#5804 decision 3): every ``code`` of a deploy refusal's JSON, at any depth."""
+    """Every refusal code of a deploy's ``--json`` output, at any depth.
+
+    ASSUMED (#5804 decision 3) for the code itself. The CLI renders an API
+    refusal of the bundle upload inside the ``error`` string of its
+    ``{"error", "fix"}`` envelope (``cli/src/api.rs`` ``expect_ok``:
+    ``"{what} failed with {status}: {body}"``; ``cli/src/exit.rs``
+    ``error_json``), so a ``bundle.<code>`` inside any string value counts too,
+    as does a ``code`` key of structured output.
+    """
 
     codes: set[str] = set()
     if isinstance(output, Mapping):
@@ -274,6 +344,8 @@ def deploy_refusal_codes(output: Any) -> set[str]:
     elif isinstance(output, list):
         for value in output:
             codes |= deploy_refusal_codes(value)
+    elif isinstance(output, str):
+        codes |= set(_BUNDLE_CODE.findall(output))
     return codes
 
 
@@ -340,6 +412,216 @@ _IGNORED_TOKENS = {
     tokenize.DEDENT,
     tokenize.ENDMARKER,
 }
+_NON_CODE_TOKENS = _IGNORED_TOKENS - {tokenize.NEWLINE}
+
+
+_EQUALITY_ASSERTS = frozenset({"assertEqual", "assertEquals", "assertNotEqual"})
+
+
+def _is_float_literal(token: tokenize.TokenInfo) -> bool:
+    if token.type != tokenize.NUMBER:
+        return False
+    text = token.string.lower()
+    return not text.startswith(("0x", "0o", "0b")) and ("." in text or "e" in text)
+
+
+def _call_arguments(tokens: Sequence[tokenize.TokenInfo]) -> list[tokenize.TokenInfo]:
+    """The tokens inside the parentheses that open at ``tokens[0]``, nested ones included."""
+
+    depth = 0
+    inside: list[tokenize.TokenInfo] = []
+    for token in tokens:
+        if token.type == tokenize.OP and token.string in {"(", "[", "{"}:
+            depth += 1
+            if depth == 1:
+                continue
+        elif token.type == tokenize.OP and token.string in {")", "]", "}"}:
+            depth -= 1
+            if depth == 0:
+                break
+        inside.append(token)
+    return inside
+
+
+def float_equality_assertions(added_text: str) -> list[str]:
+    """Each added float assertion that is not ``assertAlmostEqual``, as its call name.
+
+    An ``assertEqual(``, ``assertEquals(`` or ``assertNotEqual(`` call with a float
+    literal among its arguments (a number with a ``.`` or an exponent), and a bare
+    ``assert`` statement comparing with ``==`` or ``!=`` to a float literal, break
+    the review rule. So does such a call or statement naming a variable the added
+    code assigns a float literal (``expected = 33.0``, a unary minus included)
+    or a converter call (``actual = convert(100, "c", "de")``), or calling the
+    fixture's converter, which returns a float (``convert(0, "c", "de")``,
+    ``unitconv.convert(...)`` or a name imported from it). Comments and strings
+    never count.
+    """
+
+    # NEWLINE is kept: it ends a bare ``assert`` statement.
+    tokens = [t for t in _code_tokens(added_text) if t.type not in _NON_CODE_TOKENS]
+    functions, modules = _converter_names(tokens)
+
+    def converter_call(argument: Sequence[tokenize.TokenInfo], i: int) -> bool:
+        return _is_converter_call(argument, i, functions, modules)
+
+    float_names = _float_assigned_names(tokens) | _converter_assigned_names(tokens, converter_call)
+
+    def floaty(argument: Sequence[tokenize.TokenInfo]) -> bool:
+        return any(
+            _is_float_literal(t)
+            or (
+                t.type == tokenize.NAME
+                and t.string in float_names
+                and not (i and argument[i - 1].string == ".")
+            )
+            or (t.type == tokenize.NAME and converter_call(argument, i))
+            for i, t in enumerate(argument)
+        )
+
+    found: list[str] = []
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME:
+            continue
+        if token.string in _EQUALITY_ASSERTS:
+            following = tokens[index + 1 : index + 2]
+            if not following or following[0].string != "(":
+                continue
+            if index and tokens[index - 1].string == "def":
+                continue
+            if floaty(_call_arguments(tokens[index + 1 :])):
+                found.append(token.string)
+        elif token.string == "assert":
+            statement: list[tokenize.TokenInfo] = []
+            for inner in tokens[index + 1 :]:
+                if inner.type == tokenize.NEWLINE:
+                    break
+                statement.append(inner)
+            compares = any(t.type == tokenize.OP and t.string in {"==", "!="} for t in statement)
+            if compares and floaty(statement):
+                found.append("assert")
+    return found
+
+
+def _float_assigned_names(tokens: Sequence[tokenize.TokenInfo]) -> set[str]:
+    """Names a statement of the added code assigns a float literal: ``x = 33.0``, ``x = -1e3``."""
+
+    names: set[str] = set()
+    for index, token in enumerate(tokens):
+        starts = (
+            index == 0
+            or tokens[index - 1].type == tokenize.NEWLINE
+            or (tokens[index - 1].string == ";")
+        )
+        if token.type != tokenize.NAME or not starts:
+            continue
+        rest = [t.string for t in tokens[index + 1 : index + 2]]
+        if rest != ["="]:
+            continue
+        value = list(tokens[index + 2 : index + 4])
+        if value and value[0].type == tokenize.OP and value[0].string in {"-", "+"}:
+            value = value[1:] + list(tokens[index + 4 : index + 5])
+        if not value or not _is_float_literal(value[0]):
+            continue
+        after = value[1:2]
+        if (
+            not after
+            or after[0].type in {tokenize.NEWLINE, tokenize.ENDMARKER}
+            or (after[0].string == ";")
+        ):
+            names.add(token.string)
+    return names
+
+
+def _converter_assigned_names(
+    tokens: Sequence[tokenize.TokenInfo],
+    converter_call: Callable[[Sequence[tokenize.TokenInfo], int], bool],
+) -> set[str]:
+    """Names a statement of the added code binds to a converter call.
+
+    ``actual = convert(100, "c", "de")`` and ``actual = unitconv.convert(...)``
+    bind ``actual`` to the converter's float result.
+    """
+
+    names: set[str] = set()
+    for index, token in enumerate(tokens):
+        starts = (
+            index == 0
+            or tokens[index - 1].type == tokenize.NEWLINE
+            or (tokens[index - 1].string == ";")
+        )
+        if token.type != tokenize.NAME or not starts:
+            continue
+        if [t.string for t in tokens[index + 1 : index + 2]] != ["="]:
+            continue
+        value = list(tokens[index + 2 : index + 6])
+        # The callee is the value's first name, or ``module.convert``.
+        dotted = len(value) > 2 and value[1].string == "."
+        if value and value[0].type == tokenize.NAME and converter_call(value, 2 if dotted else 0):
+            names.add(token.string)
+    return names
+
+
+def _is_converter_call(
+    argument: Sequence[tokenize.TokenInfo], i: int, functions: set[str], modules: set[str]
+) -> bool:
+    """Whether ``argument[i]`` opens a call of the fixture converter."""
+
+    if i + 1 >= len(argument) or argument[i + 1].string != "(":
+        return False
+    dotted = i > 0 and argument[i - 1].string == "."
+    if not dotted:
+        return argument[i].string in functions
+    owner = argument[i - 2].string if i > 1 else ""
+    return argument[i].string == CONVERTER_FUNCTION and owner in modules
+
+
+# The fixture's converter (``fixtures/unitconv/unitconv/convert.py``): ``convert``
+# returns a float, so an exact equality on its result is a float assertion.
+CONVERTER_PACKAGE = "unitconv"
+CONVERTER_FUNCTION = "convert"
+
+
+def _converter_names(tokens: Sequence[tokenize.TokenInfo]) -> tuple[set[str], set[str]]:
+    """The names that call the fixture converter, and the names of its modules.
+
+    ``convert`` and the package ``unitconv`` always count; an added
+    ``from unitconv[.convert] import convert [as c]`` adds ``c``, and an added
+    ``import unitconv[.convert] as m`` adds ``m`` as a module.
+    """
+
+    functions = {CONVERTER_FUNCTION}
+    modules = {CONVERTER_PACKAGE, CONVERTER_FUNCTION}
+    strings = [t.string for t in tokens]
+    for index, word in enumerate(strings):
+        if word not in {"from", "import"}:
+            continue
+        if index + 1 >= len(strings) or strings[index + 1] != CONVERTER_PACKAGE:
+            continue
+        end = index + 1
+        while end < len(tokens) and tokens[end].type != tokenize.NEWLINE:
+            end += 1
+        statement = strings[index + 1 : end]
+        if word == "import":
+            if "as" in statement:
+                modules.add(statement[statement.index("as") + 1])
+            continue
+        if "import" not in statement:
+            continue
+        imported = [
+            name
+            for name in statement[statement.index("import") + 1 :]
+            if name not in {"(", ")", ","}
+        ]
+        for at, name in enumerate(imported):
+            if name != CONVERTER_FUNCTION or (at and imported[at - 1] == "as"):
+                continue
+            alias = (
+                imported[at + 2] if at + 2 < len(imported) and imported[at + 1] == "as" else name
+            )
+            # ``from unitconv import convert as c`` may name the module or the function.
+            functions.add(alias)
+            modules.add(alias)
+    return functions, modules
 
 
 def _is_places_six(argument: Sequence[tokenize.TokenInfo]) -> bool:
@@ -372,6 +654,66 @@ def _by_app(item: Mapping[str, Any], ids: Mapping[str, Any]) -> bool:
     return bool(item["user"]["login"] == ids["app_login"])
 
 
+def _touched_at(comment: Mapping[str, Any]) -> datetime:
+    """When a comment last read as it does: ``updated_at`` (edited in place) or ``created_at``."""
+
+    return parse_time(comment.get("updated_at") or comment["created_at"])
+
+
+def _app_comments_since(
+    comments: Sequence[Mapping[str, Any]], ids: Mapping[str, Any], since: Any, text: str
+) -> list[Mapping[str, Any]]:
+    """App comments holding ``text`` that were created or updated at or after ``since``."""
+
+    start = parse_time(since)
+    return [
+        c
+        for c in comments
+        if _by_app(c, ids) and text in str(c["body"]) and _touched_at(c) >= start
+    ]
+
+
+def checks_green(checks: Mapping[str, Any], sha: str) -> list[str]:
+    """Why a head's checks are not green, or nothing when they are.
+
+    ``check_runs`` is the body of ``GET /repos/{r}/commits/{sha}/check-runs``
+    (https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference)
+    and ``status`` the body of ``GET /repos/{r}/commits/{sha}/status``
+    (https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference).
+    """
+
+    reasons: list[str] = []
+    if checks["sha"] != sha:
+        reasons.append("the checks were read for another commit than the revision head")
+    runs = list(checks["check_runs"]["check_runs"])
+    total = checks["check_runs"]["total_count"]
+    if len(runs) != total:
+        reasons.append(f"read {len(runs)} of {total} check runs of the revision head")
+    if not runs:
+        reasons.append("the revision head has no check run")
+    pending = [r["name"] for r in runs if r["status"] != "completed"]
+    if pending:
+        reasons.append(f"check runs not completed on the revision head: {pending}")
+    completed = [r for r in runs if r["status"] == "completed"]
+    failing = [
+        r["name"]
+        for r in completed
+        if r["conclusion"] != PASSING_CONCLUSION and r["conclusion"] not in NEUTRAL_CONCLUSIONS
+    ]
+    if failing:
+        reasons.append(f"check runs not passing on the revision head: {failing}")
+    if not [r for r in completed if r["conclusion"] == PASSING_CONCLUSION]:
+        reasons.append("no check run on the revision head executed with a success conclusion")
+    status = checks["status"]
+    statuses = list(status["statuses"])
+    if status["total_count"] == 0:
+        if statuses:
+            reasons.append("the combined status lists commit statuses but counts none")
+    elif status["state"] != "success" or any(s["state"] != "success" for s in statuses):
+        reasons.append(f"the combined status of the revision head is {status['state']}")
+    return reasons
+
+
 # --- Beats ----------------------------------------------------------------------
 def _judge_preflight(b: _Beat, rec: Mapping[str, Any]) -> None:
     pre = rec["preflight"]
@@ -401,26 +743,45 @@ def _mine(requests: Sequence[Mapping[str, Any]], work_item: str) -> list[Mapping
 
 
 def _active_at(request: Mapping[str, Any], moment: Any) -> bool:
-    """ASSUMED: a request is active from ``created_at`` until ``finished_at`` (None: still)."""
+    """A request is active from ``created_at`` until ``terminal_at`` (None: still)."""
 
     if parse_time(request["created_at"]) > parse_time(moment):
         return False
-    finished = request["finished_at"]
-    return finished is None or parse_time(finished) > parse_time(moment)
+    terminal = request["terminal_at"]
+    return terminal is None or parse_time(terminal) > parse_time(moment)
+
+
+def asking_request_id(body: str) -> str | None:
+    """The UUID of the request the questions comment's marker names, or None."""
+
+    found = QUESTIONS_MARKER_LINE.search(body or "")
+    return found.group(1) if found else None
+
+
+def _request_keys_missing(requests: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The :data:`REQUEST_KEYS` some request record lacks, in order."""
+
+    return [key for key in REQUEST_KEYS if any(key not in r for r in requests)]
 
 
 def _judge_beat_a(b: _Beat, rec: Mapping[str, Any]) -> None:
     a, ids = rec["beat_a"], rec["identities"]
     b.check(rec["agent"]["memory_rule_proposals"] is True, "rule proposals were not turned on")
     label_at = a["labelled_at"]
-    statuses = [
-        c for c in a["comments"] if _by_app(c, ids) and c["body"].startswith(STATUS_COMMENT_PREFIX)
-    ]
-    if b.check(bool(statuses), "no investigating status comment"):
+    # The status comment is edited in place (``factory_notices._sync_comment``),
+    # so its investigating lead is judged from the first read that showed it,
+    # not from the later snapshot, where the body may already be terminal.
+    seen = a["investigating"]
+    lead = seen["comment"] if isinstance(seen, Mapping) else None
+    if b.check(
+        lead is not None and _by_app(lead, ids) and lead["body"].startswith(STATUS_COMMENT_PREFIX),
+        "no investigating status comment was observed",
+    ):
+        assert lead is not None
         b.within(
             "status_seconds",
             label_at,
-            min((c["created_at"] for c in statuses), key=parse_time),
+            lead["created_at"],
             STATUS_COMMENT_WITHIN,
             "the investigating comment came late",
         )
@@ -442,10 +803,30 @@ def _judge_beat_a(b: _Beat, rec: Mapping[str, Any]) -> None:
     )
     b.check(QUESTIONS_LABEL in a["issue_labels"], "the issue lacks the questions label")
     quiet = a["quiet_snapshot"]
+    missing = _request_keys_missing(quiet["requests"])
+    if not b.check(not missing, f"a quiet snapshot request lacks {missing}"):
+        return
     requests = _mine(quiet["requests"], a["work_item_id"])
     b.check(
         len(requests) == len(quiet["requests"]), "the snapshot holds another work item's request"
     )
+    if b.check(bool(requests), "the quiet snapshot holds no request of ticket A"):
+        # The questions comment is bound to the request its marker names.
+        asker_id = asking_request_id(question["body"])
+        askers = [r for r in requests if str(r["id"]) == asker_id]
+        if b.check(len(askers) == 1, "the questions comment's marker names no request of ticket A"):
+            asker = askers[0]
+            b.check(
+                asker["status"] == "completed" and asker["terminal_cause"] == QUESTIONS_ASKED,
+                "ticket A's question request did not end completed with cause questions_asked "
+                f"(it ended {asker['status']} with cause {asker['terminal_cause']})",
+            )
+            later = [
+                r["id"]
+                for r in requests
+                if parse_time(r["created_at"]) > parse_time(asker["created_at"])
+            ]
+            b.check(not later, "a request of ticket A started after its question request")
     deadline = parse_time(question["created_at"]) + timedelta(seconds=QUIET_AFTER_QUESTIONS)
     b.check(
         b.elapsed("quiet_wait_seconds", question["created_at"], quiet["observed_at"])
@@ -503,6 +884,10 @@ def _judge_beat_b(b: _Beat, rec: Mapping[str, Any]) -> None:
         )
     others = [i["number"] for i in beat["issues"] if _by_app(i, ids)]
     b.check(not others, f"the App opened issues: {others}")
+    acks = _app_comments_since(
+        beat["ticket_comments"], ids, answer["created_at"], ANSWER_RECEIVED_LINE
+    )
+    b.check(bool(acks), "no App comment on ticket A acknowledges the answer")
 
 
 def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -587,10 +972,15 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
         "the commit came late",
     )
     b.check(called_propose_rule(request), "the revision trajectory has no propose_rule")
+    replies = _app_comments_since(c["pull_comments"], ids, submitted, now["sha"])
+    b.check(bool(replies), "no App reply on the pull request names the revision commit")
+    for reason in checks_green(c["revision_checks"], now["sha"]):
+        b.check(False, reason)
 
 
 def _judge_beat_d(b: _Beat, rec: Mapping[str, Any]) -> None:
     d, ids = rec["beat_d"], rec["identities"]
+    _judge_merge_closure(b, rec)
     b.check(not rules_of(d["rules_before_merge"]), "a rule is listed before the merge")
     b.check(d["merged_by_id"] == ids["writer_id"], "the pull request was not merged by the writer")
     after = d["rules_after_merge"]
@@ -609,6 +999,26 @@ def _judge_beat_d(b: _Beat, rec: Mapping[str, Any]) -> None:
     b.check(rules[0]["state"] == PROPOSED_STATE, "the rule is not proposed")
     b.check(rules[0]["source_url"] == expected, "the rule source is not the submitted review URL")
     b.check(rules[0]["label"] == RULE_LABEL, f"the rule is not {RULE_LABEL}")
+
+
+def _judge_merge_closure(b: _Beat, rec: Mapping[str, Any]) -> None:
+    """Ticket A closed with the merge and carries the merge notice (decision 7.4)."""
+
+    d, ids = rec["beat_d"], rec["identities"]
+    issue = d["issue_after_merge"]
+    if b.check(issue["state"] == "closed", "ticket A is not closed after the merge"):
+        b.within(
+            "issue_closed_seconds",
+            d["merged_at"],
+            issue["closed_at"],
+            PROMOTION_WITHIN,
+            "ticket A was not closed with the merge",
+        )
+    pull_url = rec["beat_b"]["open_pulls"][0]["html_url"]
+    notices = _app_comments_since(
+        d["ticket_comments_after_merge"], ids, d["merged_at"], MERGED_NOTICE_PREFIX + pull_url
+    )
+    b.check(bool(notices), "no App comment on ticket A names the merged pull request")
 
 
 def _judge_beat_e(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -677,9 +1087,12 @@ def _judge_beat_f(b: _Beat, rec: Mapping[str, Any]) -> None:
             at + 1 < len(all_lines) and all_lines[at + 1].startswith(REQUESTER_PREFIX),
             "the line is not immediately before the Requester preferences line",
         )
-    flags = almost_equal_call_flags(added_text_of(f["diff_added_lines"]))
+    added = added_text_of(f["diff_added_lines"])
+    flags = almost_equal_call_flags(added)
     if b.check(bool(flags), "the diff adds no assertAlmostEqual( call"):
         b.check(all(flags), f"{flags.count(False)} added assertAlmostEqual( calls lack places=6")
+    conflicting = float_equality_assertions(added)
+    b.check(not conflicting, f"the diff adds float assertions without places=6: {conflicting}")
 
 
 def _judge_beat_g(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -750,10 +1163,12 @@ def _judge_beat_h(b: _Beat, rec: Mapping[str, Any]) -> None:
         BUNDLE_RETIRED_CODE in deploy_refusal_codes(deploy["output"]),
         f"the deploy refusal is not {BUNDLE_RETIRED_CODE}",
     )
-    b.check(
-        deploy["version_before"] == deploy["version_after"],
-        "the in force version changed after the refused deploy",
-    )
+    # The serving version is the one the worker boots: the agent's active
+    # deployment, prod first, then the newest (``live_github_chain.serving_version``).
+    before, after = deploy["version_before"], deploy["version_after"]
+    b.check(bool(before), "no serving version before the refused deploy")
+    b.check(bool(after), "no serving version after the refused deploy")
+    b.check(before == after, "the in force version changed after the refused deploy")
 
 
 def _judge_spend(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -833,6 +1248,9 @@ ROLE_PLACEHOLDERS: Mapping[str, str] = {
     "context": "<context>",
     "registry": "<registry>",
     "code-host": "<code-host>",
+    "binary": "<curie-bin>",
+    "cloudflared": "<cloudflared>",
+    "restore-url": "<restore-url>",
 }
 
 
