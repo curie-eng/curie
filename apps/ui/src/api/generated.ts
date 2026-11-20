@@ -941,6 +941,90 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/memory/rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Rules
+         * @description The agent's proposed, accepted, rejected and removed rules, by scope and number.
+         */
+        get: operations["list_rules_agents__agent_id__memory_rules_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept Rule
+         * @description Accept a proposed rule. The decision is recorded now and takes effect at the
+         *     next ticket's admission once admission reads learned rules (#5798); a running
+         *     request keeps the rules it was admitted with.
+         */
+        post: operations["accept_rule_agents__agent_id__memory_rules__rule_id__accept_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reject Rule
+         * @description Reject a proposed rule; it never applies.
+         */
+        post: operations["reject_rule_agents__agent_id__memory_rules__rule_id__reject_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove Rule
+         * @description Remove an accepted rule. The decision is recorded now and takes effect at the
+         *     next ticket's admission once admission reads learned rules (#5798); a running
+         *     request keeps the rules it was admitted with.
+         */
+        post: operations["remove_rule_agents__agent_id__memory_rules__rule_id__remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/memory/{index}": {
         parameters: {
             query?: never;
@@ -5050,6 +5134,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/rule-proposal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Post Rule Proposal
+         * @description Store this execution's one learned rule candidate (#5796, ADR 0287).
+         *
+         *     The capability's request and WorkItem decide everything but the text: the
+         *     agent, the repository scope, the source request, pull request lineage and
+         *     URL, and the proposer (the request's verified requester). The candidate
+         *     stays hidden until the pull request merges. A capability that does not
+         *     name its WorkItem's issue is 409 ``invalid_context``; a request that is
+         *     not an eligible revision is 403 ``rule_proposal_not_eligible``; a second
+         *     proposal of the request is 409 ``rule_already_proposed``; a body that is
+         *     not one JSON object of exactly ``rule`` and ``reason`` strings is 422
+         *     ``invalid_body``; text outside the bounds is 422 ``invalid_text``,
+         *     ``too_large`` or ``reserved_text``. No refusal and no log line carries the
+         *     submitted text.
+         */
+        post: operations["post_rule_proposal_work_items_rule_proposal_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/tracker-result": {
         parameters: {
             query?: never;
@@ -5738,6 +5854,11 @@ export interface components {
             /** Memory */
             memory: boolean;
             /**
+             * Memory Rule Proposals
+             * @default false
+             */
+            memory_rule_proposals?: boolean;
+            /**
              * Memory Writes
              * @default false
              */
@@ -5837,6 +5958,8 @@ export interface components {
             } | null;
             /** Memory */
             memory?: boolean | null;
+            /** Memory Rule Proposals */
+            memory_rule_proposals?: boolean | null;
             /** Memory Writes */
             memory_writes?: boolean | null;
             /** Model */
@@ -8115,6 +8238,8 @@ export interface components {
             execution?: components["schemas"]["ExecutionBindingOut"] | null;
             /** Result Kinds */
             result_kinds: string[];
+            /** Rule Proposal */
+            rule_proposal: boolean;
             /** Session Usd Allowance */
             session_usd_allowance: number | null;
         };
@@ -10206,6 +10331,131 @@ export interface components {
             source_trace_ids?: string[];
         };
         /**
+         * MemoryRuleAuthRefusal
+         * @description A refused credential or console origin: one plain reason string.
+         */
+        MemoryRuleAuthRefusal: {
+            /** Detail */
+            detail: string;
+        };
+        /** MemoryRuleDecider */
+        MemoryRuleDecider: {
+            /** Display Name */
+            display_name: string | null;
+            /**
+             * Principal Id
+             * Format: uuid
+             */
+            principal_id: string;
+        };
+        /**
+         * MemoryRuleDecision
+         * @description The body of an accept, reject or remove: the version the person saw.
+         */
+        MemoryRuleDecision: {
+            /** Expected Version */
+            expected_version: number;
+        };
+        /** MemoryRuleDecisionOut */
+        MemoryRuleDecisionOut: {
+            /**
+             * Applies From
+             * @description The decision is recorded now and takes effect at the next ticket's admission once admission reads learned rules (#5798); a running request keeps the rules it was admitted with.
+             * @constant
+             */
+            applies_from: "next_ticket";
+            rule: components["schemas"]["MemoryRuleOut"];
+        };
+        /** MemoryRuleOut */
+        MemoryRuleOut: {
+            /** Accepted At */
+            accepted_at: string | null;
+            accepted_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Label */
+            label: string;
+            /** Number */
+            number: number;
+            /**
+             * Proposed At
+             * Format: date-time
+             */
+            proposed_at: string;
+            /** Proposed By */
+            proposed_by: string;
+            /** Reason */
+            reason: string;
+            /** Rejected At */
+            rejected_at: string | null;
+            rejected_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /** Removed At */
+            removed_at: string | null;
+            removed_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding" | "repository";
+            /** Scope Label */
+            scope_label: string;
+            /** Source Url */
+            source_url: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "proposed" | "accepted" | "rejected" | "removed";
+            /** Text */
+            text: string;
+            /** Version */
+            version: number;
+        };
+        /**
+         * MemoryRuleRefusal
+         * @description Every coded learned rule refusal, a malformed request's 422 included.
+         */
+        MemoryRuleRefusal: {
+            detail: components["schemas"]["MemoryRuleRefusalDetail"];
+        };
+        /**
+         * MemoryRuleRefusalDetail
+         * @description A coded refusal: ``code`` is ``memory_rules.<name>``.
+         */
+        MemoryRuleRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Current Version */
+            current_version?: number | null;
+            /** Fix */
+            fix: string;
+            /** Limit */
+            limit?: number | null;
+            /** Limit Bytes */
+            limit_bytes?: number | null;
+            /** Message */
+            message: string;
+        };
+        /** MemoryRuleScopeOut */
+        MemoryRuleScopeOut: {
+            /** In Force Count */
+            in_force_count: number;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding" | "repository";
+            /** Scope Label */
+            scope_label: string;
+        };
+        /**
          * MemoryRulesMetadata
          * @description The learned rules pinned at admission (#5798): numbers and digest, never the text.
          */
@@ -10226,6 +10476,15 @@ export interface components {
              * @enum {string}
              */
             state: "absent" | "selected";
+        };
+        /** MemoryRulesOut */
+        MemoryRulesOut: {
+            /** In Force Limit */
+            in_force_limit: number;
+            /** Rules */
+            rules: components["schemas"]["MemoryRuleOut"][];
+            /** Scopes */
+            scopes: components["schemas"]["MemoryRuleScopeOut"][];
         };
         /**
          * MemoryTraceBackOut
@@ -12659,6 +12918,18 @@ export interface components {
             next_owner: "agent" | "human" | "platform" | "unknown";
             /** Verification */
             verification?: components["schemas"]["Verification"][];
+        };
+        /**
+         * RuleProposalOut
+         * @description A stored proposal: a hidden candidate, shown to a person only after the
+         *     pull request merges.
+         */
+        RuleProposalOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "candidate";
         };
         /**
          * RunnerPods
@@ -16491,6 +16762,328 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_rules_agents__agent_id__memory_rules_get: {
+        parameters: {
+            query?: {
+                state?: ("proposed" | "accepted" | "rejected" | "removed") | null;
+                scope_kind?: ("agent" | "binding" | "repository") | null;
+                scope_key?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRulesOut"];
+                };
+            };
+            /** @description No platform key or live console session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description Console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    accept_rule_agents__agent_id__memory_rules__rule_id__accept_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    reject_rule_agents__agent_id__memory_rules__rule_id__reject_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    remove_rule_agents__agent_id__memory_rules__rule_id__remove_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
                 };
             };
         };
@@ -24949,6 +25542,52 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["QuestionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_rule_proposal_work_items_rule_proposal_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Reason
+                     * @description Why the feedback states a general rule, at most 240 UTF-8 bytes.
+                     */
+                    reason: string;
+                    /**
+                     * Rule
+                     * @description The rule, one sentence of at most 240 UTF-8 bytes.
+                     */
+                    rule: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleProposalOut"];
                 };
             };
             /** @description Validation Error */

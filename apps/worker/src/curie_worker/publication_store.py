@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND
 from channel_protocol.reply import ReplyTarget
+from curie_internal.memory_rules import settle_lineage_candidates
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -120,6 +121,7 @@ class PostgresPublicationStore:
         if result_max_attempts <= 0 or reconcile_max_attempts <= 0:
             raise ValueError("publication attempt limits must be positive")
         self._engine = engine
+        self._schema = schema
         self._table = f'"{schema}".publications'
         self._requests = f'"{schema}".execution_requests'
         self._approvals = f'"{schema}".approvals'
@@ -610,6 +612,20 @@ class PostgresPublicationStore:
             "first_parent_sha": first_parent_sha,
         }
         async with self._engine.begin() as connection:
+            # The owning agent row first, the order agent deletion takes, so the
+            # rule settlement below never deadlocks with it
+            # (curie_internal.memory_rules lock order).
+            await connection.execute(
+                text(
+                    f"""
+                    SELECT a.id FROM "{self._schema}".agents a
+                      JOIN {self._lineages} l ON l.agent_id = a.id
+                     WHERE l.id = :lineage_id
+                       FOR KEY SHARE OF a
+                    """
+                ),
+                parameters,
+            )
             publication = (
                 await connection.execute(
                     text(
@@ -671,6 +687,12 @@ class PostgresPublicationStore:
                 )
             ).scalar_one_or_none()
             if updated is not None:
+                # Same transaction as the terminal write (ADR 0287 decision 5,
+                # #5796): the merge promotes the lineage's newest rule
+                # candidate, a close discards them. A replay never reaches here.
+                await settle_lineage_candidates(
+                    connection, lineage_id=lineage_id, terminal_state=state, schema=self._schema
+                )
                 return
             current = (
                 (

@@ -15,6 +15,7 @@ const CRUMB: Record<Nav, string> = {
   agents: "Agents",
   "work-items": "Work items",
   factory: "Factory",
+  memory: "Memory",
   evals: "Evals",
   observability: "Observability",
   versions: "Versions",
@@ -53,6 +54,7 @@ export function Topbar() {
 
   return (
     <div
+      className="app-topbar"
       style={{
         display: "flex",
         alignItems: "center",

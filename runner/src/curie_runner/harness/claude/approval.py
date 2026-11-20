@@ -134,6 +134,7 @@ def build_approval_server(
     attachment_tools: Sequence[SdkMcpTool[Any]] = (),
     tracker_result_tool: SdkMcpTool[Any] | None = None,
     question_tool: SdkMcpTool[Any] | None = None,
+    propose_rule_tool: SdkMcpTool[Any] | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -171,6 +172,9 @@ def build_approval_server(
 
     ``question_tool`` (#5785) is ``ask_questions``, appended only when the API
     answered this execution's contract as implementation.
+
+    ``propose_rule_tool`` (ADR 0287, #5796) is ``propose_rule``, appended only
+    when the API's contract answer offered a rule proposal to a real model.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
@@ -213,6 +217,8 @@ def build_approval_server(
         tools.append(tracker_result_tool)
     if question_tool is not None:
         tools.append(question_tool)
+    if propose_rule_tool is not None:
+        tools.append(propose_rule_tool)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,

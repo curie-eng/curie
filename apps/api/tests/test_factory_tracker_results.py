@@ -1864,6 +1864,7 @@ def test_a_submission_is_delivered_once_and_completes_the_request_without_a_pull
         "completion_contract": "tracker_result",
         "result_kinds": ["findings", "ticket"],
         "session_usd_allowance": 5.0,
+        "rule_proposal": False,
     }
     assert execution["execution_request_id"] == str(triage.request_id)
     assert _request(triage)["model_session_reserved_at"] is not None
@@ -2030,6 +2031,7 @@ def test_an_implementation_capability_gets_its_contract_and_cannot_submit(
         "completion_contract": "implementation",
         "result_kinds": [],
         "session_usd_allowance": None,
+        "rule_proposal": False,
     }
     # Asking again changes nothing for an implementation request.
     assert _contract(triage).status_code == 200
@@ -2095,6 +2097,7 @@ def test_a_publication_recovery_capability_gets_the_recovery_contract(
             "result_kinds": [],
             "session_usd_allowance": None,
             "execution": None,
+            "rule_proposal": False,
         }
     # A CI fix or review turn on the same running recovery request mints an
     # ordinary capability and gets the ordinary workflow contract, bound to

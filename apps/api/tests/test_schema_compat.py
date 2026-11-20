@@ -93,8 +93,9 @@ CONTRACT = "0041"
 # Grant notices require 0183.
 # Factory question rounds require 0184.
 # Learned memory rules require 0185.
-# Run handoffs require 0186.
-APP_SCHEMA_MIN = "0186"
+# The plain feedback cap requires 0186.
+# Run handoffs require 0187.
+APP_SCHEMA_MIN = "0187"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -127,7 +128,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
-    assert HEAD == "0186"
+    assert HEAD == "0187"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -159,6 +160,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0184"] == KIND_EXPAND
     assert kinds["0185"] == KIND_EXPAND
     assert kinds["0186"] == KIND_EXPAND
+    assert kinds["0187"] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
@@ -258,6 +260,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0184",
             "0185",
             "0186",
+            "0187",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -328,8 +331,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0184",
             "0185",
             "0186",
+            "0187",
         }
-    assert current_revision() == "0186"
+    assert current_revision() == "0187"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -456,8 +460,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # Grant notices require 0183.
     # Factory question rounds require 0184.
     # Learned memory rules require 0185.
-    # Run handoffs require 0186.
-    for revision in sorted(known - {"0186"}):
+    # The plain feedback cap requires 0186.
+    # Run handoffs require 0187.
+    for revision in sorted(known - {"0187"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -500,7 +505,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0183", window, known) is False
     assert can_serve("0184", window, known) is False
     assert can_serve("0185", window, known) is False
-    assert can_serve("0186", window, known) is True
+    assert can_serve("0186", window, known) is False
+    assert can_serve("0187", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

@@ -14,6 +14,14 @@ sibling routes of ``/work-items/issue-read`` carry it:
 2. ``/work-items/tracker-result``: the ``submit_tracker_result`` tool posts
    the run's one result proposal there.
 
+The contract answer also says whether this run may propose a learned rule
+(ADR 0287, #5796): ``rule_proposal`` is a permanent field of this parser, read
+as true only when the answer carries exactly JSON ``true``. Absent or any
+other value reads false, so a runner newer than its API mounts nothing and a
+malformed value never blocks the run. True mounts ``propose_rule``
+(`curie_runner.propose_rule`), which posts to the sibling
+``/work-items/rule-proposal``.
+
 The contract is a security boundary, so discovering it fails closed: a route
 that is not the expected sibling, a transport failure after the bounded
 attempts, any non-200 answer, an unparseable or oversized body, an unknown
@@ -62,6 +70,7 @@ _ISSUE_READ_SUFFIX = "/work-items/" + ISSUE_READ_SEGMENT
 _CONTRACT_SEGMENT = "completion-contract"
 _RESULT_SEGMENT = "tracker-result"
 _QUESTIONS_SEGMENT = "questions"
+_RULE_PROPOSAL_SEGMENT = "rule-proposal"
 
 # ``ContractUnavailable.reason`` codes. Fixed strings only.
 REASON_ROUTE_INVALID = "route_invalid"
@@ -143,6 +152,9 @@ class CompletionContract:
     # ADR 0278 (#5592): the execution this process is bound to. Present, it
     # makes the start wait for the worker's requester context envelope.
     execution: ExecutionBinding | None = None
+    # ADR 0287 (#5796): the API offers this run the ``propose_rule`` tool.
+    # A permanent field: later narrowing of the contract keeps it.
+    rule_proposal: bool = False
 
     @property
     def tracker_result(self) -> bool:
@@ -163,6 +175,8 @@ class SiblingUrls:
     tracker_result: str
     # The ``ask_questions`` route (#5785), beside the issue read route.
     questions: str
+    # The ``propose_rule`` route (ADR 0287, #5796), beside the issue read route.
+    rule_proposal: str
 
 
 @dataclass(frozen=True)
@@ -189,6 +203,10 @@ class BoundContract:
     # implementation contract the API answered. Never for a tracker result or
     # a publication recovery.
     question_handler: ResultHandler | None = None
+    # The plain async handler of ``propose_rule`` (ADR 0287, #5796), set only
+    # when the API offered it on an implementation or tracker result contract
+    # and the session is not the fake model. It can sit beside either handler.
+    rule_handler: ResultHandler | None = None
 
 
 def sibling_urls(issue_read_url: str) -> SiblingUrls:
@@ -219,7 +237,12 @@ def sibling_urls(issue_read_url: str) -> SiblingUrls:
     def at(segment: str) -> str:
         return urlunsplit((parts.scheme, parts.netloc, base + segment, "", ""))
 
-    return SiblingUrls(at(_CONTRACT_SEGMENT), at(_RESULT_SEGMENT), at(_QUESTIONS_SEGMENT))
+    return SiblingUrls(
+        at(_CONTRACT_SEGMENT),
+        at(_RESULT_SEGMENT),
+        at(_QUESTIONS_SEGMENT),
+        at(_RULE_PROPOSAL_SEGMENT),
+    )
 
 
 def session_limits(
@@ -309,11 +332,16 @@ def parse_contract(payload: Any) -> CompletionContract:
     if kind == CONTRACT_PUBLICATION_RECOVERY:
         return _parse_publication_recovery(payload)
     execution = _parse_execution(payload.get("execution"))
+    # Exactly JSON true offers the tool; anything else, absent included, is
+    # false and never a contract failure.
+    rule_proposal = payload.get("rule_proposal") is True
     if kind == CONTRACT_IMPLEMENTATION:
         return (
             IMPLEMENTATION
-            if execution is None
-            else CompletionContract(CONTRACT_IMPLEMENTATION, execution=execution)
+            if execution is None and not rule_proposal
+            else CompletionContract(
+                CONTRACT_IMPLEMENTATION, execution=execution, rule_proposal=rule_proposal
+            )
         )
     if kind != CONTRACT_TRACKER_RESULT:
         raise ContractUnavailable(REASON_CONTRACT_UNKNOWN)
@@ -338,16 +366,23 @@ def parse_contract(payload: Any) -> CompletionContract:
         result_kinds=tuple(sorted(kinds)),
         session_usd_allowance=float(allowance),
         execution=execution,
+        rule_proposal=rule_proposal,
     )
 
 
 def _parse_publication_recovery(payload: dict[str, Any]) -> CompletionContract:
     """A publication recovery answer carries nothing else: no execution
-    binding, no result kinds and no allowance. Any of them present is a
-    contract failure, since the API never sends one for this kind."""
+    binding, no result kinds, no allowance and no rule proposal offer. Any of
+    them present is a contract failure, since the API never sends one for
+    this kind. ``rule_proposal: false`` is the API's answer for this kind
+    (#5796) and parses, as an absent or null field does; any other value of
+    it is refused."""
 
     kinds = payload.get("result_kinds")
     if payload.get("execution") is not None or payload.get("session_usd_allowance") is not None:
+        raise ContractUnavailable(REASON_BODY_INVALID)
+    offer = payload.get("rule_proposal")
+    if offer is not None and offer is not False:
         raise ContractUnavailable(REASON_BODY_INVALID)
     if kinds is not None and kinds != []:
         raise ContractUnavailable(REASON_RESULT_KINDS_INVALID)
@@ -454,6 +489,7 @@ async def fetch_completion_contract(
 async def bind_completion_contract(
     issue_read: tuple[str, str] | None,
     *,
+    fake_model: bool = False,
     delay: Delay = anyio.sleep,
     deadline_s: float = CONTRACT_DEADLINE_SECONDS,
 ) -> BoundContract:
@@ -464,6 +500,9 @@ async def bind_completion_contract(
     back with its ``submit_tracker_result`` tool, an implementation contract
     with the ``ask_questions`` tool (#5785), and a publication recovery
     contract with nothing (the process then constructs no model session).
+    An implementation or tracker result contract that offers a rule proposal
+    also comes back with the ``propose_rule`` handler (ADR 0287, #5796),
+    except for the fake model (``fake_model``), which never gets one.
     """
 
     if issue_read is None:
@@ -473,15 +512,28 @@ async def bind_completion_contract(
     contract = await fetch_completion_contract(
         urls.completion_contract, token, delay=delay, deadline_s=deadline_s
     )
+    rule_handler: ResultHandler | None = None
+    if contract.rule_proposal and not fake_model:
+        # Imported here because ``propose_rule`` builds on this module's
+        # shared post and refusal helpers.
+        from .propose_rule import propose_rule_handler
+
+        rule_handler = propose_rule_handler(urls.rule_proposal, token)
     if contract.kind == CONTRACT_IMPLEMENTATION:
         # Imported here because ``question_tool`` builds on this module's
         # shared post and refusal helpers.
         from .question_tool import questions_handler
 
-        return BoundContract(contract, question_handler=questions_handler(urls.questions, token))
+        return BoundContract(
+            contract,
+            question_handler=questions_handler(urls.questions, token),
+            rule_handler=rule_handler,
+        )
     if not contract.tracker_result:
         return BoundContract(contract)
-    return BoundContract(contract, tracker_result_handler(urls.tracker_result, token))
+    return BoundContract(
+        contract, tracker_result_handler(urls.tracker_result, token), rule_handler=rule_handler
+    )
 
 
 # --- The submission tool -------------------------------------------------------

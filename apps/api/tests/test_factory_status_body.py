@@ -624,8 +624,9 @@ BUNDLE_PHASES = (
     Path(__file__).resolve().parents[3] / "examples" / "dark-factory" / "progress" / "phases.json"
 )
 SVG_NS = "{http://www.w3.org/2000/svg}"
-SEVEN_STAGES = [
+BUNDLE_STAGES = [
     ("read_issue", "Reading the issue"),
+    ("investigate", "Investigating the ticket"),
     ("plan", "Planning the change"),
     ("plan_review", "Reviewing the plan"),
     ("implement", "Writing the change"),
@@ -635,6 +636,7 @@ SEVEN_STAGES = [
 ]
 _FULL_RUN = (
     "read_issue",
+    "investigate",
     "pin_criteria",
     "plan",
     "plan_review",
@@ -684,12 +686,12 @@ def _bundle_card(status: str, phases: tuple[str, ...]) -> tuple[PhaseView, str]:
             "running",
             (*_FULL_RUN, "implement"),
             "RUNNING",
-            ["done", "done", "done", "current", "done", "pending", "redo"],
+            ["done", "done", "done", "done", "current", "done", "pending", "redo"],
         ),
-        ("completed", _FULL_RUN, "SUCCEEDED", ["done"] * 7),
+        ("completed", _FULL_RUN, "SUCCEEDED", ["done"] * 8),
     ],
 )
-def test_status_body_embeds_the_card_of_the_seven_bundle_stages(
+def test_status_body_embeds_the_card_of_the_eight_bundle_stages(
     status: str, phases: tuple[str, ...], pill: str, states: list[str]
 ) -> None:
     view, svg = _bundle_card(status, phases)
@@ -704,12 +706,12 @@ def test_status_body_embeds_the_card_of_the_seven_bundle_stages(
 
     root = ET.fromstring(svg)
     groups = [g for g in root.iter(f"{SVG_NS}g") if g.get("data-stage")]
-    assert [g.get("data-stage") for g in groups] == [stage for stage, _label in SEVEN_STAGES]
+    assert [g.get("data-stage") for g in groups] == [stage for stage, _label in BUNDLE_STAGES]
     labels = []
     for group in groups:
         (label,) = [e for e in group if "label" in (e.get("class") or "").split()]
         labels.append(" ".join(part.strip() for part in label.itertext() if part.strip()))
-    assert labels == [label for _stage, label in SEVEN_STAGES]
+    assert labels == [label for _stage, label in BUNDLE_STAGES]
     assert [(g.get("class") or "").split()[-1] for g in groups] == states
     # Wrapped labels and round labels stay above the footer line.
     footer_y = HEIGHT - 16

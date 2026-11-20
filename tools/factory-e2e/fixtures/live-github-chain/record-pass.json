@@ -34,19 +34,33 @@
   "beat_a": {
     "issue_number": 11,
     "labelled_at": "2030-01-01T00:00:00Z",
-    "comments": [
-      {
+    "investigating": {
+      "comment": {
         "id": 1,
         "body": "Investigating this ticket.",
         "created_at": "2030-01-01T00:00:20Z",
         "user": {
           "login": "fixture-app[bot]",
           "id": 9000003
-        }
+        },
+        "updated_at": "2030-01-01T00:00:20Z"
+      },
+      "observed_at": "2030-01-01T00:00:30Z"
+    },
+    "comments": [
+      {
+        "id": 1,
+        "body": "Status: WAITING",
+        "created_at": "2030-01-01T00:00:20Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        },
+        "updated_at": "2030-01-01T00:05:05Z"
       },
       {
         "id": 2,
-        "body": "Before I start, I need one decision.\n\n1. How many decimal places should the CLI print?\n2. Should identity conversions print a unit suffix?\n\ncurie-factory-questions:11",
+        "body": "Before I start, I need one decision.\n\n1. How many decimal places should the CLI print?\n2. Should identity conversions print a unit suffix?\n\n<!-- curie-factory-questions:00000000-0000-4000-8000-000000000a51 -->\n",
         "created_at": "2030-01-01T00:05:00Z",
         "user": {
           "login": "fixture-app[bot]",
@@ -62,11 +76,12 @@
       "observed_at": "2030-01-01T00:06:10Z",
       "requests": [
         {
-          "id": "request-1",
+          "id": "00000000-0000-4000-8000-000000000a51",
           "status": "completed",
           "created_at": "2030-01-01T00:00:25Z",
           "work_item_id": "work-item-a",
-          "finished_at": "2030-01-01T00:05:05Z"
+          "terminal_at": "2030-01-01T00:05:05Z",
+          "terminal_cause": "questions_asked"
         }
       ]
     },
@@ -84,18 +99,20 @@
     },
     "requests": [
       {
-        "id": "request-1",
+        "id": "00000000-0000-4000-8000-000000000a51",
         "status": "completed",
         "created_at": "2030-01-01T00:00:25Z",
         "work_item_id": "work-item-a",
-        "finished_at": "2030-01-01T00:05:05Z"
+        "terminal_at": "2030-01-01T00:05:05Z",
+        "terminal_cause": "questions_asked"
       },
       {
-        "id": "request-2",
+        "id": "00000000-0000-4000-8000-000000000a52",
         "status": "completed",
         "created_at": "2030-01-01T00:10:30Z",
         "work_item_id": "work-item-a",
-        "finished_at": "2030-01-01T00:24:00Z"
+        "terminal_at": "2030-01-01T00:24:00Z",
+        "terminal_cause": "completed"
       }
     ],
     "open_pulls": [
@@ -106,12 +123,35 @@
         "head": {
           "ref": "curie/issue-11",
           "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        }
+        },
+        "html_url": "https://code-host.example.invalid/fixture-owner/fixture-repo/pull/12"
       }
     ],
     "issues": [
       {
         "number": 11,
+        "user": {
+          "login": "fixture-writer",
+          "id": 9000001
+        }
+      }
+    ],
+    "ticket_comments": [
+      {
+        "id": 1,
+        "body": "Answer received. The factory is working on this ticket again.\n\nStatus: RUNNING",
+        "created_at": "2030-01-01T00:00:20Z",
+        "updated_at": "2030-01-01T00:10:40Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        }
+      },
+      {
+        "id": 3,
+        "body": "Show 2 decimal places in the CLI output.",
+        "created_at": "2030-01-01T00:10:00Z",
+        "updated_at": "2030-01-01T00:10:00Z",
         "user": {
           "login": "fixture-writer",
           "id": 9000001
@@ -170,22 +210,24 @@
     },
     "requests": [
       {
-        "id": "request-1",
+        "id": "00000000-0000-4000-8000-000000000a51",
         "created_at": "2030-01-01T00:00:25Z",
         "objective": "",
         "tool_notes": [],
         "work_item_id": "work-item-a",
-        "finished_at": "2030-01-01T00:05:05Z"
+        "terminal_at": "2030-01-01T00:05:05Z",
+        "terminal_cause": "questions_asked"
       },
       {
-        "id": "request-2",
+        "id": "00000000-0000-4000-8000-000000000a52",
         "created_at": "2030-01-01T00:10:30Z",
         "objective": "",
         "tool_notes": [
           "Read"
         ],
         "work_item_id": "work-item-a",
-        "finished_at": "2030-01-01T00:24:00Z"
+        "terminal_at": "2030-01-01T00:24:00Z",
+        "terminal_cause": "completed"
       },
       {
         "id": "96fdb3de-72f5-5142-9f06-1232ff930e96",
@@ -197,7 +239,8 @@
           "mcp__curie__propose_rule"
         ],
         "work_item_id": "work-item-a",
-        "finished_at": "2030-01-01T00:39:00Z"
+        "terminal_at": "2030-01-01T00:39:00Z",
+        "terminal_cause": "completed"
       }
     ],
     "pull_after": {
@@ -210,7 +253,40 @@
     "branches": [
       "main",
       "curie/issue-11"
-    ]
+    ],
+    "pull_comments": [
+      {
+        "id": 21,
+        "body": "The requested revision is pushed to this pull request.\n\nChecks passed on head `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`, observed at 2030-01-01 00:41:00 UTC after the run ended.",
+        "created_at": "2030-01-01T00:40:30Z",
+        "updated_at": "2030-01-01T00:41:00Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        }
+      }
+    ],
+    "revision_checks": {
+      "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "check_runs": {
+        "total_count": 1,
+        "check_runs": [
+          {
+            "id": 31,
+            "name": "test",
+            "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "status": "completed",
+            "conclusion": "success"
+          }
+        ]
+      },
+      "status": {
+        "state": "pending",
+        "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "total_count": 0,
+        "statuses": []
+      }
+    }
   },
   "beat_d": {
     "rules_before_merge": {
@@ -236,7 +312,24 @@
         "in_force_count": 0,
         "in_force_limit": 16
       }
-    }
+    },
+    "issue_after_merge": {
+      "number": 11,
+      "state": "closed",
+      "closed_at": "2030-01-01T00:45:05Z"
+    },
+    "ticket_comments_after_merge": [
+      {
+        "id": 1,
+        "body": "Completed: https://code-host.example.invalid/fixture-owner/fixture-repo/pull/12\nPull request merged: https://code-host.example.invalid/fixture-owner/fixture-repo/pull/12\n",
+        "created_at": "2030-01-01T00:00:20Z",
+        "updated_at": "2030-01-01T00:45:40Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        }
+      }
+    ]
   },
   "beat_e": {
     "reader_permission": "read",
@@ -259,14 +352,16 @@
     "writer_command": {
       "exit_code": 0,
       "output": {
-        "id": "rule-id-1",
-        "label": "R1",
-        "state": "accepted",
-        "accepted_by": {
-          "principal_id": "principal-writer",
-          "display_name": "Fixture Writer"
+        "rule": {
+          "id": "rule-id-1",
+          "label": "R1",
+          "state": "accepted",
+          "accepted_by": {
+            "principal_id": "principal-writer",
+            "display_name": "Fixture Writer"
+          },
+          "version": 2
         },
-        "version": 2,
         "applies_from": "next_ticket"
       },
       "elapsed_seconds": 1.5,
@@ -308,15 +403,18 @@
     "remove_command": {
       "exit_code": 0,
       "output": {
-        "id": "rule-id-1",
-        "label": "R1",
-        "state": "removed",
-        "version": 3,
-        "removed_by": {
-          "principal_id": "principal-writer",
-          "display_name": "Fixture Writer"
+        "rule": {
+          "id": "rule-id-1",
+          "label": "R1",
+          "state": "removed",
+          "version": 3,
+          "removed_by": {
+            "principal_id": "principal-writer",
+            "display_name": "Fixture Writer"
+          },
+          "removed_at": "2030-01-01T01:28:00Z"
         },
-        "removed_at": "2030-01-01T01:28:00Z"
+        "applies_from": "next_ticket"
       },
       "elapsed_seconds": 1.1,
       "rule_id": "rule-id-1"
@@ -363,12 +461,8 @@
     "retired_bundle": {
       "exit_code": 1,
       "output": {
-        "issues": [
-          {
-            "code": "bundle.result_declaration_retired",
-            "location": "workflow/result.json"
-          }
-        ]
+        "error": "uploading the bundle failed with 422 Unprocessable Entity: {\"detail\":{\"code\":\"bundle.result_declaration_retired\",\"message\":\"workflow/result.json is retired; remove it from the bundle\"}}",
+        "fix": null
       },
       "version_before": "v3",
       "version_after": "v3"

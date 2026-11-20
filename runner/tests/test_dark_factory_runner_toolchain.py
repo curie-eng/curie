@@ -219,8 +219,8 @@ def owned_namespace() -> Iterator[toolchain_proof.OwnedNamespace]:
 
 def test_factory_skill_allows_locked_installs_and_reports_service_gaps() -> None:
     skill = SKILL.read_text(encoding="utf-8")
-    step = skill.split("## 6. Implement and check", 1)[1].split(
-        "## 7. Diff review", 1
+    step = skill.split("## 7. Implement and check", 1)[1].split(
+        "## 8. Diff review", 1
     )[0]
     for command in (
         "uv sync --frozen",
@@ -237,8 +237,8 @@ def test_factory_skill_allows_locked_installs_and_reports_service_gaps() -> None
 def test_factory_skill_names_registry_egress_cause_with_guidance() -> None:
     """#3761: an unreachable registry is reported as a named environment cause."""
     skill = SKILL.read_text(encoding="utf-8")
-    step = skill.split("## 6. Implement and check", 1)[1].split(
-        "## 7. Diff review", 1
+    step = skill.split("## 7. Implement and check", 1)[1].split(
+        "## 8. Diff review", 1
     )[0]
     assert "registry_egress_unreachable" in step
     # The probe distinguishes per-address reachability, which is what makes a
@@ -266,7 +266,7 @@ def test_factory_skill_budgets_against_the_reported_deadline() -> None:
             re.search(formula, checkpoint) and re.search(milestone, checkpoint, re.IGNORECASE)
             for checkpoint in checkpoints
         ), (formula, milestone)
-    step = skill.split("## 6. Implement and check", 1)[1].split("## 7. Diff review", 1)[0]
+    step = skill.split("## 7. Implement and check", 1)[1].split("## 8. Diff review", 1)[0]
     probe = next(
         block
         for block in re.findall(r"```bash\n(.*?)\n```", step, re.DOTALL)

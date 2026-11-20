@@ -1289,9 +1289,17 @@
         "0185"
       ],
       "revision": "0186",
-      "sha256": "6b411003f52a01f2dbb439735d52a4476fc521dfa1e79ff77592d73efd4e6016"
+      "sha256": "9d93d898aa176f502cc2dae41b5cd19a216131f20d95af5a9a364e9d1459c794"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "0186"
+      ],
+      "revision": "0187",
+      "sha256": "a3c506be680a88adf4558b2c2fb7ed9e1666080258bd1ea08ab6583f7f39df41"
     }
   ],
-  "schema_head": "0186",
-  "schema_min": "0186"
+  "schema_head": "0187",
+  "schema_min": "0187"
 }

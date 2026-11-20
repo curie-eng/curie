@@ -84,8 +84,9 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # Grant notices require 0183.
     # Factory question rounds require 0184.
     # Learned memory rules require 0185.
-    # Run handoffs require 0186.
-    candidate = {"schema_min": "0186", "schema_head": "0186"}
+    # The plain feedback cap requires 0186.
+    # Run handoffs require 0187.
+    candidate = {"schema_min": "0187", "schema_head": "0187"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -160,6 +161,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0184",
         "0185",
         "0186",
+        "0187",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

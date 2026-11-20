@@ -127,7 +127,8 @@ def graph_payload() -> dict[str, Any]:
         ("0183", False),
         ("0184", False),
         ("0185", False),
-        ("0186", True),
+        ("0186", False),
+        ("0187", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -180,11 +181,12 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     Grant notices require 0183.
     Factory question rounds require 0184.
     Learned memory rules require 0185.
-    Run handoffs require 0186.
+    The plain feedback cap requires 0186.
+    Run handoffs require 0187.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0186"
-    assert window.schema_head == "0186"
+    assert window.schema_min == "0187"
+    assert window.schema_head == "0187"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

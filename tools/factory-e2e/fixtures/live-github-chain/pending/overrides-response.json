@@ -1,0 +1,26 @@
+{
+  "_comment": "Copied from the head of #5857: the result object of cli/schema/overrides.schema.json (required fields) and one output of `curie cluster overrides <agent> --json` in that shape (OverridesOutput::to_json, cli/src/commands/overrides.rs). Refresh when #5857 changes.",
+  "schema_id": "https://schemas.curietech.ai/cli/overrides/v4.json",
+  "required": [
+    "agent",
+    "model",
+    "reviewer_model",
+    "thinking",
+    "memory_writes",
+    "memory_rule_proposals",
+    "changed"
+  ],
+  "output": {
+    "agent": "factory-e2e",
+    "model": null,
+    "reviewer_model": null,
+    "thinking": null,
+    "execution_deadline_seconds": null,
+    "runner_resources": null,
+    "memory_writes": false,
+    "memory_rule_proposals": true,
+    "changed": false
+  },
+  "propose_rule_tool": "propose_rule",
+  "propose_rule_mcp_name": "mcp__curie__propose_rule"
+}

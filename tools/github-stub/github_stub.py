@@ -216,6 +216,8 @@ class GithubStub:
                 " PRIMARY KEY(kind,id)); CREATE TABLE unsupported(request TEXT);"
                 "CREATE TABLE tokens(token TEXT PRIMARY KEY, permissions TEXT);"
                 "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL);"
+                "CREATE TABLE comment_history(comment_id INTEGER NOT NULL, at TEXT NOT NULL,"
+                " body TEXT NOT NULL);"
                 "CREATE TABLE oauth_codes(code_hash TEXT PRIMARY KEY, redirect_uri TEXT NOT NULL);"
                 "CREATE TABLE oauth_tokens(token_hash TEXT PRIMARY KEY);"
                 "CREATE TABLE collaborators(login TEXT PRIMARY KEY, permission TEXT NOT NULL,"
@@ -349,6 +351,35 @@ class GithubStub:
             connection.execute(
                 "INSERT OR REPLACE INTO objects VALUES(?,?,?)", (kind, identifier, json.dumps(body))
             )
+            if kind == "comment":
+                self._remember(connection, body)
+
+    @staticmethod
+    def _remember(connection: sqlite3.Connection, comment: dict[str, Any]) -> None:
+        """Keep each body a comment has held, with the instant it took it.
+
+        The stub stores only a comment's latest body, and a status comment is
+        edited in place, so a line that was visible for a while can be gone by the
+        time a scenario looks. The history is what a scenario reads to place a
+        line in time.
+        """
+
+        connection.execute(
+            "INSERT INTO comment_history VALUES(?,?,?)",
+            (comment["id"], comment.get("updated_at") or comment["created_at"], comment["body"]),
+        )
+
+    def comment_history(self, identifier: int) -> list[dict[str, str]]:
+        """Every body the comment held, oldest first, each with the instant it took it."""
+
+        with sqlite3.connect(self._database) as connection:
+            return [
+                {"at": at, "body": body}
+                for at, body in connection.execute(
+                    "SELECT at, body FROM comment_history WHERE comment_id=? ORDER BY rowid",
+                    (identifier,),
+                )
+            ]
 
     def _insert_new(self, kind: str, build: Callable[[int], dict[str, Any]]) -> dict[str, Any]:
         """Insert one new object, allocating its id under a write lock.
@@ -373,6 +404,8 @@ class GithubStub:
                 "INSERT INTO objects(kind, id, body) VALUES(?,?,?)",
                 (kind, identifier, json.dumps(body)),
             )
+            if kind == "comment":
+                self._remember(connection, body)
             connection.commit()
             return body
         finally:
@@ -565,6 +598,50 @@ class GithubStub:
             }
 
         return self._insert_new("comment", build)
+
+    def append_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        author: dict[str, Any],
+        app: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append a never-edited comment the way a person posts one, as ``_label_event``
+        appends an event.
+
+        Unlike ``add_issue_comment`` the row takes one instant for both
+        timestamps: the factory's poll pass treats a comment whose ``updated_at``
+        is later than its ``created_at`` as edited and never reads it as an answer.
+        """
+
+        issue = self._get("issue", number)
+        if issue is None:
+            raise ValueError(f"issue {number} does not exist")
+
+        def build(identifier: int) -> dict[str, Any]:
+            instant = _utc()
+            return {
+                "id": identifier,
+                "body": body,
+                "issue_number": number,
+                "user": author,
+                "performed_via_github_app": app,
+                "created_at": instant,
+                "updated_at": instant,
+                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
+                "html_url": (
+                    f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
+                ),
+            }
+
+        return self._insert_new("comment", build)
+
+    def add_user(self, user: dict[str, Any], permission: str) -> dict[str, Any]:
+        """Add a repository collaborator with ``permission``; returns the user."""
+
+        self.set_permission(str(user["login"]), permission, user=user)
+        return user
 
     # Runtime controls. The scripted driver holds this object in process, so a
     # control is a method call, like ``advance`` and ``add_issue_comment``. Each

@@ -256,6 +256,33 @@
             }
           }
         },
+        "lookupIdentities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "kind", "existingSecret"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+                "maxLength": 40,
+                "not": {"enum": ["default", "curie-cluster-message"]}
+              },
+              "kind": {
+                "enum": ["slack"]
+              },
+              "existingSecret": {
+                "type": "string",
+                "minLength": 1
+              },
+              "key": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
         "resources": {
           "type": "object"
         },
@@ -742,6 +769,24 @@
               "bot_user_id": {"type": "string", "pattern": "^U[A-Z0-9]+$"},
               "agent": {"type": "string", "pattern": "\\S"}
             }
+          }
+        }
+      }
+    },
+    "connectorServiceAccounts": {
+      "type": "array",
+      "description": "Operator-named ServiceAccounts for hosted connectors, rendered into the API as CURIE_CONNECTOR_SERVICE_ACCOUNTS. The API refuses the same shapes at boot, and also refuses a repeated agent and connector pair.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent", "connector", "serviceAccountName"],
+        "properties": {
+          "agent": {"type": "string", "pattern": "\\S"},
+          "connector": {"type": "string", "pattern": "\\S"},
+          "serviceAccountName": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
           }
         }
       }

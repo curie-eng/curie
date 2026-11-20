@@ -999,6 +999,29 @@ couldn't be read (pass `--api-key` yourself); a tunnel failure usually means
 the release isn't healthy (check with `curie cluster status`); and if
 nothing's been deployed yet, `curie cluster message` will say so plainly.
 
+### Giving a hosted connector its own ServiceAccount
+
+A hosted connector's pod runs as the namespace's `default` ServiceAccount. A
+connector that reaches a cloud provider through workload identity federation
+exchanges that ServiceAccount's token for cloud credentials, so give it its
+own ServiceAccount rather than sharing `default` with every other pod. Create
+the ServiceAccount in the release namespace together with its cloud
+federation, then name it in the chart values and upgrade:
+
+```yaml
+connectorServiceAccounts:
+  - agent: acme-bot
+    connector: storage
+    serviceAccountName: acme-bot-storage
+```
+
+The next deploy or reconcile pass of `acme-bot` rolls only the `storage`
+connector's Deployment onto that ServiceAccount. Curie never creates the
+ServiceAccount; if it is missing, the Deployment cannot create a pod and the
+connector is reported not ready. Removing the entry returns the pod to
+`default`. The [chart README](../charts/curie/README.md#a-connectors-own-serviceaccount)
+describes the validation.
+
 ### Automatically, with git-flow
 
 Beyond `curie cluster deploy`, a bundle can also deploy automatically on
@@ -1554,7 +1577,14 @@ write or admin permission) answers it and restarts the work, with no mention
 needed. Edits, bot comments, and comments made through the factory's own App
 never do, and a closed issue or a removed trigger label refuses the answer. A
 reply that arrives while the question is still being recorded is read again
-by the poll pass, or in webhook mode by the work item reconciler. Otherwise a
+by the poll pass, or in webhook mode by the work item reconciler. If the run
+ended before its question was recorded, its status comment says a reply does
+not restart the ticket. If the ticket's pull request was merged or closed
+before an answer's run started, that run ends without starting and its status
+comment says so. A comment the webhook refused as an answer for who wrote it
+(a bot, or a person who could not have started the ticket) stays refused: a
+poll pass that lists it after the question round ended does not admit it as a
+mention, even if its author gained write permission since. Otherwise a
 later bounded execution requires a new issue comment that explicitly mentions
 that login and whose sender currently has write or admin permission; ordinary
 comments, edits, and events sent by the App do not execute work. Removing
@@ -1566,7 +1596,7 @@ later publication is refused.
 Polling reads each bound repository every `factory.trackers[].pollIntervalSeconds`
 (default 45 seconds). It can admit an open labeled issue immediately, but
 sandbox acquisition waits for the base label settling interval described below.
-It admits a mention and review feedback on a factory pull request, and cancels
+It admits review feedback on a factory pull request (a plain comment on GitHub, a mention elsewhere), and cancels
 a work item whose issue was closed or unlabeled. Those reads do not record a
 webhook delivery. The webhook is optional. In webhook mode the missed-label
 backstop stays: every `FACTORY_RECONCILE_INTERVAL_S` (default 300, 0
@@ -2338,24 +2368,36 @@ execution deadline stays fixed from start and covers that wait.
 
 Review feedback on a factory pull request asks for one more revision of that
 pull request. When a work item owns the PR, an `issue_comment`,
-`pull_request_review_comment` or `pull_request_review` that mentions
-the tracker's `mention` goes to the factory, not to the Slack-bound review
-path. The sender must have write access now, the PR must still be open at the
+`pull_request_review_comment` or `pull_request_review` goes to the factory, not
+to the Slack-bound review path. On GitHub an authorized reviewer's plain
+comment on the factory's open pull request starts a revision with no mention.
+One submitted review is one revision: its body and all its inline comments are
+read together once the review is submitted. An approving review never starts a
+revision unless a comment in it mentions the factory. Each pull request allows
+10 plain-comment revisions; after that the factory posts one notice on the pull
+request and a mention of the tracker's `mention` is required. A mention always
+works and is not counted. GitLab and Bitbucket still require the mention.
+The sender must have write access now, the PR must still be open at the
 recorded head, and the delivery must come from the work item's installation.
 Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
 `sender_permission_refused`, `terminal_pull_request`, `active_request`, and
 others). An accepted mention becomes the work item's next execution request.
-The request stores its reply target when it is admitted: the review thread
-for an inline review comment, the pull request conversation for a PR comment
-or a submitted review, and the tracker issue for every other request. The
-objective still opens with the feedback URL for the agent, but nothing routes
+The request stores its reply target when it is admitted. On GitHub that is
+the pull request conversation for a PR comment or a submitted review,
+including every inline comment that is part of a submitted review that starts
+a revision (plain or mentioning, in a commented or changes-requested review);
+only a mentioning inline comment in an approved or dismissed review is
+admitted on its own, and its reply target is its review thread. On GitLab and
+Bitbucket a mention in a threaded note is answered in its discussion. Every
+other request answers on the tracker issue. The objective still opens with the feedback URL for the agent, but nothing routes
 on it. Upgrading to schema 0102 backfills the stored target of existing
 requests from that first line.
 A revision's status comment lives where its reply lives, on the pull
-request: in the review thread for an inline comment, otherwise as a PR comment
-that links the feedback. If GitHub refuses the thread reply with 422, the
-comment is posted as a linked PR comment. Either way it is edited in place
+request: in the review thread for an inline comment admitted on its own,
+otherwise as a PR comment that links the feedback, and for a submitted review
+that starts a revision it links that review. If GitHub refuses the thread reply
+with 422, the comment is posted as a linked PR comment. Either way it is edited in place
 until the revision ends. PR review feedback reaches the factory only
 when `factory.enabled` is true. A PR no work item owns keeps
 the existing review behavior.
@@ -2553,16 +2595,13 @@ as the OpenRouter key's usage delta (or `unverified`). The key is shared, so
 that delta includes any concurrent use of it.
 
 `run --scenario revision --issue-file <ticket.md> [--revision-file <text.md>]`
-needs the ticket's run to open a pull request. It then posts an ordinary
-comment on that pull request, which must be delivered as `factory_ignored`
-and add no request within 60 s. Next it posts a mention comment (the revision
-file's text, or by default a request for a docstring and a test, prefixed
-with `@<mention>` when absent). It passes when that delivery is
+needs the ticket's run to open a pull request. It then posts one plain
+comment on that pull request (the revision file's text, or by default a request
+for a docstring and a test). It passes when that delivery is
 `factory_admitted`, the revision request belongs to the same WorkItem, the
 WorkItem ends with two requests and the second `completed`, the same single
 pull request gained a commit and a new head, exactly one App reply carries the
-revision's marker and links the mention, no other App comment followed the
-ordinary one, and the default branch is unmoved. Before posting feedback, the
+revision's marker and links the comment, and the default branch is unmoved. Before posting feedback, the
 driver also requires the initial run's one final issue comment to name that
 pull request.
 
@@ -2982,6 +3021,84 @@ the conversation transcript and its native checkpoint can retain it, under the t
 own access controls and expiry and not the WorkItem snapshot's, as for requester
 preferences. A rule removed after a WorkItem was admitted can therefore remain in that
 WorkItem's snapshot and in its recorded transcript until they expire.
+
+### Learned rules
+
+A learned rule is a one-line rule an agent proposes, for example after a
+merged pull request. A proposed rule applies only after a person accepts it.
+Accepting or removing a rule changes only stored rows. The decision is
+recorded now and takes effect at the next ticket's admission once admission
+reads learned rules (#5798); a running request keeps the rules it was admitted
+with. Every decision answers `"applies_from": "next_ticket"`.
+
+The routes:
+
+1. `GET /agents/{agent_id}/memory/rules` lists the agent's `proposed`,
+   `accepted`, `rejected` and `removed` rules, ordered by scope and number,
+   with each scope's `in_force_count` (its accepted rules) and
+   `in_force_limit`. It takes the platform key or a console session, like the
+   rest of the memory API. Filter with `state`, `scope_kind` and `scope_key`;
+   any other state is refused with 422.
+2. `POST /agents/{agent_id}/memory/rules/{rule_id}/accept`, `.../reject` and
+   `.../remove` take the body `{"expected_version": N}`, the version the
+   person last read. Accept and reject act on a proposed rule, remove on an
+   accepted one. Each records who decided and when, bumps the version, and
+   writes one audit event.
+
+Only a signed-in person decides. The action routes accept a principal console
+session from the console's own origin and refuse the platform key, an
+`Authorization` header and every other credential with 401. The person's
+tenant must own the agent.
+
+The write access rule: for a rule in a repository scope, the person needs an
+active link to a GitHub account on that repository's host, and that account
+must have `write`, `maintain` or `admin` permission on the repository when
+they act. The API reads the account's current login by its immutable id,
+resolves the repository by the immutable id stored in the rule's scope, and
+only then reads the permission. It never uses the repository path stored on
+the rule, so after a rename a writer on a different repository at the old path
+cannot decide the original's rules. An operator links a person with
+`POST /identity/admin/{tenant_id}/code-host-links`. Rules in agent or binding
+scope cannot be decided through these routes yet.
+
+Each scope holds at most 16 accepted rules, and their delivered text, one
+`R<number>: <text>` line per rule, must stay within 4096 bytes. Long rules with
+large numbers can reach the byte bound before the count bound. Accept checks
+both under a lock on the agent row, so two concurrent accepts cannot pass the
+cap together. Reject and remove never meet either bound.
+
+Coded refusals carry `detail` with `code`, `message` and `fix`; OpenAPI
+declares that body as `MemoryRuleRefusal`:
+
+1. 403 `memory_rules.write_access_required`: no linked account on the host,
+   the account cannot write to the repository, or the link was revoked or
+   changed while GitHub was being read.
+2. 403 `memory_rules.write_access_unverifiable`: the scope is not a GitHub
+   repository keyed by its numeric id on a configured code host, its id now
+   answers for another repository or none, or the person has more than one
+   linked account on the host.
+3. 403 `memory_rules.scope_not_supported`: an agent or binding scope rule.
+4. 404 `memory_rules.not_found`: no such agent or rule for this person.
+5. 409 `memory_rules.stale_version` (with `current_version`),
+   `memory_rules.invalid_transition`, `memory_rules.scope_full` (with
+   `limit`) and `memory_rules.snapshot_full` (with `limit_bytes`).
+6. 503 `memory_rules.code_host_unavailable` when GitHub cannot be read, and
+   `memory_rules.unavailable` when the database cannot. Nothing changes; retry.
+7. 422 `memory_rules.invalid_request` for a malformed query, path or body.
+
+A refused credential (401) or console origin (403) is a plain `detail` string
+instead, declared as `MemoryRuleAuthRefusal`. A principal disabled, or whose
+tenant was suspended, while GitHub was being read is refused under the
+identity fence with the same 401 as a dead session, and nothing changes.
+
+From the CLI, `curie cluster memory <agent> --rules` lists rules over the
+cluster connection; add `--rule-state STATE` or `--scope-key KEY` to filter,
+and `--json` for the API object. `curie cluster memory <agent> --accept RULE_ID
+--expected-version N --session-file PATH` decides one rule, and `--reject` and
+`--remove` take the same arguments. The session file holds only the console
+session cookie value and must be readable by its owner alone (mode 0600 or
+stricter). Acting never sends the platform key. `--dry-run` prints the request
+it would send without sending it.
 
 ### Driving the deployed agent
 

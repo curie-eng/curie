@@ -75,6 +75,7 @@ from .memory_facts import MEMORY_TOOL_NAMES
 from .publication_precheck import PublicationPrecheck
 from .tool_names import (
     PROGRESS_TOOL,
+    PROPOSE_RULE_TOOL,
     QUESTION_TOOL,
     RUN_HANDOFF_TOOL,
     STATE_TOOL_NAMES,
@@ -255,6 +256,11 @@ TRACKER_RESULT_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TRACKER_RESULT_TOOL}"
 # capability. It writes a ticket comment, so it is never idempotent (see
 # ``side_effects.PLATFORM_SIDE_EFFECTING_TOOLS``).
 QUESTION_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{QUESTION_TOOL}"
+# The learned rule proposal tool (ADR 0287, #5796), mounted on the same server
+# only when the API's completion contract answer offered it. It stores a rule
+# candidate, so it is never idempotent (see
+# ``side_effects.PLATFORM_SIDE_EFFECTING_TOOLS``).
+PROPOSE_RULE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{PROPOSE_RULE_TOOL}"
 
 # The existing platform MCP servers ``curie`` and ``curie-state`` retain their
 # exemption under #2286 and ADR 0139. Only their exact published platform tool
@@ -290,6 +296,9 @@ QUESTION_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{QUESTION_TOOL}"
 # ``ask_questions`` (#5785) is exempt for the same reason: the API, not
 # toolPolicy, decides from the request bound capability whether the questions
 # are accepted, and only the platform's own ``curie`` server publishes the name.
+# ``propose_rule`` (ADR 0287, #5796) is exempt for the same reason: the API, not
+# toolPolicy, decides from the request bound capability whether this run may
+# propose a rule, and the rule applies only after a person accepts it.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
     {
         APPROVAL_TOOL_NAME,
@@ -300,6 +309,7 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
         ISSUE_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,
         QUESTION_TOOL_NAME,
+        PROPOSE_RULE_TOOL_NAME,
     }
 )
 

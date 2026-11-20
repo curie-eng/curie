@@ -698,6 +698,9 @@ class AgentUpdate(BaseModel):
     # it unchanged; the column is NOT NULL, so like `memory` there is no
     # default for a null to clear back to.
     memory_writes: bool | None = None
+    # Whether a factory revision run may propose one learned rule (#5796).
+    # Omitted (None) leaves it unchanged, like `memory_writes`.
+    memory_rule_proposals: bool | None = None
     # Omitted leaves the current publication policy. Explicit null is refused.
     # ``publication_branch_prefix`` null clears the prefix.
     publication_policy: Literal["approve", "auto"] | None = None
@@ -786,6 +789,8 @@ class AgentOut(BaseModel):
     memory: bool
     # Whether the runner mounts its remember/update/forget tools (#1461).
     memory_writes: bool = False
+    # Whether a factory revision run may propose one learned rule (#5796).
+    memory_rule_proposals: bool = False
     publication_policy: Literal["approve", "auto"] = "approve"
     publication_policy_version: int = 1
     publication_draft: bool = False

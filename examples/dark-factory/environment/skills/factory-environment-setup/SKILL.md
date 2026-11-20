@@ -11,9 +11,10 @@ serve both roles; Jira Cloud supplies issues for a GitHub or Bitbucket Cloud/DC
 code host. Follow the actual binding. Do not infer a tracker from a repository
 URL, or treat an inaccessible history as evidence that no tools are needed.
 
-Use the configured provider's read interface: GitHub issues and pull requests;
-GitLab issues and merge requests; Jira Cloud issues plus the linked code-host
-pull requests; or Bitbucket Cloud/DC pull requests plus the bound Jira issues.
+Use the configured provider's read interface: on GitHub, issues and pull
+requests; on GitLab, issues and merge requests; on Jira Cloud, issues plus the
+linked code-host pull requests; or on Bitbucket Cloud/DC, pull requests plus
+the bound Jira issues.
 Preserve host and project identity when linking records. Ask for missing read
 access rather than substituting another provider's history.
 

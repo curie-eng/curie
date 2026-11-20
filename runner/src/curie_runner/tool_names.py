@@ -76,3 +76,8 @@ TRACKER_RESULT_TOOL: Final = "submit_tracker_result"
 # The factory question tool on the ``curie`` server (#5785): a run that cannot
 # build its ticket without a person's answers posts its questions on the ticket.
 QUESTION_TOOL: Final = "ask_questions"
+
+# The learned rule proposal tool on the ``curie`` server (ADR 0287, #5796): a
+# revision run proposes one standing rule for its repository from the reviewer
+# feedback it is revising. Mounted only when the completion contract offers it.
+PROPOSE_RULE_TOOL: Final = "propose_rule"

@@ -783,6 +783,31 @@ connectorCaller:
   signingKeyKey: signingKey
   verifyKeyKey: verifyKey
 
+# An operator-named ServiceAccount for one agent's hosted connector. Without an
+# entry a connector pod runs as the namespace's `default` ServiceAccount. A
+# connector that authenticates to a cloud provider through workload identity
+# federation (its projected ServiceAccount token is exchanged with the cloud's
+# token service) should run as its own ServiceAccount, so no other pod in the
+# namespace shares that cloud identity.
+#
+# Each entry names an agent, one of its hosted connectors as connectors.yaml
+# declares it, and the ServiceAccount its Deployment runs as. The API renders
+# `serviceAccountName` into that connector's pod template and nothing else
+# changes. The mapping lives here, not in the bundle, so a bundle can never
+# pick another agent's ServiceAccount or a Curie component's own.
+#
+# Curie does not create the ServiceAccount and grants the worker nothing new:
+# create it in the release namespace, with its cloud federation, before you
+# deploy. A missing one leaves the connector unable to start a pod. Whether its
+# token is mounted is the ServiceAccount's own automountServiceAccountToken.
+# An entry for an undeclared or remote connector renders nothing.
+#
+# connectorServiceAccounts:
+#   - agent: acme-bot
+#     connector: storage
+#     serviceAccountName: acme-bot-storage
+connectorServiceAccounts: []
+
 # The connector action executor (ACTION-EXECUTOR-1). One switch, rendered as
 # CURIE_ACTION_EXECUTOR_ENABLED into both the API and the worker so the two can
 # never disagree. Off: the worker claims no execution and the API refuses an undo
@@ -1776,6 +1801,23 @@ channelGateway:
     existingSecret: ""
     tokenKey: token
     timeoutSeconds: 5
+  # Optional lookup identities: provider credentials the gateway uses for
+  # directory reads alone (today the Slack user email lookup above), so no
+  # agent's app needs a directory scope. Each entry is {name, kind,
+  # existingSecret, key}: name follows the Slack identity name pattern and must
+  # not be default or a declared Slack identity; kind is the provider, and slack
+  # (a bot-token-only app with users:read and users:read.email, no Socket Mode,
+  # no events) is the only one; existingSecret names an operator-supplied
+  # Secret whose key (default token) holds the credential. An identity provider
+  # then sets CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY to that name. Only the
+  # gateway receives these credentials, and only its directory reads use them;
+  # replies, other reads, the dispatcher, API and worker never do. Empty (the
+  # default) changes nothing. Restart the gateway after rotating a Secret.
+  #   lookupIdentities:
+  #     - name: directory
+  #       kind: slack
+  #       existingSecret: directory-lookup-app
+  lookupIdentities: []
   readinessProbe:
     initialDelaySeconds: 1
     periodSeconds: 5

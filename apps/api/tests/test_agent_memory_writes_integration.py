@@ -107,3 +107,28 @@ def test_patch_explicit_null_never_clears_the_not_null_column(
     resp = _patch(client, auth_headers, agent["id"], {"memory_writes": None})
     assert resp.status_code in (200, 422), resp.text
     assert _read(client, auth_headers, agent["id"])["memory_writes"] is True
+
+
+def test_patch_turns_memory_rule_proposals_on_and_back_off(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The operator switch for learned rule proposals (#5796) round-trips the
+    same way and leaves `memory_writes` alone."""
+    agent = _create_agent(client, auth_headers)
+    assert agent["memory_rule_proposals"] is False
+    assert _read(client, auth_headers, agent["id"])["memory_rule_proposals"] is False
+
+    resp = _patch(client, auth_headers, agent["id"], {"memory_rule_proposals": True})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["memory_rule_proposals"] is True
+    view = _read(client, auth_headers, agent["id"])
+    assert (view["memory_rule_proposals"], view["memory_writes"]) == (True, False)
+
+    resp = _patch(client, auth_headers, agent["id"], {"thinking": "adaptive"})
+    assert resp.status_code == 200, resp.text
+    assert _read(client, auth_headers, agent["id"])["memory_rule_proposals"] is True
+
+    resp = _patch(client, auth_headers, agent["id"], {"memory_rule_proposals": False})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["memory_rule_proposals"] is False
+    assert _read(client, auth_headers, agent["id"])["memory_rule_proposals"] is False

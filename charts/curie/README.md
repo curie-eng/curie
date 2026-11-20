@@ -2439,6 +2439,18 @@ bounds each Slack call. That caller can only read a user's email. Restart the
 gateway after rotating the Secret. See the
 [http identity operator guide](../../docs/http-identity-operator.md).
 
+`channelGateway.lookupIdentities` (default `[]`) gives directory reads their
+own provider credentials, so no agent's app needs a directory scope. Each
+entry is `{name, kind, existingSecret, key}`: `name` follows the Slack
+identity name pattern and must not be `default` or a declared Slack identity,
+`kind` is `slack` (a bot-token-only app with `users:read` and
+`users:read.email`), and `existingSecret` names a Secret whose `key` (default
+`token`) holds the credential. The chart renders
+`CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES` and one
+`CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__<index>` per entry into the gateway alone,
+and only its user email read uses them. The provider sets
+`CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` to the entry's name.
+
 An external gateway uses `channelGateway.url`; configure separate
 `channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,
 `channelGateway.tlsSecret` supplies `ca.crt` to callers. For a chart-deployed
@@ -2592,6 +2604,38 @@ each caller proxy reads the password from the Secret only when its container
 starts, so a running proxy keeps the old password and cannot spend grants until
 it restarts. The same restart applies after any later rotation of the Valkey
 password.
+
+### A connector's own ServiceAccount
+
+`connectorServiceAccounts` (default `[]`) names the ServiceAccount one
+agent's hosted connector runs as. Without an entry the connector pod runs as
+the namespace's `default` ServiceAccount. Use it for a connector that
+authenticates to a cloud provider through workload identity federation, so
+the cloud identity bound to its ServiceAccount token is not shared with every
+other pod running as `default`:
+
+```yaml
+connectorServiceAccounts:
+  - agent: acme-bot
+    connector: storage
+    serviceAccountName: acme-bot-storage
+```
+
+The API receives the list as JSON in `CURIE_CONNECTOR_SERVICE_ACCOUNTS` and
+sets `serviceAccountName` on that connector's Deployment pod template; no
+other object changes, and a connector without an entry renders exactly as
+before. The mapping is install configuration rather than a `connectors.yaml`
+field, so a bundle cannot name another agent's ServiceAccount or a Curie
+component's own. The chart does not create the ServiceAccount and grants the
+worker nothing new: create it in the release namespace, with its cloud
+federation, before deploying the agent. A missing ServiceAccount leaves the
+connector's Deployment unable to create a pod. The pod template leaves
+`automountServiceAccountToken` unset, so the ServiceAccount's own setting
+decides whether its token is mounted. The schema and the API both refuse a
+name that is not a DNS-1123 subdomain, an entry with a missing, empty or
+unknown key, and the API also refuses one agent and connector named twice.
+The contract is in
+[the connector host interface](../../docs/interfaces/connector-host/INTERFACE.md).
 
 ### HTTP identity operator files
 

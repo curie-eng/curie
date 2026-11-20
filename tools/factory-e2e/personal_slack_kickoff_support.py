@@ -163,6 +163,7 @@ CARD_FINISHED = "Factory run: finished"
 CARD_TERMINAL_HEADERS = (CARD_FINISHED, "Factory run: needs a person", "Factory run: stopped")
 CARD_STEPS = (
     "Reading the issue",
+    "Investigating the ticket",
     "Planning the change",
     "Reviewing the plan",
     "Writing the change",
@@ -3309,7 +3310,7 @@ def card_header(message: Mapping[str, Any]) -> str | None:
 
 
 def _card_finished_ok(message: Mapping[str, Any], pull_request_url: str) -> bool:
-    """Decision 4's finished card: header, seven done steps, done line, button, timing. Pure."""
+    """Decision 4's finished card: header, a done step per stage, done line, button, timing."""
 
     blocks = _blocks(message)
     found = _PULL_NUMBER.search(pull_request_url)

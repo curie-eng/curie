@@ -1703,7 +1703,12 @@ def _work_item_row(work_item_id: uuid.UUID) -> dict[str, Any]:
 
 
 def _revision_reply(pr: int, fragment: str) -> dict[str, str | None]:
-    """The typed reply target admission stores for this feedback (#3831)."""
+    """The typed reply target admission stores for this feedback (#3831).
+
+    Since #5794 admission stores a review thread target only for a mention in
+    an approved or dismissed review; every other review is answered in the
+    pull request conversation. The reply side is the same for both.
+    """
 
     url = f"https://github.com/{REPO}/pull/{pr}#{fragment}"
     thread = fragment.removeprefix("discussion_r") if fragment.startswith("discussion_r") else None
