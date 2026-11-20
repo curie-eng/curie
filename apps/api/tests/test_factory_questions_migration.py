@@ -155,6 +155,7 @@ def test_upgrade_creates_both_tables_and_widens_the_label_check(
     assert _tables() == TABLES
     label_check = _checks("factory_terminal_notices")["factory_terminal_notices_applied_label_ck"]
     assert QUESTIONS_LABEL in label_check
+    assert "curie-factory:triaged" in label_check
     rounds = _checks("factory_question_rounds")
     assert {
         "factory_question_rounds_rounds_used_ck",

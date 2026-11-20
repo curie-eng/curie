@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import importlib.util
 import io
+import json
 import sys
 import tarfile
 import uuid
@@ -15,6 +16,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
 from curie_api import bundles
 from curie_api.config import get_settings
 from curie_api.storage import BundleStore
@@ -483,44 +485,45 @@ def _judge() -> Any:
     return module
 
 
-def _cli_envelope(response: Any) -> dict[str, Any]:
-    """The CLI's output for a refused upload (`cli/src/api.rs` `expect_ok`).
+REFUSAL_VECTOR = (
+    Path(__file__).resolve().parents[3]
+    / "tests"
+    / "vectors"
+    / "bundle-upload-refusal-cli-output.json"
+)
 
-    The status renders as the CLI's HTTP client renders a 422.
-    """
 
-    assert response.status_code == 422, response.text
-    return {
-        "error": (
-            "uploading the bundle failed with 422 Unprocessable Entity: "
-            f"{response.text.strip()}"
-        ),
-        "fix": None,
-    }
+def _refusal_cases() -> dict[str, Any]:
+    cases: dict[str, Any] = json.loads(REFUSAL_VECTOR.read_text())["cases"]
+    return cases
 
 
 def test_the_chain_judge_reads_the_retired_code_from_the_cli_upload_refusal(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    judge = _judge()
-    agent_id, version_id = _create_version(client, auth_headers)
-    retired = _upload(
-        client,
-        auth_headers,
-        agent_id,
-        version_id,
-        _tar_gz({**_valid_files(), **RETIRED_DECLARATION}),
-    )
-    files = _valid_files()
-    files["skills/beta/SKILL.md"] = "# no frontmatter\n"
-    other = _upload(client, auth_headers, agent_id, version_id, _tar_gz(files))
+    """The producer chain the live judge consumes, hop by hop.
 
-    assert retired.status_code == 422, retired.text
-    assert other.status_code == 422, other.text
-    output = _cli_envelope(retired)
-    assert judge.BUNDLE_RETIRED_CODE in judge.deploy_refusal_codes(output)
-    # Counterexample: the real refusal of a different validation failure.
-    assert judge.BUNDLE_RETIRED_CODE not in judge.deploy_refusal_codes(_cli_envelope(other))
+    The API's real 422 body for each case must equal the vector's
+    ``api_body_text``; ``cli/tests/bundle_refusal_output.rs`` pins that the
+    built binary prints the vector's ``cli_stdout`` for exactly that body. The
+    judge is then fed that recorded CLI output, never a shape written here.
+    """
+
+    judge = _judge()
+    cases = _refusal_cases()
+    # A refused upload attaches nothing, so every case can target one version.
+    agent_id, version_id = _create_version(client, auth_headers)
+    for name, case in cases.items():
+        files = {**_valid_files(), **case["bundle_files"]}
+        response = _upload(client, auth_headers, agent_id, version_id, _tar_gz(files))
+        if response.status_code != case["api_status"] or response.text != case["api_body_text"]:
+            pytest.fail(f"{name}: the API answered {response.status_code} {response.text}")
+
+    retired = cases["retired_declaration"]["cli_stdout"]
+    assert judge.BUNDLE_RETIRED_CODE in judge.deploy_refusal_codes(retired)
+    # Counterexample: the CLI's real output for a different validation refusal.
+    other = cases["skill_without_frontmatter"]["cli_stdout"]
+    assert judge.BUNDLE_RETIRED_CODE not in judge.deploy_refusal_codes(other)
 
 
 def test_deploying_the_same_stored_bundle_without_the_declaration_succeeds(

@@ -26,6 +26,7 @@ mod approvals_manifest_unreadable;
 mod artifacts_fetch;
 mod boot_env_contract;
 mod budget_factory_allowance;
+mod bundle_refusal_output;
 mod callers_verb;
 mod channel_token_verb;
 mod chart_check;
