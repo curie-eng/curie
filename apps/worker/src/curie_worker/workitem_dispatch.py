@@ -49,10 +49,6 @@ class WorkItemTransportError(Exception):
     """5xx or unreachable API; the wake must stay pending for retry."""
 
 
-CompletionContract = Literal["implementation", "tracker_result"]
-CONTRACT_IMPLEMENTATION: CompletionContract = "implementation"
-CONTRACT_TRACKER_RESULT: CompletionContract = "tracker_result"
-
 # What an execute wake does (ADR 0269, #5429): an implementation request opens
 # model turns; a publication_recovery request boots the validation runtime and
 # publishes its one retained candidate without any model turn.
@@ -136,11 +132,6 @@ class WorkItemAcquireGrant:
     # before this request claims. None on every other request.
     resource_gate: ResourceGate | None
     predecessor_claim_name: str | None
-    # How the request completes (ADR 0277, #5586): an implementation request
-    # ends in a pull request, a tracker_result request in one tracker result.
-    # An API that predates the field sends none, which means implementation.
-    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
-
     @property
     def agent_id(self) -> uuid.UUID:
         return self.context.agent_id
@@ -152,7 +143,6 @@ class WorkItemStartGrant:
     execution_deadline: datetime
     remaining_s: float
     heartbeat_interval_s: float
-    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
 
 
 @dataclass(frozen=True)
@@ -169,7 +159,6 @@ class WorkItemRunning:
     execution_deadline: datetime
     context: FactoryContext | None
     refusal: str | None
-    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
 
 
 @dataclass(frozen=True)
@@ -314,24 +303,6 @@ def _optional_name(value: object) -> str | None:
     return None if value is None else _required_string(value)
 
 
-def _completion_contract(body: dict[str, Any]) -> CompletionContract:
-    """The request's completion contract; absent means implementation.
-
-    Any value other than the two known contracts is an unusable body, never
-    read as implementation: a tracker_result run must not lose its limits to
-    a misspelled field.
-    """
-
-    value = body.get("completion_contract")
-    if value is None:
-        return CONTRACT_IMPLEMENTATION
-    if value == CONTRACT_IMPLEMENTATION:
-        return CONTRACT_IMPLEMENTATION
-    if value == CONTRACT_TRACKER_RESULT:
-        return CONTRACT_TRACKER_RESULT
-    raise ValueError("unknown completion contract")
-
-
 def _execution_kind(body: dict[str, Any]) -> tuple[ExecutionKind, uuid.UUID | None]:
     """The request's execution kind and recovery candidate, read strictly.
 
@@ -406,7 +377,6 @@ class WorkItemDispatchClient:
                 recovery_candidate_id=recovery_candidate_id,
                 resource_gate=_resource_gate(body["resource_gate"]),
                 predecessor_claim_name=_optional_name(body["predecessor_claim_name"]),
-                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -482,7 +452,6 @@ class WorkItemDispatchClient:
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
                 remaining_s=float(body["remaining_s"]),
                 heartbeat_interval_s=float(body["heartbeat_interval_s"]),
-                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -566,7 +535,6 @@ class WorkItemDispatchClient:
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
                 context=context,
                 refusal=refusal,
-                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -911,10 +879,6 @@ class WorkItemRun:
         self.conversation_id = grant.conversation_id
         self.wait_deadline = grant.wait_deadline
         self.context = grant.context
-        # Learned at acquire (or from the running row of an adopted run),
-        # before the capability mint and the sandbox claim. Only ever widened
-        # to tracker_result afterwards, never narrowed (see ``start``).
-        self.completion_contract: CompletionContract = grant.completion_contract
         # Fixed at admission and learned only at acquire (#5429). A run adopted
         # from its running row is a continuation (an approval resume or a CI
         # round), never the execute wake a recovery runs on, so it has none.
@@ -1017,11 +981,6 @@ class WorkItemRun:
             self.started = True
             self.runtime_epoch = grant.runtime_epoch
             self.execution_deadline = grant.execution_deadline
-            if grant.completion_contract == CONTRACT_TRACKER_RESULT:
-                # The contract is fixed at admission, so the two answers
-                # agree. Should they not, the stricter one governs: a
-                # tracker_result run is never continued, retried or published.
-                self.completion_contract = CONTRACT_TRACKER_RESULT
         interval = max(_MIN_HEARTBEAT_INTERVAL_S, grant.heartbeat_interval_s)
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(interval),
@@ -1034,12 +993,6 @@ class WorkItemRun:
         """Publish the one retained candidate with no model turn (ADR 0269, #5429)."""
 
         return self.execution_kind == EXECUTION_PUBLICATION_RECOVERY
-
-    @property
-    def is_tracker_result(self) -> bool:
-        """One investigation session that ends in a tracker result (ADR 0277)."""
-
-        return self.completion_contract == CONTRACT_TRACKER_RESULT
 
     def bound_remaining_s(self, remaining_s: float | None) -> float | None:
         if self.execution_deadline is None:
