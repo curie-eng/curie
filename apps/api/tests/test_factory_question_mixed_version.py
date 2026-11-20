@@ -912,15 +912,18 @@ _TABLES = ("factory_question_round", "factory_answer_receipt")
 # add its case here first.
 _EXPECTED_USES = {
     # The answer receipt (#5786) only picks the answer-received lead line of
-    # a status body; an older pass renders the same request without it.
+    # a status body; an older pass renders the same request without it. The
+    # questions-unrecorded line reads a round an asker cleared before it was
+    # recorded; an older pass renders the same status without that line.
     "curie_api/factory_notices.py": {
         "ANSWER_RECEIVED_LINE",
-        "ANSWER_STARTED_OUTCOMES",
-        "FactoryAnswerReceipt",
         "QUESTIONS_ASKED",
         "QUESTIONS_LABEL",
+        "QUESTIONS_UNRECORDED_LINE",
         "ROUND_LIMIT",
+        "answer_started",
         "asked_round",
+        "question_unrecorded",
     },
     # The plain answer intake (#5787): the webhook and the poll pass read the
     # row state and hand the comment to the answer core. Proved beside an
@@ -931,6 +934,10 @@ _EXPECTED_USES = {
         "OUTSTANDING",
         "POSTING",
     },
+    # A comment between a round's question and that round's end is refused
+    # not_outstanding after the round clears (#5787) instead of being admitted
+    # as a mention. It reads the row and writes only the answer receipt; an
+    # older replica admits that comment as a mention, as before.
     "curie_api/github_factory.py": {
         "ADMITTED",
         "ANSWERED",
@@ -939,12 +946,15 @@ _EXPECTED_USES = {
         "COALESCED",
         "FactoryAnswerReceipt",
         "FactoryQuestionRound",
+        "NOT_OUTSTANDING",
         "OUTSTANDING",
         "POSTING",
         "QUESTION_POSTING",
         "QUEUED_FOLLOW_UP",
         "WORK_ITEM_CANCELLED",
         "admit_answer",
+        "answered_closed_round",
+        "ordered_comment_id",
     },
     "curie_api/routers/work_item_issue.py": {
         "ALREADY_ASKED",
@@ -964,6 +974,11 @@ _EXPECTED_USES = {
         "input_valid",
         "post_and_record",
     },
+    # An answer's follow-up refused a start on a merged or closed pull request
+    # ends at that refusal (#5786). It only reads the answer receipt and writes
+    # no round state; an older replica keeps deferring the same request to its
+    # start-deferral limit, which ends it start_failed as before.
+    "curie_api/workitem_dispatch.py": {"answer_started"},
     "curie_api/workitems/lifecycle.py": {
         "ANSWERED",
         "CLEARED",
