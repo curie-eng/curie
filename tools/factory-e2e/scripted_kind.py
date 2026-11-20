@@ -776,7 +776,7 @@ class ScriptedRun:
         self.stub._put("issue", 3815, issue)
         if self.args.scenario != "facts":
             self.model = model.ModelScript(
-                Path(self.args.transcript),
+                self.model_transcript(),
                 record=self.args.record,
                 host=callback,
                 **self.model_options(model),
@@ -940,6 +940,11 @@ class ScriptedRun:
         """Extra ModelScript keywords; called once the GitHub stub is running."""
 
         return {}
+
+    def model_transcript(self) -> Path:
+        """The file ModelScript serves, or dumps every exchange to when recording."""
+
+        return Path(self.args.transcript)
 
     def make_router(self, model_module: Any) -> scripted_lanes.LaneRouter | None:
         """The replay's lane router, or None to serve the transcript alone.

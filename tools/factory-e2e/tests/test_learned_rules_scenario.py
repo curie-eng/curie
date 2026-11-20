@@ -33,6 +33,7 @@ from curie_api import requester_instruction_context as api_requester
 from curie_api.factory_reply_target import feedback_url
 from curie_api.github_factory_review import _objective
 from curie_api.github_review_events import UnverifiedFeedback
+from curie_api.github_review_store import feedback_provenance
 from curie_runner.memory_rules_context import rules_section
 from curie_runner.requester_context import requester_section
 from curie_runner.sender_frame import frame_user_turn
@@ -112,6 +113,7 @@ def _passing() -> dict[str, Any]:
             {
                 "step": "c",
                 "merged": True,
+                "source_matches_reply_target": True,
                 "rules": [
                     {
                         "id": RULE_ID,
@@ -335,6 +337,26 @@ VIOLATIONS: dict[str, tuple[Callable[[dict[str, Any]], None], str]] = {
     "reader refusal unnamed": (_set("d", "reader", "codes", value=[]), "does not name"),
     "writer accept failed": (_set("d", "writer", "exit", value=1), "writer's accept"),
     "rule not accepted": (_set("d", "writer", "state", value="proposed"), "accepted"),
+    "raw source differs from the raw reply target": (
+        _set("c", "source_matches_reply_target", value=False),
+        "unscrubbed source",
+    ),
+    "no reviewer prompt of B": (
+        _set(
+            "e",
+            "captures",
+            value=[_capture(11, lrs.TICKET_B, implementer=True, section=True)],
+        ),
+        "no reviewer prompt of B",
+    ),
+    "places=60 passing as six": (
+        _set(
+            "e",
+            "added_asserts",
+            value=["self.assertAlmostEqual(convert(0, 'f', 'r'), 459.67, places=60)"],
+        ),
+        "without places=6",
+    ),
     "decision on a fixed version": (_set("d", "expected_version", value=1), "proposed rule's"),
     "accept not bumping the version": (_set("d", "writer", "version", value=2), "move by one"),
     "proposed rule without a version": (_set("c", "rules", 0, "version", value=None), "version"),
@@ -789,7 +811,9 @@ def _revision_request(base: str, pull: int) -> dict[str, Any]:
         commit_sha=None,
         author_association="COLLABORATOR",
     )
-    objective = _objective(feedback, url, {"pull_request_body": "Adds Kelvin."})
+    objective = _objective(
+        feedback_provenance(feedback), url, {"pull_request_body": "Adds Kelvin."}
+    )
     text = frame_user_turn("job", "", objective, "github")
     return {"messages": [{"role": "user", "content": [{"type": "text", "text": text}]}]}
 

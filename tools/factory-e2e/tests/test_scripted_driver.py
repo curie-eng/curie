@@ -3264,9 +3264,12 @@ def test_a_learned_rules_recording_is_split_by_ticket_and_scrubbed(
         ],
         ["a", "b", "a", "c"],
     )
-    # ModelScript.close() dumps every exchange to the A file first.
+    # A committed A file from an earlier recording; ModelScript dumps elsewhere.
     first.parent.mkdir()
     first.write_text(json.dumps({"version": 1, "exchanges": [{"stale": True}]}))
+    run.workdir = tmp_path / "work"
+    assert run.model_transcript() == run.workdir / "recording-raw.json"
+    assert run.model_transcript() not in run.transcripts.values()
     run.write_recording()
 
     model = sk._module("factory_model_script_split", MODEL_SCRIPT)
@@ -3280,6 +3283,9 @@ def test_a_learned_rules_recording_is_split_by_ticket_and_scrubbed(
     assert "host stub.example.test" in texts
     assert run.evidence["recorded_exchanges"] == {"a": 2, "b": 1, "c": 1}
 
-    run.model = _RecordedModel([_recorded("x", "y")], [None])
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.model = _RecordedModel([_recorded("x", "cloned 192.0.2.10:34567")], [None])
     with pytest.raises(lanes.LaneError, match="no known ticket tag"):
         run.write_recording()
+    # A failed split leaves every committed file as it was.
+    assert {letter: path.read_text() for letter, path in run.transcripts.items()} == committed

@@ -1754,7 +1754,8 @@ the evidence.
 
 ## Scripted learned rules chain (#5799)
 
-`curie dev factory-e2e scripted --scenario learned-rules` proves the learned
+`curie dev factory-e2e scripted --scenario learned-rules --transcript
+tools/model-script/transcripts/learned-rules-chain-a.json` proves the learned
 rule chain from outside on one owned kind install, with the GitHub stub, the
 scripted model server and a disposable Dex. It reuses the scripted driver's
 install and ticket A (stub issue 3815), then a reviewer with write access

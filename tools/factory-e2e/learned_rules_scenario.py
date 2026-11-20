@@ -60,6 +60,8 @@ REQUESTER_APPLIED = re.compile(r"^Requester preferences: applied; sha256:[0-9a-f
 SENDER_FRAME = "[platform-sender"
 ASSERT_CALL = "assertAlmostEqual("
 PLACES = "places=6"
+# The keyword's value, so `places=60` or `places=6.5` never passes as six.
+_PLACES_SIX = re.compile(r"\bplaces\s*=\s*6(?![\d.])")
 _CODE = re.compile(r"memory_rules\.[a-z_]+")
 
 
@@ -237,6 +239,12 @@ def assert_promoted(step: Mapping[str, Any], pull_a: int, reply_url: str) -> Map
         isinstance(version, int) and not isinstance(version, bool) and version >= 1,
         f"the proposed rule has no version: {version!r}",
     )
+    # Compared before scrubbing, so a source that differs only in the stub's
+    # address (a dropped port) cannot pass as the same scrubbed URL.
+    _require(
+        step.get("source_matches_reply_target") is True,
+        "the rule's unscrubbed source is not the revision's unscrubbed reply target",
+    )
     source = rule.get("source_url")
     _require(source == reply_url, "the rule's source is not the revision's reply target")
     path = urlsplit(str(source)).path
@@ -310,6 +318,7 @@ def assert_ticket_b(step: Mapping[str, Any]) -> None:
             capture["close"] < requester,
             "B's learned rules section does not end before the requester section",
         )
+    _require(bool(others), "no reviewer prompt of B was captured, so none was checked")
     copied = [c.get("sequence") for c in others if c.get("open") is not None]
     _require(not copied, f"B's reviewer prompts carry the learned rules section: {copied}")
     lines = list(step.get("annotations") or [])
@@ -331,7 +340,7 @@ def assert_ticket_b(step: Mapping[str, Any]) -> None:
     )
     added = list(step.get("added_asserts") or [])
     _require(bool(added), "B's diff adds no assertAlmostEqual( call")
-    bare = [line for line in added if PLACES not in line]
+    bare = [line for line in added if not _PLACES_SIX.search(line)]
     _require(not bare, f"B's diff adds assertAlmostEqual( without {PLACES}: {bare}")
 
 

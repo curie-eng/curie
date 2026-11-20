@@ -25,6 +25,7 @@ import scripted_lanes as lanes
 from curie_api.factory_reply_target import feedback_url
 from curie_api.github_factory_review import _objective
 from curie_api.github_review_events import UnverifiedFeedback
+from curie_api.github_review_store import feedback_provenance
 from curie_runner.sender_frame import frame_user_turn
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -95,7 +96,10 @@ def _feedback(pull: int, fragment: str) -> UnverifiedFeedback:
 
 
 def _revision_text(pull: int, fragment: str = "issuecomment-501") -> str:
-    objective = _objective(_feedback(pull, fragment), feedback_url(BASE, REPO, pull, fragment), {})
+    feedback = _feedback(pull, fragment)
+    objective = _objective(
+        feedback_provenance(feedback), feedback_url(BASE, REPO, pull, fragment), {}
+    )
     return frame_user_turn("job", "", objective, "github")
 
 
@@ -436,7 +440,9 @@ def _marker_revision_text(address: str) -> str:
     )
     url = feedback_url(BASE, REPO, PULLS["a"], "issuecomment-2")
     objective = _objective(
-        _feedback(PULLS["a"], "issuecomment-2"), url, {"pull_request_body": body}
+        feedback_provenance(_feedback(PULLS["a"], "issuecomment-2")),
+        url,
+        {"pull_request_body": body},
     )
     return frame_user_turn("job", "", objective, "github")
 
@@ -519,3 +525,11 @@ def test_a_replayed_session_on_a_new_publication_branch_matches_its_recording(
         assert status == 200 and body["content"][0]["text"] == "a-review-0"
     else:
         assert status == 422
+
+
+def test_an_issue_naming_no_ticket_before_the_feedback_url_still_reaches_its_lane() -> None:
+    identity = lrl.issue_identity(_FakeStub())
+    url = feedback_url(BASE, REPO, PULLS["b"], "issuecomment-7")
+    text = f"See {BASE}/{REPO}/issues/999 and {BASE}/{REPO}/pull/{UNRELATED_PULL} first.\n{url}"
+    assert identity(_body(text)) == lrl.TICKETS["b"]
+    assert identity(_body(f"Only {BASE}/{REPO}/issues/999 here.")) is None

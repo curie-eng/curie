@@ -24,7 +24,7 @@ PUBLICATION_BRANCH_PLACEHOLDER = "curie/publication-<branch>"
 
 TICKETS: dict[str, int] = {"a": 3815, "b": 3921, "c": 3922}
 _BY_NUMBER = {number: letter for letter, number in TICKETS.items()}
-_ISSUE_OR_PULL = re.compile(r"/(?:issues|pull)/(\d+)")
+_PULL = re.compile(r"/pull/(\d+)")
 _ISSUE = re.compile(r"/issues/(\d+)")
 # The factory's closing reference is `Closes #<n>` (GitHubTracker.closing_reference).
 _CLOSES = re.compile(r"\b[Cc]loses #(\d+)\b")
@@ -67,8 +67,12 @@ def issue_identity(stub: Any) -> Callable[[dict[str, Any]], int | None]:
         issue = _ISSUE.search(text)
         if issue is not None and int(issue.group(1)) in _BY_NUMBER:
             return int(issue.group(1))
-        for found in _ISSUE_OR_PULL.finditer(text):
-            return ticket_of_pull(stub, int(found.group(1)))
+        # Otherwise the first pull request that closes a ticket; an issue or pull
+        # request that names no ticket is skipped, never the answer.
+        for found in _PULL.finditer(text):
+            ticket = ticket_of_pull(stub, int(found.group(1)))
+            if ticket is not None:
+                return ticket
         return None
 
     return identity

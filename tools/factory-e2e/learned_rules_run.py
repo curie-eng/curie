@@ -211,6 +211,16 @@ class LearnedRulesRun(sk.ScriptedRun):
             options["tag"] = lrl.ticket_tag(self.identity)
         return options
 
+    def model_transcript(self) -> Path:
+        """A recording's raw dump goes to the run directory: ModelScript.close writes
+        every exchange, unsplit and unscrubbed, and only a clean split may reach the
+        committed ticket files."""
+
+        if self.args.record:
+            assert self.workdir is not None
+            return self.workdir / "recording-raw.json"
+        return super().model_transcript()
+
     def make_router(self, model_module: Any) -> scripted_lanes.LaneRouter:
         assert self.identity is not None
         return lrl.build_router(model_module, self.transcripts, self.identity, self.replacements())
@@ -756,11 +766,11 @@ class LearnedRulesRun(sk.ScriptedRun):
         # Judge each step as it lands, so a broken link stops the run before the
         # next ticket's model calls are made; assert_chain still judges the whole.
         self.judge(lrs.assert_ticket_a, "a")
-        self.revise(github, pull_a)
+        raw_reply_url = self.revise(github, pull_a)
         # Steps are stored scrubbed, so later checks take the reply target the
-        # judge read from step b, never the raw stub URL revise saw.
+        # judge read from step b; promote compares the raw URLs itself.
         reply_url = self.judge(lrs.assert_revision, "b", pull_a)
-        rule = self.promote(pull_a, reply_url)
+        rule = self.promote(pull_a, raw_reply_url)
         rule = self.judge(lrs.assert_promoted, "c", pull_a, reply_url)
         accepted = self.accept(rule)
         self.judge(lrs.assert_decided, "d", rule)
@@ -826,11 +836,17 @@ class LearnedRulesRun(sk.ScriptedRun):
         return str(revision.get("reply_target_url") or "")
 
     def promote(self, pull_a: int, reply_url: str) -> dict[str, Any]:
-        """c: merging A's pull request makes one proposed rule."""
+        """c: merging A's pull request makes one proposed rule; ``reply_url`` is
+        the revision's unscrubbed reply target."""
 
         merged = self.stub.merge_pull(pull_a)
         rules = self.wait("the proposed rule", lambda: self.list_rules() or None)
-        self.record_step("c", merged=bool(merged.get("merged")), rules=rules)
+        self.record_step(
+            "c",
+            merged=bool(merged.get("merged")),
+            rules=rules,
+            source_matches_reply_target=all(r.get("source_url") == reply_url for r in rules),
+        )
         return dict(rules[0])
 
     def accept(self, rule: Mapping[str, Any]) -> dict[str, Any]:
@@ -929,8 +945,8 @@ class LearnedRulesRun(sk.ScriptedRun):
     def write_recording(self) -> None:
         """Split the proxied exchanges by ticket, scrub them, and write the three files.
 
-        ``ModelScript.close`` already dumped every exchange to the A file; this
-        overwrites it with ticket A's own.
+        ``ModelScript.close`` dumped every exchange to the run directory; a split
+        that fails leaves the committed files untouched.
         """
 
         model_module = sk._module("learned_rules_record_model_script", MODEL_SCRIPT)
