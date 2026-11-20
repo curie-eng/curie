@@ -570,19 +570,19 @@ def test_the_transcript_serves_the_asking_session_then_the_publishing_one(
 
     # Session 1 is the asking turn and the worker's one continuation turn, which
     # also ends; only then does session 2 start again from ordinal 0.
-    first = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(7)]
-    second = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(18)]
+    first = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(6)]
+    second = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(19)]
 
-    assert "mcp__curie__ask_questions" in _tools(first[4])
-    assert [first[n]["message"]["stop_reason"] for n in (5, 6)] == ["end_turn", "end_turn"]
-    assert first[6]["message"]["id"] == "msg_one_ticket_done_again"
+    assert "mcp__curie__ask_questions" in _tools(first[3])
+    assert [first[n]["message"]["stop_reason"] for n in (4, 5)] == ["end_turn", "end_turn"]
+    assert first[5]["message"]["id"] == "msg_one_ticket_done_again"
     assert all(e["message"]["id"] != "msg_one_ticket_done_again" for e in second)
     assert all("mcp__curie__publish_changes" not in _tools(e) for e in first)
-    assert "mcp__curie__publish_changes" in _tools(second[17])
+    assert "mcp__curie__publish_changes" in _tools(second[18])
     assert all("mcp__curie__ask_questions" not in _tools(e) for e in second)
     assert router.unrouted == []
     served_ordinals = router.evidence()["one-ticket"]["served_ordinals"]
-    assert served_ordinals == [*range(7), *range(18)]
+    assert served_ordinals == [*range(6), *range(19)]
 
 
 def test_the_asked_questions_are_exactly_two_and_the_publication_closes_the_issue() -> None:
