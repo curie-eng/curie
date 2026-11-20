@@ -191,11 +191,28 @@ def marker_of(properties: Any) -> str | None:
     return marker if isinstance(marker, str) and marker else None
 
 
+# The factory's marker prefixes. On Jira a marker is only ever the comment
+# property; the same words typed into a comment's text mark nothing.
+MARKER_PREFIXES = (ots.QUESTIONS_MARKER, "curie-execution-request:")
+
+
+def inert(text: str) -> str:
+    """``text`` with every marker prefix it shows broken, so visible words can
+    never stand in for the property the assertions require."""
+
+    for prefix in MARKER_PREFIXES:
+        text = text.replace(prefix, f"{prefix[:-1]} (visible text):")
+    return text
+
+
 def rendered(body: Any, properties: Any) -> str:
-    """A Jira comment as the GitHub-shaped body the assertions read."""
+    """A Jira comment as the GitHub-shaped body the assertions read.
+
+    The hidden first line comes only from the ``curie.factory`` property.
+    """
 
     marker = marker_of(properties)
-    text = adf_text(body)
+    text = inert(adf_text(body))
     return f"<!-- {marker} -->\n{text}" if marker else text
 
 

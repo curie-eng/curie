@@ -20,8 +20,8 @@ Two things are added around the fake, neither of them Jira:
    ``GET /_stub/state`` returns the site as a scenario observes it from outside:
    every issue with its labels and comments (body as stored ADF, entity
    properties), each comment's body and properties as they changed over time,
-   the request count per Jira operation, and every request no Jira route
-   served.
+   the request count per Jira operation, every request no Jira route
+   served, and when the poll read each issue's comments.
 
 On startup ``serve`` prints one JSON line, ``{"port": <port>}``, to stdout, and
 nothing else there. SIGTERM or SIGINT stops it.
@@ -39,6 +39,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -63,6 +64,7 @@ from starlette.routing import Route  # noqa: E402
 TOKEN_ENV = "CURIE_JIRA_STUB_CONTROL_TOKEN"
 TOKEN_HEADER = "X-Curie-Stub-Token"
 CONTROL_PREFIX = "/_stub/"
+COMMENT_LISTING = re.compile(r"/issue/([^/]+)/comment$")
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
@@ -94,6 +96,7 @@ class WallClockJira(jira_fake.JiraFake):
         super().__init__(start_ms=wall_ms(), **kwargs)
         self.unrouted: list[str] = []
         self.history: list[dict[str, Any]] = []
+        self.comment_reads: list[dict[str, str]] = []
         self._seen: dict[int, str] = {}
 
     @property  # type: ignore[override]
@@ -173,7 +176,28 @@ class WallClockJira(jira_fake.JiraFake):
             "history": copy.deepcopy(self.history),
             "requests": dict(Counter(request.kind for request in self.requests)),
             "unrouted": list(self.unrouted),
+            "comment_reads": list(self.comment_reads),
         }
+
+    def note_reads(self, served: list[jira_fake.Recorded]) -> None:
+        """Record each served newest-first comment listing: the poll's comment read.
+
+        The poll reads an issue's comments newest first back to its window
+        (``JiraTracker._recent_comments``); a status comment lookup reads them
+        oldest first. So a listing here is the intake having read the issue's
+        comments, at this instant.
+        """
+
+        for request in served:
+            found = COMMENT_LISTING.search(request.path)
+            if (
+                request.kind == "comments"
+                and request.method == "GET"
+                and request.status == 200
+                and request.params.get("orderBy") == "-created"
+                and found is not None
+            ):
+                self.comment_reads.append({"issue": found.group(1), "at": iso(self.now_ms)})
 
 
 class StubApp:
@@ -208,6 +232,7 @@ class StubApp:
             return
         before = len(self.site.requests)
         await self.site.app(scope, receive, send)
+        self.site.note_reads(self.site.requests[before:])
         if len(self.site.requests) == before:
             # No fake route took the request: not something Jira serves here.
             self.site.unrouted.append(f"{scope.get('method')} {path}")

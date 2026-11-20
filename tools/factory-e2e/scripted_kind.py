@@ -1828,9 +1828,11 @@ class ScriptedRun:
                 if not audited:
                     errors.append(str(exc))
             try:
-                self.evidence[field] = (
-                    service.unexpected if service is self.model else service.unknown_requests
-                )
+                audit = service.unexpected if service is self.model else service.unknown_requests
+                # A model audit entry carries the turn's input text. The Jira
+                # leg uploads its evidence publicly, so it records the count.
+                public = service is self.model and self.jira_enabled()
+                self.evidence[field] = len(audit) if public else audit
                 port = service.port
                 host = service.host
                 with socket.socket() as sock:

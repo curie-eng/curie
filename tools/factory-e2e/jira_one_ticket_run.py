@@ -21,11 +21,14 @@ shapes ``one_ticket_scenario`` judges, and holds the Jira-only assertions.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import selectors
+import signal
 import socket
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
 
@@ -132,6 +135,9 @@ class JiraStubProcess:
             stdout=subprocess.PIPE,
             stderr=self._log,
             text=True,
+            # Its own process group: ``uv run`` starts the server as a child, and
+            # teardown has to stop the server, not only the wrapper.
+            start_new_session=True,
         )
         assert self.process.stdout is not None
         selector = selectors.DefaultSelector()
@@ -158,24 +164,54 @@ class JiraStubProcess:
                 sock.getsockname() != sock.getpeername()
             )
 
+    def group_alive(self) -> bool:
+        """Whether any process of the stub's process group still exists."""
+
+        if self.process is None:
+            return False
+        try:
+            os.killpg(self.process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _stop_group(self, sig: signal.Signals, seconds: float) -> bool:
+        assert self.process is not None
+        try:
+            os.killpg(self.process.pid, sig)
+        except ProcessLookupError:
+            pass
+        bound = time.monotonic() + seconds
+        while time.monotonic() < bound:
+            self.process.poll()
+            if not self.group_alive():
+                return True
+            time.sleep(0.05)
+        return False
+
     def close(self) -> dict[str, Any]:
-        """Stop the stub and report what is left: its exit and its port."""
+        """Stop the stub's whole process group and report what is left.
+
+        ``exited`` holds only when no process of the group remains, so a server
+        that outlived its wrapper is reported, not hidden by the wrapper's exit.
+        """
 
         teardown: dict[str, Any] = {"started": self.process is not None, "port": self.port}
         if self.process is not None:
-            if self.process.poll() is None:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=15)
+            if self.process.poll() is None or self.group_alive():
+                if not self._stop_group(signal.SIGTERM, 15):
+                    self._stop_group(signal.SIGKILL, 15)
+            self.process.poll()
             if self.process.stdout is not None:
                 self.process.stdout.close()
             teardown["returncode"] = self.process.returncode
         if self._log is not None:
             self._log.close()
-        teardown["exited"] = self.process is None or self.process.returncode is not None
+        teardown["exited"] = self.process is None or (
+            self.process.returncode is not None and not self.group_alive()
+        )
         teardown["listening"] = self.listening()
         return teardown
 
@@ -229,14 +265,21 @@ class JiraOneTicket:
             time.sleep(1)
         raise JiraOneTicketError(f"{what} did not happen inside the command bound")
 
-    @staticmethod
-    def searches(state: dict[str, Any]) -> int:
-        """Intake passes: each poll of the tracker runs the label search once."""
+    def reads_since(self, state: dict[str, Any], after: datetime) -> int:
+        """Intake passes that read this ticket's comments after ``after``.
 
-        return int(state["requests"].get("search", 0))
+        The stub records each poll comment read it served (``comment_reads``);
+        one pass reads the ticket's comments once, after its label search.
+        """
 
-    def wait_for_intake_passes(self, since: int) -> None:
-        """Wait until the intake has searched the site QUIET_POLLS times since ``since``."""
+        return sum(
+            1
+            for read in state["comment_reads"]
+            if read["issue"] == self.issue_id and ots.instant(read["at"]) > after
+        )
+
+    def wait_for_intake_passes(self, after: datetime) -> None:
+        """Wait until QUIET_POLLS intake passes have read the ticket's comments after ``after``."""
 
         poll = float(self.driver.tracker_poll_seconds)
         bound = time.monotonic() + 4 * one_ticket_run.QUIET_POLLS * poll
@@ -244,12 +287,13 @@ class JiraOneTicket:
             bound = min(bound, self.driver.deadline)
 
         def looked(state: dict[str, Any]) -> bool:
+            passes = self.reads_since(state, after)
             if time.monotonic() >= bound:
                 raise JiraOneTicketError(
-                    f"the intake searched {self.searches(state) - since} times, "
+                    f"the intake read the ticket's comments {passes} times, "
                     f"expected {one_ticket_run.QUIET_POLLS}"
                 )
-            return self.searches(state) - since >= one_ticket_run.QUIET_POLLS
+            return passes >= one_ticket_run.QUIET_POLLS
 
         self.wait("the intake passes", looked)
 
@@ -372,9 +416,8 @@ class JiraOneTicket:
         self.evidence.update(work_item_id=str(item["id"]), asking_request_id=str(asking["id"]))
 
         # A plain comment from outside the start allowlist starts nothing.
-        since = self.searches(state)
-        self.jira.add_comment(self.issue_id, OUTSIDER_TEXT, ojt.OUTSIDER["account_id"])
-        self.wait_for_intake_passes(since)
+        outsider = self.jira.add_comment(self.issue_id, OUTSIDER_TEXT, ojt.OUTSIDER["account_id"])
+        self.wait_for_intake_passes(ots.instant(outsider["at"]))
         ots.assert_ignored_comments(len(observed["requests"]), len(self.observe()["requests"]))
 
         # The labeller's plain answer, the one authorized answer.
@@ -397,7 +440,7 @@ class JiraOneTicket:
         ots.assert_answer_receipts(observed["receipts"], str(answer["id"]), str(second["id"]))
 
         # Session 2 publishes, and nothing else starts.
-        self.wait_for_intake_passes(self.searches(self.state()))
+        self.wait_for_intake_passes(one_ticket_run.now())
         observed = self.observe()
         state = self.state()
         pulls = [self.github._fresh_pull(row) for row in self.github._rows("pull")]

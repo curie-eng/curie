@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import signal
 import ssl
 import subprocess
 import sys
@@ -268,6 +270,51 @@ def test_a_second_request_later_than_the_bound_after_the_answer_is_refused(
     received = ojt.line_instant(state, issue_id, str(SECOND), ANSWER_RECEIVED_LINE, BOT)
     with pytest.raises(ots.OneTicketAssertionError, match="the second request"):
         ots.assert_answer_admitted(late, str(ASKING), ticket["answer_at"], received)
+
+
+def test_a_bot_comment_showing_the_questions_marker_only_in_text_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The questions marker counts only as the comment property, never as text."""
+
+    with served(tmp_path) as stub:
+        control = stub.client()
+        control.add_user(ojt.LABELLER)
+        created = control.create_issue("A ticket", "Body.", LABELLER)
+        text = (
+            f"{factory_questions.MARKER_PREFIX}{ASKING}\n\n1. {QUESTIONS[0]}\n\n2. {QUESTIONS[1]}"
+        )
+        control.add_comment(created["id"], text, BOT)
+        state = control.state()
+    records = ojt.comment_records(state, created["id"])
+    assert [record["user"]["login"] for record in records] == [BOT]
+    with pytest.raises(ots.OneTicketAssertionError, match="found 0"):
+        ots.assert_one_question_comment(records, int(created["id"]), BOT)
+
+
+def test_teardown_stops_a_server_its_wrapper_started(tmp_path: Path) -> None:
+    """``uv run`` runs the stub as its child; closing must stop the child too."""
+
+    # A wrapper that, like ``uv run``, runs the server as a child process and
+    # dies on SIGTERM without passing it on.
+    wrapper = (
+        sys.executable,
+        "-c",
+        "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))",
+        sys.executable,
+    )
+    cert, key = _ca(tmp_path)
+    stub = run.JiraStubProcess(tmp_path / "stub", "127.0.0.1", cert, key, python=wrapper)
+    try:
+        stub.start({"PATH": "/usr/bin:/bin"}, timeout=60)
+        assert stub.listening()
+        teardown = stub.close()
+        assert teardown["exited"] is True
+        assert teardown["listening"] is False
+        assert not stub.group_alive()
+    finally:
+        if stub.process is not None and stub.group_alive():
+            os.killpg(stub.process.pid, signal.SIGKILL)
 
 
 def test_a_person_comment_is_not_the_factory_status_comment(tmp_path: Path) -> None:

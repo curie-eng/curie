@@ -310,3 +310,25 @@ def test_serve_refuses_to_start_without_a_control_token(tmp_path: Path) -> None:
     assert result.returncode == 2
     assert run.TOKEN_ENV in result.stderr
     assert result.stdout == ""
+
+
+@pytest.mark.anyio
+async def test_comment_reads_record_the_poll_read_and_not_a_status_lookup(tmp_path: Path) -> None:
+    """A driver waits on ``comment_reads`` for intake passes over a ticket."""
+
+    with served(tmp_path) as stub:
+        control = stub.client()
+        control.add_user(LABELLER)
+        created = control.create_issue("A ticket", "Body.", LABELLER["account_id"])
+        control.add_label(created["id"], LABEL, LABELLER["account_id"])
+        ref = _stub_ref(stub, created)
+        async with _tls_client(stub) as client:
+            tracker = _stub_tracker(stub, client)
+            # The status comment lookup lists the ticket's comments too.
+            await tracker.marked_comments.upsert_marked(
+                ReplyTarget.on_issue(ref), MARKER, QUESTIONS
+            )
+            assert control.state()["comment_reads"] == []
+            await tracker.poll_marked(None, running=(), answering=())
+        reads = control.state()["comment_reads"]
+    assert [read["issue"] for read in reads] == [created["id"]]
