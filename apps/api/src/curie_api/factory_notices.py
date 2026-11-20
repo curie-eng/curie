@@ -1705,7 +1705,7 @@ async def _render(
         None if progress_line or not base else f"{base}/v1/factory/cards/{row.card_token}.svg"
     )
     live_summary: str | None = None
-    if result is None and target.kind == "issue":
+    if result is None:
         current_view = view or phase_view(
             {"phases": [], "loops": []}, reports, request.status, cause
         )
@@ -1728,7 +1728,7 @@ async def _render(
             f"**{safe_tracker_line(state_line[:120])}**  \n{safe_tracker_line(update_line[:200])}"
         )
     ci_observation = await session.get(FactoryCiObservation, request.id)
-    if result is not None and triage is None and target.kind == "issue":
+    if result is not None and triage is None:
         platform_checks: list[tuple[str, str | None, str, str]] = []
         try:
             observations = await read_verification_observations(session, request.id)

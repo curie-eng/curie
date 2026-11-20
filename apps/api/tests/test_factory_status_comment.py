@@ -3399,6 +3399,37 @@ def test_an_unchanged_follow_up_is_answered_without_a_checklist(
     client, github, sink = admitted
     _number, revision = _running_revision(client, github, sink, fragment)
     assert report(client, revision, "plan", round=1).status_code == 201
+    _reconcile()
+    (live_comment,) = _marked(sink, revision)
+    assert "Running" in live_comment["body"]
+    assert "No progress note reported" in live_comment["body"]
+    handoff = client.post(
+        f"/v1/work-item-progress/{revision}/handoff",
+        headers={"X-API-Key": progress_token(revision)},
+        json={
+            "next_owner": "human",
+            "next_action": "Review the feedback answer",
+            "human_decision": "Confirm the existing decision",
+            "findings": [
+                {
+                    "summary": "Decision confirmation remains open",
+                    "owner": "human",
+                    "next_step": "Confirm the answer",
+                    "source": "agent_reported",
+                }
+            ],
+            "verification": [
+                {
+                    "check": "Existing decision covers the feedback",
+                    "command": "uv run pytest apps/api/tests/test_factory_status_comment.py",
+                    "state": "unverified",
+                    "source": "agent_reported",
+                    "acceptance_criteria": ["AC1"],
+                }
+            ],
+        },
+    )
+    assert handoff.status_code == 201, handoff.text
     detail = "No changes needed: Decisions entry 2 already records this approach."
     finished = _finish_unpublished(client, revision, cause="no_pull_request", detail=detail)
     assert finished.status_code == 200, finished.text
@@ -3407,6 +3438,12 @@ def test_an_unchanged_follow_up_is_answered_without_a_checklist(
 
     (comment,) = _marked(sink, revision)
     body = comment["body"]
+    assert body.startswith("## Run outcome\n")
+    assert "**Next owner:** human (agent reported)" in body
+    assert "**Next action:** Review the feedback answer (agent reported)" in body
+    assert "Decision confirmation remains open" in body
+    assert "**AC1 — Existing decision covers the feedback:** unverified" in body
+    assert f"In response to https://github.com/{REPO}/pull/" in body
     assert "Status: ANSWERED" in body
     assert "Status: SUCCEEDED" not in body
     assert detail in body
