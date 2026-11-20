@@ -3017,9 +3017,9 @@ before any other work.
 
 Every request the factory admits from a labelled ticket runs under the implementation
 completion contract and is served the rules pinned at admission; there is no separate
-triage path. A bundle that still carries `workflow/result.json` is refused at upload,
-push, deploy and promote with `bundle.result_declaration_retired`: delete the file and
-deploy again. The rule text rides the implementer's system prompt, so
+triage path. A bundle that still carries the retired result declaration (a result.json
+file in its workflow directory) is refused at upload, push, deploy and promote with
+`bundle.result_declaration_retired`: delete the file and deploy again. The rule text rides the implementer's system prompt, so
 the conversation transcript and its native checkpoint can retain it, under the transcript's
 own access controls and expiry and not the WorkItem snapshot's, as for requester
 preferences. A rule removed after a WorkItem was admitted can therefore remain in that
