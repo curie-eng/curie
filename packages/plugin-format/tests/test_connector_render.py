@@ -2662,3 +2662,87 @@ def test_grant_store_accepts_a_credential_free_address(address: str) -> None:
         )
     )
     assert entries["CURIE_CALLER_PROXY_GRANT_STORE"]["value"] == address
+
+
+# An operator-named ServiceAccount for one connector
+# (docs/interfaces/connector-host/INTERFACE.md, "A connector's own ServiceAccount").
+def _with_account(account: str | None, spec: ConnectorSpec = HOSTED) -> dict[str, dict]:
+    return _by_kind(
+        r.render(
+            release="acme-rel",
+            agent="acme-bot",
+            namespace="acme-ns",
+            app_name="curie",
+            connector="grafana",
+            spec=spec,
+            secret_name="conn-secrets",
+            proxy=_proxy(),
+            service_account=account,
+        )
+    )
+
+
+def test_a_named_service_account_lands_on_the_connector_pod() -> None:
+    pod = _with_account("acme-bot-grafana")["Deployment"]["spec"]["template"]["spec"]
+    assert pod["serviceAccountName"] == "acme-bot-grafana"
+    # Token mounting stays the ServiceAccount's own setting.
+    assert "automountServiceAccountToken" not in pod
+
+
+def test_a_named_service_account_moves_nothing_else() -> None:
+    named = _with_account("acme-bot-grafana")
+    baseline = _proxied()
+    assert named.keys() == baseline.keys()
+    for key in named:
+        if key != "Deployment":
+            assert named[key] == baseline[key], key
+    deployment = json.loads(json.dumps(named["Deployment"]))
+    assert deployment["spec"]["template"]["spec"].pop("serviceAccountName") == "acme-bot-grafana"
+    assert deployment == baseline["Deployment"]
+
+
+def test_an_unnamed_service_account_renders_the_same_bytes() -> None:
+    assert "serviceAccountName" not in _with_account(None)["Deployment"]["spec"]["template"][
+        "spec"
+    ]
+    cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        objs = r.render(
+            release="acme-rel",
+            agent="acme-bot",
+            namespace="acme-ns",
+            app_name="curie",
+            connector=case["connector"],
+            spec=ConnectorSpec.model_validate(case["spec"]),
+            secret_name="conn-secrets",
+            proxy=_caller_proxy(),
+            service_account=None,
+        )
+        canonical = json.dumps(objs, sort_keys=True, separators=(",", ":"))
+        assert hashlib.sha256(canonical.encode()).hexdigest() == case["sha256"], case["name"]
+
+
+@pytest.mark.parametrize(
+    "account",
+    ["", "Acme-Bot", "acme_bot", "-acme", "acme-", "acme..bot", "a" * 254],
+)
+def test_a_service_account_that_is_not_a_kubernetes_name_is_refused(account: str) -> None:
+    with pytest.raises(ValueError, match="service_account"):
+        _with_account(account)
+
+
+def test_a_remote_connector_renders_nothing_with_a_named_service_account() -> None:
+    assert (
+        r.render(
+            release="acme-rel",
+            agent="acme-bot",
+            namespace="acme-ns",
+            app_name="curie",
+            connector="remote",
+            spec=REMOTE,
+            secret_name="conn-secrets",
+            proxy=_proxy(),
+            service_account="acme-bot-remote",
+        )
+        == []
+    )
