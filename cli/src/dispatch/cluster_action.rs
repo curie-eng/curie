@@ -1798,7 +1798,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 conn,
                 dry_run,
             } = target;
-            let rule_scope = if rules.rules {
+            let rule_scope = if rules.rules || rules.action().is_some() {
                 commands::RuleScopeFilter::resolve(
                     channel.clone(),
                     rules.agent_scope,
@@ -1822,6 +1822,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         rule_id,
                         expected_version,
                         session_file,
+                        scope: rule_scope,
                         api_url: conn.api_url,
                         namespace: conn.namespace,
                         release: conn.release,

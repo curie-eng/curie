@@ -1184,6 +1184,8 @@ pub struct MemoryRules {
 pub enum MemoryRuleAppliesFrom {
     #[serde(rename = "next_ticket")]
     NextTicket,
+    #[serde(rename = "next_session")]
+    NextSession,
 }
 
 /// An accept, reject or remove answer (`MemoryRuleDecisionOut`).

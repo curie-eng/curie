@@ -9142,7 +9142,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Accept this proposed rule. Needs --expected-version and --session-file",
+              "help": "Accept this proposed rule. With --channel KIND=ADDRESS or --agent-scope the rule must be in that scope or nothing is sent. Needs --expected-version and --session-file",
               "id": "accept",
               "long": "accept",
               "positional": false,

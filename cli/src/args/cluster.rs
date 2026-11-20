@@ -112,15 +112,15 @@ pub(crate) struct SubscriptionSession {
 /// private session file and never the platform key.
 #[derive(Args, Debug, Default, Clone)]
 #[group(skip)]
+#[command(group(clap::ArgGroup::new("rule_surface").multiple(true)))]
 pub(crate) struct MemoryRuleArgs {
     /// List learned rules (`GET /agents/{id}/memory/rules`).
     #[arg(
         long,
         conflicts_with_all = [
             "add", "delete", "guidance", "guidance_from", "reset_guidance",
-            "accept", "reject", "remove",
         ],
-        group = "rule_verb"
+        group = "rule_surface"
     )]
     pub(crate) rules: bool,
     /// With --rules, show only rules in this state: proposed, accepted,
@@ -140,18 +140,19 @@ pub(crate) struct MemoryRuleArgs {
     /// bound channel instead.
     #[arg(
         long,
-        requires = "rules",
+        requires = "rule_surface",
         conflicts_with_all = ["channel", "scope_key"]
     )]
     pub(crate) agent_scope: bool,
-    /// Accept this proposed rule. Needs --expected-version and --session-file.
+    /// Accept this proposed rule. With --channel KIND=ADDRESS or --agent-scope
+    /// the rule must be in that scope or nothing is sent. Needs --expected-version and --session-file.
     #[arg(
         long,
         value_name = "RULE_ID",
-        groups = ["rule_action", "rule_verb"],
+        groups = ["rule_action", "rule_verb", "rule_surface"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
-            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
             "reject", "remove",
         ]
     )]
@@ -160,10 +161,10 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(
         long,
         value_name = "RULE_ID",
-        groups = ["rule_action", "rule_verb"],
+        groups = ["rule_action", "rule_verb", "rule_surface"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
-            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
             "accept", "remove",
         ]
     )]
@@ -172,10 +173,10 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(
         long,
         value_name = "RULE_ID",
-        groups = ["rule_action", "rule_verb"],
+        groups = ["rule_action", "rule_verb", "rule_surface"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
-            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
             "accept", "reject",
         ]
     )]
@@ -192,7 +193,7 @@ pub(crate) struct MemoryRuleArgs {
     /// Console session cookie, __Host-curie_console_session. Used by --accept,
     /// --reject and --remove, which never send the platform key. With --rules
     /// it lists with the session instead of the platform key.
-    #[arg(long, value_name = "PATH", requires = "rule_verb")]
+    #[arg(long, value_name = "PATH", requires = "rule_surface")]
     pub(crate) session_file: Option<PathBuf>,
 }
 

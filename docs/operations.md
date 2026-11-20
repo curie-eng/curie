@@ -3099,7 +3099,13 @@ the API object. `curie cluster memory <agent> --accept RULE_ID
 `--remove` take the same arguments. The session file holds only the console
 session cookie value and must be readable by its owner alone (mode 0600 or
 stricter). Acting never sends the platform key. `--dry-run` prints the request
-it would send without sending it.
+it would send without sending it. `--rules` may accompany a decision verb; the
+verb decides and nothing extra is listed. `--channel KIND=ADDRESS` or
+`--agent-scope` beside a decision verb asserts the rule's scope: the CLI lists
+that scope with the same session file first and, when the rule id is not in it,
+exits non zero and sends no decision. Without a scope flag no list request is
+made. A decision on a channel or agent scope rule reports that it takes effect
+at the agent's next session; a running session keeps the rules it started with.
 
 ### Driving the deployed agent
 

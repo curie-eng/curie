@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use super::AgentActionOpts;
 use crate::api::{
-    ApiClient, MemoryRule, MemoryRuleChange, MemoryRuleState, MemoryRules, OwnerApiClient,
+    ApiClient, MemoryRule, MemoryRuleAppliesFrom, MemoryRuleChange, MemoryRuleState, MemoryRules,
+    OwnerApiClient,
 };
 use crate::exit::CliError;
 use crate::ui::{CliOutput, DryRunPlan, Ui};
@@ -79,6 +80,8 @@ pub struct MemoryRuleActOpts {
     pub rule_id: String,
     pub expected_version: i64,
     pub session_file: PathBuf,
+    /// A scope the rule must be in; empty means no check and no extra request.
+    pub scope: RuleScopeFilter,
     pub api_url: Option<String>,
     pub namespace: String,
     pub release: String,
@@ -111,6 +114,11 @@ pub struct RuleScopeFilter {
 }
 
 impl RuleScopeFilter {
+    /// Whether any scope flag narrowed the filter.
+    pub fn is_set(&self) -> bool {
+        self.kind.is_some() || self.key.is_some()
+    }
+
     /// Resolve the `--channel`, `--agent-scope` and `--scope-key` flags.
     pub fn resolve(
         channel: Option<String>,
@@ -263,8 +271,14 @@ pub async fn memory_rule_act(opts: MemoryRuleActOpts) -> Result<MemoryRulesOutpu
         } else {
             api_url.trim_end_matches('/').to_string()
         };
-        return Ok(MemoryRulesOutput::DryRun(DryRunPlan {
-            lines: vec![
+        let mut lines = Vec::new();
+        if opts.scope.is_set() {
+            lines.push(format!(
+                "GET {base}/agents/<id>/memory/rules{}  (scope check: refuse unless the rule is listed)",
+                query_string(&None, &opts.scope)
+            ));
+        }
+        lines.extend([
                 format!(
                     "POST {base}/agents/<id>/memory/rules/{rule_id}/{action}  (would resolve agent {:?} first)",
                     opts.agent
@@ -274,11 +288,33 @@ pub async fn memory_rule_act(opts: MemoryRuleActOpts) -> Result<MemoryRulesOutpu
                     "credential: Console session cookie from {} (value not shown); no platform key",
                     opts.session_file.display()
                 ),
-            ],
-        }));
+        ]);
+        return Ok(MemoryRulesOutput::DryRun(DryRunPlan { lines }));
     }
     let client = OwnerApiClient::new(&api_url, cookie)?;
     let agent = client.find_agent(&opts.agent).await?;
+    if opts.scope.is_set() {
+        let listed = client
+            .list_memory_rules(
+                &agent.id,
+                None,
+                opts.scope.kind.as_deref(),
+                opts.scope.key.as_deref(),
+            )
+            .await?;
+        if !listed
+            .rules
+            .iter()
+            .any(|r| r.id.hyphenated().to_string() == rule_id)
+        {
+            let fix = "list that scope with `curie cluster memory <agent> --rules` and copy the rule id from it";
+            return Err(CliError::usage(format!(
+                "rule {rule_id} is not in the requested scope; no decision was sent"
+            ))
+            .with_fix(fix)
+            .into());
+        }
+    }
     let body = crate::api_requests::MemoryRuleDecision {
         expected_version: opts.expected_version,
     };
@@ -335,8 +371,14 @@ fn render_rules(ui: &Ui, rules: &MemoryRules) {
 
 fn render_change(ui: &Ui, verb: MemoryRuleVerb, change: &MemoryRuleChange) {
     let rule = &change.rule;
+    let when = match change.applies_from {
+        MemoryRuleAppliesFrom::NextTicket => "applies from the next ticket",
+        MemoryRuleAppliesFrom::NextSession => {
+            "takes effect at the agent's next session in that channel; a running session keeps the rules it started with"
+        }
+    };
     ui.payload(&format!(
-        "{} rule {} ({}); applies from the next ticket",
+        "{} rule {} ({}); {when}",
         verb.past_tense(),
         plain(&rule.label),
         plain(&rule.scope_label),
