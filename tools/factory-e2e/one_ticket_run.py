@@ -303,7 +303,7 @@ class OneTicket:
             second_request_id=str(second["id"]),
             answer_comment_id=answer["id"],
             follow_up_comment_id=follow_up["id"],
-            pull_request=pull["html_url"],
+            pull_request=pull["number"],
             investigating_seconds=(self.sightings["investigating"] - label_at).total_seconds(),
             answer_received_seconds=(self.sightings["answer_received"] - answer_at).total_seconds(),
             second_request_seconds=(ots.instant(second["created_at"]) - answer_at).total_seconds(),
