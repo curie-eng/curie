@@ -97,6 +97,9 @@ class WallClockJira(jira_fake.JiraFake):
         self.unrouted: list[str] = []
         self.history: list[dict[str, Any]] = []
         self.comment_reads: list[dict[str, str]] = []
+        # Requests already looked at: concurrent requests share the log, so
+        # one request can fall in another's slice before its own ends.
+        self._noted: set[int] = set()
         self._seen: dict[int, str] = {}
 
     @property  # type: ignore[override]
@@ -189,6 +192,9 @@ class WallClockJira(jira_fake.JiraFake):
         """
 
         for request in served:
+            if id(request) in self._noted or request.status == 0:
+                continue
+            self._noted.add(id(request))
             found = COMMENT_LISTING.search(request.path)
             if (
                 request.kind == "comments"

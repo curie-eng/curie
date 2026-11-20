@@ -26,6 +26,7 @@ import secrets
 import selectors
 import signal
 import socket
+import sqlite3
 import subprocess
 import time
 from datetime import datetime
@@ -47,6 +48,8 @@ START_SECONDS = 900
 OUTSIDER_TEXT = "I would also like this."
 # Past the last recorded check run, as the publication scenario advances it.
 CHECK_REPLAY_SECONDS = 1800
+# How long the end-of-run observation may take, whatever the command bound left.
+OUTCOME_SECONDS = 60
 
 
 class JiraOneTicketError(RuntimeError):
@@ -228,6 +231,7 @@ class JiraOneTicket:
         self.jira = stub.client()
         self.evidence: dict[str, Any] = {"scenario": "jira-one-ticket", "result": "failed"}
         self.issue_id = ""
+        self.baseline_pulls: list[int] = []
 
     # Observation -----------------------------------------------------------
 
@@ -299,6 +303,21 @@ class JiraOneTicket:
 
         self.wait("the intake passes", looked)
 
+    def wait_for_intake_decision(self, after_ms: int) -> None:
+        """Wait until the intake has decided every notice up to ``after_ms``.
+
+        The stored poll cursor is the durable record: it is saved only after
+        every notice of a page was applied or refused, and its time is the
+        newest issue update the page held. A time at or after a comment's
+        creation means a page that held the comment was decided.
+        """
+
+        def decided(state: dict[str, Any]) -> bool:
+            stored = ojt.cursor_time_ms(self.driver.sql(ojt.cursor_sql(ots.LABEL)))
+            return stored is not None and stored >= after_ms
+
+        self.wait("the intake's decision on the outsider's comment", decided)
+
     def asked(self, baseline_pulls: list[int]) -> dict[str, Any]:
         """Wait for session 1's questions and for its request to finish asking."""
 
@@ -362,37 +381,51 @@ class JiraOneTicket:
         try:
             self.drive()
         finally:
-            try:
-                self.evidence.update(self.outcome())
-            except (OSError, ValueError, KeyError, ojt.JiraStubError) as exc:
-                # A stub or install that stopped answering must not hide why the drive failed.
-                self.evidence["outcome_error"] = str(exc)
+            self.record_outcome()
 
-    def outcome(self) -> dict[str, Any]:
-        """What the ticket's records show at the end, pass or fail.
+    def record_outcome(self) -> None:
+        """Record what the ticket's records show at the end, pass or fail.
 
-        Request statuses and the factory's own comments as a reader sees them,
-        so a failed run says where the flow stopped. Every value is fixture
-        text or platform output about the fixture.
+        Request statuses, status comment records and the factory's comments as
+        fixed facts, so a failed run says where the flow stopped. It never
+        raises: an observation that fails is named, and the drive's own error
+        stands. The SQL reads get their own short deadline, since the drive
+        may have spent the command's.
         """
 
-        state = self.state()
-        found: dict[str, Any] = {"jira_requests": state["requests"]}
+        try:
+            pulls = ots.new_pulls(self.github._rows("pull"), self.baseline_pulls)
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            pulls = []
+        pull_url = str(pulls[0].get("html_url")) if len(pulls) == 1 else None
+        try:
+            state = self.state()
+        except (OSError, ValueError, ojt.JiraStubError) as exc:
+            self.evidence["outcome_errors"] = [f"jira stub: {type(exc).__name__}"]
+            return
+        self.evidence["jira_requests"] = state["requests"]
         if not self.issue_id:
-            return found
-        observed = self.observe()
-        found["requests"] = [
-            {key: request.get(key) for key in ("id", "sequence", "status", "terminal_cause")}
-            for request in observed["requests"]
-        ]
-        found["status_comments"] = observed["notices"]
-        found["bot_comments"] = [
-            {"id": comment["id"], "text": comment["body"][:2000]}
+            return
+        self.evidence["labels"] = ojt.issue_of(state, self.issue_id)["labels"]
+        self.evidence["bot_comments"] = [
+            ojt.comment_outcome(comment, pull_url)
             for comment in ojt.comment_records(state, self.issue_id)
             if comment["user"]["login"] == ojt.BOT_ACCOUNT_ID
         ]
-        found["labels"] = ojt.issue_of(state, self.issue_id)["labels"]
-        return found
+        previous = self.driver.deadline
+        self.driver.deadline = time.monotonic() + OUTCOME_SECONDS
+        try:
+            observed = self.observe()
+        except Exception as exc:  # noqa: BLE001 - a diagnostic never replaces the drive's error
+            self.evidence["outcome_errors"] = [f"observation: {type(exc).__name__}"]
+            return
+        finally:
+            self.driver.deadline = previous
+        self.evidence["requests"] = [
+            {key: request.get(key) for key in ("id", "sequence", "status", "terminal_cause")}
+            for request in observed["requests"]
+        ]
+        self.evidence["status_comments"] = observed["notices"]
 
     def drive(self) -> None:
         bot = ojt.BOT_ACCOUNT_ID
@@ -404,6 +437,7 @@ class JiraOneTicket:
 
         # One human label on one fresh Jira issue.
         baseline_pulls = [int(row["number"]) for row in self.github._rows("pull")]
+        self.baseline_pulls = baseline_pulls
         title, body = one_ticket_run.issue_title_and_body()
         created = self.jira.create_issue(title, body, labeller)
         self.issue_id, key = created["id"], created["key"]
@@ -432,7 +466,7 @@ class JiraOneTicket:
 
         # A plain comment from outside the start allowlist starts nothing.
         outsider = self.jira.add_comment(self.issue_id, OUTSIDER_TEXT, ojt.OUTSIDER["account_id"])
-        self.wait_for_intake_passes(ots.instant(outsider["at"]))
+        self.wait_for_intake_decision(ojt.instant_ms(outsider["at"]))
         ots.assert_ignored_comments(len(observed["requests"]), len(self.observe()["requests"]))
 
         # The labeller's plain answer, the one authorized answer.

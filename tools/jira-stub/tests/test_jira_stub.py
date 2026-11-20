@@ -11,6 +11,7 @@ same answers from both.
 from __future__ import annotations
 
 import base64
+import importlib.util
 import re
 import ssl
 import subprocess
@@ -332,3 +333,32 @@ async def test_comment_reads_record_the_poll_read_and_not_a_status_lookup(tmp_pa
             await tracker.poll_marked(None, running=(), answering=())
         reads = control.state()["comment_reads"]
     assert [read["issue"] for read in reads] == [created["id"]]
+
+
+def test_a_comment_read_in_two_overlapping_request_slices_counts_once() -> None:
+    """Concurrent requests share the fake's log, so slices can overlap."""
+
+    spec = importlib.util.spec_from_file_location("jira_stub_under_test", run.STUB)
+    assert spec is not None and spec.loader is not None
+    stub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stub)
+    site = stub.WallClockJira()
+
+    def listing(status: int) -> Any:
+        return fake_jira.Recorded(
+            kind="comments",
+            method="GET",
+            host="127.0.0.1",
+            path=f"/ex/jira/{ojt.CLOUD_ID}/rest/api/3/issue/10001/comment",
+            params={"orderBy": "-created"},
+            json=None,
+            authorization=None,
+            status=status,
+        )
+
+    first, second = listing(200), listing(0)
+    site.note_reads([first, second])  # the first request ends while the second runs
+    second.status = 200
+    site.note_reads([second])  # the second request's own slice
+    site.note_reads([first, second])  # a later slice that still holds both
+    assert [read["issue"] for read in site.comment_reads] == ["10001", "10001"]

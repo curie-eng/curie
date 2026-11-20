@@ -402,3 +402,83 @@ def test_the_scripted_driver_validates_the_jira_scenario() -> None:
     args.record = True
     with pytest.raises(sk.fe.ConfigError, match="only the publication scenario"):
         sk.validate_configuration(args)
+
+
+def test_comment_outcome_keeps_fixed_facts_and_no_run_specific_text() -> None:
+    pull_url = "https://10.0.0.9:33285/acme-corp/acme-bot/pull/1"
+    body = (
+        f"<!-- curie-execution-request:{SECOND} -->\n"
+        f"{ANSWER_RECEIVED_LINE}\n"
+        "Could not complete: the worker failed reading /home/runner/work/tmp/x.json\n"
+        "Cause: execution_deadline\n"
+        f"Pull request: {pull_url} (open)\n"
+        "Status: NEEDS HUMAN"
+    )
+    outcome = ojt.comment_outcome({"id": "10104", "body": body}, pull_url)
+    assert outcome == {
+        "id": "10104",
+        "marker": "status",
+        "lines": [ots.ANSWER_RECEIVED_LINE, "Could not complete:"],
+        "status": "NEEDS HUMAN",
+        "cause": "execution_deadline",
+        "names_pull_request": True,
+    }
+    published = json.dumps(outcome)
+    assert "10.0.0.9" not in published and "/home/" not in published
+
+
+def test_the_poll_cursor_time_is_read_from_its_stored_form() -> None:
+    assert ojt.cursor_time_ms("1763625600123;c10102,h10100") == 1763625600123
+    assert ojt.cursor_time_ms("") is None
+    assert ojt.cursor_time_ms("not-a-cursor") is None
+    assert ojt.cursor_time_ms(None) is None
+    assert "marked:' || 'factory'" in ojt.cursor_sql("factory")
+
+
+class _Github:
+    def _rows(self, kind: str) -> list[dict[str, Any]]:
+        return []
+
+
+class _Driver:
+    def __init__(self) -> None:
+        self.stub = _Github()
+        self.deadline: float | None = 0.0
+
+    def sql(self, query: str) -> Any:
+        raise RuntimeError("kubectl exec timed out")
+
+
+class _Stub:
+    def client(self) -> Any:
+        stub = self
+
+        class Client:
+            def state(self) -> dict[str, Any]:
+                return stub.state
+
+        return Client()
+
+    state: dict[str, Any] = {
+        "requests": {"search": 3},
+        "issues": [{"id": "10001", "key": "PROJ-1", "labels": ["factory"], "comments": []}],
+        "history": [],
+    }
+
+
+def test_a_failed_end_observation_never_replaces_the_drive_error() -> None:
+    driver = _Driver()
+    scenario = run.JiraOneTicket(driver, _Stub())  # type: ignore[arg-type]
+    scenario.issue_id = "10001"
+
+    def drive() -> None:
+        raise run.JiraOneTicketError("the answered run did not happen")
+
+    scenario.drive = drive  # type: ignore[method-assign]
+    with pytest.raises(run.JiraOneTicketError, match="the answered run did not happen"):
+        scenario.execute()
+    assert scenario.evidence["outcome_errors"] == ["observation: RuntimeError"]
+    assert scenario.evidence["jira_requests"] == {"search": 3}
+    assert scenario.evidence["labels"] == ["factory"]
+    # The command's own deadline is restored after the bounded observation.
+    assert driver.deadline == 0.0

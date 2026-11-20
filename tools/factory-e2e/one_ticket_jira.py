@@ -360,3 +360,66 @@ def notices_sql(issue_id: str) -> str:
         "JOIN curie.work_items w ON w.id=r.work_item_id "
         f"WHERE w.tracker_kind='jira_cloud' AND w.tracker_issue_id='{number}'"
     )
+
+
+def cursor_sql(label: str) -> str:
+    """The Jira site's stored poll cursor for ``label``, read-only, as JSON text.
+
+    The tracker intake saves it only after every notice of a page was applied
+    or deliberately refused (``factory_tracker_intake``), and its time is the
+    newest issue update the page held.
+    """
+
+    return (
+        "SELECT to_json(coalesce((SELECT etags->>'marked:' || "
+        f"'{label}' FROM curie.factory_poll_cursors "
+        f"WHERE tracker_kind='jira_cloud' AND tracker_scope_id='{CLOUD_ID}'),''))"
+    )
+
+
+def cursor_time_ms(cursor: Any) -> int | None:
+    """The time of a Jira poll cursor ``<epoch ms>;<ids>``, or None."""
+
+    if not isinstance(cursor, str):
+        return None
+    head, separator, _ids = cursor.partition(";")
+    return int(head) if separator and head.isascii() and head.isdigit() else None
+
+
+def instant_ms(value: Any) -> int:
+    return int(ots.instant(value).timestamp() * 1000)
+
+
+# Evidence --------------------------------------------------------------------
+
+_STATUS_LINE = re.compile(r"^Status: ([A-Z][A-Z ]*)$", re.MULTILINE)
+_CAUSE_LINE = re.compile(r"^Cause: ([a-z][a-z0-9_]*)$", re.MULTILINE)
+_KNOWN_LINES = (ots.INVESTIGATING_LINE, ots.ANSWER_RECEIVED_LINE, "Could not complete:")
+
+
+def comment_outcome(record: Mapping[str, Any], pull_url: str | None) -> dict[str, Any]:
+    """A factory comment as fixed facts for public evidence, never its text.
+
+    A status comment can quote run-specific URLs and worker-supplied detail,
+    so only its marker kind, the platform's fixed lines it shows, its status
+    and cause codes, and whether it names the pull request are kept.
+    """
+
+    body = str(record["body"])
+    first = body.split("\n", 1)[0]
+    if first.startswith(f"<!-- {ots.QUESTIONS_MARKER}"):
+        marker = "questions"
+    elif first.startswith("<!-- curie-execution-request:"):
+        marker = "status"
+    else:
+        marker = None
+    status = _STATUS_LINE.search(body)
+    cause = _CAUSE_LINE.search(body)
+    return {
+        "id": str(record["id"]),
+        "marker": marker,
+        "lines": [line for line in _KNOWN_LINES if line in body],
+        "status": status.group(1) if status else None,
+        "cause": cause.group(1) if cause else None,
+        "names_pull_request": bool(pull_url) and str(pull_url) in body,
+    }
