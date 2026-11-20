@@ -65,3 +65,21 @@ call `start()`, set clients' trust to `ca_file`, advance replay time with
 automatically. A replay proves local
 factory boundary behavior; it does not replace the required live factory and
 external integration evidence.
+
+Two more seeded accounts exist for learned rule scenarios. `RULE_WRITER`, id 6630,
+login `rule-writer`, has write permission. `RULE_READER`, id 6631, login
+`rule-reader`, has read permission. `GET /user/{id}` (also under `/api/v3`)
+answers any seeded or added collaborator by numeric id with its user object, and
+answers 404 for an unknown id, as GitHub does
+(https://docs.github.com/en/rest/users/users#get-a-user-using-their-id).
+`add_issue_comment` and `append_comment` take an optional `author_association`
+such as `MEMBER` or `COLLABORATOR`, and a comment row carries it only when given.
+
+A pull request's conversation behaves like GitHub's: `GET` and `POST` on
+`issues/{n}/comments` work for a pull request number even though the stub keeps
+no issue row for it, and both comment helpers accept a pull request number.
+Comments on a pull request link to `/pull/{n}`. `merge_pull(number)` fast-forwards
+`main` to the pull request head, marks the pull request closed and merged with
+`merged_at` and `merge_commit_sha`, and returns the fresh pull request. It raises
+`ValueError` when the head is not a fast-forward of the base or the pull request
+is not open. Pull request reads carry `merged_at`, `draft` and `updated_at`.

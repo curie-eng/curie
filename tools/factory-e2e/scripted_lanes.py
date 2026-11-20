@@ -142,13 +142,20 @@ class Lane:
 class LaneRouter:
     """Route each model request to its agent's lane on its issue."""
 
-    def __init__(self, agent_markers: dict[str, str], default_agent: str = IMPLEMENTATION) -> None:
+    def __init__(
+        self,
+        agent_markers: dict[str, str],
+        default_agent: str = IMPLEMENTATION,
+        *,
+        issue_of: Callable[[dict[str, Any]], int | None] = request_issue,
+    ) -> None:
         # No marker at all is a router of one agent: every request is the default
         # agent's, and the lanes tell its issues apart.
         if default_agent in agent_markers:
             raise LaneError("name the non-default agents by their bundle system prompts")
         self.agent_markers = dict(agent_markers)
         self.default_agent = default_agent
+        self.issue_of = issue_of
         self.lanes: dict[tuple[str, int], Lane] = {}
         self.unrouted: list[dict[str, Any]] = []
         self.hooks: list[Callable[[Lane, int], None]] = []
@@ -173,16 +180,20 @@ class LaneRouter:
             raise LaneError("a request carries more than one agent's system prompt")
         return matches[0] if matches else self.default_agent
 
-    def install(self, script: Any, model_module: Any) -> None:
-        """Answer ``script``'s requests through the lanes; its own transcript is the fallback."""
+    def install(self, script: Any, model_module: Any, *, fallback: bool = True) -> None:
+        """Answer ``script``'s requests through the lanes.
 
-        self._fallback = script._match
+        Its own transcript is the fallback unless ``fallback`` is False, in which
+        case a request no lane claims is recorded in ``unrouted`` and refused.
+        """
+
+        self._fallback = script._match if fallback else None
         self._request_key = model_module.request_key
         self._parse = model_module._safe_json
         script._match = self.match
 
     def lane_for(self, request: dict[str, Any]) -> Lane | None:
-        issue = request_issue(request)
+        issue = self.issue_of(request)
         if issue is None:
             return None
         agent = self.agent_of(request)
@@ -201,6 +212,10 @@ class LaneRouter:
         lane = self.lane_for(request) if method == "POST" and path == "/v1/messages" else None
         if lane is None:
             if self._fallback is None:
+                if method == "POST" and path == "/v1/messages":
+                    self.unrouted.append(
+                        {"agent": self.agent_of(request), "issue": self.issue_of(request)}
+                    )
                 return None
             if self.agent_of(request) != self.default_agent:
                 # A non-default agent never borrows the default transcript.

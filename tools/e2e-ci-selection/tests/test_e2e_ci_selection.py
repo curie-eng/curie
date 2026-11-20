@@ -5125,6 +5125,10 @@ FRESH_INSTALL_TEST = "test_fresh_cluster_up_converges_without_rerun"
 SCRIPTED_PUBLICATION_COMMAND = (
     "python3 tools/factory-e2e/factory_e2e.py scripted --scenario publication"
 )
+SCRIPTED_LEARNED_RULES_COMMAND = (
+    "python3 tools/factory-e2e/factory_e2e.py scripted --scenario learned-rules"
+    " --transcript tools/model-script/transcripts/learned-rules-chain-a.json"
+)
 SCRIPTED_FACTORY_LEGS = (
     ("scenario", lambda run: run == SCRIPTED_PUBLICATION_COMMAND),
     *(
@@ -5144,8 +5148,12 @@ SCRIPTED_FACTORY_LEGS = (
         "fresh-install",
         lambda run: run == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
     ),
+    ("learned-rules", lambda run: run == SCRIPTED_LEARNED_RULES_COMMAND),
 )
-SCRIPTED_FACTORY_EVIDENCE_STEP = "Upload scripted factory evidence"
+SCRIPTED_FACTORY_EVIDENCE_STEPS = {
+    "Upload scripted factory evidence": "always() && matrix.suite == 'scenario'",
+    "Upload scripted learned rules evidence": "always() && matrix.suite == 'learned-rules'",
+}
 
 
 def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
@@ -5170,14 +5178,13 @@ def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
     for step in steps:
         if "matrix.suite" not in json.dumps(step) or any(step is owner for owner in claimed):
             continue
-        if not (
-            step.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP
-            and step.get("if") == "always() && matrix.suite == 'scenario'"
-        ):
+        expected = SCRIPTED_FACTORY_EVIDENCE_STEPS.get(step.get("name"))
+        if expected is None or step.get("if") != expected:
             raise AssertionError(f"unexpected matrix.suite use in step {step.get('name')!r}")
-    evidence = [s for s in steps if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP]
-    if len(evidence) != 1 or evidence[0].get("if") != "always() && matrix.suite == 'scenario'":
-        raise AssertionError("evidence upload must run only in the scenario leg")
+    for name, guard in SCRIPTED_FACTORY_EVIDENCE_STEPS.items():
+        evidence = [s for s in steps if s.get("name") == name]
+        if len(evidence) != 1 or evidence[0].get("if") != guard:
+            raise AssertionError(f"{name!r} must appear once and run only in its own leg")
 
 
 def _scripted_factory_step(job: dict[str, Any], leg: str) -> dict[str, Any]:
@@ -5206,8 +5213,31 @@ def _enable_fail_fast(job: dict[str, Any]) -> None:
 
 
 def _unguard_evidence(job: dict[str, Any]) -> None:
-    evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP)
+    evidence = next(s for s in job["steps"] if s.get("name") == "Upload scripted factory evidence")
     evidence["if"] = "always()"
+
+
+def _drop_learned_rules_leg(job: dict[str, Any]) -> None:
+    job["strategy"]["matrix"]["suite"].remove("learned-rules")
+
+
+def _unguard_learned_rules_evidence(job: dict[str, Any]) -> None:
+    evidence = next(
+        s for s in job["steps"] if s.get("name") == "Upload scripted learned rules evidence"
+    )
+    evidence["if"] = "always()"
+
+
+def _misdirect_learned_rules_evidence(job: dict[str, Any]) -> None:
+    evidence = next(
+        s for s in job["steps"] if s.get("name") == "Upload scripted learned rules evidence"
+    )
+    evidence["if"] = "always() && matrix.suite == 'scenario'"
+
+
+def _select_publication_in_learned_rules(job: dict[str, Any]) -> None:
+    step = _scripted_factory_step(job, "learned-rules")
+    step["run"] = step["run"].replace("--scenario learned-rules", "--scenario publication")
 
 
 def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
@@ -5224,6 +5254,10 @@ def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
         _select_triage_in_factory_ci,
         _enable_fail_fast,
         _unguard_evidence,
+        _drop_learned_rules_leg,
+        _unguard_learned_rules_evidence,
+        _misdirect_learned_rules_evidence,
+        _select_publication_in_learned_rules,
     ),
 )
 def test_scripted_factory_leg_mapping_rejects_skippable_shapes(

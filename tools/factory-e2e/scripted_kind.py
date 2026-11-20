@@ -42,6 +42,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = REPO_ROOT / "tools/factory-e2e/fixtures/unitconv"
 ISSUE = REPO_ROOT / "tools/factory-e2e/fixtures/unitconv-issue.md"
 TRANSCRIPT = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
+# The scripted parser's --transcript default, relative to the command's directory.
+DEFAULT_TRANSCRIPT_ARG = Path("tools/model-script/transcripts/unitconv-issue.json")
 IMAGES = ("curie-api:local", "curie-worker:local", "curie-ui:local", "curie-runner:latest")
 # The chart runs its channel gateway on the dispatcher image, which
 # install_values names curie-dispatcher:local. A run that enables the gateway
@@ -57,6 +59,9 @@ RECORD_REQUEST_RESERVE_USD = 2.0
 RECORD_ATTEMPTS = 3
 # The gateway sends this to the in-process Slack recorder only; it is no credential.
 SCRIPTED_SLACK_BOT_TOKEN = "xoxb-0000000000-scripted-example"
+# The learned rules chain (#5799) runs in its own driver, learned_rules_run.
+LEARNED_RULES = "learned-rules"
+RECORDING_SCENARIOS = frozenset({"publication", LEARNED_RULES})
 
 
 class ScriptedScenarioError(RuntimeError):
@@ -80,20 +85,42 @@ def validate_configuration(args: argparse.Namespace) -> None:
             raise fe.ConfigError("the facts scenario never records or calls a model")
         return
     if args.record:
-        if args.scenario != "publication":
-            raise fe.ConfigError("only the publication scenario supports recording")
+        if args.scenario not in RECORDING_SCENARIOS:
+            raise fe.ConfigError(
+                "only the publication scenario supports recording, besides learned-rules"
+            )
         if not os.environ.get("CURIE_FACTORY_RECORD_KEY"):
             raise fe.ConfigError("recording requires CURIE_FACTORY_RECORD_KEY")
-    elif not Path(args.transcript).is_file():
-        raise fe.ConfigError(
-            f"transcript {args.transcript} is missing; use scripted --scenario publication --record"
-        )
-    else:
-        loader = Path(__file__).resolve().parents[2] / "tools/model-script/model_script.py"
+        if args.scenario == LEARNED_RULES and Path(args.transcript) != DEFAULT_TRANSCRIPT_ARG:
+            # The recording writes the A file and its -b and -c siblings.
+            import learned_rules_lanes
+
+            try:
+                learned_rules_lanes.transcript_paths(Path(args.transcript))
+            except scripted_lanes.LaneError as exc:
+                raise fe.ConfigError(f"transcript {args.transcript}: {exc}") from None
+        return
+    transcripts = [Path(args.transcript)]
+    if args.scenario == LEARNED_RULES:
+        # The learned rules chain replays one transcript per ticket: the A file
+        # the command names and its -b and -c siblings.
+        import learned_rules_lanes
+
         try:
-            _module("factory_model_script_check", loader).load_transcript(Path(args.transcript))
+            transcripts = list(learned_rules_lanes.transcript_paths(Path(args.transcript)).values())
+        except scripted_lanes.LaneError as exc:
+            raise fe.ConfigError(f"transcript {args.transcript}: {exc}") from None
+    loader = Path(__file__).resolve().parents[2] / "tools/model-script/model_script.py"
+    for transcript in transcripts:
+        if not transcript.is_file():
+            raise fe.ConfigError(
+                f"transcript {transcript} is missing; use scripted --scenario "
+                f"{args.scenario if args.scenario == LEARNED_RULES else 'publication'} --record"
+            )
+        try:
+            _module("factory_model_script_check", loader).load_transcript(transcript)
         except (OSError, ValueError) as exc:
-            raise fe.ConfigError(f"transcript {args.transcript} is malformed: {exc}") from None
+            raise fe.ConfigError(f"transcript {transcript} is malformed: {exc}") from None
 
 
 def scripted_values(
@@ -749,25 +776,17 @@ class ScriptedRun:
         self.stub._put("issue", 3815, issue)
         if self.args.scenario != "facts":
             self.model = model.ModelScript(
-                Path(self.args.transcript), record=self.args.record, host=callback
+                Path(self.args.transcript),
+                record=self.args.record,
+                host=callback,
+                **self.model_options(model),
             )
             if self.args.record:
                 self.count_recording_requests(model)
             else:
-                # Recording captures the issue-to-pull-request transcript only;
-                # the triage and one-ticket lanes are scripted and need no provider.
-                if self.gateway_enabled():
-                    self.router = triage_run.build_router(model)
-                    self.router.resolvers.append(
-                        triage_run.output_resolver(
-                            self.stub, model.load_transcript(Path(self.args.transcript))
-                        )
-                    )
-                    self.router.hooks.append(triage_run.revoke_on_first_turn(self.stub))
-                else:
-                    self.router = scripted_lanes.LaneRouter({})
-                self.router.add(one_ticket_run.build_lane(model))
-                self.router.install(self.model, model)
+                self.router = self.make_router(model)
+                if self.router is not None:
+                    self.router.install(self.model, model, fallback=self.router_fallback())
                 if self.gateway_enabled():
                     self.slack = scripted_lanes.SlackRecorder(host=callback)
                     self.slack.start()
@@ -797,6 +816,7 @@ class ScriptedRun:
             "factory-app",
             f"--from-file=privateKey={app_key}",
         )
+        self.before_install(registry_ref)
         values = scripted_values(
             model_base_url=self.stub.base_url if self.model is None else self.model.base_url,
             github_api=self.stub.base_url + "/api/v3",
@@ -815,6 +835,7 @@ class ScriptedRun:
             )
             values["agentSandbox"]["runnerImages"] = self.facts_runner_images
             values["worker"]["replicas"] = 0
+        self.extend_install_values(values)
         # Direct Helm installation follows the existing factory preflight.
         # Generate the same sealed credential/caller inputs as cluster up,
         # without exposing their values in argv or build logs.
@@ -903,6 +924,7 @@ class ScriptedRun:
         )
         self.kubectl("apply", "-f", str(stub_policy))
         self.deploy(registry_ref)
+        self.before_label(github)
         issue = self.stub._get("issue", 3815)
         issue["labels"] = [{"name": "factory"}]
         issue["updated_at"] = github._utc()
@@ -910,6 +932,48 @@ class ScriptedRun:
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
         self.wait_for_final()
         self.run_scenarios(github)
+
+    # Hooks a scenario subclass overrides to reuse ``execute``. The defaults keep
+    # the publication, triage-to-pr and facts scenarios exactly as they were.
+
+    def model_options(self, model_module: Any) -> dict[str, Any]:
+        """Extra ModelScript keywords; called once the GitHub stub is running."""
+
+        return {}
+
+    def make_router(self, model_module: Any) -> scripted_lanes.LaneRouter | None:
+        """The replay's lane router, or None to serve the transcript alone.
+
+        A recording captures the issue-to-pull-request transcript only; the
+        triage and one-ticket lanes are scripted and need no provider.
+        """
+
+        if self.gateway_enabled():
+            router = triage_run.build_router(model_module)
+            router.resolvers.append(
+                triage_run.output_resolver(
+                    self.stub, model_module.load_transcript(Path(self.args.transcript))
+                )
+            )
+            router.hooks.append(triage_run.revoke_on_first_turn(self.stub))
+        else:
+            router = scripted_lanes.LaneRouter({})
+        router.add(one_ticket_run.build_lane(model_module))
+        return router
+
+    def router_fallback(self) -> bool:
+        """Whether a request no lane claims is answered from the run's transcript."""
+
+        return True
+
+    def before_install(self, registry_ref: str) -> None:
+        """After the namespace and the app Secret exist, before ``helm install``."""
+
+    def extend_install_values(self, values: dict[str, Any]) -> None:
+        """Change the chart values in place, after the scenario's own changes."""
+
+    def before_label(self, github: Any) -> None:
+        """After ``deploy``, before issue 3815 gets its label."""
 
     def run_scenarios(self, github: Any) -> None:
         """What runs on the install once the publication scenario has finished."""
@@ -1844,7 +1908,13 @@ def main(args: argparse.Namespace) -> int:
     try:
         validate_configuration(args)
         curie_bin, curie_version = fe.resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
-        run = ScriptedRun(args)
+        if args.scenario == LEARNED_RULES:
+            # Imported here: learned_rules_run subclasses ScriptedRun.
+            from learned_rules_run import LearnedRulesRun
+
+            run: ScriptedRun = LearnedRulesRun(args)
+        else:
+            run = ScriptedRun(args)
     except fe.ConfigError as exc:
         print(f"factory-e2e: {exc}", file=sys.stderr)
         return fe.EXIT_CONFIG

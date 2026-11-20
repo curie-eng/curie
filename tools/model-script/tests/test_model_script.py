@@ -586,3 +586,143 @@ def test_factory_transcript_rejects_a_different_sender_lane(prompt: str) -> None
     finally:
         with pytest.raises(ms.UnexpectedRequest):
             script.close()
+
+
+def _provider(message: dict[str, Any]) -> ThreadingHTTPServer:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            payload = json.dumps(message).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_capture_dir_writes_one_numbered_file_per_request(tmp_path: Path) -> None:
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [_exchange("work https://h.example/o/r/issues/42", "Plan")])
+    capture = tmp_path / "capture"
+    script = ms.ModelScript(path, capture_dir=capture)
+    script.start()
+    try:
+        payload = _request("Factory system text.", "work https://h.example/o/r/issues/42")
+        payload["tools"] = [{"name": "Bash"}, {"name": "Edit"}]
+        assert _post(script.base_url, payload)[0] == 200
+        assert _post(script.base_url, payload)[0] == 422
+    finally:
+        script._server.shutdown()
+        script._server.server_close()
+    files = sorted(capture.glob("*.json"))
+    assert [f.name for f in files] == ["000001.json", "000002.json"]
+    first = json.loads(files[0].read_text())
+    assert first == {
+        "sequence": 1,
+        "lane_key": ms.scrub("work https://h.example/o/r/issues/42"),
+        "ordinal": 0,
+        "issue": 42,
+        "system": "Factory system text.",
+        "tools": ["Bash", "Edit"],
+    }
+
+
+def test_capture_dir_uses_the_supplied_issue_reader(tmp_path: Path) -> None:
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [])
+    capture = tmp_path / "capture"
+    script = ms.ModelScript(path, capture_dir=capture, issue_of=lambda _request: 7)
+    script.start()
+    try:
+        _post(script.base_url, _request("s", "no issue here"))
+    finally:
+        script._server.shutdown()
+        script._server.server_close()
+    assert json.loads((capture / "000001.json").read_text())["issue"] == 7
+
+
+def test_no_capture_dir_writes_nothing(tmp_path: Path) -> None:
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [])
+    script = ms.ModelScript(path)
+    script.start()
+    try:
+        _post(script.base_url, _request("s", "x"))
+    finally:
+        script._server.shutdown()
+        script._server.server_close()
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_record_tags_align_with_appended_exchanges_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+    provider = _provider(_message("Edit", "recorded"))
+    recorder = ms.ModelScript(
+        tmp_path / "recorded.json",
+        record=True,
+        upstream=f"http://127.0.0.1:{provider.server_address[1]}",
+        tag=lambda request: request["messages"][0]["content"].split()[-1],
+    )
+    recorder.start()
+    try:
+        for name in ("x", "y", "x"):
+            assert _post(recorder.base_url, _request("s", f"work {name}"))[0] == 200
+    finally:
+        recorder.close()
+        provider.shutdown()
+        provider.server_close()
+    assert recorder.recorded_tags == ["x", "y", "x"]
+    assert len(recorder._exchanges) == len(recorder.recorded_tags)
+
+
+def test_record_without_tag_keeps_tags_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+    provider = _provider(_message("Edit", "recorded"))
+    recorder = ms.ModelScript(
+        tmp_path / "recorded.json",
+        record=True,
+        upstream=f"http://127.0.0.1:{provider.server_address[1]}",
+    )
+    recorder.start()
+    try:
+        assert _post(recorder.base_url, _request("s", "work"))[0] == 200
+    finally:
+        recorder.close()
+        provider.shutdown()
+        provider.server_close()
+    assert recorder.recorded_tags == []
+
+
+@pytest.mark.parametrize("command", ["serve", "record"])
+def test_capture_dir_flag_reaches_the_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+    seen: dict[str, Any] = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake(*_args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise Stop
+
+    monkeypatch.setattr(ms, "ModelScript", fake)
+    flag = "--transcript" if command == "serve" else "--output"
+    with pytest.raises(Stop):
+        ms.main([command, flag, str(tmp_path / "t.json"), "--capture-dir", str(tmp_path / "c")])
+    assert seen["capture_dir"] == tmp_path / "c"
+    with pytest.raises(Stop):
+        ms.main([command, flag, str(tmp_path / "t.json")])
+    assert seen["capture_dir"] is None

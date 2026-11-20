@@ -6670,9 +6670,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     scripted.add_argument(
         "--scenario",
-        choices=("publication", "facts", "triage-to-pr"),
+        choices=("publication", "facts", "triage-to-pr", "learned-rules"),
         required=True,
-        help="run issue-to-PR, admission facts, or issue-to-PR followed by triage on one install",
+        help=(
+            "run issue-to-PR, admission facts, issue-to-PR followed by triage on one install, "
+            "or the learned rule chain over three tickets (--transcript names the ticket A "
+            "file; its -b and -c siblings sit beside it)"
+        ),
     )
     scripted.add_argument(
         "--transcript",

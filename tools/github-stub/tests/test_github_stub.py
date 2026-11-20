@@ -1096,3 +1096,198 @@ def test_concurrent_issue_pull_and_label_creates_keep_distinct_ids(stub: Any) ->
                 assert len(matched) == 1
                 extra_ids.append(matched[0]["id"])
             assert len(set(extra_ids)) == width, {"batch": batch, "label_event_ids": extra_ids}
+
+
+def _branch(stub: Any, name: str, parent: str, message: str) -> str:
+    """Commit on ``parent``'s tree in the bare repository and point ``name`` at it."""
+
+    git = ("git", "--git-dir", str(stub._repository))
+    tree = subprocess.run(
+        (*git, "rev-parse", f"{parent}^{{tree}}"), capture_output=True, check=True, text=True
+    ).stdout.strip()
+    sha = subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=Example",
+            "-c",
+            "user.email=a@example.com",
+            *git[1:],
+            "commit-tree",
+            tree,
+            "-p",
+            parent,
+            "-m",
+            message,
+        ),
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run((*git, "update-ref", f"refs/heads/{name}", sha), check=True)
+    return sha
+
+
+def _open_pull(stub: Any, github: httpx.Client, head: str) -> dict[str, Any]:
+    return _ok(
+        github.post(
+            f"/repos/{REPO}/pulls",
+            json={"title": "Change", "head": head, "base": "main", "body": "body"},
+        ),
+        201,
+    )
+
+
+def test_user_by_id_answers_every_collaborator_and_refuses_unknown(
+    stub: Any, github: httpx.Client
+) -> None:
+    module = sys.modules["curie_github_stub"]
+    assert module.RULE_WRITER == {"id": 6630, "login": "rule-writer", "type": "User"}
+    assert module.RULE_READER == {"id": 6631, "login": "rule-reader", "type": "User"}
+    for user, permission in ((module.RULE_WRITER, "write"), (module.RULE_READER, "read")):
+        assert _ok(github.get(f"/user/{user['id']}")) == user
+        assert _ok(github.get(f"/api/v3/user/{user['id']}")) == user
+        found = _ok(github.get(f"/repos/{REPO}/collaborators/{user['login']}/permission"))
+        assert found["permission"] == permission
+    added = stub.add_user({"id": 7700, "login": "newcomer", "type": "User"}, "write")
+    assert _ok(github.get("/user/7700")) == added
+    assert github.get("/user/999999").status_code == 404
+    assert github.get("/user/999999").json() == {"message": "Not Found"}
+
+
+def test_comment_rows_carry_author_association_only_when_given(
+    stub: Any, github: httpx.Client
+) -> None:
+    writer = {"id": 6630, "login": "rule-writer", "type": "User"}
+    plain = stub.add_issue_comment(3815, "plain", author=writer)
+    assert "author_association" not in plain
+    seeded = stub.add_issue_comment(3815, "seeded", author=writer, author_association="MEMBER")
+    appended = stub.append_comment(3815, "appended", author=writer, author_association="OWNER")
+    assert seeded["author_association"] == "MEMBER"
+    assert appended["author_association"] == "OWNER"
+    fresh = _ok(github.get(f"/repos/{REPO}/issues/comments/{appended['id']}"))
+    assert fresh["author_association"] == "OWNER"
+
+
+def test_pull_request_conversation_comments_without_an_issue_row(
+    stub: Any, github: httpx.Client
+) -> None:
+    _branch(stub, "feature", stub.main_revision(), "feature")
+    number = _open_pull(stub, github, "feature")["number"]
+    issues_before = [row["number"] for row in _ok(github.get(f"/repos/{REPO}/issues"))]
+    assert number not in issues_before
+    assert github.get(f"/repos/{REPO}/issues/{number}").status_code == 404
+    writer = {"id": 6630, "login": "rule-writer", "type": "User"}
+    mention = stub.append_comment(
+        number, "@bot revise", author=writer, author_association="COLLABORATOR"
+    )
+    assert (
+        mention["html_url"] == f"{stub.base_url}/{REPO}/pull/{number}#issuecomment-{mention['id']}"
+    )
+    posted = _ok(
+        github.post(f"/repos/{REPO}/issues/{number}/comments", json={"body": "reply"}), 201
+    )
+    assert posted["html_url"].startswith(f"{stub.base_url}/{REPO}/pull/{number}#")
+    listed = _ok(github.get(f"/repos/{REPO}/issues/{number}/comments"))
+    assert [row["body"] for row in listed] == ["@bot revise", "reply"]
+    assert _ok(github.get(f"/repos/{REPO}/issues/comments/{mention['id']}"))["issue_url"].endswith(
+        f"/repos/{REPO}/issues/{number}"
+    )
+    assert [row["number"] for row in _ok(github.get(f"/repos/{REPO}/issues"))] == issues_before
+    assert github.get(f"/repos/{REPO}/issues/987654/comments").status_code == 404
+    with pytest.raises(ValueError):
+        stub.append_comment(987654, "nowhere", author=writer)
+
+
+def test_merge_pull_fast_forwards_main_and_marks_the_pull_merged(
+    stub: Any, github: httpx.Client
+) -> None:
+    head = _branch(stub, "feature", stub.main_revision(), "feature")
+    number = _open_pull(stub, github, "feature")["number"]
+    open_pull = _ok(github.get(f"/repos/{REPO}/pulls/{number}"))
+    assert open_pull["merged"] is False
+    assert open_pull["merged_at"] is None
+    assert open_pull["draft"] is False
+    assert open_pull["updated_at"]
+    merged = stub.merge_pull(number)
+    assert merged["merged"] is True and merged["state"] == "closed"
+    assert merged["merge_commit_sha"] == head
+    assert stub.main_revision() == head
+    fetched = _ok(github.get(f"/repos/{REPO}/pulls/{number}"))
+    assert fetched["merged_at"] and fetched["merged"] is True and fetched["state"] == "closed"
+    with pytest.raises(ValueError, match="not open"):
+        stub.merge_pull(number)
+    with pytest.raises(ValueError, match="does not exist"):
+        stub.merge_pull(987654)
+
+
+def test_merge_pull_refuses_a_head_that_is_not_a_fast_forward(
+    stub: Any, github: httpx.Client
+) -> None:
+    original = stub.main_revision()
+    _branch(stub, "first", original, "first")
+    _branch(stub, "second", original, "second")
+    first = _open_pull(stub, github, "first")["number"]
+    second = _open_pull(stub, github, "second")["number"]
+    stub.merge_pull(first)
+    moved = stub.main_revision()
+    with pytest.raises(ValueError, match="not a fast-forward"):
+        stub.merge_pull(second)
+    assert stub.main_revision() == moved
+    assert _ok(github.get(f"/repos/{REPO}/pulls/{second}"))["state"] == "open"
+
+
+def test_production_code_host_resolves_the_stub_accounts(
+    stub: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The API's own consumer reads the stub's answers, over the stub's HTTPS."""
+
+    import asyncio
+
+    from curie_api.forges.github.code_host import PATH_ID_PREFIX, GitHubCodeHost
+    from curie_api.forges.types import Actor
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(stub.ca_file))
+    settings = Settings(
+        GITHUB_API_URL=stub.base_url,
+        GITHUB_APP_ID="51",
+        GITHUB_APP_PRIVATE_KEY=_app_key(),
+        GITHUB_TOKEN="",
+    )
+
+    async def run() -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            verify=ssl.create_default_context(cafile=str(stub.ca_file)), trust_env=False
+        ) as client:
+            host = GitHubCodeHost(
+                client,
+                api_url=stub.base_url,
+                html_base=stub.base_url,
+                timeout_s=30,
+                credentials=GitHubCredentials(auth=GitHubAuth.from_settings(settings)),
+            )
+            repository = await host.resolve_repository(f"{PATH_ID_PREFIX}{REPO}")
+            return {
+                "repository": repository,
+                "writer_login": await host.account_login(repository, "6630"),
+                "writer_can_write": await host.user_can_write(
+                    repository, Actor("6630", "rule-writer")
+                ),
+                "reader_login": await host.account_login(repository, "6631"),
+                "reader_can_write": await host.user_can_write(
+                    repository, Actor("6631", "rule-reader")
+                ),
+                "unknown_login": await host.account_login(repository, "999999"),
+                "unknown_can_write": await host.user_can_write(
+                    repository, Actor("999999", "nobody")
+                ),
+            }
+
+    seen = asyncio.run(run())
+    assert seen["repository"].path == REPO
+    assert seen["writer_login"] == "rule-writer"
+    assert seen["writer_can_write"] is True
+    assert seen["reader_login"] == "rule-reader"
+    assert seen["reader_can_write"] is False
+    assert seen["unknown_login"] is None
+    assert seen["unknown_can_write"] is False
