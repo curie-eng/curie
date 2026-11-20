@@ -277,6 +277,8 @@ def test_scripted_driver_records_the_curie_bin_it_used(
         assert run.command(run.curie, "build").strip() == str(candidate_curie)
 
     monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+    # This test is about the binary; its stubbed install has no scenario to run.
+    monkeypatch.setattr(sk.ScriptedRun, "runs_one_ticket", False)
 
     assert sk.main(_replay_args(tmp_path)) == 0
     evidence = _evidence(tmp_path)
@@ -308,6 +310,8 @@ def test_scripted_driver_resolves_relative_and_path_binaries(
         assert run.command(run.curie, "build").strip() == str(candidate_curie)
 
     monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+    # This test is about the binary; its stubbed install has no scenario to run.
+    monkeypatch.setattr(sk.ScriptedRun, "runs_one_ticket", False)
 
     assert sk.main(_replay_args(tmp_path)) == 0
     evidence = _evidence(tmp_path)
@@ -2970,6 +2974,85 @@ def test_the_one_ticket_verdict_reaches_the_evidence_file_and_the_exit_code(
     if outcome == "failed":
         assert "second request after the bot comment" in evidence["error"]
         assert evidence["one_ticket"]["error"] == "a second request after the bot comment"
+
+
+def test_the_scripted_command_fails_when_the_one_ticket_scenario_did_not_run(
+    candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.ScriptedRun, "execute", lambda _run: None)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+
+    evidence = _evidence(tmp_path)
+    assert evidence["result"] == "failed"
+    assert evidence["error"] == "the one-ticket scenario did not run"
+    assert "one_ticket" not in evidence
+
+
+def test_the_scripted_command_fails_when_the_one_ticket_scenario_did_not_pass(
+    candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+
+    def execute(run: sk.ScriptedRun) -> None:
+        run.one_ticket = one_ticket_run.OneTicket(run, lanes.LaneRouter({}))
+
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+    assert _evidence(tmp_path)["error"] == "the one-ticket scenario did not pass"
+
+
+@pytest.mark.parametrize(
+    ("argv", "required"),
+    [
+        (["scripted", "--scenario", "publication"], True),
+        (["scripted", "--scenario", "triage-to-pr"], True),
+        (["scripted", "--scenario", "publication", "--record"], False),
+        (["scripted", "--scenario", "facts"], False),
+    ],
+)
+def test_the_one_ticket_verdict_is_owed_by_every_replay_of_an_install_and_no_other_run(
+    argv: list[str], required: bool
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(argv))
+
+    assert run.one_ticket_required() is required
+    assert (run.one_ticket_verdict_error() is not None) is required
+
+
+def test_the_scenarios_after_the_publication_scenario_call_the_one_ticket_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The call site itself: removing the call from ``run_scenarios`` fails this test."""
+
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
+    run.router = lanes.LaneRouter({})
+    calls: list[str] = []
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+
+    run.run_scenarios(None)
+
+    assert calls == ["observe", "one-ticket"]
+
+
+def test_a_fixture_that_owns_its_agents_does_not_run_the_one_ticket_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from c4_admitted_kind import AdmittedKind
+
+    run = AdmittedKind(tmp_path, Path("curie"))
+    run.router = lanes.LaneRouter({})
+    calls: list[str] = []
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+
+    run.run_scenarios(None)
+
+    assert calls == ["observe"]
+    assert run.one_ticket_required() is False
 
 
 def test_only_the_scripted_command_runs_the_one_ticket_scenario_on_its_install() -> None:

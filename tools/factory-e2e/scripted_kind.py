@@ -909,11 +909,36 @@ class ScriptedRun:
         self.stub._put("issue", 3815, issue)
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
         self.wait_for_final()
+        self.run_scenarios(github)
+
+    def run_scenarios(self, github: Any) -> None:
+        """What runs on the install once the publication scenario has finished."""
+
         self.observe()
         if self.router is not None and self.runs_one_ticket:
             self.run_one_ticket(github)
         if self.router is not None and self.slack is not None:
             self.run_triage_to_pr(github)
+
+    def one_ticket_required(self) -> bool:
+        """Whether this command owes a one-ticket verdict: every replay of an install.
+
+        The facts scenario installs no model and a recording captures one
+        transcript, so neither scripts a lane for it.
+        """
+
+        return self.runs_one_ticket and self.args.scenario != "facts" and not self.args.record
+
+    def one_ticket_verdict_error(self) -> str | None:
+        """Why the command cannot pass: the scenario was skipped, not reached, or did not pass."""
+
+        if not self.one_ticket_required():
+            return None
+        if self.one_ticket is None:
+            return "the one-ticket scenario did not run"
+        if self.one_ticket.evidence.get("result") != "passed":
+            return "the one-ticket scenario did not pass"
+        return None
 
     def run_one_ticket(self, github: Any) -> None:
         """The one-ticket scenario, on this install, after the first one passed."""
@@ -1838,6 +1863,9 @@ def main(args: argparse.Namespace) -> int:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, interrupted)
         run.execute()
+        missing = run.one_ticket_verdict_error()
+        if missing is not None:
+            raise ScriptedScenarioError(missing)
         result = 0
     except fe.ConfigError as exc:
         result = fe.EXIT_CONFIG

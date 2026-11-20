@@ -382,6 +382,114 @@ def _intake_verdicts(stub: Any, since: str) -> dict[int, tuple[bool, str]]:
     return asyncio.run(decide())
 
 
+class _NoFacts:
+    """The facts exchange the poll pass builds; it has nothing owed in this proof."""
+
+    def __init__(self, *_args: Any) -> None: ...
+
+    async def recover_owed(self) -> None: ...
+
+    async def observe(self, *_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    async def deliver_owed(self) -> None: ...
+
+
+def _offered_to_the_answer_intake(
+    stub: Any, monkeypatch: pytest.MonkeyPatch, since: str
+) -> list[int]:
+    """Run the production poll pass over the stub and return the comments it offered as answers.
+
+    Everything the pass reads from GitHub is the stub's real output through the
+    production tracker. The seams that need a database are replaced: the facts
+    exchange, the open-question and owned-pull lookups, and the answer intake
+    itself, which records the comment it is handed.
+    """
+
+    offered: list[int] = []
+
+    async def record(
+        _maker: Any, _settings: Any, _tracker: Any, _notice: Any, comment: Any
+    ) -> bool:
+        offered.append(int(comment["id"]))
+        return True
+
+    async def numbers(*_args: Any) -> set[int]:
+        return {ots.ISSUE}
+
+    async def nothing(*_args: Any, **_kwargs: Any) -> list[int]:
+        return []
+
+    async def no_retries(*_args: Any, **_kwargs: Any) -> set[int]:
+        return set()
+
+    monkeypatch.setattr(factory_poll_intake, "FactsExchange", _NoFacts)
+    monkeypatch.setattr(factory_poll_intake, "drain_answer_retries", no_retries)
+    monkeypatch.setattr(factory_poll_intake, "_issue_numbers", numbers)
+    monkeypatch.setattr(factory_poll_intake, "_answering_issue_numbers", numbers)
+    monkeypatch.setattr(factory_poll_intake, "open_pulls", nothing)
+    monkeypatch.setattr(factory_poll_intake, "_admit_answer", record)
+    monkeypatch.setattr(factory_poll_intake, "repository_ref", lambda *_a, **_k: "repository")
+
+    async def poll() -> None:
+        context = ssl.create_default_context(cafile=str(stub.ca_file))
+        async with httpx.AsyncClient(verify=context, trust_env=False) as client:
+            cursor = factory_poll_intake.Cursor(comments_since=ots.instant(since))
+            await factory_poll_intake._admit_mentions(
+                object(),  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                client,
+                cursor,
+                _tracker(stub, client),
+                now=ots.instant(since),
+                api=f"{stub.base_url}/api/v3",
+                token="example-installation-token",
+                repo_path=REPOSITORY,
+                installation_id=5501,
+                repository={},
+                verified=None,  # type: ignore[arg-type]
+                serves=True,
+            )
+
+    asyncio.run(poll())
+    return offered
+
+
+def test_the_production_poll_pass_offers_the_stubs_fresh_answer_and_never_the_edited_one(
+    stub: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handoff: the stub's own comment output goes through ``_admit_mentions``.
+
+    The fresh answer and the plain comment beside it are offered to the answer
+    intake; the same text edited in place after posting, which the stub stamps
+    with a later ``updated_at``, is refused by the pass and never offered. With
+    the pass disabled nothing is offered and the first assertion fails.
+    """
+
+    answer, follow_up = stub.append_comments(
+        ots.ISSUE, [run.ANSWER_TEXT, run.FOLLOW_UP_TEXT], author=GITHUB.HUMAN
+    )
+    edited = stub.append_comment(ots.ISSUE, "Placeholder.", author=GITHUB.HUMAN)
+    stub.edit_comment_body(edited["id"], run.ANSWER_TEXT)
+    since = (ots.instant(answer["created_at"]) - timedelta(seconds=30)).isoformat()
+
+    offered = _offered_to_the_answer_intake(stub, monkeypatch, since)
+
+    assert offered == [answer["id"], follow_up["id"]]
+    assert edited["id"] not in offered
+
+
+def test_the_production_poll_pass_refuses_an_answer_posted_before_its_threshold(
+    stub: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer = stub.append_comment(ots.ISSUE, run.ANSWER_TEXT, author=GITHUB.HUMAN)
+    after = (ots.instant(answer["created_at"]) + timedelta(seconds=5)).isoformat()
+
+    offered = _offered_to_the_answer_intake(stub, monkeypatch, after)
+
+    assert offered == []
+
+
 def test_the_helper_comment_is_read_as_an_answer_by_the_production_poll_rules(stub: Any) -> None:
     stub.add_user(run.READER, "read")
     before = "2020-01-01T00:00:00Z"
