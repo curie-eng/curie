@@ -922,6 +922,27 @@ def test_connect_refusals_are_pages_for_browsers_and_json_otherwise(connect_brow
     assert malformed.json() == {"detail": "invalid account confirmation"}
     assert browser_links(tenant_id) == []
 
+    # A multipart body with no boundary fails in Starlette's parser with its own
+    # HTTPException, before FastAPI validation. It stays private either way.
+    bad_body = {"Content-Type": "multipart/form-data"}
+    parsed = client.post(f"{path}/confirm", content=b"x", headers={**origin, **bad_body, **browser})
+    assert_page(parsed, 400, "This link can't be used")
+    parsed = client.post(f"{path}/confirm", content=b"x", headers={**origin, **bad_body})
+    assert parsed.status_code == 400
+    for name, value in PRIVATE_HEADERS.items():
+        assert parsed.headers[name] == value
+    assert parsed.headers["content-type"].startswith("application/json")
+
+    # Accept must name text/html itself: a parameter that merely contains the
+    # text, a zero quality, or a bare wildcard keeps the JSON answer.
+    for accept in ('application/json; profile="text/html"', "text/html;q=0", "*/*"):
+        answer = client.get(unknown, headers={"Accept": accept})
+        assert answer.status_code == 400, accept
+        assert answer.json() == {"detail": "invalid or expired account connection"}, accept
+    assert_page(
+        client.get(unknown, headers={"Accept": "TEXT/HTML ; q=0.5"}), 400, "This link can't be used"
+    )
+
     client.cookies.set(PROOF_COOKIE, proof)
     assert client.get(path).status_code == 200
     csrf = client.cookies.get(CSRF_COOKIE)

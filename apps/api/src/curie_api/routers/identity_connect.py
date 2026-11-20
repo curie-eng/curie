@@ -10,6 +10,7 @@ from fastapi import APIRouter, Form, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..approval_auth import enforce_console_cookie_origin
 from ..config import get_settings
@@ -47,7 +48,26 @@ PRIVATE_HEADERS = {
 
 
 def wants_html(request: Request) -> bool:
-    return "text/html" in request.headers.get("accept", "").lower()
+    """True when Accept names the text/html media range itself with a nonzero q.
+
+    `*/*` and parameters that merely contain the text do not count: only a
+    browser that asks for a page gets one.
+    """
+    for part in request.headers.get("accept", "").split(","):
+        media, *params = (piece.strip() for piece in part.split(";"))
+        if media.lower() != "text/html":
+            continue
+        quality = 1.0
+        for param in params:
+            name, _, value = param.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0.0
+        if quality > 0:
+            return True
+    return False
 
 
 def refusal_page(status: int, headers: Mapping[str, str] | None = None) -> HTMLResponse:
@@ -79,7 +99,9 @@ class PrivateConnectRoute(APIRoute):
                     status_code=400,
                     headers=PRIVATE_HEADERS,
                 )
-            except HTTPException as exc:
+            except StarletteHTTPException as exc:
+                # The base class: a malformed multipart body raises Starlette's,
+                # not FastAPI's subclass, and must stay private too.
                 if exc.status_code in REFUSALS and wants_html(request):
                     return refusal_page(exc.status_code, exc.headers)
                 exc.headers = {**(exc.headers or {}), **PRIVATE_HEADERS}
