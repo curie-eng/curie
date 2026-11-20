@@ -48,7 +48,6 @@ from forge_fakes.github import (  # noqa: E402
 from test_github_factory_ingress import _mark_running, _rows  # noqa: E402
 from test_github_factory_review import (  # noqa: E402
     _PULLS,
-    FRAGMENTS,
     HEAD,
     ReviewGitHubAPI,
     _admit_issue,
@@ -58,6 +57,7 @@ from test_github_factory_review import (  # noqa: E402
     _complete,
     _execute,
     _feedback_event,
+    _feedback_link,
     _mention,
     _own_pull_request,
     _pr_url,
@@ -162,7 +162,7 @@ def revise(
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "factory_admitted", response.text
     revision = _requests(number)[-1]
-    assert revision["reply_target_url"] == f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
+    assert revision["reply_target_url"] == _feedback_link(event, pr, fid)
     assert revision["requester"] == f"github:{SENDER_ID}:{SENDER}"
     _mark_running(client, revision["id"])
     return Run(
@@ -428,7 +428,8 @@ def test_an_eligible_proposal_stores_one_candidate_with_the_platform_values(
     assert rule["source_request_id"] == run.request_id
     assert rule["source_lineage_id"] == run.lineage_id
     assert rule["source_url"] == run.reply_target_url
-    assert rule["source_url"].startswith(f"{_pr_url(run.pr)}#discussion_r")
+    # Review feedback is admitted per submitted review (#5794).
+    assert rule["source_url"].startswith(f"{_pr_url(run.pr)}#pullrequestreview-")
     assert rule["source_turn"] is None
     assert (rule["accepted_by"], rule["rejected_by"], rule["removed_by"]) == (None, None, None)
     (event,) = stored_events()
