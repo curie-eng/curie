@@ -1864,7 +1864,7 @@ async def _render(
             line = f"Checks were not verified: {code_span(ci_observation.reason or 'invalidated')}."
         body += f"\n\n{line}"
     mention = github_status_mention(settings, work_item.tracker_kind)
-    if mention is not None:
+    if mention is not None and target.kind in {"pull_request", "review_thread"}:
         body = append_github_ask_line(body, mention)
     return body
 

@@ -694,7 +694,7 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert WAITING in body
     assert FINAL_MARKER not in body
     assert "![Curie status]" not in body
-    assert body.rstrip().endswith(github_ask_line(MENTION))
+    assert github_ask_line(MENTION) not in body
     assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # Human and admission labels are never touched.
     assert {LABEL, "bug"} <= sink.issue_labels[number]
@@ -756,10 +756,10 @@ def test_a_card_url_replaces_the_checklist_as_phases_advance(
     assert "Read issue" not in body
     assert WAITING not in body
     assert marker_for(request_id) in body
-    assert body.rstrip().endswith(github_ask_line(MENTION))
+    assert github_ask_line(MENTION) not in body
 
 
-def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
+def test_github_issue_status_comment_omits_pull_request_ask_line(admitted: Any) -> None:  # noqa: F811
     client, github, sink = admitted
     number = 9929
     request_id = _admit(client, github, sink, number)
@@ -770,8 +770,7 @@ def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> 
     assert "Status: QUEUED" in body
     assert WAITING in body
     assert marker_for(request_id) in body
-    assert body.rstrip().endswith(ask)
-    assert body.count(ask) == 1
+    assert ask not in body
 
 
 def test_non_github_status_comments_omit_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
@@ -3340,6 +3339,7 @@ def test_a_running_pull_request_follow_up_hides_the_checklist_until_a_later_phas
     assert _READING in comment["body"]
     assert "Status: RUNNING" in comment["body"]
     assert _checklist_lines(comment["body"]) == []
+    assert comment["body"].rstrip().endswith(github_ask_line(MENTION))
 
     assert report(client, revision, "read_issue").status_code == 201
     _execute(
