@@ -578,7 +578,7 @@ run `curie cluster console login --subject <you>` and paste the code it prints.
 The session cookie is `__Host-` prefixed and `Secure`, so browsers store it only
 over HTTPS or from `http://localhost` / a loopback host. A sealed cluster console
 reached over plain HTTP from a non-loopback host cannot sign in; reach it through
-`kubectl port-forward` (or a kind `extraPortMappings` entry) on localhost, or
+`curie cluster access` (loopback `kubectl port-forward` for the Console and Langfuse, for as long as it runs) or a kind `extraPortMappings` entry on localhost, or
 serve it over HTTPS ([#3968](https://github.com/curie-eng/curie/issues/3968)).
 `--json` also reports the current
 upgrade phase and the last known-good version.
