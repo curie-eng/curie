@@ -284,6 +284,9 @@ class InMemoryMarkedComments(_Declared):
     def comments(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         return [(comment.author, comment.body) for comment in self._accept(target)]
 
+    def _find(self, target: ReplyTarget, comment_id: str) -> _Comment | None:
+        return next((item for item in self._accept(target) if item.id == comment_id), None)
+
     async def find_marked(self, target: ReplyTarget, marker: str) -> MarkedComment | None:
         self._gate(Operation.FIND_MARKED)
         thread = self._accept(target)
@@ -364,6 +367,7 @@ class _Issue:
     dependencies: tuple[TrackerIssueRef, ...] = ()
     linked: list[PullRequestRef] = field(default_factory=list)
     author: Actor = REPORTER
+    closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -375,6 +379,9 @@ class _TimelineEvent:
     marker: str
     actor: Actor
     at: datetime
+    # A plain comment's body; None for a label event or `mention_in_comment`.
+    # A comment's notice kind is decided at poll time (`InMemoryTracker.comment`).
+    body: str | None = None
 
 
 class InMemoryTracker(_Declared):
@@ -558,6 +565,43 @@ class InMemoryTracker(_Declared):
         self._issue(issue)
         return self._record(issue, Disposition.MENTION, f"@{self.mention}", actor)
 
+    def comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        """``actor`` comments ``body`` on ``issue`` from outside the port; returns
+        the comment id.
+
+        The comment takes its id from the same counter as the adapter's own
+        marked comments and its creation time from their ``clock``, so it
+        orders against a factory question as on a real tracker. A poll
+        delivers it as `Disposition.ANSWER` when ``issue`` is ``answering``,
+        as `Disposition.MENTION` when ``body`` mentions ``@<mention>``, and not
+        at all otherwise; never when ``actor`` is the adapter's own identity.
+        Not a port write: no ledger entry.
+        """
+
+        self._issue(issue)
+        target = ReplyTarget.on_issue(issue)
+        comment_id = self._comments.seed_comment(target, actor, body)
+        created = self._comments._find(target, comment_id)
+        assert created is not None
+        self._timeline.append(
+            _TimelineEvent(
+                position=len(self._timeline) + 1,
+                event_id=comment_id,
+                issue=issue,
+                disposition=Disposition.ANSWER,
+                marker=self.label,
+                actor=actor,
+                at=created.created_at,
+                body=body,
+            )
+        )
+        return comment_id
+
+    def close_issue(self, issue: TrackerIssueRef) -> None:
+        """A person closes ``issue``. Not a port write: no ledger entry."""
+
+        self._issue(issue).closed = True
+
     def labels(self, issue: TrackerIssueRef) -> frozenset[str]:
         return frozenset(self._issue(issue).labels)
 
@@ -590,21 +634,44 @@ class InMemoryTracker(_Declared):
             return True
         return event.marker == self.label
 
+    def _mentions(self, body: str) -> bool:
+        pattern = rf"(?<![\w.@-])@{re.escape(self.mention)}(?![\w.-])"
+        return re.search(pattern, body, re.IGNORECASE) is not None
+
+    def _event_notice(
+        self, event: _TimelineEvent, answering: Collection[TrackerIssueRef]
+    ) -> MarkedNotice | None:
+        if event.body is None:
+            return self._notice(event) if self._marks(event) else None
+        if event.actor == self.identity:
+            return None
+        if event.issue in answering:
+            return self._notice(event)
+        if self._mentions(event.body):
+            return self._notice(
+                replace(event, disposition=Disposition.MENTION, marker=f"@{self.mention}")
+            )
+        return None
+
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         self._gate(Operation.POLL_MARKED)
         start = _cursor_position(cursor)
         unread = self._timeline[start:]
+        answers = frozenset(answering)
         notices: list[MarkedNotice] = []
         for offset in range(0, len(unread), self._page_size):
             # Read every page before returning any notice or cursor.
             self.faults.read_page("timeline")
-            notices.extend(
-                self._notice(event)
-                for event in unread[offset : offset + self._page_size]
-                if self._marks(event)
-            )
+            for event in unread[offset : offset + self._page_size]:
+                notice = self._event_notice(event, answers)
+                if notice is not None:
+                    notices.append(notice)
         if not unread:
             self.faults.read_page("timeline")
         seen = {(notice.issue, notice.event_id) for notice in notices}
@@ -637,6 +704,15 @@ class InMemoryTracker(_Declared):
             return False
         if notice.disposition is Disposition.MENTION:
             return any(event.event_id == notice.event_id for event in self._timeline)
+        if notice.disposition is Disposition.ANSWER:
+            # Open and labelled now, and the comment still stands (#5789 decision 3).
+            comment = self._comments._find(ReplyTarget.on_issue(notice.issue), notice.event_id)
+            return (
+                self.label in issue.labels
+                and not issue.closed
+                and comment is not None
+                and comment.author == notice.actor
+            )
         if notice.disposition is Disposition.CANCEL:
             return self.label not in issue.labels
         latest = self._last(notice.issue, Disposition.ADMIT)

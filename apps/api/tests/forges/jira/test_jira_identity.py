@@ -105,7 +105,7 @@ async def test_jira_identity_a_matching_site_and_bot_poll(api_url: str) -> None:
     _labelled(fake)
     tracker = jira_tracker(fake, api_url=api_url)
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
 
     assert len(page.notices) == 1
     (tenant,) = fake.requests_of("tenant_info")
@@ -127,8 +127,8 @@ async def test_jira_identity_is_verified_once_per_connection() -> None:
     _labelled(fake)
     tracker = jira_tracker(fake)
 
-    first = await tracker.poll_marked(None, running=())
-    await tracker.poll_marked(first.cursor, running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
+    await tracker.poll_marked(first.cursor, running=(), answering=())
 
     assert len(fake.requests_of("tenant_info")) == 1
     assert len(fake.requests_of("myself")) == 1
@@ -144,7 +144,7 @@ async def test_jira_identity_a_cloud_id_mismatch_is_unauthorized_before_any_sear
     tracker = jira_tracker(fake, scope_id=CLOUD_ID)
 
     with caplog.at_level(logging.DEBUG), pytest.raises(Unauthorized) as refused:
-        await tracker.poll_marked(None, running=())
+        await tracker.poll_marked(None, running=(), answering=())
 
     assert fake.requests_of("search") == []
     message = str(refused.value)
@@ -163,7 +163,7 @@ async def test_jira_identity_a_bot_account_mismatch_is_unauthorized_before_any_s
     tracker = jira_tracker(fake)
 
     with caplog.at_level(logging.DEBUG), pytest.raises(Unauthorized) as refused:
-        await tracker.poll_marked(None, running=())
+        await tracker.poll_marked(None, running=(), answering=())
 
     assert fake.requests_of("search") == []
     message = str(refused.value)
@@ -183,7 +183,7 @@ async def test_jira_identity_a_refused_token_is_unauthorized_and_never_echoed(
     tracker = jira_tracker(fake)
 
     with caplog.at_level(logging.DEBUG), pytest.raises(Unauthorized) as refused:
-        await tracker.poll_marked(None, running=())
+        await tracker.poll_marked(None, running=(), answering=())
 
     assert [r.status for r in fake.requests if r.kind != "tenant_info"][:1] == [401]
     _assert_no_secret(_printed(refused.value))
@@ -198,7 +198,7 @@ async def test_jira_identity_a_forbidden_search_is_unauthorized() -> None:
     fake.fail_next("search", status=403, body={"errorMessages": ["Forbidden"], "errors": {}})
 
     with pytest.raises(Unauthorized):
-        await tracker.poll_marked(None, running=())
+        await tracker.poll_marked(None, running=(), answering=())
 
 
 class _EchoingDown(httpx.AsyncBaseTransport):
@@ -221,7 +221,7 @@ async def test_jira_identity_a_transport_error_is_unavailable_and_carries_no_tok
         tracker = jira_tracker(fake, client=client)
 
         with caplog.at_level(logging.DEBUG), pytest.raises(Unavailable) as failed:
-            await tracker.poll_marked(None, running=())
+            await tracker.poll_marked(None, running=(), answering=())
 
     _assert_no_secret(_printed(failed.value))
     _assert_nothing_logged(caplog)
@@ -238,7 +238,7 @@ async def test_jira_identity_a_bad_json_answer_is_unavailable() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(garbled)) as client:
         tracker = jira_tracker(fake, client=client)
         with pytest.raises(Unavailable):
-            await tracker.poll_marked(None, running=())
+            await tracker.poll_marked(None, running=(), answering=())
 
 
 @pytest.mark.anyio
@@ -392,7 +392,7 @@ async def test_initial_label_nonhuman_creator_cannot_borrow_human_reporter(
     tracker = jira_tracker(fake, start_authority={"type": "allowlist", "accounts": [HUMAN_ID]})
 
     for cursor in (None, "0;"):
-        page = await tracker.poll_marked(cursor, running=())
+        page = await tracker.poll_marked(cursor, running=(), answering=())
         assert [(n.issue, n.actor) for n in page.notices] == [(fake.ref(neighbor), human.actor)]
     assert await tracker.marking_actor(fake.ref(ignored), LABEL) is None
     assert await tracker.marking_actor(fake.ref(neighbor), LABEL) == human.actor
@@ -420,7 +420,7 @@ async def test_initial_label_authority_uses_creator_after_reporter_change(
     fake.edit_reporter(denied.id, allowed, allowed)
     fake.edit_reporter(accepted.id, outsider, outsider)
 
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
     assert {n.issue for n in page.notices} == {fake.ref(denied), fake.ref(accepted)}
     for notice in page.notices:
         expected = notice.issue == fake.ref(accepted)

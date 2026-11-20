@@ -224,6 +224,9 @@ def _asgi(fake: gitlab_fake.GitLabAPI, origin: str) -> Starlette:
             headers=[(k, v) for k, v in request.headers.items() if k.lower() != "host"],
             content=await request.body(),
         )
+        action = fake.take_before(forwarded)
+        if action is not None:
+            await asyncio.to_thread(action)
         answered = fake.handle(forwarded)
         headers = {
             k: v

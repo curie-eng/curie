@@ -44,12 +44,12 @@ async def test_jira_cancel_a_removed_label_cancels_with_the_removing_history_id(
     issue = fake.seed_issue("Ticket")
     fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     (admit,) = admitted.notices
     assert await tracker.verify_current(admit) is True
 
     removed = fake.remove_label(issue.id, LABEL, human)
-    page = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),))
+    page = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),), answering=())
 
     (cancel,) = page.notices
     assert cancel.disposition is Disposition.CANCEL
@@ -65,11 +65,11 @@ async def test_jira_cancel_a_done_status_cancels_with_the_status_change_id() -> 
     issue = fake.seed_issue("Ticket", status="In Progress")
     fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     (admit,) = admitted.notices
 
     done = fake.set_status(issue.id, "Done", human)
-    page = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),))
+    page = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),), answering=())
 
     (cancel,) = page.notices
     assert cancel.disposition is Disposition.CANCEL
@@ -90,10 +90,10 @@ async def test_jira_cancel_a_running_issue_that_keeps_its_label_is_not_cancelled
     issue = fake.seed_issue("Ticket")
     fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
 
     fake.set_status(issue.id, "In Progress", human)
-    page = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),))
+    page = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),), answering=())
 
     assert page.notices == ()
     assert fake.requests_of("issue"), "a running issue is read on every poll"
@@ -106,11 +106,11 @@ async def test_jira_cancel_a_running_issue_that_answers_404_yields_deleted_notic
     issue = fake.seed_issue("Ticket")
     fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
 
     gone = fake.ref(issue)
     fake.delete_issue(issue.id)
-    page = await tracker.poll_marked(admitted.cursor, running=(gone,))
+    page = await tracker.poll_marked(admitted.cursor, running=(gone,), answering=())
 
     (cancel,) = page.notices
     assert (cancel.issue, cancel.disposition, cancel.event_id) == (
@@ -128,15 +128,15 @@ async def test_jira_cancel_a_transient_running_issue_read_defers_the_poll(status
     issue = fake.seed_issue("Ticket")
     fake.add_label(issue.id, LABEL, _human(fake))
     tracker = jira_tracker(fake)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     reads = len(fake.requests_of("issue"))
     fake.fail_next("issue", status=status, headers={"Retry-After": "30"})
 
     with pytest.raises(Unavailable):
-        await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),))
+        await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),), answering=())
 
     assert len(fake.requests_of("issue")) == reads + 1
-    resumed = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),))
+    resumed = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),), answering=())
     assert resumed.notices == ()
     assert len(fake.requests_of("issue")) == reads + 2
 
@@ -148,16 +148,16 @@ async def test_jira_cancel_a_relabel_after_cancel_is_a_new_admission() -> None:
     issue = fake.seed_issue("Ticket")
     fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     (first,) = admitted.notices
 
     fake.remove_label(issue.id, LABEL, human)
-    cancelled = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),))
+    cancelled = await tracker.poll_marked(admitted.cursor, running=(fake.ref(issue),), answering=())
     assert [n.disposition for n in cancelled.notices] == [Disposition.CANCEL]
 
     fake.advance(30)
     relabelled = fake.add_label(issue.id, LABEL, human)
-    page = await tracker.poll_marked(cancelled.cursor, running=())
+    page = await tracker.poll_marked(cancelled.cursor, running=(), answering=())
 
     (second,) = _of(page, Disposition.ADMIT)
     assert (second.issue, second.event_id) == (fake.ref(issue), relabelled)
@@ -174,11 +174,11 @@ async def test_jira_cancel_the_removal_is_found_when_it_predates_the_cursor() ->
     fake.add_label(issue.id, LABEL, human)
     removed = fake.remove_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
-    caught_up = await tracker.poll_marked(None, running=())
+    caught_up = await tracker.poll_marked(None, running=(), answering=())
     assert caught_up.notices == ()
 
     fake.advance(3600)
-    page = await tracker.poll_marked(caught_up.cursor, running=(fake.ref(issue),))
+    page = await tracker.poll_marked(caught_up.cursor, running=(fake.ref(issue),), answering=())
 
     assert [(n.disposition, n.event_id) for n in page.notices] == [(Disposition.CANCEL, removed)]
 
@@ -189,10 +189,10 @@ async def _mentioned(fake: JiraFake, human: JiraUser) -> tuple[object, MarkedNot
     issue = fake.seed_issue("Ticket", status="In Progress")
     fake.add_label(issue.id, LABEL, human)
     tracker = jira_tracker(fake)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     fake.advance(30)
     fake.add_comment(issue.id, human, adf_mention(BOT_ACCOUNT_ID, BOT_NAME, before="Again "))
-    page = await tracker.poll_marked(admitted.cursor, running=())
+    page = await tracker.poll_marked(admitted.cursor, running=(), answering=())
     (mention,) = _of(page, Disposition.MENTION)
     return issue.id, mention
 
