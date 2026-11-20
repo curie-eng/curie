@@ -189,7 +189,9 @@ class OneTicket:
         """One human label on one fresh issue; returns the label event's instant."""
 
         title, body = issue_title_and_body()
+        # The ticket itself is the one issue the factory must not add to.
         self.baseline_issues = [int(row["number"]) for row in self.stub._rows("issue")]
+        self.baseline_issues.append(ots.ISSUE)
         self.baseline_pulls = len(self.stub._rows("pull"))
         issue = self.stub._issue(ots.ISSUE, title, body, [ots.LABEL])
         issue["user"] = github.HUMAN
