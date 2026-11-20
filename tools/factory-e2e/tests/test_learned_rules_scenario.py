@@ -884,3 +884,185 @@ def test_a_refused_accept_stops_the_chain_before_ticket_b_is_labelled(
     decided = _step({"steps": run.chain["steps"]}, "d")
     assert decided["writer"]["codes"] == ["memory_rules.stale_version"]
     run.cleanup()
+
+
+# Steps d to f on real-shaped inputs ------------------------------------------
+#
+# The live chain stores every step scrubbed while the driver reads raw values
+# (the stub's real host and port in URLs). This drives accept, ticket B and
+# ticket C through the real driver code against the real stub, the real
+# capture writer and the product's own section and annotation renderers, so a
+# raw-versus-scrubbed or shape mismatch fails here instead of in a paid run.
+
+IMPLEMENTER_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+REQUESTER_TEXT = lrr.REQUESTER_FILE.read_text()
+SELECTION = "cccccccc-0000-4000-8000-000000000001"
+
+
+def _rules_canonical(text: str) -> str:
+    from curie_internal.memory_rules import canonical_text
+
+    return canonical_text([(1, text)])
+
+
+class _Factory:
+    """Stands in for the install between a label and the final notice: the runner's
+    Messages requests reach the real capture writer, and a branch and pull request
+    land on the real stub with the body the API annotates."""
+
+    def __init__(self, run: lrr.LearnedRulesRun, stub: Any, model: Any, rule_text: str) -> None:
+        self.run, self.stub, self.model, self.rule_text = run, stub, model, rule_text
+        self.rules_in_force = True
+        self.items: dict[int, dict[str, Any]] = {}
+
+    def request(self, number: int, *, implementer: bool) -> None:
+        issue_url = f"{self.stub.base_url}/{REPO}/issues/{number}"
+        system: list[dict[str, Any]] = [{"type": "text", "text": IMPLEMENTER_SYSTEM}]
+        if implementer:
+            if self.rules_in_force:
+                canonical = _rules_canonical(self.rule_text)
+                system.append({"type": "text", "text": rules_section(1, DIGEST, canonical)})
+            system.append(
+                {
+                    "type": "text",
+                    "text": requester_section(
+                        SELECTION,
+                        REQUESTER_DIGEST,
+                        REQUESTER_TEXT,
+                        learned_rules=self.rules_in_force,
+                    ),
+                }
+            )
+            first = frame_user_turn("job", "", f"Implement {issue_url}", "github")
+        else:
+            first = f"<system-reminder>\nReview the change for {issue_url}\n</system-reminder>"
+        body = {
+            "model": "claude",
+            "system": system,
+            "tools": [{"name": "Read"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": first}]}],
+        }
+        self.model._capture(json.dumps(body).encode())
+
+    def publish(self, number: int, asserts: list[str]) -> None:
+        branch = f"curie/publication-{number:032x}"
+        work = self.run.workdir / f"clone-{number}"
+        git = ["git", "-c", "user.name=factory", "-c", "user.email=factory@example.test"]
+        self.stub._run("git", "clone", "-q", str(self.stub._repository), str(work))
+        test = work / "tests" / f"test_issue_{number}.py"
+        test.parent.mkdir(exist_ok=True)
+        test.write_text("".join(f"        {line}\n" for line in asserts))
+        self.stub._run(*git, "-C", str(work), "add", "-A")
+        self.stub._run(*git, "-C", str(work), "commit", "-qm", f"Issue {number}")
+        self.stub._run(*git, "-C", str(work), "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+        body = api_requester.annotate(f"Adds the units.\n\nCloses #{number}", REQUESTER_DIGEST)
+        if self.rules_in_force:
+            body = api_rules.annotate(body, api_rules.AppliedRules((1,), DIGEST))
+        _post_pull(self.stub, branch, body)
+        self.items[number] = (
+            {"state": "selected", "count": 1, "rule_numbers": [1], "sha256": DIGEST}
+            if self.rules_in_force
+            else {"state": "absent", "count": 0, "rule_numbers": [], "sha256": None}
+        )
+
+
+def _post_pull(stub: Any, branch: str, body: str) -> int:
+    request = Request(
+        f"{stub.base_url}/api/v3/repos/{REPO}/pulls",
+        data=json.dumps(
+            {"title": "Add units", "head": branch, "base": "main", "body": body}
+        ).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer example"},
+        method="POST",
+    )
+    context = ssl.create_default_context(cafile=str(stub.ca_file))
+    with urlopen(request, context=context, timeout=30) as response:
+        assert response.status == 201
+        return int(json.load(response)["number"])
+
+
+def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub: Any
+) -> None:
+    from types import SimpleNamespace
+
+    # The stub module is loaded by path, so read its accounts from the class's module.
+    github = SimpleNamespace(RULE_WRITER=type(stub).__init__.__globals__["RULE_WRITER"])
+    model_module = sk._module("learned_rules_model_script", lrr.MODEL_SCRIPT)
+    run, calls = _chain_run(tmp_path, monkeypatch, writer_code=None)
+    run.stub = stub
+    run.workdir = tmp_path / "work"
+    run.workdir.mkdir()
+    run.capture_dir = run.workdir / "model-captures"
+    run.identity = lrl.issue_identity(stub)
+    run.deadline = __import__("time").monotonic() + 60
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({"version": 1, "exchanges": []}))
+    model = model_module.ModelScript(empty, capture_dir=run.capture_dir, issue_of=run.identity)
+    rule_text = lrs.RULE_TEXT
+    factory = _Factory(run, stub, model, rule_text)
+    raw_source = f"{stub.base_url}/{REPO}/pull/7#issuecomment-41"
+    listed = {"id": RULE_ID, "label": "R1", "state": "proposed", "version": 2}
+    listed.update(source_url=raw_source, text=rule_text)
+
+    def decide(verb: str, rule_id: str, version: int, role: str) -> tuple[int, str]:
+        if version != listed["version"]:
+            return 1, json.dumps({"error": {"code": "memory_rules.stale_version"}})
+        if role == "reader":
+            return 1, json.dumps({"error": {"code": lrs.WRITE_ACCESS_REQUIRED}})
+        listed.update(state={"accept": "accepted", "remove": "removed"}[verb], version=version + 1)
+        factory.rules_in_force = verb == "accept"
+        return 0, ""
+
+    def label(_github: Any, number: int) -> None:
+        lrr.LearnedRulesRun.label_ticket(run, github, number)
+        factory.request(number, implementer=True)
+        factory.request(number, implementer=False)
+        factory.request(number, implementer=True)
+        asserts = (
+            ["self.assertAlmostEqual(convert(0, 'f', 'r'), 459.67, places=6)"]
+            if number == lrs.TICKET_B
+            else []
+        )
+        factory.publish(number, asserts)
+
+    def sql(query: str) -> list[Any]:
+        for number in (lrs.TICKET_B, lrs.TICKET_C):
+            if query == lrr.requests_sql(number):
+                return [{"id": f"request-{number}", "status": "completed"}]
+            if query == lrr.work_items_sql(number):
+                return [f"item-{number}"]
+        raise AssertionError(f"unexpected SQL {query[:80]}")
+
+    def api(method: str, path: str, **_kwargs: Any) -> tuple[int, Any]:
+        number = int(path.rsplit("-", 1)[1])
+        return 200, {"memory_rules": factory.items[number]}
+
+    monkeypatch.setattr(run, "decide", decide)
+    monkeypatch.setattr(run, "list_rules", lambda: [dict(listed)])
+    monkeypatch.setattr(run, "label_ticket", label)
+    monkeypatch.setattr(run, "run_ticket", lambda *args: lrr.LearnedRulesRun.run_ticket(run, *args))
+    monkeypatch.setattr(run, "sql", sql)
+    monkeypatch.setattr(run, "api", api)
+    monkeypatch.setattr(run, "final_notice", lambda _request_id: {"id": 1})
+    monkeypatch.setattr(run, "check_boundaries", lambda: None)
+
+    def lanes_step() -> None:
+        raise _Stop("lanes")
+
+    monkeypatch.setattr(run, "lanes_step", lanes_step)
+    try:
+        with pytest.raises(_Stop, match="lanes"):
+            run.run_chain(github)
+    finally:
+        run.stub = None
+        run.cleanup()
+    steps = {step["step"]: step for step in run.chain["steps"]}
+    assert set(steps) == {"a", "b", "c", "d", "e", "f"}
+    rule = lrs.assert_promoted(steps["c"], 7, REPLY_URL)
+    accepted = lrs.assert_decided(steps["d"], rule)
+    lrs.assert_ticket_b(steps["e"])
+    lrs.assert_ticket_c(steps["f"], accepted)
+    assert all(c["issue"] == lrs.TICKET_B for c in steps["e"]["captures"])
+    stored = json.dumps(run.chain["steps"])
+    assert stub.base_url not in stored and f"{stub.host}:{stub.port}" not in stored
