@@ -977,6 +977,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "DryRun" => FactoryIntakeOutput::DryRun(plan()),
             "Done" => FactoryIntakeOutput::Done { enabled: true },
             "RepositoriesUpdated" => FactoryIntakeOutput::RepositoriesUpdated { enabled: false, repos: vec!["acme/bot".into()] },
+            "ModelAuthModeSet" => FactoryIntakeOutput::ModelAuthModeSet { mode: "personal".into() },
         ],
     );
     m.insert(

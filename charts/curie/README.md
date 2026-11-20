@@ -93,6 +93,16 @@ and 60 seconds for scheduling and Helm operations. Raising
 `worker.deliveryBudgetSeconds` raises both the effective drain wait and worker
 grace automatically, so the Helm timeout must rise too.
 
+**Upgrading a personal mode release.** A release that selected personal
+subscription mode by setting `FACTORY_MODEL_AUTH_MODE` in `api.extraEnv` and
+`worker.extraEnv` fails its next render with this chart: the variable is now
+chart-owned and comes from `factory.modelAuthMode`. Retained values keep the
+old entries (`--reuse-values` and `--reset-then-reuse-values` both replay
+them), and Helm replaces a list whole, so give both lists again without the
+variable, with `[]` for a list that becomes empty, and set the value, in the
+same upgrade. See [Factory model auth mode](#factory-model-auth-mode) for the
+values file and command.
+
 **Upgrade drain and claim state.** Before each upgrade, a hook pauses new worker
 claims and waits for accepted deliveries to finish. The chart stores an
 installation identity in its managed Secret and reuses it across upgrades. A
@@ -2716,8 +2726,43 @@ render, and so does setting `FACTORY_MODEL_AUTH_MODE` through `api.extraEnv` or
 `worker.extraEnv`, even with an equal value. Personal mode needs the Kubernetes
 sandbox substrate: a personal render whose `worker.extraEnv` sets
 `CURIE_SANDBOX_SUBSTRATE` to anything but `kubernetes` fails, because the
-worker would refuse to start. `ci/factory-model-auth-mode-assertions.sh` pins
-this.
+worker would refuse to start. Only a literal value is accepted there: a
+`valueFrom` entry cannot be verified before the worker starts, and an empty
+value is a worker startup error, so both are refused in personal mode. The API
+and the worker read their settings case-insensitively, so an `extraEnv` entry
+named `factory_model_auth_mode` (any case variant) fails the render too.
+`ci/factory-model-auth-mode-assertions.sh` pins this.
+
+A release that selected personal mode through `FACTORY_MODEL_AUTH_MODE` in
+`api.extraEnv` and `worker.extraEnv` must drop those entries and set the value
+in one upgrade, because the new chart refuses the retained entries and
+`curie cluster factory --model-auth-mode` writes only `factory.modelAuthMode`.
+Write a private values file that repeats each list without the variable (keep
+every other entry; use `[]` for a list that becomes empty) and sets the mode:
+
+```yaml
+factory:
+  modelAuthMode: personal
+api:
+  extraEnv:
+    - name: ACME_API_EXTENSION   # every other retained api entry, unchanged
+      value: kept
+worker:
+  extraEnv: []
+```
+
+Then pass it in the same upgrade:
+
+```bash
+helm upgrade curie <new-chart> -n curie --reset-then-reuse-values \
+  -f model-auth-mode.yaml --timeout <minimum>s
+```
+
+Helm replaces a list whole, so the file's lists win over the retained ones and
+the render carries `FACTORY_MODEL_AUTH_MODE=personal` once in each of the API
+and the worker. Setting only `factory.modelAuthMode` while the old entries are
+retained still fails the render. Later mode changes need only
+`curie cluster factory --model-auth-mode <mode>`.
 
 ### Reserved environment variables
 

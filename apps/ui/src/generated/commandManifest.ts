@@ -6110,7 +6110,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Select the installation's model auth mode (factory.modelAuthMode): service or personal. Personal needs the Kubernetes sandbox substrate. Omit to keep the recorded mode",
+              "help": "Select the installation's model auth mode (factory.modelAuthMode): service or personal. Personal needs the Kubernetes sandbox substrate. Given alone, it writes only the mode and leaves intake as recorded. Omit to keep the recorded mode",
               "id": "model_auth_mode",
               "long": "model-auth-mode",
               "positional": false,

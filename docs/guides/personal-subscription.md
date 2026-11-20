@@ -17,7 +17,10 @@ This page does not repeat it.
    substrate. The operator selects the mode with
    `curie cluster factory --model-auth-mode personal`, which sets the chart
    value `factory.modelAuthMode`; `curie cluster status` shows it as
-   `factory model auth mode: personal`. See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue).
+   `factory model auth mode: personal`. An installation that set
+   `FACTORY_MODEL_AUTH_MODE` through `api.extraEnv` and `worker.extraEnv`
+   must remove those entries and set `factory.modelAuthMode` in the same
+   upgrade; the chart README section "Factory model auth mode" shows how. See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue).
 2. `personalClaude.grantNamespace` names an existing namespace used only for
    personal grant custody. An empty value makes enrollment answer
    `custody_unconfigured`. See
@@ -317,8 +320,8 @@ Other `skill` and `local` commands are not refused by this check.
 On a cluster, `factory.modelAuthMode` is the only switch. The chart renders it
 as `FACTORY_MODEL_AUTH_MODE` into both the API and the worker, and refuses the
 variable in `api.extraEnv` or `worker.extraEnv`. A personal release whose
-`worker.extraEnv` sets `CURIE_SANDBOX_SUBSTRATE` to anything but `kubernetes`
-is refused by `curie cluster factory --model-auth-mode personal` and by the
+`worker.extraEnv` sets `CURIE_SANDBOX_SUBSTRATE` to anything but the literal
+`kubernetes` (a `valueFrom` entry or an empty value included) is refused by `curie cluster factory --model-auth-mode personal` and by the
 chart render, before anything is applied. A worker started in personal mode
 on another substrate anyway refuses to start with
 `personal_mode_requires_kubernetes: FACTORY_MODEL_AUTH_MODE=personal needs CURIE_SANDBOX_SUBSTRATE=kubernetes`.

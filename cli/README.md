@@ -315,15 +315,24 @@ before any Docker call, including under `--dry-run`, with
 `curie cluster ...`.
 
 A cluster selects the mode with
-`curie cluster factory --model-auth-mode personal` (or `service`), which writes
-the chart value `factory.modelAuthMode` and nothing else. The chart renders it
-as `FACTORY_MODEL_AUTH_MODE` into both the API and the worker. Omitting the
-flag keeps the recorded mode. Personal mode needs the Kubernetes sandbox
-substrate: the command refuses, before any Helm write, a release whose
-`worker.extraEnv` sets `CURIE_SANDBOX_SUBSTRATE` to anything but `kubernetes`.
+`curie cluster factory --model-auth-mode personal` (or `service`). The chart
+renders `factory.modelAuthMode` as `FACTORY_MODEL_AUTH_MODE` into both the API
+and the worker. Given with no other intake option, the flag is a mode-only
+change: it skips App registration, preflight and the intake checks, reads the
+recorded release (a missing release is an error), and applies a values file
+holding only `factory.modelAuthMode` with `--reuse-values`, so intake, its
+forges (GitHub, GitLab or Jira) and `factory.enabled` stay as recorded. Its
+`--json` result is `{"factory_model_auth_mode": "<mode>"}`. Given with other
+intake options, the usual intake configuration runs and also writes the mode.
+Omitting the flag keeps the recorded mode. Personal mode needs the Kubernetes
+sandbox substrate: the command refuses, before any Helm write, a release whose
+`worker.extraEnv` sets `CURIE_SANDBOX_SUBSTRATE` to anything but the literal
+`kubernetes`, including a `valueFrom` entry or an empty value.
 `curie cluster status` prints `factory model auth mode: <mode>`, and its JSON
-carries `factory_model_auth_mode` (null when the computed release values are
-unavailable).
+carries `factory_model_auth_mode`. A release upgraded with retained values from
+a chart without the key shows the literal of a retained `FACTORY_MODEL_AUTH_MODE`
+extraEnv entry, else `service`; the value is null only when the computed
+release values are unavailable (or that retained literal is invalid).
 
 | Target | What runs | Slack | Kubernetes | Verbs | Reach for it to |
 |---|---|---|---|---|---|

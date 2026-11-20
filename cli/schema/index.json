@@ -193,13 +193,13 @@
       "result": "FactoryAppRegistrationOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "FactoryAppSetupOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "FactoryExplainOutput",
@@ -211,7 +211,7 @@
       "result": "FactoryIntakeOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "GithubAppOutput",

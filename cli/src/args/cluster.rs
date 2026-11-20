@@ -747,7 +747,8 @@ pub(crate) enum ClusterAction {
         intake: Option<String>,
         /// Select the installation's model auth mode (factory.modelAuthMode):
         /// service or personal. Personal needs the Kubernetes sandbox
-        /// substrate. Omit to keep the recorded mode.
+        /// substrate. Given alone, it writes only the mode and leaves intake
+        /// as recorded. Omit to keep the recorded mode.
         #[arg(long, value_parser = ["service", "personal"], conflicts_with_all = ["disable", "repo_runners", "repo_docker"])]
         model_auth_mode: Option<String>,
         /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.

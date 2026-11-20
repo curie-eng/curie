@@ -38,6 +38,7 @@ mod cluster_convergence;
 mod cluster_deploy_no_docker;
 mod cluster_down_failforward;
 mod cluster_down_namespace_bound;
+mod cluster_factory_model_auth_mode;
 mod cluster_kube_context;
 mod cluster_lint_values;
 mod cluster_namespace_ownership;

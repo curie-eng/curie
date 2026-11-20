@@ -90,7 +90,9 @@ render --set factory.modelAuthMode=service | check "explicit service" service
 render --set factory.modelAuthMode=personal | check "personal" personal
 
 echo "=== unknown values ==="
-refused "unknown mode" "/factory/modelAuthMode': value must be one of" \
+# Helm words the schema refusal differently across versions, so require only
+# that it names the key.
+refused "unknown mode" "modelAuthMode" \
   render --set factory.modelAuthMode=shared
 # The template guard holds on its own when a render skips the schema.
 refused "unknown mode without the schema" \
@@ -108,12 +110,28 @@ for workload in api worker; do
   done
 done
 
+# The api and the worker read settings case-insensitively, so a case variant
+# of the name would override the chart value just the same.
+for workload in api worker; do
+  refused "$workload.extraEnv factory_model_auth_mode" \
+    "$workload.extraEnv sets factory_model_auth_mode, which the $workload reads as FACTORY_MODEL_AUTH_MODE; remove it from extraEnv and configure factory.modelAuthMode instead" \
+    render --set "$workload.extraEnv[0].name=factory_model_auth_mode" \
+      --set-string "$workload.extraEnv[0].value=personal"
+done
+
 echo "=== personal mode needs the Kubernetes substrate ==="
 substrate() {
   printf -- '--set\nworker.extraEnv[0].name=CURIE_SANDBOX_SUBSTRATE\n--set-string\nworker.extraEnv[0].value=%s\n' "$1"
 }
 mapfile -t docker_substrate < <(substrate docker)
 mapfile -t kube_substrate < <(substrate kubernetes)
+mapfile -t padded_substrate < <(substrate " Kubernetes ")
+mapfile -t empty_substrate < <(substrate "")
+from_config_map=(
+  --set "worker.extraEnv[0].name=CURIE_SANDBOX_SUBSTRATE"
+  --set "worker.extraEnv[0].valueFrom.configMapKeyRef.name=acme-substrate"
+  --set "worker.extraEnv[0].valueFrom.configMapKeyRef.key=substrate"
+)
 refused "personal with CURIE_SANDBOX_SUBSTRATE=docker" \
   "factory.modelAuthMode=personal needs the Kubernetes sandbox substrate, but worker.extraEnv sets CURIE_SANDBOX_SUBSTRATE=docker" \
   render --set factory.modelAuthMode=personal "${docker_substrate[@]}"
@@ -121,5 +139,19 @@ render --set factory.modelAuthMode=service "${docker_substrate[@]}" \
   | check "service with CURIE_SANDBOX_SUBSTRATE=docker" service
 render --set factory.modelAuthMode=personal "${kube_substrate[@]}" \
   | check "personal with CURIE_SANDBOX_SUBSTRATE=kubernetes" personal
+render --set factory.modelAuthMode=personal "${padded_substrate[@]}" \
+  | check "personal with CURIE_SANDBOX_SUBSTRATE=' Kubernetes '" personal
+# A valueFrom entry resolves only at runtime, to anything; an empty value is a
+# worker startup error. Both are refused in personal mode only.
+refused "personal with CURIE_SANDBOX_SUBSTRATE from a ConfigMap" \
+  "worker.extraEnv sets CURIE_SANDBOX_SUBSTRATE from valueFrom, which cannot be verified before the worker starts" \
+  render --set factory.modelAuthMode=personal "${from_config_map[@]}"
+refused "personal with an empty CURIE_SANDBOX_SUBSTRATE" \
+  "worker.extraEnv sets CURIE_SANDBOX_SUBSTRATE to an empty value" \
+  render --set factory.modelAuthMode=personal "${empty_substrate[@]}"
+render --set factory.modelAuthMode=service "${from_config_map[@]}" \
+  | check "service with CURIE_SANDBOX_SUBSTRATE from a ConfigMap" service
+render --set factory.modelAuthMode=service "${empty_substrate[@]}" \
+  | check "service with an empty CURIE_SANDBOX_SUBSTRATE" service
 
 echo "factory model auth mode assertions passed"

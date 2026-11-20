@@ -2847,8 +2847,18 @@ outside Kubernetes set `CURIE_PERSONAL_ROLLOUT_HOLD=false`.
 
 The worker reads the same `factory.modelAuthMode`, which the chart renders as
 `FACTORY_MODEL_AUTH_MODE` into the API and the worker alike. Select it with
-`curie cluster factory --model-auth-mode personal` (or `service`); `curie
-cluster status` prints it as `factory model auth mode`. With `personal`, the
+`curie cluster factory --model-auth-mode personal` (or `service`). Given alone,
+that flag writes only `factory.modelAuthMode` and leaves intake, its forges and
+`factory.enabled` as recorded. `curie cluster status` prints the mode as
+`factory model auth mode`.
+
+A release that selected personal mode by setting `FACTORY_MODEL_AUTH_MODE` in
+`api.extraEnv` and `worker.extraEnv` fails its next render, because the chart
+owns the variable now and retained values replay the old entries. In the same
+upgrade, give both lists again without the variable (`[]` when nothing else
+remains) and set `factory.modelAuthMode: personal` in one values file; the
+chart README section "Factory model auth mode" has the file and the
+`helm upgrade --reset-then-reuse-values -f` command. With `personal`, the
 worker refuses to start with `personal_mode_requires_kubernetes` unless
 `CURIE_SANDBOX_SUBSTRATE` is `kubernetes`; the chart and `curie cluster
 factory` refuse a personal release whose `worker.extraEnv` selects another
