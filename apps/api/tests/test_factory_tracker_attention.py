@@ -106,8 +106,8 @@ def test_omitted_human_decision_is_not_attributed_to_agent() -> None:
         {"next_owner": "agent", "next_action": "Continue", "verification": []}
     )
     rendered = format_handoff(handoff, no_pull_request=True)
-    assert "**Human decision now:** none recorded." in rendered
-    assert "none recorded. (agent reported)" not in rendered
+    assert "**Human decision now:** None recorded" in rendered
+    assert "None recorded (agent reported)" not in rendered
 
 
 def test_card_state_leaves_room_for_reviewer_metadata() -> None:

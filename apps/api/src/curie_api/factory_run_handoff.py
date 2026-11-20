@@ -94,7 +94,7 @@ def format_handoff(
     decision = (
         f"{safe_tracker_line(handoff.human_decision)} (agent reported)"
         if handoff.human_decision
-        else "none recorded."
+        else "None recorded"
     )
     if no_pull_request:
         lines.append("**No pull request was published.**")
@@ -180,7 +180,7 @@ def fallback_summary(
             (
                 f"**Human decision now:** {question} (agent reported)"
                 if question is not None
-                else "**Human decision now:** none recorded."
+                else "**Human decision now:** None recorded"
             ),
             *([f"**Agent-reported reason:** {reason}"] if reason is not None else []),
             *(["**Recovery of uncommitted work:** unknown."] if status != "completed" else []),
