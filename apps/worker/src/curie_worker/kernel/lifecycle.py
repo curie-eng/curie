@@ -83,7 +83,7 @@ from .log import logger
 
 
 def _lease_still_held(lease: DeliveryLease | None) -> bool:
-    """Whether this owner may still speak for its delivery (Draft ADR 0288 decision 3).
+    """Whether this owner may still speak for its delivery (ADR 0288 decision 3).
 
     False once the lease is lost, or once a fenced lease is past its confirmed
     ownership window: the heartbeat may not yet have noticed an expiry that a
@@ -170,7 +170,7 @@ async def process_event(
                 # @spec HTTP-INVOCATION-EXECUTION-31: only the relay hears of it.
                 await self._settle_relay_after_refusal(qevent)
                 if refusal.notice is not None and _lease_still_held(lease):
-                    # Draft ADR 0288 decision 3: a refused approval ticket. The
+                    # ADR 0288 decision 3: a refused approval ticket. The
                     # lease is checked again here because it may have been lost
                     # or run out while the run closed or the marker was
                     # written; a stale owner sends nothing.

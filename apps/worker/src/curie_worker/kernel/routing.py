@@ -396,7 +396,7 @@ async def _settle_relay_after_refusal(self: Kernel, qevent: QueuedTurn) -> None:
 
 
 async def _notice_after_refusal(self: Kernel, qevent: QueuedTurn, text: str) -> None:
-    """Tell the requester that a prepared approval ticket was refused (Draft ADR 0288).
+    """Tell the requester that a prepared approval ticket was refused (ADR 0288).
 
     Called after the done marker, so a lost lease has already stopped this
     owner and a redelivery of the settled event is skipped before it can post a

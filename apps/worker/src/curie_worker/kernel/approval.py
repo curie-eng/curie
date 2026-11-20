@@ -1044,9 +1044,9 @@ async def _pause_for_approval(
     except ApprovalContinuityRefused as exc:
         # @spec HTTP-APPROVAL-CONTINUITY-3: definitive refusal is the HTTP terminal
         # refusal, never the legacy escalation below.
-        # Draft ADR 0288 decision 3: a refused ticket says nothing about who
-        # asked, so the lifecycle owner tells the requester in one plain
-        # sentence, after the lease check and the terminal marker.
+        # ADR 0288 decision 3: a refused ticket says nothing about who
+        # asked, so the lifecycle owner replaces the placeholder with the
+        # fixed notice ADR 0288 quotes, after the lease check and the marker.
         notice = TICKET_RETRY_REPLY if exc.code in TICKET_RETRY_CODES else None
         raise identity.HttpIdentityRefused(notice=notice) from None
     except WorkspaceSelectionRefused as exc:

@@ -473,6 +473,14 @@ def test_selected_email_turn_without_approver_emails_reaches_identity_creation(
     asyncio.run(run())
 
 
+def test_the_ticket_refusal_notice_is_the_text_adr_0288_quotes() -> None:
+    """ADR 0288 decision 3 quotes the notice; the worker sends exactly that text."""
+    assert TICKET_RETRY_REPLY == (
+        "The approval request for this action could not be created. "
+        "Please ask again, and a new request will be prepared."
+    )
+
+
 @pytest.mark.parametrize(
     ("status", "detail", "settled", "told"),
     [
@@ -493,8 +501,8 @@ def test_definite_creation_refusal_settles_the_turn(
 ) -> None:
     """A coded creation refusal ACKs the turn. Availability failure stays pending.
 
-    Draft ADR 0288 decision 3: a refusal of the prepared ticket itself replaces
-    the placeholder with one plain sentence; every refusal about a person, a
+    ADR 0288 decision 3: a refusal of the prepared ticket itself replaces
+    the placeholder with the fixed notice; every refusal about a person, a
     route or availability stays silent.
     """
 
@@ -566,7 +574,7 @@ def test_definite_creation_refusal_settles_the_turn(
 def test_an_undelivered_ticket_refusal_notice_keeps_the_terminal_outcome(
     make_harness: Any,
 ) -> None:
-    """Draft ADR 0288 decision 3: the notice is best effort, the refusal stays terminal."""
+    """ADR 0288 decision 3: the notice is best effort, the refusal stays terminal."""
 
     async def run() -> None:
         async def handle(_request: httpx.Request) -> httpx.Response:
@@ -614,7 +622,7 @@ def test_an_undelivered_ticket_refusal_notice_keeps_the_terminal_outcome(
 def test_the_ticket_refusal_notice_leaves_the_relay_to_its_own_settlement(
     make_harness: Any, adapter: str | None, told: bool,
 ) -> None:
-    """Draft ADR 0288 decision 3: the relay waiter gets only its existing refusal reply."""
+    """ADR 0288 decision 3: the relay waiter gets only its existing refusal reply."""
 
     async def run() -> None:
         async with make_harness(binding=Binding(), identity_authority=Core()) as h:
@@ -630,7 +638,7 @@ def test_the_ticket_refusal_notice_leaves_the_relay_to_its_own_settlement(
 def test_a_lease_lost_while_the_marker_is_written_sends_no_ticket_notice(
     make_harness: Any, how: str,
 ) -> None:
-    """Draft ADR 0288 decision 3: a stale owner never tells the requester.
+    """ADR 0288 decision 3: a stale owner never tells the requester.
 
     The lease is still held at the lifecycle's lease check and is lost, or its
     confirmed window runs out before the heartbeat notices, while the done

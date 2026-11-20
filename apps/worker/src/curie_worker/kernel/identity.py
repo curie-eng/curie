@@ -51,7 +51,7 @@ class HttpIdentityRefused(RuntimeError):
 
     ``notice`` is a fixed person-facing sentence the lifecycle owner may deliver
     after the terminal marker, set only for a refusal that says nothing about
-    any person (Draft ADR 0288 decision 3). None, the default, keeps the
+    any person (ADR 0288 decision 3). None, the default, keeps the
     refusal silent.
     """
 

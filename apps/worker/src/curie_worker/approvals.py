@@ -56,7 +56,7 @@ class ApprovalContinuityRefused(RuntimeError):
     """@spec HTTP-APPROVAL-CONTINUITY-3.
 
     ``code`` is the API's exact refusal detail when the refusal carried one, so
-    a caller can tell a refused ticket from a refused person (Draft ADR 0288
+    a caller can tell a refused ticket from a refused person (ADR 0288
     decision 3). The message stays fixed and names no code.
     """
 
@@ -76,7 +76,7 @@ TICKET_RETRY_CODES = frozenset(
 )
 """Creation refusals about the prepared ticket itself, not about any person.
 
-Draft ADR 0288 decision 3. Each one means the ticket the model sent was damaged,
+ADR 0288 decision 3. Each one means the ticket the model sent was damaged,
 stale, already used, or prepared for other details, and a fresh request makes a
 fresh ticket. ``approval_ticket_arguments_unstable`` is deliberately absent: the
 stored arguments changed form in the database, and asking again for the same
