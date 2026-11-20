@@ -756,6 +756,91 @@ fn read_pid(path: &Path) -> u32 {
         .unwrap_or(0)
 }
 
+#[derive(Debug)]
+struct ProcFields {
+    state: char,
+    pgrp: u32,
+}
+
+/// Fields after the comm in `/proc/<pid>/stat`. The comm is wrapped in
+/// parentheses and can itself contain parentheses, so the split is the last
+/// `)`.
+fn proc_fields(pid: u32) -> Option<ProcFields> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = text.rsplit_once(')')?.1.trim_start();
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some(ProcFields { state, pgrp })
+}
+
+fn holds_stdout_pipe(pid: u32) -> bool {
+    fs::read_link(format!("/proc/{pid}/fd/1"))
+        .map(|target| target.to_string_lossy().starts_with("pipe:"))
+        .unwrap_or(false)
+}
+
+/// The leader has exited. Its children are reparented at exit, so the pipe
+/// holder is no longer a child of that zombie. The proof is that the leader
+/// stays unreaped while the live holder keeps the stdout pipe and the group.
+/// `wait_with_output` reaps the leader as soon as it exits, so this window
+/// does not last. A descendant that is only an orphan zombie is not accepted.
+fn leader_stayed_unreaped_while_child_held_the_pipe(
+    parent_path: &Path,
+    child_path: &Path,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let mut held_since: Option<std::time::Instant> = None;
+    let mut last = String::from("no sample");
+    while started.elapsed() < std::time::Duration::from_secs(5) {
+        let parent = read_pid(parent_path);
+        let child = read_pid(child_path);
+        if parent > 1 && child > 1 && parent != child {
+            let leader = proc_fields(parent);
+            let holder = proc_fields(child);
+            last = format!("parent={parent} child={child} leader={leader:?} holder={holder:?}");
+            match (&leader, &holder) {
+                (Some(leader), Some(holder))
+                    if leader.state == 'Z'
+                        && holder.state != 'Z'
+                        && holder.pgrp == parent
+                        && leader.pgrp == parent
+                        && holds_stdout_pipe(child) =>
+                {
+                    let since = held_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= std::time::Duration::from_millis(400) {
+                        return Ok(());
+                    }
+                }
+                (None, Some(holder)) if holder.state != 'Z' && holder.pgrp == parent => {
+                    return Err(format!(
+                        "leader was reaped while the descendant was still alive: {last}"
+                    ));
+                }
+                _ => held_since = None,
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!(
+        "the exited leader did not stay unreaped while the descendant held the pipe: {last}"
+    ))
+}
+
+/// Stops a leaked `sleep` descendant. The pid is signaled only when its comm
+/// is still `sleep`, so a recycled pid is left alone.
+fn stop_leaked_sleep(path: &Path) {
+    let pid = read_pid(path);
+    if pid <= 1 {
+        return;
+    }
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    if comm.trim() == "sleep" {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+}
+
 #[tokio::test]
 async fn cluster_down_extension_refuses_a_mixed_namespace() {
     let _env = crate::support::ENV_LOCK.lock().await;
@@ -1408,13 +1493,16 @@ exit 1
 }
 
 /// The leader exits while a descendant still holds the output pipe and stays
-/// in the leader's process group. The read has to stop that descendant itself.
-/// Reaping the leader zombie would leave the descendant running.
+/// in the leader's process group. `$$` inside that subshell is the leader, so
+/// the fixture records `$!` instead. The read has to leave the leader unreaped
+/// while that child holds the pipe, then stop the child itself. Reaping the
+/// leader the way `wait_with_output` does fails the unreaped observation even
+/// when a later signal happens to reach the group.
 #[tokio::test]
 async fn cluster_down_extension_stops_a_pipe_holder_after_the_leader_exits() {
     let _env = crate::support::ENV_LOCK.lock().await;
     let _restored = RestoredProcessEnv::capture();
-    set_extension_timing(40, 800);
+    set_extension_timing(40, 3_000);
     let started = std::time::Instant::now();
     let dir = tempfile::tempdir().expect("tempdir");
     let argv_log = dir.path().join("kubectl-argv.log");
@@ -1424,6 +1512,7 @@ async fn cluster_down_extension_stops_a_pipe_holder_after_the_leader_exits() {
     let child_pid = dir.path().join("child.pid");
     let parent_pgid = dir.path().join("parent.pgid");
     let child_pgid = dir.path().join("child.pgid");
+    let child_ready = dir.path().join("child.ready");
     fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
     fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
     test_executable::install_in(
@@ -1462,13 +1551,14 @@ if [ "$1" = api-resources ]; then
   sed -n 's/.*) [^ ]* [^ ]* \([0-9][0-9]*\).*/\1/p' /proc/$$/stat > '{parent_pgid}'
   (
     trap '' HUP TERM
-    echo $$ > '{child_pid}'
-    sed -n 's/.*) [^ ]* [^ ]* \([0-9][0-9]*\).*/\1/p' /proc/$$/stat > '{child_pgid}'
+    echo ready > '{child_ready}'
     exec sleep 30
   ) &
-  while [ ! -s '{child_pgid}' ]; do
+  echo $! > '{child_pid}'
+  while [ ! -s '{child_ready}' ]; do
     :
   done
+  sed -n 's/.*) [^ ]* [^ ]* \([0-9][0-9]*\).*/\1/p' "/proc/$(cat '{child_pid}')/stat" > '{child_pgid}'
   exit 0
 fi
 echo "unexpected kubectl $*" >&2
@@ -1481,16 +1571,33 @@ exit 1
             child_pid = child_pid.display(),
             parent_pgid = parent_pgid.display(),
             child_pgid = child_pgid.display(),
+            child_ready = child_ready.display(),
         ),
     );
     prepend_path(dir.path());
+    let parent_watch = parent_pid.clone();
+    let child_watch = child_pid.clone();
+    let watcher = std::thread::spawn(move || {
+        leader_stayed_unreaped_while_child_held_the_pipe(&parent_watch, &child_watch)
+    });
+    // Runs on the way out, including after a failed assertion. It does not
+    // run before `process_gone`, so it cannot hide a descendant the sweep left
+    // behind.
+    struct StopLeakedSleep<'a>(&'a std::path::Path);
+    impl Drop for StopLeakedSleep<'_> {
+        fn drop(&mut self) {
+            stop_leaked_sleep(self.0);
+        }
+    }
+    let _stop_leaked_sleep = StopLeakedSleep(&child_pid);
 
     let err = down(down_opts())
         .await
         .expect_err("a pipe held by a descendant must not outlive the deadline");
     let elapsed = started.elapsed();
+    let held = watcher.join().expect("pipe-holder watcher");
     assert!(
-        elapsed < std::time::Duration::from_secs(4),
+        elapsed < std::time::Duration::from_secs(6),
         "the pipe holder must be stopped inside the deadline, not by its own 30s sleep: {elapsed:?}"
     );
     let (class, _fix) = classify(&err);
@@ -1504,7 +1611,11 @@ exit 1
     let parent_group = read_pid(&parent_pgid);
     let child_group = read_pid(&child_pgid);
     assert!(parent > 1, "the leader must record its pid");
-    assert!(child > 1, "the pipe holder must record its pid");
+    assert!(child > 1, "the pipe holder must record the background pid");
+    assert_ne!(
+        child, parent,
+        "the pipe holder must not be the leader pid repeated by $$"
+    );
     assert_eq!(
         parent_group, parent,
         "the leader must be the process group id"
@@ -1513,6 +1624,7 @@ exit 1
         child_group, parent,
         "the pipe holder must stay in the leader's group so a group signal can stop it"
     );
+    held.expect("the exited leader must stay unreaped while the descendant holds the pipe");
     assert!(
         process_gone(child),
         "pipe holder {child} is still running after the leader exited"

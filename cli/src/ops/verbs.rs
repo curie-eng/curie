@@ -728,7 +728,12 @@ fn format_namespace_conditions(item: &serde_json::Value) -> Result<String> {
 
 /// A metav1 List. `kubectl -o json` uses `apiVersion: v1` and `kind: List`
 /// for every resource, including custom groups. Items must be objects.
-fn kubernetes_list_items(output: &str, what: &str) -> Result<Vec<serde_json::Value>> {
+/// The callback borrows the items in place. Callers do not clone the array.
+fn with_kubernetes_list_items<T>(
+    output: &str,
+    what: &str,
+    body: impl FnOnce(&[serde_json::Value]) -> Result<T>,
+) -> Result<T> {
     let document: serde_json::Value =
         serde_json::from_str(output).with_context(|| format!("parsing {what}"))?;
     if !document.is_object() {
@@ -750,7 +755,7 @@ fn kubernetes_list_items(output: &str, what: &str) -> Result<Vec<serde_json::Val
     if items.iter().any(|item| !item.is_object()) {
         bail!("{what} contains an item that is not an object");
     }
-    Ok(items.clone())
+    body(items)
 }
 
 fn namespace_item_name(item: &serde_json::Value, what: &str) -> Result<String> {
@@ -775,45 +780,47 @@ struct OwnedNamespaceSnapshot {
 /// Admission view of one owned-namespace list. Phase and deletion conditions
 /// are required here. A later poll does not use this parser.
 fn parse_owned_namespace_list(output: &str) -> Result<Vec<OwnedNamespaceSnapshot>> {
-    let items = kubernetes_list_items(output, "the owned namespace list")?;
-    let mut rows = Vec::new();
-    for item in &items {
-        let name = namespace_item_name(item, "the owned namespace list")?;
-        if rows
-            .iter()
-            .any(|row: &OwnedNamespaceSnapshot| row.name == name)
-        {
-            bail!("the owned namespace list repeats {name}");
+    with_kubernetes_list_items(output, "the owned namespace list", |items| {
+        let mut rows = Vec::new();
+        for item in items {
+            let name = namespace_item_name(item, "the owned namespace list")?;
+            if rows
+                .iter()
+                .any(|row: &OwnedNamespaceSnapshot| row.name == name)
+            {
+                bail!("the owned namespace list repeats {name}");
+            }
+            let phase = item
+                .pointer("/status/phase")
+                .and_then(serde_json::Value::as_str)
+                .filter(|phase| !phase.is_empty())
+                .context("owned namespace list contains a Namespace without a phase")?
+                .to_string();
+            rows.push(OwnedNamespaceSnapshot {
+                name,
+                phase,
+                conditions: format_namespace_conditions(item)?,
+            });
         }
-        let phase = item
-            .pointer("/status/phase")
-            .and_then(serde_json::Value::as_str)
-            .filter(|phase| !phase.is_empty())
-            .context("owned namespace list contains a Namespace without a phase")?
-            .to_string();
-        rows.push(OwnedNamespaceSnapshot {
-            name,
-            phase,
-            conditions: format_namespace_conditions(item)?,
-        });
-    }
-    Ok(rows)
+        Ok(rows)
+    })
 }
 
 /// Poll view of the same list. Membership is the Namespace name. Phase and
 /// deletion conditions are ignored, so a later status change still updates the
 /// set a failed read must not replace.
 fn parse_owned_namespace_membership(output: &str) -> Result<Vec<String>> {
-    let items = kubernetes_list_items(output, "the owned namespace list")?;
-    let mut names = Vec::new();
-    for item in &items {
-        let name = namespace_item_name(item, "the owned namespace list")?;
-        if names.iter().any(|seen| seen == &name) {
-            bail!("the owned namespace list repeats {name}");
+    with_kubernetes_list_items(output, "the owned namespace list", |items| {
+        let mut names = Vec::new();
+        for item in items {
+            let name = namespace_item_name(item, "the owned namespace list")?;
+            if names.iter().any(|seen| seen == &name) {
+                bail!("the owned namespace list repeats {name}");
+            }
+            names.push(name);
         }
-        names.push(name);
-    }
-    Ok(names)
+        Ok(names)
+    })
 }
 
 /// Objects in one namespace. Built-in residue must carry the documented
@@ -825,45 +832,46 @@ fn parse_namespace_inventory(
     namespace: &str,
     resource: &str,
 ) -> Result<Vec<(String, String)>> {
-    let items = kubernetes_list_items(output, "namespace object inventory")?;
-    let expected = built_in_controller_identity(resource);
-    let mut found = Vec::new();
-    for item in &items {
-        let api_version = item
-            .get("apiVersion")
-            .and_then(serde_json::Value::as_str)
-            .filter(|api_version| !api_version.is_empty())
-            .context("namespace object inventory contains an object without an apiVersion")?;
-        let kind = item
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .filter(|kind| !kind.is_empty())
-            .context("namespace object inventory contains an object without a kind")?;
-        let name = item
-            .pointer("/metadata/name")
-            .and_then(serde_json::Value::as_str)
-            .filter(|name| !name.is_empty())
-            .context("namespace object inventory contains an object without a name")?;
-        let item_namespace = item
-            .pointer("/metadata/namespace")
-            .and_then(serde_json::Value::as_str)
-            .filter(|item_namespace| !item_namespace.is_empty())
-            .context("namespace object inventory contains an object without a namespace")?;
-        if item_namespace != namespace {
-            bail!(
+    with_kubernetes_list_items(output, "namespace object inventory", |items| {
+        let expected = built_in_controller_identity(resource);
+        let mut found = Vec::new();
+        for item in items {
+            let api_version = item
+                .get("apiVersion")
+                .and_then(serde_json::Value::as_str)
+                .filter(|api_version| !api_version.is_empty())
+                .context("namespace object inventory contains an object without an apiVersion")?;
+            let kind = item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| !kind.is_empty())
+                .context("namespace object inventory contains an object without a kind")?;
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .context("namespace object inventory contains an object without a name")?;
+            let item_namespace = item
+                .pointer("/metadata/namespace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|item_namespace| !item_namespace.is_empty())
+                .context("namespace object inventory contains an object without a namespace")?;
+            if item_namespace != namespace {
+                bail!(
                 "namespace object inventory contains an object from namespace {item_namespace}, not {namespace}"
             );
-        }
-        if let Some((expected_version, expected_kind)) = expected {
-            if api_version != expected_version || kind != expected_kind {
-                bail!(
+            }
+            if let Some((expected_version, expected_kind)) = expected {
+                if api_version != expected_version || kind != expected_kind {
+                    bail!(
                     "namespace object inventory contains {resource} item {kind} {api_version}, not {expected_kind} {expected_version}"
                 );
+                }
             }
+            found.push((kind.to_string(), name.to_string()));
         }
-        found.push((kind.to_string(), name.to_string()));
-    }
-    Ok(found)
+        Ok(found)
+    })
 }
 
 /// Documented built-in identity for residue the namespace controller removes
@@ -929,6 +937,61 @@ enum Diagnosis {
 enum AdmittedPoll {
     Removed { waited: std::time::Duration },
     Expired { rows: Vec<OwnedNamespaceWait> },
+}
+
+/// The shared post-timeout deadline is open only before `deadline`. An equal
+/// instant has already expired, so evidence that arrives on that boundary is
+/// late.
+fn post_timeout_open(now: tokio::time::Instant, deadline: tokio::time::Instant) -> bool {
+    now < deadline
+}
+
+/// Admission's acceptance point. A `Ready` diagnosis that is late becomes
+/// unreadable, so an empty list cannot finish the sweep and a qualifying list
+/// cannot start the extension. Rows already accepted stay available for the
+/// 300s refusal. They are not a new success observation.
+fn finish_diagnosis(
+    diagnosis: Diagnosis,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> Diagnosis {
+    if post_timeout_open(now, deadline) {
+        return diagnosis;
+    }
+    match diagnosis {
+        Diagnosis::Ready(rows) => Diagnosis::Unreadable { rows },
+        unreadable => unreadable,
+    }
+}
+
+/// What one poll does with a parsed membership. `None` is a failed read.
+enum PollStep {
+    Removed { waited: std::time::Duration },
+    Expired { rows: Vec<OwnedNamespaceWait> },
+    Continue { rows: Vec<OwnedNamespaceWait> },
+}
+
+/// Poll acceptance. A membership that is late, including a parsed empty list,
+/// does not succeed and does not replace the last in-deadline set.
+fn accept_poll_membership(
+    previous: Vec<OwnedNamespaceWait>,
+    membership: Option<Vec<String>>,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    started: tokio::time::Instant,
+) -> PollStep {
+    if !post_timeout_open(now, deadline) {
+        return PollStep::Expired { rows: previous };
+    }
+    match membership {
+        Some(names) if names.is_empty() => PollStep::Removed {
+            waited: started.elapsed(),
+        },
+        Some(names) => PollStep::Continue {
+            rows: merge_observed_namespaces(&previous, &names),
+        },
+        None => PollStep::Continue { rows: previous },
+    }
 }
 
 fn unreadable_namespace(namespace: OwnedNamespaceSnapshot, objects: &str) -> OwnedNamespaceWait {
@@ -999,9 +1062,10 @@ fn post_timeout_elapsed(what: &str) -> anyhow::Error {
 /// One post-timeout kubectl read. The child gets its own process group so a
 /// timeout can stop the credential plugin it spawned. Pipes are read without
 /// reaping the leader, and the group is signaled only while that leader is
-/// still unreaped. The same `child_deadline` is checked after spawn and again
-/// before a result is consumed. The kill and reap finish by `deadline`. This
-/// is not the shared `run_capture` path.
+/// still unreaped. The same `child_deadline` is checked after spawn, again
+/// before a result is decoded, and again after UTF-8 conversion. A converted
+/// result that crossed that deadline is not returned. The kill and reap finish
+/// by `deadline`. This is not the shared `run_capture` path.
 async fn run_post_timeout_read(
     cmd: &OpsCommand,
     deadline: tokio::time::Instant,
@@ -1084,11 +1148,14 @@ async fn run_post_timeout_read(
             if tokio::time::Instant::now() >= child_deadline {
                 return Err(post_timeout_elapsed(what));
             }
-            Ok((
-                status.success(),
-                String::from_utf8_lossy(&stdout).into_owned(),
-                String::from_utf8_lossy(&stderr).into_owned(),
-            ))
+            let stdout = String::from_utf8_lossy(&stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&stderr).into_owned();
+            // Decoding is part of the read. A result that crossed the child
+            // deadline while being converted is not consumed.
+            if tokio::time::Instant::now() >= child_deadline {
+                return Err(post_timeout_elapsed(what));
+            }
+            Ok((status.success(), stdout, stderr))
         }
         Ok(Err(error)) => {
             group.signal();
@@ -1164,11 +1231,15 @@ async fn diagnose_owned_namespace_wait(
         _ => return Diagnosis::Unreadable { rows: Vec::new() },
     };
     let namespaces = match parse_owned_namespace_list(&listed) {
-        Ok(namespaces) => namespaces,
-        Err(_) => return Diagnosis::Unreadable { rows: Vec::new() },
+        Ok(namespaces) if post_timeout_open(tokio::time::Instant::now(), deadline) => namespaces,
+        Ok(_) | Err(_) => return Diagnosis::Unreadable { rows: Vec::new() },
     };
     if namespaces.is_empty() {
-        return Diagnosis::Ready(Vec::new());
+        return finish_diagnosis(
+            Diagnosis::Ready(Vec::new()),
+            tokio::time::Instant::now(),
+            deadline,
+        );
     }
     let discovered = match run_post_timeout_read(
         &super::namespaced_resources_cmd(),
@@ -1188,8 +1259,8 @@ async fn diagnose_owned_namespace_wait(
         }
     };
     let resources = match parse_namespaced_resources(&discovered) {
-        Ok(resources) => resources,
-        Err(_) => {
+        Ok(resources) if post_timeout_open(tokio::time::Instant::now(), deadline) => resources,
+        Ok(_) | Err(_) => {
             return Diagnosis::Unreadable {
                 rows: namespaces
                     .into_iter()
@@ -1230,7 +1301,7 @@ async fn diagnose_owned_namespace_wait(
                 }
             };
             match parse_namespace_inventory(&inventory, &namespace.name, resource) {
-                Ok(items) => {
+                Ok(items) if post_timeout_open(tokio::time::Instant::now(), deadline) => {
                     if built_in_controller_identity(resource).is_none() && !items.is_empty() {
                         foreign_residue = true;
                     }
@@ -1238,6 +1309,10 @@ async fn diagnose_owned_namespace_wait(
                         grouped.entry(kind.clone()).or_default().push(name.clone());
                         object_refs.push((kind, name));
                     }
+                }
+                Ok(_) => {
+                    failures.push("inventory unreadable".to_string());
+                    break;
                 }
                 Err(_) => failures.push(format!("{resource}: list unreadable")),
             }
@@ -1257,11 +1332,15 @@ async fn diagnose_owned_namespace_wait(
             foreign_residue,
         ));
     }
-    if readable {
-        Diagnosis::Ready(rows)
-    } else {
-        Diagnosis::Unreadable { rows }
-    }
+    finish_diagnosis(
+        if readable {
+            Diagnosis::Ready(rows)
+        } else {
+            Diagnosis::Unreadable { rows }
+        },
+        tokio::time::Instant::now(),
+        deadline,
+    )
 }
 
 async fn read_owned_namespace_membership(
@@ -1331,14 +1410,19 @@ async fn poll_admitted_namespaces(
         if remaining.is_zero() {
             return AdmittedPoll::Expired { rows: last };
         }
-        match read_owned_namespace_membership(o, deadline_at).await {
-            Ok(names) if names.is_empty() => {
-                return AdmittedPoll::Removed {
-                    waited: started.elapsed(),
-                };
-            }
-            Ok(names) => last = merge_observed_namespaces(&last, &names),
-            Err(_) => {}
+        let membership = read_owned_namespace_membership(o, deadline_at).await.ok();
+        // Acceptance is after conversion and parsing. A late list, including a
+        // parsed empty one, cannot succeed or replace `last`.
+        match accept_poll_membership(
+            last,
+            membership,
+            tokio::time::Instant::now(),
+            deadline_at,
+            started,
+        ) {
+            PollStep::Removed { waited } => return AdmittedPoll::Removed { waited },
+            PollStep::Expired { rows } => return AdmittedPoll::Expired { rows },
+            PollStep::Continue { rows } => last = rows,
         }
     }
 }
@@ -6846,6 +6930,120 @@ mod tests {
         assert!(parse_namespaced_resources("events\nwidgets.example.com\n").is_ok());
         assert!(parse_namespaced_resources("not a resource\n").is_err());
         assert!(parse_namespaced_resources("\n").is_err());
+    }
+
+    fn sample_namespace_wait(name: &str) -> OwnedNamespaceWait {
+        OwnedNamespaceWait {
+            name: name.to_string(),
+            phase: "Terminating".to_string(),
+            conditions: "none".to_string(),
+            objects: "Event (1): evt-a".to_string(),
+            controller_owned: true,
+        }
+    }
+
+    // The post-timeout deadline stays closed at an equal instant. A late empty
+    // admission is not Ready, and a late poll does not succeed or replace the
+    // set that was accepted while the deadline was open.
+    #[test]
+    fn late_namespace_evidence_does_not_admit_or_replace_the_set() {
+        let now = tokio::time::Instant::now();
+        let open = now + std::time::Duration::from_nanos(1);
+        assert!(!post_timeout_open(now, now));
+        assert!(post_timeout_open(now, open));
+
+        let late_empty = finish_diagnosis(Diagnosis::Ready(Vec::new()), now, now);
+        assert!(
+            matches!(late_empty, Diagnosis::Unreadable { rows } if rows.is_empty()),
+            "a late empty admission must not be Ready"
+        );
+        let open_empty = finish_diagnosis(Diagnosis::Ready(Vec::new()), now, open);
+        assert!(matches!(
+            open_empty,
+            Diagnosis::Ready(rows) if rows.is_empty()
+        ));
+
+        let late_ready = finish_diagnosis(
+            Diagnosis::Ready(vec![sample_namespace_wait("agent-ns")]),
+            now,
+            now,
+        );
+        match late_ready {
+            Diagnosis::Unreadable { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "agent-ns");
+            }
+            Diagnosis::Ready(_) => panic!("a late qualifying admission must not stay Ready"),
+        }
+
+        let late_empty_poll = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            Some(Vec::new()),
+            now,
+            now,
+            now,
+        );
+        match late_empty_poll {
+            PollStep::Expired { rows } => assert_eq!(rows[0].name, "agent-ns"),
+            PollStep::Removed { .. } => panic!("a late empty poll must not succeed"),
+            PollStep::Continue { .. } => panic!("a late empty poll must not be applied"),
+        }
+
+        let late_rename = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            Some(vec!["renamed-ns".to_string()]),
+            now,
+            now,
+            now,
+        );
+        match late_rename {
+            PollStep::Expired { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "agent-ns");
+            }
+            PollStep::Removed { .. } => panic!("a late membership must not succeed"),
+            PollStep::Continue { rows } => {
+                panic!("a late membership replaced the set with {}", rows[0].name)
+            }
+        }
+
+        let open_empty_poll = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            Some(Vec::new()),
+            now,
+            open,
+            now,
+        );
+        assert!(matches!(open_empty_poll, PollStep::Removed { .. }));
+
+        let open_rename = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            Some(vec!["renamed-ns".to_string()]),
+            now,
+            open,
+            now,
+        );
+        match open_rename {
+            PollStep::Continue { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "renamed-ns");
+            }
+            PollStep::Removed { .. } => panic!("an in-deadline rename is not removal"),
+            PollStep::Expired { .. } => panic!("an in-deadline rename is not expiry"),
+        }
+
+        let failed = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            None,
+            now,
+            open,
+            now,
+        );
+        match failed {
+            PollStep::Continue { rows } => assert_eq!(rows[0].name, "agent-ns"),
+            PollStep::Removed { .. } => panic!("a failed read is not an empty sweep"),
+            PollStep::Expired { .. } => panic!("a failed read inside the deadline keeps polling"),
+        }
     }
 
     // #1654 cross-release teardown scope. Two independent Curie installs on one
