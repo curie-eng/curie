@@ -1,7 +1,8 @@
 """Learned rules: list them, and let a person decide them (#5797, #5801).
 
 The list route sits on the memory API's own authorization (platform key or a
-live console session). Accept, reject and remove take a principal console
+live console session); a principal's console session lists only its own
+tenant's agents. Accept, reject and remove take a principal console
 session only, never the platform key: a rule applies only after a person
 decides it. For a repository rule only a person whose linked code host account
 can write to that repository right now decides. For an agent or binding scope
@@ -52,7 +53,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import identity_fence
 from ..approval_auth import enforce_console_cookie_origin
-from ..auth import require_api_key, require_principal_session
+from ..auth import AdministrativeActor, require_administrator, require_principal_session
 from ..config import get_settings
 from ..crud.console import principal_is_active
 from ..deps import SessionDep
@@ -161,7 +162,11 @@ _CODED: dict[str, Any] = {"model": MemoryRuleRefusal}
 _LIST_RESPONSES: dict[int | str, dict[str, Any]] = {
     401: {"model": MemoryRuleAuthRefusal, "description": "No platform key or live console session"},
     403: {"model": MemoryRuleAuthRefusal, "description": "Console session origin rejected"},
-    404: {**_CODED, "description": "`memory_rules.not_found`"},
+    404: {
+        **_CODED,
+        "description": "`memory_rules.not_found`: no such agent, or a principal session "
+        "of another tenant",
+    },
     422: {**_CODED, "description": "`memory_rules.invalid_request`"},
     503: {**_CODED, "description": "`memory_rules.unavailable`"},
 }
@@ -239,13 +244,16 @@ def _same_origin(request: Request) -> None:
 
 
 DeciderDep = Annotated[Principal, Depends(require_principal_session)]
+# The router's guard, read again by the list route: FastAPI caches a
+# dependency per request, so the caller is authenticated once.
+AdministratorDep = Annotated[AdministrativeActor, Depends(require_administrator)]
 SameOriginDep = Annotated[None, Depends(_same_origin)]
 
 router = APIRouter(
     prefix="/agents",
     tags=["memory"],
     route_class=MemoryRulesRoute,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_administrator)],
 )
 decision_router = APIRouter(
     prefix="/agents",
@@ -331,18 +339,41 @@ async def _in_force_counts(
     return {(kind, key): int(count) for kind, key, count in rows.tuples().all()}
 
 
+def _session_principal(actor: AdministrativeActor) -> uuid.UUID | None:
+    """The principal a console session is bound to, or None for the platform
+    key and a session bound to no principal."""
+
+    if actor.kind != "console_session" or actor.subject is None:
+        return None
+    kind, _, value = actor.subject.partition(":")
+    return uuid.UUID(value) if kind == "principal" else None
+
+
 @router.get("/{agent_id}/memory/rules", response_model=MemoryRulesOut, responses=_LIST_RESPONSES)
 async def list_rules(
     agent_id: uuid.UUID,
     session: SessionDep,
+    actor: AdministratorDep,
     state: Annotated[ListedRuleState | None, Query()] = None,
     scope_kind: Annotated[RuleScopeKind | None, Query()] = None,
     scope_key: Annotated[str | None, Query(max_length=1024)] = None,
 ) -> MemoryRulesOut:
-    """The agent's proposed, accepted, rejected and removed rules, by scope and number."""
+    """The agent's proposed, accepted, rejected and removed rules, by scope and number.
+
+    The platform key and a console session bound to no principal read any
+    agent. A principal's console session reads only an agent of its own
+    tenant: another tenant's agent is the same 404 as an unknown one, for
+    every filter and scope, so its rules, reasons and deciders never leave it.
+    """
 
     try:
-        if await session.scalar(select(Agent.id).where(Agent.id == agent_id)) is None:
+        agent_tenant = await session.scalar(select(Agent.tenant_id).where(Agent.id == agent_id))
+        if agent_tenant is None:
+            raise _refusal("not_found")
+        principal_id = _session_principal(actor)
+        if principal_id is not None and agent_tenant != await session.scalar(
+            select(Principal.tenant_id).where(Principal.id == principal_id)
+        ):
             raise _refusal("not_found")
         query = _rule_query(agent_id)
         if state is not None:

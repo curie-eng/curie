@@ -1076,6 +1076,10 @@ def local_env_values(project: str) -> dict[str, str]:
         "CURIE_LOCAL_OIDC_AUDIENCE": pto.OIDC_CLIENT_ID,
         "CURIE_LOCAL_OIDC_JWKS_URL": f"{issuer}/keys",
         "CURIE_LOCAL_OIDC_CLIENT_SECRET": client_secret,
+        # Per-fixture bearer tokens: the gateway listens on the host network, so
+        # the public development defaults must never reach it.
+        "CURIE_CHANNEL_GATEWAY_API_TOKEN": secrets.token_urlsafe(32),
+        "CURIE_CHANNEL_GATEWAY_WORKER_TOKEN": secrets.token_urlsafe(32),
         "CURIE_LOCAL_OIDC_REDIRECT_URI": redirect_uri,
         "CURIE_LOCAL_OIDC_SCOPES": pto.OIDC_SCOPES,
         "CURIE_LOCAL_OIDC_ADMIT_ALL_AUTHENTICATED": "true",

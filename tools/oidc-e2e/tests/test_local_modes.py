@@ -191,6 +191,24 @@ def test_local_env_secret_is_per_run(tmp_path: Path, values: dict[str, str]) -> 
     assert again["CURIE_LOCAL_IMAGE_TAG"] == "dev-curie-local-oidc-b"
 
 
+DEV_TOKENS = ("curie-dev-gateway-api", "curie-dev-gateway-worker")
+TOKEN_VARIABLES = ("CURIE_CHANNEL_GATEWAY_API_TOKEN", "CURIE_CHANNEL_GATEWAY_WORKER_TOKEN")
+
+
+def test_local_env_gateway_tokens_are_fresh_and_distinct(
+    tmp_path: Path, values: dict[str, str]
+) -> None:
+    api, worker = (values[name] for name in TOKEN_VARIABLES)
+    assert api != worker
+    assert not {api, worker} & set(DEV_TOKENS)
+    assert len(api) >= 32 and len(worker) >= 32
+    proc = run_local_env(tmp_path / "again.env", "--project", "curie-local-oidc-c")
+    assert proc.returncode == 0, proc.stderr
+    again = oidc_e2e.read_env_file(tmp_path / "again.env")
+    assert again[TOKEN_VARIABLES[0]] != api
+    assert again[TOKEN_VARIABLES[1]] != worker
+
+
 def test_local_env_refuses_a_bad_project(tmp_path: Path) -> None:
     proc = run_local_env(tmp_path / "bad.env", "--project", "Bad Name")
     assert proc.returncode == 2
@@ -342,6 +360,31 @@ def test_a_missing_isolation_variable_fails_the_render(
     broken.write_text(oidc_e2e.render_env_file({k: v for k, v in values.items() if k != name}))
     with pytest.raises(AssertionError) as caught:
         assert_isolated(render(broken, ("core",)), values)
+    assert name in str(caught.value)
+
+
+@needs_compose
+def test_gateway_tokens_reach_the_three_services(env_file: Path, values: dict[str, str]) -> None:
+    config = render(env_file, ("core",))
+    api_token, worker_token = (values[name] for name in TOKEN_VARIABLES)
+    gateway = environment(config, "curie-channel-gateway")
+    assert gateway["CURIE_CHANNEL_GATEWAY_API_TOKEN"] == api_token
+    assert gateway["CURIE_CHANNEL_GATEWAY_WORKER_TOKEN"] == worker_token
+    assert environment(config, "curie-api")["CURIE_CHANNEL_GATEWAY_TOKEN"] == api_token
+    assert environment(config, "curie-worker")["CURIE_CHANNEL_GATEWAY_TOKEN"] == worker_token
+    for service in ("curie-channel-gateway", "curie-api", "curie-worker"):
+        assert not set(DEV_TOKENS) & set(environment(config, service).values())
+
+
+@needs_compose
+@pytest.mark.parametrize("name", TOKEN_VARIABLES)
+def test_a_missing_gateway_token_fails_the_render(
+    tmp_path: Path, values: dict[str, str], name: str
+) -> None:
+    broken = tmp_path / "broken.env"
+    broken.write_text(oidc_e2e.render_env_file({k: v for k, v in values.items() if k != name}))
+    with pytest.raises(AssertionError) as caught:
+        render(broken, ("core",))
     assert name in str(caught.value)
 
 

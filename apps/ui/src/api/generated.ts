@@ -951,6 +951,11 @@ export interface paths {
         /**
          * List Rules
          * @description The agent's proposed, accepted, rejected and removed rules, by scope and number.
+         *
+         *     The platform key and a console session bound to no principal read any
+         *     agent. A principal's console session reads only an agent of its own
+         *     tenant: another tenant's agent is the same 404 as an unknown one, for
+         *     every filter and scope, so its rules, reasons and deciders never leave it.
          */
         get: operations["list_rules_agents__agent_id__memory_rules_get"];
         put?: never;
@@ -16854,7 +16859,7 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
                 };
             };
-            /** @description `memory_rules.not_found` */
+            /** @description `memory_rules.not_found`: no such agent, or a principal session of another tenant */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -260,8 +260,9 @@ or later. Two modes of `curie dev oidc-e2e` drive it:
 
 1. `local-env --out FILE [--project NAME]` writes a mode 0600 env file with the
    project (default `curie-local-oidc`), every isolation variable above on free
-   loopback ports, `COMPOSE_FILE`, a Dex client secret generated for this run,
-   and the Dex config, whose one user is `approver@example.com`.
+   loopback ports, `COMPOSE_FILE`, a Dex client secret and two channel gateway bearer tokens generated for this
+   run (the gateway listens on the host network, so the public development
+   tokens must not reach it; the overlay requires these), and the Dex config, whose one user is `approver@example.com`.
 2. `local-session --env FILE --email approver@example.com --out FILE` signs
    that user in through Dex, writes only the session cookie value to a mode
    0600 file, and prints only `kind`, `principal_id` and `tenant_id`. It exits

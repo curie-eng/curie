@@ -1068,6 +1068,34 @@ def test_channel_scope_rule_refuses_another_tenant_and_the_platform_key(stack: S
     assert response.json()["applies_from"] == "next_session"
 
 
+def test_list_refuses_a_principal_of_another_tenant_for_every_scope(stack: Stack) -> None:
+    """A principal session of another tenant reads none of this agent's rules,
+    filtered or not; the agent's own tenant and the platform key read both."""
+
+    channel_text = "Answer in the thread, never in the channel."
+    repository_text = "Run the formatter on changed hunks only."
+    channel = _channel_rule(stack, "binding", text=channel_text)
+    repository = _rule(stack, text=repository_text)
+    stranger = enrollment.seed_owner(enrollment.seed_tenant(), issuer=stack.issuer)
+    foreign = stranger.headers(origin=None)
+
+    for params in ({}, {"scope_kind": "binding", "scope_key": BINDING}):
+        refused = _list(stack, headers=foreign, **params)
+        assert refused.status_code == 404, refused.text
+        assert refused.headers["Cache-Control"] == "no-store"
+        assert refused.json()["detail"]["code"] == "memory_rules.not_found"
+        for leaked in (channel_text, repository_text, BINDING, "Reviewers asked"):
+            assert leaked not in refused.text
+
+    for headers in (stack.owner.headers(origin=None), stack.platform):
+        listed = _list(stack, headers=headers)
+        assert listed.status_code == 200, listed.text
+        assert {rule["id"]: rule["text"] for rule in listed.json()["rules"]} == {
+            str(channel): channel_text,
+            str(repository): repository_text,
+        }
+
+
 def test_channel_scope_rule_keeps_the_version_check_and_the_scope_cap(stack: Stack) -> None:
     rule_id = _channel_rule(stack, "binding")
     before = _snapshot(rule_id)

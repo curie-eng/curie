@@ -3021,13 +3021,17 @@ router with its sandbox credentials (ADR 0287 decision 7, which amends ADR
    credential are refused with 403, and so is a turn the worker reported
    ended. A body with any other field is 422 `invalid_body`, and text over 240
    bytes is 422 `too_large`; no refusal or log line echoes the text.
-2. `GET /agents/{agent_id}/state/_rules` answers `proposals_enabled` and the
-   `accepted` rules of the agent scope, then of the credential's own binding,
-   each ordered by acceptance and at most 16 per scope. The runner reads it
-   once at session start with its boot credential when the run is not a
-   factory run, and puts the rules in its prompt. A credential that names no
-   binding reads the agent scope only. The platform key is refused; operators
-   list rules with the route below.
+2. `GET /agents/{agent_id}/state/_rules`, called with a scoped sandbox
+   memory credential (the boot read credential or a turn's write credential),
+   answers `proposals_enabled` and the `accepted` rules of the agent scope,
+   then of the credential's own binding, each ordered by acceptance and at
+   most 16 per scope. The runner reads it once at session start with its boot
+   credential when the run is not a factory run, and puts the rules in its
+   prompt. A credential that names no binding reads the agent scope only.
+   Only such a credential gets learned rules. The platform key, a bundle token
+   and a legacy token get HTTP 200 with the ordinary key/value listing of a
+   `_rules` state namespace, exactly what `GET /agents/{agent_id}/state/{namespace}`
+   answers, never a learned rule; operators list rules with the route below.
 
 The routes:
 
@@ -3035,7 +3039,9 @@ The routes:
    `accepted`, `rejected` and `removed` rules, ordered by scope and number,
    with each scope's `in_force_count` (its accepted rules) and
    `in_force_limit`. It takes the platform key or a console session, like the
-   rest of the memory API. Filter with `state`, `scope_kind` and `scope_key`;
+   rest of the memory API. A principal's console session sees only its own
+   tenant's agents: another tenant's agent is 404 `memory_rules.not_found`,
+   whatever the filter. Filter with `state`, `scope_kind` and `scope_key`;
    any other state is refused with 422.
 2. `POST /agents/{agent_id}/memory/rules/{rule_id}/accept`, `.../reject` and
    `.../remove` take the body `{"expected_version": N}`, the version the
