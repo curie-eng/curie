@@ -747,12 +747,27 @@ class LearnedRulesRun(sk.ScriptedRun):
             pull_request=pull_a,
             closes=lrs.closes(self.evidence["pull_request"].get("body")),
         )
+        # Judge each step as it lands, so a broken link stops the run before the
+        # next ticket's model calls are made; assert_chain still judges the whole.
+        self.judge(lrs.assert_ticket_a, "a")
         reply_url = self.revise(github, pull_a)
+        self.judge(lrs.assert_revision, "b", pull_a)
         rule = self.promote(pull_a, reply_url)
-        self.accept(rule)
+        rule = self.judge(lrs.assert_promoted, "c", pull_a, reply_url)
+        accepted = self.accept(rule)
+        self.judge(lrs.assert_decided, "d", rule)
         self.ticket_b(github, rule)
-        self.ticket_c(github, rule)
+        self.judge(lrs.assert_ticket_b, "e")
+        self.ticket_c(github, accepted)
+        self.judge(lrs.assert_ticket_c, "f", accepted)
         self.lanes_step()
+
+    def judge(self, check: Callable[..., Any], name: str, *args: Any) -> Any:
+        step = next(s for s in reversed(self.chain["steps"]) if s.get("step") == name)
+        try:
+            return check(step, *args)
+        except lrs.LearnedRulesAssertionError as exc:
+            raise LearnedRulesError(f"learned-rules: {exc}") from None
 
     def revise(self, github: Any, pull_a: int) -> str:
         """b: the writer's mentioned review comment admits a revision that proposes."""
@@ -810,19 +825,31 @@ class LearnedRulesRun(sk.ScriptedRun):
         self.record_step("c", merged=bool(merged.get("merged")), rules=rules)
         return dict(rules[0])
 
-    def accept(self, rule: Mapping[str, Any]) -> None:
-        """d: the reader is refused write access; the writer accepts."""
+    def accept(self, rule: Mapping[str, Any]) -> dict[str, Any]:
+        """d: the reader is refused write access; the writer accepts.
+
+        Each lifecycle change bumps the rule's version, so the decision passes the
+        version the list read, never a fixed number. Returns the rule as read after.
+        """
 
         rule_id = str(rule["id"])
-        reader_exit, reader_output = self.decide("accept", rule_id, 1, "reader")
-        writer_exit, _ = self.decide("accept", rule_id, 1, "writer")
-        state = next((r["state"] for r in self.list_rules() if r["id"] == rule_id), None)
+        version = int(rule["version"])
+        reader_exit, reader_output = self.decide("accept", rule_id, version, "reader")
+        writer_exit, writer_output = self.decide("accept", rule_id, version, "writer")
+        after = next((r for r in self.list_rules() if r["id"] == rule_id), {})
         self.record_step(
             "d",
             rule_id=rule_id,
+            expected_version=version,
             reader={"exit": reader_exit, "codes": lrs.error_codes(reader_output)},
-            writer={"exit": writer_exit, "state": state},
+            writer={
+                "exit": writer_exit,
+                "codes": lrs.error_codes(writer_output),
+                "state": after.get("state"),
+                "version": after.get("version"),
+            },
         )
+        return dict(after)
 
     def ticket_b(self, github: Any, rule: Mapping[str, Any]) -> None:
         """e: the writer's conflicting document, then ticket B under the accepted rule."""
@@ -853,10 +880,23 @@ class LearnedRulesRun(sk.ScriptedRun):
         """f: the writer removes R1; ticket C carries no learned rules."""
 
         rule_id = str(rule["id"])
-        code, _ = self.decide("remove", rule_id, 2, "writer")
+        version = int(rule["version"])
+        code, output = self.decide("remove", rule_id, version, "writer")
         state = next((r["state"] for r in self.list_rules() if r["id"] == rule_id), None)
+        if code != 0 or state != "removed":
+            # Stop before C's model calls; the judge names the failure.
+            self.record_step(
+                "f",
+                remove_exit=code,
+                remove_codes=lrs.error_codes(output),
+                expected_version=version,
+                state_after=state,
+            )
+            return
         observed = self.run_ticket(github, lrs.TICKET_C, str(rule.get("text") or ""))
-        self.record_step("f", remove_exit=code, state_after=state, **observed)
+        self.record_step(
+            "f", remove_exit=code, expected_version=version, state_after=state, **observed
+        )
 
     def lanes_step(self) -> None:
         """g: lanes complete, nothing unrouted, every capture on its ticket."""

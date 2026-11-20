@@ -117,7 +117,8 @@ def _passing() -> dict[str, Any]:
                         "id": RULE_ID,
                         "label": "R1",
                         "state": "proposed",
-                        "version": 1,
+                        # Created as a candidate at 1; the promotion bumped it.
+                        "version": 2,
                         "source_url": REPLY_URL,
                         "text": lrs.RULE_TEXT,
                     }
@@ -126,8 +127,9 @@ def _passing() -> dict[str, Any]:
             {
                 "step": "d",
                 "rule_id": RULE_ID,
+                "expected_version": 2,
                 "reader": {"exit": 1, "codes": [lrs.WRITE_ACCESS_REQUIRED]},
-                "writer": {"exit": 0, "state": "accepted"},
+                "writer": {"exit": 0, "codes": [], "state": "accepted", "version": 3},
             },
             {
                 "step": "e",
@@ -154,6 +156,7 @@ def _passing() -> dict[str, Any]:
             {
                 "step": "f",
                 "remove_exit": 0,
+                "expected_version": 3,
                 "state_after": "removed",
                 "labeller": lrs.WRITER_LOGIN,
                 "pull_request": 9,
@@ -332,6 +335,9 @@ VIOLATIONS: dict[str, tuple[Callable[[dict[str, Any]], None], str]] = {
     "reader refusal unnamed": (_set("d", "reader", "codes", value=[]), "does not name"),
     "writer accept failed": (_set("d", "writer", "exit", value=1), "writer's accept"),
     "rule not accepted": (_set("d", "writer", "state", value="proposed"), "accepted"),
+    "decision on a fixed version": (_set("d", "expected_version", value=1), "proposed rule's"),
+    "accept not bumping the version": (_set("d", "writer", "version", value=2), "move by one"),
+    "proposed rule without a version": (_set("c", "rules", 0, "version", value=None), "version"),
     "requester document not set": (
         _set("e", "coding_instructions_exit", value=1),
         "requester document",
@@ -367,6 +373,7 @@ VIOLATIONS: dict[str, tuple[Callable[[dict[str, Any]], None], str]] = {
     "no added assertAlmostEqual": (_set("e", "added_asserts", value=[]), "adds no"),
     "assertAlmostEqual without places=6": (_bare_assert, "without places=6"),
     "removal failed": (_set("f", "remove_exit", value=1), "remove failed"),
+    "remove on a stale version": (_set("f", "expected_version", value=2), "accepted rule's"),
     "rule not removed": (_set("f", "state_after", value="accepted"), "removed"),
     "C rules not absent": (
         _set("f", "work_item_memory_rules", "state", value="selected"),
@@ -797,3 +804,82 @@ def test_a_revision_on_the_factory_pull_request_routes_to_the_ticket_it_closes(s
     assert identity(_revision_request(stub.base_url, ticket_a)) == lrs.TICKET_A
     assert identity(_revision_request(stub.base_url, other)) == lrs.TICKET_B
     assert identity(_revision_request(stub.base_url, unrelated)) is None
+
+
+# The chain stops at a broken link before the next ticket's model calls ------
+
+
+def _chain_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, writer_code: str | None):
+    """A LearnedRulesRun whose steps a to c replay the passing evidence and whose
+    decisions answer like the API: a stale version is refused, an accept bumps it."""
+
+    for name in ("DOCKER_HOST", "DOCKER_CONTEXT", "CURIE_LOCAL_STUB_HOST"):
+        monkeypatch.delenv(name, raising=False)
+    args = fe.parse_args(
+        ["scripted", "--scenario", "learned-rules", "--transcript", str(_transcripts(tmp_path))]
+    )
+    run = lrr.LearnedRulesRun(args)
+    passing = {step["step"]: step for step in _passing()["steps"]}
+    pull_a = passing["a"]["pull_request"]
+    rule = dict(passing["c"]["rules"][0])
+    calls: list[tuple[str, ...]] = []
+    run.evidence["pull_request"] = {"number": pull_a, "body": f"Closes #{lrs.TICKET_A}"}
+    run.proposals_on = True
+    run.session_files = {role: tmp_path / role for role in ("writer", "reader")}
+    run.env.update(CURIE_API_URL=API_ORIGIN, CURIE_API_KEY="platform-key")
+    monkeypatch.setattr(run, "label_events", lambda _number: 1)
+
+    def revise(_github: Any, _pull: int) -> str:
+        run.chain["steps"].append(passing["b"])
+        return REPLY_URL
+
+    def promote(_pull: int, _reply_url: str) -> dict[str, Any]:
+        run.chain["steps"].append(passing["c"])
+        return dict(rule)
+
+    def decide(verb: str, rule_id: str, version: int, role: str) -> tuple[int, str]:
+        calls.append((verb, role, str(version)))
+        if version != rule["version"]:
+            return 1, json.dumps({"error": {"code": "memory_rules.stale_version"}})
+        if role == "reader":
+            return 1, json.dumps({"error": {"code": lrs.WRITE_ACCESS_REQUIRED}})
+        if writer_code is not None:
+            return 1, json.dumps({"error": {"code": writer_code}})
+        rule.update(state={"accept": "accepted", "remove": "removed"}[verb], version=version + 1)
+        return 0, ""
+
+    def ticket(_github: Any, number: int, _text: str) -> dict[str, Any]:
+        calls.append(("ticket", str(number)))
+        raise _Stop(f"ticket {number} would make model calls")
+
+    monkeypatch.setattr(run, "revise", revise)
+    monkeypatch.setattr(run, "promote", promote)
+    monkeypatch.setattr(run, "decide", decide)
+    monkeypatch.setattr(run, "list_rules", lambda: [dict(rule)])
+    monkeypatch.setattr(run, "command_result", lambda *_argv, **_kwargs: (0, ""))
+    monkeypatch.setattr(run, "run_ticket", ticket)
+    return run, calls
+
+
+def test_decisions_pass_the_listed_version_and_ticket_b_follows_the_accept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, calls = _chain_run(tmp_path, monkeypatch, writer_code=None)
+    with pytest.raises(_Stop, match=f"ticket {lrs.TICKET_B}"):
+        run.run_chain(object())
+    assert calls == [("accept", "reader", "2"), ("accept", "writer", "2"), ("ticket", "3921")]
+    decided = _step({"steps": run.chain["steps"]}, "d")
+    assert decided["writer"] == {"exit": 0, "codes": [], "state": "accepted", "version": 3}
+    run.cleanup()
+
+
+def test_a_refused_accept_stops_the_chain_before_ticket_b_is_labelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, calls = _chain_run(tmp_path, monkeypatch, writer_code="memory_rules.stale_version")
+    with pytest.raises(lrr.LearnedRulesError, match="writer's accept exited 1"):
+        run.run_chain(object())
+    assert ("ticket", str(lrs.TICKET_B)) not in calls
+    decided = _step({"steps": run.chain["steps"]}, "d")
+    assert decided["writer"]["codes"] == ["memory_rules.stale_version"]
+    run.cleanup()

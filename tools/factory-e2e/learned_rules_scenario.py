@@ -232,7 +232,11 @@ def assert_promoted(step: Mapping[str, Any], pull_a: int, reply_url: str) -> Map
     rule = rules[0]
     _require(rule.get("state") == "proposed", f"the rule is {rule.get('state')}, not proposed")
     _require(rule.get("label") == "R1", f"the rule is labelled {rule.get('label')}, not R1")
-    _require(rule.get("version") == 1, "the proposed rule is not at version 1")
+    version = rule.get("version")
+    _require(
+        isinstance(version, int) and not isinstance(version, bool) and version >= 1,
+        f"the proposed rule has no version: {version!r}",
+    )
     source = rule.get("source_url")
     _require(source == reply_url, "the rule's source is not the revision's reply target")
     path = urlsplit(str(source)).path
@@ -241,10 +245,18 @@ def assert_promoted(step: Mapping[str, Any], pull_a: int, reply_url: str) -> Map
     return dict(rule)
 
 
-def assert_decided(step: Mapping[str, Any], rule: Mapping[str, Any]) -> None:
-    """d: the read only principal is refused; the writer accepts."""
+def assert_decided(step: Mapping[str, Any], rule: Mapping[str, Any]) -> Mapping[str, Any]:
+    """d: the read only principal is refused; the writer accepts.
+
+    Both decisions pass the version the list read for the proposed rule, and the
+    accept bumps it by one. Returns the accepted rule's id and version.
+    """
 
     _require(step.get("rule_id") == rule.get("id"), "another rule was decided")
+    _require(
+        step.get("expected_version") == rule.get("version"),
+        "the decision did not pass the proposed rule's version",
+    )
     reader = step.get("reader") or {}
     _require(reader.get("exit") == 1, f"the reader's accept exited {reader.get('exit')}")
     _require(
@@ -254,6 +266,11 @@ def assert_decided(step: Mapping[str, Any], rule: Mapping[str, Any]) -> None:
     writer = step.get("writer") or {}
     _require(writer.get("exit") == 0, f"the writer's accept exited {writer.get('exit')}")
     _require(writer.get("state") == "accepted", "the rule did not read accepted")
+    _require(
+        writer.get("version") == int(rule["version"]) + 1,
+        "the accepted rule's version did not move by one",
+    )
+    return {"id": rule.get("id"), "version": writer.get("version")}
 
 
 def _captures(step: Mapping[str, Any], issue: int) -> tuple[list[Mapping[str, Any]], list[Any]]:
@@ -318,9 +335,13 @@ def assert_ticket_b(step: Mapping[str, Any]) -> None:
     _require(not bare, f"B's diff adds assertAlmostEqual( without {PLACES}: {bare}")
 
 
-def assert_ticket_c(step: Mapping[str, Any]) -> None:
+def assert_ticket_c(step: Mapping[str, Any], accepted: Mapping[str, Any]) -> None:
     """f: after removal, C carries no learned rules anywhere."""
 
+    _require(
+        step.get("expected_version") == accepted.get("version"),
+        "the remove did not pass the accepted rule's version",
+    )
     _require(step.get("remove_exit") == 0, "the writer's remove failed")
     _require(step.get("state_after") == "removed", "the rule did not read removed")
     _ticket(step, TICKET_C)
@@ -392,8 +413,8 @@ def assert_chain(evidence: Mapping[str, Any], *, record: bool) -> None:
     pull_a = assert_ticket_a(steps["a"])
     reply_url = assert_revision(steps["b"], pull_a)
     rule = assert_promoted(steps["c"], pull_a, reply_url)
-    assert_decided(steps["d"], rule)
+    accepted = assert_decided(steps["d"], rule)
     assert_ticket_b(steps["e"])
-    assert_ticket_c(steps["f"])
+    assert_ticket_c(steps["f"], accepted)
     windows = {TICKET_B: _window(steps["e"], TICKET_B), TICKET_C: _window(steps["f"], TICKET_C)}
     assert_lanes(steps["g"], windows, record=record)
