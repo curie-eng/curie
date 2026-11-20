@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/memory-rules/v1.0.json",
+  "$id": "https://schemas.curietech.ai/cli/memory-rules/v1.1.json",
   "title": "curie cluster memory --rules | --accept | --reject | --remove --json",
   "description": "The learned rule list the API returned, the changed rule an accept, reject or remove returned, or an offline request plan.",
   "$defs": {
@@ -60,7 +60,10 @@
           "type": "object"
         },
         "applies_from": {
-          "const": "next_ticket"
+          "enum": [
+            "next_ticket",
+            "next_session"
+          ]
         }
       },
       "required": [

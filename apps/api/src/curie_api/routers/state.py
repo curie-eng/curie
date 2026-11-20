@@ -14,9 +14,10 @@ platform key. On the ``memory`` namespace a sandbox credential is further held t
 its own channel, to fact keys, and to the sender its per-turn credential names
 (ADR-0188); on ``transcript`` it is held to its own channel's threads (#3767).
 The per-turn credential may also propose one learned rule per turn in its own
-binding or agent scope, and every non-legacy sandbox credential reads the
+binding or agent scope, and every state credential with memory claims reads the
 accepted rules a session loads at its start (``rules_router``, ADR 0287
-decision 7, #5801).
+decision 7, #5801); every other caller reads ``_rules`` there as the ordinary
+key/value namespace listing it always was.
 """
 
 import asyncio
@@ -52,6 +53,7 @@ from curie_api.schemas.memory_rules import (
     ChannelRuleProposalIn,
     ChannelRuleRefusal,
     ChannelRulesOut,
+    MemoryRuleAuthRefusal,
     MemoryRuleOut,
 )
 from curie_api.schemas.state import (
@@ -1502,17 +1504,19 @@ async def delete_state_for_binding(
 #
 # A non-factory turn proposes one learned rule with its per-turn memory write
 # credential, and a session reads the accepted rules at its start with its boot
-# credential. Both routes live on their own router, included before ``router`` so
-# ``_rules`` never reaches the key/value namespace handlers, and answer a validly
-# signed state credential for another agent with 403 instead of the 401 the other
-# state routes keep (``require_rules_access``). Accept, reject and remove stay on
-# the memory router, out of reach of every sandbox credential.
+# credential. Both routes live on their own router, included before ``router``,
+# and answer a validly signed state credential for another agent with 403 instead
+# of the 401 the other state routes keep (``require_rules_access``). ``_rules`` is
+# also an ordinary key/value namespace name any caller may have written to, so the
+# read answers every caller without memory claims exactly what ``list_state``
+# would for that namespace. Accept, reject and remove stay on the memory router,
+# out of reach of every sandbox credential.
 
-RULES_PATH: Final = "/{agent_id}/state/_rules"
-_RULES_LOG_PATH: Final = "state/_rules"
+RULES_NAMESPACE: Final = "_rules"
+RULES_PATH: Final = f"/{{agent_id}}/state/{RULES_NAMESPACE}"
+_RULES_LOG_PATH: Final = f"state/{RULES_NAMESPACE}"
 OTHER_AGENT: Final = "credential is for another agent"
 TURN_CREDENTIAL_ONLY: Final = "rules are proposed only with a turn credential"
-SCOPED_CREDENTIAL_ONLY: Final = "rules are read only with a scoped sandbox credential"
 _NO_STORE: Final = {"Cache-Control": "no-store"}
 # Three fields of at most 240 bytes each, with room for every character escaped.
 _PROPOSAL_BODY_MAX_BYTES: Final = 8 * 1024
@@ -1565,22 +1569,62 @@ _PROPOSAL_REFUSALS: Final[dict[str, tuple[int, str, str]]] = {
         "Use the agent this credential was minted for.",
     ),
 }
-_RULES_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    401: {"description": "Missing or invalid credential"},
+# The refusal bodies each route really answers: a coded refusal is an object
+# ``detail`` (``ChannelRuleRefusal``), and a credential refusal or a failed
+# credential check is a plain string ``detail`` (``MemoryRuleAuthRefusal``).
+_RULES_UNAUTHORIZED: Final[dict[str, Any]] = {
+    "model": MemoryRuleAuthRefusal,
+    "description": "Missing or invalid credential",
+}
+_PROPOSE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    401: _RULES_UNAUTHORIZED,
     403: {
-        "model": ChannelRuleRefusal,
-        "description": "A credential that may not use this route (a plain string), or "
+        "model": ChannelRuleRefusal | MemoryRuleAuthRefusal,
+        "description": "A credential that may not propose (a plain string: another agent's, "
+        "not a turn credential, read-only, released, or its turn ended), or "
         "`rule_proposal_not_eligible`",
     },
     404: {"model": ChannelRuleRefusal, "description": "`agent_not_found`"},
     409: {"model": ChannelRuleRefusal, "description": "`rule_already_proposed`"},
+    # A malformed agent id in the path is FastAPI's validation list.
     422: {
-        "model": ChannelRuleRefusal,
-        "description": "`invalid_body`, `invalid_text`, `too_large` or `reserved_text`",
+        "description": "`invalid_body`, `invalid_text`, `too_large` or `reserved_text`, "
+        "or a malformed agent id",
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/ChannelRuleRefusal"},
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                    ]
+                }
+            }
+        },
     },
     503: {
-        "model": ChannelRuleRefusal,
-        "description": "`rule_proposal_unavailable` or `rules_unavailable`",
+        "model": ChannelRuleRefusal | MemoryRuleAuthRefusal,
+        "description": "`rule_proposal_unavailable`, or the credential or its turn could "
+        "not be checked (a plain string)",
+    },
+}
+# The read takes no body, so its 422 stays FastAPI's default validation list.
+_READ_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    200: {
+        "description": "`ChannelRulesOut` for a scoped sandbox credential with memory claims; "
+        "for every other caller the `_rules` key/value namespace listing, as "
+        "`GET /agents/{agent_id}/state/{namespace}` answers it"
+    },
+    401: _RULES_UNAUTHORIZED,
+    403: {
+        "model": MemoryRuleAuthRefusal,
+        "description": "Another agent's credential, a released credential, or one naming no "
+        "valid channel",
+    },
+    404: {"model": ChannelRuleRefusal, "description": "`agent_not_found`"},
+    503: {
+        "model": ChannelRuleRefusal | MemoryRuleAuthRefusal,
+        "description": "`rules_unavailable`, or the credential could not be checked "
+        "(a plain string)",
     },
 }
 
@@ -1695,7 +1739,7 @@ _PROPOSAL_BODY_SCHEMA: Final = ChannelRuleProposalIn.model_json_schema(
     RULES_PATH,
     status_code=status.HTTP_201_CREATED,
     response_model=MemoryRuleOut,
-    responses=_RULES_RESPONSES,
+    responses=_PROPOSE_RESPONSES,
     openapi_extra={
         "requestBody": {
             "required": True,
@@ -1807,26 +1851,36 @@ async def propose_rule(
     )
 
 
-@rules_router.get(RULES_PATH, response_model=ChannelRulesOut, responses=_RULES_RESPONSES)
+@rules_router.get(
+    RULES_PATH,
+    response_model=ChannelRulesOut | list[StateEntryOut],
+    responses=_READ_RESPONSES,
+)
 async def read_rules(
     agent_id: uuid.UUID,
     session: SessionDep,
     principal: RulesPrincipal,
-) -> ChannelRulesOut:
+) -> ChannelRulesOut | list[StateEntryOut]:
     """The accepted rules a non-factory session loads at its start (#5801).
 
-    Only a scoped sandbox state credential with memory claims reads it (the
-    boot read credential or a turn's write credential); the platform key, the
-    bundle token and a legacy token are refused 403. Answers the agent's
-    ``memory_rule_proposals`` as ``proposals_enabled`` and the ``accepted``
-    rules of the agent scope, then of the binding scope the credential's
-    ``binding`` claim names (none for a credential with no binding), each
-    ordered by acceptance and at most 16 per scope. Never a proposed,
-    rejected or removed rule, and never another binding's.
+    A scoped sandbox state credential with memory claims (the boot read
+    credential or a turn's write credential) gets ``ChannelRulesOut``: the
+    agent's ``memory_rule_proposals`` as ``proposals_enabled`` and the
+    ``accepted`` rules of the agent scope, then of the binding scope the
+    credential's ``binding`` claim names (none for a credential with no
+    binding), each ordered by acceptance and at most 16 per scope. Never a
+    proposed, rejected or removed rule, and never another binding's.
+
+    Every other caller (the platform key, the bundle token and a legacy token)
+    gets what ``GET /agents/{agent_id}/state/{namespace}`` answers for the
+    ``_rules`` namespace: the key/value entries stored there, as a list of
+    ``StateEntryOut``, after the same checks. A state credential signed for
+    another agent is 403 here, where the key/value routes answer 401.
     """
 
     if principal.caller is not StateCaller.STATE or principal.legacy:
-        _refuse(principal, agent_id, _RULES_LOG_PATH, SCOPED_CREDENTIAL_ONLY)
+        await forbid_reserved_namespace(RULES_NAMESPACE, principal)
+        return await list_state(agent_id, RULES_NAMESPACE, session, principal)
     binding_key = None if principal.binding is None else _rules_binding_key(principal, agent_id)
     try:
         loaded = await memory_rule_channel.load_channel_rules(

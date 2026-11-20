@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use super::AgentActionOpts;
 use crate::api::{
-    ApiClient, MemoryRule, MemoryRuleAppliesFrom, MemoryRuleChange, MemoryRuleState, MemoryRules,
-    OwnerApiClient,
+    ApiClient, MemoryRule, MemoryRuleAppliesFrom, MemoryRuleChange, MemoryRuleScopeKind,
+    MemoryRuleState, MemoryRules, OwnerApiClient,
 };
 use crate::exit::CliError;
 use crate::ui::{CliOutput, DryRunPlan, Ui};
@@ -117,6 +117,18 @@ impl RuleScopeFilter {
     /// Whether any scope flag narrowed the filter.
     pub fn is_set(&self) -> bool {
         self.kind.is_some() || self.key.is_some()
+    }
+
+    /// Whether a listed rule sits in exactly the requested scope: each part the
+    /// filter names must equal the rule's own `scope_kind` and `scope_key`.
+    fn holds(&self, rule: &MemoryRule) -> bool {
+        let kind = match rule.scope_kind {
+            MemoryRuleScopeKind::Agent => "agent",
+            MemoryRuleScopeKind::Binding => "binding",
+            MemoryRuleScopeKind::Repository => "repository",
+        };
+        self.kind.as_deref().is_none_or(|k| k == kind)
+            && self.key.as_deref().is_none_or(|k| k == rule.scope_key)
     }
 
     /// Resolve the `--channel`, `--agent-scope` and `--scope-key` flags.
@@ -305,7 +317,7 @@ pub async fn memory_rule_act(opts: MemoryRuleActOpts) -> Result<MemoryRulesOutpu
         if !listed
             .rules
             .iter()
-            .any(|r| r.id.hyphenated().to_string() == rule_id)
+            .any(|r| r.id.hyphenated().to_string() == rule_id && opts.scope.holds(r))
         {
             let fix = "list that scope with `curie cluster memory <agent> --rules` and copy the rule id from it";
             return Err(CliError::usage(format!(

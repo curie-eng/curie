@@ -631,8 +631,8 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Changed" => MemoryRulesOutput::Changed {
                 verb: curie::commands::MemoryRuleVerb::Accept,
                 change: Box::new(
-                    curie::api::parse_memory_rule_change(memory_rules_vector("accept"))
-                        .expect("the recorded accept parses"),
+                    curie::api::parse_memory_rule_change(memory_rules_vector("accept_binding"))
+                        .expect("the recorded binding accept parses"),
                 ),
             },
         ],

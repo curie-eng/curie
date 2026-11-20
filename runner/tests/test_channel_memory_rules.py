@@ -30,12 +30,14 @@ from curie_runner.channel_memory_rules import (
     CHANNEL_FRAMING,
     MAX_RESPONSE_BYTES,
     ChannelRules,
+    is_work_item_run,
     load_channel_rules,
     render_channel_rules,
     rules_url,
 )
 from curie_runner.issue_read import ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
 from curie_runner.memory_rules_context import FRAMING, rules_section
+from curie_runner.progress import PROGRESS_URL_ENV
 from curie_runner.propose_rule import (
     CHANNEL_PROPOSE_RULE_DESCRIPTION,
     PROPOSE_RULE_DESCRIPTION,
@@ -694,3 +696,53 @@ def test_build_runner_takes_what_the_boot_read_returns() -> None:
     fields = {f.name for f in dataclasses.fields(boot._BootFetches)}
     assert "channel_rules" in fields
     assert "channel_rules" in inspect.signature(build_runner).parameters
+
+
+# --- 6. A WorkItem run whose issue-read mint failed -----------------------------------------
+
+
+def test_the_work_item_marker_is_either_capability_or_progress_url() -> None:
+    wir = {ISSUE_READ_URL_ENV: "http://api/work-items/issue-read", ISSUE_READ_TOKEN_ENV: "t"}
+    progress = {PROGRESS_URL_ENV: "http://api/v1/work-item-progress/w"}
+    assert is_work_item_run({}) is False
+    assert is_work_item_run(wir) is True
+    assert is_work_item_run(progress) is True
+    assert is_work_item_run({**wir, **progress}) is True
+    assert is_work_item_run({PROGRESS_URL_ENV: "   "}) is False
+    assert is_work_item_run({ISSUE_READ_URL_ENV: "http://api/x"}) is False
+
+
+def test_a_work_item_run_without_wir_neither_reads_renders_nor_mounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = RulesApi()
+
+    async def probe(*_args: Any, **_kwargs: Any) -> Any:
+        return _PROBE
+
+    async def go() -> Any:
+        monkeypatch.delenv(ISSUE_READ_URL_ENV, raising=False)
+        monkeypatch.delenv(ISSUE_READ_TOKEN_ENV, raising=False)
+        async with TestServer(api.app(FakeStateApi())) as server:
+            env = _env(monkeypatch, tmp_path, server, extra={"CURIE_MODEL": MODEL})
+            monkeypatch.setenv(PROGRESS_URL_ENV, str(server.make_url("/v1/work-item-progress/w")))
+            monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+            monkeypatch.setattr(boot, "ClaudeAgentSession", _ScriptedSession)
+            config = RunnerConfig.from_env(env)
+            fetches = await boot._load_boot_fetches(config, False, None)
+            assert fetches.channel_rules is None
+            # Even if rules reached the builder, the run is still treated as a factory run.
+            runner = build_runner(
+                config,
+                fake_model=False,
+                memory_facts_preamble=fetches.memory_facts_preamble,
+                memory_guidance=fetches.memory_guidance,
+                mcp_capability=_PROBE,
+                channel_rules=ON,
+            )
+            return await initialized_session(runner)
+
+    session = anyio.run(go)
+    assert [r for r in api.requests if r[1] == RULES_PATH] == []
+    assert "<<<curie-learned-rules" not in session.options.system_prompt
+    assert PROPOSE not in _published(session.options)

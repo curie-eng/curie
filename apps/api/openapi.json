@@ -27493,7 +27493,7 @@
     },
     "/agents/{agent_id}/state/_rules": {
       "get": {
-        "description": "The accepted rules a non-factory session loads at its start (#5801).\n\nOnly a scoped sandbox state credential with memory claims reads it (the\nboot read credential or a turn's write credential); the platform key, the\nbundle token and a legacy token are refused 403. Answers the agent's\n``memory_rule_proposals`` as ``proposals_enabled`` and the ``accepted``\nrules of the agent scope, then of the binding scope the credential's\n``binding`` claim names (none for a credential with no binding), each\nordered by acceptance and at most 16 per scope. Never a proposed,\nrejected or removed rule, and never another binding's.",
+        "description": "The accepted rules a non-factory session loads at its start (#5801).\n\nA scoped sandbox state credential with memory claims (the boot read\ncredential or a turn's write credential) gets ``ChannelRulesOut``: the\nagent's ``memory_rule_proposals`` as ``proposals_enabled`` and the\n``accepted`` rules of the agent scope, then of the binding scope the\ncredential's ``binding`` claim names (none for a credential with no\nbinding), each ordered by acceptance and at most 16 per scope. Never a\nproposed, rejected or removed rule, and never another binding's.\n\nEvery other caller (the platform key, the bundle token and a legacy token)\ngets what ``GET /agents/{agent_id}/state/{namespace}`` answers for the\n``_rules`` namespace: the key/value entries stored there, as a list of\n``StateEntryOut``, after the same checks. A state credential signed for\nanother agent is 403 here, where the key/value routes answer 401.",
         "operationId": "read_rules_agents__agent_id__state__rules_get",
         "parameters": [
           {
@@ -27528,24 +27528,42 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChannelRulesOut"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ChannelRulesOut"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/StateEntryOut"
+                      },
+                      "type": "array"
+                    }
+                  ],
+                  "title": "Response Read Rules Agents  Agent Id  State  Rules Get"
                 }
               }
             },
-            "description": "Successful Response"
+            "description": "`ChannelRulesOut` for a scoped sandbox credential with memory claims; for every other caller the `_rules` key/value namespace listing, as `GET /agents/{agent_id}/state/{namespace}` answers it"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
             "description": "Missing or invalid credential"
           },
           "403": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
                 }
               }
             },
-            "description": "A credential that may not use this route (a plain string), or `rule_proposal_not_eligible`"
+            "description": "Another agent's credential, a released credential, or one naming no valid channel"
           },
           "404": {
             "content": {
@@ -27557,35 +27575,33 @@
             },
             "description": "`agent_not_found`"
           },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChannelRuleRefusal"
-                }
-              }
-            },
-            "description": "`rule_already_proposed`"
-          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             },
-            "description": "`invalid_body`, `invalid_text`, `too_large` or `reserved_text`"
+            "description": "Validation Error"
           },
           "503": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ChannelRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 503 Read Rules Agents  Agent Id  State  Rules Get"
                 }
               }
             },
-            "description": "`rule_proposal_unavailable` or `rules_unavailable`"
+            "description": "`rules_unavailable`, or the credential could not be checked (a plain string)"
           }
         },
         "summary": "Read Rules",
@@ -27675,17 +27691,32 @@
             "description": "Successful Response"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
             "description": "Missing or invalid credential"
           },
           "403": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ChannelRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 403 Propose Rule Agents  Agent Id  State  Rules Post"
                 }
               }
             },
-            "description": "A credential that may not use this route (a plain string), or `rule_proposal_not_eligible`"
+            "description": "A credential that may not propose (a plain string: another agent's, not a turn credential, read-only, released, or its turn ended), or `rule_proposal_not_eligible`"
           },
           "404": {
             "content": {
@@ -27711,21 +27742,36 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ChannelRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  ]
                 }
               }
             },
-            "description": "`invalid_body`, `invalid_text`, `too_large` or `reserved_text`"
+            "description": "`invalid_body`, `invalid_text`, `too_large` or `reserved_text`, or a malformed agent id"
           },
           "503": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ChannelRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 503 Propose Rule Agents  Agent Id  State  Rules Post"
                 }
               }
             },
-            "description": "`rule_proposal_unavailable` or `rules_unavailable`"
+            "description": "`rule_proposal_unavailable`, or the credential or its turn could not be checked (a plain string)"
           }
         },
         "summary": "Propose Rule",

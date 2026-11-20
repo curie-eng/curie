@@ -64,7 +64,12 @@ from .attachments import (
     read_status,
     reconcile,
 )
-from .channel_memory_rules import ChannelRules, load_channel_rules, rules_url
+from .channel_memory_rules import (
+    ChannelRules,
+    is_work_item_run,
+    load_channel_rules,
+    rules_url,
+)
 from .config import (
     ALLOW_TOKENLESS_ENV,
     RunnerConfig,
@@ -1121,9 +1126,10 @@ def build_runner(
     # with a WorkItem whose worker injected the route and capability.
     issue_read = resolve_issue_read(os.environ)
     # The accepted standing rules of a run with no work item (#5801). A factory
-    # run (``wir``) never uses them: its rules and its ``propose_rule`` come
+    # run (``wir`` or the work-item progress URL, which survives a failed
+    # issue-read mint) never uses them: its rules and its ``propose_rule`` come
     # from the completion contract and the admission pin.
-    channel_rules_in_force = channel_rules if issue_read is None else None
+    channel_rules_in_force = channel_rules if not is_work_item_run(os.environ) else None
     # The channel ``propose_rule`` mounts beside the memory tools only, and only
     # when the session start read offered it. It writes with the turn's own
     # credential, so with no turn credential it refuses without a request.
@@ -2062,10 +2068,10 @@ def _channel_rules_source(config: RunnerConfig, fake_model: bool) -> tuple[str, 
     """The ``state/_rules`` URL and boot memory token to read, or None.
 
     Read only on the real model path, with a memory ref and the boot memory
-    token, and never on a run holding the ``wir`` capability (#5801).
+    token, and never on a WorkItem run: ``wir`` capability or progress URL (#5801).
     """
 
-    if fake_model or resolve_issue_read(os.environ) is not None:
+    if fake_model or is_work_item_run(os.environ):
         return None
     url = rules_url(config.session.memory_ref)
     token = os.environ.get(MEMORY_TOKEN_ENV) or None

@@ -307,7 +307,7 @@
       "result": "MemoryRulesOutput",
       "kind": "CliOutput",
       "schema": "memory-rules.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "MessageDryRunOutput",

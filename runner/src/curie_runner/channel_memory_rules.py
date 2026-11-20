@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
+from aci_protocol import BootEnv
 from curie_internal.memory_rules import (
     AGENT_SCOPE_KEY,
     SelectedMemoryRules,
@@ -36,6 +37,11 @@ from .memory_rules_context import rules_section
 from .redact import register_held_secrets
 
 logger = logging.getLogger(__name__)
+
+# The same keys as ``issue_read`` and ``progress``, which import the SDK.
+_ISSUE_READ_URL_ENV = BootEnv.env_key("issue_read_url")
+_ISSUE_READ_TOKEN_ENV = BootEnv.env_key("issue_read_token")
+_PROGRESS_URL_ENV = BootEnv.env_key("progress_url")
 
 RULES_SEGMENT = "_rules"
 _MEMORY_SUFFIX = "/state/memory"
@@ -79,6 +85,20 @@ NONE = ChannelRules()
 
 class _Malformed(Exception):
     """The answer is not the documented shape."""
+
+
+def is_work_item_run(env: Mapping[str, str]) -> bool:
+    """True for a factory (WorkItem) execution, which never takes the channel path.
+
+    Either marker is enough: the ``wir`` issue-read capability, or the work-item
+    progress URL. The worker sets the progress URL for every WorkItem execution
+    independently of the issue-read mint, which can fail without stopping the boot.
+    """
+
+    wir = bool(env.get(_ISSUE_READ_URL_ENV, "").strip()) and bool(
+        env.get(_ISSUE_READ_TOKEN_ENV, "").strip()
+    )
+    return wir or bool(env.get(_PROGRESS_URL_ENV, "").strip())
 
 
 def rules_url(memory_ref: str | None) -> str | None:
@@ -265,6 +285,7 @@ __all__ = [
     "MAX_RESPONSE_BYTES",
     "NONE",
     "ChannelRules",
+    "is_work_item_run",
     "load_channel_rules",
     "render_channel_rules",
     "rules_url",

@@ -361,13 +361,17 @@ def _accepts(stack: Stack, rule_id: uuid.UUID, owner: Owner | None = None) -> di
 # --- the CLI's recorded responses ---------------------------------------------------
 
 # The real list and accept responses the CLI parses (`cli/tests/memory_rules.rs`),
-# with volatile ids and clocks replaced by stable placeholders.
+# repository scope and binding scope, with volatile ids and clocks replaced by
+# stable placeholders.
 CLI_VECTOR = (
     Path(__file__).resolve().parents[3] / "tests" / "vectors" / "memory-rules-responses.json"
 )
 CLI_VECTOR_NOTE = (
     "Real responses of GET /agents/{agent_id}/memory/rules and POST "
-    ".../memory/rules/{rule_id}/accept, recorded from the routes by "
+    ".../memory/rules/{rule_id}/accept: list and accept for repository scope rules, "
+    "accept_binding for a binding scope rule (applies_from next_session) and "
+    "list_binding for the list filtered to that binding scope "
+    "(?scope_kind=binding&scope_key=...), recorded from the routes by "
     "apps/api/tests/test_memory_rule_routes.py::"
     "test_list_and_accept_responses_match_the_cli_vector, which fails when they drift. "
     "Ids and clocks are placeholders. Refresh: CURIE_WRITE_MEMORY_RULES_VECTOR=1 "
@@ -415,11 +419,31 @@ def test_list_and_accept_responses_match_the_cli_vector(stack: Stack) -> None:
     assert listed.status_code == 200, listed.text
     accepted = _decide(stack, proposed)
     assert accepted.status_code == 200, accepted.text
+    # Seeded after the repository recordings, so those stay as they were.
+    binding_rule = _channel_rule(stack, "binding", number=1, minute=5)
+    accepted_binding = _decide(stack, binding_rule)
+    assert accepted_binding.status_code == 200, accepted_binding.text
+    listed_binding = _list(stack, scope_kind="binding", scope_key=BINDING)
+    assert listed_binding.status_code == 200, listed_binding.text
 
-    recorded = _stable({"list": listed.json(), "accept": accepted.json()})
+    # Placeholders number in key order, so the binding keys come last.
+    recorded = _stable(
+        {
+            "list": listed.json(),
+            "accept": accepted.json(),
+            "accept_binding": accepted_binding.json(),
+            "list_binding": listed_binding.json(),
+        }
+    )
     assert recorded["list"]["rules"], "the vector must carry rules"
     states = {rule["state"] for rule in recorded["list"]["rules"]}
     assert states == {"proposed", "accepted", "rejected", "removed"}
+    assert recorded["accept_binding"]["applies_from"] == "next_session"
+    assert recorded["accept_binding"]["rule"]["scope_kind"] == "binding"
+    assert [
+        (rule["scope_kind"], rule["scope_key"], rule["state"])
+        for rule in recorded["list_binding"]["rules"]
+    ] == [("binding", BINDING, "accepted")]
     document = {"_comment": CLI_VECTOR_NOTE} | recorded
     if os.environ.get("CURIE_WRITE_MEMORY_RULES_VECTOR") == "1":
         CLI_VECTOR.write_text(json.dumps(document, indent=2) + "\n")

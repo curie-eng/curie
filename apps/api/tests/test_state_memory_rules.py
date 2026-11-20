@@ -47,7 +47,6 @@ CLOSE_URL = "/v1/internal/memory/closed-turns"
 
 READ_ONLY = "memory credential is read-only"
 TURN_CREDENTIAL_ONLY = "rules are proposed only with a turn credential"
-SCOPED_CREDENTIAL_ONLY = "rules are read only with a scoped sandbox credential"
 OTHER_AGENT = "credential is for another agent"
 TURN_ENDED = "this conversation's turn has ended"
 
@@ -120,6 +119,25 @@ def _app(aid: str) -> dict[str, str]:
 
 def _url(aid: str) -> str:
     return f"/agents/{aid}/state/_rules"
+
+
+RULES_PATH = "/agents/{agent_id}/state/_rules"
+
+
+def _declared_schema(client: Any, method: str, status: int) -> dict[str, Any]:
+    """The JSON body schema the app's own OpenAPI declares for one answer of the
+    rules route, with the document's components alongside so its ``$ref``s resolve."""
+
+    document = client.app.openapi()
+    declared = document["paths"][RULES_PATH][method]["responses"][str(status)]
+    schema: dict[str, Any] = declared["content"]["application/json"]["schema"]
+    return {**schema, "components": document["components"]}
+
+
+def _assert_matches_contract(client: Any, response: Any, method: str) -> None:
+    import jsonschema
+
+    jsonschema.validate(response.json(), _declared_schema(client, method, response.status_code))
 
 
 def _propose(client: Any, aid: str, headers: dict[str, str], body: Any = None) -> Any:
@@ -642,15 +660,40 @@ def test_read_carries_at_most_sixteen_rules_per_scope(
     assert [rule["text"] for rule in found["rules"]] == texts[:16]
 
 
-@pytest.mark.parametrize("credential", ["platform", "app", "legacy"])
-def test_read_refuses_credentials_without_memory_claims(
-    client: Any, auth_headers: dict[str, str], clean_db: None, credential: str
+def test_read_without_memory_claims_lists_the_rules_key_value_namespace(
+    client: Any, auth_headers: dict[str, str], clean_db: None, decider: uuid.UUID
 ) -> None:
+    """``_rules`` is also a key/value namespace any state caller may write. The
+    platform key, the bundle token and a legacy token list it as the generic
+    namespace listing answers it; only a memory credential gets the rules."""
+
     aid = _agent(client, auth_headers)
-    headers = {"platform": auth_headers, "app": _app(aid), "legacy": _legacy(aid)}[credential]
-    _refused_plain(client.get(_url(aid), headers=headers), 403, SCOPED_CREDENTIAL_ONLY)
-    # Liveness: the boot read credential reads.
-    assert client.get(_url(aid), headers=_reader(aid)).status_code == 200
+    _seed(aid, decider, state="accepted", number=1, text=C1_FIRST)
+    marker = "stored by a bundle under the rules namespace name"
+    put = client.put(f"{_url(aid)}/bundle-key", json={"value": {"note": marker}}, headers=_app(aid))
+    assert put.status_code == 200, put.text
+    stored = put.json()
+    assert (stored["namespace"], stored["key"]) == ("_rules", "bundle-key")
+
+    for headers in (_app(aid), auth_headers, _legacy(aid)):
+        listed = client.get(_url(aid), headers=headers)
+        assert listed.status_code == 200, listed.text
+        (entry,) = listed.json()
+        assert set(entry) == {"namespace", "key", "value", "version", "updated_at"}
+        assert {name: entry[name] for name in ("namespace", "key", "value", "version")} == {
+            "namespace": "_rules",
+            "key": "bundle-key",
+            "value": {"note": marker},
+            "version": stored["version"],
+        }
+        assert C1_FIRST not in listed.text
+        _assert_matches_contract(client, listed, "get")
+
+    rules = client.get(_url(aid), headers=_reader(aid))
+    assert rules.status_code == 200, rules.text
+    assert [rule["text"] for rule in rules.json()["rules"]] == [C1_FIRST]
+    assert marker not in rules.text and "bundle-key" not in rules.text
+    _assert_matches_contract(client, rules, "get")
 
 
 def test_rules_route_does_not_shadow_other_state(
@@ -666,6 +709,37 @@ def test_rules_route_does_not_shadow_other_state(
         "proposals_enabled": True,
         "rules": [],
     }
+
+
+def test_both_403_shapes_match_the_declared_contract(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A credential refusal answers a plain string ``detail`` and a coded refusal
+    an object ``detail``; the generated contract declares both for the 403."""
+
+    import jsonschema
+
+    aid = _agent(client, auth_headers, proposals=False)
+    plain = _propose(client, aid, _reader(aid))
+    _refused_plain(plain, 403, READ_ONLY)
+    coded = _propose(client, aid, _writer(aid))
+    assert coded.status_code == 403, coded.text
+    assert _code(coded) == "rule_proposal_not_eligible"
+
+    for response in (plain, coded):
+        _assert_matches_contract(client, response, "post")
+    # The read's 403 is a credential refusal too.
+    other = _agent(client, auth_headers, name="other", channels=OTHER_CHANNELS)
+    foreign = client.get(_url(aid), headers=_reader(other, binding=OTHER_BINDING))
+    _refused_plain(foreign, 403, OTHER_AGENT)
+    _assert_matches_contract(client, foreign, "get")
+    # The check has teeth: the coded schema alone refuses the string body.
+    coded_only = {
+        "$ref": "#/components/schemas/ChannelRuleRefusal",
+        "components": client.app.openapi()["components"],
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(plain.json(), coded_only)
 
 
 # --- handoffs: the worker's real credentials and the runner's real renderer ----------

@@ -65,6 +65,28 @@ fn rule_list() -> Value {
     list
 }
 
+/// The recorded binding scope rule (`list_binding`), in `state` at `version`.
+fn binding_rule(state: &str, version: i64) -> Value {
+    named(vector("list_binding")["rules"][0].clone(), state, version)
+}
+
+/// An agent scope rule. The vectors record no agent scope row, so this is the
+/// recorded binding row with only its scope fields changed.
+fn agent_rule(state: &str, version: i64) -> Value {
+    let mut rule = binding_rule(state, version);
+    rule["scope_kind"] = json!("agent");
+    rule["scope_key"] = json!("");
+    rule["scope_label"] = json!("every channel");
+    rule
+}
+
+/// The recorded binding accept answer for this test's rule.
+fn binding_accept() -> Value {
+    let mut answer = vector("accept_binding");
+    answer["rule"] = named(answer["rule"].clone(), "accepted", 2);
+    answer
+}
+
 fn accept_path() -> String {
     format!("/agents/{AGENT_ID}/memory/rules/{RULE_ID}/accept")
 }
@@ -879,22 +901,24 @@ fn scoped_server(listed: Vec<Value>, answer: Value) -> support::MockServer {
 fn accept_with_rules_and_a_channel_lists_the_scope_then_posts() {
     let fixture = Fixture::new();
     let session = fixture.session(0o600);
-    let answer = json!({"rule": rule("accepted", 2), "applies_from": "next_session"});
-    let server = scoped_server(vec![rule("proposed", 1)], answer.clone());
+    let answer = binding_accept();
+    let server = scoped_server(vec![binding_rule("proposed", 1)], answer.clone());
     let args = scoped_args(
         "--accept",
-        &["--channel", "slack=C1"],
+        &["--channel", "slack=C0EXAMPLE1"],
         &session,
         &server.base_url,
     );
     let output = fixture.run(&args);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
-    assert_eq!(object(&output), answer);
+    let printed = object(&output);
+    assert_eq!(printed, answer);
+    assert_eq!(printed["applies_from"], "next_session");
     let requests = server.recorded();
     assert_eq!(requests.len(), 3);
     assert_eq!(
         requests[1].path,
-        format!("/agents/{AGENT_ID}/memory/rules?scope_kind=binding&scope_key=slack%3AC1")
+        format!("/agents/{AGENT_ID}/memory/rules?scope_kind=binding&scope_key=slack%3AC0EXAMPLE1")
     );
     assert_cookie_only(&requests[1]);
     assert_eq!(requests[2].method, "POST");
@@ -906,17 +930,62 @@ fn a_scope_that_does_not_hold_the_rule_sends_no_decision() {
     let fixture = Fixture::new();
     let session = fixture.session(0o600);
     let other = RULE_ID.replace('2', "3");
-    let mut elsewhere = rule("accepted", 2);
+    let mut elsewhere = binding_rule("accepted", 2);
     elsewhere["id"] = json!(other);
     let answer = json!({"rule": rule("removed", 3), "applies_from": "next_session"});
     for (verb, scope) in [
-        ("--accept", vec!["--channel", "slack=C1"]),
+        ("--accept", vec!["--channel", "slack=C0EXAMPLE1"]),
         ("--remove", vec!["--agent-scope"]),
     ] {
         let server = scoped_server(vec![elsewhere.clone()], answer.clone());
         let args = scoped_args(verb, &scope, &session, &server.base_url);
         let output = fixture.run(&args);
-        assert_ne!(output.status.code(), Some(0), "{}", text(&output));
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+        assert!(
+            text(&output).contains("not in the requested scope"),
+            "{}",
+            text(&output)
+        );
+        let requests = server.recorded();
+        assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
+        assert_eq!(requests.len(), 2);
+    }
+}
+
+/// The GET answers the very rule id asked about, but in another scope: only the
+/// id matching is not enough.
+#[test]
+fn a_listed_rule_with_the_right_id_in_another_scope_sends_no_decision() {
+    let fixture = Fixture::new();
+    let session = fixture.session(0o600);
+    let answer = json!({"rule": rule("removed", 3), "applies_from": "next_session"});
+    let cases = [
+        // The repository row from `list`, asked for as a binding.
+        (
+            "--accept",
+            vec!["--channel", "slack=C0EXAMPLE1"],
+            rule("proposed", 1),
+        ),
+        // The same binding row under another channel key.
+        (
+            "--accept",
+            vec!["--channel", "slack=C0OTHER"],
+            binding_rule("proposed", 1),
+        ),
+        // A binding row, asked for as the agent scope.
+        (
+            "--remove",
+            vec!["--agent-scope"],
+            binding_rule("accepted", 2),
+        ),
+        // The repository row, asked for as the agent scope.
+        ("--reject", vec!["--agent-scope"], rule("proposed", 1)),
+    ];
+    for (verb, scope, listed) in cases {
+        let server = scoped_server(vec![listed], answer.clone());
+        let args = scoped_args(verb, &scope, &session, &server.base_url);
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
         assert!(
             text(&output).contains("not in the requested scope"),
             "{}",
@@ -933,7 +1002,7 @@ fn agent_scope_remove_posts_after_the_agent_scope_list() {
     let fixture = Fixture::new();
     let session = fixture.session(0o600);
     let answer = json!({"rule": rule("removed", 3), "applies_from": "next_session"});
-    let server = scoped_server(vec![rule("accepted", 2)], answer.clone());
+    let server = scoped_server(vec![agent_rule("accepted", 2)], answer.clone());
     let args = scoped_args("--remove", &["--agent-scope"], &session, &server.base_url);
     let output = fixture.run(&args);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
