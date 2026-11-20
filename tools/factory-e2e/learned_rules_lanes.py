@@ -83,8 +83,20 @@ def build_router(
     model_module: Any,
     transcripts: dict[str, Path],
     identity: Callable[[dict[str, Any]], int | None],
+    replacements: dict[str, str] | None = None,
 ) -> lanes.LaneRouter:
-    router = lanes.LaneRouter({}, issue_of=identity)
+    """Lanes A, B and C. ``replacements`` are the ones the recording applied to its
+    transcripts; a request gets the same before its key is computed, because a
+    pull request body quotes the stub's address outside any URL the key scrubs."""
+
+    normalize = None
+    if replacements:
+        table = dict(replacements)
+
+        def normalize(request: dict[str, Any]) -> dict[str, Any]:
+            return dict(scrub_recording([request], table)[0])
+
+    router = lanes.LaneRouter({}, issue_of=identity, normalize=normalize)
     for letter, number in TICKETS.items():
         exchanges = model_module.load_transcript(transcripts[letter])
         router.add(

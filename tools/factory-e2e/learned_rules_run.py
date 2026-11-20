@@ -209,7 +209,7 @@ class LearnedRulesRun(sk.ScriptedRun):
 
     def make_router(self, model_module: Any) -> scripted_lanes.LaneRouter:
         assert self.identity is not None
-        return lrl.build_router(model_module, self.transcripts, self.identity)
+        return lrl.build_router(model_module, self.transcripts, self.identity, self.replacements())
 
     def router_fallback(self) -> bool:
         return False

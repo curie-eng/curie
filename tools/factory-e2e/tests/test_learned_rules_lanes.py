@@ -420,3 +420,62 @@ def test_scrub_recording_replaces_every_string_and_copies() -> None:
         "see https://stub.example.test/y 192.0.2.1"
     )
     assert original[0]["lane_key"] == "http://127.0.0.1:9/x"
+
+
+# A revision quotes ticket A's pull request body, whose factory marker names the
+# stub's address outside any URL. The recording replaced the address it saw; the
+# replay's stub listens elsewhere, so the router must apply its own replacements.
+RECORDED_AT = "192.0.2.10:36001"
+REPLAYED_AT = "192.0.2.20:41002"
+
+
+def _marker_revision_text(address: str) -> str:
+    body = (
+        "Adds Kelvin.\n\n"
+        f"<!-- curie-factory-issue kind=github host={address} scope=4401 issue=3815 -->"
+    )
+    url = feedback_url(BASE, REPO, PULLS["a"], "issuecomment-2")
+    objective = _objective(
+        _feedback(PULLS["a"], "issuecomment-2"), url, {"pull_request_body": body}
+    )
+    return frame_user_turn("job", "", objective, "github")
+
+
+def _replacements(address: str) -> dict[str, str]:
+    host = address.split(":")[0]
+    return {address: "stub.example.test", host: "stub.example.test"}
+
+
+@pytest.mark.parametrize("normalized", [True, False])
+def test_a_replayed_revision_quoting_the_stub_address_matches_its_recording(
+    model_module: Any, tmp_path: Path, normalized: bool
+) -> None:
+    recorded_key = model_module.scrub(_marker_revision_text(RECORDED_AT))
+    assert RECORDED_AT in recorded_key  # the key scrub leaves the bare address
+    [exchange] = lrl.scrub_recording(
+        [{"lane_key": recorded_key, "ordinal": 0, "message": _message("a-revision-0")}],
+        _replacements(RECORDED_AT),
+    )
+    paths = lrl.transcript_paths(_empty_transcript(tmp_path, model_module))
+    for letter, path in paths.items():
+        model_module.dump_transcript(path, [exchange] if letter == "a" else [])
+    router = lrl.build_router(
+        model_module,
+        paths,
+        lrl.issue_identity(_FakeStub()),
+        _replacements(REPLAYED_AT) if normalized else None,
+    )
+    model_module.dump_transcript(tmp_path / "empty.json", [])
+    script = model_module.ModelScript(tmp_path / "empty.json")
+    router.install(script, model_module, fallback=False)
+    script.start()
+    try:
+        status, body = _post(script.base_url, _body(_marker_revision_text(REPLAYED_AT)))
+    finally:
+        script._server.shutdown()
+        script._server.server_close()
+    if normalized:
+        assert status == 200 and body["content"][0]["text"] == "a-revision-0"
+    else:
+        assert status == 422
+        assert router.lanes[("implementation", lrl.TICKETS["a"])].used == set()
