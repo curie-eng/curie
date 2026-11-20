@@ -169,22 +169,32 @@ provide the equivalent provider-specific steps.
    invoke
    `$review-pr <pr-url>`. The [PR review guide](guides/factory-pr-review.md)
    covers component details, coverage, manual tests and approved feedback.
-5. **Request a revision.** On the pull request, an authorized reviewer's plain
+5. **Answer questions or request a revision.** When the factory needs
+   something it cannot find, it investigates first, then posts its numbered
+   questions as one comment on the ticket and stops; the ticket carries
+   `curie-factory:questions`. Answer with a plain comment on the ticket, from
+   someone who could have started it (on Jira, someone the binding allows to
+   start work). No mention and no relabel: the factory reads the whole thread
+   and starts again. It asks at most three rounds per ticket. Edits, bot
+   comments and comments older than the question never answer it. On the pull
+   request, an authorized reviewer's plain
    comment starts a revision on GitHub, with no mention. One submitted review
    is one revision (its body and all its inline comments together), and an
    approving review starts none unless a comment mentions the factory. Each
    pull request allows 10 plain-comment revisions; the factory then posts one
    notice and a mention, such as `@<app-slug>`, is required. A mention always
    works and is not counted. GitLab and Bitbucket still require the mention.
-   On the issue, use a new comment explicitly mentioning the configured App
-   login; ordinary issue comments and edits do not execute work. Feedback
-   publication requires a new human approval even where initial factory
-   publication is automatic; see the operations reference.
+   Outside an open question, a later issue comment must explicitly mention the
+   configured App login to start work; ordinary issue comments and edits do
+   not. Feedback publication requires a new human approval even where initial
+   factory publication is automatic; see the operations reference.
 6. **Stop or retry deliberately.** Remove the factory label or close the issue
    to cancel. Running work remains cancellation requested until termination
    is observed; an existing PR remains open and linked. After resolving a
-   failure or answering clarification, re-add the label or send an authorized
-   mention. Relabelling replaces the current run; inspect existing work first.
+   failure, re-add the label or send an authorized mention. To answer the
+   factory's questions, comment on the ticket and leave the label in place;
+   removing it cancels the question. Relabelling replaces the current run;
+   inspect existing work first.
    After a reinstall or lost factory storage, a still-labelled issue whose
    factory pull request is open is not run again; its status comment links
    that pull request, and several open ones are refused until one remains. A

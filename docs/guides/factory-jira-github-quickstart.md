@@ -243,17 +243,25 @@ curie cluster work-items --agent dark-factory --context "$CURIE_CONTEXT" \
   --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE"
 ```
 
-## Request a revision or cancel
+## Answer, request a revision or cancel
 
-As the authorized Jira human, add a new comment to the still-labelled Jira
-ticket. Use Jira's mention picker to mention the factory account, then state a
-specific change, such as adding a tab-only name test. Jira must store a real
-mention of the factory account's `accountId`; plain text resembling a mention
-is insufficient. Ordinary comments and comment edits do not start work.
+When the factory asks questions, it posts them as one numbered comment on the
+Jira ticket and stops, and the Jira label `curie-factory:questions` appears.
+As someone on the binding's start allowlist or group, answer with a plain new
+comment on the same still-labelled ticket. No mention is needed. The factory
+reads the thread and starts again, for at most three rounds. Comment edits and
+comments older than the question never answer it.
 
-On GitHub, authorized pull request feedback uses the GitHub App's login instead
-and checks the author's repository write access, independently of the Jira
-start allowlist. Feedback publication requires fresh human approval even when
+To ask for a change when no question is open, add a new comment to the
+still-labelled Jira ticket as the authorized Jira human. Use Jira's mention
+picker to mention the factory account, then state a specific change, such as
+adding a tab-only name test. Jira must store a real mention of the factory
+account's `accountId`; plain text resembling a mention is insufficient. Outside
+an open question, ordinary comments and comment edits do not start work.
+
+On GitHub, an authorized reviewer's plain pull request comment or submitted
+review starts a revision with no mention. It checks the author's repository
+write access, independently of the Jira start allowlist. Feedback publication requires fresh human approval even when
 initial publication was automatic. See
 [GitHub review feedback](../operations.md#accepting-review-feedback-from-github).
 

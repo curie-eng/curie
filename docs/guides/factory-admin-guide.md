@@ -101,5 +101,29 @@ owners. Compare outcomes in a later window. The maintenance skill neither
 changes bindings nor retries old issues. See [maintenance details](factory-environments.md#review-failures-over-time)
 and [outcome measurement](measuring-factory-outcomes.md).
 
+## Let the factory propose rules, and accept them
+
+After a merged pull request the factory can propose a one-line rule for the
+repository, such as a convention reviewers corrected. Proposals are off by
+default. Turn them on for the agent:
+
+```bash
+curie cluster overrides dark-factory --memory-rule-proposals on \
+  --context "$CURIE_CONTEXT" --namespace "$CURIE_NAMESPACE" \
+  --release "$CURIE_RELEASE"
+```
+
+The setting takes effect for the next request. A proposed rule does nothing
+until a person accepts it: sign in to the console and open the **Memory** page,
+choose the agent and its repository, and under **Learned rules** accept,
+dismiss or later remove a rule. The person needs a console login linked to a
+GitHub account with write access to that repository; the platform
+administrator creates that link (see
+[learned rules](../operations.md#learned-rules)). Each repository holds at most
+16 accepted rules. An accepted rule applies from the next ticket the factory
+admits; a request already running keeps the rules it started with. Removing a
+rule stops it applying to later tickets. A rule cannot add tools, credentials
+or budget, change acceptance criteria, or skip review and publication gates.
+
 For approvals, models, budgets, and stop controls, use the
 [co-worker administrator guide](../administering-co-workers.md).
