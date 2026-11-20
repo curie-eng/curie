@@ -13,9 +13,9 @@ One agent does the work with one skill,
 [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md), and two
 reviewer subagents check it on a stronger model. The skill walks ten phases:
 
-1. `read_issue`: read the ticket by link. The whole thread is the
-   specification: earlier factory questions and every later human comment are
-   part of the ticket.
+1. `read_issue` reads the ticket by link. The description and the answers
+   verified for this execution define the requested behaviour. The discussion
+   and earlier factory questions provide context.
 2. `investigate`: establish the current behaviour with bounded shell probes.
    For a reported bug it attempts a reproduction and records the result
    whether it reproduced or not; for a feature it records the behaviour the
