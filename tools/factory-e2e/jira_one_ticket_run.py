@@ -45,6 +45,8 @@ CHANNEL_KIND = "jira"
 # ``uv run`` may first build the workspace environment.
 START_SECONDS = 900
 OUTSIDER_TEXT = "I would also like this."
+# Past the last recorded check run, as the publication scenario advances it.
+CHECK_REPLAY_SECONDS = 1800
 
 
 class JiraOneTicketError(RuntimeError):
@@ -320,10 +322,23 @@ class JiraOneTicket:
 
         return dict(self.wait("the questions ending", ready))
 
-    def answered(self, asking: str) -> dict[str, Any]:
-        """Wait for the second request to end with its final status comment."""
+    def answered(self, asking: str, baseline_pulls: list[int]) -> dict[str, Any]:
+        """Wait for the second request to end with its final status comment.
+
+        The GitHub stub replays recorded check runs on its own clock. Once
+        session 2's pull request exists, that clock moves past the recording,
+        as the publication scenario does, so the platform's CI gate sees the
+        checks finish rather than waiting out the request's deadline.
+        """
+
+        advanced = False
 
         def ready(state: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal advanced
+            if not advanced and ots.new_pulls(self.github._rows("pull"), baseline_pulls):
+                self.github.advance(CHECK_REPLAY_SECONDS)
+                advanced = True
+                self.evidence["check_clock_advanced"] = True
             observed = self.observe()
             requests = observed["requests"]
             if len(requests) < 2 or str(requests[1]["id"]) == asking:
@@ -423,7 +438,7 @@ class JiraOneTicket:
         # The labeller's plain answer, the one authorized answer.
         answer = self.jira.add_comment(self.issue_id, one_ticket_run.ANSWER_TEXT, labeller)
         answer_at = ots.instant(answer["at"])
-        observed = self.answered(str(asking["id"]))
+        observed = self.answered(str(asking["id"]), baseline_pulls)
         state = self.state()
         received_at = None
         if len(observed["requests"]) > 1:
