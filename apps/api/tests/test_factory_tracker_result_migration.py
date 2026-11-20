@@ -19,7 +19,9 @@ the 0162 ones at the end of this module, in the same probe style.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import tarfile
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -1446,11 +1448,10 @@ def test_a_version_carrying_a_stored_policy_admits_one_implementation_request(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from test_factory_tracker_result_admission import _agent_id, _deployed
-
     client, _github, _sink = admitted
-    agent_id = _agent_id()
-    version_id = _deployed(client, agent_id, None)
+    (agent,) = _app_rows("SELECT id FROM curie.agents")
+    agent_id = str(agent["id"])
+    version_id = _deploy_plain_bundle(client, agent_id)
     support._exec(
         "UPDATE curie.agent_versions SET result_policy_schema_version = 1, "
         "result_policy_digest = :digest, result_policy = CAST(:policy AS jsonb) "
@@ -1486,6 +1487,43 @@ def test_a_version_carrying_a_stored_policy_admits_one_implementation_request(
         },
         "rule_proposal": False,
     }
+
+
+def _deploy_plain_bundle(client: Any, agent_id: str) -> str:
+    """Upload and deploy a bundle with no declaration through the real routes."""
+
+    headers = {"X-API-Key": get_settings().api_key}
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": f"v-{uuid.uuid4().hex[:6]}", "created_by": "policy-test"},
+        headers=headers,
+    )
+    assert version.status_code == 201, version.text
+    version_id = str(version.json()["id"])
+    files = {
+        ".claude-plugin/plugin.json": '{"name": "policy-plugin", "version": "0.1.0"}',
+        "skills/work/SKILL.md": "---\nname: work\ndescription: works one issue\n---\n\n# work\n",
+    }
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        for rel, content in files.items():
+            data = content.encode()
+            info = tarfile.TarInfo(f"policy-plugin/{rel}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    uploaded = client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("policy.tar.gz", buf.getvalue())},
+        headers=headers,
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    deployed = client.post(
+        "/deployments",
+        json={"agent_id": agent_id, "version_id": version_id, "environment": "dev"},
+        headers=headers,
+    )
+    assert deployed.status_code == 201, deployed.text
+    return version_id
 
 
 def _tenant(work_item_id: uuid.UUID) -> uuid.UUID:
