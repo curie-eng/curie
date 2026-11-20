@@ -448,7 +448,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "accepted-by-another-principal",
-        [("beat_e/writer_command/output/accepted_by/principal_id", "principal-reader")],
+        [("beat_e/writer_command/output/rule/accepted_by/principal_id", "principal-reader")],
         "beat_e",
         "not accepted by the writer principal",
     ),
@@ -576,7 +576,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "removal-ended-accepted",
-        [("beat_g/remove_command/output/state", "accepted")],
+        [("beat_g/remove_command/output/rule/state", "accepted")],
         "beat_g",
         "did not end removed",
     ),
@@ -748,9 +748,9 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
             ("beat_e/rule_before/id", "rule-id-9"),
             ("beat_e/reader_command/rule_id", "rule-id-9"),
             ("beat_e/writer_command/rule_id", "rule-id-9"),
-            ("beat_e/writer_command/output/id", "rule-id-9"),
+            ("beat_e/writer_command/output/rule/id", "rule-id-9"),
             ("beat_g/remove_command/rule_id", "rule-id-9"),
-            ("beat_g/remove_command/output/id", "rule-id-9"),
+            ("beat_g/remove_command/output/rule/id", "rule-id-9"),
         ],
         "beat_e",
         "not the promoted rule",
@@ -769,7 +769,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "writer-accept-changed-another-rule",
-        [("beat_e/writer_command/output/id", "rule-id-9")],
+        [("beat_e/writer_command/output/rule/id", "rule-id-9")],
         "beat_e",
         "changed another rule",
     ),
@@ -781,19 +781,19 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "removal-changed-another-rule",
-        [("beat_g/remove_command/output/id", "rule-id-9")],
+        [("beat_g/remove_command/output/rule/id", "rule-id-9")],
         "beat_g",
         "removal changed another rule",
     ),
     (
         "removal-by-the-reader",
-        [("beat_g/remove_command/output/removed_by/principal_id", "principal-reader")],
+        [("beat_g/remove_command/output/rule/removed_by/principal_id", "principal-reader")],
         "beat_g",
         "not removed by the writer principal",
     ),
     (
         "removal-after-ticket-c-was-labelled",
-        [("beat_g/remove_command/output/removed_at", at(95))],
+        [("beat_g/remove_command/output/rule/removed_at", at(95))],
         "beat_g",
         "after ticket C was labelled",
     ),
@@ -851,6 +851,150 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "spend",
         "not measured at: ['after_c']",
     ),
+    (
+        "request-waiting-after-questions",
+        [("beat_a/quiet_snapshot/requests/0/status", "waiting")],
+        "beat_a",
+        "queued or running",
+    ),
+    (
+        "no-answer-acknowledgment",
+        [("beat_b/ticket_comments/0/body", "Investigating this ticket.\n\nStatus: RUNNING")],
+        "beat_b",
+        "acknowledges the answer",
+    ),
+    (
+        "acknowledgment-older-than-the-answer",
+        [("beat_b/ticket_comments/0/updated_at", at(9))],
+        "beat_b",
+        "acknowledges the answer",
+    ),
+    (
+        "acknowledgment-by-the-writer",
+        [("beat_b/ticket_comments/0/user", {"login": "fixture-writer", "id": 9000001})],
+        "beat_b",
+        "acknowledges the answer",
+    ),
+    (
+        "reply-names-the-old-head",
+        [("beat_c/pull_comments/0/body", lambda s: s.replace("b" * 40, "a" * 40))],
+        "beat_c",
+        "names the revision commit",
+    ),
+    (
+        "reply-older-than-the-review",
+        [
+            ("beat_c/pull_comments/0/created_at", at(29)),
+            ("beat_c/pull_comments/0/updated_at", at(29)),
+        ],
+        "beat_c",
+        "names the revision commit",
+    ),
+    (
+        "revision-head-has-no-check-run",
+        [("beat_c/revision_checks/check_runs/check_runs", [])],
+        "beat_c",
+        "no check run",
+    ),
+    (
+        "revision-check-run-failed",
+        [("beat_c/revision_checks/check_runs/check_runs/0/conclusion", "failure")],
+        "beat_c",
+        "not passing",
+    ),
+    (
+        "revision-check-run-still-running",
+        [
+            ("beat_c/revision_checks/check_runs/check_runs/0/status", "in_progress"),
+            ("beat_c/revision_checks/check_runs/check_runs/0/conclusion", None),
+        ],
+        "beat_c",
+        "not completed",
+    ),
+    (
+        "revision-combined-status-failed",
+        [
+            ("beat_c/revision_checks/status/state", "failure"),
+            ("beat_c/revision_checks/status/total_count", 1),
+        ],
+        "beat_c",
+        "combined status",
+    ),
+    (
+        "checks-read-for-the-old-head",
+        [("beat_c/revision_checks/sha", "a" * 40)],
+        "beat_c",
+        "another commit",
+    ),
+    (
+        "ticket-a-open-after-the-merge",
+        [("beat_d/issue_after_merge/state", "open"), ("beat_d/issue_after_merge/closed_at", None)],
+        "beat_d",
+        "not closed after the merge",
+    ),
+    (
+        "ticket-a-closed-late",
+        [("beat_d/issue_after_merge/closed_at", at(51))],
+        "beat_d",
+        "not closed with the merge",
+    ),
+    (
+        "ticket-a-closed-before-the-merge",
+        [("beat_d/issue_after_merge/closed_at", at(44))],
+        "beat_d",
+        "not closed with the merge",
+    ),
+    (
+        "no-merge-notice-on-ticket-a",
+        [("beat_d/ticket_comments_after_merge/0/body", lambda s: s.split("\n")[0])],
+        "beat_d",
+        "names the merged pull request",
+    ),
+    (
+        "merge-notice-names-another-pull-request",
+        [
+            (
+                "beat_d/ticket_comments_after_merge/0/body",
+                lambda s: s.replace("/pull/12", "/pull/99"),
+            )
+        ],
+        "beat_d",
+        "names the merged pull request",
+    ),
+    (
+        "merge-notice-older-than-the-merge",
+        [("beat_d/ticket_comments_after_merge/0/updated_at", at(44))],
+        "beat_d",
+        "names the merged pull request",
+    ),
+    (
+        "conflicting-float-assert-equal-beside-a-correct-one",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, '        self.assertEqual(convert(1, "C", "De"), 148.5)'],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-float-assert-not-equal-with-an-exponent",
+        [("beat_f/diff_added_lines", lambda ls: [*ls, "        self.assertNotEqual(x, 1e-3)"])],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-bare-float-assert",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, "        assert convert(0, 'c', 'de') == 150.0"],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
     *[
         (f"teardown-{key}-unverified", [(f"teardown/{key}", False)], "teardown", key)
         for key in judge.TEARDOWN_KEYS
@@ -905,6 +1049,19 @@ def test_judge_rejects_each_broken_shape(
         ],
         [("beat_c/requests/2/tool_notes", [{"tool": "propose_rule"}])],
         [("beat_f/diff_added_lines", ["self.assertAlmostEqual(f(1), (2.0), places = 6)"])],
+        # Liveness: an integer assertEqual, and floats only in strings and comments.
+        [("beat_f/diff_added_lines", lambda ls: [*ls, "        self.assertEqual(len(rows), 3)"])],
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, '        self.assertEqual(label, "1.5")  # assertEqual(x, 2.5)'],
+            )
+        ],
+        # Liveness: the acknowledgment as first posted, never edited.
+        [
+            ("beat_b/ticket_comments/0/updated_at", None),
+            ("beat_b/ticket_comments/0/created_at", at(10, 40)),
+        ],
     ],
     ids=[
         "bound-is-inclusive",
@@ -920,6 +1077,9 @@ def test_judge_rejects_each_broken_shape(
         "refusal-code-at-any-depth",
         "tool-note-as-mapping",
         "nested-parens-and-spacing",
+        "integer-assert-equal",
+        "floats-only-in-strings-and-comments",
+        "acknowledgment-never-edited",
     ],
 )
 def test_judge_still_accepts_the_valid_neighbour_of_each_bound(
@@ -952,6 +1112,12 @@ def test_verdict_evidence_is_plain_json() -> None:
     evidence = judge.judge_chain(broken(("attempt", 3))).evidence()
     assert json.loads(json.dumps(evidence)) == evidence
     assert evidence["passed"] is False and evidence["attempt"] == 3
+
+
+def test_answer_received_line_mirrors_the_product() -> None:
+    import curie_api.factory_questions as questions
+
+    assert judge.ANSWER_RECEIVED_LINE == questions.ANSWER_RECEIVED_LINE
 
 
 def test_fixture_texts_equal_the_judges_constants() -> None:

@@ -39,6 +39,26 @@ and :data:`ACTIVE_REQUEST_STATES`. Requests carry ``work_item_id`` and ``finishe
 (None while active) so the judge can tie evidence to ticket A's work item and
 read the requests active at the 60 second mark; usage samples are labelled
 :data:`SPEND_SAMPLE_LABELS`; label events use GitHub's timeline shape.
+
+Fields the driver part added to the record, each read as GitHub returns it:
+
+1. ``beat_b["ticket_comments"]``: ticket A's issue comments, read after the pull
+   request opened. One App comment must hold :data:`ANSWER_RECEIVED_LINE` and be
+   created or updated (status comments are edited in place) at or after the
+   answer. ``beat_b["open_pulls"][i]["html_url"]`` is the pull request's URL.
+2. ``beat_c["pull_comments"]``: the pull request's conversation comments. One App
+   comment created or updated at or after the review's ``submitted_at`` must name
+   the revision head ``beat_c["pull_after"]["head"]["sha"]`` in full.
+3. ``beat_c["revision_checks"]``: ``{"sha", "check_runs", "status"}``, the check
+   runs and the combined status of that head as GitHub returns them. Green is at
+   least one check run, every one ``completed`` with a passing conclusion, and a
+   combined state ``success`` or no commit statuses at all.
+4. ``beat_d["issue_after_merge"]`` (ticket A, read after the merge: ``state`` and
+   ``closed_at``) must be closed within :data:`PROMOTION_WITHIN` of the merge, and
+   ``beat_d["ticket_comments_after_merge"]`` must hold an App comment with
+   :data:`MERGED_NOTICE_PREFIX` and the pull request URL.
+5. ``beat_f["diff_added_lines"]`` must add no float assertion other than
+   ``assertAlmostEqual(..., places=6)``: see :func:`float_equality_assertions`.
 """
 
 from __future__ import annotations
@@ -70,6 +90,13 @@ STATUS_COMMENT_PREFIX = "Investigating this ticket."
 QUESTIONS_MARKER = "curie-factory-questions:"
 QUESTIONS_LABEL = "curie-factory:questions"
 ANSWERED_PREFIX = "Answered on the ticket by "
+# Mirror of curie_api.factory_questions.ANSWER_RECEIVED_LINE (a test pins equality):
+# the first line of the status comment of a request an answer started.
+ANSWER_RECEIVED_LINE = "Answer received. The factory is working on this ticket again."
+# Mirror of the line curie_api.factory_notices writes once the pull request merged.
+MERGED_NOTICE_PREFIX = "Pull request merged: "
+# Check run conclusions that count as green (GitHub REST check runs).
+PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 LEARNED_PREFIX = "Learned rules:"
 REQUESTER_PREFIX = "Requester preferences:"
 # Fixture texts, equal to the files under fixtures/live-github-chain/ (a test
@@ -99,8 +126,9 @@ READER_REFUSAL_CODES = frozenset(
 )
 # ASSUMED (#5804 decision 3): the stable bundle refusal code.
 BUNDLE_RETIRED_CODE = "bundle.result_declaration_retired"
-# ASSUMED: request states that mean a run is queued or in progress.
-ACTIVE_REQUEST_STATES = frozenset({"queued", "running"})
+# Request states that mean a run is queued or in progress: the live states of
+# ``execution_requests_status_ck`` (models.py); ``waiting`` is queued on capacity.
+ACTIVE_REQUEST_STATES = frozenset({"queued", "waiting", "running", "cancellation_requested"})
 UNBOUND_LABEL_PREFIX = "factory-unbound-"
 # One model usage sample before beat (a) and one after each beat (decision 8).
 SPEND_SAMPLE_LABELS = ("before_a", *(f"after_{beat}" for beat in "abcdefgh"))
@@ -244,9 +272,14 @@ def refusal_code(output: Mapping[str, Any]) -> str:
 
 
 def accepted_rule_of(output: Mapping[str, Any]) -> Mapping[str, Any]:
-    """ASSUMED (#5797): the action's JSON is the changed rule item (plus ``applies_from``)."""
+    """The changed rule of an accept, reject or remove's JSON.
 
-    return output
+    #5852 (``cli/src/commands/memory_rules.rs``) prints the API's
+    ``MemoryRuleDecisionOut``: ``{"rule": {...}, "applies_from": "next_ticket"}``.
+    """
+
+    rule: Mapping[str, Any] = output["rule"]
+    return rule
 
 
 def principal_of(actor: Mapping[str, Any] | None) -> str:
@@ -340,6 +373,70 @@ _IGNORED_TOKENS = {
     tokenize.DEDENT,
     tokenize.ENDMARKER,
 }
+_NON_CODE_TOKENS = _IGNORED_TOKENS - {tokenize.NEWLINE}
+
+
+_EQUALITY_ASSERTS = frozenset({"assertEqual", "assertEquals", "assertNotEqual"})
+
+
+def _is_float_literal(token: tokenize.TokenInfo) -> bool:
+    if token.type != tokenize.NUMBER:
+        return False
+    text = token.string.lower()
+    return not text.startswith(("0x", "0o", "0b")) and ("." in text or "e" in text)
+
+
+def _call_arguments(tokens: Sequence[tokenize.TokenInfo]) -> list[tokenize.TokenInfo]:
+    """The tokens inside the parentheses that open at ``tokens[0]``, nested ones included."""
+
+    depth = 0
+    inside: list[tokenize.TokenInfo] = []
+    for token in tokens:
+        if token.type == tokenize.OP and token.string in {"(", "[", "{"}:
+            depth += 1
+            if depth == 1:
+                continue
+        elif token.type == tokenize.OP and token.string in {")", "]", "}"}:
+            depth -= 1
+            if depth == 0:
+                break
+        inside.append(token)
+    return inside
+
+
+def float_equality_assertions(added_text: str) -> list[str]:
+    """Each added float assertion that is not ``assertAlmostEqual``, as its call name.
+
+    An ``assertEqual(``, ``assertEquals(`` or ``assertNotEqual(`` call with a float
+    literal among its arguments (a number with a ``.`` or an exponent), and a bare
+    ``assert`` statement comparing with ``==`` or ``!=`` to a float literal, break
+    the review rule. Comments and strings never count.
+    """
+
+    # NEWLINE is kept: it ends a bare ``assert`` statement.
+    tokens = [t for t in _code_tokens(added_text) if t.type not in _NON_CODE_TOKENS]
+    found: list[str] = []
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME:
+            continue
+        if token.string in _EQUALITY_ASSERTS:
+            following = tokens[index + 1 : index + 2]
+            if not following or following[0].string != "(":
+                continue
+            if index and tokens[index - 1].string == "def":
+                continue
+            if any(_is_float_literal(t) for t in _call_arguments(tokens[index + 1 :])):
+                found.append(token.string)
+        elif token.string == "assert":
+            statement: list[tokenize.TokenInfo] = []
+            for inner in tokens[index + 1 :]:
+                if inner.type == tokenize.NEWLINE:
+                    break
+                statement.append(inner)
+            compares = any(t.type == tokenize.OP and t.string in {"==", "!="} for t in statement)
+            if compares and any(_is_float_literal(t) for t in statement):
+                found.append("assert")
+    return found
 
 
 def _is_places_six(argument: Sequence[tokenize.TokenInfo]) -> bool:
@@ -370,6 +467,56 @@ def _closes(body: str, issue: int) -> bool:
 
 def _by_app(item: Mapping[str, Any], ids: Mapping[str, Any]) -> bool:
     return bool(item["user"]["login"] == ids["app_login"])
+
+
+def _touched_at(comment: Mapping[str, Any]) -> datetime:
+    """When a comment last read as it does: ``updated_at`` (edited in place) or ``created_at``."""
+
+    return parse_time(comment.get("updated_at") or comment["created_at"])
+
+
+def _app_comments_since(
+    comments: Sequence[Mapping[str, Any]], ids: Mapping[str, Any], since: Any, text: str
+) -> list[Mapping[str, Any]]:
+    """App comments holding ``text`` that were created or updated at or after ``since``."""
+
+    start = parse_time(since)
+    return [
+        c
+        for c in comments
+        if _by_app(c, ids) and text in str(c["body"]) and _touched_at(c) >= start
+    ]
+
+
+def checks_green(checks: Mapping[str, Any], sha: str) -> list[str]:
+    """Why a head's checks are not green, or nothing when they are.
+
+    ``check_runs`` is the body of ``GET /repos/{r}/commits/{sha}/check-runs``
+    (https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference)
+    and ``status`` the body of ``GET /repos/{r}/commits/{sha}/status``
+    (https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference).
+    """
+
+    reasons: list[str] = []
+    if checks["sha"] != sha:
+        reasons.append("the checks were read for another commit than the revision head")
+    runs = list(checks["check_runs"]["check_runs"])
+    if not runs:
+        reasons.append("the revision head has no check run")
+    pending = [r["name"] for r in runs if r["status"] != "completed"]
+    if pending:
+        reasons.append(f"check runs not completed on the revision head: {pending}")
+    failing = [
+        r["name"]
+        for r in runs
+        if r["status"] == "completed" and r["conclusion"] not in PASSING_CONCLUSIONS
+    ]
+    if failing:
+        reasons.append(f"check runs not passing on the revision head: {failing}")
+    status = checks["status"]
+    if not (status["state"] == "success" or status["total_count"] == 0):
+        reasons.append(f"the combined status of the revision head is {status['state']}")
+    return reasons
 
 
 # --- Beats ----------------------------------------------------------------------
@@ -503,6 +650,10 @@ def _judge_beat_b(b: _Beat, rec: Mapping[str, Any]) -> None:
         )
     others = [i["number"] for i in beat["issues"] if _by_app(i, ids)]
     b.check(not others, f"the App opened issues: {others}")
+    acks = _app_comments_since(
+        beat["ticket_comments"], ids, answer["created_at"], ANSWER_RECEIVED_LINE
+    )
+    b.check(bool(acks), "no App comment on ticket A acknowledges the answer")
 
 
 def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -587,10 +738,15 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
         "the commit came late",
     )
     b.check(called_propose_rule(request), "the revision trajectory has no propose_rule")
+    replies = _app_comments_since(c["pull_comments"], ids, submitted, now["sha"])
+    b.check(bool(replies), "no App reply on the pull request names the revision commit")
+    for reason in checks_green(c["revision_checks"], now["sha"]):
+        b.check(False, reason)
 
 
 def _judge_beat_d(b: _Beat, rec: Mapping[str, Any]) -> None:
     d, ids = rec["beat_d"], rec["identities"]
+    _judge_merge_closure(b, rec)
     b.check(not rules_of(d["rules_before_merge"]), "a rule is listed before the merge")
     b.check(d["merged_by_id"] == ids["writer_id"], "the pull request was not merged by the writer")
     after = d["rules_after_merge"]
@@ -609,6 +765,26 @@ def _judge_beat_d(b: _Beat, rec: Mapping[str, Any]) -> None:
     b.check(rules[0]["state"] == PROPOSED_STATE, "the rule is not proposed")
     b.check(rules[0]["source_url"] == expected, "the rule source is not the submitted review URL")
     b.check(rules[0]["label"] == RULE_LABEL, f"the rule is not {RULE_LABEL}")
+
+
+def _judge_merge_closure(b: _Beat, rec: Mapping[str, Any]) -> None:
+    """Ticket A closed with the merge and carries the merge notice (decision 7.4)."""
+
+    d, ids = rec["beat_d"], rec["identities"]
+    issue = d["issue_after_merge"]
+    if b.check(issue["state"] == "closed", "ticket A is not closed after the merge"):
+        b.within(
+            "issue_closed_seconds",
+            d["merged_at"],
+            issue["closed_at"],
+            PROMOTION_WITHIN,
+            "ticket A was not closed with the merge",
+        )
+    pull_url = rec["beat_b"]["open_pulls"][0]["html_url"]
+    notices = _app_comments_since(
+        d["ticket_comments_after_merge"], ids, d["merged_at"], MERGED_NOTICE_PREFIX + pull_url
+    )
+    b.check(bool(notices), "no App comment on ticket A names the merged pull request")
 
 
 def _judge_beat_e(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -677,9 +853,12 @@ def _judge_beat_f(b: _Beat, rec: Mapping[str, Any]) -> None:
             at + 1 < len(all_lines) and all_lines[at + 1].startswith(REQUESTER_PREFIX),
             "the line is not immediately before the Requester preferences line",
         )
-    flags = almost_equal_call_flags(added_text_of(f["diff_added_lines"]))
+    added = added_text_of(f["diff_added_lines"])
+    flags = almost_equal_call_flags(added)
     if b.check(bool(flags), "the diff adds no assertAlmostEqual( call"):
         b.check(all(flags), f"{flags.count(False)} added assertAlmostEqual( calls lack places=6")
+    conflicting = float_equality_assertions(added)
+    b.check(not conflicting, f"the diff adds float assertions without places=6: {conflicting}")
 
 
 def _judge_beat_g(b: _Beat, rec: Mapping[str, Any]) -> None:

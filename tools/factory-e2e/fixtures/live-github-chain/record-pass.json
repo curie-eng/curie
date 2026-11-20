@@ -106,12 +106,35 @@
         "head": {
           "ref": "curie/issue-11",
           "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        }
+        },
+        "html_url": "https://code-host.example.invalid/fixture-owner/fixture-repo/pull/12"
       }
     ],
     "issues": [
       {
         "number": 11,
+        "user": {
+          "login": "fixture-writer",
+          "id": 9000001
+        }
+      }
+    ],
+    "ticket_comments": [
+      {
+        "id": 1,
+        "body": "Answer received. The factory is working on this ticket again.\n\nStatus: RUNNING",
+        "created_at": "2030-01-01T00:00:20Z",
+        "updated_at": "2030-01-01T00:10:40Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        }
+      },
+      {
+        "id": 3,
+        "body": "Show 2 decimal places in the CLI output.",
+        "created_at": "2030-01-01T00:10:00Z",
+        "updated_at": "2030-01-01T00:10:00Z",
         "user": {
           "login": "fixture-writer",
           "id": 9000001
@@ -210,7 +233,40 @@
     "branches": [
       "main",
       "curie/issue-11"
-    ]
+    ],
+    "pull_comments": [
+      {
+        "id": 21,
+        "body": "The requested revision is pushed to this pull request.\n\nChecks passed on head `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`, observed at 2030-01-01 00:41:00 UTC after the run ended.",
+        "created_at": "2030-01-01T00:40:30Z",
+        "updated_at": "2030-01-01T00:41:00Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        }
+      }
+    ],
+    "revision_checks": {
+      "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "check_runs": {
+        "total_count": 1,
+        "check_runs": [
+          {
+            "id": 31,
+            "name": "test",
+            "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "status": "completed",
+            "conclusion": "success"
+          }
+        ]
+      },
+      "status": {
+        "state": "pending",
+        "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "total_count": 0,
+        "statuses": []
+      }
+    }
   },
   "beat_d": {
     "rules_before_merge": {
@@ -236,7 +292,24 @@
         "in_force_count": 0,
         "in_force_limit": 16
       }
-    }
+    },
+    "issue_after_merge": {
+      "number": 11,
+      "state": "closed",
+      "closed_at": "2030-01-01T00:45:05Z"
+    },
+    "ticket_comments_after_merge": [
+      {
+        "id": 1,
+        "body": "Completed: https://code-host.example.invalid/fixture-owner/fixture-repo/pull/12\nPull request merged: https://code-host.example.invalid/fixture-owner/fixture-repo/pull/12\n",
+        "created_at": "2030-01-01T00:00:20Z",
+        "updated_at": "2030-01-01T00:45:40Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        }
+      }
+    ]
   },
   "beat_e": {
     "reader_permission": "read",
@@ -259,14 +332,16 @@
     "writer_command": {
       "exit_code": 0,
       "output": {
-        "id": "rule-id-1",
-        "label": "R1",
-        "state": "accepted",
-        "accepted_by": {
-          "principal_id": "principal-writer",
-          "display_name": "Fixture Writer"
+        "rule": {
+          "id": "rule-id-1",
+          "label": "R1",
+          "state": "accepted",
+          "accepted_by": {
+            "principal_id": "principal-writer",
+            "display_name": "Fixture Writer"
+          },
+          "version": 2
         },
-        "version": 2,
         "applies_from": "next_ticket"
       },
       "elapsed_seconds": 1.5,
@@ -308,15 +383,18 @@
     "remove_command": {
       "exit_code": 0,
       "output": {
-        "id": "rule-id-1",
-        "label": "R1",
-        "state": "removed",
-        "version": 3,
-        "removed_by": {
-          "principal_id": "principal-writer",
-          "display_name": "Fixture Writer"
+        "rule": {
+          "id": "rule-id-1",
+          "label": "R1",
+          "state": "removed",
+          "version": 3,
+          "removed_by": {
+            "principal_id": "principal-writer",
+            "display_name": "Fixture Writer"
+          },
+          "removed_at": "2030-01-01T01:28:00Z"
         },
-        "removed_at": "2030-01-01T01:28:00Z"
+        "applies_from": "next_ticket"
       },
       "elapsed_seconds": 1.1,
       "rule_id": "rule-id-1"

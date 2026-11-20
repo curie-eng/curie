@@ -161,6 +161,8 @@ tools/factory-e2e/tests/test_gitlab_driver.py
 tools/factory-e2e/tests/test_jira_driver.py
 tools/factory-e2e/tests/test_kind_images.py
 tools/factory-e2e/tests/test_live_github_chain.py
+tools/factory-e2e/tests/test_live_github_chain_driver.py
+tools/factory-e2e/tests/test_live_github_chain_pending.py
 tools/factory-e2e/tests/test_personal_owner_enforcement.py
 tools/factory-e2e/tests/test_personal_profile.py
 tools/factory-e2e/tests/test_personal_slack_kickoff.py
