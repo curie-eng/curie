@@ -639,11 +639,12 @@ def evidence_serializer(identifiers: judge.Identifiers) -> Callable[[dict[str, A
 
 
 def local_identifiers(p: fe.Preflight) -> dict[str, list[str | int]]:
-    """Operator-machine values: the CLI binary's path and the webhook restore URL.
+    """Operator-machine values: the CLI and tunnel binaries' paths and the restore URL.
 
     ``main`` keeps the binary path out of the log and the evidence (the hook's
-    ``private_binary``); these catch it anywhere else, and the restore URL a
-    dead tunnel's step names. A bare command name is not a path and is skipped.
+    ``private_binary``); these catch it anywhere else, the configured tunnel
+    binary (``check_tools`` names a missing one), and the restore URL a dead
+    tunnel's step names. A bare command name is not a path and is skipped.
     """
 
     ids: dict[str, list[str | int]] = {}
@@ -651,6 +652,8 @@ def local_identifiers(p: fe.Preflight) -> dict[str, list[str | int]]:
     paths: list[str | int] = sorted(b for b in binaries if os.path.dirname(b))
     if paths:
         ids["binary"] = paths
+    if os.path.dirname(p.config.cloudflared):
+        ids["cloudflared"] = [p.config.cloudflared]
     if p.config.restore_webhook_url:
         ids["restore-url"] = [p.config.restore_webhook_url]
     return ids
@@ -1379,12 +1382,42 @@ def _uuid(value: str) -> str:
     return value
 
 
+# The keys of a request record read from the install's request route
+# (``GET /v1/internal/work-items/requests/{id}``, ``workitem_dispatch.request_view``).
+REQUEST_VIEW_KEYS = ("work_item_id", "status", "terminal_at", "terminal_cause", "objective")
+
+
+def request_row(listed: Mapping[str, Any], view: Mapping[str, Any]) -> dict[str, Any]:
+    """One request: its id and ``created_at`` from the listing, the rest from the API.
+
+    ``request_view`` carries no ``created_at`` and no route lists a work item's
+    requests, so only those two come from ``execution_requests``.
+    """
+
+    if str(view.get("id")) != str(listed["id"]):
+        raise fe.PreflightFailed("the request route answered for another request")
+    return {
+        "id": str(listed["id"]),
+        "created_at": listed["created_at"],
+        **{key: view.get(key) for key in REQUEST_VIEW_KEYS},
+    }
+
+
 def request_rows(p: fe.Preflight, work_item_id: str) -> list[dict[str, Any]]:
-    return sql_json(
+    """The work item's requests: listed by SQL, each read through the request route."""
+
+    listed = sql_json(
         p,
-        "SELECT id, work_item_id, status, created_at, terminal_at, terminal_cause, objective "
-        f"FROM execution_requests WHERE work_item_id = '{_uuid(work_item_id)}' ORDER BY sequence",
+        "SELECT id, created_at FROM execution_requests "
+        f"WHERE work_item_id = '{_uuid(work_item_id)}' ORDER BY sequence",
     )
+    rows = []
+    for item in listed:
+        view = p.execution_request(_uuid(str(item["id"])))
+        if view is None:
+            raise fe.PreflightFailed("the request route did not answer for a listed request")
+        rows.append(request_row(item, view))
+    return rows
 
 
 def thread_transcripts(p: fe.Preflight, work_item_id: str) -> list[Any]:
@@ -1415,6 +1448,27 @@ def work_item_for_issue(
         f"AND tracker_scope_id = '{int(repository_id)}' AND tracker_issue_id IN ({listed})",
     )
     return str(rows[0]["id"]) if rows else None
+
+
+def check_runs_of(p: fe.Preflight, repo: str, sha: str) -> dict[str, Any]:
+    """Every check run of ``sha``, page by page, until ``total_count`` are collected.
+
+    https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+    returns at most 100 runs a page. A page that adds nothing ends the read, so a
+    short read keeps fewer runs than ``total_count`` and the judge fails it.
+    """
+
+    runs: list[Any] = []
+    total = 0
+    page = 1
+    while True:
+        body = _github(p, "GET", f"/repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}")
+        total = int(body["total_count"])
+        batch = list(body["check_runs"])
+        runs.extend(batch)
+        if not batch or len(runs) >= total:
+            return {"total_count": total, "check_runs": runs}
+        page += 1
 
 
 def _github(p: fe.Preflight, method: str, path: str, body: Any = None, *, want: int = 200) -> Any:
@@ -1895,7 +1949,7 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
         committed_at=str(commit["commit"]["committer"]["date"]),
         branches=p._paged(f"/repos/{repo}/branches"),
         pull_comments=pull_comments,
-        check_runs=_github(p, "GET", f"/repos/{repo}/commits/{head}/check-runs"),
+        check_runs=check_runs_of(p, repo, head),
         combined_status=_github(p, "GET", f"/repos/{repo}/commits/{head}/status"),
     )
     sample_usage(p, chain, "after_c")

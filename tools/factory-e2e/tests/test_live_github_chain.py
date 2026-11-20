@@ -1100,6 +1100,60 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "deploy refusal is not",
     ),
     (
+        # A name bound to the converter's float result, then compared exactly.
+        "conflicting-assert-equal-on-a-name-bound-to-the-converter",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    '        actual = convert(100, "c", "de")',
+                    "        self.assertEqual(actual, 0)",
+                ],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-assert-equal-on-a-name-bound-to-the-package-converter",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    '        actual = unitconv.convert(100, "c", "de")',
+                    "        self.assertEqual(actual, 0)",
+                ],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        # Every check run skipped, with no commit status: nothing executed.
+        "revision-check-runs-all-skipped",
+        [("beat_c/revision_checks/check_runs/check_runs/0/conclusion", "skipped")],
+        "beat_c",
+        "executed with a success conclusion",
+    ),
+    (
+        "revision-check-runs-read-short",
+        [("beat_c/revision_checks/check_runs/total_count", 65)],
+        "beat_c",
+        "read 1 of 65 check runs",
+    ),
+    (
+        "revision-commit-status-not-success",
+        [
+            ("beat_c/revision_checks/status/state", "success"),
+            ("beat_c/revision_checks/status/total_count", 1),
+            ("beat_c/revision_checks/status/statuses", [{"context": "ci", "state": "error"}]),
+        ],
+        "beat_c",
+        "combined status",
+    ),
+    (
         "conflicting-bare-float-assert",
         [
             (
@@ -1177,6 +1231,32 @@ def test_judge_rejects_each_broken_shape(
                 ],
             )
         ],
+        # Liveness: a name bound to a call that is not the converter stays allowed.
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    '        actual = parser.convert(100, "c", "de")',
+                    "        rows = len(actual)",
+                    "        self.assertEqual(rows, 0)",
+                    "        self.assertEqual(actual, 0)",
+                ],
+            )
+        ],
+        # Liveness: a successful check run beside a skipped one.
+        [
+            (
+                "beat_c/revision_checks/check_runs",
+                lambda c: {
+                    "total_count": 2,
+                    "check_runs": [
+                        *c["check_runs"],
+                        {**c["check_runs"][0], "id": 32, "name": "docs", "conclusion": "skipped"},
+                    ],
+                },
+            )
+        ],
         # Liveness: a name assigned an integer stays allowed.
         [
             (
@@ -1216,6 +1296,8 @@ def test_judge_rejects_each_broken_shape(
         "nested-parens-and-spacing",
         "integer-assert-equal",
         "assert-equal-on-another-call",
+        "name-bound-to-another-call",
+        "success-beside-skipped-check-run",
         "integer-variable-assert-equal",
         "floats-only-in-strings-and-comments",
         "acknowledgment-never-edited",
@@ -1262,7 +1344,63 @@ def test_question_request_is_the_newest_request_of_ticket_a() -> None:
     first = PASSING["beat_a"]["quiet_snapshot"]["requests"][0]
     later = {**first, "id": "request-later", "created_at": at(5, 1), "terminal_cause": "completed"}
     reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests", [first, later])))
+    assert "a request of ticket A started after its question request" in reasons, reasons
+
+
+ASKER = PASSING["beat_a"]["quiet_snapshot"]["requests"][0]["id"]
+
+
+def _asked_by(request_id: str) -> tuple[str, Any]:
+    return ("beat_a/comments/1/body", lambda body: body.replace(ASKER, request_id))
+
+
+def test_question_request_failed_asker_with_a_later_questions_asked_request_fails() -> None:
+    # Counterexample: the marker names a request that failed; a later request
+    # ended completed with questions_asked, so the newest request alone passes.
+    asker = {
+        **PASSING["beat_a"]["quiet_snapshot"]["requests"][0],
+        "status": "failed",
+        "terminal_at": at(4, 50),
+        "terminal_cause": "execution_deadline",
+    }
+    later = {
+        **asker,
+        "id": "00000000-0000-4000-8000-000000000a52",
+        "created_at": at(4, 55),
+        "status": "completed",
+        "terminal_at": at(5, 5),
+        "terminal_cause": judge.QUESTIONS_ASKED,
+    }
+    reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests", [asker, later])))
     assert any("did not end completed with cause questions_asked" in r for r in reasons), reasons
+
+
+def test_question_request_marker_naming_no_known_request_fails() -> None:
+    reasons = _beat_a_reasons(broken(_asked_by("00000000-0000-4000-8000-0000000000ff")))
+    assert "the questions comment's marker names no request of ticket A" in reasons, reasons
+
+
+def test_question_request_marker_without_a_request_id_fails() -> None:
+    edit = ("beat_a/comments/1/body", lambda body: body.replace(ASKER, "11"))
+    reasons = _beat_a_reasons(broken(edit))
+    assert "the questions comment's marker names no request of ticket A" in reasons, reasons
+
+
+def test_question_request_marker_posted_by_the_product_binds_its_asker() -> None:
+    # Liveness: the GitHub adapter's own marked body naming the asker, which
+    # completed with questions_asked, passes.
+    import uuid
+
+    from curie_api.factory_questions import marker_for
+    from curie_api.forges.github.comments import GitHubMarkedComments
+
+    asker = uuid.UUID("00000000-0000-4000-8000-000000000a53")
+    body = GitHubMarkedComments.embed(marker_for(asker), "1. How many places?")
+    record = broken(
+        ("beat_a/comments/1/body", body),
+        ("beat_a/quiet_snapshot/requests/0/id", str(asker)),
+    )
+    assert _beat_a_reasons(record) == ()
 
 
 def test_terminal_at_old_finished_at_shape_fails_beat_a_with_a_reason() -> None:

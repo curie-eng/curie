@@ -52,9 +52,11 @@ Fields the driver part added to the record, each read as GitHub returns it:
    comment created or updated at or after the review's ``submitted_at`` must name
    the revision head ``beat_c["pull_after"]["head"]["sha"]`` in full.
 3. ``beat_c["revision_checks"]``: ``{"sha", "check_runs", "status"}``, the check
-   runs and the combined status of that head as GitHub returns them. Green is at
-   least one check run, every one ``completed`` with a passing conclusion, and a
-   combined state ``success`` or no commit statuses at all.
+   runs (every page, collected to ``total_count``) and the combined status of
+   that head as GitHub returns them. Green is every check run read, every one
+   ``completed``, at least one with conclusion ``success`` and none with a
+   conclusion other than ``success``, ``skipped`` or ``neutral``; and either no
+   commit status at all or every commit status ``success``.
 4. ``beat_d["issue_after_merge"]`` (ticket A, read after the merge: ``state`` and
    ``closed_at``) must be closed within :data:`PROMOTION_WITHIN` of the merge, and
    ``beat_d["ticket_comments_after_merge"]`` must hold an App comment with
@@ -90,6 +92,14 @@ MAX_ATTEMPTS = 2
 # --- Texts the beats name ----------------------------------------------------
 STATUS_COMMENT_PREFIX = "Investigating this ticket."
 QUESTIONS_MARKER = "curie-factory-questions:"
+# The questions comment's marker as the GitHub adapter posts it: the asking
+# request's UUID after the prefix (``curie_api.factory_questions.marker_for``),
+# in a hidden HTML comment (``GitHubMarkedComments.embed``); a test pins both.
+QUESTIONS_MARKER_LINE = re.compile(
+    "<!-- "
+    + re.escape(QUESTIONS_MARKER)
+    + r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) -->"
+)
 QUESTIONS_LABEL = "curie-factory:questions"
 ANSWERED_PREFIX = "Answered on the ticket by "
 # Mirror of curie_api.factory_questions.ANSWER_RECEIVED_LINE (a test pins equality):
@@ -97,8 +107,11 @@ ANSWERED_PREFIX = "Answered on the ticket by "
 ANSWER_RECEIVED_LINE = "Answer received. The factory is working on this ticket again."
 # Mirror of the line curie_api.factory_notices writes once the pull request merged.
 MERGED_NOTICE_PREFIX = "Pull request merged: "
-# Check run conclusions that count as green (GitHub REST check runs).
-PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+# Check run conclusions (GitHub REST check runs): ``success`` is green; a run
+# ``skipped`` or ``neutral`` did not execute a check, so it neither satisfies
+# nor fails the head; every other conclusion fails it.
+PASSING_CONCLUSION = "success"
+NEUTRAL_CONCLUSIONS = frozenset({"skipped", "neutral"})
 LEARNED_PREFIX = "Learned rules:"
 REQUESTER_PREFIX = "Requester preferences:"
 # Fixture texts, equal to the files under fixtures/live-github-chain/ (a test
@@ -437,25 +450,21 @@ def float_equality_assertions(added_text: str) -> list[str]:
     literal among its arguments (a number with a ``.`` or an exponent), and a bare
     ``assert`` statement comparing with ``==`` or ``!=`` to a float literal, break
     the review rule. So does such a call or statement naming a variable the added
-    code assigns a float literal (``expected = 33.0``, a unary minus included),
-    or calling the fixture's converter, which returns a float
-    (``convert(0, "c", "de")``, ``unitconv.convert(...)`` or a name imported
-    from it). Comments and strings never count.
+    code assigns a float literal (``expected = 33.0``, a unary minus included)
+    or a converter call (``actual = convert(100, "c", "de")``), or calling the
+    fixture's converter, which returns a float (``convert(0, "c", "de")``,
+    ``unitconv.convert(...)`` or a name imported from it). Comments and strings
+    never count.
     """
 
     # NEWLINE is kept: it ends a bare ``assert`` statement.
     tokens = [t for t in _code_tokens(added_text) if t.type not in _NON_CODE_TOKENS]
-    float_names = _float_assigned_names(tokens)
     functions, modules = _converter_names(tokens)
 
     def converter_call(argument: Sequence[tokenize.TokenInfo], i: int) -> bool:
-        if i + 1 >= len(argument) or argument[i + 1].string != "(":
-            return False
-        dotted = i > 0 and argument[i - 1].string == "."
-        if not dotted:
-            return argument[i].string in functions
-        owner = argument[i - 2].string if i > 1 else ""
-        return argument[i].string == CONVERTER_FUNCTION and owner in modules
+        return _is_converter_call(argument, i, functions, modules)
+
+    float_names = _float_assigned_names(tokens) | _converter_assigned_names(tokens, converter_call)
 
     def floaty(argument: Sequence[tokenize.TokenInfo]) -> bool:
         return any(
@@ -521,6 +530,49 @@ def _float_assigned_names(tokens: Sequence[tokenize.TokenInfo]) -> set[str]:
         ):
             names.add(token.string)
     return names
+
+
+def _converter_assigned_names(
+    tokens: Sequence[tokenize.TokenInfo],
+    converter_call: Callable[[Sequence[tokenize.TokenInfo], int], bool],
+) -> set[str]:
+    """Names a statement of the added code binds to a converter call.
+
+    ``actual = convert(100, "c", "de")`` and ``actual = unitconv.convert(...)``
+    bind ``actual`` to the converter's float result.
+    """
+
+    names: set[str] = set()
+    for index, token in enumerate(tokens):
+        starts = (
+            index == 0
+            or tokens[index - 1].type == tokenize.NEWLINE
+            or (tokens[index - 1].string == ";")
+        )
+        if token.type != tokenize.NAME or not starts:
+            continue
+        if [t.string for t in tokens[index + 1 : index + 2]] != ["="]:
+            continue
+        value = list(tokens[index + 2 : index + 6])
+        # The callee is the value's first name, or ``module.convert``.
+        dotted = len(value) > 2 and value[1].string == "."
+        if value and value[0].type == tokenize.NAME and converter_call(value, 2 if dotted else 0):
+            names.add(token.string)
+    return names
+
+
+def _is_converter_call(
+    argument: Sequence[tokenize.TokenInfo], i: int, functions: set[str], modules: set[str]
+) -> bool:
+    """Whether ``argument[i]`` opens a call of the fixture converter."""
+
+    if i + 1 >= len(argument) or argument[i + 1].string != "(":
+        return False
+    dotted = i > 0 and argument[i - 1].string == "."
+    if not dotted:
+        return argument[i].string in functions
+    owner = argument[i - 2].string if i > 1 else ""
+    return argument[i].string == CONVERTER_FUNCTION and owner in modules
 
 
 # The fixture's converter (``fixtures/unitconv/unitconv/convert.py``): ``convert``
@@ -634,20 +686,30 @@ def checks_green(checks: Mapping[str, Any], sha: str) -> list[str]:
     if checks["sha"] != sha:
         reasons.append("the checks were read for another commit than the revision head")
     runs = list(checks["check_runs"]["check_runs"])
+    total = checks["check_runs"]["total_count"]
+    if len(runs) != total:
+        reasons.append(f"read {len(runs)} of {total} check runs of the revision head")
     if not runs:
         reasons.append("the revision head has no check run")
     pending = [r["name"] for r in runs if r["status"] != "completed"]
     if pending:
         reasons.append(f"check runs not completed on the revision head: {pending}")
+    completed = [r for r in runs if r["status"] == "completed"]
     failing = [
         r["name"]
-        for r in runs
-        if r["status"] == "completed" and r["conclusion"] not in PASSING_CONCLUSIONS
+        for r in completed
+        if r["conclusion"] != PASSING_CONCLUSION and r["conclusion"] not in NEUTRAL_CONCLUSIONS
     ]
     if failing:
         reasons.append(f"check runs not passing on the revision head: {failing}")
+    if not [r for r in completed if r["conclusion"] == PASSING_CONCLUSION]:
+        reasons.append("no check run on the revision head executed with a success conclusion")
     status = checks["status"]
-    if not (status["state"] == "success" or status["total_count"] == 0):
+    statuses = list(status["statuses"])
+    if status["total_count"] == 0:
+        if statuses:
+            reasons.append("the combined status lists commit statuses but counts none")
+    elif status["state"] != "success" or any(s["state"] != "success" for s in statuses):
         reasons.append(f"the combined status of the revision head is {status['state']}")
     return reasons
 
@@ -687,6 +749,13 @@ def _active_at(request: Mapping[str, Any], moment: Any) -> bool:
         return False
     terminal = request["terminal_at"]
     return terminal is None or parse_time(terminal) > parse_time(moment)
+
+
+def asking_request_id(body: str) -> str | None:
+    """The UUID of the request the questions comment's marker names, or None."""
+
+    found = QUESTIONS_MARKER_LINE.search(body or "")
+    return found.group(1) if found else None
 
 
 def _request_keys_missing(requests: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -742,12 +811,22 @@ def _judge_beat_a(b: _Beat, rec: Mapping[str, Any]) -> None:
         len(requests) == len(quiet["requests"]), "the snapshot holds another work item's request"
     )
     if b.check(bool(requests), "the quiet snapshot holds no request of ticket A"):
-        last = max(requests, key=lambda r: parse_time(r["created_at"]))
-        b.check(
-            last["status"] == "completed" and last["terminal_cause"] == QUESTIONS_ASKED,
-            "ticket A's question request did not end completed with cause questions_asked "
-            f"(it ended {last['status']} with cause {last['terminal_cause']})",
-        )
+        # The questions comment is bound to the request its marker names.
+        asker_id = asking_request_id(question["body"])
+        askers = [r for r in requests if str(r["id"]) == asker_id]
+        if b.check(len(askers) == 1, "the questions comment's marker names no request of ticket A"):
+            asker = askers[0]
+            b.check(
+                asker["status"] == "completed" and asker["terminal_cause"] == QUESTIONS_ASKED,
+                "ticket A's question request did not end completed with cause questions_asked "
+                f"(it ended {asker['status']} with cause {asker['terminal_cause']})",
+            )
+            later = [
+                r["id"]
+                for r in requests
+                if parse_time(r["created_at"]) > parse_time(asker["created_at"])
+            ]
+            b.check(not later, "a request of ticket A started after its question request")
     deadline = parse_time(question["created_at"]) + timedelta(seconds=QUIET_AFTER_QUESTIONS)
     b.check(
         b.elapsed("quiet_wait_seconds", question["created_at"], quiet["observed_at"])
@@ -1170,6 +1249,7 @@ ROLE_PLACEHOLDERS: Mapping[str, str] = {
     "registry": "<registry>",
     "code-host": "<code-host>",
     "binary": "<curie-bin>",
+    "cloudflared": "<cloudflared>",
     "restore-url": "<restore-url>",
 }
 

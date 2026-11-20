@@ -60,7 +60,7 @@
       },
       {
         "id": 2,
-        "body": "Before I start, I need one decision.\n\n1. How many decimal places should the CLI print?\n2. Should identity conversions print a unit suffix?\n\ncurie-factory-questions:11",
+        "body": "Before I start, I need one decision.\n\n1. How many decimal places should the CLI print?\n2. Should identity conversions print a unit suffix?\n\n<!-- curie-factory-questions:00000000-0000-4000-8000-000000000a51 -->\n",
         "created_at": "2030-01-01T00:05:00Z",
         "user": {
           "login": "fixture-app[bot]",
@@ -76,7 +76,7 @@
       "observed_at": "2030-01-01T00:06:10Z",
       "requests": [
         {
-          "id": "request-1",
+          "id": "00000000-0000-4000-8000-000000000a51",
           "status": "completed",
           "created_at": "2030-01-01T00:00:25Z",
           "work_item_id": "work-item-a",
@@ -99,7 +99,7 @@
     },
     "requests": [
       {
-        "id": "request-1",
+        "id": "00000000-0000-4000-8000-000000000a51",
         "status": "completed",
         "created_at": "2030-01-01T00:00:25Z",
         "work_item_id": "work-item-a",
@@ -107,7 +107,7 @@
         "terminal_cause": "questions_asked"
       },
       {
-        "id": "request-2",
+        "id": "00000000-0000-4000-8000-000000000a52",
         "status": "completed",
         "created_at": "2030-01-01T00:10:30Z",
         "work_item_id": "work-item-a",
@@ -210,7 +210,7 @@
     },
     "requests": [
       {
-        "id": "request-1",
+        "id": "00000000-0000-4000-8000-000000000a51",
         "created_at": "2030-01-01T00:00:25Z",
         "objective": "",
         "tool_notes": [],
@@ -219,7 +219,7 @@
         "terminal_cause": "questions_asked"
       },
       {
-        "id": "request-2",
+        "id": "00000000-0000-4000-8000-000000000a52",
         "created_at": "2030-01-01T00:10:30Z",
         "objective": "",
         "tool_notes": [

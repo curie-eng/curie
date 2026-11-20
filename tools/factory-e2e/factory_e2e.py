@@ -509,7 +509,8 @@ class ScenarioHooks:
     runs in ``main`` after the teardown and before the evidence is written;
     False fails the run. ``ensure_label`` replaces the shared intake label
     step. ``private_binary`` keeps the CLI binary's path out of the log and
-    the evidence (its version is still recorded).
+    the evidence (its version is still recorded), and the completion line
+    names the evidence file by its basename only.
     """
 
     before_run: Callable[[Preflight], None] | None = None
@@ -7565,8 +7566,9 @@ def main(argv: list[str] | None = None) -> int:
     if preflight.evidence_refused:
         print("factory-e2e: the evidence serializer refused the evidence", file=sys.stderr)
         code = code or EXIT_FAILED
+    shown_evidence = evidence_path if show_path else evidence_path.name
     print(
-        filtered(f"factory-e2e: {preflight.evidence['result']}; evidence {evidence_path}"),
+        filtered(f"factory-e2e: {preflight.evidence['result']}; evidence {shown_evidence}"),
         file=sys.stderr,
     )
     return code

@@ -48,6 +48,10 @@ WRITER_PRINCIPAL = "00000000-0000-4000-8000-00000000000a"
 READER_PRINCIPAL = "00000000-0000-4000-8000-00000000000b"
 TENANT = "00000000-0000-4000-8000-0000000000aa"
 AGENT = "00000000-0000-4000-8000-0000000000bb"
+# Ticket A's question request (its marker is in the passing record's questions
+# comment) and the request the answer starts.
+ASKER = PASSING["beat_a"]["quiet_snapshot"]["requests"][0]["id"]
+RESTART = "00000000-0000-4000-8000-000000000a52"
 
 
 # --------------------------------------------------------------------------
@@ -600,6 +604,78 @@ def test_wiring_another_scenario_keeps_the_binary_path_in_its_evidence(
     assert f"factory-e2e: curie binary {binary.resolve()} (curie 0.0.0-test)" in (
         capsys.readouterr().err
     )
+
+
+def test_wiring_a_missing_cloudflared_and_the_evidence_path_reach_no_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The shared tool check names a missing tunnel binary by its configured
+    # path, and the completion line names the evidence file.
+    _private_binary(tmp_path, monkeypatch)
+    private = tmp_path / "home" / "someone" / "private"
+    cloudflared = private / "cloudflared"
+    _main_env(
+        monkeypatch,
+        tmp_path,
+        CURIE_FACTORY_READER_ACCOUNT_ID="1002",
+        CURIE_FACTORY_CLOUDFLARED=str(cloudflared),
+    )
+    _not_ready(monkeypatch)
+    _github(monkeypatch, open_items=[])
+    _Recorder(monkeypatch)
+    real_which = fe.shutil.which
+    monkeypatch.setattr(
+        fe.shutil,
+        "which",
+        lambda tool: None if tool == str(cloudflared) else real_which(tool) or f"/bin/{tool}",
+    )
+    evidence = private / "evidence.json"
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+
+    assert code == fe.EXIT_CONFIG
+    out, err = capsys.readouterr()
+    written = evidence.read_text()
+    for text in (out, err, written):
+        for raw in (str(cloudflared), str(evidence), "someone/private"):
+            assert raw not in text, (raw, text)
+    assert "required tools not on PATH: <cloudflared>" in err
+    assert json.loads(written)["error"] == "required tools not on PATH: <cloudflared>"
+    assert "factory-e2e: refused; evidence evidence.json" in err
+
+
+def test_wiring_another_scenario_prints_its_evidence_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression: only the live chain withholds the evidence path.
+    _main_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(fe, "resolve_curie_binary", lambda *_a, **_k: ("curie", "curie 0.0.0"))
+    issue = tmp_path / "issue.md"
+    issue.write_text("A title\n\nA body.\n")
+
+    def stop(_p: fe.Preflight, _driver: Any) -> None:
+        raise fe.PreflightFailed("stopped by the test")
+
+    monkeypatch.setattr(fe.Preflight, "run", stop)
+    evidence = tmp_path / "reports" / "evidence.json"
+    code = fe.main(
+        [
+            "run",
+            "--scenario",
+            "issue-to-pr",
+            "--issue-file",
+            str(issue),
+            "--evidence",
+            str(evidence),
+        ]
+    )
+    assert code == fe.EXIT_FAILED
+    assert f"factory-e2e: failed; evidence {evidence}" in capsys.readouterr().err
 
 
 def test_wiring_a_serializer_refusal_exits_nonzero(
@@ -1368,7 +1444,7 @@ def test_wiring_beat_a_keeps_the_first_read_of_the_investigating_lead(
     monkeypatch.setattr(lgc, "work_item_for_issue", lambda *_a: "work-item-a")
     rows = [
         _row(
-            "request-1",
+            ASKER,
             "completed",
             "2000-01-01T00:00:25Z",
             "2000-01-01T00:05:05Z",
@@ -1978,6 +2054,26 @@ def _row(
     }
 
 
+def _request_route(
+    monkeypatch: pytest.MonkeyPatch, p: fe.Preflight, rows: list[dict[str, Any]]
+) -> list[str]:
+    """The install's request route over ``rows``, answering ``request_view`` keys only."""
+
+    from curie_api.models import ExecutionRequest
+    from curie_api.workitem_dispatch import request_view
+
+    keys = set(request_view(ExecutionRequest()))
+    read: list[str] = []
+
+    def execution_request(request_id: str) -> dict[str, Any] | None:
+        read.append(request_id)
+        row = next((r for r in rows if str(r["id"]) == request_id), None)
+        return None if row is None else {k: v for k, v in row.items() if k in keys}
+
+    monkeypatch.setattr(p, "execution_request", execution_request)
+    return read
+
+
 def _gh_pull(number: int, body: str, created: str, sha: str, ref: str) -> dict[str, Any]:
     # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
     return {
@@ -2025,7 +2121,7 @@ def _beat_a(
             {"id": 2, "name": "curie-factory:questions", "color": "ededed"},
         ],
         quiet_rows=(
-            [_row("request-1", status, "2030-01-01T00:00:25Z", terminal, cause=cause)]
+            [_row(ASKER, status, "2030-01-01T00:00:25Z", terminal, cause=cause)]
             if rows is None
             else rows
         ),
@@ -2055,7 +2151,8 @@ def test_shape_terminal_at_request_records_carry_real_request_columns(
     view = set(request_view(ExecutionRequest()))
     assert {"terminal_at", "terminal_cause"} <= view
     assert set(judge.REQUEST_KEYS) <= columns
-    # The driver's own read selects every column a record carries.
+    # The driver lists requests with columns that exist; the rest is the route's.
+    assert set(lgc.REQUEST_VIEW_KEYS) <= view
     seen: list[str] = []
 
     def fake_sql(_p: Any, query: str) -> list[dict[str, Any]]:
@@ -2066,16 +2163,16 @@ def test_shape_terminal_at_request_records_carry_real_request_columns(
     lgc.request_rows(Any, "00000000-0000-4000-8000-000000000001")
     selected = {c.strip() for c in seen[0].split("SELECT", 1)[1].split("FROM", 1)[0].split(",")}
     assert selected <= columns, selected - columns
+    assert selected == {"id", "created_at"}
     rows = [
         _row(
-            "request-1",
+            ASKER,
             "completed",
             "2030-01-01T00:00:25Z",
             "2030-01-01T00:05:05Z",
             cause=judge.QUESTIONS_ASKED,
         )
     ]
-    assert set(rows[0]) == selected
     records = lgc.request_records(rows)
     emitted = set(records[0]) - {judge.TOOL_NOTES_KEY}
     assert emitted <= columns, emitted - columns
@@ -2083,6 +2180,66 @@ def test_shape_terminal_at_request_records_carry_real_request_columns(
     assert _judged("beat_a", _beat_a(rows=rows)).passed
     asked_otherwise = _judged("beat_a", _beat_a(cause="completed"))
     assert any("cause questions_asked" in r for r in asked_otherwise.reasons)
+
+
+@pytest.mark.parametrize(
+    ("status", "cause", "passed"),
+    [("completed", judge.QUESTIONS_ASKED, True), ("failed", "execution_deadline", False)],
+    ids=["asker-asked", "asker-failed"],
+)
+def test_shape_question_request_record_keys_come_from_request_view(
+    status: str, cause: str, passed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The request route's own body (``request_view`` of a real row, as JSON)
+    # gives the status, terminal time and cause; the SQL listing gives only the
+    # id and created_at, and its other columns, stale here, are never read.
+    from curie_api.models import ExecutionRequest
+    from curie_api.workitem_dispatch import request_view
+    from fastapi.encoders import jsonable_encoder
+
+    work_item = "00000000-0000-4000-8000-0000000000a1"
+    row = ExecutionRequest(
+        id=uuid.UUID(ASKER),
+        work_item_id=uuid.UUID(work_item),
+        sequence=1,
+        status=status,
+        terminal_at=dt.datetime(2030, 1, 1, 0, 5, 5, tzinfo=dt.UTC),
+        terminal_cause=cause,
+        objective="Add a Rankine conversion.",
+    )
+    view = jsonable_encoder(request_view(row))
+    p = _preflight(tmp_path)
+    reads: list[str] = []
+
+    def execution_request(request_id: str) -> dict[str, Any] | None:
+        reads.append(request_id)
+        return copy.deepcopy(view) if request_id == ASKER else None
+
+    monkeypatch.setattr(p, "execution_request", execution_request)
+    stale = {
+        "id": ASKER,
+        "created_at": "2030-01-01T00:00:25.123456+00:00",
+        "work_item_id": work_item,
+        "status": "running",
+        "terminal_at": None,
+        "terminal_cause": None,
+        "objective": "",
+    }
+    monkeypatch.setattr(lgc, "sql_json", lambda _p, _q: [copy.deepcopy(stale)])
+
+    rows = lgc.request_rows(p, work_item)
+
+    assert reads == [ASKER]
+    assert set(rows[0]) == {"id", "created_at", *lgc.REQUEST_VIEW_KEYS}
+    assert {key: rows[0][key] for key in lgc.REQUEST_VIEW_KEYS} == {
+        key: view[key] for key in lgc.REQUEST_VIEW_KEYS
+    }
+    section = _beat_a(rows=rows)
+    section["work_item_id"] = work_item
+    verdict = _judged("beat_a", section)
+    assert verdict.passed is passed, verdict.reasons
+    if not passed:
+        assert any("did not end completed with cause questions_asked" in r for r in verdict.reasons)
 
 
 def _beat_b(ack: str = judge.ANSWER_RECEIVED_LINE) -> dict[str, Any]:
@@ -2094,13 +2251,13 @@ def _beat_b(ack: str = judge.ANSWER_RECEIVED_LINE) -> dict[str, Any]:
         issue_number=11,
         request_rows=[
             _row(
-                "request-1",
+                ASKER,
                 "completed",
                 "2030-01-01T00:00:25Z",
                 "2030-01-01T00:05:05Z",
                 cause=judge.QUESTIONS_ASKED,
             ),
-            _row("request-2", "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
+            _row(RESTART, "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
         ],
         open_pulls=[_gh_pull(12, body, "2030-01-01T00:25:00Z", "a" * 40, "curie/issue-11")],
         issues=[
@@ -2176,7 +2333,11 @@ def _transcript(*revision_tools: str) -> list[Any]:
     ]
 
 
-def _beat_c(transcripts: list[Any] | None = None, conclusion: str = "success") -> dict[str, Any]:
+def _beat_c(
+    transcripts: list[Any] | None = None,
+    conclusion: str = "success",
+    check_runs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     app = {"login": "fixture-app[bot]", "id": 9000003, "type": "Bot"}
     revision = judge.revision_request_id(9100001, 12, 7001)
     rule = judge.REVIEW_RULE_TEXT
@@ -2217,13 +2378,13 @@ def _beat_c(transcripts: list[Any] | None = None, conclusion: str = "success") -
         ],
         request_rows=[
             _row(
-                "request-1",
+                ASKER,
                 "completed",
                 "2030-01-01T00:00:25Z",
                 "2030-01-01T00:05:05Z",
                 cause=judge.QUESTIONS_ASKED,
             ),
-            _row("request-2", "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
+            _row(RESTART, "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
             _row(
                 revision,
                 "completed",
@@ -2250,7 +2411,8 @@ def _beat_c(transcripts: list[Any] | None = None, conclusion: str = "success") -
             )
         ],
         # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
-        check_runs={
+        check_runs=check_runs
+        or {
             "total_count": 1,
             "check_runs": [
                 {
@@ -2288,6 +2450,70 @@ def test_shape_beat_c_builder_into_the_judge() -> None:
     assert not _judged("beat_c", _beat_c(conclusion="failure")).passed
 
 
+def _check_run(index: int, conclusion: str) -> dict[str, Any]:
+    # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+    return {
+        "id": 100 + index,
+        "name": f"check-{index}",
+        "head_sha": "b" * 40,
+        "status": "completed",
+        "conclusion": conclusion,
+        "app": {"slug": "github-actions"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("last", "second_page", "reason"),
+    [
+        # Liveness: 65 runs over two pages, successes beside a skipped run.
+        ("skipped", 35, None),
+        # Counterexample: the one failure is on page 2.
+        ("failure", 35, "check runs not passing on the revision head: ['check-64']"),
+        # Counterexample: GitHub's pages hold fewer runs than its total_count.
+        ("success", 20, "read 50 of 65 check runs of the revision head"),
+    ],
+    ids=["mixed-success-and-skipped", "failure-on-page-two", "short-read"],
+)
+def test_handoff_revision_check_runs_are_read_over_every_page(
+    last: str,
+    second_page: int,
+    reason: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A live head listed 65 check runs, 30 a page by default; one read saw 30.
+    repo, sha = "fixture-owner/fixture-repo", "b" * 40
+    runs = [_check_run(i, "success") for i in range(64)] + [_check_run(64, last)]
+    pages = {1: runs[:30], 2: runs[30 : 30 + second_page]}
+    p = _preflight(tmp_path)
+    paths: list[str] = []
+
+    def as_actor(method: str, path: str, body: Any = None) -> Any:
+        paths.append(path)
+        route, _, query = path.partition("?")
+        assert (method, route) == ("GET", f"/repos/{repo}/commits/{sha}/check-runs")
+        params = dict(item.split("=", 1) for item in query.split("&")) if query else {}
+        assert params.get("per_page") == "100"
+        page = pages.get(int(params.get("page", "1")), [])
+        return 200, {"total_count": 65, "check_runs": copy.deepcopy(page)}
+
+    monkeypatch.setattr(p, "as_actor", as_actor)
+
+    checks = lgc.check_runs_of(p, repo, sha)
+
+    assert paths[:2] == [
+        f"/repos/{repo}/commits/{sha}/check-runs?per_page=100&page=1",
+        f"/repos/{repo}/commits/{sha}/check-runs?per_page=100&page=2",
+    ]
+    verdict = _judged("beat_c", _beat_c(check_runs=checks))
+    if reason is None:
+        assert len(checks["check_runs"]) == 65
+        assert verdict.passed, verdict.reasons
+    else:
+        assert not verdict.passed
+        assert reason in verdict.reasons, verdict.reasons
+
+
 @pytest.mark.parametrize(
     ("revision_tools", "passed"), [((PROPOSE,), True), (("Read", "Edit"), False)]
 )
@@ -2313,13 +2539,13 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
         {**row, "work_item_id": work_item}
         for row in (
             _row(
-                "request-1",
+                ASKER,
                 "completed",
                 "2030-01-01T00:00:25Z",
                 "2030-01-01T00:05:05Z",
                 cause=judge.QUESTIONS_ASKED,
             ),
-            _row("request-2", "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
+            _row(RESTART, "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
             _row(
                 revision,
                 "completed",
@@ -2342,6 +2568,7 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
         raise AssertionError(f"unexpected query {query}")
 
     monkeypatch.setattr(lgc, "sql_json", sql_json)
+    _request_route(monkeypatch, p, rows)
     before, after = "a" * 40, "b" * 40
     heads = iter([before, after])
     review = {
@@ -2359,7 +2586,9 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
         f"/repos/{repo}/pulls/12/reviews/7001/comments": [
             {**expected["review_comments"][0], "id": 5}
         ],
-        f"/repos/{repo}/commits/{after}/check-runs": expected["revision_checks"]["check_runs"],
+        f"/repos/{repo}/commits/{after}/check-runs?per_page=100&page=1": expected[
+            "revision_checks"
+        ]["check_runs"],
         f"/repos/{repo}/commits/{after}/status": expected["revision_checks"]["status"],
     }
 
