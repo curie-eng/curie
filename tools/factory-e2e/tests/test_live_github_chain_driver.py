@@ -948,6 +948,7 @@ EXPECTED_SEED = {
     "repo-runner": False,
     "docker": False,
     "live-github-chain": False,
+    "one-ticket": False,
 }
 
 

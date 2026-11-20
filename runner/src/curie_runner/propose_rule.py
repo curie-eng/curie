@@ -23,6 +23,7 @@ line names the outcome only.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import aiohttp
@@ -168,5 +169,175 @@ def propose_rule_handler(url: str, token: str) -> ResultHandler:
                 "again; continue the revision."
             )
         return _refusal(status, payload)
+
+    return propose_rule
+
+
+# --- A channel or agent rule for a turn with no work item (#5801) -----------
+#
+# The same tool name, offered when the factory's is not: the platform ``curie``
+# server mounts it beside ``remember`` only when the memory tools mount, the
+# session start read reported ``proposals_enabled`` and the run holds no
+# ``wir`` capability. It writes with the turn's own memory credential
+# (``MemoryTurn.write_token``, ADR 0188), never the boot token, and the API
+# derives the agent, the binding, the turn and the person from that credential.
+
+CHANNEL_SCOPES = ("channel", "agent")
+
+CHANNEL_PROPOSE_RULE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "rule": {
+            "type": "string",
+            "description": "The rule in one sentence, on one line, at most 240 bytes.",
+        },
+        "reason": {
+            "type": "string",
+            "description": "Why this is how you should always work from now on.",
+        },
+        "scope": {
+            "type": "string",
+            "enum": list(CHANNEL_SCOPES),
+            "description": (
+                "channel (the default) for this channel only, or agent for every "
+                "channel you work in."
+            ),
+        },
+    },
+    "required": ["rule", "reason"],
+    "additionalProperties": False,
+}
+
+CHANNEL_PROPOSE_RULE_DESCRIPTION = (
+    "Propose one standing rule for this channel (or, with scope agent, for every "
+    "channel you work in) when someone states how you should always work from now "
+    "on. A person must accept it before it applies; until then, do not act as if it "
+    "applies."
+)
+
+_CHANNEL_CONTINUE = "Do not call propose_rule again in this turn; continue the conversation."
+
+# What each refusal code tells the model. None of them repeats the rule.
+_CHANNEL_REFUSALS: dict[str, str] = {
+    "rule_proposal_not_eligible": (
+        f"Rule proposals are turned off for this agent. {_CHANNEL_CONTINUE}"
+    ),
+    "rule_already_proposed": (f"This turn already proposed its one rule. {_CHANNEL_CONTINUE}"),
+    "invalid_text": _REFUSALS["invalid_text"],
+    "too_large": _REFUSALS["too_large"],
+    "reserved_text": _REFUSALS["reserved_text"],
+    "invalid_body": (
+        "The proposal was refused as malformed: pass rule and reason as strings and, "
+        "if you pass it, scope as channel or agent. Correct it and call again, at most "
+        "once more."
+    ),
+}
+
+_NO_TURN_CREDENTIAL = (
+    "The rule was not proposed: this turn has no credential to propose with. "
+    "Tell the person it was not recorded. " + _CHANNEL_CONTINUE
+)
+
+
+def _channel_refusal(status: int, payload: Any) -> dict[str, Any]:
+    code = _code(payload)
+    if code is not None and not _CODE_RE.match(code):
+        code = None
+    logger.info("propose_rule refused status=%d code=%s", status, code or "none")
+    if code is not None and code in _CHANNEL_REFUSALS:
+        return _error(f"The rule proposal was refused ({code}). {_CHANNEL_REFUSALS[code]}")
+    if status in (429, 503) or status >= 500:
+        return _error(
+            f"The platform could not take the rule proposal right now (status {status}). "
+            "Retry once shortly, or tell the person it was not recorded."
+        )
+    named = f" ({code})" if code is not None else ""
+    # A plain refusal (a read only or ended turn credential) is never rendered:
+    # the platform's detail is not the model's to repeat.
+    return _error(
+        f"The rule proposal was refused (status {status}){named}. "
+        "Tell the person it was not recorded. " + _CHANNEL_CONTINUE
+    )
+
+
+async def _post_with_key(
+    url: str, token: str, body: dict[str, Any], *, timeout: float, limit: int
+) -> tuple[int, bytes]:
+    async with (
+        aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False
+        ) as session,
+        session.post(
+            url, json=body, headers={"X-API-Key": token}, allow_redirects=False
+        ) as response,
+    ):
+        raw = bytearray()
+        async for chunk in response.content.iter_any():
+            raw.extend(chunk)
+            if len(raw) > limit:
+                raise _TooLarge
+        return response.status, bytes(raw)
+
+
+def channel_propose_rule_handler(url: str, turn_token: Callable[[], str | None]) -> ResultHandler:
+    """The handler of the channel ``propose_rule``, posting to ``state/_rules``.
+
+    ``turn_token`` returns the current turn's memory write credential; with none
+    the call is refused here and nothing is sent.
+    """
+
+    async def propose_rule(args: dict[str, Any]) -> dict[str, Any]:
+        rule = args.get("rule") if isinstance(args, dict) else None
+        reason = args.get("reason") if isinstance(args, dict) else None
+        scope = args.get("scope", "channel") if isinstance(args, dict) else None
+        if not isinstance(rule, str) or not isinstance(reason, str):
+            logger.info("propose_rule refused locally code=invalid_arguments")
+            return _error(
+                "The rule was not proposed: pass rule and reason, both strings. "
+                "Correct it and call again."
+            )
+        if scope not in CHANNEL_SCOPES:
+            logger.info("propose_rule refused locally code=invalid_scope")
+            return _error(
+                "The rule was not proposed: scope is channel or agent. Correct it and call again."
+            )
+        token = turn_token()
+        if not token:
+            logger.info("propose_rule refused locally code=no_turn_credential")
+            return _error(_NO_TURN_CREDENTIAL)
+        try:
+            # Exactly the three fields: the API derives everything else from
+            # the turn credential, so nothing else the model passed is sent.
+            status, raw = await _post_with_key(
+                url,
+                token,
+                {"rule": rule, "reason": reason, "scope": scope},
+                timeout=_PROPOSAL_TIMEOUT_SECONDS,
+                limit=_PROPOSAL_MAX_BYTES,
+            )
+        except (aiohttp.ClientError, TimeoutError, OSError, _TooLarge) as exc:
+            # Never render a transport diagnostic: it can name the endpoint.
+            logger.warning("propose_rule transport failure: %s", type(exc).__name__)
+            return _error(
+                "The rule proposal could not be sent right now. Retry once shortly, "
+                "or tell the person it was not recorded."
+            )
+        try:
+            payload = _decode(raw)
+        except ValueError:
+            payload = None
+        if status == 201:
+            if isinstance(payload, dict) and payload.get("state") == "proposed":
+                logger.info("propose_rule accepted code=proposed scope=%s", scope)
+                where = "every channel you work in" if scope == "agent" else "this channel"
+                return _ok(
+                    f"The rule was proposed for {where}. A person must accept it before "
+                    "it applies, and an accepted rule applies from the next session; "
+                    "until then, do not act as if it applies. Tell the person it awaits "
+                    "acceptance. " + _CHANNEL_CONTINUE
+                )
+            logger.info("propose_rule answer unreadable status=201")
+            return _error("The rule proposal answer could not be read. " + _CHANNEL_CONTINUE)
+        return _channel_refusal(status, payload)
 
     return propose_rule

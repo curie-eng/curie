@@ -951,6 +951,11 @@ export interface paths {
         /**
          * List Rules
          * @description The agent's proposed, accepted, rejected and removed rules, by scope and number.
+         *
+         *     The platform key and a console session bound to no principal read any
+         *     agent. A principal's console session reads only an agent of its own
+         *     tenant: another tenant's agent is the same 404 as an unknown one, for
+         *     every filter and scope, so its rules, reasons and deciders never leave it.
          */
         get: operations["list_rules_agents__agent_id__memory_rules_get"];
         put?: never;
@@ -972,9 +977,10 @@ export interface paths {
         put?: never;
         /**
          * Accept Rule
-         * @description Accept a proposed rule. The decision is recorded now and takes effect at the
-         *     next ticket's admission once admission reads learned rules (#5798); a running
-         *     request keeps the rules it was admitted with.
+         * @description Accept a proposed rule. The decision is recorded now. A repository rule takes
+         *     effect at the next ticket's admission (#5798), and a running request keeps the
+         *     rules it was admitted with; an agent or binding scope rule takes effect at the
+         *     agent's next session start (#5801).
          */
         post: operations["accept_rule_agents__agent_id__memory_rules__rule_id__accept_post"];
         delete?: never;
@@ -1014,9 +1020,10 @@ export interface paths {
         put?: never;
         /**
          * Remove Rule
-         * @description Remove an accepted rule. The decision is recorded now and takes effect at the
-         *     next ticket's admission once admission reads learned rules (#5798); a running
-         *     request keeps the rules it was admitted with.
+         * @description Remove an accepted rule. The decision is recorded now. A repository rule
+         *     stops applying at the next ticket's admission (#5798), and a running request
+         *     keeps the rules it was admitted with; an agent or binding scope rule stops
+         *     applying at the agent's next session start (#5801).
          */
         post: operations["remove_rule_agents__agent_id__memory_rules__rule_id__remove_post"];
         delete?: never;
@@ -1175,6 +1182,58 @@ export interface paths {
         get: operations["list_namespaces_agents__agent_id__state_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Rules
+         * @description The accepted rules a non-factory session loads at its start (#5801).
+         *
+         *     A scoped sandbox state credential with memory claims (the boot read
+         *     credential or a turn's write credential) gets ``ChannelRulesOut``: the
+         *     agent's ``memory_rule_proposals`` as ``proposals_enabled`` and the
+         *     ``accepted`` rules of the agent scope, then of the binding scope the
+         *     credential's ``binding`` claim names (none for a credential with no
+         *     binding), each ordered by acceptance and at most 16 per scope. Never a
+         *     proposed, rejected or removed rule, and never another binding's.
+         *
+         *     Every other caller (the platform key, the bundle token and a legacy token)
+         *     gets what ``GET /agents/{agent_id}/state/{namespace}`` answers for the
+         *     ``_rules`` namespace: the key/value entries stored there, as a list of
+         *     ``StateEntryOut``, after the same checks. A state credential signed for
+         *     another agent is 403 here, where the key/value routes answer 401.
+         */
+        get: operations["read_rules_agents__agent_id__state__rules_get"];
+        put?: never;
+        /**
+         * Propose Rule
+         * @description Propose one learned rule for this turn (ADR 0287 decision 7, #5801).
+         *
+         *     Only the per-turn memory write credential (ADR 0188) may propose: the
+         *     platform key, the bundle token, a legacy token and a read credential are
+         *     refused 403. The body is exactly ``rule``, ``reason`` and an optional
+         *     ``scope`` (``channel``, the default, or ``agent``); everything else comes
+         *     from the credential: the scope key from its ``binding`` claim, the source
+         *     turn from ``turn`` and the proposer from ``sender``. The rule is stored
+         *     ``proposed`` with the next number of its scope and applies only after a
+         *     person accepts it, from the agent's next session. A turn the worker
+         *     reported ended is refused 403; the agent's ``memory_rule_proposals`` off
+         *     is 403 ``rule_proposal_not_eligible``; a second proposal of one turn is
+         *     409 ``rule_already_proposed``; a malformed body is 422 ``invalid_body`` and
+         *     text outside the bounds 422 ``invalid_text``, ``too_large`` or
+         *     ``reserved_text``. No refusal and no log line carries the submitted text.
+         */
+        post: operations["propose_rule_agents__agent_id__state__rules_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -7983,6 +8042,67 @@ export interface components {
             thread_id?: string | null;
         };
         /**
+         * ChannelRuleOut
+         * @description One accepted rule a session loads at its start.
+         */
+        ChannelRuleOut: {
+            /**
+             * Accepted At
+             * Format: date-time
+             */
+            accepted_at: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Number */
+            number: number;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding";
+            /** Scope Label */
+            scope_label: string;
+            /** Text */
+            text: string;
+        };
+        /** ChannelRuleRefusal */
+        ChannelRuleRefusal: {
+            detail: components["schemas"]["ChannelRuleRefusalDetail"];
+        };
+        /**
+         * ChannelRuleRefusalDetail
+         * @description A coded refusal of the state router's learned rule routes.
+         */
+        ChannelRuleRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Fix */
+            fix: string;
+            /** Message */
+            message: string;
+        };
+        /**
+         * ChannelRulesOut
+         * @description The accepted rules a non-factory session loads at its start (#5801).
+         */
+        ChannelRulesOut: {
+            /**
+             * Proposals Enabled
+             * @description Whether the agent may propose rules (`memory_rule_proposals`).
+             */
+            proposals_enabled: boolean;
+            /**
+             * Rules
+             * @description Accepted rules of the agent scope, then of the credential's binding scope, each ordered by acceptance, at most 16 per scope.
+             */
+            rules: components["schemas"]["ChannelRuleOut"][];
+        };
+        /**
          * ChannelSelector
          * @description A bound channel named by the agent. ``kind`` is required in practice and
          *     refused by name when absent, so the agent learns what to send.
@@ -10288,10 +10408,10 @@ export interface components {
         MemoryRuleDecisionOut: {
             /**
              * Applies From
-             * @description The decision is recorded now and takes effect at the next ticket's admission once admission reads learned rules (#5798); a running request keeps the rules it was admitted with.
-             * @constant
+             * @description When the decision takes effect. `next_ticket` for a repository scope rule: at the next ticket's admission; a running request keeps the rules it was admitted with. `next_session` for an agent or binding scope rule: at the next session start of the agent; a running session keeps the rules it loaded (#5801).
+             * @enum {string}
              */
-            applies_from: "next_ticket";
+            applies_from: "next_ticket" | "next_session";
             rule: components["schemas"]["MemoryRuleOut"];
         };
         /** MemoryRuleOut */
@@ -16660,7 +16780,7 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
                 };
             };
-            /** @description `memory_rules.not_found` */
+            /** @description `memory_rules.not_found`: no such agent, or a principal session of another tenant */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -16725,7 +16845,7 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
                 };
             };
-            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -16808,7 +16928,7 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
                 };
             };
-            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -16891,7 +17011,7 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
                 };
             };
-            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -17263,6 +17383,175 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_rules_agents__agent_id__state__rules_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `ChannelRulesOut` for a scoped sandbox credential with memory claims; for every other caller the `_rules` key/value namespace listing, as `GET /agents/{agent_id}/state/{namespace}` answers it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRulesOut"] | components["schemas"]["StateEntryOut"][];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description Another agent's credential, a released credential, or one naming no valid channel */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `agent_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description `rules_unavailable`, or the credential could not be checked (a plain string) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+        };
+    };
+    propose_rule_agents__agent_id__state__rules_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Reason
+                     * @description Why it should always apply, at most 240 UTF-8 bytes.
+                     */
+                    reason: string;
+                    /**
+                     * Rule
+                     * @description The rule, one line of at most 240 UTF-8 bytes.
+                     */
+                    rule: string;
+                    /**
+                     * Scope
+                     * @description `channel`: the credential's own binding. `agent`: every channel.
+                     * @default channel
+                     * @enum {string}
+                     */
+                    scope?: "channel" | "agent";
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleOut"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description A credential that may not propose (a plain string: another agent's, not a turn credential, read-only, released, or its turn ended), or `rule_proposal_not_eligible` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `agent_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description `rule_already_proposed` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description `invalid_body`, `invalid_text`, `too_large` or `reserved_text`, or a malformed agent id */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description `rule_proposal_unavailable`, or the credential or its turn could not be checked (a plain string) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
                 };
             };
         };

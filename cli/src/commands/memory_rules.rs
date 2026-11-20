@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use super::AgentActionOpts;
 use crate::api::{
-    ApiClient, MemoryRule, MemoryRuleChange, MemoryRuleState, MemoryRules, OwnerApiClient,
+    ApiClient, MemoryRule, MemoryRuleAppliesFrom, MemoryRuleChange, MemoryRuleScopeKind,
+    MemoryRuleState, MemoryRules, OwnerApiClient,
 };
 use crate::exit::CliError;
 use crate::ui::{CliOutput, DryRunPlan, Ui};
@@ -79,6 +80,8 @@ pub struct MemoryRuleActOpts {
     pub rule_id: String,
     pub expected_version: i64,
     pub session_file: PathBuf,
+    /// A scope the rule must be in; empty means no check and no extra request.
+    pub scope: RuleScopeFilter,
     pub api_url: Option<String>,
     pub namespace: String,
     pub release: String,
@@ -101,11 +104,67 @@ fn checked_rule_id(rule_id: &str) -> Result<String> {
     }
 }
 
-fn query_string(state: &Option<String>, scope_key: &Option<String>) -> String {
+/// Which scope a `--rules` list is narrowed to: the API's `scope_kind` and the
+/// exact `scope_key` (`agent` has the empty key, a bound channel is
+/// `<kind>:<address>`, the string the API's binding claim carries).
+#[derive(Debug, Clone, Default)]
+pub struct RuleScopeFilter {
+    pub kind: Option<String>,
+    pub key: Option<String>,
+}
+
+impl RuleScopeFilter {
+    /// Whether any scope flag narrowed the filter.
+    pub fn is_set(&self) -> bool {
+        self.kind.is_some() || self.key.is_some()
+    }
+
+    /// Whether a listed rule sits in exactly the requested scope: each part the
+    /// filter names must equal the rule's own `scope_kind` and `scope_key`.
+    fn holds(&self, rule: &MemoryRule) -> bool {
+        let kind = match rule.scope_kind {
+            MemoryRuleScopeKind::Agent => "agent",
+            MemoryRuleScopeKind::Binding => "binding",
+            MemoryRuleScopeKind::Repository => "repository",
+        };
+        self.kind.as_deref().is_none_or(|k| k == kind)
+            && self.key.as_deref().is_none_or(|k| k == rule.scope_key)
+    }
+
+    /// Resolve the `--channel`, `--agent-scope` and `--scope-key` flags.
+    pub fn resolve(
+        channel: Option<String>,
+        agent_scope: bool,
+        scope_key: Option<String>,
+    ) -> Result<Self> {
+        if agent_scope {
+            return Ok(Self {
+                kind: Some("agent".to_string()),
+                key: Some(String::new()),
+            });
+        }
+        if let Some(channel) = super::memory_channel(channel)? {
+            return Ok(Self {
+                kind: Some("binding".to_string()),
+                key: Some(format!("{}:{}", channel.kind, channel.address)),
+            });
+        }
+        Ok(Self {
+            kind: None,
+            key: scope_key,
+        })
+    }
+}
+
+fn query_string(state: &Option<String>, scope: &RuleScopeFilter) -> String {
     let mut query = Vec::new();
     if let Some(state) = state {
         query.push(format!("state={state}"));
     }
+    if let Some(kind) = &scope.kind {
+        query.push(format!("scope_kind={kind}"));
+    }
+    let scope_key = &scope.key;
     if let Some(scope_key) = scope_key {
         query.push(format!("scope_key={scope_key}"));
     }
@@ -120,7 +179,7 @@ fn query_string(state: &Option<String>, scope_key: &Option<String>) -> String {
 pub struct MemoryRuleListSessionOpts {
     pub agent: String,
     pub state: Option<String>,
-    pub scope_key: Option<String>,
+    pub scope: RuleScopeFilter,
     pub session_file: PathBuf,
     pub api_url: Option<String>,
     pub namespace: String,
@@ -150,7 +209,7 @@ pub async fn memory_rules_list_session(
             lines: vec![
                 format!(
                     "GET {base}/agents/<id>/memory/rules{}  (would resolve agent {:?} first)",
-                    query_string(&opts.state, &opts.scope_key),
+                    query_string(&opts.state, &opts.scope),
                     opts.agent
                 ),
                 format!(
@@ -163,7 +222,12 @@ pub async fn memory_rules_list_session(
     let client = OwnerApiClient::new(&api_url, cookie)?;
     let agent = client.find_agent(&opts.agent).await?;
     let rules = client
-        .list_memory_rules(&agent.id, opts.state.as_deref(), opts.scope_key.as_deref())
+        .list_memory_rules(
+            &agent.id,
+            opts.state.as_deref(),
+            opts.scope.kind.as_deref(),
+            opts.scope.key.as_deref(),
+        )
         .await?;
     Ok(MemoryRulesOutput::Rules(rules))
 }
@@ -172,10 +236,10 @@ pub async fn memory_rules_list_session(
 pub async fn memory_rules_list(
     opts: AgentActionOpts,
     state: Option<String>,
-    scope_key: Option<String>,
+    scope: RuleScopeFilter,
 ) -> Result<MemoryRulesOutput> {
     if opts.dry_run {
-        let query = query_string(&state, &scope_key);
+        let query = query_string(&state, &scope);
         return Ok(MemoryRulesOutput::DryRun(DryRunPlan {
             lines: vec![
                 format!(
@@ -190,7 +254,12 @@ pub async fn memory_rules_list(
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
     let rules = client
-        .list_memory_rules(&agent.id, state.as_deref(), scope_key.as_deref())
+        .list_memory_rules(
+            &agent.id,
+            state.as_deref(),
+            scope.kind.as_deref(),
+            scope.key.as_deref(),
+        )
         .await?;
     Ok(MemoryRulesOutput::Rules(rules))
 }
@@ -214,8 +283,14 @@ pub async fn memory_rule_act(opts: MemoryRuleActOpts) -> Result<MemoryRulesOutpu
         } else {
             api_url.trim_end_matches('/').to_string()
         };
-        return Ok(MemoryRulesOutput::DryRun(DryRunPlan {
-            lines: vec![
+        let mut lines = Vec::new();
+        if opts.scope.is_set() {
+            lines.push(format!(
+                "GET {base}/agents/<id>/memory/rules{}  (scope check: refuse unless the rule is listed)",
+                query_string(&None, &opts.scope)
+            ));
+        }
+        lines.extend([
                 format!(
                     "POST {base}/agents/<id>/memory/rules/{rule_id}/{action}  (would resolve agent {:?} first)",
                     opts.agent
@@ -225,11 +300,33 @@ pub async fn memory_rule_act(opts: MemoryRuleActOpts) -> Result<MemoryRulesOutpu
                     "credential: Console session cookie from {} (value not shown); no platform key",
                     opts.session_file.display()
                 ),
-            ],
-        }));
+        ]);
+        return Ok(MemoryRulesOutput::DryRun(DryRunPlan { lines }));
     }
     let client = OwnerApiClient::new(&api_url, cookie)?;
     let agent = client.find_agent(&opts.agent).await?;
+    if opts.scope.is_set() {
+        let listed = client
+            .list_memory_rules(
+                &agent.id,
+                None,
+                opts.scope.kind.as_deref(),
+                opts.scope.key.as_deref(),
+            )
+            .await?;
+        if !listed
+            .rules
+            .iter()
+            .any(|r| r.id.hyphenated().to_string() == rule_id && opts.scope.holds(r))
+        {
+            let fix = "list that scope with `curie cluster memory <agent> --rules` and copy the rule id from it";
+            return Err(CliError::usage(format!(
+                "rule {rule_id} is not in the requested scope; no decision was sent"
+            ))
+            .with_fix(fix)
+            .into());
+        }
+    }
     let body = crate::api_requests::MemoryRuleDecision {
         expected_version: opts.expected_version,
     };
@@ -286,8 +383,14 @@ fn render_rules(ui: &Ui, rules: &MemoryRules) {
 
 fn render_change(ui: &Ui, verb: MemoryRuleVerb, change: &MemoryRuleChange) {
     let rule = &change.rule;
+    let when = match change.applies_from {
+        MemoryRuleAppliesFrom::NextTicket => "applies from the next ticket",
+        MemoryRuleAppliesFrom::NextSession => {
+            "takes effect at the agent's next session in that channel; a running session keeps the rules it started with"
+        }
+    };
     ui.payload(&format!(
-        "{} rule {} ({}); applies from the next ticket",
+        "{} rule {} ({}); {when}",
         verb.past_tense(),
         plain(&rule.label),
         plain(&rule.scope_label),

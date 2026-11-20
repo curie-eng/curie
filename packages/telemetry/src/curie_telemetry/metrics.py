@@ -362,6 +362,7 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/memory/{index}/provenance",
     "/agents/{agent_id}/resume",
     "/agents/{agent_id}/state",
+    "/agents/{agent_id}/state/_rules",
     "/agents/{agent_id}/state/bindings/{kind}/{address}",
     "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
     "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",

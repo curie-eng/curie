@@ -1352,6 +1352,7 @@
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
           "/agents/{agent_id}/state",
+          "/agents/{agent_id}/state/_rules",
           "/agents/{agent_id}/state/bindings/{kind}/{address}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
@@ -1599,7 +1600,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 10240
+      "cardinality_bound": 10280
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1642,6 +1643,7 @@
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
           "/agents/{agent_id}/state",
+          "/agents/{agent_id}/state/_rules",
           "/agents/{agent_id}/state/bindings/{kind}/{address}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
@@ -1889,7 +1891,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 10240
+      "cardinality_bound": 10280
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1932,6 +1934,7 @@
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
           "/agents/{agent_id}/state",
+          "/agents/{agent_id}/state/_rules",
           "/agents/{agent_id}/state/bindings/{kind}/{address}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
@@ -2172,7 +2175,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 2048
+      "cardinality_bound": 2056
     },
     "curie.background.loop": {
       "type": "counter",

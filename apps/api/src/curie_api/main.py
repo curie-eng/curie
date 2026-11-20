@@ -171,7 +171,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The shared client reaches the code host, so it trusts the operator's
     # code host CA bundle as well as the public roots (#3831).
     http_client = httpx.AsyncClient(
-        timeout=10.0, verify=code_host_verify(settings),
+        timeout=10.0,
+        verify=code_host_verify(settings),
         mounts=gateway_http_mounts(settings.channel_gateway_url),
     )
     app.state.http_client = http_client
@@ -662,7 +663,8 @@ class HttpTelemetryMiddleware:
 
 # @spec HTTP-INVOCATION-EXECUTION-15
 def create_app(
-    *, http_identity_runtime: HttpInvocationRuntime | None = None,
+    *,
+    http_identity_runtime: HttpInvocationRuntime | None = None,
     http_identity_client: HttpIdentityClient | None = None,
 ) -> FastAPI:
     if (
@@ -756,6 +758,8 @@ def create_app(
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
     app.include_router(hook_wake.admin_router)
+    # Before `state.router`, so `_rules` never reaches the key/value namespace routes (#5801).
+    app.include_router(state.rules_router)
     app.include_router(state.router)
     app.include_router(state.internal_router)
     app.include_router(state.released_router)
@@ -840,7 +844,8 @@ def create_configured_app() -> FastAPI:
     if tls is None:
         return create_app(http_identity_runtime=runtime)
     return create_app(
-        http_identity_runtime=runtime, http_identity_client=HttpIdentityClient(tls_context=tls),
+        http_identity_runtime=runtime,
+        http_identity_client=HttpIdentityClient(tls_context=tls),
     )
 
 

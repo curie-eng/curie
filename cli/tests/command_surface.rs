@@ -873,6 +873,7 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
             // The learned rule flags are cluster only: no session login exists locally (#5797).
             expected.extend([
                 "--accept",
+                "--agent-scope",
                 "--expected-version",
                 "--reject",
                 "--remove",
