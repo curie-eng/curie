@@ -2345,20 +2345,21 @@ read together once the review is submitted. An approving review never starts a
 revision unless a comment in it mentions the factory. Each pull request allows
 10 plain-comment revisions; after that the factory posts one notice on the pull
 request and a mention of the tracker's `mention` is required. A mention always
-works and is not counted. GitLab and Bitbucket still require the mention. The sender must have write access now, the PR must still be open at the
+works and is not counted. GitLab and Bitbucket still require the mention.
+The sender must have write access now, the PR must still be open at the
 recorded head, and the delivery must come from the work item's installation.
 Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
 `sender_permission_refused`, `terminal_pull_request`, `active_request`, and
 others). An accepted mention becomes the work item's next execution request.
-The request stores its reply target when it is admitted: the pull request
-conversation for a PR comment or a submitted review, including every inline
-comment that is part of a submitted review that starts a revision (plain or
-mentioning, in a commented or changes-requested review), and the tracker issue
-for every other request. Only a mentioning inline comment in an approved or
-dismissed review is admitted on its own, and its reply target is its review
-thread. The
-objective still opens with the feedback URL for the agent, but nothing routes
+The request stores its reply target when it is admitted. On GitHub that is
+the pull request conversation for a PR comment or a submitted review,
+including every inline comment that is part of a submitted review that starts
+a revision (plain or mentioning, in a commented or changes-requested review);
+only a mentioning inline comment in an approved or dismissed review is
+admitted on its own, and its reply target is its review thread. On GitLab and
+Bitbucket a mention in a threaded note is answered in its discussion. Every
+other request answers on the tracker issue. The objective still opens with the feedback URL for the agent, but nothing routes
 on it. Upgrading to schema 0102 backfills the stored target of existing
 requests from that first line.
 A revision's status comment lives where its reply lives, on the pull

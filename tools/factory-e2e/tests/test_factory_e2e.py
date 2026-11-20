@@ -1889,9 +1889,12 @@ def _revision_preflight(tmp_path: Path, text: str) -> fe.Preflight:
         "please @ACME-BOT add a test",
         "please @example-factory add a test",
         "@example-factory[bot] add a test",
+        # An alias the driver cannot see when the App comes from the
+        # environment alone, with no app.json slug.
+        "please @another-app-alias add a test",
     ],
 )
-def test_revision_file_naming_the_mention_or_app_slug_is_refused_before_any_post(
+def test_revision_file_that_mentions_any_login_is_refused_before_any_post(
     tmp_path: Path, text: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     posted: list[str] = []
@@ -1908,7 +1911,7 @@ def test_revision_file_without_a_mention_is_accepted(tmp_path: Path) -> None:
     preflight = _revision_preflight(tmp_path, text)
     assert preflight.revision_text == text
     assert (
-        fe.plain_comment_text(text, preflight.config.mention, preflight.config.app_slug)
+        fe.plain_comment_text(text)
         == text.strip()
     )
 

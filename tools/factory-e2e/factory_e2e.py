@@ -493,9 +493,6 @@ class FactoryConfig:
     # Where `curie build` pushes the bundle's runner layer (#3420); None when
     # the bundle declares no layer or already carries a lock for one.
     layer_registry: str | None = None
-    # The App's own login (app.json slug); the factory also treats a mention of
-    # it as an ask, so a plain comment must not contain it either.
-    app_slug: str | None = None
     # The operator's own GitHub login; None means ask gh at check time.
     operator_login: str | None = None
     # Anthropic-compatible base URL injected into the worker. None keeps the
@@ -1079,7 +1076,6 @@ def load_config(
         repo=repo,
         label=label,
         mention=mention,
-        app_slug=str(meta.get("slug") or "") or None,
         cloudflared=env.get("CURIE_FACTORY_CLOUDFLARED") or "cloudflared",
         priority_classes=priority_classes,
         restore_webhook_url=env.get("CURIE_FACTORY_WEBHOOK_RESTORE_URL") or None,
@@ -2153,7 +2149,7 @@ class Preflight:
         self.revision_text = revision_text
         if scenario_name == "revision" and revision_text:
             # Refuse before any cluster or GitHub work, not at the post.
-            plain_comment_text(revision_text, config.mention, config.app_slug)
+            plain_comment_text(revision_text)
         self.expect = expect
         self.expect_causes = frozenset(expect_causes)
         self.expect_reasons = tuple(expect_reasons)
@@ -4695,31 +4691,28 @@ def revision_comment_text(text: str | None, mention: str) -> str:
     return body if f"@{mention}" in body else f"@{mention} {body}"
 
 
-def _mentions_login(body: str, login: str) -> bool:
-    # Same token rule as mentions_login in apps/api/src/curie_api/github_factory_events.py.
-    pattern = rf"(?<![A-Za-z0-9-])@{re.escape(login)}(?![A-Za-z0-9-])"
-    return re.search(pattern, body, flags=re.IGNORECASE) is not None
+# Any @login token, as mentions_login in apps/api/src/curie_api/github_factory_events.py
+# bounds one: an address inside a word (ops@example.com) is not a mention.
+_ANY_MENTION = re.compile(r"(?<![A-Za-z0-9-])@[A-Za-z0-9][A-Za-z0-9-]*")
 
 
-def plain_comment_text(
-    text: str | None, mention: str | None = None, app_slug: str | None = None
-) -> str:
-    """The plain comment body: the operator text, not addressed to the factory.
+def plain_comment_text(text: str | None) -> str:
+    """The plain comment body: the operator text, not addressed to anyone.
 
-    Refuses text naming the configured mention or the App slug, the two tokens
-    mentions_factory (apps/api/src/curie_api/github_factory_events.py) accepts as
-    an ask: such a comment would pass against a mention-required factory and
-    prove nothing. Pure.
+    Refuses text that mentions any login. A mention of the factory (its
+    configured mention, its App slug, or an alias the driver cannot see when
+    the App is configured from the environment alone) would pass against a
+    mention-required factory and prove nothing. Pure.
     """
 
     body = (text or DEFAULT_REVISION_TEXT).strip()
-    for login in (mention, app_slug):
-        if login and _mentions_login(body, login):
-            raise ConfigError(
-                f"the revision text names @{login}; the revision scenario must prove "
-                "that a plain comment (no mention of the factory) starts a revision, "
-                "so remove the mention from the revision file"
-            )
+    found = _ANY_MENTION.search(body)
+    if found is not None:
+        raise ConfigError(
+            f"the revision text mentions {found.group(0)}; the revision scenario must prove "
+            "that a plain comment (no mention) starts a revision, so remove the mention "
+            "from the revision file"
+        )
     return body
 
 
@@ -4887,7 +4880,7 @@ def revision(p: Preflight) -> dict[str, Any]:
     # One plain comment on the owned PR: one revision request on the same WorkItem.
     since = time.time()
     comment = p.post_pr_comment(
-        pr_number, plain_comment_text(p.revision_text, p.config.mention, p.config.app_slug)
+        pr_number, plain_comment_text(p.revision_text)
     )
     comment_id = int(comment["id"])
     obs["comment_id"] = comment_id

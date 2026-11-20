@@ -338,6 +338,10 @@ async def admit_parsed_feedback(
         or feedback.installation_id != bound.installation_id
     ):
         raise FeedbackIgnored("installation_mismatch")
+    # The local identity check comes before any replay, so a piece whose
+    # repository or pull request disagrees with the lineage is refused even
+    # when its review was already admitted.
+    check_feedback_lineage(feedback, bound)
     review_key = (
         None
         if feedback.review_id is None
@@ -360,7 +364,6 @@ async def admit_parsed_feedback(
         )
         if replay is not None:
             return replay
-    check_feedback_lineage(feedback, bound)
     if verified is None:
         code_host = factory_code_host_entry(registry)
         verified = await verify_repository(
