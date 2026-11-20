@@ -61,6 +61,7 @@ from ..issue_read import (
     IssueReadAuthority,
     IssueReadRefused,
     IssueReadUnavailable,
+    answer_receipt_request_ids,
     read_issue,
     read_issue_authority,
 )
@@ -223,12 +224,13 @@ async def read_work_item_issue(
         content = await read_issue(
             authority, settings=settings, client=request.app.state.http_client
         )
+        answer_request_ids = await answer_receipt_request_ids(session, authority)
         receipts = (
             await session.scalars(
                 select(FactoryAnswerReceipt)
                 .where(
                     FactoryAnswerReceipt.work_item_id == authority.work_item_id,
-                    FactoryAnswerReceipt.request_id == authority.execution_request_id,
+                    FactoryAnswerReceipt.request_id.in_(answer_request_ids),
                     FactoryAnswerReceipt.outcome.in_(questions_core.ANSWER_RECEIPT_OUTCOMES),
                 )
                 .order_by(

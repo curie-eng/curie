@@ -83,12 +83,16 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
 from redis.asyncio import Redis
 from test_factory_question_ending import (
     _ask,
+    _finish_clean,
+    _lose_owner,
+    _queue_revision,
     _request,
     _requests,
     _round_row,
     _status_body,
     _take_over,
 )
+from test_factory_retry import _make_due
 from test_factory_terminus import _reconcile
 
 PATHS = ("webhook", "poll")
@@ -644,6 +648,64 @@ def test_issue_read_withholds_an_unproven_answer(world: World, change: str) -> N
     assert read["answer_attempt"] is True
     assert read["admitted_answers"] == []
     assert comment["body"] in read["thread_context"]
+
+
+def test_issue_read_preserves_answer_authority_through_automatic_retries(world: World) -> None:
+    number = 6283
+    asking = _outstanding(world, number)
+    starter = _admits(world, "webhook", asking, number)
+    folded = world.github.add_comment(number, "Keep the header row.", user=MAINTAINER)
+    _deliver(world, "webhook", folded, number)
+    answer = _take_over(asking, _answer_id(asking, starter))
+
+    _lose_owner(answer)
+    assert _request(answer.request_id)["terminal_cause"] == "owner_lost"
+    lost_id = _requests(answer.work_item_id)[-1]["id"]
+    assert lost_id != answer.request_id
+    retry = _take_over(answer, lost_id)
+    after_owner_loss = _run_issue(retry)
+
+    _finish_clean(retry, "sandbox_node_disrupted")
+    assert _request(retry.request_id)["terminal_cause"] == "sandbox_node_disrupted"
+    retry_id = _requests(retry.work_item_id)[-1]["id"]
+    assert retry_id != retry.request_id
+    _make_due(retry_id)
+    successor = _take_over(retry, retry_id)
+    after_retry = _run_issue(successor)
+
+    for read in (after_owner_loss, after_retry):
+        assert read["answer_attempt"] is True
+        assert read["has_question_history"] is True
+        assert read["admitted_answers"] == [
+            {"comment_id": str(starter["id"]), "author_id": str(WRITER["id"]), "text": ANSWER},
+            {
+                "comment_id": str(folded["id"]),
+                "author_id": str(MAINTAINER["id"]),
+                "text": folded["body"],
+            },
+        ]
+
+    world.github.edit_comment(starter["id"], "Use the updated filename.")
+    world.github.edit_comment(folded["id"], "Drop the header row.")
+    edited = _run_issue(successor)
+    assert edited["answer_attempt"] is True
+    assert edited["admitted_answers"] == []
+    assert "Use the updated filename." in edited["thread_context"]
+
+
+def test_issue_read_does_not_inherit_answers_on_an_independent_revision(world: World) -> None:
+    number = 6284
+    asking = _outstanding(world, number)
+    starter = _admits(world, "webhook", asking, number)
+    answer = _take_over(asking, _answer_id(asking, starter))
+    revision_id = _queue_revision(answer)
+    tr._finish(answer, "failed", "no_pull_request")
+
+    independent = _run_issue(_take_over(answer, revision_id))
+    assert independent["has_question_history"] is True
+    assert independent["answer_attempt"] is False
+    assert independent["admitted_answers"] == []
+    assert ANSWER in independent["thread_context"]
 
 
 @pytest.mark.parametrize("path", PATHS)

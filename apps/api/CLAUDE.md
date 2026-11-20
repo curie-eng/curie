@@ -99,9 +99,9 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   (`Tracker.read_ticket`; a GitHub issue with an App installation token
   freshly minted only for the recorded installation). The response carries the
   issue description and thread context separately. A comment is an admitted
-  answer only when its fingerprint matches a successful receipt for the same
-  execution and WorkItem. Receipts store fingerprints and identifiers. Text
-  stays on the tracker.
+  answer only when its fingerprint matches a successful receipt for the
+  execution or one of its automatic retry predecessors on the same WorkItem.
+  Receipts store fingerprints and identifiers. Text stays on the tracker.
   The same capability authorizes exactly four sibling routes (ADR 0277,
   #5586; #5785; ADR 0287, #5796), each repeating the issue check before and
   after any tracker call.
