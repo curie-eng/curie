@@ -436,10 +436,11 @@ def test_post_delivery_sends_the_exact_bytes(fake: GitHubRepositoryFake, secret:
     received: list[tuple[bytes, dict[str, str]]] = []
     app = FastAPI()
 
-    @app.post("/github/webhook")
     async def webhook(request: Request) -> dict[str, str]:
         received.append((await request.body(), dict(request.headers)))
         return {"status": "ok"}
+
+    app.add_api_route("/github/webhook", webhook, methods=["POST"])
 
     posted = fake.create_review(_pull(fake), REVIEWER, body="Look.", event="COMMENT")
     delivery: WebhookDelivery = posted.deliveries[0]
