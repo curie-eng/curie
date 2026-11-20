@@ -102,6 +102,13 @@ export const WIRED_ACTIONS = [
   { id: "memory-edit", label: "Edit a learned memory entry", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
   { id: "memory-delete", label: "Delete a learned memory entry", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
 
+  // WiredMemoryPage (#5800) — learned rules. Every action is a flag of the one
+  // `cluster memory` command: --rules lists; --accept, --reject, --remove act.
+  { id: "memory-rules-list", label: "List learned rules", mapping: { command: "cluster.memory" } },
+  { id: "memory-rule-accept", label: "Accept a learned rule", mapping: { command: "cluster.memory" } },
+  { id: "memory-rule-dismiss", label: "Dismiss a proposed learned rule", mapping: { command: "cluster.memory" } },
+  { id: "memory-rule-remove", label: "Remove an accepted learned rule", mapping: { command: "cluster.memory" } },
+
   // WiredEvals (#868) — the eval matrix is read from GET /evals/matrix. There is
   // no top-level `curie` verb that just reads the matrix (the CLI polls it
   // internally during a model sweep), so the view renders the honest amber gap.

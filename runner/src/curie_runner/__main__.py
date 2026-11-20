@@ -91,6 +91,7 @@ from .harness.claude.approval import (
 from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
+from .harness.claude.propose_rule_tool import wrap_propose_rule_handler
 from .harness.claude.question_tool import wrap_questions_handler
 from .harness.claude.requester_guard import build_learned_rules_guard, build_subagent_guard
 from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
@@ -1370,6 +1371,7 @@ def build_runner(
         def curie_server(
             tracker_result_tool: SdkMcpTool[Any] | None = None,
             question_tool: SdkMcpTool[Any] | None = None,
+            propose_rule_tool: SdkMcpTool[Any] | None = None,
         ) -> McpSdkServerConfig:
             return build_approval_server(
                 approval_gate,
@@ -1407,6 +1409,7 @@ def build_runner(
                 ),
                 tracker_result_tool=tracker_result_tool,
                 question_tool=question_tool,
+                propose_rule_tool=propose_rule_tool,
             )
 
         platform_servers: dict[str, Any] = {
@@ -1439,9 +1442,13 @@ def build_runner(
             )
             # An implementation contract mounts ``ask_questions`` (#5785) the
             # same way; ``bind_completion_contract`` sets at most one of the two.
+            # Either contract may also mount ``propose_rule`` (ADR 0287, #5796)
+            # when the API offered it; the binding never sets it for the fake.
             session_platform_servers = (
                 platform_servers
-                if bound.result_handler is None and bound.question_handler is None
+                if bound.result_handler is None
+                and bound.question_handler is None
+                and bound.rule_handler is None
                 else {
                     **platform_servers,
                     APPROVAL_SERVER_NAME: curie_server(
@@ -1453,6 +1460,11 @@ def build_runner(
                         (
                             wrap_questions_handler(bound.question_handler)
                             if bound.question_handler is not None
+                            else None
+                        ),
+                        (
+                            wrap_propose_rule_handler(bound.rule_handler)
+                            if bound.rule_handler is not None
                             else None
                         ),
                     ),
@@ -1580,7 +1592,9 @@ def build_runner(
             # which could still block the model. Any failure blocks the model.
             reason: str | None = None
             try:
-                bound_contract = await bind_completion_contract(issue_read)
+                bound_contract = await bind_completion_contract(
+                    issue_read, fake_model=fake_model
+                )
             except ContractUnavailable as exc:
                 reason = exc.reason
             except Exception:  # noqa: BLE001 - the contract gate fails closed
@@ -1604,6 +1618,8 @@ def build_runner(
                     "completion contract tracker_result result_kinds=%s",
                     ",".join(bound_contract.contract.result_kinds),
                 )
+            if reason is None and bound_contract.rule_handler is not None:
+                logger.info("completion contract offers propose_rule")
         if preflight_block is not None:
             # Blocked before any model session: the start answers offline with
             # its explanation, and the worker leaves the request's evidence.

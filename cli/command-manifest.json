@@ -7289,6 +7289,18 @@
               "required": false
             },
             {
+              "global": false,
+              "help": "Let the agent propose memory rules on or off (`memory_rule_proposals`, #5796). Takes effect for the next request's completion contract. A person still accepts any proposed rule; the agent never activates one itself",
+              "id": "memory_rule_proposals",
+              "long": "memory-rule-proposals",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",

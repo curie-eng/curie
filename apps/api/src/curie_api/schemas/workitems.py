@@ -83,6 +83,14 @@ class CompletionContractOut(BaseModel):
     result_kinds: list[str]
     session_usd_allowance: float | None
     execution: ExecutionBindingOut | None = None
+    # Whether this execution may propose one learned rule (#5796, ADR 0287):
+    # true exactly when the request is a revision admitted from reviewer
+    # feedback, its agent has ``memory_rule_proposals`` on, its WorkItem's
+    # pull request lineage is open and the WorkItem is not cancelled, at the
+    # time of the call. Always false for ``publication_recovery``. The runner
+    # mounts ``propose_rule`` only when it is true. A permanent field: later
+    # narrowings of this answer keep it, with this meaning.
+    rule_proposal: bool
 
 
 class TrackerResultSubmission(BaseModel):
@@ -123,6 +131,29 @@ class QuestionsSubmission(BaseModel):
         default=None,
         description="1 to 10 questions, each 1 to 1,000 characters with no blank line.",
     )
+
+
+class RuleProposalSubmission(BaseModel):
+    """The runner ``propose_rule`` tool's call (#5796): one standing rule for the
+    repository and why it is general, each one line of at most 240 UTF-8 bytes
+    with no reserved heading or section marker. Exactly these two string
+    fields; any other body is refused 422 ``invalid_body`` with nothing echoed.
+    The agent, scope, source and proposer come from the capability and the
+    stored request, never from the body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule: str = Field(description="The rule, one sentence of at most 240 UTF-8 bytes.")
+    reason: str = Field(
+        description="Why the feedback states a general rule, at most 240 UTF-8 bytes."
+    )
+
+
+class RuleProposalOut(BaseModel):
+    """A stored proposal: a hidden candidate, shown to a person only after the
+    pull request merges."""
+
+    status: Literal["candidate"]
 
 
 class QuestionsOut(BaseModel):

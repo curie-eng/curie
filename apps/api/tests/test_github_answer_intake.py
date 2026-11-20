@@ -50,6 +50,7 @@ from curie_api import factory_questions
 from curie_api.config import get_settings
 from curie_api.factory_facts_schema import REQUEST_MARKER
 from curie_api.factory_poll_intake import poll_once
+from curie_api.factory_questions import QUESTIONS_UNRECORDED_LINE
 from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_factory_events import FactoryNotice
 from curie_api.main import create_app
@@ -73,13 +74,22 @@ from forge_fakes.github import (
     _post,
     _signature,
     fake_installation_tokens,
+    issue_event,
 )
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,
     comments,
 )
 from redis.asyncio import Redis
-from test_factory_question_ending import _ask, _request, _requests, _round_row, _take_over
+from test_factory_question_ending import (
+    _ask,
+    _request,
+    _requests,
+    _round_row,
+    _status_body,
+    _take_over,
+)
+from test_factory_terminus import _reconcile
 
 PATHS = ("webhook", "poll")
 TOKEN = "ghs_answer_intake_fixture"
@@ -1138,3 +1148,146 @@ def test_refused_retained_service_item_in_personal_mode(
     assert _refusals(caplog, comment) == {"personal_owner_required"}
     assert _ids(triage) == [triage.request_id]
     assert _receipts(triage) == {}
+
+
+# Answer-path true-ups (#5786, #5787) ----------------------------------------------------
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_posting_window_answer_after_the_asker_exits_is_named_on_its_status(
+    world: World, path: str
+) -> None:
+    """03-tu a: GitHub stores the question comment and answers 502; the reply
+    comes while the round reads ``posting``; the asker never records the
+    question and ends without a pull request. No round takes the reply, so
+    the asker's status comment says replies to its questions restart nothing."""
+
+    number = 6232 if path == "webhook" else 6233
+    triage = _running(world, number)
+    world.github.store_then_fail = 502
+    assert _ask(triage).status_code == 503
+    world.github.tick()
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+    payload = _payload(comment, number)
+    delivery = str(uuid.uuid4())
+    if path == "webhook":
+        deferred = _post(world.client, "issue_comment", payload, delivery=delivery)
+        assert deferred.status_code == 503, deferred.text
+    else:
+        _poll(world)
+    assert _retry_keys() == {f"answer-retry:{comment['id']}"}
+
+    tr._finish(triage, "failed", "no_pull_request")
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["comment_id"]) == ("cleared", None)
+    if path == "webhook":
+        redelivered = _post(world.client, "issue_comment", payload, delivery=delivery)
+        assert redelivered.status_code == 200, redelivered.text
+    else:
+        _poll(world)
+    _reconcile()
+
+    assert _retry_keys() == set()
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+    body = _status_body(world.sink, triage.request_id)
+    assert QUESTIONS_UNRECORDED_LINE.strip() in body
+
+
+def test_a_recorded_round_status_never_says_its_questions_were_unrecorded(
+    world: World,
+) -> None:
+    """Counterexample: an asker whose round was recorded keeps the question ending."""
+
+    triage = _outstanding(world, 6234)
+    _reconcile()
+
+    body = _status_body(world.sink, triage.request_id)
+    assert "Questions asked (round 1 of 3)" in body
+    assert QUESTIONS_UNRECORDED_LINE.strip() not in body
+
+
+@pytest.mark.parametrize("refusal", ["answer_not_authorized", "ticket_closed"])
+def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
+    world: World, caplog: pytest.LogCaptureFixture, refusal: str
+) -> None:
+    """03-tu b: the webhook refuses a mention as an answer while round 1 is
+    open: its author may not answer, or a person closed the ticket. Then the
+    author gains write access, or the ticket is reopened before any
+    cancellation applied; another answer ends round 1, round 2 is asked and
+    answered, and the run it started ends. The poll pass, whose cursor is
+    behind, lists the refused comment: the webhook's verdict stands, so it
+    never becomes a mention revision. A mention made in the very second the
+    round ended is still one."""
+
+    caplog.set_level(logging.INFO)
+    number = 6235 if refusal == "answer_not_authorized" else 6238
+    triage = _outstanding(world, number)
+    author = READER if refusal == "answer_not_authorized" else WRITER
+    if refusal == "ticket_closed":
+        # GET an issue answers state closed
+        # (https://docs.github.com/en/rest/issues/issues#get-an-issue); no
+        # closed delivery reaches the factory before the reopen.
+        world.github.planted_issues[number] = PlantedIssue(state="closed", labels=(LABEL,))
+    refused = world.github.add_comment(number, f"@{MENTION} replace the rows.", user=author)
+    response = _post(world.client, "issue_comment", _payload(refused, number))
+    assert _code(response.json()) == refusal, response.text
+    if refusal == "answer_not_authorized":
+        world.github.grant(READER, "write")
+    else:
+        del world.github.planted_issues[number]
+    answer = world.github.add_comment(number, ANSWER, user=WRITER)
+    assert _deliver(world, "webhook", answer, number)["status"] == "factory_admitted"
+    successor = _take_over(triage, _answer_id(triage, answer))
+    asked = _ask(successor, ["Round 2: which file holds the rows?"])
+    assert asked.status_code == 200, asked.text
+    tr._finish(successor, "failed", "no_pull_request")
+    second = world.github.add_comment(number, ANSWER, user=WRITER)
+    assert _deliver(world, "webhook", second, number)["status"] == "factory_admitted"
+    last = _take_over(triage, _answer_id(triage, second))
+    tr._finish(last, "failed", "budget_exceeded")
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["rounds_used"]) == ("cleared", 2), row
+    before = _ids(triage)
+
+    # GitHub's clock in the second the round ended, which it reports whole.
+    world.github.clock = row["updated_at"].replace(microsecond=0)
+    later = world.github.add_comment(number, f"@{MENTION} also sort them.", user=WRITER)
+
+    _poll(world)
+
+    assert refusal in _refusals(caplog, refused)
+    assert str(refused["id"]) not in _receipts(triage)
+    assert _ids(triage) == [*before, _mention_id(number, later)]
+
+
+@pytest.mark.parametrize("ended", ["closed", "unlabeled"])
+def test_poll_pass_that_finds_the_close_and_an_answer_refuses_the_answer(
+    world: World, caplog: pytest.LogCaptureFixture, ended: str
+) -> None:
+    """03-tu c: one poll pass discovers the issue closed (or unlabelled) by a
+    person and a plain answer made before it. The answer is refused for the
+    ticket's state (#5787 criterion 4), not dropped unseen by the
+    cancellation, and the WorkItem is still cancelled in the same pass."""
+
+    caplog.set_level(logging.INFO)
+    number = 6236 if ended == "closed" else 6237
+    triage = _outstanding(world, number)
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+    world.github.planted_issues[number] = PlantedIssue(
+        state="closed" if ended == "closed" else "open",
+        labels=(LABEL,) if ended == "closed" else (),
+        events=[issue_event(ended, event_id=880000 + number, label=LABEL)],
+    )
+
+    _poll(world)
+
+    expected = "ticket_closed" if ended == "closed" else "trigger_label_absent"
+    assert _refusals(caplog, comment) == {expected}
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+    (item,) = _rows(
+        "SELECT cancelled_at FROM curie.work_items WHERE id = :id", {"id": triage.work_item_id}
+    )
+    assert item["cancelled_at"] is not None
+    assert _round_row(triage.work_item_id) is None

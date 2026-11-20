@@ -185,6 +185,8 @@ pub struct AgentUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_partitions: Option<BTreeMap<String, HookPartitionInput>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_rule_proposals: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_writes: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Option<String>>,

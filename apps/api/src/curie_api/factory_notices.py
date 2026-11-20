@@ -56,12 +56,14 @@ from .factory_comment_text import (
 from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, pill_for
 from .factory_questions import (
     ANSWER_RECEIVED_LINE,
-    ANSWER_STARTED_OUTCOMES,
     QUESTIONS_ASKED,
     QUESTIONS_LABEL,
+    QUESTIONS_UNRECORDED_LINE,
     ROUND_LIMIT,
     asked_round,
+    question_unrecorded,
 )
+from .factory_questions import answer_started as _answer_started
 from .factory_reply_target import stored_reply_target
 from .factory_retry_policy import condition_text
 from .factory_triage_status import (
@@ -95,7 +97,6 @@ from .github_review_truth import VerifiedRepository
 from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
-    FactoryAnswerReceipt,
     FactoryBaseTransition,
     FactoryCiObservation,
     FactoryStatusComment,
@@ -179,6 +180,14 @@ _USD_BUDGET_DETAIL = re.compile(
 # phrase (``Acme Research Team``) is. A slug still matches in any case.
 # ``workspace=acme`` is an assignment, not diagnostic prose, so the value may
 # be a plain word. The colon form stays on ``_PROVIDER_WORKSPACE``.
+
+
+# The ``start_failed`` sentence of a request an answer started whose pull
+# request merged or closed before it could start (#5786).
+ANSWER_PULL_REQUEST_ENDED_SENTENCE = (
+    "this ticket's pull request was merged or closed before the factory could act on "
+    "the answer, so no new run started."
+)
 
 
 def start_failed_sentence(attempts: int, reason: str) -> str:
@@ -1439,23 +1448,6 @@ def github_status_mention(settings: Settings, tracker_kind: str) -> str | None:
     return mention
 
 
-async def _answer_started(
-    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
-) -> bool:
-    """Whether an answer comment created ``request_id`` (#5786 decision 5)."""
-
-    found = await session.scalar(
-        select(FactoryAnswerReceipt.comment_key)
-        .where(
-            FactoryAnswerReceipt.work_item_id == work_item_id,
-            FactoryAnswerReceipt.request_id == request_id,
-            FactoryAnswerReceipt.outcome.in_(ANSWER_STARTED_OUTCOMES),
-        )
-        .limit(1)
-    )
-    return found is not None
-
-
 async def _render(
     session: AsyncSession,
     settings: Settings,
@@ -1561,6 +1553,10 @@ async def _render(
                 ),
                 work_item_cancelled=work_item.cancelled_at is not None,
             )
+            if cause != QUESTIONS_ASKED and await question_unrecorded(
+                session, work_item.id, request.id
+            ):
+                result += QUESTIONS_UNRECORDED_LINE
             if (
                 request.status in {"failed", "expired", "cancelled"}
                 and pr_url

@@ -1469,6 +1469,11 @@
             "title": "Memory",
             "type": "boolean"
           },
+          "memory_rule_proposals": {
+            "default": false,
+            "title": "Memory Rule Proposals",
+            "type": "boolean"
+          },
           "memory_writes": {
             "default": false,
             "title": "Memory Writes",
@@ -1782,6 +1787,17 @@
               }
             ],
             "title": "Memory"
+          },
+          "memory_rule_proposals": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Rule Proposals"
           },
           "memory_writes": {
             "anyOf": [
@@ -7326,6 +7342,10 @@
             "title": "Result Kinds",
             "type": "array"
           },
+          "rule_proposal": {
+            "title": "Rule Proposal",
+            "type": "boolean"
+          },
           "session_usd_allowance": {
             "anyOf": [
               {
@@ -7341,7 +7361,8 @@
         "required": [
           "completion_contract",
           "result_kinds",
-          "session_usd_allowance"
+          "session_usd_allowance",
+          "rule_proposal"
         ],
         "title": "CompletionContractOut",
         "type": "object"
@@ -17778,6 +17799,21 @@
           "repo_full_name"
         ],
         "title": "RoutingCheckRequest",
+        "type": "object"
+      },
+      "RuleProposalOut": {
+        "description": "A stored proposal: a hidden candidate, shown to a person only after the\npull request merges.",
+        "properties": {
+          "status": {
+            "const": "candidate",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "RuleProposalOut",
         "type": "object"
       },
       "RunnerPods": {
@@ -42491,6 +42527,85 @@
           }
         },
         "summary": "Post Questions",
+        "tags": [
+          "work-items"
+        ]
+      }
+    },
+    "/work-items/rule-proposal": {
+      "post": {
+        "description": "Store this execution's one learned rule candidate (#5796, ADR 0287).\n\nThe capability's request and WorkItem decide everything but the text: the\nagent, the repository scope, the source request, pull request lineage and\nURL, and the proposer (the request's verified requester). The candidate\nstays hidden until the pull request merges. A capability that does not\nname its WorkItem's issue is 409 ``invalid_context``; a request that is\nnot an eligible revision is 403 ``rule_proposal_not_eligible``; a second\nproposal of the request is 409 ``rule_already_proposed``; a body that is\nnot one JSON object of exactly ``rule`` and ``reason`` strings is 422\n``invalid_body``; text outside the bounds is 422 ``invalid_text``,\n``too_large`` or ``reserved_text``. No refusal and no log line carries the\nsubmitted text.",
+        "operationId": "post_rule_proposal_work_items_rule_proposal_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Issue-Read",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Issue-Read"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "The runner ``propose_rule`` tool's call (#5796): one standing rule for the\nrepository and why it is general, each one line of at most 240 UTF-8 bytes\nwith no reserved heading or section marker. Exactly these two string\nfields; any other body is refused 422 ``invalid_body`` with nothing echoed.\nThe agent, scope, source and proposer come from the capability and the\nstored request, never from the body.",
+                "properties": {
+                  "reason": {
+                    "description": "Why the feedback states a general rule, at most 240 UTF-8 bytes.",
+                    "title": "Reason",
+                    "type": "string"
+                  },
+                  "rule": {
+                    "description": "The rule, one sentence of at most 240 UTF-8 bytes.",
+                    "title": "Rule",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rule",
+                  "reason"
+                ],
+                "title": "RuleProposalSubmission",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuleProposalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Rule Proposal",
         "tags": [
           "work-items"
         ]

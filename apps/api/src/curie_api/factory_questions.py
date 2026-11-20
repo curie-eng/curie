@@ -770,6 +770,40 @@ async def rows_an_older_replica_settled(
     return list(ids)
 
 
+# A request whose question comment was written but never recorded (the tracker
+# stored it and its response was lost) ends without the question ending; its
+# status comment says so, since the round takes no answer (#5787).
+QUESTIONS_UNRECORDED_LINE: Final = (
+    "This run's questions could not be recorded, so a reply to them does not "
+    "restart this ticket. Add the label again to start a new run.\n"
+)
+
+
+async def question_unrecorded(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
+) -> bool:
+    """Whether ``request_id`` ended with its question comment unrecorded.
+
+    Its round was still ``posting`` when it settled, so settlement cleared it
+    with no question comment id: an answer made in that window was deferred
+    and then finds no round. A round refused for the cap can have no comment
+    id too; its count is at the cap, a posting round's is below it. The
+    caller excludes the question ending.
+    """
+
+    row = await session.scalar(
+        select(FactoryQuestionRound).where(FactoryQuestionRound.work_item_id == work_item_id)
+    )
+    if (
+        row is None
+        or row.asking_request_id != request_id
+        or row.state != CLEARED
+        or row.comment_id is not None
+    ):
+        return False
+    return row.rounds_used < ROUND_LIMIT
+
+
 async def asked_round(
     session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
 ) -> int | None:
@@ -849,6 +883,24 @@ class AnswerNotAdmitted(Exception):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(f"factory answer not admitted: {code}")
+
+
+async def answer_started(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
+) -> bool:
+    """Whether an answer comment created ``request_id`` (decision 5): a
+    receipt of an answer-started outcome names it."""
+
+    found = await session.scalar(
+        select(FactoryAnswerReceipt.comment_key)
+        .where(
+            FactoryAnswerReceipt.work_item_id == work_item_id,
+            FactoryAnswerReceipt.request_id == request_id,
+            FactoryAnswerReceipt.outcome.in_(ANSWER_STARTED_OUTCOMES),
+        )
+        .limit(1)
+    )
+    return found is not None
 
 
 def answer_request_id(issue: TrackerIssueRef, comment_id: str) -> uuid.UUID:

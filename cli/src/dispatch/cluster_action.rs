@@ -1181,6 +1181,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             runner_resources,
             clear_runner_resources,
             memory_writes,
+            memory_rule_proposals,
             conn,
             dry_run,
         } => {
@@ -1212,7 +1213,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             )
             .await?;
             emit(
-                commands::overrides_with_memory_writes(
+                commands::overrides_with_memory_flags(
                     AgentActionOpts {
                         api_url,
                         api_key,
@@ -1225,6 +1226,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     execution_deadline,
                     runner_resources,
                     commands::memory_writes_flag(memory_writes.as_deref()),
+                    commands::memory_writes_flag(memory_rule_proposals.as_deref()),
                 )
                 .await?,
             )
