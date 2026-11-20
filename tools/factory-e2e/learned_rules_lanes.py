@@ -11,6 +11,7 @@ the ticket it closes through its stub record.
 from __future__ import annotations
 
 import copy
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -149,5 +150,15 @@ def scrub_recording(
 def write_transcripts(
     model_module: Any, split: dict[str, list[dict[str, Any]]], paths: dict[str, Path]
 ) -> None:
-    for letter, exchanges in split.items():
-        model_module.dump_transcript(paths[letter], exchanges)
+    """Write all three transcripts or none: each goes to a sibling temporary file
+    first, and the committed files are replaced only after every write succeeded."""
+
+    staged = {letter: paths[letter].with_name(paths[letter].name + ".tmp") for letter in split}
+    try:
+        for letter, exchanges in split.items():
+            model_module.dump_transcript(staged[letter], exchanges)
+        for letter, temporary in staged.items():
+            os.replace(temporary, paths[letter])
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)

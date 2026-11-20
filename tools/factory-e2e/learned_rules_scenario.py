@@ -61,6 +61,8 @@ REQUESTER_PREFIX = "Requester preferences:"
 REQUESTER_APPLIED = re.compile(r"^Requester preferences: applied; sha256:[0-9a-f]{64}$")
 SENDER_FRAME = "[platform-sender"
 ASSERT_CALL = "assertAlmostEqual("
+# The call with any whitespace before its opening parenthesis, which Python allows.
+_ASSERT_CALL_RE = re.compile(r"\bassertAlmostEqual\s*\(")
 PLACES = "places=6"
 _CODE = re.compile(r"memory_rules\.[a-z_]+")
 
@@ -100,7 +102,8 @@ def prompt_positions(
         "requester": requester if requester >= 0 else None,
         "rule_line": rule_line,
         "requester_text": requester_line,
-        "system_chars": len(system),
+        # Whitespace alone is no system prompt.
+        "system_chars": len(system.strip()),
     }
 
 
@@ -120,7 +123,7 @@ def added_assert_lines(diff: str) -> list[str]:
     return [
         line[1:].strip()
         for line in diff.splitlines()
-        if line.startswith("+") and not line.startswith("+++") and ASSERT_CALL in line
+        if line.startswith("+") and not line.startswith("+++") and _ASSERT_CALL_RE.search(line)
     ]
 
 

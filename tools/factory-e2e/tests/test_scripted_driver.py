@@ -3050,3 +3050,44 @@ def test_cleanup_replaces_the_replay_fixtures_only_after_a_passed_chain(
     assert (after != committed) is passed
     if passed:
         assert [e["lane_key"] for e in json.loads(after["b"])["exchanges"]] == ["b0"]
+
+
+@pytest.mark.parametrize("failure", ["teardown", "transcript-write"])
+def test_a_passed_chain_replaces_no_fixture_when_teardown_or_a_write_fails(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    monkeypatch.setattr(
+        sk.ScriptedRun,
+        "cleanup",
+        lambda _self: (
+            ["owned kind cluster remains after teardown"] if failure == "teardown" else []
+        ),
+    )
+    original_write_text = Path.write_text
+
+    def write_text(self: Path, *args: Any, **kwargs: Any) -> int:
+        if failure == "transcript-write" and "learned-rules-chain-b.json" in self.name:
+            raise OSError("disk full")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    first.parent.mkdir()
+    run = lrr.LearnedRulesRun(_chain_args(first, "--record"))
+    for path in run.transcripts.values():
+        committed_text = json.dumps({"version": 1, "exchanges": [{"committed": path.name}]})
+        original_write_text(path, committed_text)
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.stub = _RecordedStub()
+    run.model = _RecordedModel(
+        [_recorded("a0", "one"), _recorded("b0", "two"), _recorded("c0", "three")], list("abc")
+    )
+    run.workdir = tmp_path / "work"
+    run.chain["result"] = "passed"
+
+    errors = run.cleanup()
+
+    assert errors
+    assert {letter: path.read_text() for letter, path in run.transcripts.items()} == committed
+    assert not list(first.parent.glob("*.tmp"))

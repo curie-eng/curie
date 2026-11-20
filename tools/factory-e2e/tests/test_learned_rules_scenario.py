@@ -490,6 +490,14 @@ def test_added_assert_lines_read_only_added_lines() -> None:
     ]
 
 
+def test_a_call_with_whitespace_before_the_parenthesis_is_counted_and_read() -> None:
+    spaced = "+        self.assertAlmostEqual (convert(32, 'f', 'c'), 0.0, places=6)"
+    diff = "\n".join(("+++ b/t.py", spaced))
+    assert lrs.added_assert_lines(diff) == [spaced[1:].strip()]
+    assert lrs.places_six(spaced[1:].strip()) is True
+    assert lrs.places_six("self.assertAlmostEqual (a, b, places=5)") is False
+
+
 def test_propose_ordinals_find_the_tool_call_in_served_answers() -> None:
     exchanges = [
         {"lane_key": "k", "ordinal": 0, "message": {"content": [{"type": "text", "text": "x"}]}},
@@ -984,8 +992,10 @@ class _Factory:
             "tools": [{"name": "Read"}],
             "messages": [{"role": "user", "content": [{"type": "text", "text": first}]}],
         }
-        if implementer or self.reviewer_system:
+        if implementer or self.reviewer_system is True:
             body["system"] = system
+        elif isinstance(self.reviewer_system, str):
+            body["system"] = [{"type": "text", "text": self.reviewer_system}]
         self.model._capture(json.dumps(body).encode())
 
     def publish(self, number: int, asserts: list[str]) -> None:
@@ -1125,6 +1135,17 @@ def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
         ({"requester_text": "Use tabs for indentation."}, "conflicting requester document"),
         # A reviewer request whose system prompt the capture writer stores as "".
         ({"reviewer_system": False}, "hold no system prompt"),
+        # A reviewer request whose only system text is whitespace.
+        ({"reviewer_system": "  \n\t "}, "hold no system prompt"),
+        # A valid call written with whitespace before the parenthesis is still read.
+        (
+            {
+                "b_asserts": [
+                    "self.assertAlmostEqual (convert(0, 'f', 'r'), 459.67, places=5)",
+                ]
+            },
+            "without places=6",
+        ),
         # The keyword says five; a trailing comment spells six.
         (
             {
@@ -1136,7 +1157,13 @@ def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
             "without places=6",
         ),
     ],
-    ids=["other-requester-document", "empty-reviewer-prompt", "places-six-in-a-comment"],
+    ids=[
+        "other-requester-document",
+        "empty-reviewer-prompt",
+        "whitespace-reviewer-prompt",
+        "places-five-with-a-space-before-the-parenthesis",
+        "places-six-in-a-comment",
+    ],
 )
 def test_ticket_b_counterexamples_through_the_real_stub_and_capture_writer_are_refused(
     fault: dict[str, Any],

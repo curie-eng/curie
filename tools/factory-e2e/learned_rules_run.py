@@ -1010,9 +1010,15 @@ class LearnedRulesRun(sk.ScriptedRun):
         except (OSError, subprocess.SubprocessError) as exc:
             errors.append(str(exc))
         errors.extend(super().cleanup())
-        # Only a chain the judge passed may replace the committed fixtures: a failure
-        # anywhere, including before the first model call, leaves all three as they were.
-        if self.args.record and self.model is not None and self.chain.get("result") == "passed":
+        # Only a chain the judge passed, torn down cleanly, may replace the committed
+        # fixtures: a failure anywhere, including before the first model call or in
+        # teardown, leaves all three as they were.
+        if (
+            self.args.record
+            and self.model is not None
+            and self.chain.get("result") == "passed"
+            and not errors
+        ):
             try:
                 self.write_recording()
             except (scripted_lanes.LaneError, OSError, ValueError) as exc:
