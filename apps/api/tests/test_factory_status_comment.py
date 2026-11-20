@@ -3353,8 +3353,7 @@ def test_a_running_pull_request_follow_up_hides_the_checklist_until_a_later_phas
     assert _READING in comment["body"]
     assert "Status: RUNNING" in comment["body"]
     assert _checklist_lines(comment["body"]) == []
-    for label in _NINE_STEPS:
-        assert label not in comment["body"]
+    assert "**Running · Read issue**" in comment["body"]
 
     assert report(client, revision, "plan", round=1).status_code == 201
     sink.requests.clear()
@@ -3442,6 +3441,7 @@ def test_an_unchanged_follow_up_is_answered_without_a_checklist(
     assert "**Next owner:** human (agent reported)" in body
     assert "**Next action:** Review the feedback answer (agent reported)" in body
     assert "Decision confirmation remains open" in body
+    assert "**No pull request was published.**" not in body
     assert "**AC1 — Existing decision covers the feedback:** unverified" in body
     assert f"In response to https://github.com/{REPO}/pull/" in body
     assert "Status: ANSWERED" in body

@@ -1762,13 +1762,13 @@ async def _render(
         summary = (
             format_handoff(
                 run_handoff,
-                no_pull_request=cause == "no_pull_request",
+                no_pull_request=cause == "no_pull_request" and target.kind == "issue",
                 platform_checks=platform_checks,
             )
             if run_handoff is not None
             else fallback_summary(
                 status=request.status,
-                no_pull_request=cause == "no_pull_request",
+                no_pull_request=cause == "no_pull_request" and target.kind == "issue",
                 retrying=retrying,
                 platform_checks=platform_checks,
                 agent_detail=row.detail if cause in _AGENT_MESSAGE_CAUSES else None,
