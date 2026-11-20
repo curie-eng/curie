@@ -449,7 +449,12 @@ share that identity with every other pod in the namespace that also runs as
 The mapping is operator configuration, never bundle content. The chart value
 `connectorServiceAccounts` is a list of entries, each with exactly three
 non-empty keys: `agent`, `connector` and `serviceAccountName`. The chart passes
-the list to the API as JSON in `CURIE_CONNECTOR_SERVICE_ACCOUNTS`. A bundle
+the list to the API as JSON in `CURIE_CONNECTOR_SERVICE_ACCOUNTS`, which
+`connector_service_accounts_for`
+(`apps/api/src/curie_api/config.py::Settings.connector_service_accounts_for`)
+reads per agent, and `render`'s `service_account` argument
+(`packages/plugin-format/src/plugin_format/connector_render.py::render`) places
+on the Deployment. A bundle
 cannot choose a ServiceAccount: a cloud identity bound to a ServiceAccount is a
 credential, and a bundle field would let any agent's bundle in the namespace
 name another agent's federated ServiceAccount, or a Curie component's own

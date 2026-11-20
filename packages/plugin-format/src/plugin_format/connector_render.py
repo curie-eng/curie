@@ -503,6 +503,16 @@ def is_secret_name(name: str) -> bool:
     return len(name) <= _SECRET_NAME_MAX and bool(_SECRET_NAME.fullmatch(name))
 
 
+def is_service_account_name(name: str) -> bool:
+    """Whether ``name`` is a Kubernetes ServiceAccount name.
+
+    The API server validates a ServiceAccount name as a DNS-1123 subdomain, the
+    same grammar as a Secret name.
+    """
+
+    return is_secret_name(name)
+
+
 def referenced_secret_name(from_secret: str, agent: str) -> str:
     """The Secret a ``SecretRef`` points at when deployed as ``agent``.
 
@@ -573,7 +583,14 @@ def render_deployment(
     proxy: ConnectorProxy | None = None,
     gated_tools: tuple[str, ...] = (),
     grant_store: GrantStore | None = None,
+    service_account: str | None = None,
 ) -> dict[str, Any]:
+    if service_account is not None and not is_service_account_name(service_account):
+        raise ValueError(
+            f"service_account {service_account!r} for connector {connector!r} is not a "
+            "Kubernetes ServiceAccount name (lowercase alphanumeric, `-` or `.`, starting "
+            f"and ending alphanumeric, at most {_SECRET_NAME_MAX} characters)"
+        )
     name = object_name(release, agent, connector)
     subs = substitutions(release, agent, connector, namespace, spec.port)
     env: list[dict[str, Any]] = [
@@ -740,6 +757,15 @@ def render_deployment(
                         ),
                     ],
                     **({"volumes": volumes} if volumes else {}),
+                    # An operator-named ServiceAccount, for a connector whose
+                    # projected token is its cloud identity. Absent, the pod
+                    # runs as `default` and the render is unchanged. Token
+                    # mounting stays the ServiceAccount's own setting.
+                    **(
+                        {"serviceAccountName": service_account}
+                        if service_account is not None
+                        else {}
+                    ),
                     **(
                         {"imagePullSecrets": [{"name": name} for name in proxy.pull_secrets]}
                         if proxy is not None and proxy.pull_secrets
@@ -983,6 +1009,7 @@ def render(
     proxy: ConnectorProxy | None = None,
     gated_tools: tuple[str, ...] = (),
     grant_store: GrantStore | None = None,
+    service_account: str | None = None,
 ) -> list[dict[str, Any]]:
     """Every object needed to run one hosted connector. Empty for a remote one.
 
@@ -1033,6 +1060,7 @@ def render(
             proxy,
             gated_tools=gated_tools,
             grant_store=grant_store,
+            service_account=service_account,
         ),
         render_networkpolicy(release, agent, app_name, connector, spec, proxy),
         render_ingress_networkpolicy(release, agent, app_name, connector, spec, proxy),
