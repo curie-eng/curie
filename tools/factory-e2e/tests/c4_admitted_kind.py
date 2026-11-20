@@ -175,6 +175,9 @@ def publication_failure_summary(
 
 
 class AdmittedKind(sk.ScriptedRun):
+    # Its tests drive their own agents and tickets on the shared install.
+    runs_one_ticket = False
+
     def __init__(self, root: Path, binary: Path) -> None:
         super().__init__(fe.parse_args(["scripted", "--scenario", "publication"]))
         # ScriptedRun defaults its context. This fixture retains the caller's

@@ -347,6 +347,10 @@ class ScriptedRun:
     """One private cluster, registry, fixture server and model endpoint."""
 
     tracker_poll_seconds = TRACKER_POLL_SECONDS
+    # The one-ticket scenario needs the install ``execute`` provisions: one
+    # factory agent on the fixture repository. A subclass that provisions its own
+    # agents and drives its own scenario on the shared install turns it off.
+    runs_one_ticket = True
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -906,7 +910,7 @@ class ScriptedRun:
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
         self.wait_for_final()
         self.observe()
-        if self.router is not None:
+        if self.router is not None and self.runs_one_ticket:
             self.run_one_ticket(github)
         if self.router is not None and self.slack is not None:
             self.run_triage_to_pr(github)

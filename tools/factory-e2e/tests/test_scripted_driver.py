@@ -2972,6 +2972,18 @@ def test_the_one_ticket_verdict_reaches_the_evidence_file_and_the_exit_code(
         assert evidence["one_ticket"]["error"] == "a second request after the bot comment"
 
 
+def test_only_the_scripted_command_runs_the_one_ticket_scenario_on_its_install() -> None:
+    # The c4 fixtures subclass ScriptedRun to provision their own agents and
+    # drive their own tickets; the one-ticket flow needs the agent execute makes
+    # and a free fixture repository, so it is theirs to skip.
+    from c4_admitted_kind import AdmittedKind
+    from test_c4_held_cancellation import HeldRun
+
+    assert sk.ScriptedRun.runs_one_ticket is True
+    assert AdmittedKind.runs_one_ticket is False
+    assert HeldRun.runs_one_ticket is False
+
+
 def test_the_publication_scenario_installs_the_one_ticket_lane_and_no_gateway() -> None:
     run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
     assert not run.gateway_enabled()
