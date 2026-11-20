@@ -6670,9 +6670,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     scripted.add_argument(
         "--scenario",
-        choices=("publication", "facts", "triage-to-pr"),
+        choices=("publication", "facts", "triage-to-pr", "jira-one-ticket"),
         required=True,
-        help="run issue-to-PR, admission facts, or issue-to-PR followed by triage on one install",
+        help=(
+            "run issue-to-PR, admission facts, issue-to-PR followed by triage on one install, "
+            "or the one-ticket flow on a Jira-tracked ticket (the Jira stub as tracker)"
+        ),
     )
     scripted.add_argument(
         "--transcript",
