@@ -23,9 +23,10 @@ from typing import Any
 
 import httpx
 
-from .forges.github.transport import github_headers, parse_time
-from .github_review_events import FeedbackIgnored, FeedbackUnavailable, feedback_event_id
-from .github_review_truth import VerifiedRepository
+from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, feedback_event_id
+from curie_api.github_review_truth import VerifiedRepository
+
+from .transport import github_headers, parse_time
 
 ACTIONABLE_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED"})
 NON_ACTIONABLE_STATES = frozenset({"APPROVED", "DISMISSED"})
