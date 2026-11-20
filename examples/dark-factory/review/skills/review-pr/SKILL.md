@@ -50,7 +50,9 @@ that makes the result clearer:
    their real entry points, assertions and limits. Separate automated end to
    end tests from integration or plan tests, author reported manual runs, your
    own runs and checks on the current head. State explicitly when no automated
-   end to end test was added.
+   end to end test was added. Present scenarios in numbered, user-flow order.
+   Start each with a one line behavior summary, then give its test location,
+   setup, actual assertion, execution evidence and limit.
 3. **System map.** Give each primary changed component one line describing its
    role and change. Identify new components and why they exist, and removed or
    replaced components and why. Distinguish internal helpers from deployable or
@@ -64,15 +66,19 @@ that makes the result clearer:
    never floating inside a lane. See [the inspection procedure](references/review.md).
    Explain the observable change in plain language. Skip a diagram that would
    only repeat one action.
-5. **Unit scenarios.** Describe added or changed unit tests by the behavior and
-   positive, negative or edge conditions they assert. Name relevant existing
-   regression coverage and what the assertions cannot establish.
+5. **Unit scenarios.** Present added or changed unit tests as numbered
+   scenarios with a one line behavior summary, then the test location, setup,
+   actual assertion and positive, negative or edge conditions. Name relevant
+   existing regression coverage and what the assertions cannot establish.
 6. **Algorithms and data.** Explain significant decision rules, ordering,
    retries, complexity or state transitions, including whether an algorithm is
    new or changed. Describe new or changed data models and API or storage
-   contracts. For persistent data, explain migration order, existing records,
-   compatibility, rollback and backfill. State explicitly when no persistent
-   model or migration changes.
+   contracts. Show schema changes in a compact before and after table: linked
+   model or contract, changed fields and types, constraints or indexes, why
+   the change exists and affected readers. For persistent data, follow the table
+   with numbered migration steps covering existing records, compatibility,
+   rollback and backfill. State explicitly when no persistent model or
+   migration changes.
 7. **Findings and architectural assessment.** After the purpose, system map,
    changed flows, tests and data context, give actionable findings with
    severity, trigger, consequence and the change or decision needed. Check changed

@@ -88,6 +88,33 @@ not a database migration.
 When asked to dig deeper, follow a concrete request through that component's
 entry point, dependencies, state and failure behavior, using actual source.
 
+## Show schema changes clearly
+
+When a PR changes a database, API, event, configuration or other shared schema,
+show the actual contract delta before discussing migration. Use a compact table
+with one row per meaningful model, field, relation, constraint or index change:
+
+| Model or changed element | Before | After | Why and affected reader |
+| --- | --- | --- | --- |
+| Name linked to current diff | Existing type, nullability, default or rule | New type, nullability, default or rule | Purpose and consumer impact |
+
+For a new model, say `none` in Before; for a removed model, say `removed` in
+After and explain what replaces its readers or stored records. Include keys,
+uniqueness, foreign keys, indexes and compatibility-sensitive serialization
+when they change. Do not turn an unchanged generated schema file into a new
+model. Keep the table readable by splitting a large schema into model sections
+instead of hiding important fields in one cell. If the current client renders
+wide tables poorly, use one compact model block with labeled Before, After
+and Why lines per change instead.
+
+For persistent changes, follow the table with a numbered rollout: migration
+order relative to application deployment, what happens to existing rows,
+backfill or default behavior, old and new reader or writer compatibility, and
+rollback or downgrade path. Name the migration file and whether the PR includes
+the backfill. If the rollout is not established by the diff or linked plan,
+mark it unknown. Distinguish database migrations from generated API types and
+in memory data structures.
+
 Review the security posture of changed defaults. Check host and network
 binding, identity, authorization, credential handling, public endpoints,
 tenant boundaries, and whether access lasts only during a command or for a
@@ -117,6 +144,24 @@ catch. Flag vacuous assertions, skipped checks and mocks that stop before the
 production behavior being claimed. Cite unchanged regression tests relevant to
 changed callers, contracts and sibling paths; do not assert that unrelated green
 tests establish absence of regressions.
+
+Present each test tier as an ordered list, using IDs such as E1 for automated
+end to end, I1 for integration or plan, U1 for unit and M1 for a manual run.
+Order scenarios by the real user flow: primary success, failure or security,
+boundary or retry, then migration or compatibility. Begin each item with a
+one line behavior summary rather than a test function name. Under that line,
+give the linked test location, entry point and setup, exact assertion, and
+what it can and cannot prove. For example:
+
+1. **E1 — A user can complete the changed flow.** Test: linked path and name.
+   Entry point and setup: real command, API or UI with named substitutes.
+   Assertion: observable state or response actually checked by the test.
+   Evidence: run command, head SHA and outcome, or `not run` if unknown.
+
+Use the same compact pattern for other tiers. Group closely related parameter
+cases under one scenario when their assertion is the same. Keep automated test
+presence separate from execution status and from author reported manual proof.
+Do not describe a proposed test or a command in a PR body as an added test.
 
 Say whether an automated end to end test was added to this PR. A test of a
 plan builder is an integration or plan test if it never executes the external
