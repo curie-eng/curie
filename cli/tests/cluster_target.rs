@@ -111,6 +111,10 @@ fn cluster_cases() -> Vec<ClusterCase> {
             args: &["publication-policy", "acme-bot", "--dry-run"],
         },
         ClusterCase {
+            name: "factory-progress",
+            args: &["factory-progress", "acme-bot", "--dry-run"],
+        },
+        ClusterCase {
             name: "surfaces",
             args: &["surfaces", "acme-bot", "--dry-run"],
         },
@@ -394,7 +398,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 42);
+    assert_eq!(covered_names.len(), 43);
 }
 
 #[test]
@@ -555,6 +559,10 @@ fn connection_backed_verbs_discover_the_file_target() {
         (
             "publication-policy",
             &["cluster", "publication-policy", "acme-bot"],
+        ),
+        (
+            "factory-progress",
+            &["cluster", "factory-progress", "acme-bot"],
         ),
         ("surfaces", &["cluster", "surfaces", "acme-bot"]),
         (

@@ -1218,6 +1218,32 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read or set the Slack channel one agent's factory runs post progress to
+    /// (`PATCH /agents/{id}`, `factory_slack_channel`).
+    ///
+    /// This is its own verb, not a flag on `curie cluster factory`: that
+    /// command configures release-wide Helm intake, has no API connection and
+    /// no agent argument, so a per-agent setting there would be ambiguous.
+    ///
+    /// With neither flag this inspects. The agent must already hold exactly
+    /// one Slack binding with an identity for the channel; add it first with
+    /// `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>`. Binding it is
+    /// a separate decision because it also makes the agent answer there.
+    FactoryProgress {
+        /// Agent name or id.
+        agent: String,
+        /// Post progress to this Slack channel id (public C..., private G...).
+        #[arg(long, value_name = "CHANNEL_ID", conflicts_with = "no_slack_channel")]
+        slack_channel: Option<String>,
+        /// Stop posting factory progress to Slack.
+        #[arg(long)]
+        no_slack_channel: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List, add, or remove an agent's surfaces
     /// (`/agents/{id}/channels`).
     ///

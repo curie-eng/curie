@@ -375,6 +375,10 @@ pub struct Agent {
     pub publication_draft: bool,
     #[serde(default)]
     pub publication_branch_prefix: Option<String>,
+    /// The Slack channel a factory run's progress posts to. `None` means no
+    /// Slack progress. Set through `<tier> factory-progress`.
+    #[serde(default)]
+    pub factory_slack_channel: Option<String>,
     /// Whether this agent's connector calls carry the verified requester (ADR
     /// 0270 decision 1). `None` means a platform older than the flag, which
     /// `approvals --requester-identity` reports instead of reading it as off.
@@ -2610,6 +2614,36 @@ fn mint_channel_token_body(
     }
 }
 
+/// The refusal for a 409 `factory_slack_channel_unbound`, or `None` when the
+/// body carries any other detail (the caller then reports the raw 409).
+///
+/// The wire shape is `{"detail": {"code": "factory_slack_channel_unbound"}}`,
+/// so the code is read from the parsed detail object, never matched as a loose
+/// substring of the body.
+fn factory_slack_unbound_refusal(
+    body: &str,
+    tier: &str,
+    agent: &str,
+    channel: &str,
+) -> Option<anyhow::Error> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let code = value.get("detail")?.get("code")?.as_str()?;
+    if code != "factory_slack_channel_unbound" {
+        return None;
+    }
+    let message = format!(
+        "agent {agent} has no Slack binding for channel {channel} (exactly one binding with an identity is required)"
+    );
+    let fix = format!(
+        "bind the channel with `curie {tier} surfaces {agent} --add slack={channel}`, then rerun this command"
+    );
+    // The typed error keeps the exit class and the `--json` fix; the operator
+    // context is what the human path prints as `Fix:`.
+    let typed =
+        anyhow::Error::from(crate::exit::CliError::failure(message.clone()).with_fix(fix.clone()));
+    Some(crate::exit::operator_context(typed, message, Some(fix)))
+}
+
 /// Is this 404 a MISSING ENDPOINT rather than a missing resource?
 ///
 /// FastAPI answers an unrouted path with exactly `{"detail":"Not Found"}`,
@@ -3658,6 +3692,61 @@ impl ApiClient {
                 "PATCH /agents/{id}",
             )
             .await?;
+        Self::expect_ok(resp, "updating the agent")
+            .await?
+            .json()
+            .await
+            .context("decoding updated agent")
+    }
+
+    /// `PATCH /agents/{id}` carrying only `factory_slack_channel`: a channel
+    /// sets it, `None` sends an explicit `null` and clears it.
+    ///
+    /// A 409 whose body is `{"detail": {"code": "factory_slack_channel_unbound"}}`
+    /// becomes a failure that names the exact `surfaces --add` command for
+    /// `tier`. The command is only named, never run: a surface binding also
+    /// makes the agent answer in that channel and picks its Slack identity,
+    /// which is a separate decision from where factory progress posts. A 422
+    /// is a usage error carrying the API's message. Everything else falls
+    /// through to [`Self::expect_ok`].
+    pub async fn update_agent_factory_slack_channel(
+        &self,
+        agent: &Agent,
+        channel: Option<&str>,
+        tier: &str,
+    ) -> Result<Agent> {
+        let body = AgentUpdate {
+            factory_slack_channel: Some(channel.map(str::to_string)),
+            ..AgentUpdate::default()
+        };
+        let resp = self
+            .send_request(
+                self.http
+                    .patch(format!("{}/agents/{}", self.base_url, agent.id))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentUpdate>(&body),
+                "PATCH /agents/{id}",
+            )
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            let text = resp.text().await.unwrap_or_default();
+            if let Some(channel) = channel {
+                if let Some(refusal) =
+                    factory_slack_unbound_refusal(&text, tier, &agent.name, channel)
+                {
+                    return Err(refusal);
+                }
+            }
+            bail!("updating the agent failed with {status}: {}", text.trim());
+        }
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(crate::exit::CliError::usage(format!(
+                "the API rejected the factory Slack channel: {}",
+                text.trim()
+            ))));
+        }
         Self::expect_ok(resp, "updating the agent")
             .await?
             .json()
@@ -7228,6 +7317,48 @@ mod tests {
     /// A typed request body as it goes on the wire.
     fn wire<T: serde::Serialize>(body: &T) -> serde_json::Value {
         serde_json::to_value(body).expect("request bodies serialize")
+    }
+
+    #[test]
+    fn the_unbound_409_names_the_surfaces_command_for_the_tier() {
+        let body = r#"{"detail":{"code":"factory_slack_channel_unbound"}}"#;
+        for tier in ["local", "cluster"] {
+            let refusal =
+                super::factory_slack_unbound_refusal(body, tier, "acme-bot", "C0EXAMPLE1")
+                    .expect("the unbound code is recognised");
+            let error = refusal;
+            let (class, fix) = crate::exit::classify(&error);
+            assert_eq!(class, crate::exit::ExitClass::Failure);
+            assert!(
+                format!("{error:#}").contains("no Slack binding"),
+                "{error:#}"
+            );
+            assert_eq!(
+                fix.as_deref(),
+                Some(
+                    format!(
+                        "bind the channel with `curie {tier} surfaces acme-bot --add slack=C0EXAMPLE1`, then rerun this command"
+                    )
+                    .as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_409_body_is_not_the_unbound_refusal() {
+        for body in [
+            r#"{"detail":{"code":"something_else"}}"#,
+            r#"{"detail":"factory_slack_channel_unbound"}"#,
+            r#"{"code":"factory_slack_channel_unbound"}"#,
+            "not json factory_slack_channel_unbound",
+        ] {
+            assert!(
+                super::factory_slack_unbound_refusal(body, "local", "acme-bot", "C0EXAMPLE1")
+                    .is_none(),
+                "{body}"
+            );
+        }
     }
 
     /// One percent-decoding pass, as the API applies to the request path and

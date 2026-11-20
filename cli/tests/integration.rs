@@ -114,6 +114,7 @@ mod example_sre_bot_install;
 mod exit_codes;
 mod factory_github_app;
 mod factory_preparation_install;
+mod factory_progress_verb;
 mod factory_quickstart_context;
 mod factory_quickstart_forges;
 mod factory_quickstart_gitlab;

@@ -388,6 +388,12 @@
       "version": "1.0"
     },
     {
+      "result": "FactoryProgressOutput",
+      "kind": "CliOutput",
+      "schema": "factory-progress.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "QuickstartOutput",
       "kind": "CliOutput",
       "schema": "factory-quickstart.schema.json",
