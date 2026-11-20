@@ -760,9 +760,13 @@ def render_deployment(
                     # An operator-named ServiceAccount, for a connector whose
                     # projected token is its cloud identity. Absent, the pod
                     # runs as `default` and the render is unchanged. Token
-                    # mounting stays the ServiceAccount's own setting.
+                    # mounting stays the ServiceAccount's own setting. The
+                    # deprecated alias is declared too, so that a later apply
+                    # without either field removes both: the API server fills
+                    # the alias on write, and an alias this field manager does
+                    # not own survives the apply and restores the name.
                     **(
-                        {"serviceAccountName": service_account}
+                        {"serviceAccountName": service_account, "serviceAccount": service_account}
                         if service_account is not None
                         else {}
                     ),
