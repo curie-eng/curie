@@ -109,21 +109,21 @@ def observed_revision(request: dict[str, Any]) -> str | None:
 
 
 def trailing_message(request: dict[str, Any]) -> str:
-    """The role and shortened text of the request's newest message."""
+    """The roles and shortened texts of the request's newest messages, newest last."""
 
     messages = [m for m in request.get("messages") or [] if isinstance(m, dict)]
-    if not messages:
-        return ""
-    last = messages[-1]
-    content = last.get("content")
-    parts = _texts(content)
-    if isinstance(content, list):
-        parts += [
-            f"[{block.get('type')}]" + "".join(_texts(block.get("content")))
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "tool_result"
-        ]
-    return f"{last.get('role')}: " + " ".join(parts)[:240]
+    shown = []
+    for message in messages[-3:]:
+        content = message.get("content")
+        parts = _texts(content)
+        if isinstance(content, list):
+            parts += [
+                f"[{block.get('type')}]" + "".join(_texts(block.get("content")))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            ]
+        shown.append(f"{message.get('role')}: " + " ".join(parts)[:400])
+    return " || ".join(shown)
 
 
 def retarget(exchanges: list[dict[str, Any]], source: int, target: int) -> list[dict[str, Any]]:
