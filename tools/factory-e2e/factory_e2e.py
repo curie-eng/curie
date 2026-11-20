@@ -35,10 +35,10 @@ comment must name the exact pull request URL. A failure comment must state
 `Could not complete:` followed by a reason.
 
 `revision --issue-file <file> [--revision-file <file>]` waits for that run to
-open a pull request and post its final issue comment, posts an ordinary PR
-comment (it must be ignored), then a mention comment, and judges that the
-mention adds a second request to the same WorkItem that pushes a new commit to
-the same pull request and gets one linked App reply. `cancel-waiting` installs
+open a pull request and post its final issue comment, posts one plain PR
+conversation comment (no mention), and judges that it adds exactly one request
+to the same WorkItem that pushes one new commit to the same pull request and
+gets one linked App reply. `cancel-waiting` installs
 with a sandbox pod quota of 0 so
 the request waits on capacity, removes the label, and judges a direct
 `cancelled` with cause `issue_cancelled`. `cancel-running [--issue-file]`
@@ -1198,7 +1198,7 @@ def last_label_event_id(events: list[Any], label: str) -> int | None:
 
 
 def revision_request_id(repository_id: int, comment_id: int) -> uuid.UUID:
-    """The execution request id the api derives for a PR mention revision.
+    """The execution request id the api derives for a PR conversation comment revision.
 
     Mirrors UnverifiedFeedback.event_id in github_review_events.py and the
     request id _admit derives from it in github_factory_review.py.
@@ -1676,23 +1676,18 @@ def judge_cli_state(
 
 
 def judge_revision(obs: Mapping[str, Any]) -> list[str]:
-    """Every way a PR mention revision falls short. Empty means it passed. Pure."""
+    """Every way a plain PR comment revision falls short. Empty means it passed. Pure."""
 
     failures: list[str] = []
-    if obs.get("ordinary_delivery_api_status") != "factory_ignored":
+    if obs.get("comment_delivery_status_code") != 200:
+        failures.append(f"the comment delivery got HTTP {obs.get('comment_delivery_status_code')}")
+    if obs.get("comment_delivery_api_status") != "factory_admitted":
         failures.append(
-            "the ordinary PR comment was not ignored: api status "
-            f"{obs.get('ordinary_delivery_api_status')!r}"
+            f"the comment was not admitted: api status {obs.get('comment_delivery_api_status')!r}"
         )
-    if obs.get("ordinary_new_requests") != 0:
+    if obs.get("comment_new_requests") != 1:
         failures.append(
-            f"the ordinary PR comment created {obs.get('ordinary_new_requests')} request(s)"
-        )
-    if obs.get("mention_delivery_status_code") != 200:
-        failures.append(f"the mention delivery got HTTP {obs.get('mention_delivery_status_code')}")
-    if obs.get("mention_delivery_api_status") != "factory_admitted":
-        failures.append(
-            f"the mention was not admitted: api status {obs.get('mention_delivery_api_status')!r}"
+            f"the comment added {obs.get('comment_new_requests')} request(s), expected exactly 1"
         )
     if not obs.get("work_item_id") or obs.get("revision_request_work_item_id") != obs.get(
         "work_item_id"
@@ -1711,19 +1706,25 @@ def judge_revision(obs: Mapping[str, Any]) -> list[str]:
         failures.append(f"the pull request changed: #{before} before, #{after} after")
     if not obs.get("head_sha_after") or obs.get("head_sha_after") == obs.get("head_sha_before"):
         failures.append("the pull request head did not move")
-    if int(obs.get("commits_after") or 0) <= int(obs.get("commits_before") or 0):
-        failures.append("the pull request gained no commit")
+    gained = int(obs.get("commits_after") or 0) - int(obs.get("commits_before") or 0)
+    if gained != 1:
+        failures.append(f"the pull request gained {gained} commit(s), expected exactly 1")
     replies = list(obs.get("revision_replies") or [])
     if len(replies) != 1:
         failures.append(f"{len(replies)} App replies carry the revision marker, expected one")
-    elif not obs.get("mention_comment_url") or not re.search(
-        rf"(?m)^In response to {re.escape(str(obs['mention_comment_url']))}\s*$",
+    elif not obs.get("comment_url") or not re.search(
+        rf"(?m)^In response to {re.escape(str(obs['comment_url']))}\s*$",
         str(replies[0].get("body") or ""),
     ):
-        failures.append("the revision reply does not link the mention comment")
-    if obs.get("app_comments_after_ordinary") != 1:
+        failures.append("the revision reply does not link the plain comment")
+    if int(obs.get("revision_replies_on_other_pull_requests") or 0) != 0:
         failures.append(
-            f"{obs.get('app_comments_after_ordinary')} App comments followed the ordinary "
+            f"{obs.get('revision_replies_on_other_pull_requests')} revision reply(ies) landed "
+            "on another pull request"
+        )
+    if obs.get("app_comments_after_comment") != 1:
+        failures.append(
+            f"{obs.get('app_comments_after_comment')} App comments followed the plain "
             "comment, expected only the revision reply"
         )
     if obs.get("default_branch_moved"):
@@ -4656,7 +4657,6 @@ SCENARIOS["issue-to-pr"] = issue_to_pr
 # Scenarios: revision, cancel-waiting, cancel-running
 # --------------------------------------------------------------------------
 
-REVISION_QUIET_SECONDS = 60
 CANCEL_QUIET_SECONDS = 180
 CANCEL_SETTLE_SECONDS = 600
 WAITING_HOLD_SECONDS = 300
@@ -4686,6 +4686,12 @@ def revision_comment_text(text: str | None, mention: str) -> str:
 
     body = (text or DEFAULT_REVISION_TEXT).strip()
     return body if f"@{mention}" in body else f"@{mention} {body}"
+
+
+def plain_comment_text(text: str | None) -> str:
+    """The plain comment body: the operator text, not addressed to the factory. Pure."""
+
+    return (text or DEFAULT_REVISION_TEXT).strip()
 
 
 def _timeline(obs: dict[str, Any], event: str, **facts: Any) -> None:
@@ -4776,8 +4782,8 @@ def _new_obs(p: Preflight) -> dict[str, Any]:
 
 
 def revision(p: Preflight) -> dict[str, Any]:
-    """The labelled run opens a PR; an ordinary PR comment is ignored; a
-    mention revises the same PR under the same WorkItem."""
+    """The labelled run opens a PR; one plain PR comment revises the same PR
+    under the same WorkItem."""
 
     obs = _new_obs(p)
     work_item_id = obs["work_item_id"]
@@ -4849,37 +4855,20 @@ def revision(p: Preflight) -> dict[str, Any]:
     )
     requests_before = len(detail.get("requests") or [])
 
-    # An ordinary comment on the owned PR: ignored, no request, no reply.
+    # One plain comment on the owned PR: one revision request on the same WorkItem.
     since = time.time()
-    ordinary = p.post_pr_comment(
-        pr_number, "Noting for the record: the change reads fine so far. No action needed."
-    )
-    obs["ordinary_comment_id"] = ordinary.get("id")
-    obs["ordinary_comment_created_at"] = ordinary.get("created_at")
-    _timeline(obs, "ordinary comment posted", comment_id=ordinary.get("id"))
-    delivery = _await_comment_delivery(p, int(ordinary["id"]), since)
-    obs["ordinary_delivery_id"] = delivery.get("guid")
-    obs["ordinary_delivery_status_code"] = delivery.get("status_code")
-    obs["ordinary_delivery_api_status"] = delivery_api_status(delivery)
-    _timeline(obs, "ordinary comment delivered", api_status=obs["ordinary_delivery_api_status"])
-    log(f"revision: quiet window {REVISION_QUIET_SECONDS}s after the ordinary comment")
-    time.sleep(REVISION_QUIET_SECONDS)
-    quiet = p.work_item_detail(work_item_id) or {}
-    obs["ordinary_new_requests"] = len(quiet.get("requests") or []) - requests_before
-
-    # The mention: one revision request on the same WorkItem.
-    since = time.time()
-    mention = p.post_pr_comment(pr_number, revision_comment_text(p.revision_text, p.config.mention))
-    mention_id = int(mention["id"])
-    obs["mention_comment_id"] = mention_id
-    obs["mention_comment_url"] = mention.get("html_url")
-    _timeline(obs, "mention posted", comment_id=mention_id)
-    delivery = _await_comment_delivery(p, mention_id, since)
-    obs["mention_delivery_id"] = delivery.get("guid")
-    obs["mention_delivery_status_code"] = delivery.get("status_code")
-    obs["mention_delivery_api_status"] = delivery_api_status(delivery)
-    _timeline(obs, "mention delivered", api_status=obs["mention_delivery_api_status"])
-    revision_id = str(revision_request_id(p.repository_id, mention_id))
+    comment = p.post_pr_comment(pr_number, plain_comment_text(p.revision_text))
+    comment_id = int(comment["id"])
+    obs["comment_id"] = comment_id
+    obs["comment_url"] = comment.get("html_url")
+    obs["comment_created_at"] = comment.get("created_at")
+    _timeline(obs, "plain comment posted", comment_id=comment_id)
+    delivery = _await_comment_delivery(p, comment_id, since)
+    obs["comment_delivery_id"] = delivery.get("guid")
+    obs["comment_delivery_status_code"] = delivery.get("status_code")
+    obs["comment_delivery_api_status"] = delivery_api_status(delivery)
+    _timeline(obs, "plain comment delivered", api_status=obs["comment_delivery_api_status"])
+    revision_id = str(revision_request_id(p.repository_id, comment_id))
     obs["revision_request_id"] = revision_id
     try:
         request = _wait(
@@ -4918,6 +4907,7 @@ def revision(p: Preflight) -> dict[str, Any]:
     obs["pr_number_after"] = pr_after.get("number") if pr_after else None
     obs["work_item_state_after"] = detail.get("state")
     obs["request_statuses"] = _ordered_statuses(detail)
+    obs["comment_new_requests"] = len(detail.get("requests") or []) - requests_before
     obs["publication"] = detail.get("publication")
     obs["head_sha_after"], obs["commits_after"] = p.pr_head(pr_number)
     obs["pull_request_numbers"] = _scenario_pr_numbers(p)
@@ -4928,13 +4918,16 @@ def revision(p: Preflight) -> dict[str, Any]:
     obs["revision_replies"] = [
         {**r, "body": record_agent_text(r["body"], known)[0]} for r in replies
     ]
-    ordinary_at = _parse_time(obs.get("ordinary_comment_created_at"))
-    obs["app_comments_after_ordinary"] = sum(
+    obs["revision_replies_on_other_pull_requests"] = sum(
+        len(replies_on(number)) for number in obs["pull_request_numbers"] if number != pr_number
+    )
+    comment_at = _parse_time(obs.get("comment_created_at"))
+    obs["app_comments_after_comment"] = sum(
         1
         for c in pr_comments
         if _app_authored(c, p.config.mention, p.config.app_id)
-        and ordinary_at is not None
-        and (_parse_time(c.get("created_at")) or ordinary_at) >= ordinary_at
+        and comment_at is not None
+        and (_parse_time(c.get("created_at")) or comment_at) >= comment_at
     )
     obs["default_branch_moved"] = p.default_branch_head() != p.head_before
     _timeline(obs, "revision ended", terminal=terminal, head_sha=obs["head_sha_after"])

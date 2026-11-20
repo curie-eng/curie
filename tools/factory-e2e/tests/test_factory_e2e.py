@@ -1756,10 +1756,9 @@ def test_run_parses_revision_file_and_cancel_running_issue_file_optional() -> No
 
 def _revision_obs(**overrides: Any) -> dict[str, Any]:
     obs: dict[str, Any] = {
-        "ordinary_delivery_api_status": "factory_ignored",
-        "ordinary_new_requests": 0,
-        "mention_delivery_status_code": 200,
-        "mention_delivery_api_status": "factory_admitted",
+        "comment_delivery_status_code": 200,
+        "comment_delivery_api_status": "factory_admitted",
+        "comment_new_requests": 1,
         "work_item_id": "w1",
         "revision_request_work_item_id": "w1",
         "request_statuses": ["completed", "completed"],
@@ -1775,9 +1774,10 @@ def _revision_obs(**overrides: Any) -> dict[str, Any]:
                 "body": "The requested revision is pushed.\nIn response to https://github.com/acme/fixture/pull/7#issuecomment-555\n"
             }
         ],
-        "mention_comment_id": 555,
-        "mention_comment_url": "https://github.com/acme/fixture/pull/7#issuecomment-555",
-        "app_comments_after_ordinary": 1,
+        "comment_id": 555,
+        "comment_url": "https://github.com/acme/fixture/pull/7#issuecomment-555",
+        "revision_replies_on_other_pull_requests": 0,
+        "app_comments_after_comment": 1,
         "default_branch_moved": False,
         "cli_failures": [],
     }
@@ -1792,7 +1792,7 @@ def _revision_obs(**overrides: Any) -> dict[str, Any]:
         "In response to https://github.com/acme/fixture/pull/7#issuecomment-5550\n",
     ],
 )
-def test_judge_revision_requires_the_exact_mention_link(body: str) -> None:
+def test_judge_revision_requires_the_exact_comment_link(body: str) -> None:
     assert fe.judge_revision(_revision_obs(revision_replies=[{"body": body}])) != []
 
 
@@ -1801,27 +1801,75 @@ def test_judge_revision_passes_the_clean_fixture() -> None:
 
 
 @pytest.mark.parametrize(
-    "overrides",
+    ("overrides", "message"),
     [
-        {"ordinary_delivery_api_status": "factory_admitted"},
-        {"ordinary_new_requests": 1},
-        {"mention_delivery_status_code": 500},
-        {"mention_delivery_api_status": "factory_ignored"},
-        {"revision_request_work_item_id": "w2"},
-        {"request_statuses": ["completed"]},
-        {"pull_request_numbers": [7, 8]},
-        {"pr_number_after": 8},
-        {"head_sha_after": "a" * 40},
-        {"commits_after": 1},
-        {"revision_replies": []},
-        {"revision_replies": [{"body": "no reference here"}]},
-        {"app_comments_after_ordinary": 2},
-        {"default_branch_moved": True},
-        {"cli_failures": ["work-items exit 1"]},
+        ({"comment_delivery_status_code": 500}, "the comment delivery got HTTP 500"),
+        (
+            {"comment_delivery_api_status": "factory_ignored"},
+            "the comment was not admitted: api status 'factory_ignored'",
+        ),
+        (
+            {"revision_request_work_item_id": "w2"},
+            "the revision request does not belong to the original WorkItem",
+        ),
+        (
+            {"pull_request_numbers": [7, 8]},
+            "2 pull requests were opened, expected exactly one",
+        ),
+        ({"pr_number_after": 8}, "the pull request changed: #7 before, #8 after"),
+        ({"head_sha_after": "a" * 40}, "the pull request head did not move"),
+        ({"commits_after": 1}, "the pull request gained 0 commit(s), expected exactly 1"),
+        ({"commits_after": 3}, "the pull request gained 2 commit(s), expected exactly 1"),
+        ({"revision_replies": []}, "0 App replies carry the revision marker, expected one"),
+        (
+            {"revision_replies": [{"body": "no reference here"}]},
+            "the revision reply does not link the plain comment",
+        ),
+        (
+            {"app_comments_after_comment": 2},
+            "2 App comments followed the plain comment, expected only the revision reply",
+        ),
+        ({"default_branch_moved": True}, "the default branch moved during the run"),
+        ({"cli_failures": ["work-items exit 1"]}, "cli: work-items exit 1"),
     ],
 )
-def test_judge_revision_fails_one_rule_at_a_time(overrides: dict[str, Any]) -> None:
-    assert fe.judge_revision(_revision_obs(**overrides)) != []
+def test_judge_revision_fails_one_rule_at_a_time(overrides: dict[str, Any], message: str) -> None:
+    assert message in fe.judge_revision(_revision_obs(**overrides))
+
+
+def test_judge_revision_rejects_zero_requests() -> None:
+    failures = fe.judge_revision(
+        _revision_obs(comment_new_requests=0, request_statuses=["completed"], commits_after=1)
+    )
+    assert "the comment added 0 request(s), expected exactly 1" in failures
+    assert "the WorkItem has 1 request(s), expected 2" in failures
+
+
+def test_judge_revision_rejects_two_requests() -> None:
+    failures = fe.judge_revision(
+        _revision_obs(
+            comment_new_requests=2, request_statuses=["completed", "completed", "completed"]
+        )
+    )
+    assert "the comment added 2 request(s), expected exactly 1" in failures
+    assert "the WorkItem has 3 request(s), expected 2" in failures
+
+
+def test_judge_revision_rejects_a_reply_on_a_second_pull_request() -> None:
+    failures = fe.judge_revision(
+        _revision_obs(
+            pull_request_numbers=[7, 8],
+            revision_replies=[],
+            revision_replies_on_other_pull_requests=1,
+        )
+    )
+    assert "1 revision reply(ies) landed on another pull request" in failures
+    assert "2 pull requests were opened, expected exactly one" in failures
+
+
+def test_plain_comment_text_is_not_addressed_to_the_factory() -> None:
+    assert fe.plain_comment_text("  add a test \n") == "add a test"
+    assert "@" not in fe.plain_comment_text(None)
 
 
 def _cancel_waiting_obs(**overrides: Any) -> dict[str, Any]:
