@@ -745,6 +745,11 @@ pub(crate) enum ClusterAction {
         /// Select polling or webhook intake. Omit to keep the recorded mode.
         #[arg(long, value_parser = ["poll", "webhook"])]
         intake: Option<String>,
+        /// Select the installation's model auth mode (factory.modelAuthMode):
+        /// service or personal. Personal needs the Kubernetes sandbox
+        /// substrate. Omit to keep the recorded mode.
+        #[arg(long, value_parser = ["service", "personal"], conflicts_with_all = ["disable", "repo_runners", "repo_docker"])]
+        model_auth_mode: Option<String>,
         /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.
         /// Sets `api.githubRepoAllowlist`. With --app-id, pass at least one
         /// --repo or use --all-installed-repos to allow the whole installation.

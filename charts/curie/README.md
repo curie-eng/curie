@@ -2704,6 +2704,21 @@ release namespace, and both Deployments receive
 `CURIE_PERSONAL_GRANT_NAMESPACE`. Changing it requires every user to
 reconnect. See `docs/operations.md`, "Personal Claude enrollment".
 
+### Factory model auth mode
+
+`factory.modelAuthMode` (default `service`) selects the installation's model
+auth mode: `service` runs every WorkItem on the installation's model
+credential, and `personal` runs each one on its owner's enrolled personal
+Claude subscription. `curie cluster factory --model-auth-mode personal` writes
+it. The chart renders it as `FACTORY_MODEL_AUTH_MODE` into both the API and the
+worker from one helper, so the two cannot disagree. Any other value fails the
+render, and so does setting `FACTORY_MODEL_AUTH_MODE` through `api.extraEnv` or
+`worker.extraEnv`, even with an equal value. Personal mode needs the Kubernetes
+sandbox substrate: a personal render whose `worker.extraEnv` sets
+`CURIE_SANDBOX_SUBSTRATE` to anything but `kubernetes` fails, because the
+worker would refuse to start. `ci/factory-model-auth-mode-assertions.sh` pins
+this.
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement

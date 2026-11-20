@@ -13,9 +13,11 @@ here. The command reference is
 Your operator has to finish these steps first. The links are the configuration.
 This page does not repeat it.
 
-1. The installation is Kubernetes, with `FACTORY_MODEL_AUTH_MODE=personal` and
-   `CURIE_SANDBOX_SUBSTRATE=kubernetes`. There is no chart switch for the mode.
-   See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue).
+1. The installation is Kubernetes, in personal mode on the Kubernetes sandbox
+   substrate. The operator selects the mode with
+   `curie cluster factory --model-auth-mode personal`, which sets the chart
+   value `factory.modelAuthMode`; `curie cluster status` shows it as
+   `factory model auth mode: personal`. See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue).
 2. `personalClaude.grantNamespace` names an existing namespace used only for
    personal grant custody. An empty value makes enrollment answer
    `custody_unconfigured`. See
@@ -230,7 +232,7 @@ a declared test driver on a test installation, are in
 
 ## Other ways in
 
-1. Adding the factory label with `FACTORY_MODEL_AUTH_MODE=personal` admits a
+1. Adding the factory label with `factory.modelAuthMode` set to `personal` admits a
    WorkItem when the labeller is linked to a principal whose personal Claude
    enrollment is active. The WorkItem owner is that principal at the
    enrollment's generation. An unlinked labeller is refused
@@ -312,8 +314,13 @@ variable, or run on a cluster with `curie cluster up`.
 `personal`. A different case or surrounding spaces does not select the mode.
 Other `skill` and `local` commands are not refused by this check.
 
-A worker with `FACTORY_MODEL_AUTH_MODE=personal` refuses to start unless the
-substrate is Kubernetes. That error is
+On a cluster, `factory.modelAuthMode` is the only switch. The chart renders it
+as `FACTORY_MODEL_AUTH_MODE` into both the API and the worker, and refuses the
+variable in `api.extraEnv` or `worker.extraEnv`. A personal release whose
+`worker.extraEnv` sets `CURIE_SANDBOX_SUBSTRATE` to anything but `kubernetes`
+is refused by `curie cluster factory --model-auth-mode personal` and by the
+chart render, before anything is applied. A worker started in personal mode
+on another substrate anyway refuses to start with
 `personal_mode_requires_kubernetes: FACTORY_MODEL_AUTH_MODE=personal needs CURIE_SANDBOX_SUBSTRATE=kubernetes`.
 
 ## Known limitations

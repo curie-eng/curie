@@ -1345,6 +1345,13 @@ factory:
   githubAppClientSecretExistingSecret: ""
   githubAppClientSecretExistingSecretKey: clientSecret
   intake: poll  # or webhook
+  # Model auth mode for the whole installation (ADR 0268): service (the
+  # default) runs every WorkItem on the installation's model credential;
+  # personal runs each on its owner's enrolled personal Claude subscription and
+  # needs the Kubernetes sandbox substrate. Rendered as FACTORY_MODEL_AUTH_MODE
+  # into both the api and the worker, which must agree; set it here (or with
+  # `curie cluster factory --model-auth-mode`), never through extraEnv.
+  modelAuthMode: service
   baseLabelSettleSeconds: 60
   # Requester coding instructions (ADR 0278): admission pins each requester's
   # stored document and the worker delivers it to the implementer. false makes

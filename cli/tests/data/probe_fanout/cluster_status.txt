@@ -1,4 +1,5 @@
 curie · namespace curie · revision 3 · deployed
 UI            http://127.0.0.1:30080/?api=1
 Langfuse      kubectl -n curie port-forward svc/curie-langfuse-web 3000:3000  then http://localhost:3000
+factory model auth mode: unknown (computed release values unavailable)
 upgrade idle · phase idle · known-good none

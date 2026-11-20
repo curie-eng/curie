@@ -1948,6 +1948,28 @@ true
      without the block renders. */}}
 {{- define "curie.factory.mount" -}}/etc/curie/forges{{- end -}}
 
+{{/* The installation's model auth mode (ADR 0268), rendered as
+     FACTORY_MODEL_AUTH_MODE into BOTH the api and the worker from this one
+     helper so the two cannot drift. Absent or null means service. The schema
+     enum refuses other values; this guard also covers renders that skip the
+     schema. Personal mode needs the Kubernetes substrate: the worker refuses
+     to start (personal_mode_requires_kubernetes) when worker.extraEnv selects
+     another CURIE_SANDBOX_SUBSTRATE, so the render refuses first. */}}
+{{- define "curie.factory.modelAuthMode" -}}
+{{- $mode := get (.Values.factory | default dict) "modelAuthMode" | default "service" | toString -}}
+{{- if not (has $mode (list "service" "personal")) -}}
+{{- fail (printf "factory.modelAuthMode must be service or personal, got %q." $mode) -}}
+{{- end -}}
+{{- if eq $mode "personal" -}}
+{{- range (.Values.worker.extraEnv | default list) -}}
+{{- if and (eq .name "CURIE_SANDBOX_SUBSTRATE") (ne (.value | default "kubernetes" | toString | trim | lower) "kubernetes") -}}
+{{- fail (printf "factory.modelAuthMode=personal needs the Kubernetes sandbox substrate, but worker.extraEnv sets CURIE_SANDBOX_SUBSTRATE=%s; remove that entry (kubernetes is the default) or set factory.modelAuthMode=service." (.value | toString)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $mode -}}
+{{- end -}}
+
 {{/* A number as a plain string, never in exponent form. */}}
 {{- define "curie.factory.str" -}}
 {{- if kindIs "float64" . }}{{ . | int64 | toString }}{{ else }}{{ . | toString }}{{ end -}}

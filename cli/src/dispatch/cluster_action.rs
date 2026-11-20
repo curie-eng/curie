@@ -401,6 +401,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         }
         ClusterAction::Factory {
             intake,
+            model_auth_mode,
             repos,
             all_installed_repos,
             label,
@@ -460,6 +461,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     private_key_file,
                     org,
                     intake,
+                    model_auth_mode,
                     runner_binding,
                     repo_runners,
                     registry,

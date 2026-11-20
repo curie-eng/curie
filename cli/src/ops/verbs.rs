@@ -959,6 +959,19 @@ pub struct ClusterStatus {
     /// Each recorded forge credential's expiry (#4397), from the computed
     /// values; a warning is also in `warnings`.
     pub credentials: Vec<crate::forge_expiry::ExpiryLine>,
+    /// `factory.modelAuthMode` from the computed release values (`service`
+    /// or `personal`); `None` when those values or the key are unavailable.
+    pub factory_model_auth_mode: Option<String>,
+}
+
+/// The installation's model auth mode as the computed release values record
+/// it at `factory.modelAuthMode`. `None` when the values are unavailable or
+/// the release's chart predates the key.
+pub fn factory_model_auth_mode(computed: Option<&serde_json::Value>) -> Option<String> {
+    computed?
+        .pointer("/factory/modelAuthMode")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 impl crate::ui::CliOutput for ClusterStatusOutput {
@@ -987,6 +1000,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     "healthy": healthy,
                     "upgrade": s.upgrade.to_json(),
                     "credentials": serde_json::to_value(&s.credentials).expect("credentials serialize"),
+                    "factory_model_auth_mode": s.factory_model_auth_mode,
                 })
             }
         }
@@ -1016,6 +1030,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 for line in &s.credentials {
                     ui.payload(&line.status_line());
                 }
+                ui.payload(&factory_model_auth_mode_line(
+                    s.factory_model_auth_mode.as_deref(),
+                ));
                 ui.payload(&format!(
                     "upgrade {} · phase {} · known-good {}",
                     s.upgrade.status,
@@ -1040,6 +1057,14 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
             }
         }
     }
+}
+
+/// The human status line for the installation's model auth mode.
+pub fn factory_model_auth_mode_line(mode: Option<&str>) -> String {
+    format!(
+        "factory model auth mode: {}",
+        mode.unwrap_or("unknown (computed release values unavailable)")
+    )
 }
 
 pub(crate) enum MailVerdict {
@@ -1331,6 +1356,8 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         _ => Vec::new(),
     };
     let read_health = !credentials.is_empty() && helm_ok;
+    let factory_model_auth_mode =
+        factory_model_auth_mode(computed.as_ref().ok().and_then(Option::as_ref));
 
     let (ui_url, langfuse_url, worker_claims, delivery, health) = tokio::join!(
         resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
@@ -1436,6 +1463,7 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         delivery,
         upgrade,
         credentials,
+        factory_model_auth_mode,
     }));
     let json = crate::ui::CliOutput::to_json(&output);
     if let Some(error) = context_error {
@@ -7163,6 +7191,7 @@ mod tests {
             },
             upgrade: crate::ops::upgrade::UpgradeStatusView::idle(None),
             credentials: Vec::new(),
+            factory_model_auth_mode: None,
         }));
         crate::ui::CliOutput::to_json(&output)["healthy"].clone()
     }
@@ -7845,5 +7874,63 @@ mod tests {
                 .any(|l| l.contains("get svc curie-langfuse-web")),
             "{lines:?}"
         );
+    }
+
+    fn model_auth_mode_status(mode: Option<String>) -> ClusterStatusOutput {
+        ClusterStatusOutput::Status(Box::new(ClusterStatus {
+            namespace: "acme".to_string(),
+            revision: "1".to_string(),
+            release_state: "deployed".to_string(),
+            release_found: true,
+            release_missing_note: None,
+            pods: Vec::new(),
+            ready: 0,
+            total: 0,
+            unhealthy: Vec::new(),
+            warnings: Vec::new(),
+            pods_listed: true,
+            urls: Vec::new(),
+            delivery: crate::completion_outbox::Report::unknown(),
+            upgrade: crate::ops::upgrade::UpgradeStatusView::idle(None),
+            credentials: Vec::new(),
+            factory_model_auth_mode: mode,
+        }))
+    }
+
+    #[test]
+    fn model_auth_mode_status_reads_the_computed_chart_value() {
+        for mode in ["service", "personal"] {
+            let computed = serde_json::json!({"factory": {"modelAuthMode": mode}});
+            let read = factory_model_auth_mode(Some(&computed));
+            assert_eq!(read.as_deref(), Some(mode));
+            let json = crate::ui::CliOutput::to_json(&model_auth_mode_status(read.clone()));
+            assert_eq!(json["factory_model_auth_mode"], mode, "{json}");
+            assert_eq!(
+                factory_model_auth_mode_line(read.as_deref()),
+                format!("factory model auth mode: {mode}")
+            );
+        }
+    }
+
+    #[test]
+    fn model_auth_mode_status_is_null_without_computed_values() {
+        for computed in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"factory": {}})),
+        ] {
+            let read = factory_model_auth_mode(computed.as_ref());
+            assert_eq!(read, None, "{computed:?}");
+            let json = crate::ui::CliOutput::to_json(&model_auth_mode_status(read.clone()));
+            assert!(
+                json.get("factory_model_auth_mode")
+                    .is_some_and(serde_json::Value::is_null),
+                "{json}"
+            );
+            assert_eq!(
+                factory_model_auth_mode_line(None),
+                "factory model auth mode: unknown (computed release values unavailable)"
+            );
+        }
     }
 }

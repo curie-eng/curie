@@ -114,6 +114,7 @@ worker:
   CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS: worker.workspace.uploadTimeoutSeconds
   DATABASE_URL: postgres.host / postgres.port / postgres.auth / postgres.sslMode
   DB_SCHEMA: the chart-managed database schema (remove this override)
+  FACTORY_MODEL_AUTH_MODE: factory.modelAuthMode
   LANGFUSE_HOST: langfuse.host / langfuse.web.service.port
   LANGFUSE_PUBLIC_KEY: langfuse.init.projectPublicKey
   LANGFUSE_SECRET_KEY: langfuse.existingSecret
@@ -201,6 +202,7 @@ api:
   FACTORY_GITHUB_APP_CLIENT_ID: factory.githubAppClientId
   FACTORY_GITHUB_APP_CLIENT_SECRET: factory.githubAppClientSecretExistingSecret
   FACTORY_INTAKE: factory.intake
+  FACTORY_MODEL_AUTH_MODE: factory.modelAuthMode
   FACTORY_BASE_LABEL_SETTLE_S: factory.baseLabelSettleSeconds
   CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY: factory.requesterCodingInstructions.apply
   GITHUB_API_URL: api.githubApiUrl

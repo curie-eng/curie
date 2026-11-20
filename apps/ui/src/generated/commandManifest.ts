@@ -6110,6 +6110,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Select the installation's model auth mode (factory.modelAuthMode): service or personal. Personal needs the Kubernetes sandbox substrate. Omit to keep the recorded mode",
+              "id": "model_auth_mode",
+              "long": "model-auth-mode",
+              "positional": false,
+              "possible_values": [
+                "service",
+                "personal"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation. With --repo-runner/--repo-docker, selects advisory discovery only; the recorded intake allowlist stays unchanged",
               "id": "repos",
               "long": "repo",
