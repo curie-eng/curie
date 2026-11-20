@@ -25,6 +25,7 @@ B and C transcripts, scrubbed of the stub's address.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
@@ -167,6 +168,12 @@ def write_private(path: Path, text: str) -> None:
 
 def rule_view(rule: Mapping[str, Any]) -> dict[str, Any]:
     return {key: rule.get(key) for key in ("id", "label", "state", "version", "source_url", "text")}
+
+
+def key_digest(key: Any) -> str:
+    """A short digest of a request's lane key, to match a capture to the answer served."""
+
+    return hashlib.sha256(str(key).encode()).hexdigest()[:16]
 
 
 class LearnedRulesRun(sk.ScriptedRun):
@@ -492,14 +499,20 @@ class LearnedRulesRun(sk.ScriptedRun):
         return max((int(row["sequence"]) for row in self.captures()), default=0)
 
     def window_captures(
-        self, window: tuple[int, int], issue: int, rule_text: str | None
+        self,
+        window: tuple[int, int],
+        issue: int,
+        rule_text: str | None,
+        requester_text: str | None = None,
     ) -> list[dict[str, Any]]:
         lo, hi = window
         found = []
         for row in self.captures():
             if not lo <= int(row["sequence"]) <= hi or row.get("issue") != issue:
                 continue
-            positions = lrs.prompt_positions(str(row.get("system") or ""), rule_text)
+            positions = lrs.prompt_positions(
+                str(row.get("system") or ""), rule_text, requester_text
+            )
             found.append(
                 {
                     "sequence": int(row["sequence"]),
@@ -747,7 +760,12 @@ class LearnedRulesRun(sk.ScriptedRun):
             "closes": lrs.closes(pull.get("body")),
             "work_item_memory_rules": item.get("memory_rules"),
             "window": [window[0], window[1]],
-            "captures": self.window_captures(window, number, rule_text),
+            "captures": self.window_captures(
+                window,
+                number,
+                rule_text,
+                REQUESTER_FILE.read_text() if number == lrs.TICKET_B else None,
+            ),
             "annotations": lrs.annotation_lines(pull.get("body")),
             "added_asserts": lrs.added_assert_lines(diff),
         }
@@ -926,19 +944,43 @@ class LearnedRulesRun(sk.ScriptedRun):
         """g: lanes complete, nothing unrouted, every capture on its ticket."""
 
         captures = [
-            {"sequence": int(c["sequence"]), "issue": c.get("issue")} for c in self.captures()
+            {
+                "sequence": int(c["sequence"]),
+                "issue": c.get("issue"),
+                "ordinal": c.get("ordinal"),
+                "key": key_digest(c.get("lane_key")),
+            }
+            for c in self.captures()
         ]
         if self.args.record:
             with self.model._lock:
                 tags = list(self.model.recorded_tags)
+                pairs = list(zip(self.model._exchanges, tags, strict=False))
             counts = {letter: tags.count(letter) for letter in lrs.TICKETS}
             untagged = sum(1 for tag in tags if tag not in lrs.TICKETS)
+            served = [
+                {
+                    "lane": lrs.LANES[tag],
+                    "ordinal": exchange["ordinal"],
+                    "key": key_digest(exchange["lane_key"]),
+                }
+                for exchange, tag in pairs
+                if tag in lrs.LANES
+            ]
             self.record_step(
-                "g", record=True, recorded_counts=counts, untagged=untagged, captures=captures
+                "g",
+                record=True,
+                recorded_counts=counts,
+                untagged=untagged,
+                captures=captures,
+                served=served,
             )
             return
         assert self.router is not None
-        self.record_step("g", record=False, lanes=self.router.evidence(), captures=captures)
+        served = [{**row, "key": key_digest(row["key"])} for row in self.router.served_log]
+        self.record_step(
+            "g", record=False, lanes=self.router.evidence(), captures=captures, served=served
+        )
 
     # Recording and teardown ---------------------------------------------------
 
@@ -968,7 +1010,9 @@ class LearnedRulesRun(sk.ScriptedRun):
         except (OSError, subprocess.SubprocessError) as exc:
             errors.append(str(exc))
         errors.extend(super().cleanup())
-        if self.args.record and self.model is not None:
+        # Only a chain the judge passed may replace the committed fixtures: a failure
+        # anywhere, including before the first model call, leaves all three as they were.
+        if self.args.record and self.model is not None and self.chain.get("result") == "passed":
             try:
                 self.write_recording()
             except (scripted_lanes.LaneError, OSError, ValueError) as exc:

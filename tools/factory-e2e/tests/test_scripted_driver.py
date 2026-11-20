@@ -3289,3 +3289,48 @@ def test_a_learned_rules_recording_is_split_by_ticket_and_scrubbed(
         run.write_recording()
     # A failed split leaves every committed file as it was.
     assert {letter: path.read_text() for letter, path in run.transcripts.items()} == committed
+
+
+@pytest.mark.parametrize(
+    ("exchanges", "tags", "passed"),
+    [
+        # A failure after ticket A's model calls: the split alone would succeed and
+        # replace B and C with empty transcripts.
+        ([_recorded("a0", "one"), _recorded("a1", "two")], ["a", "a"], False),
+        # A failure after the model was set up and before its first call.
+        ([], [], False),
+        # The control: a chain the judge passed writes all three files.
+        (
+            [_recorded("a0", "one"), _recorded("b0", "two"), _recorded("c0", "three")],
+            list("abc"),
+            True,
+        ),
+    ],
+    ids=["failed-after-a", "failed-before-first-call", "passed-chain-writes"],
+)
+def test_cleanup_replaces_the_replay_fixtures_only_after_a_passed_chain(
+    exchanges: list[dict[str, Any]],
+    tags: list[str | None],
+    passed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    # The cluster, registry and endpoint teardown is not under test here.
+    monkeypatch.setattr(sk.ScriptedRun, "cleanup", lambda _self: [])
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    first.parent.mkdir()
+    run = lrr.LearnedRulesRun(_chain_args(first, "--record"))
+    for path in run.transcripts.values():
+        path.write_text(json.dumps({"version": 1, "exchanges": [{"committed": path.name}]}))
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.stub = _RecordedStub()
+    run.model = _RecordedModel(list(exchanges), list(tags))
+    run.workdir = tmp_path / "work"
+    if passed:
+        run.chain["result"] = "passed"
+    run.cleanup()
+    after = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    assert (after != committed) is passed
+    if passed:
+        assert [e["lane_key"] for e in json.loads(after["b"])["exchanges"]] == ["b0"]

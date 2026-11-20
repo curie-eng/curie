@@ -28,6 +28,7 @@ g. every ticket lane is complete and every captured prompt is on its ticket.
 
 from __future__ import annotations
 
+import ast
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -53,6 +54,7 @@ WRITE_ACCESS_REQUIRED = "memory_rules.write_access_required"
 SECTION_OPEN = "<<<curie-learned-rules "
 SECTION_CLOSE = "<<<end-curie-learned-rules sha256="
 REQUESTER_OPEN = "<<<curie-requester-preferences"
+REQUESTER_CLOSE = "<<<end-curie-requester-preferences"
 # apps/api/src/curie_api/memory_rules_context.py (applied_line, annotate).
 LEARNED_PREFIX = "Learned rules:"
 REQUESTER_PREFIX = "Requester preferences:"
@@ -60,8 +62,6 @@ REQUESTER_APPLIED = re.compile(r"^Requester preferences: applied; sha256:[0-9a-f
 SENDER_FRAME = "[platform-sender"
 ASSERT_CALL = "assertAlmostEqual("
 PLACES = "places=6"
-# The keyword's value, so `places=60` or `places=6.5` never passes as six.
-_PLACES_SIX = re.compile(r"\bplaces\s*=\s*6(?![\d.])")
 _CODE = re.compile(r"memory_rules\.[a-z_]+")
 
 
@@ -77,9 +77,12 @@ def _require(condition: bool, message: str) -> None:
 # Pure readers the driver uses to turn raw observations into step evidence ------
 
 
-def prompt_positions(system: str, rule_text: str | None) -> dict[str, Any]:
+def prompt_positions(
+    system: str, rule_text: str | None, requester_text: str | None = None
+) -> dict[str, Any]:
     """Where a system prompt opens and closes the learned rules section and the
-    requester section, and whether the section carries ``R1: <rule_text>``."""
+    requester section, whether the section carries ``R1: <rule_text>``, and
+    whether the requester section carries ``requester_text``."""
 
     opened = system.find(SECTION_OPEN)
     closed = system.find(SECTION_CLOSE)
@@ -87,11 +90,17 @@ def prompt_positions(system: str, rule_text: str | None) -> dict[str, Any]:
     rule_line = False
     if opened >= 0 and closed > opened and rule_text:
         rule_line = f"\nR1: {rule_text}\n" in system[opened:closed]
+    requester_closed = system.find(REQUESTER_CLOSE, requester) if requester >= 0 else -1
+    requester_line = False
+    if requester >= 0 and requester_closed > requester and requester_text:
+        requester_line = requester_text.strip() in system[requester:requester_closed]
     return {
         "open": opened if opened >= 0 else None,
         "close": closed if closed >= 0 else None,
         "requester": requester if requester >= 0 else None,
         "rule_line": rule_line,
+        "requester_text": requester_line,
+        "system_chars": len(system),
     }
 
 
@@ -113,6 +122,36 @@ def added_assert_lines(diff: str) -> list[str]:
         for line in diff.splitlines()
         if line.startswith("+") and not line.startswith("+++") and ASSERT_CALL in line
     ]
+
+
+def places_six(line: str) -> bool:
+    """Whether the line is one call whose ``places`` keyword argument is the integer 6.
+
+    Read from the parsed call, so a comment, a string or another keyword that
+    spells ``places=6`` does not count, and ``places=60`` or ``places=6.5`` is not six.
+    """
+
+    try:
+        tree = ast.parse(line.strip())
+    except SyntaxError:
+        return False
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == ASSERT_CALL.rstrip("(")
+    ]
+    if not calls:
+        return False
+    for call in calls:
+        values = [kw.value for kw in call.keywords if kw.arg == "places"]
+        if len(values) != 1:
+            return False
+        value = values[0]
+        if not (isinstance(value, ast.Constant) and type(value.value) is int and value.value == 6):
+            return False
+    return True
 
 
 def tool_use_names(message: Mapping[str, Any]) -> list[str]:
@@ -318,7 +357,15 @@ def assert_ticket_b(step: Mapping[str, Any]) -> None:
             capture["close"] < requester,
             "B's learned rules section does not end before the requester section",
         )
+        _require(
+            capture.get("requester_text") is True,
+            "B's requester section does not carry the conflicting requester document",
+        )
     _require(bool(others), "no reviewer prompt of B was captured, so none was checked")
+    empty = [c.get("sequence") for c in others if not int(c.get("system_chars") or 0)]
+    _require(
+        not empty, f"B's reviewer captures hold no system prompt, so none was checked: {empty}"
+    )
     copied = [c.get("sequence") for c in others if c.get("open") is not None]
     _require(not copied, f"B's reviewer prompts carry the learned rules section: {copied}")
     lines = list(step.get("annotations") or [])
@@ -340,7 +387,7 @@ def assert_ticket_b(step: Mapping[str, Any]) -> None:
     )
     added = list(step.get("added_asserts") or [])
     _require(bool(added), "B's diff adds no assertAlmostEqual( call")
-    bare = [line for line in added if not _PLACES_SIX.search(line)]
+    bare = [line for line in added if not places_six(line)]
     _require(not bare, f"B's diff adds assertAlmostEqual( without {PLACES}: {bare}")
 
 
@@ -375,6 +422,50 @@ def _window(step: Mapping[str, Any], issue: int) -> tuple[int, int]:
     )
     assert isinstance(window, Sequence)
     return int(window[0]), int(window[1])
+
+
+def _tie_captures_to_lanes(
+    step: Mapping[str, Any], captures: Sequence[Mapping[str, Any]], *, record: bool
+) -> None:
+    """Every request a lane served has the capture of that request on the lane's ticket.
+
+    ``served`` lists one row per answered request (the lane that answered it, the
+    answer's ordinal and a digest of the request's lane key); each is matched to
+    one capture by key and ordinal that names the lane's ticket.
+    A replay also owes the converse: a capture no lane answered is refused. A
+    recording proxies requests the upstream may have refused, so only the first
+    direction binds it.
+    """
+
+    served = list(step.get("served") or [])
+    _require(bool(served), "no served request was listed, so no capture was tied to a lane")
+    remaining = list(captures)
+    for row in served:
+        lane = str(row.get("lane"))
+        _require(lane in LANES.values(), f"a request was served by an unknown lane: {lane}")
+        issue = TICKETS[lane.rsplit("-", 1)[-1]]
+        found = next(
+            (
+                c
+                for c in remaining
+                if c.get("key") == row.get("key")
+                and c.get("ordinal") == row.get("ordinal")
+                and c.get("issue") == issue
+            ),
+            None,
+        )
+        _require(
+            found is not None,
+            f"lane {lane} served ordinal {row.get('ordinal')} with no capture of that request "
+            f"on #{issue}",
+        )
+        assert found is not None
+        remaining.remove(found)
+    if not record:
+        _require(
+            not remaining,
+            f"captures no lane served: {[c.get('sequence') for c in remaining]}",
+        )
 
 
 def assert_lanes(
@@ -412,6 +503,7 @@ def assert_lanes(
             _require(issue == inside[0], f"capture {sequence} in #{inside[0]}'s run names #{issue}")
         else:
             _require(issue not in windows, f"capture {sequence} names #{issue} outside its run")
+    _tie_captures_to_lanes(step, captures, record=record)
 
 
 def assert_chain(evidence: Mapping[str, Any], *, record: bool) -> None:

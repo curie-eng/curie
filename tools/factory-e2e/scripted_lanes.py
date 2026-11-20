@@ -162,6 +162,9 @@ class LaneRouter:
         self.normalize_key = normalize_key
         self.lanes: dict[tuple[str, int], Lane] = {}
         self.unrouted: list[dict[str, Any]] = []
+        # One row per answered request: the lane, the answer's ordinal and the
+        # request's raw lane key, so a capture of that request can be tied to it.
+        self.served_log: list[dict[str, Any]] = []
         self.hooks: list[Callable[[Lane, int], None]] = []
         # Called for an (agent, issue) with no lane yet, for issues the platform
         # creates during the run; a resolver returns the lane or None.
@@ -227,6 +230,7 @@ class LaneRouter:
                 return None
             return self._fallback(method, path, body)
         wanted = self._request_key(request)
+        raw_key = wanted[0] if wanted is not None else None
         normalize = self.normalize_key or (lambda key: key)
         if wanted is not None:
             wanted = (normalize(wanted[0]), wanted[1])
@@ -246,6 +250,9 @@ class LaneRouter:
                 lane.revisions.append(revision)
             lane.used.add(index)
             lane.served.append(exchange["ordinal"])
+            self.served_log.append(
+                {"lane": lane.name, "ordinal": exchange["ordinal"], "key": raw_key}
+            )
             for hook in self.hooks:
                 hook(lane, exchange["ordinal"])
             return dict(answer)

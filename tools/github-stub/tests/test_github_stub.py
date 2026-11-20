@@ -1291,3 +1291,65 @@ def test_production_code_host_resolves_the_stub_accounts(
     assert seen["reader_can_write"] is False
     assert seen["unknown_login"] is None
     assert seen["unknown_can_write"] is False
+
+
+def test_the_production_write_check_refuses_the_reader_and_admits_the_writer_through_the_stub(
+    stub: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``memory_rules._write_refusal`` is the production login-to-permission
+    composition: it reads the account's login, builds the actor from it and asks
+    whether that actor can write. Only the registry lookup is replaced, by a
+    connection whose adapter is the real GitHub code host aimed at the stub, so
+    an actor built from another account's login changes the answer."""
+
+    import asyncio
+    from types import SimpleNamespace
+
+    from curie_api.forges.github.code_host import PATH_ID_PREFIX, GitHubCodeHost
+    from curie_api.routers import memory_rules
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(stub.ca_file))
+    settings = Settings(
+        GITHUB_API_URL=stub.base_url,
+        GITHUB_APP_ID="51",
+        GITHUB_APP_PRIVATE_KEY=_app_key(),
+        GITHUB_TOKEN="",
+    )
+
+    async def run() -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            verify=ssl.create_default_context(cafile=str(stub.ca_file)), trust_env=False
+        ) as client:
+
+            def adapter(_client: Any, *, repository: Any = None) -> GitHubCodeHost:
+                # As GitHubCodeHostConnection.adapter builds it from the hint.
+                return GitHubCodeHost(
+                    client,
+                    api_url=stub.base_url,
+                    html_base=stub.base_url,
+                    timeout_s=30,
+                    credentials=GitHubCredentials(auth=GitHubAuth.from_settings(settings)),
+                    repository_paths={repository.project_id: repository.path}
+                    if repository is not None
+                    else {},
+                )
+
+            registry = SimpleNamespace(
+                code_host_for=lambda _kind, _host: SimpleNamespace(adapter=adapter)
+            )
+            monkeypatch.setattr(memory_rules, "forges_registry", lambda _settings: registry)
+            repository = await adapter(client).resolve_repository(f"{PATH_ID_PREFIX}{REPO}")
+            scope = memory_rules._Scope(
+                repository.kind, repository.host, repository.project_id, repository.path
+            )
+            return {
+                "writer": await memory_rules._write_refusal(client, scope, "6630"),
+                "reader": await memory_rules._write_refusal(client, scope, "6631"),
+                "unknown": await memory_rules._write_refusal(client, scope, "999999"),
+            }
+
+    seen = asyncio.run(run())
+    assert seen["writer"] is None
+    for who in ("reader", "unknown"):
+        assert seen[who] is not None
+        assert seen[who].detail["code"] == "memory_rules.write_access_required"

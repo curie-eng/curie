@@ -65,7 +65,25 @@ def _capture(sequence: int, issue: int, *, implementer: bool, section: bool) -> 
         "close": 900 if section else None,
         "requester": 1000 if implementer else None,
         "rule_line": section,
+        "requester_text": implementer and issue == lrs.TICKET_B,
+        "system_chars": 5000,
     }
+
+
+_G_ISSUES = (
+    *((n, lrs.TICKET_A) for n in range(1, 11)),
+    *((n, lrs.TICKET_B) for n in range(11, 14)),
+    *((n, lrs.TICKET_C) for n in range(14, 16)),
+)
+
+
+def _g_capture(sequence: int, issue: int) -> dict[str, Any]:
+    return {"sequence": sequence, "issue": issue, "ordinal": sequence, "key": f"key-{sequence}"}
+
+
+def _served(sequence: int, issue: int) -> dict[str, Any]:
+    letter = next(k for k, v in lrs.TICKETS.items() if v == issue)
+    return {"lane": lrs.LANES[letter], "ordinal": sequence, "key": f"key-{sequence}"}
 
 
 def _passing() -> dict[str, Any]:
@@ -182,11 +200,8 @@ def _passing() -> dict[str, Any]:
                     },
                     "unrouted": [],
                 },
-                "captures": [
-                    *({"sequence": n, "issue": lrs.TICKET_A} for n in range(1, 11)),
-                    *({"sequence": n, "issue": lrs.TICKET_B} for n in range(11, 14)),
-                    *({"sequence": n, "issue": lrs.TICKET_C} for n in range(14, 16)),
-                ],
+                "captures": [_g_capture(n, issue) for n, issue in _G_ISSUES],
+                "served": [_served(n, issue) for n, issue in _G_ISSUES],
             },
         ]
     }
@@ -938,6 +953,10 @@ class _Factory:
         self.run, self.stub, self.model, self.rule_text = run, stub, model, rule_text
         self.rules_in_force = True
         self.items: dict[int, dict[str, Any]] = {}
+        # Counterexamples: what the install would deliver if a link were wrong.
+        self.requester_text = REQUESTER_TEXT
+        self.reviewer_system = True
+        self.b_asserts = ["self.assertAlmostEqual(convert(0, 'f', 'r'), 459.67, places=6)"]
 
     def request(self, number: int, *, implementer: bool) -> None:
         issue_url = f"{self.stub.base_url}/{REPO}/issues/{number}"
@@ -952,7 +971,7 @@ class _Factory:
                     "text": requester_section(
                         SELECTION,
                         REQUESTER_DIGEST,
-                        REQUESTER_TEXT,
+                        self.requester_text,
                         learned_rules=self.rules_in_force,
                     ),
                 }
@@ -962,10 +981,11 @@ class _Factory:
             first = f"<system-reminder>\nReview the change for {issue_url}\n</system-reminder>"
         body = {
             "model": "claude",
-            "system": system,
             "tools": [{"name": "Read"}],
             "messages": [{"role": "user", "content": [{"type": "text", "text": first}]}],
         }
+        if implementer or self.reviewer_system:
+            body["system"] = system
         self.model._capture(json.dumps(body).encode())
 
     def publish(self, number: int, asserts: list[str]) -> None:
@@ -1005,9 +1025,12 @@ def _post_pull(stub: Any, branch: str, body: str) -> int:
         return int(json.load(response)["number"])
 
 
-def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub: Any
-) -> None:
+def _drive_steps_d_to_f(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub: Any, **faults: Any
+) -> tuple[lrr.LearnedRulesRun, dict[str, Any]]:
+    """Run accept, ticket B and ticket C through the real driver code against the
+    real stub; ``faults`` set attributes of the install stand-in before it runs."""
+
     from types import SimpleNamespace
 
     # The stub module is loaded by path, so read its accounts from the class's module.
@@ -1025,6 +1048,8 @@ def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
     model = model_module.ModelScript(empty, capture_dir=run.capture_dir, issue_of=run.identity)
     rule_text = lrs.RULE_TEXT
     factory = _Factory(run, stub, model, rule_text)
+    for name, value in faults.items():
+        setattr(factory, name, value)
     raw_source = f"{stub.base_url}/{REPO}/pull/7#issuecomment-41"
     listed = {"id": RULE_ID, "label": "R1", "state": "proposed", "version": 2}
     listed.update(source_url=raw_source, text=rule_text)
@@ -1043,12 +1068,7 @@ def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
         factory.request(number, implementer=True)
         factory.request(number, implementer=False)
         factory.request(number, implementer=True)
-        asserts = (
-            ["self.assertAlmostEqual(convert(0, 'f', 'r'), 459.67, places=6)"]
-            if number == lrs.TICKET_B
-            else []
-        )
-        factory.publish(number, asserts)
+        factory.publish(number, factory.b_asserts if number == lrs.TICKET_B else [])
 
     def sql(query: str) -> list[Any]:
         for number in (lrs.TICKET_B, lrs.TICKET_C):
@@ -1081,7 +1101,13 @@ def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
     finally:
         run.stub = None
         run.cleanup()
-    steps = {step["step"]: step for step in run.chain["steps"]}
+    return run, {step["step"]: step for step in run.chain["steps"]}
+
+
+def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub: Any
+) -> None:
+    run, steps = _drive_steps_d_to_f(tmp_path, monkeypatch, stub)
     assert set(steps) == {"a", "b", "c", "d", "e", "f"}
     rule = lrs.assert_promoted(steps["c"], 7, REPLY_URL)
     accepted = lrs.assert_decided(steps["d"], rule)
@@ -1090,6 +1116,122 @@ def test_steps_d_to_f_pass_the_judge_on_raw_host_inputs_through_the_real_stub(
     assert all(c["issue"] == lrs.TICKET_B for c in steps["e"]["captures"])
     stored = json.dumps(run.chain["steps"])
     assert stub.base_url not in stored and f"{stub.host}:{stub.port}" not in stored
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        # The section renders but carries another document than the one the writer set.
+        ({"requester_text": "Use tabs for indentation."}, "conflicting requester document"),
+        # A reviewer request whose system prompt the capture writer stores as "".
+        ({"reviewer_system": False}, "hold no system prompt"),
+        # The keyword says five; a trailing comment spells six.
+        (
+            {
+                "b_asserts": [
+                    "self.assertAlmostEqual(convert(0, 'f', 'r'), 459.67, places=5)"
+                    "  # previously places=6"
+                ]
+            },
+            "without places=6",
+        ),
+    ],
+    ids=["other-requester-document", "empty-reviewer-prompt", "places-six-in-a-comment"],
+)
+def test_ticket_b_counterexamples_through_the_real_stub_and_capture_writer_are_refused(
+    fault: dict[str, Any],
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stub: Any,
+) -> None:
+    # The driver judges step e as it lands, so the run stops there with the judge's words.
+    with pytest.raises(lrr.LearnedRulesError, match=message):
+        _drive_steps_d_to_f(tmp_path, monkeypatch, stub, **fault)
+
+
+def _tie_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    drop_capture: int | None = None,
+    foreign_capture: int | None = None,
+) -> tuple[lrr.LearnedRulesRun, Any]:
+    """Two requests per ticket served by the real router and captured by the real
+    capture writer; the driver's own step g then reads both."""
+
+    from types import SimpleNamespace
+
+    for name in ("DOCKER_HOST", "DOCKER_CONTEXT", "CURIE_LOCAL_STUB_HOST"):
+        monkeypatch.delenv(name, raising=False)
+    model_module = sk._module("learned_rules_tie_model_script", lrr.MODEL_SCRIPT)
+    identity = lrl.issue_identity(SimpleNamespace(_get=lambda *_args: None))
+    bodies: list[tuple[int, bytes]] = []
+    transcripts = lrl.transcript_paths(tmp_path / "chain-a.json")
+    for letter, number in lrl.TICKETS.items():
+        exchanges = []
+        for kind in ("implement", "review"):
+            first = f"{kind} https://stub.example.test/{REPO}/issues/{number}"
+            body = {
+                "system": [{"type": "text", "text": f"{kind} system"}],
+                "messages": [{"role": "user", "content": [{"type": "text", "text": first}]}],
+            }
+            raw = json.dumps(body).encode()
+            key = model_module.request_key(body)
+            message = {"type": "message", "content": []}
+            exchanges.append({"lane_key": key[0], "ordinal": key[1], "message": message})
+            bodies.append((number, raw))
+        model_module.dump_transcript(transcripts[letter], exchanges)
+    args = fe.parse_args(
+        ["scripted", "--scenario", "learned-rules", "--transcript", str(transcripts["a"])]
+    )
+    run = lrr.LearnedRulesRun(args)
+    run.workdir = tmp_path / "work"
+    run.capture_dir = run.workdir / "model-captures"
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({"version": 1, "exchanges": []}))
+    model = model_module.ModelScript(empty, capture_dir=run.capture_dir, issue_of=identity)
+    run.router = lrl.build_router(model_module, transcripts, identity)
+    run.router.install(model, model_module, fallback=False)
+    for index, (_number, raw) in enumerate(bodies):
+        if index != drop_capture:
+            model._capture(raw)
+        assert model._match("POST", "/v1/messages", raw) is not None
+    if foreign_capture is not None:
+        # The capture of this request names another ticket than the lane that served it.
+        path = sorted(run.capture_dir.glob("*.json"))[foreign_capture]
+        row = json.loads(path.read_text())
+        row["issue"] = lrs.TICKET_C
+        path.write_text(json.dumps(row))
+    return run, model_module
+
+
+def _step_g(run: lrr.LearnedRulesRun) -> dict[str, Any]:
+    run.lanes_step()
+    return next(step for step in run.chain["steps"] if step["step"] == "g")
+
+
+def test_every_served_request_has_its_capture_on_the_serving_lanes_ticket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, _ = _tie_run(tmp_path, monkeypatch)
+    lrs.assert_lanes(_step_g(run), {}, record=False)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"drop_capture": 3}, "served ordinal 0 with no capture of that request on #3921"),
+        ({"foreign_capture": 3}, "no capture of that request on #3921"),
+    ],
+    ids=["dropped-capture", "capture-on-another-ticket"],
+)
+def test_a_dropped_or_misfiled_capture_is_refused_per_request(
+    changes: dict[str, Any], message: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, _ = _tie_run(tmp_path, monkeypatch, **changes)
+    with pytest.raises(lrs.LearnedRulesAssertionError, match=message):
+        lrs.assert_lanes(_step_g(run), {}, record=False)
 
 
 def _secret_scan_rule(rule_id: str) -> Any:
