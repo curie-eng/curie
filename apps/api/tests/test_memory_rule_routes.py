@@ -1103,3 +1103,166 @@ def test_snapshot_refuses_long_rules_with_large_numbers(stack: Stack) -> None:
     # A short rule still fits beside the same fifteen.
     _accepts(stack, _rule(stack, number=base + 17, text="Keep it short."))
     assert _accepted_count(stack) == 16
+
+
+# --- the console's recorded requests and responses ----------------------------------
+
+# The console's client (`apps/ui/src/api/client.ts`) is the caller of these routes.
+# Its requests are recorded by `apps/ui/src/api/memoryRules.client.test.ts` and
+# replayed here against the registered routes; the routes' answers are recorded here
+# and read back through that client by the console's own tests. Each side fails when
+# its vector drifts, so a renamed path, a renamed body field or a dropped refusal code
+# cannot slip between the two.
+CONSOLE_REQUESTS = (
+    Path(__file__).resolve().parents[3] / "tests" / "vectors" / "memory-rules-console-requests.json"
+)
+CONSOLE_RESPONSES = (
+    Path(__file__).resolve().parents[3]
+    / "tests"
+    / "vectors"
+    / "memory-rules-console-responses.json"
+)
+CONSOLE_RESPONSES_NOTE = (
+    "Real answers of the learned rule decision routes, recorded by "
+    "apps/api/tests/test_memory_rule_routes.py::"
+    "test_console_responses_match_the_console_vector, which fails when they drift. "
+    "Ids and clocks are placeholders. Refresh: CURIE_WRITE_MEMORY_RULES_VECTOR=1 "
+    "uv run pytest apps/api/tests/test_memory_rule_routes.py -k console_vector"
+)
+
+
+def _recorded(response: httpx.Response) -> dict[str, Any]:
+    return {"status": response.status_code, "body": response.json()}
+
+
+def test_console_responses_match_the_console_vector(stack: Stack) -> None:
+    _link(stack, stack.owner)
+    other = enrollment.seed_owner(stack.tenant_id, issuer=stack.issuer)
+    accepted = _decide(stack, _rule(stack, minute=1))
+    rejected = _decide(stack, _rule(stack, minute=2), "reject")
+    removed = _decide(
+        stack,
+        _rule(stack, state="accepted", decider=other.principal_id, minute=3),
+        "remove",
+    )
+    stale = _decide(stack, _rule(stack, minute=4), version=2)
+    unlinked = _decide(stack, _rule(stack, minute=5), owner=other)
+
+    def unreachable(request: httpx.Request) -> httpx.Response | None:
+        if "/collaborators/" in request.url.path:
+            raise httpx.ConnectError("connection refused", request=request)
+        return None
+
+    stack.overrides.append(unreachable)
+    unavailable = _decide(stack, _rule(stack, minute=6))
+
+    expected = {
+        "accept": (accepted, 200, "accepted"),
+        "reject": (rejected, 200, "rejected"),
+        "remove": (removed, 200, "removed"),
+    }
+    for name, (response, status, state) in expected.items():
+        assert response.status_code == status, (name, response.text)
+        assert response.json()["rule"]["state"] == state, name
+    refusals = {
+        "refusal_stale_version": (stale, 409, "memory_rules.stale_version"),
+        "refusal_write_access_required": (unlinked, 403, "memory_rules.write_access_required"),
+        "refusal_code_host_unavailable": (unavailable, 503, "memory_rules.code_host_unavailable"),
+    }
+    for name, (response, status, code) in refusals.items():
+        assert response.status_code == status, (name, response.text)
+        assert response.json()["detail"]["code"] == code, name
+
+    recorded = _stable(
+        {
+            "accept": _recorded(accepted),
+            "reject": _recorded(rejected),
+            "remove": _recorded(removed),
+            "refusal_stale_version": _recorded(stale),
+            "refusal_write_access_required": _recorded(unlinked),
+            "refusal_code_host_unavailable": _recorded(unavailable),
+        }
+    )
+    document = {"_comment": CONSOLE_RESPONSES_NOTE} | recorded
+    if os.environ.get("CURIE_WRITE_MEMORY_RULES_VECTOR") == "1":
+        CONSOLE_RESPONSES.write_text(json.dumps(document, indent=2) + "\n")
+    assert json.loads(CONSOLE_RESPONSES.read_text()) == document, (
+        f"{CONSOLE_RESPONSES.name} no longer matches the routes; refresh it as its _comment says"
+    )
+
+
+def _console_requests(stack: Stack, rule_ids: dict[str, uuid.UUID]) -> dict[str, dict[str, Any]]:
+    """The requests the console client recorded, with the placeholder ids replaced."""
+
+    recorded = json.loads(CONSOLE_REQUESTS.read_text())
+    found: dict[str, dict[str, Any]] = {}
+    for request in recorded["requests"]:
+        operation = request["operation"]
+        path = request["path"].replace(recorded["agent_id"], str(stack.agent_id))
+        if operation != "list":
+            path = path.replace(recorded["rule_id"], str(rule_ids[operation]))
+        found[operation] = {"method": request["method"], "path": path, "body": request["body"]}
+    assert set(found) == {"list", "accept", "reject", "remove"}, set(found)
+    return found
+
+
+def _send(
+    stack: Stack, request: dict[str, Any], *, path: str | None = None, body: Any = None
+) -> httpx.Response:
+    return stack.client.request(
+        request["method"],
+        path or request["path"],
+        json=body if body is not None else request["body"],
+        headers=stack.owner.headers(),
+    )
+
+
+def test_console_client_requests_are_served_by_the_registered_routes(stack: Stack) -> None:
+    _link(stack, stack.owner)
+    other = enrollment.seed_owner(stack.tenant_id, issuer=stack.issuer)
+    to_accept = _rule(stack, minute=1)
+    to_reject = _rule(stack, minute=2)
+    to_remove = _rule(stack, state="accepted", decider=other.principal_id, minute=3)
+    requests = _console_requests(
+        stack, {"accept": to_accept, "reject": to_reject, "remove": to_remove}
+    )
+
+    listed = _send(stack, requests["list"])
+    assert listed.status_code == 200, listed.text
+    assert {item["id"] for item in listed.json()["rules"]} == {
+        str(to_accept),
+        str(to_reject),
+        str(to_remove),
+    }
+    for operation, rule_id, state in (
+        ("accept", to_accept, "accepted"),
+        ("reject", to_reject, "rejected"),
+        ("remove", to_remove, "removed"),
+    ):
+        answered = _send(stack, requests[operation])
+        assert answered.status_code == 200, (operation, answered.text)
+        assert answered.json()["rule"]["state"] == state, operation
+        assert _row(rule_id)["state"] == state, operation
+
+
+def test_console_client_request_negative_controls_are_refused(stack: Stack) -> None:
+    _link(stack, stack.owner)
+    rule_id = _rule(stack)
+    before = _snapshot(rule_id)
+    requests = _console_requests(stack, {"accept": rule_id, "reject": rule_id, "remove": rule_id})
+
+    # A wrong path: the console once called Dismiss by that name, and no route has it.
+    wrong_path = requests["reject"]["path"].replace("/reject", "/dismiss")
+    missing = _send(stack, requests["reject"], path=wrong_path)
+    assert missing.status_code == 404, missing.text
+    assert _snapshot(rule_id) == before
+
+    # A wrong body: the rule's version under another name is refused, never read.
+    for body in ({"version": 1}, {"expected_version": 1, "version": 1}, {}):
+        malformed = _send(stack, requests["accept"], body=body)
+        assert malformed.status_code == 422, (body, malformed.text)
+        assert malformed.json()["detail"]["code"] == "memory_rules.invalid_request"
+        assert _snapshot(rule_id) == before
+
+    # Liveness: the recorded request itself still goes through.
+    assert _send(stack, requests["accept"]).status_code == 200

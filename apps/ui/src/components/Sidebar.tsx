@@ -10,6 +10,7 @@ const ITEMS: [Nav, string][] = [
   ["agents", "Agents"],
   ["work-items", "Work items"],
   ["factory", "Factory"],
+  ["memory", "Memory"],
   ["evals", "Evals"],
   ["observability", "Observability"],
   ["versions", "Versions"],
@@ -27,6 +28,7 @@ export function Sidebar() {
   };
   return (
     <div
+      className="app-sidebar"
       style={{
         width: 220,
         flexShrink: 0,
@@ -88,7 +90,7 @@ export function Sidebar() {
         <span style={{ color: C.muted, fontSize: 11 }}>⌄</span>
       </button>
 
-      <nav style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <nav className="app-nav" style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         {ITEMS.map(([id, label]) => {
           const active = state.nav === id && !state.agentDetail;
           const badge = badges[id];
