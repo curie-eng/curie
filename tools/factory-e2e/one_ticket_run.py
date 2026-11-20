@@ -202,6 +202,10 @@ class OneTicket:
         """Wait for session 1's questions and for its request to finish asking."""
 
         def ready() -> dict[str, Any] | None:
+            if ots.closing_pulls(self.stub._rows("pull"), ots.ISSUE):
+                raise OneTicketError(
+                    "session 1 opened a pull request instead of ending on its questions"
+                )
             if not ots.question_comments(self.comments(), ots.ISSUE):
                 return None
             observed = self.observe()
@@ -237,6 +241,14 @@ class OneTicket:
         return [c for c in self.comments() if marker in c["body"] and fe._NOTICE_FINAL in c["body"]]
 
     def execute(self, github: Any) -> None:
+        try:
+            self.drive(github)
+        finally:
+            # What each lane served, kept on failure too: the ordinals show where
+            # a session ended or continued.
+            self.evidence["lanes"] = self.router.evidence()
+
+    def drive(self, github: Any) -> None:
         bot = github.BOT["login"]
         agent = str(self.driver.evidence["agent_id"])
         self.stub.add_user(READER, "read")
@@ -293,6 +305,5 @@ class OneTicket:
             investigating_seconds=(self.sightings["investigating"] - label_at).total_seconds(),
             answer_received_seconds=(self.sightings["answer_received"] - answer_at).total_seconds(),
             second_request_seconds=(ots.instant(second["created_at"]) - answer_at).total_seconds(),
-            lanes=self.router.evidence(),
         )
         self.evidence["result"] = "passed"
