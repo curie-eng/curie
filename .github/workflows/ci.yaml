@@ -1881,14 +1881,28 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [changes]
     if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || (needs.changes.outputs.deep == 'true' && (needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true')) }}
+    permissions:
+      contents: read
+      actions: read
     steps:
+      - name: Restore image archives from the failed release run
+        if: github.ref == 'refs/heads/task/diagnose-kind-image-binding'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: 44631502933
+          pattern: ci-image-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/ci-images
       - uses: actions/checkout@v7
+        if: github.ref != 'refs/heads/task/diagnose-kind-image-binding'
         with:
           persist-credentials: false
-          ref: ${{ github.ref == 'refs/heads/task/diagnose-kind-image-binding' && 'b39b57e2402f1daafb223af0424c02c47da38d93' || '' }}
       - name: Pull Docker Hub images through the mirror
+        if: github.ref != 'refs/heads/task/diagnose-kind-image-binding'
         run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
+        if: github.ref != 'refs/heads/task/diagnose-kind-image-binding'
         id: imagescache
         continue-on-error: true
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
@@ -1912,6 +1926,7 @@ jobs:
               mirrors = ["mirror.gcr.io"]
           use: false
       - name: Write the CI image bake definition
+        if: github.ref != 'refs/heads/task/diagnose-kind-image-binding'
         run: |
           cat > ci-images-bake.json <<'EOF'
           {"group": {"default": {"targets": ["api", "dispatcher", "worker", "ui", "runner", "mail-adapter"]}},
@@ -1925,6 +1940,7 @@ jobs:
           }}
           EOF
       - name: Build the CI images in parallel
+        if: github.ref != 'refs/heads/task/diagnose-kind-image-binding'
         uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
           builder: ${{ steps.imagescache.outcome == 'success' && steps.imagescache.outputs.name || steps.imagescache_retry.outputs.name }}
@@ -1933,8 +1949,10 @@ jobs:
           push: false
           load: true
       - name: Build the worker-local overlay on the local worker base
+        if: github.ref != 'refs/heads/task/diagnose-kind-image-binding'
         run: docker build --build-arg BASE_TAG=ci-local -t curie-ci/worker-local:candidate -f compose/worker-local.Dockerfile compose
       - name: Save each image as its own archive
+        if: github.ref != 'refs/heads/task/diagnose-kind-image-binding'
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/ci-images"
