@@ -420,7 +420,7 @@ pub(crate) enum ClusterAction {
     },
     /// Open loopback port-forwards to the Console and Langfuse of a release
     /// whose services are ClusterIP (`cluster up --no-expose`, and what
-    /// `factory quickstart` installs on kind). Runs in the foreground; the
+    /// `factory quickstart` installs). Runs in the foreground; the
     /// forwards exist only while it runs. Press Ctrl-C to stop them.
     Access {
         /// Kubernetes namespace.

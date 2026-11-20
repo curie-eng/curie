@@ -683,12 +683,12 @@ pub enum QuickstartOutput {
 }
 
 impl QuickstartOutput {
-    /// The closing `cluster access` line for a finished install on a kind
-    /// context, printed by the caller after the result is emitted: it needs the
-    /// release's namespace and name, which the result does not carry.
+    /// The closing `cluster access` line for a finished install, printed by the
+    /// caller after the result is emitted: it needs the release's namespace and
+    /// name, which the result does not carry.
     pub fn console_access_hint(&self, namespace: &str, release: &str) -> Option<String> {
         match self {
-            Self::Ready { context, .. } => console_access_hint(context, namespace, release),
+            Self::Ready { context, .. } => Some(console_access_hint(context, namespace, release)),
             _ => None,
         }
     }
@@ -993,21 +993,18 @@ fn is_kind_context(name: &str) -> bool {
     name.starts_with("kind-")
 }
 
-/// How to reach the Console and Langfuse on a kind context, whose services
-/// quickstart leaves ClusterIP. `None` on any other context, which keeps the
-/// exposure `cluster up` defaults to.
-fn console_access_hint(context: &str, namespace: &str, release: &str) -> Option<String> {
-    is_kind_context(context).then(|| {
-        let mut command = format!("curie cluster access --context {context}");
-        for (flag, value) in [("--namespace", namespace), ("--release", release)] {
-            if value != "curie" {
-                command.push_str(&format!(" {flag} {value}"));
-            }
+/// How to reach the Console and Langfuse, whose services quickstart leaves
+/// ClusterIP on every context.
+fn console_access_hint(context: &str, namespace: &str, release: &str) -> String {
+    let mut command = format!("curie cluster access --context {context}");
+    for (flag, value) in [("--namespace", namespace), ("--release", release)] {
+        if value != "curie" {
+            command.push_str(&format!(" {flag} {value}"));
         }
-        format!(
-            "The Console and Langfuse are not published on this host. Run `{command}` to open them on localhost while it runs."
-        )
-    })
+    }
+    format!(
+        "The Console and Langfuse are not published on this host. Run `{command}` to open them on localhost while it runs."
+    )
 }
 
 fn unconfirmed_remote_context<'a>(
@@ -1358,12 +1355,12 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
         "--chart".into(),
         target.chart.to_string(),
     ];
+    // Quickstart is also how organisations stand up shared factory clusters, so
+    // the console and Langfuse stay ClusterIP on every path and are reached on
+    // demand with `curie cluster access`, which holds loopback port-forwards
+    // only while it runs.
+    up.push("--no-expose".into());
     if kind_target {
-        // A kind node publishes none of its NodePorts to the host, so the
-        // console and Langfuse stay ClusterIP and are reached on demand with
-        // `curie cluster access`, which holds loopback port-forwards only
-        // while it runs.
-        up.push("--no-expose".into());
         up.push("--set".into());
         up.push(GVISOR_OFF_SET.into());
     }
@@ -2913,11 +2910,11 @@ mod tests {
         assert!(plan_touches_forbidden_tool(&lines).is_none(), "{text}");
     }
 
-    /// A kind node publishes none of its NodePorts, so the kind path keeps the
-    /// console and Langfuse ClusterIP; a targeted non-kind context keeps what
-    /// `cluster up` does by default.
+    /// Quickstart keeps the console and Langfuse ClusterIP on every path: the
+    /// kind path it creates, an existing kind cluster, and a targeted
+    /// non-kind context. Only the kind paths also turn gVisor off.
     #[test]
-    fn only_the_kind_path_installs_with_no_expose() {
+    fn every_quickstart_path_installs_with_no_expose() {
         let text = describe(&quickstart_plan(&base()).unwrap()).join("\n");
         assert!(
             text.contains("--chart charts/curie --no-expose --set security.gvisor.mode=off"),
@@ -2926,27 +2923,32 @@ mod tests {
         let mut remote = base();
         remote.explicit_context = Some("remote-cluster".into());
         let text = describe(&quickstart_plan(&remote).unwrap()).join("\n");
-        assert!(!text.contains("--no-expose"), "{text}");
+        assert!(text.contains("--chart charts/curie --no-expose"), "{text}");
+        assert!(!text.contains("security.gvisor.mode=off"), "{text}");
         let mut existing_kind = base();
         existing_kind.explicit_context = Some(KIND_CONTEXT.into());
         let text = describe(&quickstart_plan(&existing_kind).unwrap()).join("\n");
-        assert!(text.contains("--no-expose"), "{text}");
+        assert!(
+            text.contains("--chart charts/curie --no-expose --set security.gvisor.mode=off"),
+            "{text}"
+        );
     }
 
     #[test]
-    fn the_access_hint_names_the_context_and_only_a_kind_context_gets_it() {
-        let hint = console_access_hint(KIND_CONTEXT, "curie", "curie").unwrap();
+    fn the_access_hint_names_the_context_on_every_context() {
+        let hint = console_access_hint(KIND_CONTEXT, "curie", "curie");
         assert!(
             hint.contains(&format!("`curie cluster access --context {KIND_CONTEXT}`")),
             "{hint}"
         );
-        assert_eq!(
-            console_access_hint("remote-cluster", "curie", "curie"),
-            None
+        let hint = console_access_hint("remote-cluster", "curie", "curie");
+        assert!(
+            hint.contains("`curie cluster access --context remote-cluster`"),
+            "{hint}"
         );
         // A namespace or release that is not the default must be in the command,
         // or the command it prints addresses a different release.
-        let hint = console_access_hint(KIND_CONTEXT, "factory", "acme").unwrap();
+        let hint = console_access_hint(KIND_CONTEXT, "factory", "acme");
         assert!(
             hint.contains(&format!(
                 "`curie cluster access --context {KIND_CONTEXT} --namespace factory --release acme`"

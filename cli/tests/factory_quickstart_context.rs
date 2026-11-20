@@ -116,6 +116,25 @@ fn the_kind_quickstart_installs_clusterip_for_cluster_access() {
     assert!(text.contains(" --no-expose "), "{text}");
 }
 
+/// The existing-cluster path (a targeted context that is not kind) installs
+/// ClusterIP as well, so quickstart opens no host port on any path and
+/// `curie cluster access` is the one opt-in way to reach the Console. It still
+/// leaves gVisor as the cluster has it.
+#[test]
+fn the_existing_cluster_quickstart_installs_clusterip_for_cluster_access() {
+    let mut input = plan_input();
+    input.explicit_context = Some("scratch-cluster".into());
+    let planned = quickstart_plan(&input).expect("an explicit context proceeds");
+    let text = describe(&planned).join("\n");
+    assert!(
+        text.contains("curie cluster up --context scratch-cluster"),
+        "{text}"
+    );
+    assert!(text.contains(" --no-expose"), "{text}");
+    assert!(!text.contains("kind create cluster"), "{text}");
+    assert!(!text.contains("security.gvisor.mode=off"), "{text}");
+}
+
 #[test]
 fn an_explicit_context_is_not_refused_without_a_terminal() {
     let mut input = plan_input();
