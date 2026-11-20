@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 NONE_DECLARATION = "None: the change follows directly from the acceptance criteria."
+# A line that is exactly this ends the section, as the next `## ` heading does. The
+# platform writes it before the lines it adds after the agent's text, so those
+# lines do not join a Decisions section the agent left last.
+SECTION_END = "---"
 # The section's nonblank lines may hold at most this many characters in total.
 # The cap is checked before any entry is parsed, so a body of any size is
 # decided in time linear in its length.
@@ -75,7 +79,7 @@ def parse_decisions_section(body: object) -> list[dict[str, Any]]:
     citations = 0
     size = 0
     for line in lines[headings[0] + 1 :]:
-        if line.startswith("## "):
+        if line.startswith("## ") or line == SECTION_END:
             break
         if line.strip():
             size += len(line)

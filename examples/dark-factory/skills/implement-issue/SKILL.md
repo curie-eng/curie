@@ -209,7 +209,9 @@ unrecorded rationale or invent an alternative to fill a slot.
 
 The pull request body contains exactly one heading line `## Decisions`, after
 the summary and before the acceptance checklist. The section ends at the next
-line beginning with `## `, or at the end of the body. Its nonblank lines use
+line beginning with `## `, at a line that is exactly `---` (the platform writes one
+before the lines it adds after your text, so a section you leave last still parses),
+or at the end of the body. Its nonblank lines use
 exactly one of these two forms:
 
 1. One to seven entries, numbered contiguously from 1, each on one line:

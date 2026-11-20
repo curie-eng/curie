@@ -46,7 +46,7 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..factory_comment_text import append_github_ask_line
+from ..factory_comment_text import append_github_ask_line, end_trailing_decisions
 from ..factory_rediscovery import issue_marker, publishing_code_host
 from ..factory_tracker_result_runtime import CONTRACT_TRACKER_RESULT
 from ..forges.config import RepositoryBindingConfig
@@ -569,6 +569,11 @@ async def create_publication(
     if data.work_item_request_id is not None:
         work_item_request_id = data.work_item_request_id
         await _refuse_tracker_result_request(session, work_item_request_id)
+        # Everything the platform adds below follows the agent's text. Close a
+        # trailing Decisions section first so none of it joins that section.
+        sectioned = end_trailing_decisions(data.body or "")
+        if sectioned != (data.body or ""):
+            data = data.model_copy(update={"body": sectioned})
         prior_paths = (
             await session.scalars(
                 select(Publication.changed_paths).where(
@@ -593,7 +598,7 @@ async def create_publication(
         if factory_ci.python_paths(changed_paths):
             try:
                 observations = await factory_progress.read_verification_observations(
-                    session, data.work_item_request_id
+                    session, work_item_request_id
                 )
             except ValueError as exc:
                 raise HTTPException(

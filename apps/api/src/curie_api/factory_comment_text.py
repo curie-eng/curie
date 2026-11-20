@@ -24,10 +24,40 @@ def github_ask_line(mention: str) -> str:
 
 
 _ASK_PREFIX = "Ask the factory:"
+_DECISIONS_HEADING = "## Decisions"
+# The line that ends a Decisions section, as the hook grammar
+# (`examples/dark-factory/hooks/decisions_section.py`) and `curie factory explain`
+# read it. A test holds all three to the same text.
+DECISIONS_SECTION_END = "---"
+
+
+def end_trailing_decisions(body: str) -> str:
+    """The body with its trailing Decisions section closed off from platform text.
+
+    Everything the platform adds after the agent's text (the closing reference,
+    the issue marker, the ask line, the preference lines) would otherwise join a
+    Decisions section the agent left last, and the section no longer parses. A
+    ``---`` line ends it. A body whose last section is not Decisions, or that
+    already ends the section, comes back unchanged, so a second call is a no-op.
+    """
+
+    lines = body.splitlines()
+    headings = [i for i, line in enumerate(lines) if line == _DECISIONS_HEADING]
+    if not headings:
+        return body
+    for line in lines[headings[-1] + 1 :]:
+        if line.startswith("## ") or line == DECISIONS_SECTION_END:
+            return body
+    closed = f"{body.rstrip()}\n\n{DECISIONS_SECTION_END}"
+    return f"{closed}\n" if body.endswith("\n") else closed
 
 
 def append_github_ask_line(body: str, mention: str) -> str:
-    """Put that line last, dropping every earlier ask line, whatever its wording."""
+    """Put that line last, dropping every earlier ask line, whatever its wording.
+
+    A trailing Decisions section is closed off first (`end_trailing_decisions`),
+    so the line never becomes part of it.
+    """
 
     line = github_ask_line(mention)
     kept: list[str] = []
@@ -38,7 +68,7 @@ def append_github_ask_line(body: str, mention: str) -> str:
                 kept.pop()
             continue
         kept.append(part)
-    text = "\n".join(kept).rstrip()
+    text = end_trailing_decisions("\n".join(kept).rstrip())
     text = f"{text}\n\n{line}" if text else line
     if body.endswith("\n"):
         text += "\n"

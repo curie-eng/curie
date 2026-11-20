@@ -618,6 +618,56 @@
           "evidence": "e"
         }
       ]
+    },
+    {
+      "id": "break-line-ends-the-section",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n\n---\n\nAsk the factory: comment on this pull request.\n",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        }
+      ]
+    },
+    {
+      "id": "break-line-ends-the-section-before-a-heading",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n---\nUnrelated text.\n## Checks\nChecks passed.\n",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        }
+      ]
+    },
+    {
+      "id": "break-line-with-nothing-before-it",
+      "body": "## Decisions\n---\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n",
+      "valid": false
+    },
+    {
+      "id": "malformed-entry-before-break-line",
+      "body": "## Decisions\n1. Keep the parser pure.\n\n---\n\nAsk the factory: comment on this pull request.\n",
+      "valid": false
+    },
+    {
+      "id": "break-line-with-trailing-space-does-not-end-the-section",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n--- \nAsk the factory: comment on this pull request.\n",
+      "valid": false
+    },
+    {
+      "id": "longer-rule-does-not-end-the-section",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n----\n",
+      "valid": false
     }
   ]
 }
