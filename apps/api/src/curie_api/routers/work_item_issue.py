@@ -1,17 +1,15 @@
 """The single issue read authorized by a factory issue read capability (ADR 0187),
-its two tracker result siblings (ADR 0277, #5586), the question route (#5785)
-and the rule proposal route (#5796, ADR 0287).
+the completion contract route, the question route (#5785) and the rule
+proposal route (#5796, ADR 0287).
 
 The same ``wir`` capability authorizes ``/work-items/completion-contract`` (the
-runner asks which contract its execution runs under; a tracker result request
-reserves its one model session there), ``/work-items/tracker-result`` (the
-runner's ``submit_tracker_result`` tool), ``/work-items/questions`` (the
-runner's ``ask_questions`` tool) and ``/work-items/rule-proposal`` (the
-runner's ``propose_rule`` tool). Each re-checks that the capability names the
-durable WorkItem's issue before and after any tracker call.
+runner asks which contract its execution runs under),
+``/work-items/questions`` (the runner's ``ask_questions`` tool) and
+``/work-items/rule-proposal`` (the runner's ``propose_rule`` tool). Each
+re-checks that the capability names the durable WorkItem's issue before and
+after any tracker call.
 """
 
-import asyncio
 import json
 import logging
 import math
@@ -35,23 +33,15 @@ from curie_api.schemas.workitems import (
     QuestionsSubmission,
     RuleProposalOut,
     RuleProposalSubmission,
-    TrackerResultOut,
-    TrackerResultSubmission,
 )
 
+from .. import completion_contract as runtime
 from .. import factory_questions as questions_core
-from .. import factory_tracker_result_runtime as runtime
 from .. import memory_rule_lifecycle as rules_core
 from .. import requester_instruction_context
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
-from ..factory_tracker_result_delivery import (
-    TrackerResultRefused,
-    TrackerResultStorageError,
-    deliver,
-)
-from ..factory_tracker_results import ProposalInvalid, parse_proposal
 from ..forges.errors import ForgeError
 from ..forges.registry import forges_registry
 from ..forges.trackers import display_reference, issue_link
@@ -179,17 +169,14 @@ return 1
 """
 
 
-async def charge_issue_read_attempt(
-    client: Redis, execution_request_id: uuid.UUID, *, purpose: str = "issue_read"
-) -> None:
-    """Charge one attempt to the execution's ``purpose`` window (issue reads,
-    or the tracker result routes, which keep their own)."""
+async def charge_issue_read_attempt(client: Redis, execution_request_id: uuid.UUID) -> None:
+    """Charge one attempt to the execution's issue read window."""
 
     try:
         charged = await client.eval(
             _CHARGE_ATTEMPT,
             1,
-            f"work_item:{purpose}:{execution_request_id}",
+            f"work_item:issue_read:{execution_request_id}",
             uuid.uuid4().hex,
             _ISSUE_READS_PER_WINDOW,
         )
@@ -291,24 +278,15 @@ def _unavailable() -> HTTPException:
     )
 
 
-# Tracker result siblings (ADR 0277, #5586) -----------------------------------------
+# The completion contract route ---------------------------------------------------
 
-# One inline delivery attempt after a submission; the reconciler retries the rest.
-_INLINE_DELIVERY_SECONDS = 45.0
-_TRACKER_RESULT_BUDGET = "tracker_result"
 _REFUSAL_MESSAGES = {
     runtime.INVALID_CONTEXT: "the execution no longer grants this call",
-    runtime.SESSION_ALREADY_STARTED: "this execution's one model session already started",
-    runtime.SESSION_NOT_STARTED: "this execution has not reserved its model session",
-    runtime.NOT_TRACKER_RESULT: "this execution does not complete with a tracker result",
-    runtime.RESULT_ALREADY_SUBMITTED: "this execution already submitted its result",
 }
 
 
 def _refused(code: str) -> HTTPException:
-    return issue_read_error(
-        409, code, _REFUSAL_MESSAGES.get(code, "the tracker result was refused")
-    )
+    return issue_read_error(409, code, _REFUSAL_MESSAGES.get(code, "the call was refused"))
 
 
 def _contract_refused(code: str) -> HTTPException:
@@ -323,7 +301,7 @@ def _contract_refused(code: str) -> HTTPException:
         409,
         {
             "code": code,
-            "message": _REFUSAL_MESSAGES.get(code, "the tracker result was refused"),
+            "message": _REFUSAL_MESSAGES.get(code, "the call was refused"),
             "rule_proposal": False,
         },
         headers={"Cache-Control": "no-store"},
@@ -359,63 +337,35 @@ async def _named_pair(session: SessionDep, claims: IssueReadClaims) -> runtime.R
 
 @router.post("/completion-contract", response_model=CompletionContractOut)
 async def read_completion_contract(
-    request: Request,
     response: Response,
     session: SessionDep,
     claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
 ) -> CompletionContractOut:
-    """The execution's completion contract; for a tracker result request, the
-    reservation of its one model session.
+    """The execution's completion contract.
 
-    The first call for a tracker result request reads the source issue's
-    title and body, mints the request's grant and reserves the session; any
-    later call is 409 ``session_already_started``, so a second runner starts
-    no model. An implementation request reserves nothing and gets no grant.
-    A publication recovery request (#5429) passes the same fences as an
-    implementation request, reserves nothing, and is answered
-    ``publication_recovery`` with no execution binding, so its runner
-    constructs no model session.
+    An implementation request is answered with its ADR 0278 execution
+    binding. A publication recovery request (#5429) passes the same fences and
+    is answered ``publication_recovery`` with no execution binding, so its
+    runner constructs no model session. A capability that does not name its
+    WorkItem's issue, a cancelled WorkItem, and a request that can no longer
+    run are 409 ``invalid_context``.
     """
 
     response.headers["Cache-Control"] = "no-store"
-    settings = get_settings()
     try:
         pair = await _named_pair(session, claims)
-        view = await runtime.contract_precheck(session, pair)
+        await runtime.contract_precheck(session, pair)
         await session.rollback()
-        if view is None:
-            await charge_issue_read_attempt(
-                request.app.state.valkey,
-                claims.execution_request_id,
-                purpose=_TRACKER_RESULT_BUDGET,
-            )
-            _tracker, digest = await runtime.read_source_sha256(
-                settings, request.app.state.http_client, pair.work_item
-            )
-            # Cancellation or a re-route may land during the tracker read.
-            await _named_pair(session, claims)
-            view = await runtime.reserve_session(
-                session,
-                request_id=claims.execution_request_id,
-                content_sha256=digest,
-                settings=settings,
-            )
     except runtime.RuntimeRefused as refused:
         # Every refusal also answers ``rule_proposal`` false (ADR 0287).
         raise _contract_refused(refused.code) from None
-    except (runtime.SourceUnavailable, IssueReadUnavailable):
-        raise _tracker_unavailable() from None
     if claims.publication_recovery:
         # Minted only for a publication recovery request's execute delivery,
         # whose kind cannot change. A CI fix or review turn on the same
         # request mints an ordinary capability and gets the ordinary
-        # workflow contract below (ADR 0269 point 5). The column CHECK pins a
-        # recovery's stored contract to implementation, so the precheck
-        # above reserved nothing.
+        # workflow contract below (ADR 0269 point 5).
         return CompletionContractOut(
             completion_contract=_PUBLICATION_RECOVERY,
-            result_kinds=[],
-            session_usd_allowance=None,
             execution=None,
             rule_proposal=False,
         )
@@ -430,98 +380,9 @@ async def read_completion_contract(
     )
     await session.rollback()
     return CompletionContractOut(
-        completion_contract=view.completion_contract,
-        result_kinds=list(view.result_kinds),
-        session_usd_allowance=view.session_usd_allowance,
+        completion_contract="implementation",
         execution=execution,
         rule_proposal=eligible is not None,
-    )
-
-
-@router.post("/tracker-result", response_model=TrackerResultOut)
-async def submit_tracker_result(
-    data: TrackerResultSubmission,
-    request: Request,
-    response: Response,
-    session: SessionDep,
-    claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
-) -> TrackerResultOut:
-    """Seal the execution's one tracker result and attempt its delivery once.
-
-    Refuses (409, nothing written) an implementation request, a request
-    whose session was never reserved, a second submission, a source issue
-    whose title or body changed since the reservation, and every grant fence
-    (`RefusalReason`); an invalid proposal is 422 with field paths and codes
-    only. An accepted result is answered with its delivery state after one
-    inline attempt; the WorkItem reconciler retries an owed one.
-    """
-
-    response.headers["Cache-Control"] = "no-store"
-    settings = get_settings()
-    try:
-        pair = await _named_pair(session, claims)
-        target = await runtime.submission_precheck(session, pair)
-        await session.rollback()
-        try:
-            proposal = parse_proposal(data.proposal)
-        except ProposalInvalid as invalid:
-            raise HTTPException(
-                422,
-                {
-                    "code": "proposal_invalid",
-                    "issues": [
-                        {"field": issue.field, "code": issue.code} for issue in invalid.issues
-                    ],
-                },
-                headers={"Cache-Control": "no-store"},
-            ) from None
-        await charge_issue_read_attempt(
-            request.app.state.valkey, claims.execution_request_id, purpose=_TRACKER_RESULT_BUDGET
-        )
-        tracker, digest = await runtime.read_source_sha256(
-            settings, request.app.state.http_client, pair.work_item
-        )
-        if target.source_content_sha256 is None or digest != target.source_content_sha256:
-            raise runtime.RuntimeRefused("source_fingerprint_changed")
-        await _named_pair(session, claims)
-        delivery_id = await runtime.seal_submission(
-            session,
-            request_id=claims.execution_request_id,
-            target=target,
-            proposal=proposal,
-            tracker=tracker,
-            settings=settings,
-        )
-    except runtime.RuntimeRefused as refused:
-        raise _refused(refused.code) from None
-    except TrackerResultRefused as refused:
-        raise _refused(refused.reason.value) from None
-    except TrackerResultStorageError:
-        raise issue_read_error(
-            503, "storage_unavailable", "The result could not be stored; retry shortly"
-        ) from None
-    except (runtime.SourceUnavailable, IssueReadUnavailable):
-        raise _tracker_unavailable() from None
-    try:
-        async with asyncio.timeout(_INLINE_DELIVERY_SECONDS):
-            await deliver(
-                request.app.state.sessionmaker,
-                delivery_id,
-                tracker=tracker,
-                settings=settings,
-                owner=f"tracker-result-route:{uuid.uuid4()}",
-            )
-    except (TimeoutError, TrackerResultStorageError):
-        # Sealed and owed: the reconciler's delivery pass retries it.
-        logger.warning("tracker result inline delivery did not finish delivery=%s", delivery_id)
-    answer = await runtime.submission_answer(session, delivery_id)
-    return TrackerResultOut.model_validate(
-        {
-            "result_kind": answer.result_kind,
-            "state": answer.state,
-            "result_comment_url": answer.result_comment_url,
-            "ticket_url": answer.ticket_url,
-        }
     )
 
 

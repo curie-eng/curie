@@ -45,7 +45,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import test_factory_tracker_results as tr
+import factory_run_support as tr
 from curie_api import factory_questions
 from curie_api.config import get_settings
 from curie_api.factory_facts_schema import REQUEST_MARKER
@@ -190,7 +190,7 @@ def world(comments: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
 # The question round, the production way ------------------------------------------
 
 
-def _running(world: World, number: int) -> tr._Triage:
+def _running(world: World, number: int) -> tr._Run:
     """A labelled issue admitted by webhook, its request acquired and started."""
 
     world.sink.issue_labels[number] = {LABEL}
@@ -225,7 +225,7 @@ def _running(world: World, number: int) -> tr._Triage:
         json={"execution_request_id": str(request_id), "publication_recovery": False},
     )
     assert minted.status_code == 200, minted.text
-    triage = tr._Triage(
+    job = tr._Run(
         client=world.client,
         request_id=request_id,
         work_item_id=row["work_item_id"],
@@ -237,8 +237,8 @@ def _running(world: World, number: int) -> tr._Triage:
         capability=minted.json()["capability"],
         context=context,
     )
-    tr._begin(triage)
-    return triage
+    tr._begin(job)
+    return job
 
 
 def _question(world: World, number: int) -> dict[str, Any]:
@@ -248,22 +248,22 @@ def _question(world: World, number: int) -> dict[str, Any]:
     return question
 
 
-def _settle(triage: tr._Triage) -> None:
+def _settle(job: tr._Run) -> None:
     """The asking request ends without a pull request: the round is outstanding."""
 
-    tr._finish(triage, "failed", "no_pull_request")
-    row = _round_row(triage.work_item_id)
+    tr._finish(job, "failed", "no_pull_request")
+    row = _round_row(job.work_item_id)
     assert row is not None and row["state"] == "outstanding", row
 
 
-def _outstanding(world: World, number: int) -> tr._Triage:
-    triage = _running(world, number)
-    response = _ask(triage)
+def _outstanding(world: World, number: int) -> tr._Run:
+    job = _running(world, number)
+    response = _ask(job)
     assert response.status_code == 200, response.text
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and row["comment_id"] == str(_question(world, number)["id"])
-    _settle(triage)
-    return triage
+    _settle(job)
+    return job
 
 
 # Delivery through each door ---------------------------------------------------------
@@ -302,19 +302,19 @@ def _code(result: dict[str, Any] | None) -> str | None:
     return str(result["errors"][0]["code"])
 
 
-def _ids(triage: tr._Triage) -> list[uuid.UUID]:
-    return [row["id"] for row in _requests(triage.work_item_id)]
+def _ids(job: tr._Run) -> list[uuid.UUID]:
+    return [row["id"] for row in _requests(job.work_item_id)]
 
 
-def _answer_id(triage: tr._Triage, comment: dict[str, Any]) -> uuid.UUID:
-    return factory_questions.answer_request_id(triage.issue, str(comment["id"]))
+def _answer_id(job: tr._Run, comment: dict[str, Any]) -> uuid.UUID:
+    return factory_questions.answer_request_id(job.issue, str(comment["id"]))
 
 
-def _receipts(triage: tr._Triage) -> dict[str, tuple[str, uuid.UUID | None]]:
+def _receipts(job: tr._Run) -> dict[str, tuple[str, uuid.UUID | None]]:
     rows = _rows(
         "SELECT comment_key, outcome, request_id FROM curie.factory_answer_receipts "
         "WHERE work_item_id = :id",
-        {"id": triage.work_item_id},
+        {"id": job.work_item_id},
     )
     return {row["comment_key"]: (row["outcome"], row["request_id"]) for row in rows}
 
@@ -334,19 +334,19 @@ def _refusals(caplog: pytest.LogCaptureFixture, comment: dict[str, Any]) -> set[
 def _admits(
     world: World,
     path: str,
-    triage: tr._Triage,
+    job: tr._Run,
     number: int,
     user: dict[str, Any] = WRITER,
     app: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A new plain answer by ``user`` admits exactly one request."""
 
-    before = _ids(triage)
+    before = _ids(job)
     comment = world.github.add_comment(number, ANSWER, user=user, app=app)
     result = _deliver(world, path, comment, number)
     if result is not None:
         assert result["status"] == "factory_admitted", result
-    assert _ids(triage) == [*before, _answer_id(triage, comment)]
+    assert _ids(job) == [*before, _answer_id(job, comment)]
     return comment
 
 
@@ -354,43 +354,43 @@ def _admits(
 
 
 def test_webhook_admits_a_plain_answer(world: World) -> None:
-    triage = _outstanding(world, 6101)
+    job = _outstanding(world, 6101)
     comment = world.github.add_comment(6101, ANSWER, user=WRITER)
 
     result = _deliver(world, "webhook", comment, 6101)
 
     assert result is not None and result["status"] == "factory_admitted", result
-    expected = _answer_id(triage, comment)
-    assert _ids(triage) == [triage.request_id, expected]
+    expected = _answer_id(job, comment)
+    assert _ids(job) == [job.request_id, expected]
     (created,) = _rows(
         "SELECT work_item_id, status, requester FROM curie.execution_requests WHERE id = :id",
         {"id": expected},
     )
     assert created == {
-        "work_item_id": triage.work_item_id,
+        "work_item_id": job.work_item_id,
         "status": "waiting",
         "requester": f"github:{WRITER['id']}:{WRITER['login']}",
     }
-    assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+    assert _receipts(job) == {str(comment["id"]): ("admitted", expected)}
 
 
 def test_poll_admits_a_plain_answer(world: World) -> None:
-    triage = _outstanding(world, 6102)
+    job = _outstanding(world, 6102)
     comment = world.github.add_comment(6102, ANSWER, user=WRITER)
 
     _poll(world)
     _poll(world)
 
-    expected = _answer_id(triage, comment)
-    assert _ids(triage) == [triage.request_id, expected]
+    expected = _answer_id(job, comment)
+    assert _ids(job) == [job.request_id, expected]
     assert _request(expected)["status"] == "waiting"
-    assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+    assert _receipts(job) == {str(comment["id"]): ("admitted", expected)}
 
 
 @pytest.mark.parametrize("first", PATHS)
 def test_dedupe_one_comment_by_both_doors(world: World, first: str) -> None:
     number = 6103 if first == "webhook" else 6104
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
 
     _deliver(world, first, comment, number)
@@ -398,9 +398,9 @@ def test_dedupe_one_comment_by_both_doors(world: World, first: str) -> None:
 
     if second is not None:
         assert second["status"] == "factory_duplicate", second
-    expected = _answer_id(triage, comment)
-    assert _ids(triage) == [triage.request_id, expected]
-    assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+    expected = _answer_id(job, comment)
+    assert _ids(job) == [job.request_id, expected]
+    assert _receipts(job) == {str(comment["id"]): ("admitted", expected)}
 
 
 # Criterion 3: who may answer --------------------------------------------------------
@@ -420,7 +420,7 @@ def test_refused_author(
 ) -> None:
     caplog.set_level(logging.INFO)
     number = 6110 + sorted(AUTHOR_REFUSALS).index(case) + (0 if path == "webhook" else 5)
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     user, app, reason = AUTHOR_REFUSALS[case]
     refused = world.github.add_comment(number, ANSWER, user=user, app=app)
 
@@ -429,20 +429,20 @@ def test_refused_author(
     if result is not None:
         assert _code(result) == reason, result
     assert _refusals(caplog, refused) == {reason}
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
     # The question is still open to a person who may answer it.
-    _admits(world, path, triage, number)
+    _admits(world, path, job, number)
 
 
 @pytest.mark.parametrize("path", PATHS)
 def test_refused_edited_comment(world: World, path: str) -> None:
     number = 6120 if path == "webhook" else 6121
-    triage = _running(world, number)
+    job = _running(world, number)
     earlier = world.github.add_comment(number, "Draft note.", user=WRITER)
     world.github.tick()
-    assert _ask(triage).status_code == 200
-    _settle(triage)
+    assert _ask(job).status_code == 200
+    _settle(job)
     world.github.tick()
     edited = world.github.edit_comment(earlier["id"], ANSWER)
 
@@ -453,9 +453,9 @@ def test_refused_edited_comment(world: World, path: str) -> None:
 
     if result is not None:
         assert _code(result) == "unsupported_action", result
-    assert _receipts(triage) == {}
-    assert _ids(triage) == [triage.request_id]
-    _admits(world, path, triage, number)
+    assert _receipts(job) == {}
+    assert _ids(job) == [job.request_id]
+    _admits(world, path, job, number)
 
 
 @pytest.mark.parametrize("path", PATHS)
@@ -464,7 +464,7 @@ def test_refused_without_trigger_label(
 ) -> None:
     caplog.set_level(logging.INFO)
     number = 6122 if path == "webhook" else 6123
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
     # The label is gone on GitHub; no unlabel event has been processed.
     world.github.planted_issues[number] = PlantedIssue(labels=())
@@ -474,15 +474,15 @@ def test_refused_without_trigger_label(
     if result is not None:
         assert _code(result) == "trigger_label_absent", result
     assert _refusals(caplog, comment) == {"trigger_label_absent"}
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 @pytest.mark.parametrize("path", PATHS)
 def test_refused_on_cancelled_work_item(world: World, path: str) -> None:
     number = 6124 if path == "webhook" else 6125
-    triage = _outstanding(world, number)
-    first = _admits(world, path, triage, number)
+    job = _outstanding(world, number)
+    first = _admits(world, path, job, number)
     world.github.planted_issues[number] = PlantedIssue(labels=())
     unlabeled = _post(
         world.client, "issues", _issue_event("unlabeled", number, label={"name": LABEL})
@@ -493,35 +493,35 @@ def test_refused_on_cancelled_work_item(world: World, path: str) -> None:
     }, unlabeled.text
     # Relabelled on GitHub without an admission: only the cancellation refuses.
     del world.github.planted_issues[number]
-    requests = _ids(triage)
+    requests = _ids(job)
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
 
     result = _deliver(world, path, comment, number)
 
     if result is not None:
         assert _code(result) == "ordinary_comment", result
-    assert _ids(triage) == requests
-    assert _round_row(triage.work_item_id) is None
-    assert set(_receipts(triage)) == {str(first["id"])}
+    assert _ids(job) == requests
+    assert _round_row(job.work_item_id) is None
+    assert set(_receipts(job)) == {str(first["id"])}
 
 
 @pytest.mark.parametrize("path", PATHS)
 def test_refused_without_open_question(world: World, path: str) -> None:
     number = 6126 if path == "webhook" else 6127
-    triage = _running(world, number)
+    job = _running(world, number)
     early = world.github.add_comment(number, ANSWER, user=WRITER)
 
     result = _deliver(world, path, early, number)
 
     if result is not None:
         assert _code(result) == "ordinary_comment", result
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
     world.github.tick()
-    assert _ask(triage).status_code == 200
-    _settle(triage)
-    _admits(world, path, triage, number)
-    assert _answer_id(triage, early) not in _ids(triage)
+    assert _ask(job).status_code == 200
+    _settle(job)
+    _admits(world, path, job, number)
+    assert _answer_id(job, early) not in _ids(job)
 
 
 ACCEPTED = {
@@ -534,14 +534,14 @@ ACCEPTED = {
 @pytest.mark.parametrize("path", PATHS)
 def test_accepted_author(world: World, path: str, case: str) -> None:
     number = 6130 + sorted(ACCEPTED).index(case) + (0 if path == "webhook" else 2)
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     user, app = ACCEPTED[case]
 
-    comment = _admits(world, path, triage, number, user=user, app=app)
+    comment = _admits(world, path, job, number, user=user, app=app)
 
     (created,) = _rows(
         "SELECT requester FROM curie.execution_requests WHERE id = :id",
-        {"id": _answer_id(triage, comment)},
+        {"id": _answer_id(job, comment)},
     )
     assert created["requester"] == f"github:{user['id']}:{user['login']}"
 
@@ -553,7 +553,7 @@ def test_accepted_author(world: World, path: str, case: str) -> None:
 def test_closed_before_delivery(world: World, caplog: pytest.LogCaptureFixture, path: str) -> None:
     caplog.set_level(logging.INFO)
     number = 6140 if path == "webhook" else 6141
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
     # Closed on GitHub after the comment; its close event is not processed.
     world.github.planted_issues[number] = PlantedIssue(state="closed", labels=(LABEL,))
@@ -563,8 +563,8 @@ def test_closed_before_delivery(world: World, caplog: pytest.LogCaptureFixture, 
     if result is not None:
         assert _code(result) == "ticket_closed", result
     assert _refusals(caplog, comment) == {"ticket_closed"}
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 # Criterion 5: several answers fold into one attempt, or one follow-up ----------------
@@ -573,26 +573,26 @@ def test_closed_before_delivery(world: World, caplog: pytest.LogCaptureFixture, 
 @pytest.mark.parametrize("path", PATHS)
 def test_coalesce_two_answers_before_the_start(world: World, path: str) -> None:
     number = 6150 if path == "webhook" else 6151
-    triage = _outstanding(world, number)
-    first = _admits(world, path, triage, number)
+    job = _outstanding(world, number)
+    first = _admits(world, path, job, number)
     second = world.github.add_comment(number, "Also keep the header row.", user=MAINTAINER)
 
     result = _deliver(world, path, second, number)
 
     if result is not None:
         assert result["status"] == "factory_coalesced", result
-    started = _answer_id(triage, first)
-    assert _ids(triage) == [triage.request_id, started]
+    started = _answer_id(job, first)
+    assert _ids(job) == [job.request_id, started]
     assert _request(started)["status"] == "waiting"
-    assert _receipts(triage) == {
+    assert _receipts(job) == {
         str(first["id"]): ("admitted", started),
         str(second["id"]): ("coalesced", started),
     }
 
 
-def _run_issue(triage: tr._Triage) -> dict[str, Any]:
-    response = triage.client.post(
-        "/work-items/issue-read", headers={"X-Curie-Issue-Read": triage.capability}
+def _run_issue(run: tr._Run) -> dict[str, Any]:
+    response = run.client.post(
+        "/work-items/issue-read", headers={"X-Curie-Issue-Read": run.capability}
     )
     assert response.status_code == 200, response.text
     return dict(response.json())
@@ -711,10 +711,10 @@ def test_issue_read_does_not_inherit_answers_on_an_independent_revision(world: W
 @pytest.mark.parametrize("path", PATHS)
 def test_follow_up_queues_behind_the_running_answer(world: World, path: str) -> None:
     number = 6152 if path == "webhook" else 6153
-    triage = _outstanding(world, number)
-    first = _admits(world, path, triage, number)
-    running = _answer_id(triage, first)
-    running_turn = _take_over(triage, running)
+    job = _outstanding(world, number)
+    first = _admits(world, path, job, number)
+    running = _answer_id(job, first)
+    running_turn = _take_over(job, running)
     assert _request(running)["status"] == "running"
     third = world.github.add_comment(number, "One more detail.", user=WRITER)
 
@@ -722,11 +722,11 @@ def test_follow_up_queues_behind_the_running_answer(world: World, path: str) -> 
 
     if result is not None:
         assert result["status"] == "factory_queued", result
-    follow_up = _answer_id(triage, third)
-    assert _ids(triage) == [triage.request_id, running, follow_up]
+    follow_up = _answer_id(job, third)
+    assert _ids(job) == [job.request_id, running, follow_up]
     assert _request(running)["status"] == "running"
     assert _request(follow_up)["status"] == "queued"
-    assert _receipts(triage)[str(third["id"])] == ("queued_follow_up", follow_up)
+    assert _receipts(job)[str(third["id"])] == ("queued_follow_up", follow_up)
     assert [a["comment_id"] for a in _run_issue(running_turn)["admitted_answers"]] == [
         str(first["id"])
     ]
@@ -769,7 +769,7 @@ def _facts_body() -> str:
 @pytest.mark.parametrize("path", PATHS)
 def test_mention_while_outstanding_is_one_answer(world: World, path: str) -> None:
     number = 6160 if path == "webhook" else 6161
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     comment = world.github.add_comment(
         number, f"@{MENTION} replace the rows on a re-run.", user=WRITER
     )
@@ -778,14 +778,14 @@ def test_mention_while_outstanding_is_one_answer(world: World, path: str) -> Non
 
     if result is not None:
         assert result["status"] == "factory_admitted", result
-    assert _ids(triage) == [triage.request_id, _answer_id(triage, comment)]
-    assert _mention_id(number, comment) not in _ids(triage)
+    assert _ids(job) == [job.request_id, _answer_id(job, comment)]
+    assert _mention_id(number, comment) not in _ids(job)
 
 
 @pytest.mark.parametrize("path", PATHS)
 def test_facts_request_comment_is_never_an_answer(world: World, path: str) -> None:
     number = 6162 if path == "webhook" else 6163
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     request = world.github.add_comment(number, _facts_body(), user=WRITER)
 
     result = _deliver(world, path, request, number)
@@ -793,10 +793,10 @@ def test_facts_request_comment_is_never_an_answer(world: World, path: str) -> No
     if result is not None:
         # The facts exchange answers it before the factory intake sees it.
         assert result["status"] == "ignored", result
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
-    _admits(world, path, triage, number)
-    assert str(request["id"]) not in _receipts(triage)
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
+    _admits(world, path, job, number)
+    assert str(request["id"]) not in _receipts(job)
 
 
 # Criterion 7: a refusal is recorded by reason and identity only ------------------------
@@ -808,7 +808,7 @@ def test_log_records_carry_codes_only(
 ) -> None:
     caplog.set_level(logging.INFO)
     number = 6170 if path == "webhook" else 6171
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     sentinel = "SENTINEL-answer-body-7c1f: replace the rows on a re-run."
     refused = world.github.add_comment(number, sentinel, user=READER)
 
@@ -822,7 +822,7 @@ def test_log_records_carry_codes_only(
     ]
     assert record.args == (
         "answer_not_authorized",
-        triage.work_item_id,
+        job.work_item_id,
         refused["id"],
         READER["id"],
     )
@@ -830,7 +830,7 @@ def test_log_records_carry_codes_only(
         rendered = f"{captured.getMessage()} {captured.args!r} {captured.exc_text or ''}"
         assert "SENTINEL-answer-body" not in rendered
         assert TOKEN not in rendered
-    assert _ids(triage) == [triage.request_id]
+    assert _ids(job) == [job.request_id]
 
 
 # The fence on GitHub's own ids (coordinator X1) ----------------------------------------
@@ -839,38 +839,38 @@ def test_log_records_carry_codes_only(
 @pytest.mark.parametrize("path", PATHS)
 def test_immediate_answer_in_the_question_second(world: World, path: str) -> None:
     number = 6180 if path == "webhook" else 6181
-    triage = _running(world, number)
-    assert _ask(triage).status_code == 200
+    job = _running(world, number)
+    assert _ask(job).status_code == 200
     question = _question(world, number)
     # Same clock second as the question, the very next comment id.
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
     assert comment["created_at"] == question["created_at"]
     assert comment["id"] == question["id"] + 1
-    _settle(triage)
+    _settle(job)
 
     result = _deliver(world, path, comment, number)
 
     if result is not None:
         assert result["status"] == "factory_admitted", result
-    assert _ids(triage) == [triage.request_id, _answer_id(triage, comment)]
+    assert _ids(job) == [job.request_id, _answer_id(job, comment)]
 
 
 @pytest.mark.parametrize("path", PATHS)
 def test_late_delivery_of_an_earlier_comment_admits_nothing(world: World, path: str) -> None:
     number = 6182 if path == "webhook" else 6183
-    triage = _running(world, number)
+    job = _running(world, number)
     earlier = world.github.add_comment(number, ANSWER, user=WRITER)
     world.github.tick()
-    assert _ask(triage).status_code == 200
+    assert _ask(job).status_code == 200
     assert earlier["id"] < _question(world, number)["id"]
-    _settle(triage)
+    _settle(job)
 
     result = _deliver(world, path, earlier, number)
 
     if result is not None:
         assert _code(result) == "not_after_question", result
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {str(earlier["id"]): ("not_after_question", None)}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {str(earlier["id"]): ("not_after_question", None)}
 
 
 # The question write landed but its round is still posting (coordinator X2) -------------
@@ -886,12 +886,12 @@ def _retry_keys() -> set[str]:
 @pytest.mark.parametrize("path", PATHS)
 def test_posting_window_answer_is_admitted_once(world: World, path: str) -> None:
     number = 6190 if path == "webhook" else 6191
-    triage = _running(world, number)
+    job = _running(world, number)
     # GitHub stores the question comment, but its answer to the write is lost.
     world.github.store_then_fail = 502
-    assert _ask(triage).status_code == 503
+    assert _ask(job).status_code == 503
     question = _question(world, number)
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and row["state"] == "posting"
     world.github.tick()
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
@@ -906,16 +906,16 @@ def test_posting_window_answer_is_admitted_once(world: World, path: str) -> None
     else:
         _poll(world)
         assert _retry_keys() == {f"answer-retry:{comment['id']}"}
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
     # The runner retries its ask: the marked write finds the comment it posted.
-    assert _ask(triage).status_code == 200
+    assert _ask(job).status_code == 200
     assert _question(world, number) == question
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["comment_id"]) == ("outstanding", str(question["id"]))
-    _settle(triage)
+    _settle(job)
 
     if path == "webhook":
         redelivered = _post(world.client, "issue_comment", payload, delivery=delivery)
@@ -924,9 +924,9 @@ def test_posting_window_answer_is_admitted_once(world: World, path: str) -> None
     else:
         _poll(world)
         assert _retry_keys() == set()
-    expected = _answer_id(triage, comment)
-    assert _ids(triage) == [triage.request_id, expected]
-    assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+    expected = _answer_id(job, comment)
+    assert _ids(job) == [job.request_id, expected]
+    assert _receipts(job) == {str(comment["id"]): ("admitted", expected)}
 
 
 def _reconciler_tick(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -967,9 +967,9 @@ def test_posting_window_answer_is_admitted_by_the_reconciler_tick(
     settings = get_settings()
     assert (settings.factory_intake, settings.factory_reconcile_interval_s) == ("webhook", 0)
     number = 6192
-    triage = _running(world, number)
+    job = _running(world, number)
     world.github.store_then_fail = 502
-    assert _ask(triage).status_code == 503
+    assert _ask(job).status_code == 503
     world.github.tick()
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
 
@@ -977,20 +977,20 @@ def test_posting_window_answer_is_admitted_by_the_reconciler_tick(
 
     assert deferred.status_code == 503, deferred.text
     assert _retry_keys() == {f"answer-retry:{comment['id']}"}
-    assert _ask(triage).status_code == 200
-    _settle(triage)
-    assert _ids(triage) == [triage.request_id]
+    assert _ask(job).status_code == 200
+    _settle(job)
+    assert _ids(job) == [job.request_id]
 
     _reconciler_tick(world, monkeypatch)
 
-    expected = _answer_id(triage, comment)
-    assert _ids(triage) == [triage.request_id, expected]
-    assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+    expected = _answer_id(job, comment)
+    assert _ids(job) == [job.request_id, expected]
+    assert _receipts(job) == {str(comment["id"]): ("admitted", expected)}
     assert _retry_keys() == set()
 
     _reconciler_tick(world, monkeypatch)
 
-    assert _ids(triage) == [triage.request_id, expected]
+    assert _ids(job) == [job.request_id, expected]
     assert _retry_keys() == set()
 
 
@@ -999,9 +999,9 @@ def test_posting_window_webhook_key_survives_a_concurrent_poll_pass(world: World
     pass's cursor save keeps it, and the next pass's drain admits the answer."""
 
     number = 6193
-    triage = _running(world, number)
+    job = _running(world, number)
     world.github.store_then_fail = 502
-    assert _ask(triage).status_code == 503
+    assert _ask(job).status_code == 503
     world.github.tick()
     answered: list[dict[str, Any]] = []
     app = world.client.app
@@ -1033,15 +1033,15 @@ def test_posting_window_webhook_key_survives_a_concurrent_poll_pass(world: World
 
     (comment,) = answered
     assert _retry_keys() == {f"answer-retry:{comment['id']}"}
-    assert _ids(triage) == [triage.request_id]
-    assert _ask(triage).status_code == 200
-    _settle(triage)
+    assert _ids(job) == [job.request_id]
+    assert _ask(job).status_code == 200
+    _settle(job)
 
     _poll(world)
 
-    expected = _answer_id(triage, comment)
-    assert _ids(triage) == [triage.request_id, expected]
-    assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+    expected = _answer_id(job, comment)
+    assert _ids(job) == [job.request_id, expected]
+    assert _receipts(job) == {str(comment["id"]): ("admitted", expected)}
     assert _retry_keys() == set()
 
 
@@ -1050,22 +1050,22 @@ def test_posting_window_answer_edited_into_facts_is_never_an_answer(world: World
     goes to the facts exchange: no answer and no mention request."""
 
     number = 6194
-    triage = _running(world, number)
+    job = _running(world, number)
     world.github.store_then_fail = 502
-    assert _ask(triage).status_code == 503
+    assert _ask(job).status_code == 503
     world.github.tick()
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
     _poll(world)
     assert _retry_keys() == {f"answer-retry:{comment['id']}"}
     world.github.tick()
     world.github.edit_comment(comment["id"], _facts_body())
-    assert _ask(triage).status_code == 200
-    _settle(triage)
+    assert _ask(job).status_code == 200
+    _settle(job)
 
     _poll(world)
 
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
     assert _retry_keys() == set()
 
 
@@ -1079,23 +1079,23 @@ def test_dedupe_mention_answer_after_the_round_clears(world: World, first: str) 
     never admits it as a mention revision."""
 
     number = 6200 if first == "webhook" else 6201
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     comment = world.github.add_comment(number, f"@{MENTION} replace the rows.", user=WRITER)
     _deliver(world, first, comment, number)
-    answered = _answer_id(triage, comment)
-    assert _ids(triage) == [triage.request_id, answered]
-    successor = _take_over(triage, answered)
+    answered = _answer_id(job, comment)
+    assert _ids(job) == [job.request_id, answered]
+    successor = _take_over(job, answered)
     tr._finish(successor, "failed", "budget_exceeded")
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and row["state"] == "cleared", row
-    before = _ids(triage)
+    before = _ids(job)
 
     second = _deliver(world, "poll" if first == "webhook" else "webhook", comment, number)
 
     if second is not None:
         assert second["status"] == "factory_duplicate", second
-    assert _ids(triage) == before
-    assert _mention_id(number, comment) not in _ids(triage)
+    assert _ids(job) == before
+    assert _mention_id(number, comment) not in _ids(job)
 
 
 def test_refused_edit_after_permission_granted(
@@ -1106,7 +1106,7 @@ def test_refused_edit_after_permission_granted(
 
     caplog.set_level(logging.INFO)
     number = 6202
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     refused = world.github.add_comment(number, ANSWER, user=READER)
     world.github.tick()
     world.github.add_comment(number, "Build status noted.", user=HELPER_BOT)
@@ -1118,8 +1118,8 @@ def test_refused_edit_after_permission_granted(
 
     _poll(world)
 
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 def test_facts_body_on_the_authenticated_read_is_never_an_answer(world: World) -> None:
@@ -1127,7 +1127,7 @@ def test_facts_body_on_the_authenticated_read_is_never_an_answer(world: World) -
     comment returns a facts request, which keeps precedence."""
 
     number = 6203
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
     payload = _payload(comment, number)
     world.github.edit_comment(comment["id"], _facts_body())
@@ -1136,15 +1136,15 @@ def test_facts_body_on_the_authenticated_read_is_never_an_answer(world: World) -
 
     assert response.status_code == 200, response.text
     assert _code(response.json()) == "ordinary_comment", response.text
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 def test_refused_binding_missing(world: World) -> None:
     number = 6204
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     (item,) = _rows(
-        "SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": triage.work_item_id}
+        "SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": job.work_item_id}
     )
     # The agent's only GitHub surface moves to another repository.
     moved = world.client.patch(
@@ -1159,16 +1159,16 @@ def test_refused_binding_missing(world: World) -> None:
     result = _deliver(world, "webhook", comment, number)
 
     assert _code(result) == "binding_missing", result
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 def test_refused_installation_mismatch(world: World) -> None:
     number = 6205
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     (item,) = _rows(
         "SELECT code_host_installation_id FROM curie.work_items WHERE id = :id",
-        {"id": triage.work_item_id},
+        {"id": job.work_item_id},
     )
     assert item["code_host_installation_id"] == INSTALLATION_ID
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
@@ -1179,15 +1179,15 @@ def test_refused_installation_mismatch(world: World) -> None:
 
     assert response.status_code == 200, response.text
     assert _code(response.json()) == "installation_mismatch", response.text
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 def test_refused_payload_claims_another_author(world: World) -> None:
     """Authority comes from GitHub's read of the comment, not the payload."""
 
     number = 6206
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     comment = world.github.add_comment(number, ANSWER, user=READER)
     claimed = {**comment, "user": dict(WRITER)}
     payload = _issue_event("created", number, comment=claimed, sender=dict(WRITER))
@@ -1196,8 +1196,8 @@ def test_refused_payload_claims_another_author(world: World) -> None:
 
     assert response.status_code == 200, response.text
     assert _code(response.json()) == "answer_not_authorized", response.text
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 def test_refused_edit_at_the_cursor_boundary(
@@ -1208,7 +1208,7 @@ def test_refused_edit_at_the_cursor_boundary(
 
     caplog.set_level(logging.INFO)
     number = 6207
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     world.github.tick()
     refused = world.github.add_comment(number, ANSWER, user=READER)
     _poll(world)
@@ -1219,8 +1219,8 @@ def test_refused_edit_at_the_cursor_boundary(
 
     _poll(world)
 
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 def test_refused_comment_edited_before_the_first_poll(world: World) -> None:
@@ -1230,7 +1230,7 @@ def test_refused_comment_edited_before_the_first_poll(world: World) -> None:
     pass never takes it for an answer either."""
 
     number = 6211
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     _poll(world)
     world.github.tick()
     facts = world.github.add_comment(number, _facts_body(), user=WRITER)
@@ -1240,17 +1240,17 @@ def test_refused_comment_edited_before_the_first_poll(world: World) -> None:
 
     _poll(world)
 
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
     # The question is still open to a new plain answer.
-    _admits(world, "poll", triage, number)
+    _admits(world, "poll", job, number)
 
 
 def test_boundary_reply_in_the_cursor_second_is_new(world: World) -> None:
     """A reply created in the threshold's own second and never edited is new."""
 
     number = 6208
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     question = _question(world, number)
     _poll(world)
     reply = world.github.add_comment(number, ANSWER, user=WRITER)
@@ -1258,9 +1258,9 @@ def test_boundary_reply_in_the_cursor_second_is_new(world: World) -> None:
 
     _poll(world)
 
-    expected = _answer_id(triage, reply)
-    assert _ids(triage) == [triage.request_id, expected]
-    assert _receipts(triage) == {str(reply["id"]): ("admitted", expected)}
+    expected = _answer_id(job, reply)
+    assert _ids(job) == [job.request_id, expected]
+    assert _receipts(job) == {str(reply["id"]): ("admitted", expected)}
 
 
 @pytest.mark.parametrize("path", PATHS)
@@ -1272,10 +1272,10 @@ def test_refused_retained_service_item_in_personal_mode(
 
     caplog.set_level(logging.INFO)
     number = 6209 if path == "webhook" else 6210
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     (item,) = _rows(
         "SELECT model_auth_mode FROM curie.work_items WHERE id = :id",
-        {"id": triage.work_item_id},
+        {"id": job.work_item_id},
     )
     assert item["model_auth_mode"] == "service"
     monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", "personal")
@@ -1287,8 +1287,8 @@ def test_refused_retained_service_item_in_personal_mode(
     if result is not None:
         assert _code(result) == "personal_owner_required", result
     assert _refusals(caplog, comment) == {"personal_owner_required"}
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
 
 
 # Answer-path true-ups (#5786, #5787) ----------------------------------------------------
@@ -1304,9 +1304,9 @@ def test_posting_window_answer_after_the_asker_exits_is_named_on_its_status(
     the asker's status comment says replies to its questions restart nothing."""
 
     number = 6232 if path == "webhook" else 6233
-    triage = _running(world, number)
+    job = _running(world, number)
     world.github.store_then_fail = 502
-    assert _ask(triage).status_code == 503
+    assert _ask(job).status_code == 503
     world.github.tick()
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
     payload = _payload(comment, number)
@@ -1318,8 +1318,8 @@ def test_posting_window_answer_after_the_asker_exits_is_named_on_its_status(
         _poll(world)
     assert _retry_keys() == {f"answer-retry:{comment['id']}"}
 
-    tr._finish(triage, "failed", "no_pull_request")
-    row = _round_row(triage.work_item_id)
+    tr._finish(job, "failed", "no_pull_request")
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["comment_id"]) == ("cleared", None)
     if path == "webhook":
         redelivered = _post(world.client, "issue_comment", payload, delivery=delivery)
@@ -1329,9 +1329,9 @@ def test_posting_window_answer_after_the_asker_exits_is_named_on_its_status(
     _reconcile()
 
     assert _retry_keys() == set()
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
-    body = _status_body(world.sink, triage.request_id)
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
+    body = _status_body(world.sink, job.request_id)
     assert QUESTIONS_UNRECORDED_LINE.strip() in body
 
 
@@ -1340,10 +1340,10 @@ def test_a_recorded_round_status_never_says_its_questions_were_unrecorded(
 ) -> None:
     """Counterexample: an asker whose round was recorded keeps the question ending."""
 
-    triage = _outstanding(world, 6234)
+    job = _outstanding(world, 6234)
     _reconcile()
 
-    body = _status_body(world.sink, triage.request_id)
+    body = _status_body(world.sink, job.request_id)
     assert "Questions asked (round 1 of 3)" in body
     assert QUESTIONS_UNRECORDED_LINE.strip() not in body
 
@@ -1363,7 +1363,7 @@ def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
 
     caplog.set_level(logging.INFO)
     number = 6235 if refusal == "answer_not_authorized" else 6238
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     author = READER if refusal == "answer_not_authorized" else WRITER
     if refusal == "ticket_closed":
         # GET an issue answers state closed
@@ -1379,17 +1379,17 @@ def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
         del world.github.planted_issues[number]
     answer = world.github.add_comment(number, ANSWER, user=WRITER)
     assert _deliver(world, "webhook", answer, number)["status"] == "factory_admitted"
-    successor = _take_over(triage, _answer_id(triage, answer))
+    successor = _take_over(job, _answer_id(job, answer))
     asked = _ask(successor, ["Round 2: which file holds the rows?"])
     assert asked.status_code == 200, asked.text
     tr._finish(successor, "failed", "no_pull_request")
     second = world.github.add_comment(number, ANSWER, user=WRITER)
     assert _deliver(world, "webhook", second, number)["status"] == "factory_admitted"
-    last = _take_over(triage, _answer_id(triage, second))
+    last = _take_over(job, _answer_id(job, second))
     tr._finish(last, "failed", "budget_exceeded")
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["rounds_used"]) == ("cleared", 2), row
-    before = _ids(triage)
+    before = _ids(job)
 
     # GitHub's clock in the second the round ended, which it reports whole.
     world.github.clock = row["updated_at"].replace(microsecond=0)
@@ -1398,8 +1398,8 @@ def test_refused_answer_never_resurfaces_as_a_mention_after_the_round_clears(
     _poll(world)
 
     assert refusal in _refusals(caplog, refused)
-    assert str(refused["id"]) not in _receipts(triage)
-    assert _ids(triage) == [*before, _mention_id(number, later)]
+    assert str(refused["id"]) not in _receipts(job)
+    assert _ids(job) == [*before, _mention_id(number, later)]
 
 
 @pytest.mark.parametrize("ended", ["closed", "unlabeled"])
@@ -1413,7 +1413,7 @@ def test_poll_pass_that_finds_the_close_and_an_answer_refuses_the_answer(
 
     caplog.set_level(logging.INFO)
     number = 6236 if ended == "closed" else 6237
-    triage = _outstanding(world, number)
+    job = _outstanding(world, number)
     comment = world.github.add_comment(number, ANSWER, user=WRITER)
     world.github.planted_issues[number] = PlantedIssue(
         state="closed" if ended == "closed" else "open",
@@ -1425,10 +1425,10 @@ def test_poll_pass_that_finds_the_close_and_an_answer_refuses_the_answer(
 
     expected = "ticket_closed" if ended == "closed" else "trigger_label_absent"
     assert _refusals(caplog, comment) == {expected}
-    assert _ids(triage) == [triage.request_id]
-    assert _receipts(triage) == {}
+    assert _ids(job) == [job.request_id]
+    assert _receipts(job) == {}
     (item,) = _rows(
-        "SELECT cancelled_at FROM curie.work_items WHERE id = :id", {"id": triage.work_item_id}
+        "SELECT cancelled_at FROM curie.work_items WHERE id = :id", {"id": job.work_item_id}
     )
     assert item["cancelled_at"] is not None
-    assert _round_row(triage.work_item_id) is None
+    assert _round_row(job.work_item_id) is None

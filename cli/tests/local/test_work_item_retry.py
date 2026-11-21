@@ -614,7 +614,6 @@ def _request_row(
         reply_address=ADDRESS,
         reply_conversation_id=f"1700000000.{issue:06d}",
         reply_target_kind="issue",
-        completion_contract="implementation",
         execution_kind="implementation",
         retry_of_request_id=retry_of,
         retry_origin_request_id=origin,

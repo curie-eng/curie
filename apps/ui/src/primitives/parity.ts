@@ -118,6 +118,14 @@ export const WIRED_ACTIONS = [
   { id: "work-items-cluster", label: "List factory work items (prod)", mapping: { command: "cluster.work-items" } },
   { id: "work-items-local", label: "List factory work items (dev)", mapping: { command: "local.work-items" } },
 
+  // WiredAgentFactoryProgress — set or clear the Slack channel a factory agent
+  // posts progress to. Env-scoped like deploy. The unbound-channel hint points at
+  // the surfaces verb, which is where the binding is added.
+  { id: "factory-progress-cluster", label: "Set the factory progress channel (prod)", mapping: { command: "cluster.factory-progress" } },
+  { id: "factory-progress-local", label: "Set the factory progress channel (dev)", mapping: { command: "local.factory-progress" } },
+  { id: "surfaces-cluster", label: "Add an agent surface (prod)", mapping: { command: "cluster.surfaces" } },
+  { id: "surfaces-local", label: "Add an agent surface (dev)", mapping: { command: "local.surfaces" } },
+
   // WiredAgentBehaviorPacks (#870) — view/edit the agent's opt-in behavior packs.
   // No CLI path reads or writes behavior_packs (see cli/api-mirrors.json), so the
   // save action renders the honest amber gap glyph linking to the parity epic.

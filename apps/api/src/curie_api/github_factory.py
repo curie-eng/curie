@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import httpx
 from fastapi import HTTPException
@@ -60,7 +60,7 @@ from .forges.ports import CodeHost
 from .forges.registry import ForgeRegistry, forges_registry
 from .forges.surfaces import agent_binding, bound_labels, effective_trigger_label
 from .forges.trackers import reply_route
-from .forges.types import GITHUB, ReplyTarget, RepositoryRef, TrackerIssueRef, body_sha256
+from .forges.types import GITHUB, ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import (
     FactoryNotice,
@@ -83,9 +83,6 @@ from .models import (
 from .personal_execution import ModelAuthMode, OwnerContext, existing_work_item_refusal
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
-
-if TYPE_CHECKING:
-    from .factory_triage_handoff import DelegatedOutput, ImplementationTarget
 
 logger = logging.getLogger(__name__)
 
@@ -155,8 +152,7 @@ class VerifiedIssue:
 class Selection:
     """One trusted selection of one issue for admission (#5588 decision 7).
 
-    A verified human label event or mention (`selection_of`), or a triage
-    delegation consumed by the handoff. ``requester`` is the
+    A verified human label event or mention (`selection_of`). ``requester`` is the
     ``github:<id>:<login>`` attribution the request records;
     ``label_event_at`` is when the selecting label was applied, when known.
     """
@@ -553,8 +549,8 @@ async def admit_selection(
 ) -> Selected:
     """The trusted-selection half of admission, shared by every path (#5588 decision 7).
 
-    The caller has verified who selected the issue (a human label event, a
-    mention, or a triage delegation) and resolved the binding. This applies
+    The caller has verified who selected the issue (a human label event or a
+    mention) and resolved the binding. This applies
     the ownership, label conflict, rediscovery and binding checks of ordinary
     admission, then readmits through `workitem_dispatch` under the caller's
     issue lock. It records no intake notice: it names the one owed instead.
@@ -673,10 +669,6 @@ async def admit_notice(
             raise FactoryRefused("binding_missing")
         agent_id = matches[0].agent_id if len(matches) == 1 else None
         reason = notice.actor_refusal
-        if reason == "actor_bot" and await factory_intake_notices.delegated_output_before_label(
-            session, issue, notice
-        ):
-            return ignored("delegated_output")
         if reason is None:
             reason = await verified.tracker.label_permission(notice)
         if reason is None and existing is None and agent_id is not None:
@@ -752,23 +744,6 @@ async def admit_notice(
             reason=selected.notice_reason,
             agent_id=binding.agent_id,
             publication_url=selected.publication_url,
-        )
-    elif notice.disposition == "admit" and isinstance(selected.result, WorkItemOutcome):
-        # A triage selection's single-use delegation, in this transaction (#5588).
-        from .factory_triage_handoff import record_delegation
-
-        await record_delegation(
-            session,
-            work_item_id=selected.result.work_item.id,
-            request_id=notice.request_id,
-            actor_id=str(notice.sender_id),
-            actor_login=notice.sender_login,
-            selection_event=f"github-label-event:{notice.label_event_id}",
-            installation_id=notice.installation_id,
-            registry=registry,
-            target=lambda label: resolve_implementation_target(
-                session, registry, notice.repo_full_name, label
-            ),
         )
     return selected.outcome
 
@@ -1300,243 +1275,3 @@ async def handle_factory_delivery(
     except Exception:
         logger.exception("factory intake notice delivery deferred")
     return outcome
-
-
-# The triage handoff's internal selection (#5588) ------------------------------
-
-
-async def resolve_implementation_target(
-    session: AsyncSession, registry: ForgeRegistry, repo_full_name: str, label: str
-) -> "ImplementationTarget | None":
-    """The one binding a triage policy's implementation label starts (#5588 decision 2).
-
-    Resolved on the source repository with the effective-label machinery: the
-    label must name exactly one GitHub surface there, and that agent's
-    in-force version must have the implementation contract (no result
-    declaration). None otherwise; the platform never picks the first agent.
-    """
-
-    from .factory_tracker_result_runtime import in_force_version
-    from .factory_triage_handoff import ImplementationTarget
-
-    grouped = await bound_labels(session, registry, GITHUB_CHANNEL_KIND, repo_full_name)
-    matches = grouped.get(label, [])
-    if len(matches) != 1:
-        return None
-    binding = matches[0]
-    version = await in_force_version(session, binding.agent_id)
-    if version is not None and version.result_policy_digest is not None:
-        return None
-    return ImplementationTarget(
-        binding_id=binding.id, generation=binding.generation, agent_id=binding.agent_id
-    )
-
-
-async def _delegated_tracker(
-    settings: Settings, client: httpx.AsyncClient, output: "DelegatedOutput"
-) -> GitHubTracker:
-    """The output repository's tracker under its installation, or ``scope_lost``."""
-
-    from .factory_triage_handoff import HandoffDeferred, HandoffRefused
-
-    if not repository_is_allowed(output.repo_full_name, settings.github_repo_allowlist):
-        raise HandoffRefused("scope_lost")
-    registry = forges_registry(settings)
-    try:
-        token = await run_in_threadpool(
-            factory_credentials(registry).token_for_verified_installation,
-            output.repo_full_name,
-            output.installation_id,
-        )
-    except (GitHubInstallationRefused, ValueError):
-        raise HandoffRefused("scope_lost") from None
-    except GitHubAppError:
-        raise HandoffDeferred("installation_unavailable") from None
-    return factory_tracker(registry).for_repository(
-        client,
-        repo_full_name=output.repo_full_name,
-        repository_id=output.repository_id,
-        token=static_token(token),
-    )
-
-
-async def _selected_by_handoff(
-    session: AsyncSession, work_item: WorkItem, output: "DelegatedOutput"
-) -> bool:
-    """Whether the output's WorkItem was admitted by this handoff (a replay)."""
-
-    if work_item.readmit_request_id == output.request_id:
-        return True
-    found = await session.scalar(
-        select(ExecutionRequest.id).where(
-            ExecutionRequest.id == output.request_id,
-            ExecutionRequest.work_item_id == work_item.id,
-        )
-    )
-    return found is not None
-
-
-async def check_delegated(
-    session: AsyncSession,
-    settings: Settings,
-    client: httpx.AsyncClient,
-    output: "DelegatedOutput",
-    *,
-    labelled: bool,
-) -> VerifiedIssue:
-    """Every handoff check of decision 5, each read now; raises on the first that fails.
-
-    Writes nothing to GitHub. `HandoffRefused` carries the refusal reason;
-    `HandoffDeferred` a read that failed, which is retried and never taken as
-    approval. ``labelled`` says whether the handoff already added its label,
-    so the label conflict rule counts it once either way.
-    """
-
-    from .factory_tracker_result_runtime import in_force_version
-    from .factory_triage_handoff import HandoffDeferred, HandoffRefused
-
-    registry = forges_registry(settings)
-    tracker = await _delegated_tracker(settings, client, output)
-    issue = tracker.issue(output.issue_number)
-    try:
-        state = await tracker.issue_state(output.issue_number)
-        content = await tracker.read_source_content(issue)
-    except NotFound:
-        raise HandoffRefused("output_changed") from None
-    except ForgeError:
-        raise HandoffDeferred("output_unreadable") from None
-    if (
-        state.state != "open"
-        or state.pull_request
-        or body_sha256(content.body) != output.body_sha256
-    ):
-        raise HandoffRefused("output_changed")
-    if labelled and output.label not in state.labels:
-        raise HandoffRefused("label_absent")
-    try:
-        allowed = await tracker.may_start(issue, output.actor)
-    except NotFound:
-        allowed = False
-    except ForgeError:
-        raise HandoffDeferred("permission_unreadable") from None
-    if not allowed:
-        raise HandoffRefused("authority_revoked")
-    binding = await session.get(AgentChannel, output.binding_id, populate_existing=True)
-    if (
-        binding is None
-        or binding.generation != output.binding_generation
-        or binding.agent_id != output.agent_id
-        or binding.kind != GITHUB_CHANNEL_KIND
-        or binding.address != output.repo_full_name
-        or effective_trigger_label(binding, registry) != output.label
-    ):
-        raise HandoffRefused("target_unavailable")
-    version = await in_force_version(session, binding.agent_id)
-    if version is not None and version.result_policy_digest is not None:
-        raise HandoffRefused("target_unavailable")
-    existing = await work_item_for(session, issue)
-    if existing is not None and not await _selected_by_handoff(session, existing, output):
-        # Someone selected the output through another door: its run and its
-        # label stay as they are, and the handoff admits nothing.
-        raise HandoffRefused("output_already_selected", keep_label=True)
-    bound = await bound_labels(session, registry, GITHUB_CHANNEL_KIND, output.repo_full_name)
-    refusal = label_refusal(
-        label=output.label,
-        owner_label=(
-            None
-            if existing is None
-            else admitting_label(
-                registry,
-                existing,
-                kickoff_items=await kickoff_work_items(session, [existing.id]),
-            )
-        ),
-        other_agent=existing is not None and existing.agent_id != binding.agent_id,
-        present=sorted({name for name in bound if name in state.labels} | {output.label}),
-    )
-    if refusal is not None:
-        raise HandoffRefused(refusal[0])
-    code_host = factory_code_host(registry, client)
-    output_repository = factory_repository(
-        registry, path=output.repo_full_name, project_id=output.repository_id
-    )
-    try:
-        # By immutable id, which only a code host scoped to this repository
-        # can resolve: the unscoped one knows no repository paths.
-        repository = await (
-            factory_code_host_entry(registry)
-            .adapter(client, repository=output_repository)
-            .resolve_repository(str(output.repository_id))
-        )
-    except ForgeError:
-        raise HandoffDeferred("repository_unavailable") from None
-    verified = VerifiedIssue(
-        labels=set(state.labels),
-        default_branch=repository.default_branch,
-        tracker=tracker,
-        code_host=code_host,
-        repository=output_repository,
-    )
-    if existing is None:
-        rediscovery_host = factory_rediscovery.publishing_code_host(
-            settings, client, verified.repository
-        )
-        try:
-            found = await factory_rediscovery.rediscover(
-                tracker, rediscovery_host, issue, verified.repository, event_at=output.labelled_at
-            )
-        except ForgeError:
-            raise HandoffDeferred("publication_listing_unavailable") from None
-        if found.verdict == "completed":
-            raise HandoffRefused("publication_completed")
-        if found.verdict != "clear":
-            raise HandoffRefused("publication_exists")
-    return verified
-
-
-async def admit_delegated(
-    session: AsyncSession,
-    settings: Settings,
-    client: httpx.AsyncClient,
-    output: "DelegatedOutput",
-) -> Selected:
-    """Admit the delegated output through the shared admission service (#5588 decision 6.3).
-
-    Takes the output issue's lock, re-reads every check with the handoff's
-    label present, then admits a separate WorkItem on the output under the
-    frozen binding, the original requester and a request id derived from the
-    internal selection event. The caller commits, together with the delegation
-    consumption and the handoff outcome.
-    """
-
-    from .factory_triage_handoff import HandoffDeferred, HandoffRefused
-
-    host = factory_tracker(forges_registry(settings)).config.host
-    output_issue = TrackerIssueRef(
-        GITHUB, host, str(output.repository_id), str(output.issue_number)
-    )
-    await lock_issue(session, output_issue)
-    verified = await check_delegated(session, settings, client, output, labelled=True)
-    binding = await session.get(AgentChannel, output.binding_id)
-    if binding is None:
-        raise HandoffRefused("target_unavailable")
-    existing = await work_item_for(session, output_issue)
-    selection = Selection(
-        disposition="admit",
-        repo_full_name=output.repo_full_name,
-        repository_id=output.repository_id,
-        issue_number=output.issue_number,
-        installation_id=output.installation_id,
-        label=output.label,
-        requester=output.requester,
-        request_id=output.request_id,
-        label_event_at=output.labelled_at,
-    )
-    try:
-        return await admit_selection(
-            session, selection, settings, verified, existing, binding, client=client
-        )
-    except FeedbackUnavailable as exc:
-        raise HandoffDeferred(exc.code) from None
-    except FeedbackIgnored as exc:
-        raise HandoffRefused(exc.code) from None

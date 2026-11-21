@@ -25,8 +25,9 @@ from curie_runner.issue_read import CAPABILITY_HEADER, build_issue_tool
 from curie_runner.subprocess_env import model_credential_names
 from fastapi.testclient import TestClient
 from forge_fakes.github import REPO, _issue_event, _post, factory_env
+from forge_fakes.github_comments import _rows
+from test_factory_terminus import _start_running
 from test_factory_tracker_answer_intake import _finish, _mint, _post_questions
-from test_factory_tracker_results import _rows, _start_running
 
 ROOT = Path(__file__).resolve().parents[3]
 ISSUE_NUMBER = 3815

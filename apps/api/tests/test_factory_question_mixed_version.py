@@ -45,7 +45,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import test_factory_tracker_results as tr
+import factory_run_support as tr
 import test_github_answer_intake as intake
 from curie_api import factory_questions
 from curie_api.factory_comment_text import marker_for
@@ -168,44 +168,44 @@ def _after_the_roll() -> None:
     _reconcile()
 
 
-def _shows_the_question(sink: Any, triage: tr._Triage, number: int) -> None:
-    assert _request(triage.request_id) == QUESTION_ENDING
-    row = _round_row(triage.work_item_id)
-    assert row is not None and row["asking_request_id"] == triage.request_id
+def _shows_the_question(sink: Any, job: tr._Run, number: int) -> None:
+    assert _request(job.request_id) == QUESTION_ENDING
+    row = _round_row(job.work_item_id)
+    assert row is not None and row["asking_request_id"] == job.request_id
     assert _state_labels(sink, number) == {QUESTIONS_LABEL}
-    body = _status_body(sink, triage.request_id)
+    body = _status_body(sink, job.request_id)
     assert ASKS_FOR_ANSWER in body
     assert "Could not complete" not in body
 
 
-def _after_asker(triage: tr._Triage) -> list[tuple[uuid.UUID, str]]:
+def _after_asker(job: tr._Run) -> list[tuple[uuid.UUID, str]]:
     """Every request the WorkItem admitted after the asker, any status."""
 
-    requests = _requests(triage.work_item_id)
-    after = requests[[r["id"] for r in requests].index(triage.request_id) + 1 :]
+    requests = _requests(job.work_item_id)
+    after = requests[[r["id"] for r in requests].index(job.request_id) + 1 :]
     return [(r["id"], r["status"]) for r in after]
 
 
-def _to_redrive(triage: tr._Triage) -> list[uuid.UUID]:
+def _to_redrive(job: tr._Run) -> list[uuid.UUID]:
     """The WorkItems the re-drive would select now."""
 
     async def go() -> list[uuid.UUID]:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             return await lifecycle.question_rounds_to_redrive(session, limit=100)
 
-    return [i for i in triage.client.portal.call(go) if i == triage.work_item_id]
+    return [i for i in job.client.portal.call(go) if i == job.work_item_id]
 
 
-def _redrive(triage: tr._Triage) -> None:
+def _redrive(job: tr._Run) -> None:
     async def go() -> None:
-        async with triage.client.app.state.sessionmaker() as session:
-            await lifecycle.redrive_question_round(session, work_item_id=triage.work_item_id)
+        async with job.client.app.state.sessionmaker() as session:
+            await lifecycle.redrive_question_round(session, work_item_id=job.work_item_id)
             await session.commit()
 
-    triage.client.portal.call(go)
+    job.client.portal.call(go)
 
 
-def _answer_snapshot(triage: tr._Triage, revision: uuid.UUID) -> None:
+def _answer_snapshot(job: tr._Run, revision: uuid.UUID) -> None:
     """The run snapshot of a promoted answer, as the answer core writes it:
     the asker's requester and reply route and the answer as the objective.
     `_queue_revision` leaves it empty, and a request without one is never
@@ -219,49 +219,49 @@ def _answer_snapshot(triage: tr._Triage, revision: uuid.UUID) -> None:
         "reply_conversation_id = asker.reply_conversation_id "
         "FROM curie.execution_requests AS asker "
         "WHERE answer.id = :answer AND answer.status = 'waiting' AND asker.id = :asker",
-        {"answer": revision, "asker": triage.request_id},
+        {"answer": revision, "asker": job.request_id},
     )
 
 
-def _run_continuation(triage: tr._Triage, revision: uuid.UUID) -> tr._Triage:
-    _answer_snapshot(triage, revision)
-    return _take_over(triage, revision)
+def _run_continuation(job: tr._Run, revision: uuid.UUID) -> tr._Run:
+    _answer_snapshot(job, revision)
+    return _take_over(job, revision)
 
 
-def _continued(sink: Any, triage: tr._Triage, number: int, revision: uuid.UUID) -> dict[str, Any]:
+def _continued(sink: Any, job: tr._Run, number: int, revision: uuid.UUID) -> dict[str, Any]:
     """Run the answer's continuation to its end and record what the ticket
     shows while it runs and after."""
 
-    continuation = _run_continuation(triage, revision)
+    continuation = _run_continuation(job, revision)
     _reconcile()
     running = _state_labels(sink, number)
     tr._finish(continuation, "failed", "no_pull_request")
     _reconcile()
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     return {
         "running": running,
         "labels": _state_labels(sink, number),
         "asks": ASKS_FOR_ANSWER in _status_body(sink, revision),
-        "requests": [(r["status"], r["terminal_cause"]) for r in _requests(triage.work_item_id)],
+        "requests": [(r["status"], r["terminal_cause"]) for r in _requests(job.work_item_id)],
         "row": None if row is None else row["state"],
     }
 
 
-def _one_continuation(triage: tr._Triage, revision: uuid.UUID) -> None:
+def _one_continuation(job: tr._Run, revision: uuid.UUID) -> None:
     """The answer's revision is the only request after the asker, and live."""
 
-    requests = _requests(triage.work_item_id)
-    after = requests[[r["id"] for r in requests].index(triage.request_id) + 1 :]
+    requests = _requests(job.work_item_id)
+    after = requests[[r["id"] for r in requests].index(job.request_id) + 1 :]
     assert [r["id"] for r in after] == [revision], requests
     assert after[0]["status"] == "waiting"
 
 
-def _snapshot(sink: Any, triage: tr._Triage, number: int, revision: uuid.UUID) -> dict[str, Any]:
+def _snapshot(sink: Any, job: tr._Run, number: int, revision: uuid.UUID) -> dict[str, Any]:
     """What the ticket and its WorkItem show once the answer is promoted."""
 
-    requests = _requests(triage.work_item_id)
-    after = requests[[r["id"] for r in requests].index(triage.request_id) + 1 :]
-    row = _round_row(triage.work_item_id)
+    requests = _requests(job.work_item_id)
+    after = requests[[r["id"] for r in requests].index(job.request_id) + 1 :]
+    row = _round_row(job.work_item_id)
     return {
         "requests": [(r["status"], r["terminal_cause"]) for r in requests],
         "one_continuation": [r["id"] for r in after] == [revision],
@@ -269,7 +269,7 @@ def _snapshot(sink: Any, triage: tr._Triage, number: int, revision: uuid.UUID) -
         if row is None
         else (row["state"], row["rounds_used"], row["pending_request_id"] == revision),
         "labels": _state_labels(sink, number),
-        "asks": ASKS_FOR_ANSWER in _status_body(sink, triage.request_id),
+        "asks": ASKS_FOR_ANSWER in _status_body(sink, job.request_id),
     }
 
 
@@ -281,28 +281,28 @@ def _new_replicas_only(
     finished, before the first pass after it, or after that pass."""
 
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, number)
+    job = _asked(admitted, monkeypatch, number)
     revision: uuid.UUID | None = None
     if answer_at == "before_finish":
-        revision = _queue_revision(triage)
-        _answer(triage.work_item_id, revision)
-    tr._finish(triage, "failed", "no_pull_request")
+        revision = _queue_revision(job)
+        _answer(job.work_item_id, revision)
+    tr._finish(job, "failed", "no_pull_request")
     if answer_at == "before_pass":
-        revision = _queue_revision(triage)
-        _answer(triage.work_item_id, revision)
+        revision = _queue_revision(job)
+        _answer(job.work_item_id, revision)
     _reconcile()
     if revision is None:
-        revision = _queue_revision(triage)
-        _answer(triage.work_item_id, revision)
+        revision = _queue_revision(job)
+        _answer(job.work_item_id, revision)
     _reconcile()
     _reconcile()
-    return _snapshot(sink, triage, number, revision), _continued(sink, triage, number, revision)
+    return _snapshot(sink, job, number, revision), _continued(sink, job, number, revision)
 
 
 def _matches_new_replicas_only(
     admitted: Any,
     monkeypatch: pytest.MonkeyPatch,
-    triage: tr._Triage,
+    job: tr._Run,
     revision: uuid.UUID,
     number: int,
     *,
@@ -316,11 +316,11 @@ def _matches_new_replicas_only(
 
     _client, _github, sink = admitted
     _reconcile()
-    _one_continuation(triage, revision)
-    mixed = _snapshot(sink, triage, number, revision)
+    _one_continuation(job, revision)
+    mixed = _snapshot(sink, job, number, revision)
     assert mixed["requests"][0] == ("completed", "questions_asked")
     assert mixed["one_continuation"] is True
-    after = _continued(sink, triage, number, revision)
+    after = _continued(sink, job, number, revision)
     assert after["running"] == {RUNNING}
     assert after["labels"] == {NEEDS_HUMAN}
     assert after["asks"] is False
@@ -347,10 +347,10 @@ def test_a_finish_on_an_older_replica_still_ends_with_the_question(
 
     number = 1201 if promoted_by == "older" else 1202
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, number)
+    job = _asked(admitted, monkeypatch, number)
     with _older_replica():
-        tr._finish(triage, "failed", "no_pull_request")
-        assert _request(triage.request_id) == {
+        tr._finish(job, "failed", "no_pull_request")
+        assert _request(job.request_id) == {
             "status": "failed",
             "terminal_cause": "no_pull_request",
         }
@@ -358,19 +358,19 @@ def test_a_finish_on_an_older_replica_still_ends_with_the_question(
         assert _state_labels(sink, number) == {NEEDS_HUMAN}
 
     _after_the_roll()
-    _shows_the_question(sink, triage, number)
-    assert _round_row(triage.work_item_id)["state"] == "outstanding"  # type: ignore[index]
-    assert [r["id"] for r in _requests(triage.work_item_id)] == [triage.request_id]
+    _shows_the_question(sink, job, number)
+    assert _round_row(job.work_item_id)["state"] == "outstanding"  # type: ignore[index]
+    assert [r["id"] for r in _requests(job.work_item_id)] == [job.request_id]
 
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
     if promoted_by == "older":
         with _older_replica():
             _reconcile()
     else:
         _reconcile()
-    _one_continuation(triage, revision)
-    _matches_new_replicas_only(admitted, monkeypatch, triage, revision, number)
+    _one_continuation(job, revision)
+    _matches_new_replicas_only(admitted, monkeypatch, job, revision, number)
 
 
 def test_an_answer_before_the_older_finish_keeps_one_continuation(
@@ -381,22 +381,22 @@ def test_an_answer_before_the_older_finish_keeps_one_continuation(
     answer is the one continuation."""
 
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1203)
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+    job = _asked(admitted, monkeypatch, 1203)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
     with _older_replica():
-        tr._finish(triage, "failed", "no_pull_request")
+        tr._finish(job, "failed", "no_pull_request")
         _reconcile()
-    assert _request(triage.request_id)["status"] == "failed"
+    assert _request(job.request_id)["status"] == "failed"
 
     _after_the_roll()
-    assert _request(triage.request_id) == QUESTION_ENDING
-    row = _round_row(triage.work_item_id)
+    assert _request(job.request_id) == QUESTION_ENDING
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"]) == ("answered", revision)
-    _one_continuation(triage, revision)
+    _one_continuation(job, revision)
     _matches_new_replicas_only(
-        admitted, monkeypatch, triage, revision, 1203, answer_at="before_finish"
+        admitted, monkeypatch, job, revision, 1203, answer_at="before_finish"
     )
 
 
@@ -407,18 +407,16 @@ def test_an_answer_between_the_older_finish_and_the_roll_keeps_one_continuation(
     the answer before any re-drive (the row still reads ``outstanding``)."""
 
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1204)
+    job = _asked(admitted, monkeypatch, 1204)
     with _older_replica():
-        tr._finish(triage, "failed", "no_pull_request")
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+        tr._finish(job, "failed", "no_pull_request")
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
 
     _after_the_roll()
-    assert _request(triage.request_id) == QUESTION_ENDING
-    _one_continuation(triage, revision)
-    _matches_new_replicas_only(
-        admitted, monkeypatch, triage, revision, 1204, answer_at="before_pass"
-    )
+    assert _request(job.request_id) == QUESTION_ENDING
+    _one_continuation(job, revision)
+    _matches_new_replicas_only(admitted, monkeypatch, job, revision, 1204, answer_at="before_pass")
 
 
 def test_a_relabel_before_the_roll_is_the_one_continuation(
@@ -430,20 +428,20 @@ def test_a_relabel_before_the_roll_is_the_one_continuation(
     answer no run will take."""
 
     _client, github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1205)
+    job = _asked(admitted, monkeypatch, 1205)
     with _older_replica():
-        tr._finish(triage, "failed", "no_pull_request")
-        tr._label(triage.client, github, 1205)
-    relabelled = _requests(triage.work_item_id)[-1]["id"]
-    assert relabelled != triage.request_id
+        tr._finish(job, "failed", "no_pull_request")
+        tr._label(job.client, github, 1205)
+    relabelled = _requests(job.work_item_id)[-1]["id"]
+    assert relabelled != job.request_id
 
     _after_the_roll()
-    assert _request(triage.request_id)["status"] == "failed"
-    row = _round_row(triage.work_item_id)
+    assert _request(job.request_id)["status"] == "failed"
+    row = _round_row(job.work_item_id)
     assert row is not None and row["state"] == "cleared"
-    assert _after_asker(triage) == [(relabelled, "waiting")]
+    assert _after_asker(job) == [(relabelled, "waiting")]
     assert QUESTIONS_LABEL not in _state_labels(sink, 1205)
-    assert _to_redrive(triage) == []
+    assert _to_redrive(job) == []
 
 
 def test_a_relabel_beside_a_queued_answer_is_not_redriven_again(
@@ -458,23 +456,23 @@ def test_a_relabel_beside_a_queued_answer_is_not_redriven_again(
 
     _client, github, sink = admitted
 
-    def run(number: int, *, older: bool) -> tuple[tr._Triage, uuid.UUID, uuid.UUID]:
-        triage = _asked(admitted, monkeypatch, number)
-        revision = _queue_revision(triage)
-        _answer(triage.work_item_id, revision)
+    def run(number: int, *, older: bool) -> tuple[tr._Run, uuid.UUID, uuid.UUID]:
+        job = _asked(admitted, monkeypatch, number)
+        revision = _queue_revision(job)
+        _answer(job.work_item_id, revision)
         with _older_replica() if older else contextlib.nullcontext():
-            tr._finish(triage, "failed", "no_pull_request")
-        tr._label(triage.client, github, number)
-        relabelled = _requests(triage.work_item_id)[-1]["id"]
-        return triage, revision, relabelled
+            tr._finish(job, "failed", "no_pull_request")
+        tr._label(job.client, github, number)
+        relabelled = _requests(job.work_item_id)[-1]["id"]
+        return job, revision, relabelled
 
-    triage, revision, relabelled = run(1207, older=True)
+    job, revision, relabelled = run(1207, older=True)
     _after_the_roll()
-    assert _request(triage.request_id)["status"] == "failed"
-    row = _round_row(triage.work_item_id)
+    assert _request(job.request_id)["status"] == "failed"
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["pending_request_id"]) == ("answered", revision)
-    assert _to_redrive(triage) == []
-    mixed = _after_asker(triage)
+    assert _to_redrive(job) == []
+    mixed = _after_asker(job)
     assert mixed == [(revision, "queued"), (relabelled, "waiting")]
 
     baseline, base_revision, base_relabelled = run(1257, older=False)
@@ -495,17 +493,17 @@ def test_an_owner_loss_on_an_older_replica_settles_as_on_the_new_one(
     lost run, and the successor can still ask and end with the question."""
 
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1206)
+    job = _asked(admitted, monkeypatch, 1206)
     with _older_replica():
-        _lose_owner(triage)
-    assert _round_row(triage.work_item_id)["state"] == "outstanding"  # type: ignore[index]
+        _lose_owner(job)
+    assert _round_row(job.work_item_id)["state"] == "outstanding"  # type: ignore[index]
 
     _after_the_roll()
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and row["state"] == "cleared"
-    requests = _requests(triage.work_item_id)
+    requests = _requests(job.work_item_id)
     assert len(requests) == 2, requests
-    successor = _take_over(triage, requests[-1]["id"])
+    successor = _take_over(job, requests[-1]["id"])
     posted = _ask(successor, ["Round 2: should a re-run replace the rows?"])
     assert posted.status_code == 200, posted.text
     assert posted.json() == {"round": 2, "rounds_limit": 3}
@@ -526,21 +524,21 @@ def test_an_older_replica_cancelling_after_the_question_ending_drops_the_round(
     it, the label leaves the question state, and a relabel asks round 2."""
 
     _client, github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1211)
-    tr._finish(triage, "failed", "no_pull_request")
+    job = _asked(admitted, monkeypatch, 1211)
+    tr._finish(job, "failed", "no_pull_request")
     _reconcile()
     assert _state_labels(sink, 1211) == {QUESTIONS_LABEL}
     with _older_replica():
-        _cancel(triage)
-    assert _round_row(triage.work_item_id) is not None
+        _cancel(job)
+    assert _round_row(job.work_item_id) is not None
 
     _after_the_roll()
-    assert _round_row(triage.work_item_id) is None
+    assert _round_row(job.work_item_id) is None
     assert _state_labels(sink, 1211) == set()
 
-    tr._label(triage.client, github, 1211)
-    relabelled = _requests(triage.work_item_id)[-1]["id"]
-    fresh = _take_over(triage, relabelled)
+    tr._label(job.client, github, 1211)
+    relabelled = _requests(job.work_item_id)[-1]["id"]
+    fresh = _take_over(job, relabelled)
     posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
     assert posted.status_code == 200, posted.text
     assert posted.json() == {"round": 2, "rounds_limit": 3}
@@ -555,20 +553,20 @@ def test_a_relabel_after_an_older_cancellation_drops_the_round(
     so the fresh run is not taken for an answer to it and asks round 2."""
 
     _client, github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1213)
-    tr._finish(triage, "failed", "no_pull_request")
+    job = _asked(admitted, monkeypatch, 1213)
+    tr._finish(job, "failed", "no_pull_request")
     _reconcile()
     with _older_replica():
-        _cancel(triage)
-    assert _round_row(triage.work_item_id) is not None
+        _cancel(job)
+    assert _round_row(job.work_item_id) is not None
 
-    tr._label(triage.client, github, 1213)
-    assert _round_row(triage.work_item_id) is None
-    relabelled = _requests(triage.work_item_id)[-1]["id"]
-    assert _after_asker(triage) == [(relabelled, "waiting")]
+    tr._label(job.client, github, 1213)
+    assert _round_row(job.work_item_id) is None
+    relabelled = _requests(job.work_item_id)[-1]["id"]
+    assert _after_asker(job) == [(relabelled, "waiting")]
     _after_the_roll()
-    assert _round_row(triage.work_item_id) is None
-    fresh = _take_over(triage, relabelled)
+    assert _round_row(job.work_item_id) is None
+    fresh = _take_over(job, relabelled)
     posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
     assert posted.status_code == 200, posted.text
     assert posted.json() == {"round": 2, "rounds_limit": 3}
@@ -584,11 +582,11 @@ def test_a_new_round_after_the_selection_is_left_to_its_own_settlement(
     against the new round."""
 
     _client, github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1214)
-    tr._finish(triage, "failed", "no_pull_request")
+    job = _asked(admitted, monkeypatch, 1214)
+    tr._finish(job, "failed", "no_pull_request")
     _reconcile()
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
     # The older replica ended the queued answer without settling the round.
     tr._exec(
         "UPDATE curie.execution_requests SET status = 'cancelled', "
@@ -596,19 +594,19 @@ def test_a_new_round_after_the_selection_is_left_to_its_own_settlement(
         "version = version + 1 WHERE id = :id",
         {"id": revision},
     )
-    assert _to_redrive(triage) == [triage.work_item_id]
+    assert _to_redrive(job) == [job.work_item_id]
 
-    tr._label(triage.client, github, 1214)
-    relabelled = _requests(triage.work_item_id)[-1]["id"]
-    fresh = _take_over(triage, relabelled)
+    tr._label(job.client, github, 1214)
+    relabelled = _requests(job.work_item_id)[-1]["id"]
+    fresh = _take_over(job, relabelled)
     posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
     assert posted.status_code == 200, posted.text
-    before = _round_row(triage.work_item_id)
+    before = _round_row(job.work_item_id)
     assert before is not None
     assert (before["asking_request_id"], before["pending_request_id"]) == (relabelled, revision)
 
-    _redrive(triage)
-    after = _round_row(triage.work_item_id)
+    _redrive(job)
+    after = _round_row(job.work_item_id)
     assert after is not None
     assert (after["state"], after["asking_request_id"]) == ("outstanding", relabelled)
     tr._finish(fresh, "failed", "no_pull_request")
@@ -624,16 +622,16 @@ def test_a_round_after_a_superseded_answer_keeps_its_question_ending(
     ``outstanding``: the superseded answer belongs to round 1."""
 
     _client, github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1215)
-    tr._finish(triage, "failed", "no_pull_request")
+    job = _asked(admitted, monkeypatch, 1215)
+    tr._finish(job, "failed", "no_pull_request")
     _reconcile()
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
     _reconcile()
-    tr._label(triage.client, github, 1215)
+    tr._label(job.client, github, 1215)
     assert _request(revision) == {"status": "cancelled", "terminal_cause": "issue_cancelled"}
-    relabelled = _requests(triage.work_item_id)[-1]["id"]
-    fresh = _take_over(triage, relabelled)
+    relabelled = _requests(job.work_item_id)[-1]["id"]
+    fresh = _take_over(job, relabelled)
     posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
     assert posted.json() == {"round": 2, "rounds_limit": 3}
     with _older_replica():
@@ -642,7 +640,7 @@ def test_a_round_after_a_superseded_answer_keeps_its_question_ending(
 
     _after_the_roll()
     assert _request(relabelled) == QUESTION_ENDING
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["asking_request_id"], row["rounds_used"]) == (
         "outstanding",
@@ -664,33 +662,33 @@ def test_an_answer_queued_before_a_relabel_still_settles_the_next_round(
 
     _client, github, sink = admitted
 
-    def run(number: int, *, older: bool) -> tr._Triage:
-        triage = _asked(admitted, monkeypatch, number)
-        revision = _queue_revision(triage)
-        _answer(triage.work_item_id, revision)
-        tr._finish(triage, "failed", "no_pull_request")
-        tr._label(triage.client, github, number)
-        relabelled = _requests(triage.work_item_id)[-1]["id"]
-        assert _after_asker(triage) == [(revision, "queued"), (relabelled, "waiting")]
-        fresh = _take_over(triage, relabelled)
+    def run(number: int, *, older: bool) -> tr._Run:
+        job = _asked(admitted, monkeypatch, number)
+        revision = _queue_revision(job)
+        _answer(job.work_item_id, revision)
+        tr._finish(job, "failed", "no_pull_request")
+        tr._label(job.client, github, number)
+        relabelled = _requests(job.work_item_id)[-1]["id"]
+        assert _after_asker(job) == [(revision, "queued"), (relabelled, "waiting")]
+        fresh = _take_over(job, relabelled)
         posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
         assert posted.json() == {"round": 2, "rounds_limit": 3}
         tr._finish(fresh, "failed", "no_pull_request")
         assert _request(relabelled) == QUESTION_ENDING
-        row = _round_row(triage.work_item_id)
+        row = _round_row(job.work_item_id)
         assert row is not None
         assert (row["state"], row["pending_request_id"]) == ("answered", revision)
         _reconcile()
-        continuation = _run_continuation(triage, revision)
+        continuation = _run_continuation(job, revision)
         with _older_replica() if older else contextlib.nullcontext():
             tr._finish(continuation, "failed", "no_pull_request")
-        return triage
+        return job
 
-    triage = run(1218, older=True)
-    assert _round_row(triage.work_item_id)["state"] == "answered"  # type: ignore[index]
+    job = run(1218, older=True)
+    assert _round_row(job.work_item_id)["state"] == "answered"  # type: ignore[index]
     _after_the_roll()
-    assert _round_row(triage.work_item_id)["state"] == "cleared"  # type: ignore[index]
-    assert _to_redrive(triage) == []
+    assert _round_row(job.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _to_redrive(job) == []
 
     baseline = run(1268, older=False)
     _reconcile()
@@ -708,18 +706,18 @@ def test_a_mention_that_asks_after_a_later_relabel_ended_keeps_its_round(
     its question ending and leaves round 2 ``outstanding``."""
 
     _client, github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1219)
-    mention = _queue_revision(triage)
-    _answer(triage.work_item_id, mention)
-    tr._finish(triage, "failed", "no_pull_request")
-    tr._label(triage.client, github, 1219)
-    relabelled = _requests(triage.work_item_id)[-1]["id"]
-    assert _after_asker(triage) == [(mention, "queued"), (relabelled, "waiting")]
-    relabel_run = _take_over(triage, relabelled)
+    job = _asked(admitted, monkeypatch, 1219)
+    mention = _queue_revision(job)
+    _answer(job.work_item_id, mention)
+    tr._finish(job, "failed", "no_pull_request")
+    tr._label(job.client, github, 1219)
+    relabelled = _requests(job.work_item_id)[-1]["id"]
+    assert _after_asker(job) == [(mention, "queued"), (relabelled, "waiting")]
+    relabel_run = _take_over(job, relabelled)
     tr._finish(relabel_run, "failed", "no_pull_request")
     assert _request(relabelled)["status"] == "failed"
     _reconcile()
-    asking = _run_continuation(triage, mention)
+    asking = _run_continuation(job, mention)
     posted = _ask(asking, ["Round 2: should a re-run replace the rows?"])
     assert posted.json() == {"round": 2, "rounds_limit": 3}
     with _older_replica():
@@ -728,14 +726,14 @@ def test_a_mention_that_asks_after_a_later_relabel_ended_keeps_its_round(
 
     _after_the_roll()
     assert _request(mention) == QUESTION_ENDING
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["asking_request_id"], row["rounds_used"]) == (
         "outstanding",
         mention,
         2,
     )
-    assert _to_redrive(triage) == []
+    assert _to_redrive(job) == []
 
 
 def test_an_answer_that_ran_before_the_redrive_still_gives_the_asker_its_ending(
@@ -747,23 +745,23 @@ def test_an_answer_that_ran_before_the_redrive_still_gives_the_asker_its_ending(
     the continuation's outcome, as with no older replica."""
 
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1216)
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+    job = _asked(admitted, monkeypatch, 1216)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
     with _older_replica():
-        tr._finish(triage, "failed", "no_pull_request")
+        tr._finish(job, "failed", "no_pull_request")
         _reconcile()
-    continuation = _run_continuation(triage, revision)
+    continuation = _run_continuation(job, revision)
     tr._finish(continuation, "failed", "no_pull_request")
-    assert _round_row(triage.work_item_id)["state"] == "cleared"  # type: ignore[index]
-    assert _request(triage.request_id)["status"] == "failed"
+    assert _round_row(job.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _request(job.request_id)["status"] == "failed"
 
     _after_the_roll()
-    assert _request(triage.request_id) == QUESTION_ENDING
-    assert _round_row(triage.work_item_id)["state"] == "cleared"  # type: ignore[index]
-    assert _after_asker(triage) == [(revision, "failed")]
+    assert _request(job.request_id) == QUESTION_ENDING
+    assert _round_row(job.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _after_asker(job) == [(revision, "failed")]
     assert _state_labels(sink, 1216) == {NEEDS_HUMAN}
-    assert _to_redrive(triage) == []
+    assert _to_redrive(job) == []
 
 
 def test_an_older_status_pass_on_the_continuation_does_not_keep_the_question_label(
@@ -775,13 +773,13 @@ def test_an_older_status_pass_on_the_continuation_does_not_keep_the_question_lab
     ticket carries the continuation's label alone."""
 
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1217)
-    tr._finish(triage, "failed", "no_pull_request")
+    job = _asked(admitted, monkeypatch, 1217)
+    tr._finish(job, "failed", "no_pull_request")
     _reconcile()
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
     _reconcile()
-    continuation = _run_continuation(triage, revision)
+    continuation = _run_continuation(job, revision)
     # The continuation's comment is posted; the older pass that takes its
     # running update adds the running label and keeps the question label.
     _reconcile()
@@ -792,21 +790,21 @@ def test_an_older_status_pass_on_the_continuation_does_not_keep_the_question_lab
     assert _state_labels(sink, 1217) == {QUESTIONS_LABEL, NEEDS_HUMAN}
 
     _after_the_roll()
-    assert _round_row(triage.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _round_row(job.work_item_id)["state"] == "cleared"  # type: ignore[index]
     assert _state_labels(sink, 1217) == {NEEDS_HUMAN}
 
 
-def _record_termination(triage: tr._Triage) -> None:
+def _record_termination(job: tr._Run) -> None:
     """The worker records that the cancelled request's sandbox is gone."""
 
-    work_item_version, request_version = _versions(triage, triage.request_id)
+    work_item_version, request_version = _versions(job, job.request_id)
 
     async def terminate() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             result = await lifecycle.record_runtime_termination(
                 session,
-                work_item_id=triage.work_item_id,
-                request_id=triage.request_id,
+                work_item_id=job.work_item_id,
+                request_id=job.request_id,
                 termination_observation="sandbox gone after the cancellation",
                 expected_work_item_version=work_item_version,
                 expected_request_version=request_version,
@@ -814,7 +812,7 @@ def _record_termination(triage: tr._Triage) -> None:
             await session.commit()
             return result
 
-    assert isinstance(triage.client.portal.call(terminate), lifecycle.WorkItemOutcome)
+    assert isinstance(job.client.portal.call(terminate), lifecycle.WorkItemOutcome)
 
 
 def test_an_older_replica_cancelling_the_running_asker_drops_the_round(
@@ -824,15 +822,15 @@ def test_an_older_replica_cancelling_the_running_asker_drops_the_round(
     the cancellation; the worker's termination record lands on a new one."""
 
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 1212)
+    job = _asked(admitted, monkeypatch, 1212)
     with _older_replica():
-        _cancel(triage)
-    assert _request(triage.request_id)["status"] == "cancellation_requested"
-    _record_termination(triage)
-    assert _request(triage.request_id)["status"] == "cancelled"
+        _cancel(job)
+    assert _request(job.request_id)["status"] == "cancellation_requested"
+    _record_termination(job)
+    assert _request(job.request_id)["status"] == "cancelled"
 
     _after_the_roll()
-    assert _round_row(triage.work_item_id) is None
+    assert _round_row(job.work_item_id) is None
     assert QUESTIONS_LABEL not in _state_labels(sink, 1212)
 
 
@@ -850,25 +848,25 @@ def test_an_older_status_pass_is_rewritten_after_the_roll(
 
     number = 1221 if older_first else 1222
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, number)
+    job = _asked(admitted, monkeypatch, number)
     # The status comment is posted while the run is live, as at admission.
     _reconcile()
     assert _state_labels(sink, number) == {RUNNING}
-    tr._finish(triage, "failed", "no_pull_request")
-    assert _request(triage.request_id) == QUESTION_ENDING
+    tr._finish(job, "failed", "no_pull_request")
+    assert _request(job.request_id) == QUESTION_ENDING
     if not older_first:
         _reconcile()
-        _shows_the_question(sink, triage, number)
-    _older_status_pass(sink, triage.request_id, number)
+        _shows_the_question(sink, job, number)
+    _older_status_pass(sink, job.request_id, number)
     assert PR_OPEN in _state_labels(sink, number)
 
     _after_the_roll()
-    _shows_the_question(sink, triage, number)
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+    _shows_the_question(sink, job, number)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
     _reconcile()
-    _one_continuation(triage, revision)
-    _matches_new_replicas_only(admitted, monkeypatch, triage, revision, number)
+    _one_continuation(job, revision)
+    _matches_new_replicas_only(admitted, monkeypatch, job, revision, number)
 
 
 # The tracker intake reads an answer beside an older replica ------------------------------
@@ -992,31 +990,31 @@ def test_a_plain_answer_after_an_older_finish_is_the_one_continuation(
     reading the same comment again adds nothing."""
 
     number = 1231 if path == "webhook" else 1232
-    triage = intake._running(world, number)
-    assert _ask(triage).status_code == 200
+    job = intake._running(world, number)
+    assert _ask(job).status_code == 200
     with _older_replica():
-        tr._finish(triage, "failed", "no_pull_request")
-    assert _request(triage.request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
-    assert _round_row(triage.work_item_id)["state"] == "outstanding"  # type: ignore[index]
+        tr._finish(job, "failed", "no_pull_request")
+    assert _request(job.request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
+    assert _round_row(job.work_item_id)["state"] == "outstanding"  # type: ignore[index]
 
     comment = world.github.add_comment(number, intake.ANSWER, user=intake.WRITER)
     result = intake._deliver(world, path, comment, number)
     if result is not None:
         assert result["status"] == "factory_admitted", result
-    answer = intake._answer_id(triage, comment)
+    answer = intake._answer_id(job, comment)
 
     _after_the_roll()
-    assert _request(triage.request_id) == QUESTION_ENDING
-    assert _after_asker(triage) == [(answer, "waiting")]
-    row = _round_row(triage.work_item_id)
+    assert _request(job.request_id) == QUESTION_ENDING
+    assert _after_asker(job) == [(answer, "waiting")]
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"]) == ("answered", answer)
     again = intake._deliver(world, "poll" if path == "webhook" else "webhook", comment, number)
     if again is not None:
         assert again["status"] == "factory_duplicate", again
     _after_the_roll()
-    assert _after_asker(triage) == [(answer, "waiting")]
-    run = _take_over(triage, answer)
+    assert _after_asker(job) == [(answer, "waiting")]
+    run = _take_over(job, answer)
     assert _request(answer)["status"] == "running"
     read = intake._run_issue(run)
     assert read["has_question_history"] is True

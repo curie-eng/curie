@@ -48,7 +48,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from . import factory_tracker_result_runtime as runtime
+from . import completion_contract as runtime
 from .config import Settings, get_settings
 from .factory_comment_text import publishable_model_text
 from .forges.errors import ForgeError
@@ -315,10 +315,7 @@ async def begin_round(
     work_item, request = pair.work_item, pair.request
     if work_item.cancelled_at is not None:
         raise await _refuse_after_commit(session, WORK_ITEM_CANCELLED)
-    if (
-        runtime.contract_of(request) != runtime.CONTRACT_IMPLEMENTATION
-        or request.execution_kind == _PUBLICATION_RECOVERY
-    ):
+    if request.execution_kind == _PUBLICATION_RECOVERY:
         raise await _refuse_after_commit(session, NOT_IMPLEMENTATION_CONTRACT)
     from .workitems.lifecycle import database_now
 
@@ -691,9 +688,8 @@ async def rows_an_older_replica_settled(
        older replica failed: the queued answer ran and settled here before
        the re-drive reached the asker, which still lacks the question ending.
 
-    An asker the re-drive would leave failed (a tracker result, or a request
-    other than its queued answer admitted after it and not yet ended) is
-    selected only once the
+    An asker the re-drive would leave failed (a request other than its queued
+    answer admitted after it and not yet ended) is selected only once the
     row can clear, so no row is selected on every pass. ``work_item_id``
     narrows the check to one WorkItem: the re-drive repeats it under the
     WorkItem lock, since a relabel and a new ask can change the row between
@@ -711,7 +707,6 @@ async def rows_an_older_replica_settled(
     failed_asker = and_(
         asker.status == "failed",
         asker.terminal_cause.in_(unpublished_causes),
-        asker.completion_contract.is_distinct_from(runtime.CONTRACT_TRACKER_RESULT),
         ~exists().where(
             later.work_item_id == asker.work_item_id,
             later.sequence > asker.sequence,

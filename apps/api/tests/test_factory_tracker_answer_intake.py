@@ -40,6 +40,7 @@ from curie_api import factory_questions
 from curie_api.config import get_settings
 from curie_api.forges.memory import InMemoryTracker
 from curie_api.forges.types import Actor, TrackerIssueRef
+from factory_run_support import MINT_URL
 from forge_fakes import gitlab_lifecycle as gl
 from forge_fakes import jira as jira_fake
 from forge_fakes.bitbucket_lifecycle import install_memory_jira, memory_jira_tracker
@@ -64,7 +65,6 @@ from test_factory_tracker_intake import (  # noqa: F401  (fixtures)
     intake,
     make_intake,
 )
-from test_factory_tracker_results import MINT_URL
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

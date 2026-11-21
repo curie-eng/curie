@@ -527,38 +527,6 @@ class AgentChannel(Base):
 
 class AgentVersion(Base):
     __tablename__ = "agent_versions"
-    __table_args__ = (
-        # Migration 0162 (#5585): the tracker result policy identity is both
-        # absent or a schema version 1 declaration's canonical digest. The
-        # IS NOT NULL terms keep a half-set pair FALSE rather than NULL.
-        CheckConstraint(
-            "(result_policy_schema_version IS NULL AND result_policy_digest IS NULL) "
-            "OR (result_policy_schema_version IS NOT NULL "
-            "AND result_policy_schema_version = 1 "
-            "AND result_policy_digest IS NOT NULL "
-            "AND result_policy_digest ~ '^[0-9a-f]{64}$')",
-            name="agent_versions_result_policy_ck",
-        ),
-        # Migration 0167 (#5586): the stored policy (sorted result kinds and the
-        # implementation label) requires its digest. A digest alone is allowed
-        # for a 0162 row whose declaration SQL could not backfill; admission
-        # refuses it as an unreadable policy until a deploy records both.
-        CheckConstraint(
-            "result_policy IS NULL OR result_policy_digest IS NOT NULL",
-            name="agent_versions_result_policy_presence_ck",
-        ),
-        CheckConstraint(
-            "result_policy IS NULL OR (CASE WHEN jsonb_typeof(result_policy) = 'object' THEN "
-            "(result_policy - 'results' - 'implementation_label' = '{}'::jsonb "
-            "AND ((result_policy -> 'results' = '[\"findings\"]'::jsonb "
-            "AND result_policy -> 'implementation_label' = 'null'::jsonb) "
-            "OR (result_policy -> 'results' = '[\"findings\", \"ticket\"]'::jsonb "
-            "AND jsonb_typeof(result_policy -> 'implementation_label') = 'string' "
-            "AND length(result_policy ->> 'implementation_label') BETWEEN 1 AND 50))) "
-            "ELSE false END) IS TRUE",
-            name="agent_versions_result_policy_shape_ck",
-        ),
-    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(
@@ -577,16 +545,6 @@ class AgentVersion(Base):
     commit_sha: Mapped[str | None] = mapped_column(default=None, index=True)
     created_by: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    # The tracker result declaration's schema version and canonical SHA-256
-    # (ADR 0277), and the policy it declares: ``{"results": [sorted kinds],
-    # "implementation_label": str | None}``. Written when the bundle is
-    # attached (``deploy.apply_result_policy``); all NULL for a bundle without
-    # a declaration, which has the implementation contract.
-    result_policy_schema_version: Mapped[int | None] = mapped_column(Integer, default=None)
-    result_policy_digest: Mapped[str | None] = mapped_column(Text, default=None)
-    result_policy: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB(none_as_null=True), default=None
-    )
 
     agent: Mapped[Agent] = relationship(back_populates="versions")
 
@@ -1612,25 +1570,6 @@ class ExecutionRequest(Base):
             "OR (status IN ('completed', 'failed', 'expired') AND started_at IS NOT NULL)",
             name="execution_requests_teardown_unconfirmed_ck",
         ),
-        # Migration 0167 (#5586, ADR 0277): the completion contract selected at
-        # admission, the deployed result policy digest a tracker result request
-        # runs under, and its one model session reservation.
-        CheckConstraint(
-            "completion_contract IN ('implementation', 'tracker_result')",
-            name="execution_requests_completion_contract_ck",
-        ),
-        CheckConstraint(
-            "(completion_contract = 'tracker_result') = (result_policy_digest IS NOT NULL)",
-            name="execution_requests_result_policy_digest_ck",
-        ),
-        CheckConstraint(
-            "result_policy_digest IS NULL OR result_policy_digest ~ '^[0-9a-f]{64}$'",
-            name="execution_requests_result_policy_digest_format_ck",
-        ),
-        CheckConstraint(
-            "model_session_reserved_at IS NULL OR completion_contract = 'tracker_result'",
-            name="execution_requests_model_session_reserved_at_ck",
-        ),
         CheckConstraint(
             "dispatch_generation >= 1",
             name="execution_requests_dispatch_generation_ck",
@@ -1753,8 +1692,7 @@ class ExecutionRequest(Base):
             name="execution_requests_recovery_candidate_kind_ck",
         ),
         CheckConstraint(
-            "execution_kind <> 'publication_recovery' "
-            "OR (completion_contract = 'implementation' AND retry_of_request_id IS NOT NULL)",
+            "execution_kind <> 'publication_recovery' OR retry_of_request_id IS NOT NULL",
             name="execution_requests_recovery_shape_ck",
         ),
         CheckConstraint(
@@ -1968,18 +1906,6 @@ class ExecutionRequest(Base):
     reply_target_pr_number: Mapped[str | None] = mapped_column(Text, default=None)
     reply_target_comment_id: Mapped[str | None] = mapped_column(Text, default=None)
     reply_target_url: Mapped[str | None] = mapped_column(Text, default=None)
-    # How the request completes (ADR 0277): ``implementation`` by a pull
-    # request, ``tracker_result`` by one delivered tracker result under the
-    # deployed policy ``result_policy_digest`` names. Selected at admission
-    # from the binding's in-force version, never from issue text.
-    completion_contract: Mapped[str] = mapped_column(
-        Text, default="implementation", server_default="implementation"
-    )
-    result_policy_digest: Mapped[str | None] = mapped_column(Text, default=None)
-    # The one model session a tracker result request may start, stamped once.
-    model_session_reserved_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), default=None
-    )
 
     work_item: Mapped[WorkItem] = relationship(
         back_populates="execution_requests", foreign_keys=[work_item_id]
@@ -2102,7 +2028,7 @@ class FactoryStatusComment(Base):
             "applied_label IS NULL OR applied_label IN "
             "('', 'curie:queued', 'curie:running', 'curie:pr-open', 'curie:needs-human', "
             "'curie-factory:queued', 'curie-factory:running', 'curie-factory:pr-open', "
-            "'curie-factory:needs-human', 'curie-factory:triaged', 'curie-factory:questions')",
+            "'curie-factory:needs-human', 'curie-factory:questions')",
             name="factory_terminal_notices_applied_label_ck",
         ),
         # Application N-1's delivery scan still reads this one.
@@ -2232,298 +2158,11 @@ class WorkItemOperatorRetry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-# Tracker result delivery (ADR 0277, #5585). Migrations 0162 and 0167 (#5586)
-# freeze the CHECKs copied here. No column below except the artifact's ``content`` holds
-# text a proposal submitted: codes are CHECK constrained to snake case, and
-# digests and revisions to lowercase hex.
-FACTORY_TRACKER_RESULT_KINDS = ("ticket", "findings")
-FACTORY_TRACKER_RESULT_REASONS = (
-    "not_reproduced",
-    "already_fixed",
-    "product_decision_needed",
-    "capability_unavailable",
-    "budget_exhausted",
-)
-FACTORY_TRACKER_RESULT_STATES = ("owed", "delivered", "failed")
-FACTORY_TRACKER_RESULT_ORIGINS = ("submitted", "platform")
 _HEX64 = "'^[0-9a-f]{64}$'"
-_CODE = "'^[a-z][a-z0-9_]{0,63}$'"
-_FINDINGS_ONLY = "'[\"findings\"]'::jsonb"
-_FINDINGS_AND_TICKET = '\'["findings", "ticket"]\'::jsonb'
-_OUTPUT_COLUMNS = (
-    "output_tracker_kind, output_tracker_host, output_scope_id, "
-    "output_issue_id, output_url, output_body_sha256"
-)
 
 
 def _sql_values(values: tuple[str, ...]) -> str:
     return ", ".join(f"'{value}'" for value in values)
-
-
-class FactoryTrackerResultGrant(Base):
-    """The authority one execution request holds to deliver one tracker result.
-
-    Minted for real by #5586; in #5585 only tests create grants. The output
-    identity is the opaque string the created issue's hidden marker carries.
-    ``allowed_result_kinds`` is stored sorted, and a grant that allows a ticket
-    carries the implementation label copied from the declaration.
-    """
-
-    __tablename__ = "factory_tracker_result_grants"
-    __table_args__ = (
-        UniqueConstraint(
-            "execution_request_id",
-            name="factory_tracker_result_grants_execution_request_id_key",
-        ),
-        UniqueConstraint(
-            "output_identity", name="factory_tracker_result_grants_output_identity_key"
-        ),
-        CheckConstraint(
-            f"source_fingerprint ~ {_HEX64}",
-            name="factory_tracker_result_grants_source_fingerprint_ck",
-        ),
-        CheckConstraint(
-            "length(btrim(repository_id)) > 0",
-            name="factory_tracker_result_grants_repository_id_ck",
-        ),
-        CheckConstraint(
-            f"allowed_result_kinds IN ({_FINDINGS_ONLY}, {_FINDINGS_AND_TICKET})",
-            name="factory_tracker_result_grants_allowed_result_kinds_ck",
-        ),
-        CheckConstraint(
-            "output_identity ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'",
-            name="factory_tracker_result_grants_output_identity_ck",
-        ),
-        CheckConstraint(
-            f"(implementation_label IS NULL) = (allowed_result_kinds = {_FINDINGS_ONLY})",
-            name="factory_tracker_result_grants_implementation_label_ck",
-        ),
-        CheckConstraint(
-            "implementation_label IS NULL OR length(implementation_label) BETWEEN 1 AND 50",
-            name="factory_tracker_result_grants_implementation_label_length_ck",
-        ),
-        CheckConstraint(
-            f"source_content_sha256 IS NULL OR source_content_sha256 ~ {_HEX64}",
-            name="factory_tracker_result_grants_source_content_sha256_ck",
-        ),
-        Index("ix_factory_tracker_result_grants_work_item_id", "work_item_id"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    work_item_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
-    )
-    execution_request_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
-    )
-    source_fingerprint: Mapped[str] = mapped_column(Text)
-    repository_id: Mapped[str] = mapped_column(Text)
-    allowed_result_kinds: Mapped[list[str]] = mapped_column(JSONB)
-    output_identity: Mapped[str] = mapped_column(Text)
-    implementation_label: Mapped[str | None] = mapped_column(String(50), default=None)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    # SHA-256 of the source issue's title and body as the platform read them
-    # when the grant was minted (#5586).
-    source_content_sha256: Mapped[str | None] = mapped_column(Text, default=None)
-
-
-class FactoryTrackerResultDelivery(Base):
-    """The delivery state of one submitted result, owed until settled.
-
-    ``owed`` moves to ``delivered`` only after both tracker read-backs pass, or
-    to ``failed`` with a ``failure_code``. An attempt holds the lease
-    (``attempt_owner`` with its expiry). The output columns record the linked
-    issue once created, all together or not at all.
-    """
-
-    __tablename__ = "factory_tracker_result_deliveries"
-    __table_args__ = (
-        UniqueConstraint("grant_id", name="factory_tracker_result_deliveries_grant_id_key"),
-        CheckConstraint(
-            f"result_kind IN ({_sql_values(FACTORY_TRACKER_RESULT_KINDS)})",
-            name="factory_tracker_result_deliveries_result_kind_ck",
-        ),
-        CheckConstraint(
-            "(result_kind = 'findings') = (reason IS NOT NULL)",
-            name="factory_tracker_result_deliveries_reason_presence_ck",
-        ),
-        CheckConstraint(
-            f"reason IS NULL OR reason IN ({_sql_values(FACTORY_TRACKER_RESULT_REASONS)})",
-            name="factory_tracker_result_deliveries_reason_ck",
-        ),
-        CheckConstraint(
-            f"proposal_sha256 ~ {_HEX64}",
-            name="factory_tracker_result_deliveries_proposal_sha256_ck",
-        ),
-        CheckConstraint(
-            f"output_body_sha256 IS NULL OR output_body_sha256 ~ {_HEX64}",
-            name="factory_tracker_result_deliveries_output_body_sha256_ck",
-        ),
-        CheckConstraint(
-            f"state IN ({_sql_values(FACTORY_TRACKER_RESULT_STATES)})",
-            name="factory_tracker_result_deliveries_state_ck",
-        ),
-        CheckConstraint(
-            "(state = 'owed') = (settled_at IS NULL)",
-            name="factory_tracker_result_deliveries_settled_ck",
-        ),
-        CheckConstraint(
-            "(state = 'failed') = (failure_code IS NOT NULL)",
-            name="factory_tracker_result_deliveries_failure_ck",
-        ),
-        CheckConstraint(
-            f"last_error_code IS NULL OR last_error_code ~ {_CODE}",
-            name="factory_tracker_result_deliveries_last_error_code_ck",
-        ),
-        CheckConstraint(
-            f"failure_code IS NULL OR failure_code ~ {_CODE}",
-            name="factory_tracker_result_deliveries_failure_code_ck",
-        ),
-        CheckConstraint("attempts >= 0", name="factory_tracker_result_deliveries_attempts_ck"),
-        CheckConstraint(
-            "(attempt_owner IS NULL) = (attempt_lease_expires_at IS NULL)",
-            name="factory_tracker_result_deliveries_lease_ck",
-        ),
-        CheckConstraint(
-            f"num_nonnulls({_OUTPUT_COLUMNS}) IN (0, 6)",
-            name="factory_tracker_result_deliveries_output_ck",
-        ),
-        CheckConstraint(
-            "deadline_at > submitted_at",
-            name="factory_tracker_result_deliveries_deadline_ck",
-        ),
-        # Migration 0167 (#5586): a platform delivery is the budget exhausted
-        # findings the platform composes, and only it carries that reason.
-        CheckConstraint(
-            f"origin IN ({_sql_values(FACTORY_TRACKER_RESULT_ORIGINS)})",
-            name="factory_tracker_result_deliveries_origin_ck",
-        ),
-        CheckConstraint(
-            "origin = 'submitted' OR (result_kind = 'findings' AND reason = 'budget_exhausted')",
-            name="factory_tracker_result_deliveries_platform_origin_ck",
-        ),
-        CheckConstraint(
-            "reason IS NULL OR reason <> 'budget_exhausted' OR origin = 'platform'",
-            name="factory_tracker_result_deliveries_budget_exhausted_origin_ck",
-        ),
-        Index(
-            "ix_factory_tracker_result_deliveries_owed",
-            "next_attempt_at",
-            postgresql_where=text("state = 'owed'"),
-        ),
-        Index(
-            "ix_factory_tracker_result_deliveries_execution_request_id",
-            "execution_request_id",
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    grant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey(f"{SCHEMA}.factory_tracker_result_grants.id", ondelete="CASCADE"),
-    )
-    execution_request_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
-    )
-    result_kind: Mapped[str] = mapped_column(Text)
-    reason: Mapped[str | None] = mapped_column(Text, default=None)
-    proposal_sha256: Mapped[str] = mapped_column(Text)
-    runtime_epoch: Mapped[int] = mapped_column(BigInteger)
-    state: Mapped[str] = mapped_column(Text, default="owed", server_default="owed")
-    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    attempt_owner: Mapped[str | None] = mapped_column(Text, default=None)
-    attempt_lease_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), default=None
-    )
-    next_attempt_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    last_error_code: Mapped[str | None] = mapped_column(Text, default=None)
-    failure_code: Mapped[str | None] = mapped_column(Text, default=None)
-    # Set, committed, before a create request is sent and kept while its
-    # outcome is uncertain; then retries only reconcile, never create again.
-    create_attempted_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), default=None
-    )
-    output_tracker_kind: Mapped[str | None] = mapped_column(Text, default=None)
-    output_tracker_host: Mapped[str | None] = mapped_column(Text, default=None)
-    output_scope_id: Mapped[str | None] = mapped_column(Text, default=None)
-    output_issue_id: Mapped[str | None] = mapped_column(Text, default=None)
-    output_url: Mapped[str | None] = mapped_column(Text, default=None)
-    output_body_sha256: Mapped[str | None] = mapped_column(Text, default=None)
-    submitted_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-    origin: Mapped[str] = mapped_column(Text, default="submitted", server_default="submitted")
-
-
-class FactoryTrackerResultReceipt(Base):
-    """The record of one delivered result, written with the ``delivered`` state.
-
-    A ticket receipt names the linked issue it created or reconciled to; a
-    findings receipt names none and carries its reason. Both name the marked
-    result comment on the source issue.
-    """
-
-    __tablename__ = "factory_tracker_result_receipts"
-    __table_args__ = (
-        # The shape check also admits only the two result kinds.
-        CheckConstraint(
-            f"reason IS NULL OR reason IN ({_sql_values(FACTORY_TRACKER_RESULT_REASONS)})",
-            name="factory_tracker_result_receipts_reason_ck",
-        ),
-        CheckConstraint(
-            f"(result_kind = 'ticket' AND num_nonnulls({_OUTPUT_COLUMNS}, output_labels) = 7 "
-            "AND reason IS NULL) "
-            f"OR (result_kind = 'findings' AND num_nonnulls({_OUTPUT_COLUMNS}, output_labels) = 0 "
-            "AND reason IS NOT NULL)",
-            name="factory_tracker_result_receipts_shape_ck",
-        ),
-        CheckConstraint(
-            f"proposal_sha256 ~ {_HEX64}",
-            name="factory_tracker_result_receipts_proposal_sha256_ck",
-        ),
-        CheckConstraint(
-            f"output_body_sha256 IS NULL OR output_body_sha256 ~ {_HEX64}",
-            name="factory_tracker_result_receipts_output_body_sha256_ck",
-        ),
-        CheckConstraint(
-            "revision IS NULL OR revision ~ '^[0-9a-f]{40}$'",
-            name="factory_tracker_result_receipts_revision_ck",
-        ),
-    )
-
-    delivery_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey(f"{SCHEMA}.factory_tracker_result_deliveries.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    grant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
-    execution_request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
-    result_kind: Mapped[str] = mapped_column(Text)
-    reason: Mapped[str | None] = mapped_column(Text, default=None)
-    proposal_sha256: Mapped[str] = mapped_column(Text)
-    revision: Mapped[str | None] = mapped_column(Text, default=None)
-    result_comment_id: Mapped[str] = mapped_column(Text)
-    output_tracker_kind: Mapped[str | None] = mapped_column(Text, default=None)
-    output_tracker_host: Mapped[str | None] = mapped_column(Text, default=None)
-    output_scope_id: Mapped[str | None] = mapped_column(Text, default=None)
-    output_issue_id: Mapped[str | None] = mapped_column(Text, default=None)
-    output_url: Mapped[str | None] = mapped_column(Text, default=None)
-    output_body_sha256: Mapped[str | None] = mapped_column(Text, default=None)
-    output_labels: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), default=None)
-    delivered_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    # The web link to the marked result comment on the source issue (#5586).
-    result_comment_url: Mapped[str | None] = mapped_column(Text, default=None)
 
 
 FACTORY_QUESTION_ROUND_STATES = ("posting", "outstanding", "answered", "cleared", "exhausted")
@@ -2657,31 +2296,6 @@ class FactoryAnswerReceipt(Base):
     )
 
 
-class FactoryTrackerResultArtifact(Base):
-    """The private transport copy of one submitted proposal (ADR 0277).
-
-    The only place submitted text is stored. Deleted on confirmed delivery or
-    at the delivery deadline, whichever is first.
-    """
-
-    __tablename__ = "factory_tracker_result_artifacts"
-    __table_args__ = (
-        CheckConstraint(
-            "jsonb_typeof(content) = 'object'",
-            name="factory_tracker_result_artifacts_content_ck",
-        ),
-    )
-
-    delivery_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey(f"{SCHEMA}.factory_tracker_result_deliveries.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    content: Mapped[dict[str, Any]] = mapped_column(JSONB)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
 class ExecutionRequestPhaseReport(Base):
     """One ``report_progress`` call from the sandbox, on its active request (#3077)."""
 
@@ -2786,7 +2400,6 @@ FACTORY_SLACK_POST_KINDS = (
     "phase",
     "pull_request",
     "terminal",
-    "triage",
     "card",
     "needs_person",
     "ready",
@@ -2996,136 +2609,6 @@ class FactoryGrantNotice(Base):
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     last_error: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
-class FactoryTriageDelegation(Base):
-    """One triage selection's single-use authority to start one implementation run (#5588).
-
-    Stored in the transaction that admits a tracker-result request whose policy
-    allows a ticket. The actor is the verified human who applied the triage
-    label, by immutable id. The target is the one implementation binding the
-    declared label resolved to at admission, frozen; all three target columns
-    are null when it did not resolve to exactly one.
-    """
-
-    __tablename__ = "factory_triage_delegations"
-    __table_args__ = (
-        CheckConstraint(
-            "(target_binding_id IS NULL) = (target_agent_id IS NULL) "
-            "AND (target_binding_id IS NULL) = (target_binding_generation IS NULL)",
-            name="factory_triage_delegations_target_ck",
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    work_item_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
-    )
-    source_execution_request_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), unique=True
-    )
-    actor_id: Mapped[str] = mapped_column(Text)
-    actor_login: Mapped[str] = mapped_column(Text)
-    selection_event: Mapped[str] = mapped_column(Text)
-    tracker_kind: Mapped[str] = mapped_column(Text)
-    tracker_host: Mapped[str] = mapped_column(Text)
-    tracker_scope_id: Mapped[str] = mapped_column(Text)
-    tracker_issue_id: Mapped[str] = mapped_column(Text)
-    repository_id: Mapped[str] = mapped_column(Text)
-    result_policy_digest: Mapped[str] = mapped_column(Text)
-    target_label: Mapped[str] = mapped_column(Text)
-    installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
-    source_fingerprint: Mapped[str | None] = mapped_column(Text, default=None)
-    target_binding_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
-    target_binding_generation: Mapped[int | None] = mapped_column(default=None)
-    target_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    # Set when the source WorkItem is cancelled; a later readmit never clears it.
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-
-
-FACTORY_TRIAGE_HANDOFF_OUTCOMES = ("admitted", "refused")
-
-
-class FactoryTriageHandoff(Base):
-    """The internal selection event of one delivered triage ticket and its outcome (#5588).
-
-    Written with the ticket's receipt when a delegation exists. ``id`` is
-    derived from the source request and the output issue identity.
-    ``associated_at`` is the output association, committed before the
-    implementation label is added; the intake reads it to stay silent on the
-    factory's own label. ``outcome`` is ``admitted`` with
-    ``implementation_request_id`` or ``refused`` with ``reason``.
-    """
-
-    __tablename__ = "factory_triage_handoffs"
-    __table_args__ = (
-        UniqueConstraint(
-            "output_tracker_host",
-            "output_scope_id",
-            "output_issue_id",
-            name="factory_triage_handoffs_output_key",
-        ),
-        CheckConstraint(
-            "outcome IS NULL OR outcome IN ('admitted', 'refused')",
-            name="factory_triage_handoffs_outcome_ck",
-        ),
-        CheckConstraint(
-            "(outcome = 'admitted') = (implementation_request_id IS NOT NULL) "
-            "AND (outcome = 'refused') = (reason IS NOT NULL) "
-            "AND (outcome IS NULL) = (settled_at IS NULL)",
-            name="factory_triage_handoffs_settled_ck",
-        ),
-        Index(
-            "ix_factory_triage_handoffs_owed",
-            "next_attempt_at",
-            postgresql_where=text("outcome IS NULL OR label_cleanup_owed"),
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    delegation_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey(f"{SCHEMA}.factory_triage_delegations.id", ondelete="CASCADE"),
-        unique=True,
-    )
-    source_execution_request_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), unique=True
-    )
-    output_tracker_kind: Mapped[str] = mapped_column(Text)
-    output_tracker_host: Mapped[str] = mapped_column(Text)
-    output_scope_id: Mapped[str] = mapped_column(Text)
-    output_issue_id: Mapped[str] = mapped_column(Text)
-    output_url: Mapped[str] = mapped_column(Text)
-    output_body_sha256: Mapped[str] = mapped_column(Text)
-    implementation_request_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), default=None
-    )
-    outcome: Mapped[str | None] = mapped_column(Text, default=None)
-    reason: Mapped[str | None] = mapped_column(Text, default=None)
-    last_error: Mapped[str | None] = mapped_column(Text, default=None)
-    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
-    # A refusal after the label may have been written owes its removal until
-    # a read-back confirms it, independently of the outcome.
-    label_cleanup_owed: Mapped[bool] = mapped_column(default=False, server_default="false")
-    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
-    associated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    labelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    @property
-    def output_issue(self) -> TrackerIssueRef:
-        return TrackerIssueRef(
-            self.output_tracker_kind,
-            self.output_tracker_host,
-            self.output_scope_id,
-            self.output_issue_id,
-        )
 
 
 class ExecutionRequestModelUsage(Base):

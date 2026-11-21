@@ -77,23 +77,17 @@ class ExecutionBindingOut(BaseModel):
 
 
 class CompletionContractOut(BaseModel):
-    """How the execution completes (ADR 0277, #5586): by a pull request
-    (``implementation``), by one delivered tracker result (``tracker_result``),
-    or by publishing a retained publication candidate with no model run
+    """How the execution completes: by a pull request (``implementation``), or
+    by publishing a retained publication candidate with no model run
     (``publication_recovery``, #5429).
 
-    ``result_kinds`` are the kinds the deployed policy allows and
-    ``session_usd_allowance`` the per-session model allowance in USD (the
-    agent's dollar limit, else 5); both empty for ``implementation`` and
-    ``publication_recovery``. A ``publication_recovery`` answer also carries
-    no ``execution``: that process runs no model, so it waits for no requester
-    context.
+    ``execution`` is the ADR 0278 binding of an ``implementation`` execution.
+    A ``publication_recovery`` answer carries none: that process runs no
+    model, so it waits for no requester context.
     """
 
-    completion_contract: Literal["implementation", "tracker_result", "publication_recovery"]
-    result_kinds: list[str]
-    session_usd_allowance: float | None
-    execution: ExecutionBindingOut | None = None
+    completion_contract: Literal["implementation", "publication_recovery"]
+    execution: ExecutionBindingOut | None
     # Whether this execution may propose one learned rule (#5796, ADR 0287):
     # true exactly when the request is a revision admitted from reviewer
     # feedback, its agent has ``memory_rule_proposals`` on, its WorkItem's
@@ -102,27 +96,6 @@ class CompletionContractOut(BaseModel):
     # mounts ``propose_rule`` only when it is true. A permanent field: later
     # narrowings of this answer keep it, with this meaning.
     rule_proposal: bool
-
-
-class TrackerResultSubmission(BaseModel):
-    """The runner result tool's call: one typed proposal, validated by the API
-    (`curie_api.factory_tracker_results.parse_proposal`)."""
-
-    proposal: Any = Field(description="A ticket or findings proposal object.")
-
-
-class TrackerResultOut(BaseModel):
-    """The accepted result after one inline delivery attempt.
-
-    ``state`` ``owed`` means the platform keeps retrying until the delivery
-    deadline. ``result_comment_url`` is the source issue's marked result
-    comment and ``ticket_url`` the published ticket, each once delivered.
-    """
-
-    result_kind: Literal["ticket", "findings"]
-    state: Literal["owed", "delivered", "failed"]
-    result_comment_url: str | None
-    ticket_url: str | None
 
 
 class QuestionsSubmission(BaseModel):

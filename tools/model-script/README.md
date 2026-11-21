@@ -29,6 +29,16 @@ headers do not supply the upstream key.
 curie dev model-script record --output /tmp/factory-transcript.json --host 0.0.0.0 --port 8080
 ```
 
+Both `serve` and `record` accept `--capture-dir DIR`, for tests only. For every
+Messages request the server then writes one JSON file named by its sequence
+number (`000001.json`, `000002.json`, and so on) holding the lane key, the
+ordinal, the issue number, the full system prompt and the names of the tools the
+request offered. Transcripts never carry this data. The issue number is the first
+`/issues/<n>` in the first user message, or the result of the `issue_of` callable
+when a Python caller passes one to `ModelScript`. A Python caller may also pass a
+`tag` callable to a recording server; it stores one tag per recorded exchange in
+`recorded_tags`, aligned with the exchanges, so a mixed recording can be split.
+
 Stop either mode with SIGINT or SIGTERM. Review a recorded transcript before
 publishing it: replace anything that names a private repository with obvious
 placeholders. Each exchange stores only `lane_key`, `ordinal` and the assembled

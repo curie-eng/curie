@@ -41,7 +41,6 @@ from curie_api.forges.types import (
     Actor,
     AnswerComment,
     Disposition,
-    LinkedIssue,
     MarkedNotice,
     NoticePage,
     PullRequest,
@@ -59,8 +58,6 @@ TRACKER_CAPABILITIES: Mapping[Operation, Support] = {
     Operation.LINK_PULL_REQUEST: Support.NOOP,
     Operation.DEPENDENCIES: Support.NOOP,
     Operation.GROUP_MEMBERSHIP: Support.UNSUPPORTED,
-    # Linked output issues are GitHub only (ADR 0277); no fallback path.
-    Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
     Operation.FACTS_EXCHANGE: Support.UNSUPPORTED,
 }
 # The overlap between poll windows (decision 8): it absorbs clock skew and
@@ -641,21 +638,6 @@ class GitLabTracker:
 
     async def in_group(self, actor: Actor, group_id: str) -> bool:
         raise Unsupported(Operation.GROUP_MEMBERSHIP)
-
-    async def create_linked_issue(
-        self,
-        source: TrackerIssueRef,
-        *,
-        output_identity: str,
-        title: str,
-        body: str,
-        labels: Collection[str],
-        expected: TrackerIssueRef | None = None,
-        reconcile_only: bool = False,
-    ) -> LinkedIssue:
-        """Declared unsupported: linked output issues are GitHub only (ADR 0277)."""
-
-        raise Unsupported(Operation.CREATE_LINKED_ISSUE)
 
     # Tickets and labels -----------------------------------------------------------
 

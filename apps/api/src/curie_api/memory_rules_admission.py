@@ -26,7 +26,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .factory_tracker_result_runtime import CONTRACT_IMPLEMENTATION, CompletionContractName
 from .forges.types import RepositoryRef
 from .models import WorkItem, WorkItemMemoryRuleSnapshot
 from .schemas.workitems import MemoryRulesMetadata
@@ -117,19 +116,10 @@ def metadata(item: WorkItem, numbers: Sequence[int] = ()) -> MemoryRulesMetadata
     )
 
 
-def request_selection_columns(
-    item: WorkItem, *, completion_contract: CompletionContractName
-) -> dict[str, Any]:
-    """The request's evidence reference: pending only for an implementation request.
+def request_selection_columns(item: WorkItem) -> dict[str, Any]:
+    """The request's evidence reference: pending when the WorkItem pinned rules."""
 
-    The rules are delivered to the implementer only, so a request under any other
-    completion contract (the separate triage path, a publication recovery) carries
-    ``none`` and is served an absent envelope.
-    """
-
-    pending = (
-        item.memory_rules_state == "selected" and completion_contract == CONTRACT_IMPLEMENTATION
-    )
+    pending = item.memory_rules_state == "selected"
     return {"memory_rules_evidence": "pending" if pending else "none"}
 
 

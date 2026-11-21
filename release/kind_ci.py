@@ -105,6 +105,7 @@ def required_job_names(repo_root: Path, *, deadline: float) -> frozenset[str]:
                     "initial-binding-3",
                     "static-token-rotation",
                     "fresh-install",
+                    "learned-rules",
                 )
             ),
             *(f"Admitted agent runtime regressions (kind, shard {n}/7)" for n in range(1, 8)),

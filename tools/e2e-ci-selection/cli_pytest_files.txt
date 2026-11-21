@@ -162,6 +162,8 @@ tools/factory-e2e/tests/test_gitlab_acceptance.py
 tools/factory-e2e/tests/test_gitlab_driver.py
 tools/factory-e2e/tests/test_jira_driver.py
 tools/factory-e2e/tests/test_kind_images.py
+tools/factory-e2e/tests/test_learned_rules_lanes.py
+tools/factory-e2e/tests/test_learned_rules_scenario.py
 tools/factory-e2e/tests/test_live_github_chain.py
 tools/factory-e2e/tests/test_live_github_chain_driver.py
 tools/factory-e2e/tests/test_live_github_chain_pending.py

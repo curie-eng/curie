@@ -663,6 +663,7 @@ DIAGNOSTIC_UPLOADS = frozenset(
         ("ci.yaml", "e2e-released-upgrade-negative", "Retain safe namespace cleanup evidence"),
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Upload upgrade matrix evidence"),
         ("ci.yaml", "e2e-scripted-factory", "Upload scripted factory evidence"),
+        ("ci.yaml", "e2e-scripted-factory", "Upload scripted learned rules evidence"),
     }
 )
 
