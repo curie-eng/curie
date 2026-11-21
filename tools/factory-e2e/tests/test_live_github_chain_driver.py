@@ -983,20 +983,20 @@ def test_wiring_chain_flags_are_refused_for_another_scenario(
     assert flag in capsys.readouterr().err
 
 
-def test_wiring_attempt_flag_accepts_one_to_three() -> None:
+def test_wiring_attempt_flag_accepts_one_to_four() -> None:
     assert (
         fe.parse_args(
-            ["run", "--scenario", lgc.SCENARIO, "--live-chain-attempt", "3"]
+            ["run", "--scenario", lgc.SCENARIO, "--live-chain-attempt", "4"]
         ).live_chain_attempt
-        == 3
+        == 4
     )
     with pytest.raises(SystemExit):
-        fe.parse_args(["run", "--scenario", lgc.SCENARIO, "--live-chain-attempt", "4"])
+        fe.parse_args(["run", "--scenario", lgc.SCENARIO, "--live-chain-attempt", "5"])
     # The flag, the driver and the judge share one cap.
-    assert judge.MAX_ATTEMPTS == 3
+    assert judge.MAX_ATTEMPTS == 4
 
 
-@pytest.mark.parametrize(("attempt", "refused"), [(3, False), (4, True)])
+@pytest.mark.parametrize(("attempt", "refused"), [(4, False), (5, True)])
 def test_wiring_before_run_refuses_an_attempt_outside_the_cap(
     attempt: int, refused: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2886,6 +2886,31 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
         assert verdict.reasons == ("the revision trajectory has no propose_rule",)
 
 
+@pytest.mark.parametrize(
+    ("revision_tools", "passed"), [((PROPOSE,), True), (("Read", "Edit"), False)]
+)
+def test_wiring_the_saved_record_keeps_the_revision_trajectory_for_the_replay(
+    revision_tools: tuple[str, ...],
+    passed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #5808 AC (c): the revision's recorded tool notes reach the evidence, so an
+    # offline replay of the saved record judges propose_rule as the run did.
+    kept: list[fe.Preflight] = []
+    _chain, _queries, revision = _drive_beat_c(tmp_path, monkeypatch, revision_tools, keep=kept)
+    (p,) = kept
+    monkeypatch.setattr(lgc, "namespace_gone", lambda _p: True)
+    lgc.finish(p, [])
+    saved = p.evidence["live_chain_record"]["beat_c"]
+    (request,) = [r for r in saved["requests"] if r["id"] == revision]
+    assert request["tool_notes"] == list(revision_tools)
+    replayed = judge.judge_beat("beat_c", p.evidence["live_chain_record"])
+    assert replayed.passed is passed, replayed.reasons
+    if not passed:
+        assert replayed.reasons == ("the revision trajectory has no propose_rule",)
+
+
 def test_wiring_beat_c_keeps_the_review_comment_timestamps_for_the_edit_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3074,6 +3099,7 @@ def _drive_beat_c(
     check_samples: list[tuple[dict[str, Any], dict[str, Any]]] | None = None,
     now: Callable[[], str] | None = None,
     on_call: Callable[[str, str], None] | None = None,
+    keep: list[fe.Preflight] | None = None,
 ) -> tuple[lgc.ChainRun, list[str], str]:
     """``beat_c`` against a fake GitHub and install. ``check_samples`` are the
     revision head's check runs and combined status, one per read, the last
@@ -3194,6 +3220,8 @@ def _drive_beat_c(
     monkeypatch.setattr(p, "_paged", lambda path: copy.deepcopy(paged[path]))
     chain.record["identities"] = {**chain.record["identities"], "repository_path": repo}
 
+    if keep is not None:
+        keep.append(p)
     lgc.beat_c(p, chain)
     return chain, queries, revision
 

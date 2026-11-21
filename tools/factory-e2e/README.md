@@ -1827,7 +1827,7 @@ before ticket C, and the retired triage path. The driver is
    only; a refusal never echoes the value.
 3. `CURIE_FACTORY_MODEL_API_KEY` for the full run. `--stop-after links` needs
    none.
-4. `--live-chain-attempt N` (1 to 3) records which of the at most three attempts
+4. `--live-chain-attempt N` (1 to 4) records which of the at most four attempts
    this run is; the driver refuses any other number before its first action. Both chain flags are refused for any other scenario.
 
 ### Before any lock or cluster call
