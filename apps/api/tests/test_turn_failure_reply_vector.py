@@ -9,12 +9,18 @@ from curie_api.factory_notices import result_section
 from curie_api.factory_progress import pill_for
 
 _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "turn-failure-reply.json"
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
 
 
 def test_factory_result_names_the_vector_failure_class() -> None:
     vector = json.loads(_VECTOR.read_text())
     for example in vector["examples"]:
-        body = result_section(example["factory_cause"], pr_url=None)
+        body = result_section(
+            example["factory_cause"],
+            pr_url=None,
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
+        )
         assert body.startswith("Could not complete:")
         assert example["factory_class_line"] in body
         assert f"Cause: {example['factory_cause']}" in body
@@ -29,6 +35,8 @@ def test_a_completed_result_has_no_failure_class() -> None:
     body = result_section(
         "completed",
         pr_url="https://github.com/acme-corp/acme-bot/pull/1",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     assert "Failure class:" not in body
     assert "curie-turn-failure:" not in body
