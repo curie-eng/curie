@@ -638,6 +638,8 @@ class FakeModelSession:
             [Any, str | None, Any], Awaitable[dict[str, Any]]
         ]
         | None = None,
+        post_tool_use_hook: Callable[[Any, str | None, Any], Awaitable[dict[str, Any]]]
+        | None = None,
         approval_gate: ApprovalGate | None = None,
         replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
@@ -662,6 +664,11 @@ class FakeModelSession:
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
         self._pre_tool_use_hook = pre_tool_use_hook
+        # Like ``pre_tool_use_hook``: test-injected only, never a bundle command
+        # hook. Called for each scripted tool result before it is delivered, the
+        # order the real CLI runs PostToolUse in (ADR 0288).
+        self._post_tool_use_hook = post_tool_use_hook
+        self._tool_names: dict[str, str] = {}
         self._emit_partial_boundaries = emit_partial_boundaries
         self._disallowed_tools = tuple(disallowed_tools or ())
         # The shared policy gate (#561): a scripted request_approval block must
@@ -719,6 +726,9 @@ class FakeModelSession:
         self._refused_ids = set()
         self._pending_refusals = []
         self._denied_ids = set()
+        # A tool's result arrives in the turn that called it, as on the real
+        # CLI, so a name noted for PostToolUse never outlives its turn.
+        self._tool_names = {}
 
     async def interrupt(self) -> None:
         self.interrupts += 1
@@ -758,6 +768,7 @@ class FakeModelSession:
                     yield await self._answer_progress(message)
                 continue
             denied_messages = await self._apply_gate(message)
+            await self._observe_results(message)
             if self._emit_partial_boundaries and isinstance(message, AssistantMessage):
                 yield PartialMessageBoundary(event_type="message_start")
             yield message
@@ -776,6 +787,46 @@ class FakeModelSession:
                 # separate mechanism from the ``_interrupted`` truncation above,
                 # which models an OPERATOR stop and must keep working on its own.
                 return
+
+    async def _observe_results(self, message: Any) -> None:
+        """Note scripted tool names, and run the PostToolUse hook over their results.
+
+        A result whose call this turn refused or denied never ran, so the real
+        CLI runs no PostToolUse hook for it, and neither does this fake: such a
+        call's name is never noted. Names are forgotten at the next ``query``,
+        so a call a halt or an interrupting denial cut off cannot be observed
+        from a result scripted for a later turn. Without an injected hook
+        nothing is noted, and each noted name is dropped when its result
+        arrives.
+        """
+
+        if self._post_tool_use_hook is None:
+            return
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if not isinstance(block, ToolUseBlock):
+                    continue
+                if block.id in self._refused_ids or block.id in self._denied_ids:
+                    continue
+                self._tool_names[block.id] = block.name
+            return
+        if not isinstance(message, UserMessage):
+            return
+        if isinstance(message.content, str):
+            return
+        for block in message.content:
+            if not isinstance(block, ToolResultBlock):
+                continue
+            name = self._tool_names.pop(block.tool_use_id, None)
+            if name is None or block.is_error is True:
+                continue
+            if block.tool_use_id in self._refused_ids or block.tool_use_id in self._denied_ids:
+                continue
+            await self._post_tool_use_hook(
+                {"tool_name": name, "tool_response": block.content},
+                block.tool_use_id,
+                {"signal": None},
+            )
 
     def _perform_write(self, call: _FileWrite) -> UserMessage:
         """Write the file the way the built-in tool would, unless the call was stopped."""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -81,6 +82,22 @@ from . import (
 from .log import logger
 
 
+def _lease_still_held(lease: DeliveryLease | None) -> bool:
+    """Whether this owner may still speak for its delivery (ADR 0288 decision 3).
+
+    False once the lease is lost, or once a fenced lease is past its confirmed
+    ownership window: the heartbeat may not yet have noticed an expiry that a
+    long pause already caused. The window is read on the lease's own clock
+    (``time.monotonic``, as ``delivery_lease`` stamps it). A leaseless caller
+    and the unfenced sentinel carry no window to check.
+    """
+    if lease is None:
+        return True
+    if lease.lost.is_set():
+        return False
+    return not claim._is_fenced(lease) or lease.local_deadline_monotonic > time.monotonic()
+
+
 async def process_event(
     self: Kernel, qevent: QueuedTurn, *, lease: DeliveryLease | None = None,
     http_identity_context: str | None = None, original_payload_sha256: str | None = None,
@@ -137,7 +154,7 @@ async def process_event(
                 await self._process_event(qevent)
             else:
                 await self._process_event(qevent, lease=lease)
-        except identity.HttpIdentityRefused:
+        except identity.HttpIdentityRefused as refusal:
             if lease is not None:
                 lease.raise_if_lost()
             try:
@@ -150,8 +167,15 @@ async def process_event(
                 await self._markers.mark_done(qevent.event_id, marker_value="1")
                 constants._LIFECYCLE_OUTCOME.set("classified_failure")
                 logger.info("HTTP invocation refused before further execution")
-                # @spec HTTP-INVOCATION-EXECUTION-31: only the relay hears of it.
+                # @spec HTTP-INVOCATION-EXECUTION-31: the relay hears of it;
+                # ADR 0288's ticket notice below is the one other exception.
                 await self._settle_relay_after_refusal(qevent)
+                if refusal.notice is not None and _lease_still_held(lease):
+                    # ADR 0288 decision 3: a refused approval ticket. The
+                    # lease is checked again here because it may have been lost
+                    # or run out while the run closed or the marker was
+                    # written; a stale owner sends nothing.
+                    await self._notice_after_refusal(qevent, refusal.notice)
         except asyncio.CancelledError as exc:
             error = exc
             await self._close_hook_run_after_error(

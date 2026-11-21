@@ -35,6 +35,8 @@ from pydantic import ValidationError
 
 from ..approval_wording import approval_display, describe_approval
 from ..approvals import (
+    TICKET_RETRY_CODES,
+    TICKET_RETRY_REPLY,
     ApprovalBackendError,
     ApprovalCardRegistrar,
     ApprovalContinuityRefused,
@@ -1039,10 +1041,14 @@ async def _pause_for_approval(
             if selected:
                 # The owner may have been lost while the create was in flight.
                 identity.creation_identity()
-    except ApprovalContinuityRefused:
+    except ApprovalContinuityRefused as exc:
         # @spec HTTP-APPROVAL-CONTINUITY-3: definitive refusal is the HTTP terminal
         # refusal, never the legacy escalation below.
-        raise identity.HttpIdentityRefused() from None
+        # ADR 0288 decision 3: a refused ticket says nothing about who
+        # asked, so the lifecycle owner replaces the placeholder with the
+        # fixed notice ADR 0288 quotes, after the lease check and the marker.
+        notice = TICKET_RETRY_REPLY if exc.code in TICKET_RETRY_CODES else None
+        raise identity.HttpIdentityRefused(notice=notice) from None
     except WorkspaceSelectionRefused as exc:
         logger.info(
             "publication refused for agent=%s deployment=%s thread=%s: %s",

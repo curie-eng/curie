@@ -301,4 +301,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0275 | [A channel gateway owns provider authentication and I/O](0275-channel-gateway-provider-boundary.md) | Accepted |
 | 0276 | [Static shells share capacity and receive agent inputs per claim](0276-static-shells-share-capacity-and-receive-agent-inputs-per-claim.md) | Accepted |
 | 0278 | [Requester coding instructions are pinned preferences below repository rules](0278-requester-coding-instructions.md) | Draft |
+| 0288 | [The runner carries a connector's approval ticket to its gated call](0288-the-runner-carries-a-connector-approval-ticket-to-its-gated-call.md) | Accepted |
 <!-- END GENERATED: adr-index -->

@@ -419,7 +419,9 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
             # record. Prose is not a halt mechanism; this flag is. It rides the
             # DENY only: an allow that carried it would kill every ungated call.
             return PermissionResultDeny(message=_DENY_MESSAGE, interrupt=True)
-        return PermissionResultAllow()
+        # ADR 0288 decision 2: an approved call whose ticket copy differed
+        # runs with the grant's stored arguments (``PermissionResultAllow.updated_input``).
+        return PermissionResultAllow(updated_input=decision.updated_input)
 
     return can_use_tool
 
@@ -449,6 +451,14 @@ def _hook_field(hook_input: Any, key: str) -> Any:
     if isinstance(hook_input, Mapping):
         return hook_input.get(key)
     return getattr(hook_input, key, None)
+
+
+def _has_hook_field(hook_input: Any, key: str) -> bool:
+    """Whether a hook input carries ``key`` at all, as a mapping key or an attribute."""
+
+    if isinstance(hook_input, Mapping):
+        return key in hook_input
+    return hasattr(hook_input, key)
 
 
 def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
@@ -580,13 +590,18 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             # This WARNING is the only way to correlate "approval granted" with
             # "the call may not have actually run" from pod logs.
             logger.warning("approval one-shot grant spent tool=%s", tool_name)
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": _HOOK_GRANT_REASON,
-                }
+            allowed: dict[str, Any] = {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": _HOOK_GRANT_REASON,
             }
+            if decision.updated_input is not None:
+                # ADR 0288 decision 2: the approved call runs with the
+                # grant's stored arguments, so the connector receives the exact
+                # ticket the API verified rather than the model's second copy.
+                # ``updatedInput`` is declared on PreToolUseHookSpecificOutput.
+                allowed["updatedInput"] = decision.updated_input
+            return {"hookSpecificOutput": allowed}
 
         # ``continue_`` and ``stopReason`` are ``SyncHookJSONOutput`` common
         # control fields (claude_agent_sdk/types.py:520-561): "Whether Claude
@@ -610,4 +625,48 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
     # ``HookCallback`` alias is typed against its TypedDict union, and a plain
     # ``dict[str, Any]`` return is not assignable to it.
     callback: Any = approval_hook
-    return {"PreToolUse": [HookMatcher(matcher=None, hooks=[callback])]}
+    hooks: dict[str, list[HookMatcher]] = {
+        "PreToolUse": [HookMatcher(matcher=None, hooks=[callback])]
+    }
+    if gate.proxied_connector_servers:
+        # ADR 0288 decision 1: remember the tickets hosted connectors
+        # return. PostToolUse runs before the model sees the result, so a
+        # ticket is remembered before any call that copies it can be decided.
+        observer: Any = build_ticket_observer(gate)
+        hooks["PostToolUse"] = [HookMatcher(matcher=None, hooks=[observer])]
+    return hooks
+
+
+def build_ticket_observer(gate: ApprovalGate) -> Any:
+    """The PostToolUse callback that feeds ``ApprovalGate.observe_tool_result``.
+
+    Observation only: it always returns ``{}``, so it never changes a tool's
+    result, blocks anything or stops the turn, and it swallows its own errors
+    because a raising hook is reported to the model as a hook error. A failed
+    observation stops the carry for the conversation, since the reply it could
+    not read may hold a competing source.
+    """
+
+    async def ticket_observer(
+        hook_input: Any,
+        _tool_use_id: str | None,
+        _context: Any,
+    ) -> dict[str, Any]:
+        try:
+            tool_name = _hook_field(hook_input, "tool_name")
+            if not isinstance(tool_name, str) or not tool_name or not _has_hook_field(
+                hook_input, "tool_response"
+            ):
+                # A malformed input names no tool or carries no reply, so the
+                # reply it stands for was not read.
+                gate.ticket_carry.stop("an observation had no tool name or reply")
+            else:
+                gate.observe_tool_result(tool_name, _hook_field(hook_input, "tool_response"))
+        except Exception:  # noqa: BLE001 - observation must never fail a tool call.
+            # The unread reply may hold a second possible source of a later
+            # copy, so nothing is restored for the rest of the conversation.
+            logger.warning("approval ticket observation failed", exc_info=True)
+            gate.ticket_carry.stop("an observation failed")
+        return {}
+
+    return ticket_observer
