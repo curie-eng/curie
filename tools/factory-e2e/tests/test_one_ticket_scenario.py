@@ -37,6 +37,8 @@ import scripted_lanes as lanes  # noqa: E402
 REPO_ROOT = TOOLS.parents[1]
 STUB = REPO_ROOT / "tools/github-stub/github_stub.py"
 MODEL_SCRIPT = REPO_ROOT / "tools/model-script/model_script.py"
+REPRODUCTION_GATE = REPO_ROOT / "examples/dark-factory/hooks/reproduction_gate.py"
+DECISIONS_SECTION = REPO_ROOT / "examples/dark-factory/hooks/decisions_section.py"
 SEED_TREE = TOOLS / "fixtures/unitconv"
 RECORDING = REPO_ROOT / "tools/github-stub/recordings/curie-pr-3400.json"
 REPOSITORY = "acme-corp/acme-bot"
@@ -600,6 +602,32 @@ def test_the_asked_questions_are_exactly_two_and_the_publication_closes_the_issu
     (publish,) = [c for c in calls if c["name"] == "mcp__curie__publish_changes"]
     assert f"Closes #{ots.ISSUE}" in publish["input"]["body"]
     assert "3815" not in json.dumps(exchanges)
+
+
+def test_the_scripted_publication_passes_the_bundle_gates_on_an_answered_ticket() -> None:
+    """The session 2 body is one the dark factory's own publish gates allow.
+
+    Session 2 reads a ticket that carries the factory's questions, so the
+    bundle's reproduction gate refuses a body whose Decisions section cites no
+    answer, and the review gate refuses a section outside its grammar. The
+    runner now honours those PreToolUse denies, so a scripted body either gate
+    refuses would be denied in the run and the model asked for an exchange
+    the transcript does not hold.
+    """
+
+    reproduction = _load("one_ticket_reproduction_gate", REPRODUCTION_GATE)
+    decisions = _load("one_ticket_decisions_section", DECISIONS_SECTION)
+    model = _load("one_ticket_model_script_gates", MODEL_SCRIPT)
+    calls = [
+        block
+        for exchange in model.load_transcript(run.TRANSCRIPT)
+        for block in exchange["message"]["content"]
+        if block.get("type") == "tool_use" and block["name"] == "mcp__curie__publish_changes"
+    ]
+    (publish,) = calls
+    body = publish["input"]["body"]
+    assert reproduction.cited(body)
+    assert len(decisions.parse_decisions_section(body)) == 2
 
 
 def test_the_publication_scenario_routes_a_fixture_issue_it_never_labelled_to_the_fallback(

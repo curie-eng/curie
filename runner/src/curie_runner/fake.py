@@ -46,6 +46,7 @@ from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from .adapter import PartialMessageBoundary
 from .approval import (
     APPROVAL_TOOL_NAME,
+    NO_PUBLICATION_GATE_TEXT,
     TURN_PROGRESS_TOOL_NAME,
     ApprovalGate,
     process_approval_request,
@@ -1226,6 +1227,32 @@ class FakeModelSession:
                         ),
                         _result(is_error=True, subtype="error_during_execution"),
                     )
+            if (
+                block.name == PLATFORM_PUBLISH_TOOL_NAME
+                and self._approval_gate is not None
+                and block.id not in self._denied_ids
+            ):
+                # The in-process ``publish_changes`` body, which the CLI runs
+                # only once every PreToolUse decision allowed the call.
+                gate = self._approval_gate
+                if PLATFORM_PUBLISH_TOOL_NAME in gate.required:
+                    refusal = gate.record_publication(dict(block.input))
+                else:
+                    gate.refuse_publication(
+                        "the session carries no publication approval gate,"
+                        " so the request could not be recorded"
+                    )
+                    refusal = NO_PUBLICATION_GATE_TEXT
+                if gate.halt_after_publication():
+                    # The approval hook's PostToolUse halt after the body ran.
+                    answer = refusal or "Publication requested."
+                    return (
+                        _tool_result(block.id, answer, is_error=refusal is not None),
+                        _result(terminal_reason="hook_stopped"),
+                    )
+                self._pending_refusals.append(
+                    _tool_result(block.id, refusal or "Publication requested.", is_error=True)
+                )
         return None
 
     def _without_refused_results(self, message: Any) -> Any:

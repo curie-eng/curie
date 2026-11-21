@@ -207,8 +207,9 @@ in code now:
   `gate_kind`/`granted_tool` columns** rather than sniffing the summary (ADR-0046 supersedes
   ADR-0035's summary-prefix discriminator): for a `gate_kind='permission'` row it injects
   `CURIE_APPROVAL_GRANT_TOOL=<granted_tool>` (`GRANT_TOOL_ENV`, the exact tool name a
-  runner gate layer denied or, for `publish_changes` only, the runner's own stream observer
-  recorded (#2294); a trusted runner-authored value either way); for a `gate_kind='policy'` row it
+  runner gate layer denied or, for `publish_changes` only, the tool's own in-process body
+  recorded after every PreToolUse hook allowed the call; a trusted runner-authored value
+  either way); for a `gate_kind='policy'` row it
   injects the same `CURIE_APPROVAL_GRANT_TOOL` from the `granted_tool` column **when that
   column is non-null** — the runner sets it only for a manifest gate the operator opted into
   grantability via `grantableViaPolicy` (#558, ADR-0056), with the granted tool sourced from
