@@ -389,7 +389,7 @@ def test_the_fake_model_session_keeps_the_configured_tool_catalogue(
             id="retired-triage-contract",
         ),
         pytest.param(
-            _Api([(409, {"detail": {"code": "session_already_started"}})]),
+            _Api([(409, {"detail": {"code": "invalid_context"}})]),
             ISSUE_READ_PATH,
             id="refused-409",
         ),
@@ -609,7 +609,8 @@ def test_transport_failure_after_the_bounded_attempts_is_refused() -> None:
         ((404, {"detail": "Not Found"}), REASON_STATUS_REFUSED),
         ((302, {}), REASON_STATUS_REFUSED),
         ((409, {"detail": {"code": "invalid_context"}}), REASON_STATUS_REFUSED),
-        ((409, {"code": "session_already_started"}), REASON_STATUS_REFUSED),
+        ((409, {"code": "invalid_context"}), REASON_STATUS_REFUSED),
+        ((409, {}), REASON_STATUS_REFUSED),
         ((200, b"{not json"), REASON_BODY_INVALID),
         ((200, b"x" * 70_000), REASON_BODY_INVALID),
         ((200, ["implementation"]), REASON_BODY_INVALID),
