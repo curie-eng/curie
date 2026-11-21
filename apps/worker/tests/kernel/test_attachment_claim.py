@@ -1150,6 +1150,7 @@ def test_cancellation_waits_for_a_successful_handoff_before_cleanup(
                         "CURIE_RUNNER_TOKEN": "replacement-test-token",
                     },
                     None,
+                    record_handoff=lambda: None,
                     workspace_inference=SimpleNamespace(repo=None),
                 )
             )
@@ -1234,6 +1235,7 @@ def test_cancellation_discards_after_a_definitively_failed_handoff(
                             "CURIE_RUNNER_TOKEN": "replacement-test-token",
                         },
                         None,
+                        record_handoff=lambda: None,
                         workspace_inference=SimpleNamespace(repo=None),
                     )
                 )
@@ -1305,6 +1307,7 @@ def test_second_handoff_probe_uses_the_remaining_delivery_budget(
                     "CURIE_RUNNER_TOKEN": "replacement-test-token",
                 },
                 None,
+                record_handoff=lambda: None,
                 remaining_s=0.2,
                 workspace_inference=SimpleNamespace(repo=None),
             )
@@ -1427,6 +1430,7 @@ def test_zero_probe_budget_leaves_the_retained_file_turn_retryable(make_harness)
                     h.kernel._to_event(qevent),  # noqa: SLF001
                     {},
                     None,
+                    record_handoff=lambda: None,
                     remaining_s=0.0,
                     workspace_inference=SimpleNamespace(repo=None),
                 )
