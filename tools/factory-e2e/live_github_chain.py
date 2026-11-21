@@ -596,7 +596,7 @@ def before_run(p: fe.Preflight) -> None:
     """The scenario's config step. No lock, kubectl or helm call happens before it ends.
 
     In order: the configuration's sanitizer (so even a refused reader id writes
-    no raw namespace or context), the reader id, the fake model for
+    no raw namespace or context), the attempt number, the reader id, the fake model for
     ``--stop-after links``, the identities and the full sanitizer (before
     ``check_app`` logs the repository id and the actor), readiness, and the
     fixture's open items (poll intake could admit a leftover labelled issue
@@ -605,6 +605,10 @@ def before_run(p: fe.Preflight) -> None:
 
     chain = chain_of(p)
     install_sanitizer(p, config_identifiers(p))
+    if not 1 <= chain.attempt <= judge.MAX_ATTEMPTS:
+        raise fe.ConfigError(
+            f"{SCENARIO} allows attempts 1 to {judge.MAX_ATTEMPTS}; this is attempt {chain.attempt}"
+        )
     chain.reader_id = reader_account_id(os.environ)
     if chain.stop_after == STOP_AFTER_LINKS:
         use_fake_model(p)

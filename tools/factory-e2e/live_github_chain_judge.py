@@ -93,7 +93,7 @@ PROMOTION_WITHIN = 300
 CLI_WITHIN = 60
 UNBOUND_QUIET_WINDOW = 180
 SPEND_CAP_USD = 50.0
-MAX_ATTEMPTS = 2
+MAX_ATTEMPTS = 3
 
 # --- Texts the beats name ----------------------------------------------------
 STATUS_COMMENT_PREFIX = "Investigating this ticket."

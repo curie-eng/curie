@@ -983,15 +983,37 @@ def test_wiring_chain_flags_are_refused_for_another_scenario(
     assert flag in capsys.readouterr().err
 
 
-def test_wiring_attempt_flag_accepts_only_one_or_two() -> None:
+def test_wiring_attempt_flag_accepts_one_to_three() -> None:
     assert (
         fe.parse_args(
-            ["run", "--scenario", lgc.SCENARIO, "--live-chain-attempt", "2"]
+            ["run", "--scenario", lgc.SCENARIO, "--live-chain-attempt", "3"]
         ).live_chain_attempt
-        == 2
+        == 3
     )
     with pytest.raises(SystemExit):
-        fe.parse_args(["run", "--scenario", lgc.SCENARIO, "--live-chain-attempt", "3"])
+        fe.parse_args(["run", "--scenario", lgc.SCENARIO, "--live-chain-attempt", "4"])
+    # The flag, the driver and the judge share one cap.
+    assert judge.MAX_ATTEMPTS == 3
+
+
+@pytest.mark.parametrize(("attempt", "refused"), [(3, False), (4, True)])
+def test_wiring_before_run_refuses_an_attempt_outside_the_cap(
+    attempt: int, refused: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _preflight(tmp_path, stop_after=None, attempt=attempt)
+    reached: list[str] = []
+
+    def reader(_environ: Any) -> int:
+        reached.append("reader")
+        raise fe.ConfigError("stop after the attempt check")
+
+    monkeypatch.setattr(lgc, "reader_account_id", reader)
+    with pytest.raises(fe.ConfigError) as caught:
+        lgc.before_run(p)
+    if refused:
+        assert f"attempt {attempt}" in str(caught.value) and reached == []
+    else:
+        assert reached == ["reader"]
 
 
 def test_wiring_full_mode_needs_a_model_key_and_stop_mode_does_not(

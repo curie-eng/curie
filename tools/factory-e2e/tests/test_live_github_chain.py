@@ -758,8 +758,8 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "spend",
         "not measured at",
     ),
-    ("third-attempt", [("attempt", 3)], "attempts", "outside 1..2"),
-    ("attempt-zero", [("attempt", 0)], "attempts", "outside 1..2"),
+    ("fourth-attempt", [("attempt", 4)], "attempts", "outside 1..3"),
+    ("attempt-zero", [("attempt", 0)], "attempts", "outside 1..3"),
     (
         "request-still-active-at-the-60-second-deadline",
         [
@@ -1516,9 +1516,15 @@ def test_the_driver_can_judge_one_beat_to_stop_before_spending() -> None:
 
 
 def test_verdict_evidence_is_plain_json() -> None:
-    evidence = judge.judge_chain(broken(("attempt", 3))).evidence()
+    evidence = judge.judge_chain(broken(("attempt", 4))).evidence()
     assert json.loads(json.dumps(evidence)) == evidence
-    assert evidence["passed"] is False and evidence["attempt"] == 3
+    assert evidence["passed"] is False and evidence["attempt"] == 4
+
+
+def test_a_third_attempt_is_within_the_cap() -> None:
+    third = judge.judge_beat("attempts", broken(("attempt", 3)))
+    assert third.passed and third.measures["attempt"] == 3.0
+    assert judge.judge_chain(broken(("attempt", 3))).passed
 
 
 def test_answer_received_line_mirrors_the_product() -> None:

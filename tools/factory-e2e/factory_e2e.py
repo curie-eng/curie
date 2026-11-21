@@ -182,8 +182,8 @@ installs a disposable Dex for two OIDC principals, links them to the actor and
 the reader, and writes evidence and logs only through the judge's sanitizer.
 `--stop-after links` stops after the session probe and the links, before any
 ticket exists, so it needs no model key and makes no model request; the full
-run needs CURIE_FACTORY_MODEL_API_KEY. `--live-chain-attempt N` (1 or 2) records
-which of the at most two attempts this is. Both flags are refused for any
+run needs CURIE_FACTORY_MODEL_API_KEY. `--live-chain-attempt N` (1 to 3) records
+which of the at most three attempts this is. Both flags are refused for any
 other scenario.
 
 `one-ticket --forge jira_cloud --answer-file <file> [--issue-file <file>]`
@@ -6869,8 +6869,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     scenario.add_argument(
         "--live-chain-attempt",
         type=int,
-        choices=(1, 2),
-        help="live-github-chain: which of the at most two attempts this run is (default 1)",
+        choices=(1, 2, 3),
+        help="live-github-chain: which of the at most three attempts this run is (default 1)",
     )
     scenario.add_argument(
         "--expect",
