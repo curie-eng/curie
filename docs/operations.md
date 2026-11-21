@@ -2383,9 +2383,10 @@ On GitHub the sender must have write access now, the PR must still be open at
 the recorded head, and the delivery must come from the work item's
 installation. GitLab and Bitbucket are polled instead: the lineage must be
 open, the host must confirm the comment is current, and its author must have
-write access (GitLab, and Bitbucket where the host reports it) or, where the
-host cannot report it, be on the binding's `reviewFeedbackAllowlist`
-(Bitbucket); no head is compared.
+write access (GitLab) or be on the binding's `reviewFeedbackAllowlist`
+(Bitbucket). Neither shipped Bitbucket adapter, Cloud or Data Center, can
+report write access, so on Bitbucket that list is required, and an author
+missing from it gets no revision; no head is compared.
 Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
 `sender_permission_refused`, `terminal_pull_request`, `active_request`, and
@@ -4436,9 +4437,12 @@ cluster, then Validate refuses before Helm Apply, so the release itself is not
 changed and the ownership record is released. With a direct `helm upgrade`,
 the chart's worker drain hook (pre-upgrade, weight -10) runs before the schema
 migration hook (weight -5) refuses, so new worker claims can already be paused
-when the refusal arrives. No post-upgrade hook runs for a failed upgrade, so
-the workers claim again only when the roll hold expires (`worker.upgradeDrain.quiesceTtlSeconds`,
-capped at the gate's wait) or the next upgrade completes. Prefer the CLI, or
+when the refusal arrives. The final roll hold (`upgrade-drain-hold`, weight 10)
+runs after the migration hook, so it never runs, and the pause is only the
+300-second handoff lease on the pause marker, last renewed by the refusing
+migration process. Workers claim again once that lease lapses. After a direct
+refusal, wait out the 300 seconds before retrying (see the drain gate details
+under [curie cluster upgrade](#curie-cluster-upgrade)). Prefer the CLI, or
 set the forward-only value before the first direct attempt. A local stack runs the
 same check in its one-shot `curie-migrate` service, so follow the
 `CURIE_SCHEMA_FORWARD_ONLY=true` recipe at the end of the Slack route identity
@@ -4489,10 +4493,13 @@ label. Do them before the upgrade:
    location (for Jira, the same binding name) uses the new label, whether
    set on the surface or inherited from the tracker's configured label.
    Also record what the old binding carries, because the re-add creates a
-   fresh row: its adapter and endpoint as `curie cluster surfaces <agent>`
-   prints them, and its caller list as `curie cluster callers <agent>
-   --surface <KIND=ADDRESS>` shows it. Removing the row also invalidates
-   any adapter token minted for it.
+   fresh row. Its adapter name and caller list are readable
+   (`curie cluster surfaces <agent>`, `curie cluster callers <agent>
+   --surface <KIND=ADDRESS>`). Its reply endpoint is not: the API and the CLI
+   never return it on a read, so take it from wherever you first configured
+   the route, and write it down now. Without it a binding that had a reply
+   route cannot be rebuilt. Removing the row also invalidates every adapter
+   token minted for it.
    Then write the implementation bundle
    with `curie example dark-factory render --out <dir>` and run these in
    order:
@@ -4521,7 +4528,10 @@ label. Do them before the upgrade:
       surface takes together) when the old binding had one, then restore the caller list with
       `curie cluster callers <agent> --surface <KIND=ADDRESS> --set <ids>`
       (`PUT /agents/{id}/channels/callers`), which replaces the list whole and
-      does not change the binding's generation.
+      does not change the binding's generation. Then replace the adapter
+      token the removal invalidated: for the mail adapter,
+      `curie cluster channel-token <agent> --kind <KIND> --address <ADDRESS>`;
+      for another adapter, mint a new one through `POST /channels/token`.
    5. Remove the temporary surface, if you added one:
       `curie cluster surfaces <agent> --remove <KIND=OTHER_ADDRESS>`, or for
       Jira `--remove github=<OWNER/UNUSED_REPO>`.
@@ -4543,9 +4553,15 @@ without `--forward-only`, so neither fix works alone. Do the steps in this
 order. Name one cluster target and carry it through every `curie cluster`
 command here, the binding commands in the triage steps and `status` included:
 `--context "$CONTEXT" --namespace "$NAMESPACE" --release "$RELEASE"`. Left out,
-each command falls back to the kubeconfig's current context, namespace `curie`
-and release `curie`, which may be another installation. `--context` is a flag
-of `curie cluster` itself, so it may sit before or after the subcommand.
+each command falls back to the kubeconfig's current context, to the
+`CURIE_NAMESPACE` environment variable and then namespace `curie`, and to
+release `curie`, any of which may be another installation. `--context` is a
+flag of `curie cluster` itself, so it may sit before or after the subcommand.
+The binding commands (`surfaces`, `callers`, `kill`, `work-items`, `versions`,
+`delete`, `deploy`) also talk to the platform API, and when `CURIE_API_URL` is
+set (or `--api-url` passed) they dial that URL directly and ignore the context,
+namespace and release for that call. Unset it, or point it at the target
+release's API, and likewise `CURIE_API_KEY`, before running them.
 
 1. Finish [an existing triage binding](#before-upgrading-an-existing-triage-binding)
    steps 1 to 3 when the release has such a binding, with the same target on

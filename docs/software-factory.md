@@ -190,8 +190,8 @@ provide the equivalent provider-specific steps.
    review is against the pull request's current head. GitLab and Bitbucket
    still require the mention and read it by polling: the lineage must be open,
    the code host must confirm the comment is current, and its author must be
-   allowed (GitLab asks the host for write access; Bitbucket does too where
-   the host reports it, otherwise it uses the binding's
+   allowed (GitLab asks the host for write access; Bitbucket Cloud and Data
+   Center cannot report it, so Bitbucket requires the binding's
    `reviewFeedbackAllowlist`). That path compares no head.
    To teach the factory a rule it keeps, turn on learned-rule proposals
    (`curie cluster overrides <agent> --memory-rule-proposals on`), give
