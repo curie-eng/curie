@@ -479,11 +479,28 @@ fn inventory_truncated(node: &Value) -> bool {
 /// digest-less, a unique same-repository digest on the node that equals the
 /// running identity. A missing name is unbound unless the inventory is at the
 /// kubelet cap, where the running digest in the same repository binds it (#3352).
-/// Do not infer across repositories.
+/// Do not infer across repositories, except that several repositories naming
+/// the running manifest digest bind to it.
 /// https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
 fn resolve_reference_identity(node: &Value, reference: &str, running: &str) -> Option<String> {
     match matching_inventory_identities(node, reference) {
-        Some(identities) if identities.len() > 1 => None,
+        // `ctr import --digests` (kind load) names each digest
+        // import-<UTC date>@<digest>, so the same image loaded on two days
+        // carries two repositories for one manifest digest. That is one
+        // content identity, not an ambiguity; two distinct digests still are.
+        Some(identities) if identities.len() > 1 => {
+            let digest = |identity: &str| {
+                identity
+                    .split_once('@')
+                    .map(|(_, digest)| digest.to_owned())
+            };
+            let running_digest = digest(running)?;
+            (identities.contains(running)
+                && identities
+                    .iter()
+                    .all(|identity| digest(identity).as_deref() == Some(running_digest.as_str())))
+            .then(|| running.to_owned())
+        }
         Some(identities) if identities.is_empty() => {
             let identity = unique_repository_identity(node, &repository(reference))?;
             (identity == running).then_some(identity)

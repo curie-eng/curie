@@ -103,7 +103,7 @@ fn pods_cmd(o: &CommonOpts) -> OpsCommand {
 /// `{{ include "curie.fullname" . }}-<component>`, which equals
 /// `<release>-<component>` only when the release name happens to contain the
 /// chart name (#1533).
-fn svc_cmd(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> OpsCommand {
+pub(super) fn svc_cmd(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -4389,7 +4389,7 @@ pub(crate) fn release_fullname_from_values(release: &str, values: &serde_json::V
 /// discovered and [`chart_fullname`]'s no-override rule is the honest best
 /// guess. Every dry-run branch owes the reader the same caveat, so the note
 /// lives with the value rather than being restated at each verb.
-fn dry_run_fullname(release: &str) -> ReleaseFullname {
+pub(super) fn dry_run_fullname(release: &str) -> ReleaseFullname {
     let fullname = chart_fullname(release);
     crate::ui::ui().note(&format!(
         "dry run: service names assume the chart's default naming ({}); an install \
@@ -5650,7 +5650,7 @@ async fn resolve_service_url(
 }
 
 /// From `kubectl get svc -o json`, return (type, first nodePort, first port).
-fn parse_service(svc_json: &str) -> Option<(String, Option<u16>, u16)> {
+pub(super) fn parse_service(svc_json: &str) -> Option<(String, Option<u16>, u16)> {
     let v: serde_json::Value = serde_json::from_str(svc_json).ok()?;
     let spec = v.get("spec")?;
     let svc_type = spec.get("type").and_then(|t| t.as_str())?.to_string();
@@ -5692,8 +5692,19 @@ pub enum ServiceEndpoint {
     Unreadable,
 }
 
+/// The non-privileged local port a service port is forwarded to: ports below
+/// 1024 are offset by 18000, and an absent service port falls back to 8080.
+/// `cluster status` hints and `cluster access` forward to the same port.
+pub(super) fn forward_local_port(port: u16) -> u16 {
+    match port {
+        0 => 8080,
+        1..=1023 => port + 18000,
+        _ => port,
+    }
+}
+
 /// The path suffix that selects the console's API-backed view.
-fn api_suffix_path(api: bool) -> &'static str {
+pub(super) fn api_suffix_path(api: bool) -> &'static str {
     if api {
         "/?api=1"
     } else {
@@ -5712,11 +5723,7 @@ fn resolve_service_endpoint(svc_json: &str, host: &str, api: bool) -> ServiceEnd
             None => ServiceEndpoint::UnassignedNodePort,
         },
         Some((_, _, port)) => ServiceEndpoint::PortForwardHint {
-            local: match port {
-                0 => 8080,
-                1..=1023 => port + 18000,
-                _ => port,
-            },
+            local: forward_local_port(port),
             port,
         },
         None => ServiceEndpoint::Unreadable,
@@ -5848,7 +5855,11 @@ fn service_surface(
 }
 
 /// Fetch one release service's JSON, or None when kubectl cannot read it.
-async fn fetch_service(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> Option<String> {
+pub(super) async fn fetch_service(
+    o: &CommonOpts,
+    fullname: &ReleaseFullname,
+    suffix: &str,
+) -> Option<String> {
     match run_capture(&svc_cmd(o, fullname, suffix)).await {
         Ok((true, out, _)) => Some(out),
         _ => None,

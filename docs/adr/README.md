@@ -11,14 +11,17 @@ current state.
 
 ## Claiming a number
 
-**The next free number is one past the last row of the table below.** Read it
-from this index, not from an `ls` of your branch: a branch that has not been
-rebased shows a stale tail, and every number collision this repo has had came
-from exactly that. Check open PRs for a number already reserved off-main before
-claiming one.
-
-The number-prefix uniqueness of `docs/adr/` is gated in CI (`scripts/check-docs.sh`),
-so a collision fails the build rather than reaching main.
+**The next free number is one past the highest number allocated across the
+working tree, `origin/main`, `origin/next`, and open PRs that add an ADR.**
+Do not trust an `ls` of your branch alone: a branch that has not been rebased
+shows a stale tail, and every number collision this repo has had came from
+exactly that. The docs gate (`scripts/check-docs.sh` → `curie_doclint
+--require-remote-adr-scan`) fetches both trains, lists open PR additions, and
+reports the full allocation union. A collision this PR **adds or renames into**
+fails the required check; collisions only among other open PRs or already on
+the trains are logged as warnings so an unrelated or repairing PR is not
+blocked. When this PR adds or renames an ADR, a failed remote scan still fails
+closed; otherwise a scan failure is a warning.
 
 ## The index
 
@@ -304,4 +307,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0281 | [Personal-mode refusals offer self-service account linking](0281-personal-mode-refusals-offer-self-service-account-linking.md) | Accepted |
 | 0286 | [One labelled ticket: the factory investigates, asks on the ticket, and resumes on a plain answer](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md) | Accepted |
 | 0287 | [Learned rules are a memory kind that applies only after a person accepts it](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md) | Accepted |
+| 0288 | [The runner carries a connector's approval ticket to its gated call](0288-the-runner-carries-a-connector-approval-ticket-to-its-gated-call.md) | Accepted |
 <!-- END GENERATED: adr-index -->

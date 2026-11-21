@@ -262,6 +262,28 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             )
             .await?,
         ),
+        ClusterAction::Access {
+            namespace,
+            release,
+            ui_port,
+            langfuse_port,
+            dry_run,
+        } => {
+            let opts = ops::AccessOpts {
+                common: CommonOpts {
+                    namespace,
+                    release,
+                    dry_run,
+                },
+                ui_port,
+                langfuse_port,
+            };
+            if dry_run {
+                emit(ops::access_plan(&opts)?)
+            } else {
+                ops::access(opts).await
+            }
+        }
         ClusterAction::Observability {
             query,
             namespace,

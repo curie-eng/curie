@@ -644,6 +644,29 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Open loopback port-forwards to the Console and Langfuse of a release
+    /// whose services are ClusterIP (`cluster up --no-expose`, and what
+    /// `factory quickstart` installs). Runs in the foreground; the
+    /// forwards exist only while it runs. Press Ctrl-C to stop them.
+    Access {
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Local port for the Console. Default: derived from the service port
+        /// the way `cluster status` names it (18080 for the default UI port).
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        ui_port: Option<u16>,
+        /// Local port for Langfuse. Default: 23000, the port the chart's
+        /// Langfuse sign-in URL (`langfuse.nextauthUrl`) names.
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        langfuse_port: Option<u16>,
+        /// Print the commands that would run and exit without executing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show the release's observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
         /// Query platform observability data through the Curie API. Omit to

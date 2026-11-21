@@ -351,7 +351,9 @@ async def _settle_relay_after_refusal(self: Kernel, qevent: QueuedTurn) -> None:
     Only a turn whose replies go to the platform-owned relay adapter gets
     this notice: that adapter posts to the platform's own API, which only an
     operator holding the API key can read, never to Slack or any other
-    surface a person sees. Every other refused turn stays silent.
+    surface a person sees. Every other refused turn stays silent, except the
+    ADR 0288 notice for a refused approval ticket (``_notice_after_refusal``),
+    which the relay never gets.
 
     Called after the done marker, and best effort: a lost notice leaves the
     waiter on its deadline as before and never changes the terminal outcome.
@@ -390,6 +392,37 @@ async def _settle_relay_after_refusal(self: Kernel, qevent: QueuedTurn) -> None:
     except Exception as exc:  # noqa: BLE001 - a best-effort notice after the terminal marker
         logger.warning(
             "the identity refusal notice for event %s could not reach its relay: %s",
+            qevent.event_id,
+            type(exc).__name__,
+        )
+
+
+async def _notice_after_refusal(self: Kernel, qevent: QueuedTurn, text: str) -> None:
+    """Tell the requester that a prepared approval ticket was refused (ADR 0288).
+
+    Called after the done marker, so a lost lease has already stopped this
+    owner and a redelivery of the settled event is skipped before it can post a
+    second notice. Best effort: a failure is logged by class and never changes
+    the terminal outcome. The relay adapter is excluded because
+    ``_settle_relay_after_refusal`` owns that waiter's one reply, and a
+    targetless or factory turn posts nothing through ``_reply_for``.
+
+    Args:
+        qevent: The refused turn.
+        text: The fixed sentence carried by the refusal.
+    """
+    handle = qevent.reply_handle
+    if handle is None or handle.adapter == CLUSTER_MESSAGE_ADAPTER:
+        return
+    try:
+        await self._reply_for(
+            qevent, _route_from_handle(qevent), text, best_effort_unreachable=True
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a best-effort notice after the terminal marker
+        logger.warning(
+            "the approval ticket refusal notice for event %s was not delivered: %s",
             qevent.event_id,
             type(exc).__name__,
         )

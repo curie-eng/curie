@@ -319,6 +319,8 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   thread lock, and are still counted in the escalation text; after the window an
   unreachable runner is an ordinary `runner-error`. Cron deliveries and
   deliveries with a persisted side-effect flag get no window.
+  An attempt that performed an eager attachment handoff skips the window and
+  consumes the regular attempt budget.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
   told apart from `runner-error`, which is a plain transport failure without
   confirmed sandbox termination. When Kubernetes confirms that the sandbox pod

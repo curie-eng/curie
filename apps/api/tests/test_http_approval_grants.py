@@ -26,6 +26,9 @@ from role_policy_support import run
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from apps.api.tests.test_http_approval_answers import answer, sealed_actor
+from apps.api.tests.test_http_approval_answers import answer_case as answer_case
+from apps.api.tests.test_http_approval_answers import resolve as submit_answer
 from apps.api.tests.test_http_approval_creation import (
     RECORD_FIELDS,
     accepted,
@@ -35,6 +38,7 @@ from apps.api.tests.test_http_approval_creation import (
     request_for,
     rows,
 )
+from apps.api.tests.test_http_approval_creation import creation_case as creation_case
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
 from apps.api.tests.test_http_turn_authority import (
     assert_response,
@@ -265,3 +269,130 @@ def test_exact_grant_snapshot_reaches_the_approver_boundary_and_fails_closed(
         post_grant(case.client, body), body, decision="refuse", reason="caller_not_allowed",
     )
     assert len(case.provider.requests) == 2
+
+
+def test_grant_refuses_changed_snapshots_and_requires_the_worker_credential(
+    answer_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+) -> None:
+    case = answer_case
+    assert submit_answer(case, *answer(case)).status_code == 200
+    row, capsule = sealed_actor(case, "approved")
+    case.approval_id = str(row["id"])
+    token, payload = resume_token(case, capsule)
+    body = grant_request(case, token, payload)
+    stream = valkey.xrange(runs_stream)
+    lookups = len(case.provider.requests)
+    for field, value in (
+        ("agent_id", str(uuid.uuid4())), ("conversation_id", "synthetic-other-thread"),
+        ("gate_kind", "policy"), ("granted_tool", "synthetic_other"),
+        ("granted_arguments_json", '{"path":"widened"}'),
+    ):
+        changed = {**body, "grant": {**body["grant"], field: value}}
+        assert_grant(post_grant(case.client, changed), changed,
+                     decision="refuse", reason="invalid_context")
+
+    invocation = {**body, "check": {**check_for(case), "approval_id": case.approval_id}}
+    assert_grant(post_grant(case.client, invocation), invocation,
+                 decision="refuse", reason="unsupported_resume")
+
+    unrelated = {**body["grant"], "approval_id": str(uuid.uuid4())}
+    malformed = (
+        (b'{"schema_version":1,' + json.dumps(body).encode()[1:], 422),
+        (json.dumps({**body, "schema_version": float("nan")}).encode(), 422),
+        (json.dumps({**body, "check": {**body["check"], "stage": "start"}}).encode(), 422),
+        (json.dumps({**body, "grant": unrelated}).encode(), 422),
+        (json.dumps({**body, "summary": "synthetic"}).encode(), 422),
+        (json.dumps({**body, "pad": "x" * 65_536}).encode(), 413),
+    )
+    for raw, status in malformed:
+        response = post_grant(case.client, body, raw=raw)
+        detail = "body_too_large" if status == 413 else "invalid_approval_grant_request"
+        assert (response.status_code, response.json()) == (status, {"detail": detail})
+        assert response.headers["cache-control"] == "no-store"
+
+    for credential in ({}, {"X-API-Key": get_settings().api_key}):
+        response = case.client.post(
+            GRANT_PATH, content=json.dumps(body), headers={
+                "Content-Type": "application/json", **credential,
+            },
+        )
+        assert response.status_code == 401, response.text
+        assert response.json() == {"detail": "missing or invalid internal worker token"}
+        assert response.headers["cache-control"] == "no-store"
+
+    write(case.approval_id, {"granted_arguments": {"path": "widened"}})
+    changed = {**body, "grant": grant_for(case)}
+    assert_grant(post_grant(case.client, changed), changed,
+                 decision="refuse", reason="invalid_context")
+    assert len(case.provider.requests) == lookups
+    assert valkey.xrange(runs_stream) == stream
+    write(case.approval_id, {"granted_arguments": row["granted_arguments"]})
+    assert stored(case.approval_id)["identity_context"] == row["identity_context"]
+    assert_grant(post_grant(case.client, body), body,
+                 decision="continue", reason="current_authority")
+
+
+def test_resume_binds_the_signed_scope_and_current_row(resolved_case: SimpleNamespace) -> None:
+    case = resolved_case
+    capsule = resolve(case, "rejected")
+    token, payload = resume_token(case, capsule)
+    check = resume_check(case, token, payload)
+    next_scope = {**check["scope"], "binding_generation": check["scope"]["binding_generation"] + 1}
+    lookups = len(case.provider.requests)
+    for changes in (
+        {"approval_id": str(uuid.uuid4())}, {"approval_id": None},
+        {"event_id": f"approval-{uuid.uuid4()}-resolved"}, {"payload_sha256": "0" * 64},
+        {"scope": next_scope},
+        {"context": stored(case.approval_id)["identity_context"]},
+    ):
+        invalid = {**check, **changes}
+        assert_response(post_check(case.client, invalid), invalid,
+                        decision="refuse", reason="invalid_context")
+    for changes in (
+        {"approval_record_sha256": "1" * 64},
+        {"scope": {**capsule.scope.model_dump(), "native_id": ACTOR}},
+    ):
+        invalid = resume_check(case, *resume_token(case, capsule, **changes))
+        assert_response(post_check(case.client, invalid), invalid,
+                        decision="refuse", reason="invalid_context")
+    old_row = stored(case.approval_id)
+    for changes in ({"granted_tool": "synthetic_other"}, {"status": "approved"}):
+        write(case.approval_id, changes)
+        assert_response(post_check(case.client, check), check,
+                        decision="refuse", reason="invalid_context")
+        write(case.approval_id, {key: old_row[key] for key in changes})
+    grant = grant_request(case, token, payload)
+    assert_grant(post_grant(case.client, grant), grant, decision="refuse", reason="invalid_context")
+    assert len(case.provider.requests) == lookups
+    assert_response(post_check(case.client, check), check,
+                    decision="continue", reason="current_authority")
+    during = []
+
+    def change_row() -> None:
+        write(case.approval_id, {"granted_tool": "synthetic_other"})
+        during.append(case.approval_id)
+
+    case.provider.during_lookup = change_row
+    try:
+        assert_response(post_check(case.client, check), check,
+                        decision="refuse", reason="invalid_context")
+    finally:
+        case.provider.during_lookup = None
+    assert during == [case.approval_id]
+    write(case.approval_id, {"granted_tool": old_row["granted_tool"]})
+    case.provider.member = False
+    assert_response(post_check(case.client, check), check,
+                    decision="refuse", reason="caller_not_allowed")
+
+
+def test_expired_resume_cannot_authorize_its_stored_effect(resolved_case: SimpleNamespace) -> None:
+    case = resolved_case
+    token, payload = resume_token(case, resolve(case, "expired"))
+    body = grant_request(case, token, payload)
+    row = stored(case.approval_id)
+    assert_grant(post_grant(case.client, body), body, decision="refuse", reason="invalid_context")
+    assert len(case.provider.requests) == 2
+    assert stored(case.approval_id) == row
+    check = resume_check(case, token, payload)
+    assert_response(post_check(case.client, check), check,
+                    decision="continue", reason="current_authority")
