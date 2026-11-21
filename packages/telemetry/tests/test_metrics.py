@@ -59,9 +59,6 @@ _RECONCILER_STEPS = [
     "sync_status_comments",
     "redispatch_lapsed_acquisitions",
     "reconcile_base_transitions",
-    "expire_tracker_results",
-    "deliver_tracker_results",
-    "hand_off_triage_tickets",
     "publish_execute_wakes",
 ]
 _RECONCILER_FAILURE_METRIC = "curie.work_item.reconciler.step.failure"

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_api import factory_tracker_result_runtime, memory_rule_lifecycle, workitem_dispatch
+from curie_api import completion_contract, memory_rule_lifecycle, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.forges.types import PullRequest, PullRequestRef, PullRequestState
 from curie_api.issue_read_token import mint, verify_claims
@@ -362,7 +362,7 @@ def test_completion_contract_answers_rule_proposal_false_for_a_cancelled_work_it
     client, api = rules
     run = eligible_revision(client, api)
     (row,) = _rows("SELECT version FROM curie.work_items WHERE id = :id", {"id": run.work_item_id})
-    precheck = factory_tracker_result_runtime.contract_precheck
+    precheck = completion_contract.contract_precheck
 
     async def precheck_then_cancel(session: AsyncSession, pair: Any) -> Any:
         view = await precheck(session, pair)
@@ -377,7 +377,7 @@ def test_completion_contract_answers_rule_proposal_false_for_a_cancelled_work_it
         return view
 
     with monkeypatch.context() as patch:
-        patch.setattr(factory_tracker_result_runtime, "contract_precheck", precheck_then_cancel)
+        patch.setattr(completion_contract, "contract_precheck", precheck_then_cancel)
         answered = contract(client, run.capability)
 
     (after,) = _rows(

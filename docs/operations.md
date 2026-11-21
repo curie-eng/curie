@@ -3015,9 +3015,11 @@ A pull request published for a request whose evidence is `applied` carries one l
 with `Learned rules:` is refused with `publication.learned_rules_annotation_reserved`
 before any other work.
 
-Only a request under the implementation completion contract is served the rules: a request
-under any other contract (the separate triage path) carries `memory_rules_evidence` `none`
-and is served an absent envelope. The rule text rides the implementer's system prompt, so
+Every request the factory admits from a labelled ticket runs under the implementation
+completion contract and is served the rules pinned at admission; there is no separate
+triage path. A bundle that still carries the retired result declaration (a result.json
+file in its workflow directory) is refused at upload, push, deploy and promote with
+`bundle.result_declaration_retired`: delete the file and deploy again. The rule text rides the implementer's system prompt, so
 the conversation transcript and its native checkpoint can retain it, under the transcript's
 own access controls and expiry and not the WorkItem snapshot's, as for requester
 preferences. A rule removed after a WorkItem was admitted can therefore remain in that
@@ -3352,7 +3354,7 @@ For the `local`-target equivalent (`curie local comms --slack`), see
 
 ### Factory Slack progress
 
-An agent opts in with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears), described in the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack). The channel must have exactly one Slack binding on that agent, whose app identity posts; otherwise the API answers 409 `factory_slack_channel_unbound`. Only runs live at or after the moment the channel was set are posted. Changing the channel keeps each existing WorkItem in its original thread while that channel keeps its binding; clearing it stops all posting.
+An agent opts in with `curie cluster factory-progress <agent> --slack-channel C0EXAMPLE1` (`--no-slack-channel` clears, no flag inspects; `curie local factory-progress` on the local stack) or in the Console agent page's "Slack progress channel" field, described in the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack). The channel must have exactly one Slack binding on that agent, whose app identity posts, if it does not, the command fails and names the fix. A missing binding is created with `curie cluster surfaces <agent> --add slack=C0EXAMPLE1`, or, when another agent already holds the default Slack identity on that channel, under a free declared identity with `curie cluster surfaces <agent> --add slack=C0EXAMPLE1 --adapter <identity>`. A channel bound under more than one Slack identity is fixed by listing the bindings with `curie cluster surfaces <agent>` and removing the extra with `curie cluster surfaces <agent> --remove slack=C0EXAMPLE1 --adapter <identity>`. Run each fix, and then the command again, against the same target as the failed command. As API reference, the command sends `PATCH /agents/{agent_id}` with `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears), and the API answers 409 `factory_slack_channel_unbound` when the agent does not have exactly one such binding. Only runs live at or after the moment the channel was set are posted. Changing the channel keeps each existing WorkItem in its original thread while that channel keeps its binding. Clearing it stops every thread the progress lane rooted for that channel: no new WorkItem roots there, and existing configured threads get no further replies and no further card edits. A thread started by a [Slack kickoff](#factory-slack-kickoff) keeps its own progress either way.
 
 The worker's progress lane derives what is owed from existing run records on each pass and keeps it in a durable outbox (`factory_slack_threads` binds each WorkItem to one Slack root for its whole life, `factory_slack_posts` holds the owed posts). Each thread records its origin. A `configured` thread is one this lane roots in `factory_slack_channel`, as above. A `kickoff` thread is the message that started the run from Slack ([Factory Slack kickoff](#factory-slack-kickoff)): no root post is owed, and it needs no `factory_slack_channel`, so setting, changing or clearing the channel neither stops nor moves it. Either origin is delivered only while its channel holds exactly one Slack binding of the agent and that binding names the thread's identity. Two settings govern it: `CURIE_FACTORY_SLACK_PROGRESS_ENABLED` (default true) and `CURIE_FACTORY_SLACK_INTERVAL_S` (default 2 seconds). With the progress switch off a worker posts nothing; a worker with it on later still finds and posts what is owed.
 
@@ -3410,7 +3412,13 @@ account can hold at most five live tokens. The confirmation names the Slack
 account, warns that anyone using it can start runs on the confirming person's
 plan, and requires sign-in and an explicit CSRF-bound confirmation. In personal
 mode, confirmation redirects to `/settings/claude-plan`; a linked sender with
-an inactive enrollment gets that page directly. A refusal without a URL stays
+an inactive enrollment gets that page directly. The confirmation and its refusals
+are server-rendered pages in the Console's dark style. Their only stylesheet is
+inline and allowed by its SHA-256 hash in the page's Content-Security-Policy, so
+the page loads no script, font, image or other origin. A browser (Accept names `text/html`) sees an
+expired, used or mismatched link, including one that lapses during
+organization sign-in, a missing sign-in, and a cross-site confirmation as
+pages; other clients keep the JSON `detail`. A refusal without a URL stays
 private, has no button, and names the operator. Other kickoff refusals keep
 their public thread replies ending with `Outcome: <code>`:
 

@@ -77,9 +77,6 @@ RECONCILER_STEPS = (
     "_poll_trackers",
     "_redispatch_lapsed_acquisitions",
     "_reconcile_base_transitions",
-    "_expire_tracker_results",
-    "_deliver_tracker_results",
-    "_hand_off_triage_tickets",
     "_publish_execute_wakes",
 )
 

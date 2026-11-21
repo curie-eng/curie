@@ -80,11 +80,13 @@ test.describe("claude_plan", () => {
 
     await page.getByTestId("claude-plan-token").fill("tok-one");
     await page.getByTestId("claude-plan-write").click();
-    await expect(status).toHaveText("Connected, generation 1");
+    await expect(status).toHaveText("Connected");
+    await expect(page.getByTestId("claude-plan-generation")).toHaveText("Generation 1");
 
     await page.getByTestId("claude-plan-token").fill("tok-two");
     await page.getByTestId("claude-plan-write").click();
-    await expect(status).toHaveText("Connected, generation 2");
+    await expect(status).toHaveText("Connected");
+    await expect(page.getByTestId("claude-plan-generation")).toHaveText("Generation 2");
 
     await page.getByTestId("claude-plan-disconnect").click();
     await page.getByTestId("claude-plan-disconnect-confirm").click();
@@ -94,7 +96,8 @@ test.describe("claude_plan", () => {
     await page.getByTestId("claude-plan-token").fill("tok-three");
     await expect(page.getByTestId("claude-plan-write")).toHaveText("Reconnect");
     await page.getByTestId("claude-plan-write").click();
-    await expect(status).toHaveText("Connected, generation 4");
+    await expect(status).toHaveText("Connected");
+    await expect(page.getByTestId("claude-plan-generation")).toHaveText("Generation 4");
 
     const writes = seen
       .filter((s) => s.method !== "GET")
@@ -119,7 +122,8 @@ test.describe("claude_plan", () => {
 
     await input.fill(SENTINEL);
     await page.getByTestId("claude-plan-write").click();
-    await expect(page.getByTestId("claude-plan-status")).toHaveText("Connected, generation 1");
+    await expect(page.getByTestId("claude-plan-status")).toHaveText("Connected");
+    await expect(page.getByTestId("claude-plan-generation")).toHaveText("Generation 1");
     await expect(input).toHaveValue("");
 
     await input.fill(SENTINEL);

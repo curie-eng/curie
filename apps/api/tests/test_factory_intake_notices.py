@@ -540,27 +540,6 @@ def test_installation_changed_preserves_work_and_current_installation_liveness(
     assert _work(number) == before_work and _requests(number) == before_requests
 
 
-@pytest.mark.parametrize("path", PATHS)
-def test_delegated_output_seam(factory: Any, monkeypatch: pytest.MonkeyPatch, path: str) -> None:
-    _client, github, _agent = factory
-    github.label_actor = {"id": 99, "login": "acme[bot]", "type": "Bot"}
-    number = github.plant_issue(age=timedelta(minutes=5))
-    _observe(factory, path, number)
-    assert [r["reason"] for r in _notices(number)] == ["actor_bot"]
-    seen = []
-
-    async def delegated(session: Any, issue: Any, notice: Any) -> bool:
-        seen.append((issue.issue_id, notice.label_event_id))
-        return True
-
-    monkeypatch.setattr("curie_api.factory_intake_notices.delegated_output_before_label", delegated)
-    number = github.plant_issue(age=timedelta(minutes=5))
-    github._etags["issues"] = '"delegated-label"'
-    _observe(factory, path, number)
-    assert (str(number), github.issues[number].event_id) in seen
-    assert _notices(number) == _work(number) == []
-
-
 def test_owed_backoff_and_metric(factory: Any) -> None:
     _client, github, _agent = factory
     reader = InMemoryMetricReader()
