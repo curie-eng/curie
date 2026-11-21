@@ -982,3 +982,94 @@ def test_retained_triage_requests_stay_quiet_in_the_slack_progress_lane(
     assert [(post.target.conversation_id, post.delivery_id) for post in posts] == [
         (uncarded.root_ts, delivery_id_for(uncarded.item["id"], "card"))
     ]
+
+
+def test_an_undiscovered_triage_work_item_stays_quiet_until_its_next_request(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """Correction 14 through first discovery. Seeded at 0186 with the agent's
+    Slack destination configured and no thread row yet: a completed triage
+    request whose findings were delivered, and one that ended
+    ``tracker_result_undelivered`` with its findings still owed. Without the
+    upgrade's third step this pass discovers both WorkItems and posts their
+    roots, a card for each and a needs a person reply. With it the pass is
+    silent, and a new request on one WorkItem gets its root and its card.
+    """
+
+    isolated_migration_db.at(BELOW)
+    agent = _agent(
+        factory_slack_channel=CHANNEL, factory_slack_since=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    now = datetime.now(UTC)
+    rows: list[Statement] = [
+        _insert("agents", agent),
+        _insert(
+            "agent_channels",
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent["id"],
+                "kind": "slack",
+                "address": CHANNEL,
+                "adapter": IDENTITY,
+            },
+        ),
+    ]
+    items = []
+    for issue, status, cause, state in (
+        (711, "completed", "completed", "delivered"),
+        (712, "failed", "tracker_result_undelivered", "owed"),
+    ):
+        item = _work_item(agent["id"], issue)
+        request = _tracker_result(
+            _ended(item["id"], 1, status=status, cause=cause, terminal_at=now)
+        )
+        grant = _grant(request, ticket=False)
+        delivery = _delivery(grant, state=state, ticket_issue=None)
+        rows += [
+            _insert("work_items", item),
+            _insert("execution_requests", request),
+            _insert(GRANTS, grant),
+            _insert(DELIVERIES, delivery),
+        ]
+        if state == "delivered":
+            rows.append(_insert(RECEIPTS, _receipt(delivery, issue)))
+        items.append(item)
+    _batch(*rows)
+    assert sql_rows("SELECT count(*) FROM curie.factory_slack_threads") == [(0,)]
+
+    command.upgrade(alembic_config(), REVISION)
+    slack = RecordingSlack()
+    _progress_pass(slack)
+    assert slack.calls == []
+    threads = sql_dicts(
+        "SELECT work_item_id, first_sequence, root_ts, channel_identity, channel "
+        "FROM curie.factory_slack_threads"
+    )
+    assert sorted(threads, key=lambda row: str(row["work_item_id"])) == sorted(
+        (
+            {
+                "work_item_id": item["id"],
+                "first_sequence": 2,
+                "root_ts": None,
+                "channel_identity": IDENTITY,
+                "channel": CHANNEL,
+            }
+            for item in items
+        ),
+        key=lambda row: str(row["work_item_id"]),
+    )
+
+    # Liveness: the next request on the WorkItem gets the thread a newly
+    # discovered one would get, and the other WorkItem stays silent.
+    woken = items[0]
+    _batch(
+        _insert("execution_requests", _queued(woken["id"], 2)),
+        ("UPDATE curie.work_items SET next_sequence = 3 WHERE id = :id", {"id": woken["id"]}),
+    )
+    _progress_pass(slack)
+    posts = [event for event, _ in slack.calls if isinstance(event, ReplyPost)]
+    assert [post.delivery_id for post in posts] == [
+        delivery_id_for(woken["id"], "root"),
+        delivery_id_for(woken["id"], "card"),
+    ], slack.calls
+    assert all(route.adapter == IDENTITY for _, route in slack.calls)

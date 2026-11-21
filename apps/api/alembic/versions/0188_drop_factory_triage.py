@@ -38,6 +38,15 @@ using only states the lane already has:
    settled. A later request on the WorkItem is not terminal, so it gets its
    card and its edits as usual.
 
+3. A WorkItem with a triage request and no thread yet, whose agent has a
+   factory Slack destination with exactly one adapter-bearing binding, gets
+   the thread discovery would give it, except that its ``first_sequence`` is
+   the first eligible request after its last triage request, or the WorkItem's
+   next sequence when there is none, and it has no root post. Nothing at or
+   after that sequence is a triage request, so the lane owes the thread
+   nothing until a later request exists; it then roots the thread and posts
+   that request's card as for any new thread.
+
 Requests that are not terminal are not touched: the operator step in
 docs/operations.md ("Factory triage removal (Alembic revision 0188)") requires
 that no triage request is queued or running when the upgrade runs.
@@ -50,7 +59,9 @@ The downgrade restores the 0186 shape exactly (every table, column, default,
 foreign key, unique constraint, CHECK and index, written out here) and
 restores no rows. It refuses nothing: ``completion_contract`` comes back NOT
 NULL with its ``implementation`` default, which every kept row satisfies, and
-every other restored column is nullable or belongs to an empty table.
+every other restored column is nullable or belongs to an empty table. The
+threads step 3 recorded stay; the 0186 worker never roots them, so after a
+downgrade a later request on such a WorkItem gets no Slack thread.
 
 Revision ID: 0188
 Revises: 0186
@@ -75,6 +86,9 @@ VERSIONS = "agent_versions"
 NOTICES = "factory_terminal_notices"
 THREADS = "factory_slack_threads"
 POSTS = "factory_slack_posts"
+AGENTS = "agents"
+CHANNELS = "agent_channels"
+WORK_ITEMS = "work_items"
 
 GRANTS = "factory_tracker_result_grants"
 DELIVERIES = "factory_tracker_result_deliveries"
@@ -207,6 +221,53 @@ QUIET_CARD_POSTS = f"""
        AND p.posted_at IS NULL
        AND {_SHOWN_RETIRED}
 """
+# Correction 14, step 3: a WorkItem with a retained triage request that the
+# lane has not discovered yet. Discovery would root a thread at the triage
+# request and owe it a card and a needs a person reply, so the upgrade records
+# the thread the way discovery does, but starting after the last triage
+# request: at the first discovery-eligible request after it, else at the
+# WorkItem's next sequence. No root post is written; the lane roots such a
+# thread once a request at its first sequence exists.
+QUIET_UNDISCOVERED = f"""
+    INSERT INTO {S}.{THREADS} AS t
+           (work_item_id, agent_id, channel_identity, channel,
+            root_ts, first_sequence, origin)
+    SELECT w.id, w.agent_id, b.adapters[1], a.factory_slack_channel,
+           NULL, COALESCE(n.first_sequence, w.next_sequence), 'configured'
+      FROM {S}.{WORK_ITEMS} w
+      JOIN {S}.{AGENTS} a ON a.id = w.agent_id
+      CROSS JOIN LATERAL (
+          SELECT max(r.sequence) AS last_retired
+            FROM {S}.{REQUESTS} r
+           WHERE r.work_item_id = w.id
+             AND r.completion_contract = 'tracker_result'
+      ) x
+      CROSS JOIN LATERAL (
+          SELECT min(q.sequence) AS first_sequence
+            FROM {S}.{REQUESTS} q
+           WHERE q.work_item_id = w.id
+             AND q.sequence > x.last_retired
+             AND (q.created_at >= a.factory_slack_since
+                  OR q.terminal_at IS NULL
+                  OR q.terminal_at >= a.factory_slack_since)
+      ) n
+      CROSS JOIN LATERAL (
+          SELECT array_agg(CAST(c.adapter AS text)) AS adapters
+            FROM {S}.{CHANNELS} c
+           WHERE c.agent_id = a.id
+             AND c.kind = 'slack'
+             AND c.address = a.factory_slack_channel
+             AND c.adapter IS NOT NULL
+      ) b
+     WHERE a.factory_slack_channel IS NOT NULL
+       AND a.factory_slack_since IS NOT NULL
+       AND x.last_retired IS NOT NULL
+       AND cardinality(b.adapters) = 1
+       AND NOT EXISTS (
+           SELECT 1 FROM {S}.{THREADS} e WHERE e.work_item_id = w.id
+       )
+    ON CONFLICT (work_item_id) DO NOTHING
+"""
 QUIET_CARDS = f"""
     UPDATE {S}.{THREADS} t
        SET card_upgrade_cutoff = GREATEST(t.card_upgrade_cutoff, now()),
@@ -269,6 +330,7 @@ def upgrade() -> None:
     op.execute(sa.text(QUIET_NEEDS_PERSON))
     op.execute(sa.text(QUIET_CARD_POSTS))
     op.execute(sa.text(QUIET_CARDS))
+    op.execute(sa.text(QUIET_UNDISCOVERED))
 
     op.execute(sa.text(f"DELETE FROM {S}.{POSTS} WHERE kind = 'triage'"))
     op.execute(
