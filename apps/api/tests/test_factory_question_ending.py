@@ -23,6 +23,7 @@ queued as ``pending_request_id``.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -816,3 +817,88 @@ def test_a_relabel_that_supersedes_the_waiting_answer_clears_the_round(
     row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["rounds_used"]) == ("cleared", 1)
+
+
+# The halted turn's handoff (ADR 0286 decisions 2 and 11) -------------------------------
+
+HANDOFF = json.loads(
+    (
+        Path(__file__).resolve().parents[3] / "tests" / "vectors" / "question-halt-turn.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+def _view(job: tr._Run) -> dict[str, Any]:
+    response = job.client.get(
+        f"/v1/internal/work-items/requests/{job.request_id}", headers=tr.WORKER_HEADERS
+    )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+def test_the_request_view_reports_the_posted_round_the_worker_reads(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker skips its publish continuation on this field, so it is pinned.
+
+    Red without the API change: the view has no ``questions_posted``.
+    """
+
+    job = _running(admitted, monkeypatch, 951)
+    assert _view(job)["questions_posted"] is False
+    assert _ask(job).status_code == 200
+    view = _view(job)
+    assert {key: view[key] for key in HANDOFF["request_view"]} == HANDOFF["request_view"]
+
+
+def test_a_refused_ask_leaves_the_view_unposted(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Liveness: a running request whose ask got a 409 for the cap posted nothing,
+    so the worker still re-prompts it."""
+
+    job = _refused_fourth(admitted, monkeypatch, 952)
+    view = _view(job)
+    assert (view["status"], view["questions_posted"]) == ("running", False)
+
+
+def test_the_halted_turn_finish_settles_questions_asked_and_labels_on_one_pass(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker's finish for the runner's halted turn, exactly as pinned.
+
+    The worker's handoff test reports this finish from the replayed frames; one
+    status pass then sets the questions label (the reconciler runs every 5 s).
+    """
+
+    _client, _github, sink = admitted
+    job = _asked(admitted, monkeypatch, 954)
+    finish = HANDOFF["worker_finish"]
+    tr._finish(job, finish["outcome"], finish["cause"])
+
+    assert _request(job.request_id) == {
+        "status": "completed",
+        "terminal_cause": "questions_asked",
+    }
+    _reconcile()
+    assert _state_labels(sink, 954) == {QUESTIONS_LABEL}
+
+
+def test_an_answer_before_the_halted_turn_settles_starts_exactly_one_next_request(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One plain answer queued before settlement starts one next request, no retry."""
+
+    job = _asked(admitted, monkeypatch, 955)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
+    finish = HANDOFF["worker_finish"]
+    tr._finish(job, finish["outcome"], finish["cause"])
+
+    assert _request(job.request_id) == {
+        "status": "completed",
+        "terminal_cause": "questions_asked",
+    }
+    _promote(job)
+    assert [r["id"] for r in _requests(job.work_item_id)] == [job.request_id, revision]
+    assert _request(revision)["status"] == "waiting"
