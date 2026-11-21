@@ -563,11 +563,23 @@ pub(super) struct OwnedNamespaceWait {
     pub phase: String,
     pub conditions: String,
     pub objects: String,
+    /// True only when this namespace is Terminating, no condition status is
+    /// True, the inventory was readable, and every remaining object is one
+    /// the namespace controller removes itself.
+    controller_owned: bool,
 }
 
 /// Operator text for a sweep wait that expired. Names each remaining namespace.
 /// It does not say that any finalizer was cleared.
 pub(super) fn format_owned_namespace_wait(rows: &[OwnedNamespaceWait], resume: &str) -> String {
+    format_owned_namespace_wait_after(rows, resume, OWNED_NAMESPACE_SWEEP_TIMEOUT)
+}
+
+fn format_owned_namespace_wait_after(
+    rows: &[OwnedNamespaceWait],
+    resume: &str,
+    waited: &str,
+) -> String {
     let listed = rows
         .iter()
         .map(|row| {
@@ -579,8 +591,87 @@ pub(super) fn format_owned_namespace_wait(rows: &[OwnedNamespaceWait], resume: &
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "owned namespace sweep waited {OWNED_NAMESPACE_SWEEP_TIMEOUT} and these namespaces are still present: {listed}. Resume with: {resume}"
+        "owned namespace sweep waited {waited} and these namespaces are still present: {listed}. Resume with: {resume}"
     )
+}
+
+/// Production extension cadence and deadline. The deadline starts before the
+/// first post-timeout read and bounds every diagnosis subprocess, every later
+/// namespace-list poll, and the bounded process-group reap. Reported copy stays
+/// `300s` and `600s` even when a test injects a shorter pair.
+const OWNED_NAMESPACE_EXTENSION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const OWNED_NAMESPACE_EXTENSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+const OWNED_NAMESPACE_EXTENDED_WAIT: &str = "600s";
+/// Reap budget reserved inside the post-timeout deadline. A timed-out child is
+/// group-killed and then waited on only until this budget, or until the
+/// deadline, whichever is sooner.
+const POST_TIMEOUT_REAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Test-only timing overrides. Integration tests keep the public `DownOpts`
+/// shape and set these under `ENV_LOCK`, so reversing the product still
+/// compiles and fails on the sweep outcome. Release builds ignore them and
+/// cannot be stretched past the production deadline.
+const EXTENSION_INTERVAL_ENV: &str = "CURIE_NAMESPACE_SWEEP_EXTENSION_INTERVAL_MS";
+const EXTENSION_DEADLINE_ENV: &str = "CURIE_NAMESPACE_SWEEP_EXTENSION_DEADLINE_MS";
+
+fn extension_bounds() -> (std::time::Duration, std::time::Duration) {
+    if !cfg!(debug_assertions) {
+        return (
+            OWNED_NAMESPACE_EXTENSION_INTERVAL,
+            OWNED_NAMESPACE_EXTENSION_DEADLINE,
+        );
+    }
+    let interval_ms = std::env::var(EXTENSION_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000)
+        .clamp(1, 5_000);
+    let deadline_ms = std::env::var(EXTENSION_DEADLINE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300_000)
+        .clamp(1, 300_000);
+    (
+        std::time::Duration::from_millis(interval_ms),
+        std::time::Duration::from_millis(deadline_ms),
+    )
+}
+
+/// True for the residue the namespace controller removes on its own.
+///
+/// `conditions` is the diagnosis rendering (`Type=Status` joined by commas),
+/// or `none` when the namespace has no deletion conditions. A condition status
+/// other than `False` or `Unknown`, any other kind, a ConfigMap other than
+/// `kube-root-ca.crt`, a phase other than `Terminating`, or an unreadable
+/// inventory refuses the extension. An empty object list qualifies.
+pub(super) fn controller_owned_residue_only(
+    phase: &str,
+    conditions: &str,
+    objects: &[(&str, &str)],
+    inventory_readable: bool,
+) -> bool {
+    if !inventory_readable || phase != "Terminating" || !extension_conditions_clear(conditions) {
+        return false;
+    }
+    objects.iter().all(|(kind, name)| match *kind {
+        "Event" | "Endpoints" | "EndpointSlice" => true,
+        "ConfigMap" => *name == "kube-root-ca.crt",
+        _ => false,
+    })
+}
+
+/// Kubernetes condition statuses are `True`, `False`, and `Unknown`. Only the
+/// latter two leave the extension eligible. `none` means the array was empty.
+fn extension_conditions_clear(conditions: &str) -> bool {
+    if conditions.is_empty() || conditions == "none" {
+        return true;
+    }
+    conditions.split(',').all(|part| {
+        matches!(
+            part.trim().rsplit_once('=').map(|(_, status)| status),
+            Some("False") | Some("Unknown")
+        )
+    })
 }
 
 fn owned_namespace_list_cmd(o: &CommonOpts) -> OpsCommand {
@@ -600,33 +691,84 @@ fn owned_namespace_list_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-fn format_namespace_conditions(item: &serde_json::Value) -> String {
+fn format_namespace_conditions(item: &serde_json::Value) -> Result<String> {
     let Some(conditions) = item.pointer("/status/conditions") else {
-        return "none".to_string();
+        bail!("owned namespace is missing deletion conditions");
     };
     if conditions.is_null() {
-        return "none".to_string();
+        bail!("owned namespace is missing deletion conditions");
     }
     let Some(conditions) = conditions.as_array() else {
-        return "none".to_string();
+        bail!("owned namespace deletion conditions are not an array");
     };
-    let parts: Vec<String> = conditions
-        .iter()
-        .filter_map(|condition| {
-            let type_name = condition.get("type")?.as_str()?;
-            let status = condition.get("status")?.as_str()?;
-            if type_name.is_empty() || status.is_empty() {
-                None
-            } else {
-                Some(format!("{type_name}={status}"))
-            }
-        })
-        .collect();
-    if parts.is_empty() {
-        "none".to_string()
-    } else {
-        parts.join(", ")
+    if conditions.is_empty() {
+        return Ok("none".to_string());
     }
+    let mut parts = Vec::with_capacity(conditions.len());
+    for condition in conditions {
+        if !condition.is_object() {
+            bail!("owned namespace condition is not an object");
+        }
+        let type_name = condition
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|type_name| !type_name.is_empty())
+            .context("owned namespace condition is missing a type")?;
+        let status = condition
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .context("owned namespace condition is missing a status")?;
+        if !matches!(status, "True" | "False" | "Unknown") {
+            bail!("owned namespace condition status is not True, False, or Unknown");
+        }
+        parts.push(format!("{type_name}={status}"));
+    }
+    Ok(parts.join(", "))
+}
+
+/// A metav1 List. `kubectl -o json` uses `apiVersion: v1` and `kind: List`
+/// for every resource, including custom groups. Items must be objects.
+/// The callback borrows the items in place. Callers do not clone the array.
+fn with_kubernetes_list_items<T>(
+    output: &str,
+    what: &str,
+    body: impl FnOnce(&[serde_json::Value]) -> Result<T>,
+) -> Result<T> {
+    let document: serde_json::Value =
+        serde_json::from_str(output).with_context(|| format!("parsing {what}"))?;
+    if !document.is_object() {
+        bail!("{what} is not a JSON object");
+    }
+    if document
+        .get("apiVersion")
+        .and_then(serde_json::Value::as_str)
+        != Some("v1")
+    {
+        bail!("{what} is not a v1 List");
+    }
+    if document.get("kind").and_then(serde_json::Value::as_str) != Some("List") {
+        bail!("{what} is not a kind List");
+    }
+    let Some(items) = document.get("items").and_then(serde_json::Value::as_array) else {
+        bail!("{what} has no items array");
+    };
+    if items.iter().any(|item| !item.is_object()) {
+        bail!("{what} contains an item that is not an object");
+    }
+    body(items)
+}
+
+fn namespace_item_name(item: &serde_json::Value, what: &str) -> Result<String> {
+    if item.get("apiVersion").and_then(serde_json::Value::as_str) != Some("v1")
+        || item.get("kind").and_then(serde_json::Value::as_str) != Some("Namespace")
+    {
+        bail!("{what} contains an item that is not a v1 Namespace");
+    }
+    item.pointer("/metadata/name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("{what} contains a Namespace without a name"))
 }
 
 struct OwnedNamespaceSnapshot {
@@ -635,68 +777,142 @@ struct OwnedNamespaceSnapshot {
     conditions: String,
 }
 
-/// A kind List whose items are Namespaces. Any other shape is an error so a
-/// diagnosis failure falls through to the existing sweep failure.
+/// Admission view of one owned-namespace list. Phase and deletion conditions
+/// are required here. A later poll does not use this parser.
 fn parse_owned_namespace_list(output: &str) -> Result<Vec<OwnedNamespaceSnapshot>> {
-    let document: serde_json::Value =
-        serde_json::from_str(output).context("parsing the owned namespace list")?;
-    if document.get("kind").and_then(serde_json::Value::as_str) != Some("List") {
-        bail!("owned namespace list is not a kind List");
-    }
-    let items = document
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-        .context("owned namespace list has no items array")?;
-    let mut rows = Vec::new();
-    for item in items {
-        if item.get("kind").and_then(serde_json::Value::as_str) != Some("Namespace") {
-            bail!("owned namespace list contains an item that is not a Namespace");
+    with_kubernetes_list_items(output, "the owned namespace list", |items| {
+        let mut rows = Vec::new();
+        for item in items {
+            let name = namespace_item_name(item, "the owned namespace list")?;
+            if rows
+                .iter()
+                .any(|row: &OwnedNamespaceSnapshot| row.name == name)
+            {
+                bail!("the owned namespace list repeats {name}");
+            }
+            let phase = item
+                .pointer("/status/phase")
+                .and_then(serde_json::Value::as_str)
+                .filter(|phase| !phase.is_empty())
+                .context("owned namespace list contains a Namespace without a phase")?
+                .to_string();
+            rows.push(OwnedNamespaceSnapshot {
+                name,
+                phase,
+                conditions: format_namespace_conditions(item)?,
+            });
         }
-        let name = item
-            .pointer("/metadata/name")
-            .and_then(serde_json::Value::as_str)
-            .filter(|name| !name.is_empty())
-            .context("owned namespace list contains a Namespace without a name")?
-            .to_string();
-        let phase = item
-            .pointer("/status/phase")
-            .and_then(serde_json::Value::as_str)
-            .filter(|phase| !phase.is_empty())
-            .unwrap_or("Unknown")
-            .to_string();
-        rows.push(OwnedNamespaceSnapshot {
-            name,
-            phase,
-            conditions: format_namespace_conditions(item),
-        });
-    }
-    Ok(rows)
+        Ok(rows)
+    })
 }
 
-fn parse_remaining_objects(output: &str) -> Result<Vec<(String, String)>> {
-    let document: serde_json::Value =
-        serde_json::from_str(output).context("parsing a namespace object inventory")?;
-    let items = document
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-        .context("namespace object inventory has no items array")?;
-    let mut found = Vec::new();
-    for item in items {
-        let Some(name) = item
-            .pointer("/metadata/name")
-            .and_then(serde_json::Value::as_str)
-            .filter(|name| !name.is_empty())
-        else {
-            continue;
-        };
-        let kind = item
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .filter(|kind| !kind.is_empty())
-            .unwrap_or("Unknown");
-        found.push((kind.to_string(), name.to_string()));
+/// Poll view of the same list. Membership is the Namespace name. Phase and
+/// deletion conditions are ignored, so a later status change still updates the
+/// set a failed read must not replace.
+fn parse_owned_namespace_membership(output: &str) -> Result<Vec<String>> {
+    with_kubernetes_list_items(output, "the owned namespace list", |items| {
+        let mut names = Vec::new();
+        for item in items {
+            let name = namespace_item_name(item, "the owned namespace list")?;
+            if names.iter().any(|seen| seen == &name) {
+                bail!("the owned namespace list repeats {name}");
+            }
+            names.push(name);
+        }
+        Ok(names)
+    })
+}
+
+/// Objects in one namespace. Built-in residue must carry the documented
+/// apiVersion and kind. Every item must live in `namespace`. A custom resource
+/// is returned as itself so the caller can refuse it. This does not decide
+/// whether the object is controller residue.
+fn parse_namespace_inventory(
+    output: &str,
+    namespace: &str,
+    resource: &str,
+) -> Result<Vec<(String, String)>> {
+    with_kubernetes_list_items(output, "namespace object inventory", |items| {
+        let expected = built_in_controller_identity(resource);
+        let mut found = Vec::new();
+        for item in items {
+            let api_version = item
+                .get("apiVersion")
+                .and_then(serde_json::Value::as_str)
+                .filter(|api_version| !api_version.is_empty())
+                .context("namespace object inventory contains an object without an apiVersion")?;
+            let kind = item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| !kind.is_empty())
+                .context("namespace object inventory contains an object without a kind")?;
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .context("namespace object inventory contains an object without a name")?;
+            let item_namespace = item
+                .pointer("/metadata/namespace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|item_namespace| !item_namespace.is_empty())
+                .context("namespace object inventory contains an object without a namespace")?;
+            if item_namespace != namespace {
+                bail!(
+                "namespace object inventory contains an object from namespace {item_namespace}, not {namespace}"
+            );
+            }
+            if let Some((expected_version, expected_kind)) = expected {
+                if api_version != expected_version || kind != expected_kind {
+                    bail!(
+                    "namespace object inventory contains {resource} item {kind} {api_version}, not {expected_kind} {expected_version}"
+                );
+                }
+            }
+            found.push((kind.to_string(), name.to_string()));
+        }
+        Ok(found)
+    })
+}
+
+/// Documented built-in identity for residue the namespace controller removes
+/// itself: `(apiVersion, kind)`. `kubectl api-resources -o name` prints
+/// `plural` for the core group and `plural.group` otherwise. A custom group,
+/// including one whose kind string is Event or ConfigMap, is not in this set.
+fn built_in_controller_identity(resource: &str) -> Option<(&'static str, &'static str)> {
+    match resource {
+        "events" => Some(("v1", "Event")),
+        "events.events.k8s.io" => Some(("events.k8s.io/v1", "Event")),
+        "endpoints" => Some(("v1", "Endpoints")),
+        "endpointslices" | "endpointslices.discovery.k8s.io" => {
+            Some(("discovery.k8s.io/v1", "EndpointSlice"))
+        }
+        "configmaps" => Some(("v1", "ConfigMap")),
+        _ => None,
     }
-    Ok(found)
+}
+
+fn parse_namespaced_resources(output: &str) -> Result<Vec<String>> {
+    let mut resources = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
+        {
+            bail!("namespaced API discovery returned an unreadable resource name");
+        }
+        if resources.iter().any(|seen| seen == line) {
+            continue;
+        }
+        resources.push(line.to_string());
+    }
+    if resources.is_empty() {
+        bail!("namespaced API discovery returned no resources");
+    }
+    Ok(resources)
 }
 
 fn format_remaining_objects(grouped: std::collections::BTreeMap<String, Vec<String>>) -> String {
@@ -713,115 +929,502 @@ fn format_remaining_objects(grouped: std::collections::BTreeMap<String, Vec<Stri
         .join("; ")
 }
 
-const OWNED_NAMESPACE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const OWNED_NAMESPACE_INVENTORY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+enum Diagnosis {
+    Ready(Vec<OwnedNamespaceWait>),
+    Unreadable { rows: Vec<OwnedNamespaceWait> },
+}
 
-/// Namespaces still selected by this release's ownership pair, plus the objects
-/// left in each. One failed object list is recorded and does not abort the
-/// rest. The list and the inventory share a bounded budget so a stalled API
-/// cannot hold `cluster down` open after the sweep wait. Never finalizes,
-/// patches, or force-deletes.
-async fn diagnose_owned_namespace_wait(o: &CommonOpts) -> Result<Vec<OwnedNamespaceWait>> {
-    let listed = match tokio::time::timeout(
-        OWNED_NAMESPACE_LIST_TIMEOUT,
-        run_capture(&owned_namespace_list_cmd(o)),
+enum AdmittedPoll {
+    Removed { waited: std::time::Duration },
+    Expired { rows: Vec<OwnedNamespaceWait> },
+}
+
+/// The shared post-timeout deadline is open only before `deadline`. An equal
+/// instant has already expired, so evidence that arrives on that boundary is
+/// late.
+fn post_timeout_open(now: tokio::time::Instant, deadline: tokio::time::Instant) -> bool {
+    now < deadline
+}
+
+/// Admission's acceptance point. A `Ready` diagnosis that is late becomes
+/// unreadable, so an empty list cannot finish the sweep and a qualifying list
+/// cannot start the extension. Rows already accepted stay available for the
+/// 300s refusal. They are not a new success observation.
+fn finish_diagnosis(
+    diagnosis: Diagnosis,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> Diagnosis {
+    if post_timeout_open(now, deadline) {
+        return diagnosis;
+    }
+    match diagnosis {
+        Diagnosis::Ready(rows) => Diagnosis::Unreadable { rows },
+        unreadable => unreadable,
+    }
+}
+
+/// What one poll does with a parsed membership. `None` is a failed read.
+enum PollStep {
+    Removed { waited: std::time::Duration },
+    Expired { rows: Vec<OwnedNamespaceWait> },
+    Continue { rows: Vec<OwnedNamespaceWait> },
+}
+
+/// Poll acceptance. A membership that is late, including a parsed empty list,
+/// does not succeed and does not replace the last in-deadline set.
+fn accept_poll_membership(
+    previous: Vec<OwnedNamespaceWait>,
+    membership: Option<Vec<String>>,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    started: tokio::time::Instant,
+) -> PollStep {
+    if !post_timeout_open(now, deadline) {
+        return PollStep::Expired { rows: previous };
+    }
+    match membership {
+        Some(names) if names.is_empty() => PollStep::Removed {
+            waited: started.elapsed(),
+        },
+        Some(names) => PollStep::Continue {
+            rows: merge_observed_namespaces(&previous, &names),
+        },
+        None => PollStep::Continue { rows: previous },
+    }
+}
+
+fn unreadable_namespace(namespace: OwnedNamespaceSnapshot, objects: &str) -> OwnedNamespaceWait {
+    OwnedNamespaceWait {
+        name: namespace.name,
+        phase: namespace.phase,
+        conditions: namespace.conditions,
+        objects: objects.to_string(),
+        controller_owned: false,
+    }
+}
+
+/// The process group created for one post-timeout read. The numeric id stays
+/// armed only until this read signals the group or reaps the leader. Signaling
+/// after the leader is reaped can hit a recycled pid, including when
+/// `wait_with_output` would already have reaped the leader while a descendant
+/// still held a pipe.
+struct OwnedProcessGroup {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl OwnedProcessGroup {
+    fn arm(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn signal(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        #[cfg(unix)]
+        if let Some(pgid) = self.pid.and_then(|pid| i32::try_from(pid).ok()) {
+            // SAFETY: `pgid` is the leader of the group created for this read
+            // with `process_group(0)`, and that leader has not been reaped, so
+            // the id is still this group.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+impl Drop for OwnedProcessGroup {
+    fn drop(&mut self) {
+        self.signal();
+    }
+}
+
+async fn reap_post_timeout_child(
+    child: &mut tokio::process::Child,
+    deadline: tokio::time::Instant,
+) {
+    match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(_status)) => {}
+        Ok(Err(_error)) => {}
+        Err(_elapsed) => {}
+    }
+}
+
+fn post_timeout_elapsed(what: &str) -> anyhow::Error {
+    anyhow::anyhow!("{what} timed out during the post-timeout namespace sweep")
+}
+
+/// One post-timeout kubectl read. The child gets its own process group so a
+/// timeout can stop the credential plugin it spawned. Pipes are read without
+/// reaping the leader, and the group is signaled only while that leader is
+/// still unreaped. The same `child_deadline` is checked after spawn, again
+/// before a result is decoded, and again after UTF-8 conversion. A converted
+/// result that crossed that deadline is not returned. The kill and reap finish
+/// by `deadline`. This is not the shared `run_capture` path.
+async fn run_post_timeout_read(
+    cmd: &OpsCommand,
+    deadline: tokio::time::Instant,
+    what: &str,
+) -> Result<(bool, String, String)> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining <= POST_TIMEOUT_REAP {
+        return Err(post_timeout_elapsed(what));
+    }
+    let child_deadline = deadline - POST_TIMEOUT_REAP;
+    let (cmd, _secret_files) = cmd.materialize_secret_files()?;
+    let mut command = cmd.tokio_command();
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // kubectl runs exec credential plugins, which may spawn descendants.
+        // Give this read its own group so a timeout can stop all of it.
+        command.as_std_mut().process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| command_io_error(&cmd.program, error))
+        .with_context(|| format!("running {what} after the namespace sweep timeout"))?;
+    let mut group = OwnedProcessGroup::arm(child.id());
+    if tokio::time::Instant::now() >= child_deadline {
+        group.signal();
+        reap_post_timeout_child(&mut child, deadline).await;
+        return Err(post_timeout_elapsed(what));
+    }
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    if stdout.is_none() || stderr.is_none() {
+        group.signal();
+        reap_post_timeout_child(&mut child, deadline).await;
+        bail!("running {what} after the namespace sweep timeout: output pipes were not available");
+    }
+    let read = async move {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut stdout = stdout.expect("stdout pipe checked");
+        let mut stderr = stderr.expect("stderr pipe checked");
+        let out_read = tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut out);
+        let err_read = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut err);
+        let (out_result, err_result) = tokio::join!(out_read, err_read);
+        out_result?;
+        err_result?;
+        Ok::<_, std::io::Error>((out, err))
+    };
+    tokio::pin!(read);
+    match tokio::time::timeout_at(child_deadline, &mut read).await {
+        Ok(Ok((stdout, stderr))) => {
+            if tokio::time::Instant::now() >= child_deadline {
+                group.signal();
+                reap_post_timeout_child(&mut child, deadline).await;
+                return Err(post_timeout_elapsed(what));
+            }
+            let status = match tokio::time::timeout_at(child_deadline, child.wait()).await {
+                Ok(Ok(status)) => {
+                    group.disarm();
+                    status
+                }
+                Ok(Err(error)) => {
+                    group.signal();
+                    reap_post_timeout_child(&mut child, deadline).await;
+                    return Err(error).with_context(|| {
+                        format!("running {what} after the namespace sweep timeout")
+                    });
+                }
+                Err(_elapsed) => {
+                    group.signal();
+                    reap_post_timeout_child(&mut child, deadline).await;
+                    return Err(post_timeout_elapsed(what));
+                }
+            };
+            if tokio::time::Instant::now() >= child_deadline {
+                return Err(post_timeout_elapsed(what));
+            }
+            let stdout = String::from_utf8_lossy(&stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&stderr).into_owned();
+            // Decoding is part of the read. A result that crossed the child
+            // deadline while being converted is not consumed.
+            if tokio::time::Instant::now() >= child_deadline {
+                return Err(post_timeout_elapsed(what));
+            }
+            Ok((status.success(), stdout, stderr))
+        }
+        Ok(Err(error)) => {
+            group.signal();
+            reap_post_timeout_child(&mut child, deadline).await;
+            Err(error).with_context(|| format!("reading {what} after the namespace sweep timeout"))
+        }
+        Err(_elapsed) => {
+            // The leader may already be a zombie while a descendant holds the
+            // pipe. Signal before either is reaped, then finish the reads.
+            group.signal();
+            match tokio::time::timeout_at(deadline, &mut read).await {
+                Ok(Ok(_bytes)) => {}
+                Ok(Err(_error)) => {}
+                Err(_still_open) => {}
+            }
+            reap_post_timeout_child(&mut child, deadline).await;
+            Err(post_timeout_elapsed(what))
+        }
+    }
+}
+
+fn namespace_wait_row(
+    namespace: OwnedNamespaceSnapshot,
+    grouped: std::collections::BTreeMap<String, Vec<String>>,
+    object_pairs: &[(&str, &str)],
+    failures: &[String],
+    foreign_residue: bool,
+) -> OwnedNamespaceWait {
+    let inventory_readable = failures.is_empty();
+    // One classification. A custom resource is refused here, before the
+    // kind/name helper, so an Event-shaped custom object is not classified twice.
+    let controller_owned = !foreign_residue
+        && controller_owned_residue_only(
+            &namespace.phase,
+            &namespace.conditions,
+            object_pairs,
+            inventory_readable,
+        );
+    let mut objects = format_remaining_objects(grouped);
+    if !failures.is_empty() {
+        if objects == "none" {
+            objects = failures.join("; ");
+        } else {
+            objects.push_str("; ");
+            objects.push_str(&failures.join("; "));
+        }
+    }
+    OwnedNamespaceWait {
+        name: namespace.name,
+        phase: namespace.phase,
+        conditions: namespace.conditions,
+        objects,
+        controller_owned,
+    }
+}
+
+/// One admission pass: the ownership-scoped namespace list, namespaced
+/// discovery, and every discovered object list. A missing field, a custom
+/// resource that still has objects, or any unreadable list refuses admission.
+/// An empty namespace list is ready and empty. Never finalizes or force-deletes.
+async fn diagnose_owned_namespace_wait(
+    o: &CommonOpts,
+    deadline: tokio::time::Instant,
+) -> Diagnosis {
+    let listed = match run_post_timeout_read(
+        &owned_namespace_list_cmd(o),
+        deadline,
+        "kubectl get namespace",
     )
     .await
     {
-        Ok(captured) => captured?,
-        Err(_) => bail!("timed out listing owned namespaces after the sweep wait"),
+        Ok((true, output, _)) => output,
+        _ => return Diagnosis::Unreadable { rows: Vec::new() },
     };
-    let (ok, output, err) = listed;
+    let namespaces = match parse_owned_namespace_list(&listed) {
+        Ok(namespaces) if post_timeout_open(tokio::time::Instant::now(), deadline) => namespaces,
+        Ok(_) | Err(_) => return Diagnosis::Unreadable { rows: Vec::new() },
+    };
+    if namespaces.is_empty() {
+        return finish_diagnosis(
+            Diagnosis::Ready(Vec::new()),
+            tokio::time::Instant::now(),
+            deadline,
+        );
+    }
+    let discovered = match run_post_timeout_read(
+        &super::namespaced_resources_cmd(),
+        deadline,
+        "kubectl api-resources",
+    )
+    .await
+    {
+        Ok((true, discovered, _)) => discovered,
+        _ => {
+            return Diagnosis::Unreadable {
+                rows: namespaces
+                    .into_iter()
+                    .map(|namespace| unreadable_namespace(namespace, "inventory unreadable"))
+                    .collect(),
+            };
+        }
+    };
+    let resources = match parse_namespaced_resources(&discovered) {
+        Ok(resources) if post_timeout_open(tokio::time::Instant::now(), deadline) => resources,
+        Ok(_) | Err(_) => {
+            return Diagnosis::Unreadable {
+                rows: namespaces
+                    .into_iter()
+                    .map(|namespace| unreadable_namespace(namespace, "inventory unreadable"))
+                    .collect(),
+            };
+        }
+    };
+    let mut rows = Vec::with_capacity(namespaces.len());
+    let mut readable = true;
+    for namespace in namespaces {
+        if tokio::time::Instant::now() >= deadline {
+            readable = false;
+            rows.push(unreadable_namespace(namespace, "inventory unreadable"));
+            continue;
+        }
+        let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut object_refs: Vec<(String, String)> = Vec::new();
+        let mut failures = Vec::new();
+        let mut foreign_residue = false;
+        for resource in &resources {
+            if tokio::time::Instant::now() >= deadline {
+                failures.push("inventory unreadable".to_string());
+                break;
+            }
+            let captured = run_post_timeout_read(
+                &super::namespace_inventory_cmd(&namespace.name, resource),
+                deadline,
+                "kubectl get",
+            )
+            .await;
+            let inventory = match captured {
+                Ok((true, inventory, _)) => inventory,
+                _ => {
+                    failures.push(format!("{resource}: list unreadable"));
+                    continue;
+                }
+            };
+            match parse_namespace_inventory(&inventory, &namespace.name, resource) {
+                Ok(items) if post_timeout_open(tokio::time::Instant::now(), deadline) => {
+                    if built_in_controller_identity(resource).is_none() && !items.is_empty() {
+                        foreign_residue = true;
+                    }
+                    for (kind, name) in items {
+                        grouped.entry(kind.clone()).or_default().push(name.clone());
+                        object_refs.push((kind, name));
+                    }
+                }
+                Ok(_) => {
+                    failures.push("inventory unreadable".to_string());
+                    break;
+                }
+                Err(_) => failures.push(format!("{resource}: list unreadable")),
+            }
+        }
+        if !failures.is_empty() {
+            readable = false;
+        }
+        let object_pairs: Vec<(&str, &str)> = object_refs
+            .iter()
+            .map(|(kind, name)| (kind.as_str(), name.as_str()))
+            .collect();
+        rows.push(namespace_wait_row(
+            namespace,
+            grouped,
+            &object_pairs,
+            &failures,
+            foreign_residue,
+        ));
+    }
+    finish_diagnosis(
+        if readable {
+            Diagnosis::Ready(rows)
+        } else {
+            Diagnosis::Unreadable { rows }
+        },
+        tokio::time::Instant::now(),
+        deadline,
+    )
+}
+
+async fn read_owned_namespace_membership(
+    o: &CommonOpts,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<String>> {
+    let (ok, output, err) = run_post_timeout_read(
+        &owned_namespace_list_cmd(o),
+        deadline,
+        "kubectl get namespace",
+    )
+    .await?;
     if !ok {
         bail!(
             "could not list owned namespaces after the sweep wait: {}",
             failure_reason(&err)
         );
     }
-    let namespaces = parse_owned_namespace_list(&output)?;
-    if namespaces.is_empty() {
-        return Ok(Vec::new());
+    parse_owned_namespace_membership(&output)
+}
+
+fn merge_observed_namespaces(
+    previous: &[OwnedNamespaceWait],
+    names: &[String],
+) -> Vec<OwnedNamespaceWait> {
+    names
+        .iter()
+        .map(|name| {
+            if let Some(row) = previous.iter().find(|row| &row.name == name) {
+                return OwnedNamespaceWait {
+                    name: row.name.clone(),
+                    phase: row.phase.clone(),
+                    conditions: row.conditions.clone(),
+                    objects: row.objects.clone(),
+                    controller_owned: true,
+                };
+            }
+            OwnedNamespaceWait {
+                name: name.clone(),
+                phase: "unreadable".to_string(),
+                conditions: "unreadable".to_string(),
+                objects: "inventory unreadable".to_string(),
+                controller_owned: true,
+            }
+        })
+        .collect()
+}
+
+/// After admission, poll only the ownership-scoped namespace list. A parsed
+/// empty list is the extension's success observation. A failed or unreadable
+/// list keeps the last successful set and cannot count as empty.
+async fn poll_admitted_namespaces(
+    o: &CommonOpts,
+    interval: std::time::Duration,
+    deadline_at: tokio::time::Instant,
+    started: tokio::time::Instant,
+    admitted: Vec<OwnedNamespaceWait>,
+) -> AdmittedPoll {
+    let mut last = admitted;
+    loop {
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return AdmittedPoll::Expired { rows: last };
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return AdmittedPoll::Expired { rows: last };
+        }
+        let membership = read_owned_namespace_membership(o, deadline_at).await.ok();
+        // Acceptance is after conversion and parsing. A late list, including a
+        // parsed empty one, cannot succeed or replace `last`.
+        match accept_poll_membership(
+            last,
+            membership,
+            tokio::time::Instant::now(),
+            deadline_at,
+            started,
+        ) {
+            PollStep::Removed { waited } => return AdmittedPoll::Removed { waited },
+            PollStep::Expired { rows } => return AdmittedPoll::Expired { rows },
+            PollStep::Continue { rows } => last = rows,
+        }
     }
-    let discovered = match tokio::time::timeout(
-        OWNED_NAMESPACE_LIST_TIMEOUT,
-        run_capture(&super::namespaced_resources_cmd()),
-    )
-    .await
-    {
-        Ok(Ok((true, discovered, _err))) => discovered,
-        _ => {
-            return Ok(namespaces
-                .into_iter()
-                .map(|namespace| OwnedNamespaceWait {
-                    name: namespace.name,
-                    phase: namespace.phase,
-                    conditions: namespace.conditions,
-                    objects: "inventory timed out".to_string(),
-                })
-                .collect());
-        }
-    };
-    let resources: Vec<String> = discovered
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-    let inventory_deadline = std::time::Instant::now() + OWNED_NAMESPACE_INVENTORY_BUDGET;
-    let mut rows = Vec::with_capacity(namespaces.len());
-    for namespace in namespaces {
-        let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        let mut failures = Vec::new();
-        for resource in &resources {
-            let remaining = inventory_deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                failures.push("inventory timed out".to_string());
-                break;
-            }
-            let captured = match tokio::time::timeout(
-                remaining,
-                run_capture(&super::namespace_inventory_cmd(&namespace.name, resource)),
-            )
-            .await
-            {
-                Ok(Ok(captured)) => captured,
-                Ok(Err(_)) | Err(_) => {
-                    failures.push(format!("{resource}: list failed"));
-                    continue;
-                }
-            };
-            let (listed, inventory, _err) = captured;
-            if !listed {
-                failures.push(format!("{resource}: list failed"));
-                continue;
-            }
-            match parse_remaining_objects(&inventory) {
-                Ok(items) => {
-                    for (kind, name) in items {
-                        grouped.entry(kind).or_default().push(name);
-                    }
-                }
-                Err(_) => failures.push(format!("{resource}: list failed")),
-            }
-        }
-        let mut objects = format_remaining_objects(grouped);
-        if !failures.is_empty() {
-            if objects == "none" {
-                objects = failures.join("; ");
-            } else {
-                objects.push_str("; ");
-                objects.push_str(&failures.join("; "));
-            }
-        }
-        rows.push(OwnedNamespaceWait {
-            name: namespace.name,
-            phase: namespace.phase,
-            conditions: namespace.conditions,
-            objects,
-        });
-    }
-    Ok(rows)
 }
 
 /// #707 ownership stamp. Returns the single `kubectl label namespace` step that
@@ -1651,49 +2254,80 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     } else if sweep_wait_expired(&sweep_err) {
         // An immediate RBAC or validation failure is not a wait expiry, so it
         // keeps the permanent exit class from #767. Only kubectl's own
-        // "timed out waiting" wording opens this path.
-        match diagnose_owned_namespace_wait(&opts.common).await {
-            Ok(rows) if !owned_namespace_wait_expired(false, rows.len()) => {
+        // "timed out waiting" wording opens this path. The post-timeout
+        // deadline starts before the first diagnosis read.
+        let permanent = step_is_permanent(matches!(helm_outcome, HelmOutcome::Failed), &helm_err)
+            || step_is_permanent(matches!(hook_outcome, HookOutcome::Failed), &hook_err);
+        let (interval, deadline) = extension_bounds();
+        let started = tokio::time::Instant::now();
+        let deadline_at = started + deadline;
+        let resume_for = || {
+            resume_command(
+                &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
+                &opts.common,
+            )
+        };
+        match diagnose_owned_namespace_wait(&opts.common, deadline_at).await {
+            Diagnosis::Ready(rows) if !owned_namespace_wait_expired(false, rows.len()) => {
                 // The namespace finished deleting between the sweep error and
                 // the follow-up list. That is a completed sweep, not a failure.
                 step.done("removed");
                 SweepOutcome::Removed
             }
-            Ok(rows)
-                if !step_is_permanent(matches!(helm_outcome, HelmOutcome::Failed), &helm_err)
-                    && !step_is_permanent(
-                        matches!(hook_outcome, HookOutcome::Failed),
-                        &hook_err,
-                    ) =>
-            {
+            Diagnosis::Ready(rows) if !permanent && rows.iter().all(|row| row.controller_owned) => {
+                match poll_admitted_namespaces(&opts.common, interval, deadline_at, started, rows)
+                    .await
+                {
+                    AdmittedPoll::Removed { waited } => {
+                        ui.plumbing(&format!(
+                            "namespace sweep extension waited {}ms",
+                            waited.as_millis()
+                        ));
+                        step.done("removed");
+                        SweepOutcome::Removed
+                    }
+                    AdmittedPoll::Expired { rows } => {
+                        step.fail("still present");
+                        for line in out.lines().chain(sweep_err.lines()) {
+                            ui.plumbing(line);
+                        }
+                        let resume = resume_for();
+                        return Err(crate::exit::CliError::transient(
+                            format_owned_namespace_wait_after(
+                                &rows,
+                                &resume,
+                                OWNED_NAMESPACE_EXTENDED_WAIT,
+                            ),
+                        )
+                        .with_fix(resume)
+                        .into());
+                    }
+                }
+            }
+            Diagnosis::Ready(rows) | Diagnosis::Unreadable { rows } if !permanent => {
                 step.fail("still present");
                 for line in out.lines().chain(sweep_err.lines()) {
                     ui.plumbing(line);
                 }
-                let resume = resume_command(
-                    &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
-                    &opts.common,
-                );
+                let resume = resume_for();
                 return Err(
                     crate::exit::CliError::transient(format_owned_namespace_wait(&rows, &resume))
                         .with_fix(resume)
                         .into(),
                 );
             }
-            Ok(rows) => {
-                // A permanent helm or hook failure still decides the exit
-                // class. The sweep report carries the objects that remain.
-                step.fail("still present");
-                let resume = resume_command(
-                    &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
-                    &opts.common,
-                );
-                sweep_report = format_owned_namespace_wait(&rows, &resume);
-                SweepOutcome::Failed
-            }
-            Err(_) => {
-                step.fail("failed");
-                SweepOutcome::Failed
+            Diagnosis::Ready(rows) | Diagnosis::Unreadable { rows } => {
+                if rows.is_empty() {
+                    step.fail("failed");
+                    SweepOutcome::Failed
+                } else {
+                    // A permanent helm or hook failure still decides the exit
+                    // class. The sweep report carries the objects that remain.
+                    step.fail("still present");
+                    let resume = resume_for();
+                    sweep_report = format_owned_namespace_wait(&rows, &resume);
+                    SweepOutcome::Failed
+                }
             }
         }
     } else {
@@ -6059,6 +6693,7 @@ mod tests {
                 phase: "Terminating".into(),
                 conditions: "NamespaceFinalizersRemaining=True".into(),
                 objects: "ConfigMap (1): hold".into(),
+                controller_owned: false,
             }],
             resume,
         );
@@ -6072,6 +6707,343 @@ mod tests {
         assert!(message.contains("hold"), "{message}");
         assert!(message.contains("--timeout=300s"), "{message}");
         assert!(!message.contains("finalizer removed"), "{message}");
+    }
+
+    // #5735: the extension classifier accepts only the residue the namespace
+    // controller removes itself. Names are anonymized from the release-QA shape.
+    #[test]
+    fn controller_owned_residue_only_accepts_the_observed_shape_and_rejects_holds() {
+        let conditions = "NamespaceDeletionDiscoveryFailure=False, NamespaceDeletionGroupVersionParsingFailure=False, NamespaceDeletionContentFailure=False, NamespaceContentRemaining=False, NamespaceFinalizersRemaining=False";
+        let observed = [
+            ("ConfigMap", "kube-root-ca.crt"),
+            ("EndpointSlice", "svc-a"),
+            ("Endpoints", "svc-a"),
+            ("Event", "evt-a"),
+        ];
+        assert!(controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &observed,
+            true
+        ));
+        assert!(controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &[],
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &[("Pod", "web")],
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &[("PersistentVolumeClaim", "data")],
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &[("ConfigMap", "hold")],
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            "NamespaceDeletionContentFailure=True",
+            &observed,
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            "NamespaceFinalizersRemaining=True",
+            &observed,
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Active", conditions, &observed, true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &observed,
+            false
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            "NamespaceFinalizersRemaining=Yes",
+            &observed,
+            true
+        ));
+        assert!(controller_owned_residue_only(
+            "Terminating",
+            "NamespaceFinalizersRemaining=Unknown",
+            &[],
+            true
+        ));
+    }
+
+    // #5735: admission matches built-in API identities and rejects inventory
+    // that omits a field, lies about its namespace, or uses a condition status
+    // outside the Kubernetes enum. A custom group cannot qualify by copying a
+    // built-in kind string. A poll reads membership without phase or conditions.
+    #[test]
+    fn controller_owned_residue_rejects_custom_groups_and_masked_fields() {
+        assert_eq!(
+            built_in_controller_identity("events"),
+            Some(("v1", "Event"))
+        );
+        assert_eq!(
+            built_in_controller_identity("events.events.k8s.io"),
+            Some(("events.k8s.io/v1", "Event"))
+        );
+        assert_eq!(
+            built_in_controller_identity("endpoints"),
+            Some(("v1", "Endpoints"))
+        );
+        assert_eq!(
+            built_in_controller_identity("endpointslices.discovery.k8s.io"),
+            Some(("discovery.k8s.io/v1", "EndpointSlice"))
+        );
+        assert_eq!(
+            built_in_controller_identity("configmaps"),
+            Some(("v1", "ConfigMap"))
+        );
+        assert_eq!(
+            built_in_controller_identity("endpointslices"),
+            Some(("discovery.k8s.io/v1", "EndpointSlice"))
+        );
+        assert_eq!(built_in_controller_identity("events.example.com"), None);
+        assert_eq!(built_in_controller_identity("widgets.example.com"), None);
+        assert_eq!(built_in_controller_identity("pods"), None);
+
+        let event = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}}]}"#;
+        assert_eq!(
+            parse_namespace_inventory(event, "agent-ns", "events").expect("core Event"),
+            vec![("Event".to_string(), "evt-a".to_string())]
+        );
+        assert!(parse_namespace_inventory(event, "other-ns", "events").is_err());
+        assert!(parse_namespace_inventory(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"example.com/v1","kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}}]}"#,
+            "agent-ns",
+            "events",
+        )
+        .is_err());
+        assert!(parse_namespace_inventory(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"events.k8s.io/v1","kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}}]}"#,
+            "agent-ns",
+            "events",
+        )
+        .is_err());
+        assert_eq!(
+            parse_namespace_inventory(
+                r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"events.k8s.io/v1","kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}}]}"#,
+                "agent-ns",
+                "events.events.k8s.io",
+            )
+            .expect("events.k8s.io Event"),
+            vec![("Event".to_string(), "evt-a".to_string())]
+        );
+        assert_eq!(
+            parse_namespace_inventory(
+                r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"svc-a","namespace":"agent-ns"}}]}"#,
+                "agent-ns",
+                "endpointslices",
+            )
+            .expect("EndpointSlice"),
+            vec![("EndpointSlice".to_string(), "svc-a".to_string())]
+        );
+        assert!(parse_namespace_inventory(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"agent-ns"}}]}"#,
+            "other-ns",
+            "pods",
+        )
+        .is_err());
+        assert!(parse_namespace_inventory(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}}]}"#,
+            "agent-ns",
+            "events",
+        )
+        .is_err());
+        assert!(parse_namespace_inventory(
+            r#"{"kind":"List","items":[{"kind":"Event"}]}"#,
+            "agent-ns",
+            "events",
+        )
+        .is_err());
+        assert!(parse_namespace_inventory(
+            r#"{"apiVersion":"v1","kind":"PodList","items":[]}"#,
+            "agent-ns",
+            "pods",
+        )
+        .is_err());
+        assert!(parse_namespace_inventory(
+            r#"{"apiVersion":"v1","kind":"List","items":["evt-a"]}"#,
+            "agent-ns",
+            "events",
+        )
+        .is_err());
+        let custom = parse_namespace_inventory(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"example.com/v1","kind":"Event","metadata":{"name":"custom-evt","namespace":"agent-ns"}}]}"#,
+            "agent-ns",
+            "widgets.example.com",
+        )
+        .expect("a custom object is still named");
+        assert_eq!(
+            custom,
+            vec![("Event".to_string(), "custom-evt".to_string())]
+        );
+        assert!(built_in_controller_identity("widgets.example.com").is_none());
+
+        assert!(parse_owned_namespace_list(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns"},"status":{"conditions":[]}}]}"#
+        )
+        .is_err());
+        assert!(parse_owned_namespace_list(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns"},"status":{"phase":"Terminating","conditions":[{"type":"NamespaceFinalizersRemaining"}]}}]}"#
+        )
+        .is_err());
+        assert!(parse_owned_namespace_list(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns"},"status":{"phase":"Terminating","conditions":[{"type":"NamespaceFinalizersRemaining","status":"Yes"}]}}]}"#
+        )
+        .is_err());
+        assert!(parse_owned_namespace_list(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns"},"status":{"phase":"Terminating"}}]}"#
+        )
+        .is_err());
+        let empty_conditions = parse_owned_namespace_list(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns"},"status":{"phase":"Terminating","conditions":[]}}]}"#,
+        )
+        .expect("an empty condition array is readable");
+        assert_eq!(empty_conditions[0].conditions, "none");
+        let membership = parse_owned_namespace_membership(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"renamed-ns","phase":"Active"}}]}"#,
+        )
+        .expect("a poll does not need a phase or conditions");
+        assert_eq!(membership, vec!["renamed-ns".to_string()]);
+        assert!(parse_owned_namespace_list(
+            r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"renamed-ns"}}]}"#
+        )
+        .is_err());
+        assert!(parse_namespaced_resources("events\nwidgets.example.com\n").is_ok());
+        assert!(parse_namespaced_resources("not a resource\n").is_err());
+        assert!(parse_namespaced_resources("\n").is_err());
+    }
+
+    fn sample_namespace_wait(name: &str) -> OwnedNamespaceWait {
+        OwnedNamespaceWait {
+            name: name.to_string(),
+            phase: "Terminating".to_string(),
+            conditions: "none".to_string(),
+            objects: "Event (1): evt-a".to_string(),
+            controller_owned: true,
+        }
+    }
+
+    // The post-timeout deadline stays closed at an equal instant. A late empty
+    // admission is not Ready, and a late poll does not succeed or replace the
+    // set that was accepted while the deadline was open.
+    #[test]
+    fn late_namespace_evidence_does_not_admit_or_replace_the_set() {
+        let now = tokio::time::Instant::now();
+        let open = now + std::time::Duration::from_nanos(1);
+        assert!(!post_timeout_open(now, now));
+        assert!(post_timeout_open(now, open));
+
+        let late_empty = finish_diagnosis(Diagnosis::Ready(Vec::new()), now, now);
+        assert!(
+            matches!(late_empty, Diagnosis::Unreadable { rows } if rows.is_empty()),
+            "a late empty admission must not be Ready"
+        );
+        let open_empty = finish_diagnosis(Diagnosis::Ready(Vec::new()), now, open);
+        assert!(matches!(
+            open_empty,
+            Diagnosis::Ready(rows) if rows.is_empty()
+        ));
+
+        let late_ready = finish_diagnosis(
+            Diagnosis::Ready(vec![sample_namespace_wait("agent-ns")]),
+            now,
+            now,
+        );
+        match late_ready {
+            Diagnosis::Unreadable { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "agent-ns");
+            }
+            Diagnosis::Ready(_) => panic!("a late qualifying admission must not stay Ready"),
+        }
+
+        let late_empty_poll = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            Some(Vec::new()),
+            now,
+            now,
+            now,
+        );
+        match late_empty_poll {
+            PollStep::Expired { rows } => assert_eq!(rows[0].name, "agent-ns"),
+            PollStep::Removed { .. } => panic!("a late empty poll must not succeed"),
+            PollStep::Continue { .. } => panic!("a late empty poll must not be applied"),
+        }
+
+        let late_rename = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            Some(vec!["renamed-ns".to_string()]),
+            now,
+            now,
+            now,
+        );
+        match late_rename {
+            PollStep::Expired { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "agent-ns");
+            }
+            PollStep::Removed { .. } => panic!("a late membership must not succeed"),
+            PollStep::Continue { rows } => {
+                panic!("a late membership replaced the set with {}", rows[0].name)
+            }
+        }
+
+        let open_empty_poll = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            Some(Vec::new()),
+            now,
+            open,
+            now,
+        );
+        assert!(matches!(open_empty_poll, PollStep::Removed { .. }));
+
+        let open_rename = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            Some(vec!["renamed-ns".to_string()]),
+            now,
+            open,
+            now,
+        );
+        match open_rename {
+            PollStep::Continue { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].name, "renamed-ns");
+            }
+            PollStep::Removed { .. } => panic!("an in-deadline rename is not removal"),
+            PollStep::Expired { .. } => panic!("an in-deadline rename is not expiry"),
+        }
+
+        let failed = accept_poll_membership(
+            vec![sample_namespace_wait("agent-ns")],
+            None,
+            now,
+            open,
+            now,
+        );
+        match failed {
+            PollStep::Continue { rows } => assert_eq!(rows[0].name, "agent-ns"),
+            PollStep::Removed { .. } => panic!("a failed read is not an empty sweep"),
+            PollStep::Expired { .. } => panic!("a failed read inside the deadline keeps polling"),
+        }
     }
 
     // #1654 cross-release teardown scope. Two independent Curie installs on one

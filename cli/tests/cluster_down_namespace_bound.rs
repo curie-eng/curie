@@ -2,20 +2,21 @@
 //! expires, names a remaining object instead of clearing finalizers (#707,
 //! #767, #768).
 //!
-//! The PATH-mutating scenario lives in ONE async test. `down()` resolves
-//! `helm`/`kubectl` off the process PATH, so a second parallel test in this
-//! file would race on that shared state, and it holds `support::ENV_LOCK`
-//! against every other test in the process. The sync test below builds argv only
-//! and never touches PATH. It is the fix pin.
+//! Each PATH-mutating test holds `support::ENV_LOCK` for the whole case,
+//! including the extension-timing environment, so parallel tests cannot race
+//! on PATH. The sync test below builds argv only and never touches PATH. It
+//! is the #4017 fix pin. The #5735 pin is
+//! `cluster_down_extends_for_controller_owned_residue`.
 
 use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use curie::exit::{classify, ExitClass};
-use curie::ops::{down, down_commands, CommonOpts, DownOpts};
+use curie::ops::{down, down_commands, ClusterDownOutput, CommonOpts, DownOpts};
 
 /// Prepend `dir` to the current process PATH so its fake binaries win resolution.
 fn prepend_path(dir: &Path) {
@@ -32,6 +33,72 @@ fn restore_path(original: &Option<OsString>) {
         Some(p) => std::env::set_var("PATH", p),
         None => std::env::remove_var("PATH"),
     }
+}
+
+const EXTENSION_INTERVAL_ENV: &str = "CURIE_NAMESPACE_SWEEP_EXTENSION_INTERVAL_MS";
+const EXTENSION_DEADLINE_ENV: &str = "CURIE_NAMESPACE_SWEEP_EXTENSION_DEADLINE_MS";
+
+fn set_extension_timing(interval_ms: u64, deadline_ms: u64) {
+    std::env::set_var(EXTENSION_INTERVAL_ENV, interval_ms.to_string());
+    std::env::set_var(EXTENSION_DEADLINE_ENV, deadline_ms.to_string());
+}
+
+fn clear_extension_timing() {
+    std::env::remove_var(EXTENSION_INTERVAL_ENV);
+    std::env::remove_var(EXTENSION_DEADLINE_ENV);
+}
+
+/// Restores PATH and the extension-timing environment, including on panic.
+struct RestoredProcessEnv {
+    path: Option<OsString>,
+}
+
+impl RestoredProcessEnv {
+    fn capture() -> Self {
+        Self {
+            path: std::env::var_os("PATH"),
+        }
+    }
+
+    fn restore_now(&self) {
+        restore_path(&self.path);
+    }
+}
+
+impl Drop for RestoredProcessEnv {
+    fn drop(&mut self) {
+        restore_path(&self.path);
+        clear_extension_timing();
+    }
+}
+
+fn api_resource_calls(logged: &str) -> usize {
+    logged
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some("api-resources"))
+        .count()
+}
+
+fn resource_gets(logged: &str, resource: &str) -> usize {
+    logged
+        .lines()
+        .filter(|line| {
+            let args: Vec<&str> = line.split_whitespace().collect();
+            args.first() == Some(&"get") && args.get(1) == Some(&resource)
+        })
+        .count()
+}
+
+fn labeled_namespace_lists(logged: &str) -> usize {
+    logged
+        .lines()
+        .filter(|line| {
+            let args: Vec<&str> = line.split_whitespace().collect();
+            args.first() == Some(&"get")
+                && args.get(1) == Some(&"namespace")
+                && args.contains(&"-l")
+        })
+        .count()
 }
 
 fn down_opts() -> DownOpts {
@@ -78,7 +145,10 @@ fn sweep_command_carries_300s_timeout() {
 #[tokio::test]
 async fn cluster_down_names_a_remaining_configmap_and_exits_transient() {
     let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
     let original_path = std::env::var_os("PATH");
+    // A mistaken extension must fail this control in well under five minutes.
+    set_extension_timing(30, 400);
 
     // Scenario A: the sweep wait expires and a ConfigMap named hold is still
     // in the terminating namespace. The product must say so and exit 3, and
@@ -176,6 +246,19 @@ exit 1
     assert!(
         !logged.contains("--force"),
         "the sweep must not force the delete: {logged}"
+    );
+    assert!(
+        shown.contains("waited 300s"),
+        "a non-qualifying hold keeps the 300s wording: {shown}"
+    );
+    assert!(
+        !shown.contains("waited 600s"),
+        "a non-qualifying hold must not report the extension: {shown}"
+    );
+    assert_eq!(
+        labeled_namespace_lists(&logged),
+        1,
+        "a non-qualifying hold must not poll the extension: {logged}"
     );
 
     // Scenario B: a delete that finishes is not a wait expiry, so the product
@@ -393,5 +476,1321 @@ exit 1
     assert_eq!(class, ExitClass::Failure, "{err}");
     assert_eq!(class.code(), 1);
 
+    clear_extension_timing();
     restore_path(&original_path);
+}
+
+const QUALIFYING_NAMESPACE_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns","deletionTimestamp":"2026-01-01T00:00:00Z"},"status":{"phase":"Terminating","conditions":[{"type":"NamespaceDeletionDiscoveryFailure","status":"False"},{"type":"NamespaceDeletionGroupVersionParsingFailure","status":"False"},{"type":"NamespaceDeletionContentFailure","status":"False"},{"type":"NamespaceContentRemaining","status":"False"},{"type":"NamespaceFinalizersRemaining","status":"False"}]}}]}"#;
+
+const EVENT_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}}]}"#;
+
+const ENDPOINTS_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Endpoints","metadata":{"name":"svc-a","namespace":"agent-ns"}}]}"#;
+
+const ENDPOINTSLICE_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"svc-a","namespace":"agent-ns"}}]}"#;
+
+const ROOT_CA_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"kube-root-ca.crt","namespace":"agent-ns"}}]}"#;
+
+/// `empty_on_fourth` makes the fourth labeled namespace list empty. The first
+/// list is the initial diagnosis and the next three are extension polls.
+fn install_qualifying_kubectl(dir: &Path, empty_on_fourth: bool) -> std::path::PathBuf {
+    let argv_log = dir.join("kubectl-argv.log");
+    let present = dir.join("present.json");
+    let qualifying = dir.join("qualifying.json");
+    let events = dir.join("events.json");
+    let endpoints = dir.join("endpoints.json");
+    let slices = dir.join("slices.json");
+    let root_ca = dir.join("root-ca.json");
+    let count = dir.join("list-count");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write endpoint slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    let list_body = if empty_on_fourth {
+        format!(
+            r#"n=0
+if [ -f '{count}' ]; then
+  n=$(wc -l < '{count}' | tr -d ' ')
+fi
+printf '\n' >> '{count}'
+if [ "$n" -ge 3 ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+cat '{qualifying}'
+exit 0"#,
+            count = count.display(),
+            qualifying = qualifying.display(),
+        )
+    } else {
+        format!(
+            "cat '{qualifying}'\nexit 0",
+            qualifying = qualifying.display()
+        )
+    };
+    test_executable::install_in(
+        dir,
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir,
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' | tee -a '{argv}' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      {list_body}
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+            list_body = list_body,
+        ),
+    );
+    argv_log
+}
+
+#[tokio::test]
+async fn cluster_down_extends_for_controller_owned_residue() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    let original_path = std::env::var_os("PATH");
+    set_extension_timing(30, 15_000);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = install_qualifying_kubectl(dir.path(), true);
+    prepend_path(dir.path());
+
+    down(down_opts())
+        .await
+        .expect("controller-owned residue that disappears is a completed sweep");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(
+        logged.contains("--timeout=300s"),
+        "the initial sweep keeps the 300s argv: {logged}"
+    );
+    assert!(
+        logged.contains("timed out waiting"),
+        "the sweep delete must expire before the extension: {logged}"
+    );
+    assert_eq!(
+        labeled_namespace_lists(&logged),
+        4,
+        "the list becomes empty on the third extension poll: {logged}"
+    );
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the injected deadline must not wait out the production extension: {:?}",
+        started.elapsed()
+    );
+
+    clear_extension_timing();
+    restore_path(&original_path);
+}
+
+#[tokio::test]
+async fn cluster_down_extension_expiry_stays_transient() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    let original_path = std::env::var_os("PATH");
+    set_extension_timing(40, 2_000);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = install_qualifying_kubectl(dir.path(), false);
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("an extension that never clears the namespace stays incomplete");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(
+        shown.contains("waited 600s"),
+        "expiry reports the production 600s bound: {shown}"
+    );
+    assert!(
+        shown.contains("agent-ns"),
+        "expiry names the namespace: {shown}"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(
+        labeled_namespace_lists(&logged) > 1,
+        "expiry must poll before giving up: {logged}"
+    );
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "a short injected deadline must not run for the production 300s: {:?}",
+        started.elapsed()
+    );
+
+    clear_extension_timing();
+    restore_path(&original_path);
+}
+
+const MIXED_NAMESPACE_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns","deletionTimestamp":"2026-01-01T00:00:00Z"},"status":{"phase":"Terminating","conditions":[{"type":"NamespaceDeletionDiscoveryFailure","status":"False"},{"type":"NamespaceDeletionGroupVersionParsingFailure","status":"False"},{"type":"NamespaceDeletionContentFailure","status":"False"},{"type":"NamespaceContentRemaining","status":"False"},{"type":"NamespaceFinalizersRemaining","status":"False"}]}},{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"other-ns","deletionTimestamp":"2026-01-01T00:00:00Z"},"status":{"phase":"Terminating","conditions":[{"type":"NamespaceDeletionDiscoveryFailure","status":"False"},{"type":"NamespaceDeletionGroupVersionParsingFailure","status":"False"},{"type":"NamespaceDeletionContentFailure","status":"False"},{"type":"NamespaceContentRemaining","status":"False"},{"type":"NamespaceFinalizersRemaining","status":"False"}]}}]}"#;
+
+const POD_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"other-ns"}}]}"#;
+
+const NAMELESS_EVENT_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}},{"apiVersion":"v1","kind":"Event","metadata":{}}]}"#;
+
+const CUSTOM_EVENT_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"example.com/v1","kind":"Event","metadata":{"name":"custom-evt","namespace":"agent-ns"}}]}"#;
+
+struct CapturedStderr {
+    saved: libc::c_int,
+    path: std::path::PathBuf,
+}
+
+impl CapturedStderr {
+    fn start(path: &Path) -> Self {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open stderr capture");
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved >= 0, "dup stderr");
+        let redirected = unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
+        assert!(redirected >= 0, "redirect stderr");
+        Self {
+            saved,
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn finish(mut self) -> String {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        self.restore();
+        fs::read_to_string(&self.path).unwrap_or_default()
+    }
+
+    fn restore(&mut self) {
+        if self.saved >= 0 {
+            unsafe {
+                libc::dup2(self.saved, libc::STDERR_FILENO);
+                libc::close(self.saved);
+            }
+            self.saved = -1;
+        }
+    }
+}
+
+impl Drop for CapturedStderr {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn process_gone(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "pid="])
+            .output()
+            .expect("inspect stalled child");
+        if !output.status.success() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn read_pid(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ProcFields {
+    state: char,
+    pgrp: u32,
+}
+
+/// Fields after the comm in `/proc/<pid>/stat`. The comm is wrapped in
+/// parentheses and can itself contain parentheses, so the split is the last
+/// `)`.
+#[cfg(target_os = "linux")]
+fn proc_fields(pid: u32) -> Option<ProcFields> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = text.rsplit_once(')')?.1.trim_start();
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some(ProcFields { state, pgrp })
+}
+
+#[cfg(target_os = "linux")]
+fn holds_stdout_pipe(pid: u32) -> bool {
+    fs::read_link(format!("/proc/{pid}/fd/1"))
+        .map(|target| target.to_string_lossy().starts_with("pipe:"))
+        .unwrap_or(false)
+}
+
+/// The leader has exited. Its children are reparented at exit, so the pipe
+/// holder is no longer a child of that zombie. The proof is that the leader
+/// stays unreaped while the live holder keeps the stdout pipe and the group.
+/// `wait_with_output` reaps the leader as soon as it exits, so this window
+/// does not last. A descendant that is only an orphan zombie is not accepted.
+#[cfg(target_os = "linux")]
+fn leader_stayed_unreaped_while_child_held_the_pipe(
+    parent_path: &Path,
+    child_path: &Path,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let mut held_since: Option<std::time::Instant> = None;
+    let mut last = String::from("no sample");
+    while started.elapsed() < std::time::Duration::from_secs(5) {
+        let parent = read_pid(parent_path);
+        let child = read_pid(child_path);
+        if parent > 1 && child > 1 && parent != child {
+            let leader = proc_fields(parent);
+            let holder = proc_fields(child);
+            last = format!("parent={parent} child={child} leader={leader:?} holder={holder:?}");
+            match (&leader, &holder) {
+                (Some(leader), Some(holder))
+                    if leader.state == 'Z'
+                        && holder.state != 'Z'
+                        && holder.pgrp == parent
+                        && leader.pgrp == parent
+                        && holds_stdout_pipe(child) =>
+                {
+                    let since = held_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= std::time::Duration::from_millis(400) {
+                        return Ok(());
+                    }
+                }
+                (None, Some(holder)) if holder.state != 'Z' && holder.pgrp == parent => {
+                    return Err(format!(
+                        "leader was reaped while the descendant was still alive: {last}"
+                    ));
+                }
+                _ => held_since = None,
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!(
+        "the exited leader did not stay unreaped while the descendant held the pipe: {last}"
+    ))
+}
+
+/// Stops a live pipe holder in the fixture's group after a failed assertion.
+#[cfg(target_os = "linux")]
+fn stop_leaked_sleep(parent_path: &Path, child_path: &Path) {
+    let parent = read_pid(parent_path);
+    let child = read_pid(child_path);
+    if parent <= 1 || child <= 1 || parent == child {
+        return;
+    }
+    if proc_fields(child).is_some_and(|fields| fields.state != 'Z' && fields.pgrp == parent)
+        && holds_stdout_pipe(child)
+    {
+        let comm = fs::read_to_string(format!("/proc/{child}/comm")).unwrap_or_default();
+        if comm.trim() == "sleep" {
+            unsafe { libc::kill(child as i32, libc::SIGKILL) };
+        }
+    }
+}
+
+#[tokio::test]
+async fn cluster_down_extension_refuses_a_mixed_namespace() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(30, 800);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let mixed = dir.path().join("mixed.json");
+    let events = dir.path().join("events.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    let pod = dir.path().join("pod.json");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&mixed, MIXED_NAMESPACE_LIST).expect("write mixed list");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    fs::write(&pod, POD_LIST).expect("write pod");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+ns=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = -n ]; then
+    ns=$arg
+  fi
+  prev=$arg
+done
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{mixed}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps pods
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = pods ]; then
+  if [ "$ns" = other-ns ]; then
+    cat '{pod}'
+  else
+    printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  fi
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  sed "s/\"namespace\":\"agent-ns\"/\"namespace\":\"$ns\"/" '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  sed "s/\"namespace\":\"agent-ns\"/\"namespace\":\"$ns\"/" '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  sed "s/\"namespace\":\"agent-ns\"/\"namespace\":\"$ns\"/" '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  sed "s/\"namespace\":\"agent-ns\"/\"namespace\":\"$ns\"/" '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            mixed = mixed.display(),
+            pod = pod.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+        ),
+    );
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("one non-qualifying namespace refuses the extension");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    assert!(shown.contains("agent-ns"), "{shown}");
+    assert!(shown.contains("other-ns"), "{shown}");
+    assert!(shown.contains("web"), "{shown}");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert_eq!(api_resource_calls(&logged), 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_refuses_incomplete_inventory() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let restored = RestoredProcessEnv::capture();
+    set_extension_timing(30, 800);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let nameless = dir.path().join("nameless.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(&nameless, NAMELESS_EVENT_LIST).expect("write nameless events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{nameless}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            nameless = nameless.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+        ),
+    );
+    prepend_path(dir.path());
+    let err = down(down_opts())
+        .await
+        .expect_err("an object without a name cannot qualify");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+
+    restored.restore_now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let events = dir.path().join("events.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    let custom = dir.path().join("custom.json");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    fs::write(&custom, CUSTOM_EVENT_LIST).expect("write custom event");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps widgets.example.com
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = widgets.example.com ]; then
+  cat '{custom}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+            custom = custom.display(),
+        ),
+    );
+    prepend_path(dir.path());
+    let err = down(down_opts())
+        .await
+        .expect_err("a custom resource group cannot qualify");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    assert!(shown.contains("custom-evt"), "{shown}");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert_eq!(api_resource_calls(&logged), 1, "{logged}");
+
+    restored.restore_now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let present = dir.path().join("present.json");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  printf '%s\n' '{{'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            present = present.display(),
+        ),
+    );
+    prepend_path(dir.path());
+    let err = down(down_opts())
+        .await
+        .expect_err("a malformed namespace list is not an empty sweep");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_does_not_repeat_discovery() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(30, 15_000);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = install_qualifying_kubectl(dir.path(), true);
+    prepend_path(dir.path());
+
+    down(down_opts())
+        .await
+        .expect("controller-owned residue that disappears is a completed sweep");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(
+        api_resource_calls(&logged),
+        1,
+        "discovery runs once, at admission: {logged}"
+    );
+    assert_eq!(resource_gets(&logged, "events"), 1, "{logged}");
+    assert_eq!(resource_gets(&logged, "endpoints"), 1, "{logged}");
+    assert_eq!(resource_gets(&logged, "endpointslices"), 1, "{logged}");
+    assert_eq!(resource_gets(&logged, "configmaps"), 1, "{logged}");
+    assert_eq!(labeled_namespace_lists(&logged), 4, "{logged}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_kills_a_stalled_child() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(40, 800);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let parent_pid = dir.path().join("parent.pid");
+    let child_pid = dir.path().join("child.pid");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  echo $$ > '{parent_pid}'
+  (sleep 8) &
+  echo $! > '{child_pid}'
+  sleep 8
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            parent_pid = parent_pid.display(),
+            child_pid = child_pid.display(),
+        ),
+    );
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("a stalled discovery read stays inside the post-timeout deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "the stalled child must be reaped inside the deadline, elapsed {elapsed:?}"
+    );
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    assert!(shown.contains("agent-ns"), "{shown}");
+    let parent = read_pid(&parent_pid);
+    let child = read_pid(&child_pid);
+    assert!(parent > 0, "the stalled kubectl must record its pid");
+    assert!(child > 0, "the stalled kubectl must record its grandchild");
+    assert!(
+        process_gone(parent),
+        "stalled kubectl {parent} is still running"
+    );
+    assert!(
+        process_gone(child),
+        "stalled grandchild {child} is still running"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(logged.contains("--timeout=300s"), "{logged}");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_reports_removed() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(30, 15_000);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = install_qualifying_kubectl(dir.path(), true);
+    let stderr_path = dir.path().join("stderr.txt");
+    prepend_path(dir.path());
+    let captured = CapturedStderr::start(&stderr_path);
+
+    let output = down(down_opts())
+        .await
+        .expect("controller-owned residue that disappears is a completed sweep");
+    let shown = captured.finish();
+    assert!(
+        matches!(
+            output,
+            ClusterDownOutput::Down {
+                release_was_absent: false
+            }
+        ),
+        "the normal down entry must finish as a removed release"
+    );
+    let sweep = shown
+        .lines()
+        .find(|line| line.contains("sweeping namespaces"))
+        .unwrap_or("");
+    assert!(
+        sweep.contains("removed") && !sweep.contains("no matching"),
+        "the sweep line must say Removed and must not say NoMatch: {sweep}\n{shown}"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(
+        logged.contains("timed out waiting"),
+        "the removed result follows the timed-out delete: {logged}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_down_extension_failed_list_keeps_the_last_namespaces() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(40, 1_200);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let events = dir.path().join("events.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    let count = dir.path().join("list-count");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      n=0
+      if [ -f '{count}' ]; then
+        n=$(wc -l < '{count}' | tr -d ' ')
+      fi
+      printf '\n' >> '{count}'
+      if [ "$n" -ge 1 ]; then
+        echo 'error: the server rejected the list' >&2
+        exit 1
+      fi
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            count = count.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+        ),
+    );
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("a failed namespace list is not an empty sweep");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "a failed poll must stay inside the injected deadline: {:?}",
+        started.elapsed()
+    );
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 600s"), "{shown}");
+    assert!(shown.contains("agent-ns"), "{shown}");
+    assert!(
+        shown.contains("evt-a"),
+        "expiry keeps the last admitted objects: {shown}"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(api_resource_calls(&logged), 1, "{logged}");
+    assert!(labeled_namespace_lists(&logged) > 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+}
+
+/// The leader exits while a descendant still holds the output pipe and stays
+/// in the leader's process group. `$$` inside that subshell is the leader, so
+/// the fixture records `$!` instead. The read has to leave the leader unreaped
+/// while that child holds the pipe, then stop the child itself. Reaping the
+/// leader the way `wait_with_output` does fails the unreaped observation even
+/// when a later signal happens to reach the group.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cluster_down_extension_stops_a_pipe_holder_after_the_leader_exits() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(40, 3_000);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let parent_pid = dir.path().join("parent.pid");
+    let child_pid = dir.path().join("child.pid");
+    let parent_pgid = dir.path().join("parent.pgid");
+    let child_pgid = dir.path().join("child.pgid");
+    let child_ready = dir.path().join("child.ready");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  echo $$ > '{parent_pid}'
+  sed -n 's/.*) [^ ]* [^ ]* \([0-9][0-9]*\).*/\1/p' /proc/$$/stat > '{parent_pgid}'
+  (
+    trap '' HUP TERM
+    echo ready > '{child_ready}'
+    exec sleep 30
+  ) &
+  echo $! > '{child_pid}'
+  while [ ! -s '{child_ready}' ]; do
+    :
+  done
+  sed -n 's/.*) [^ ]* [^ ]* \([0-9][0-9]*\).*/\1/p' "/proc/$(cat '{child_pid}')/stat" > '{child_pgid}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            parent_pid = parent_pid.display(),
+            child_pid = child_pid.display(),
+            parent_pgid = parent_pgid.display(),
+            child_pgid = child_pgid.display(),
+            child_ready = child_ready.display(),
+        ),
+    );
+    prepend_path(dir.path());
+    let parent_watch = parent_pid.clone();
+    let child_watch = child_pid.clone();
+    let watcher = std::thread::spawn(move || {
+        leader_stayed_unreaped_while_child_held_the_pipe(&parent_watch, &child_watch)
+    });
+    // Runs on the way out, including after a failed assertion. It does not
+    // run before the process checks, so it cannot hide a descendant the sweep
+    // left behind.
+    struct StopLeakedSleep<'a> {
+        parent: &'a Path,
+        child: &'a Path,
+    }
+    impl Drop for StopLeakedSleep<'_> {
+        fn drop(&mut self) {
+            stop_leaked_sleep(self.parent, self.child);
+        }
+    }
+    let _stop_leaked_sleep = StopLeakedSleep {
+        parent: &parent_pid,
+        child: &child_pid,
+    };
+
+    let err = down(down_opts())
+        .await
+        .expect_err("a pipe held by a descendant must not outlive the deadline");
+    let elapsed = started.elapsed();
+    let held = watcher.join().expect("pipe-holder watcher");
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "the pipe holder must be stopped inside the deadline, not by its own 30s sleep: {elapsed:?}"
+    );
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    let parent = read_pid(&parent_pid);
+    let child = read_pid(&child_pid);
+    let parent_group = read_pid(&parent_pgid);
+    let child_group = read_pid(&child_pgid);
+    assert!(parent > 1, "the leader must record its pid");
+    assert!(child > 1, "the pipe holder must record the background pid");
+    assert_ne!(
+        child, parent,
+        "the pipe holder must not be the leader pid repeated by $$"
+    );
+    assert_eq!(
+        parent_group, parent,
+        "the leader must be the process group id"
+    );
+    assert_eq!(
+        child_group, parent,
+        "the pipe holder must stay in the leader's group so a group signal can stop it"
+    );
+    held.expect("the exited leader must stay unreaped while the descendant holds the pipe");
+    // The descendant was reparented when the leader exited. Reaping the
+    // descendant belongs to its new parent, so verify that it stopped.
+    assert!(
+        proc_fields(child).is_none_or(|fields| fields.state == 'Z'),
+        "pipe holder {child} is still running after the leader exited"
+    );
+    assert!(
+        process_gone(parent),
+        "leader {parent} was not reaped after the group was stopped"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_expiry_names_the_updated_namespace_set() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(40, 2_000);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let renamed = dir.path().join("renamed.json");
+    let events = dir.path().join("events.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    let count = dir.path().join("list-count");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(
+        &renamed,
+        r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"renamed-ns"}}]}"#,
+    )
+    .expect("write renamed membership");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      n=0
+      if [ -f '{count}' ]; then
+        n=$(wc -l < '{count}' | tr -d ' ')
+      fi
+      printf '\n' >> '{count}'
+      if [ "$n" -ge 2 ]; then
+        echo 'error: the server rejected the list' >&2
+        exit 1
+      fi
+      if [ "$n" -eq 1 ]; then
+        cat '{renamed}'
+        exit 0
+      fi
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            renamed = renamed.display(),
+            count = count.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+        ),
+    );
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("a changed namespace set that then fails to read still expires");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "expiry must stay inside the injected deadline: {:?}",
+        started.elapsed()
+    );
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 600s"), "{shown}");
+    assert!(
+        shown.contains("namespace renamed-ns"),
+        "expiry must name the namespace set from the successful poll: {shown}"
+    );
+    assert!(
+        !shown.contains("namespace agent-ns"),
+        "a failed read must not restore the admission set: {shown}"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(
+        labeled_namespace_lists(&logged) > 2,
+        "the successful poll and a later failed read must both happen: {logged}"
+    );
+    assert_eq!(api_resource_calls(&logged), 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
 }

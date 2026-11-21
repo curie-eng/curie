@@ -660,7 +660,13 @@ impl Step {
                 pb.finish_with_message(line);
             }
             None => {
+                // The namespace sweep's piped line has to keep its detail.
+                // Otherwise `removed` and `no matching namespaces` both print
+                // as `: ok`. Other steps keep the short line.
                 let line = match status {
+                    StepStatus::Ok if self.label == "sweeping namespaces" && !detail.is_empty() => {
+                        format!("{}: ok ({detail}) ({elapsed})", self.label)
+                    }
                     StepStatus::Ok => format!("{}: ok ({elapsed})", self.label),
                     StepStatus::Fail => {
                         format!("{}: failed ({detail}) ({elapsed})", self.label)
