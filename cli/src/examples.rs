@@ -846,7 +846,10 @@ pub fn install_curie_skills(
         (
             "review",
             "review-pr",
-            &["4c13897920b1ab2deeeda90a6cb00b2b465b0c3a8576eeb552185322fb6efbc8"][..],
+            &[
+                "4c13897920b1ab2deeeda90a6cb00b2b465b0c3a8576eeb552185322fb6efbc8",
+                "a99e46d6434fb4b25f2aeb48fc43b7bd43a6ad25cb7e57ca7b0cf52fc2b61a00",
+            ][..],
         ),
         (
             "environment",
