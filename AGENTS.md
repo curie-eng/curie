@@ -340,7 +340,7 @@ evidence to a public reader anyway; it is a 404 with a repo name attached.
 
 ## Frozen contracts: STOP and escalate
 
-`packages/aci-protocol` (the ACI session protocol + NDJSON events) and
+`packages/aci-protocol` (the [ACI](ARCHITECTURE.md#glossary) session protocol + NDJSON events) and
 `packages/plugin-format` (the Claude Code plugin shape, verbatim) are **frozen
 interfaces**. Every lane compiles against them across three languages (Pydantic
 source of truth -> committed JSON Schema -> generated TS + Rust). Two CI gates
@@ -578,7 +578,7 @@ deletion ruleset (issue #2090). Run
 auto-merge: it refuses that ordinary path until the head is not `next` or an
 active deletion ruleset covers `next` with an empty bypass list. For a forward merge,
 reuse passing proof from the identical tree. If no identical-tree proof exists,
-run every parity ladder rung on the resulting `main` commit:
+run every [parity ladder](ARCHITECTURE.md#glossary) rung on the resulting `main` commit:
 
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder

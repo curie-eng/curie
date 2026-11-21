@@ -269,7 +269,7 @@ message-flow and deploy-flow sequence diagrams, and the built/in-progress
 split.
 - [docs/adr/](docs/adr/) -- the load-bearing architecture decisions (Agent
 Sandbox as substrate, stateless-first sessions, Langfuse as the
-observability backbone, the frozen ACI, security rails as chart defaults,
+observability backbone, the [frozen ACI](ARCHITECTURE.md#glossary), security rails as chart defaults,
 adopt-not-build boundaries), each with the live-cluster evidence behind it.
 - [docs/agents.md](docs/agents.md): the verification contract for an agent
 driving Curie. The exact commands that prove an outcome, and the rule that a
