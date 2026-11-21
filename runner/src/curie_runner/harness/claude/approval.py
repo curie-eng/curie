@@ -442,6 +442,7 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
 # surfaced as the CLI's stop reason, not as the approval summary (which is
 # ``pending_summary``, built by ``summarize_tool_call``).
 _HOOK_STOP_REASON = "Paused for human approval: an approval-required tool call was denied."
+_QUESTIONS_STOP_REASON = "The questions are posted on the ticket, so this session has ended."
 
 # Why the hook allows a call outright. Only ever emitted after the one-shot
 # post-approval grant (#430) has actually been spent, so it can state that.
@@ -485,9 +486,10 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
     (``claude_agent_sdk/types.py:1945-1947``). ``matcher=None`` matches every
     tool call, which is the whole claim.
 
-    Returns the ``{"PreToolUse": [HookMatcher]}`` mapping ``__main__`` MERGES
-    into the bundle's own hooks (#272). Note that the CLI dispatches every
-    matcher on one event **concurrently** (``types.py:1956-1961``), so this hook
+    Returns the ``{"PreToolUse": [HookMatcher], "PostToolUse": [HookMatcher]}``
+    mapping ``__main__`` MERGES into the bundle's own hooks (#272); the
+    PostToolUse matcher only ends the turn after a posted question round.
+    Note that the CLI dispatches every matcher on one event **concurrently** (``types.py:1956-1961``), so this hook
     must not assume it runs before a bundle's hook, and its position in the
     merged list is construction order, not precedence.
 
@@ -639,20 +641,35 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             "stopReason": _HOOK_STOP_REASON,
         }
 
+    async def questions_stop(
+        _hook_input: Any,
+        _tool_use_id: str | None,
+        _context: Any,
+    ) -> dict[str, Any]:
+        # ADR 0286 decision 11 (#5785): once ``ask_questions`` has posted the
+        # round, the same turn-stopping control fields the deny above carries
+        # end the turn right after that call, before the model is asked again.
+        # The PreToolUse refusal stays as the backstop for any call the CLI
+        # had already dispatched beside it.
+        if not gate.questions_posted:
+            return {}
+        return {"continue_": False, "stopReason": _QUESTIONS_STOP_REASON}
+
     # ``Any`` for the same reason ``hooks.py::_make_callback`` uses it: the SDK's
     # ``HookCallback`` alias is typed against its TypedDict union, and a plain
     # ``dict[str, Any]`` return is not assignable to it.
     callback: Any = approval_hook
-    hooks: dict[str, list[HookMatcher]] = {
-        "PreToolUse": [HookMatcher(matcher=None, hooks=[callback])]
-    }
+    post: list[Any] = []
     if gate.proxied_connector_servers:
         # ADR 0288 decision 1: remember the tickets hosted connectors
         # return. PostToolUse runs before the model sees the result, so a
         # ticket is remembered before any call that copies it can be decided.
-        observer: Any = build_ticket_observer(gate)
-        hooks["PostToolUse"] = [HookMatcher(matcher=None, hooks=[observer])]
-    return hooks
+        post.append(build_ticket_observer(gate))
+    post.append(questions_stop)
+    return {
+        "PreToolUse": [HookMatcher(matcher=None, hooks=[callback])],
+        "PostToolUse": [HookMatcher(matcher=None, hooks=post)],
+    }
 
 
 def build_ticket_observer(gate: ApprovalGate) -> Any:

@@ -424,9 +424,8 @@ async def get_work_item_request(
     view = workitem_dispatch.request_view(row)
     # ADR 0286 decision 2 (#5785): the worker does not re-prompt a request
     # whose question round is posted, since asking ends it.
-    view["questions_posted"] = (
-        await factory_questions.question_ending(session, row.work_item_id, row.id)
-        == factory_questions.QUESTIONS_ASKED
+    view["questions_posted"] = await factory_questions.round_posted(
+        session, row.work_item_id, row.id
     )
     return view
 

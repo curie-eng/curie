@@ -175,8 +175,8 @@ class WorkItemRequestView:
     runtime_claim_name: str | None
     runtime_sandbox_name: str | None
     # Whether the API recorded this request's question round as posted (ADR
-    # 0286, #5785). An older API omits it, which reads as False.
-    questions_posted: bool = False
+    # 0286, #5785). None when the answer did not say: an older API omits it.
+    questions_posted: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -697,7 +697,11 @@ class WorkItemDispatchClient:
                 runtime_epoch=int(epoch) if epoch is not None else 0,
                 runtime_claim_name=_optional_str(body.get("runtime_claim_name")),
                 runtime_sandbox_name=_optional_str(body.get("runtime_sandbox_name")),
-                questions_posted=body.get("questions_posted") is True,
+                questions_posted=(
+                    body["questions_posted"]
+                    if isinstance(body.get("questions_posted"), bool)
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(

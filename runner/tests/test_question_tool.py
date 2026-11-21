@@ -348,22 +348,52 @@ async def _bash_decisions(options: Any) -> list[dict[str, Any]]:
     return decisions
 
 
+async def _after_ask_decisions(options: Any) -> list[dict[str, Any]]:
+    """Every PostToolUse answer the booted session gives the ask itself."""
+
+    decisions: list[dict[str, Any]] = []
+    for matcher in options.hooks.get("PostToolUse", []):
+        for callback in matcher.hooks:
+            decisions.append(
+                await callback(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "tool_name": "mcp__curie__ask_questions",
+                        "tool_input": _valid(),
+                        "tool_response": {},
+                    },
+                    "toolu_ask",
+                    {"signal": None},
+                )
+            )
+    return decisions
+
+
+def _ends(decision: dict[str, Any]) -> bool:
+    return decision.get("continue_") is False
+
+
 def _stops(decision: dict[str, Any]) -> bool:
     output = decision.get("hookSpecificOutput") or {}
     return output.get("permissionDecision") == "deny" and decision.get("continue_") is False
 
 
 @pytest.mark.parametrize(
-    ("answer", "halts"),
+    ("answer", "halts", "managed"),
     [
-        ((200, {"round": 1, "rounds_limit": 3}), True),
-        ((409, {"code": "already_asked"}), False),
-        ((503, {}), False),
+        ((200, {"round": 1, "rounds_limit": 3}), True, True),
+        ((200, {"round": 1, "rounds_limit": 3}), True, False),
+        ((409, {"code": "already_asked"}), False, True),
+        ((503, {}), False, True),
     ],
-    ids=["200", "409", "503"],
+    ids=["200", "200-no-workspace", "409", "503"],
 )
 def test_the_booted_session_stops_the_turn_after_a_posted_round(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answer: tuple[int, Any], halts: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    answer: tuple[int, Any],
+    halts: bool,
+    managed: bool,
 ) -> None:
     """``__main__`` hands the tool the gate's halt: after a 200 the next call stops the turn.
 
@@ -371,17 +401,24 @@ def test_the_booted_session_stops_the_turn_after_a_posted_round(
     ``ask_questions``; the mounted tool is called the way the CLI calls it, then
     the session's own PreToolUse hooks decide a Bash call. Red without the
     halt: no hook refuses. A refusal or a 503 posts nothing and stops nothing.
+    A factory boot with no managed workspace, approval tools or tool policy has
+    no policy gate and must still stop.
     """
 
     workspace = tmp_path / "workspace"
-    (workspace / ".git").mkdir(parents=True)
+    if managed:
+        (workspace / ".git").mkdir(parents=True)
     api = _QuestionsApi([(200, IMPLEMENTATION)], answer=answer)
 
     async def go() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         async with TestServer(api.app()) as server:
             monkeypatch.setenv(ISSUE_READ_URL_ENV, str(server.make_url(ISSUE_READ_PATH)))
             monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, CAPABILITY)
-            runner = build_runner(_config(tmp_path), mcp_capability=PROBE, workspace_path=workspace)
+            runner = build_runner(
+                _config(tmp_path),
+                mcp_capability=PROBE,
+                workspace_path=workspace if managed else None,
+            )
             session = await initialized_session(runner)
             assert isinstance(session, _ModelSession)
             before = await _bash_decisions(session.options)
@@ -394,13 +431,18 @@ def test_the_booted_session_stops_the_turn_after_a_posted_round(
                 mcp_types.CallToolRequestParams(name="ask_questions", arguments=_valid()),
             )
             after = await _bash_decisions(session.options)
-            return before, after, called.model_dump()
+            ended = await _after_ask_decisions(session.options)
+            return before, after + ended, called.model_dump()
 
     before, after, called = anyio.run(go)
 
     assert len(api.question_calls) == 1
     assert not any(_stops(decision) for decision in before)
     assert any(_stops(decision) for decision in after) is halts
+    # The ask's own PostToolUse ends the turn before the model is asked again.
+    assert (
+        any(_ends(decision) and "hookSpecificOutput" not in decision for decision in after) is halts
+    )
     assert bool(called.get("isError") or called.get("is_error")) is not halts
 
 

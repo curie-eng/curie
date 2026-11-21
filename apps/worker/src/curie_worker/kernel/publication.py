@@ -151,24 +151,34 @@ async def _bind_publication_context(
     return event.model_copy(update={"publication_context": context}), remaining_s
 
 
-async def _continuation_refused(self: Kernel, run: WorkItemRun) -> str | None:
+async def _continuation_refused(
+    self: Kernel, run: WorkItemRun, tools_called: frozenset[str]
+) -> str | None:
     """Why an unpublished turn must not be re-prompted, else None.
 
     The request status when it is readable and not running, or
     ``questions_asked`` when the API recorded this request's question round as
-    posted (#5785). An unreadable request is re-prompted, as before.
+    posted (ADR 0286 decision 2, #5785). A turn that called ``ask_questions``
+    whose round the API did not confirm either way (the read failed, or an
+    older API omits the field) is not re-prompted either, since the ask may
+    have posted. Any other unreadable request is re-prompted, as before.
     """
 
     if self._work_items is None:
         return None
+    asked = constants._QUESTION_TOOL_NAME in tools_called
     try:
         async with asyncio.timeout(constants._REQUEST_STATUS_READ_TIMEOUT_S):
             view = await self._work_items.get_request(run.request_id)
     except (WorkItemConflict, WorkItemTransportError, TimeoutError):
-        return None
+        return "questions_unconfirmed" if asked else None
     if view.status != "running":
         return view.status
-    return "questions_asked" if view.questions_posted else None
+    if view.questions_posted:
+        return "questions_asked"
+    if view.questions_posted is None and asked:
+        return "questions_unconfirmed"
+    return None
 
 
 async def _request_not_running(self: Kernel, run: WorkItemRun) -> str | None:
@@ -240,7 +250,7 @@ async def _continue_unpublished(
     # cancelled request is not re-prompted. ADR 0286 decision 2: neither is a
     # request whose question round the API recorded as posted, since asking
     # ends it. A refused or failed ask posted nothing and still continues.
-    status = await self._continuation_refused(run)
+    status = await self._continuation_refused(run, outcome.tools_called)
     if status is not None:
         logger.info("work-item continuation skipped for %s: request %s", qevent.event_id, status)
         return outcome

@@ -53,9 +53,10 @@ class _ApiRequestView(_WorkItems):
     answers, merged over the fields the client always reads.
     """
 
-    def __init__(self, view: dict[str, Any]) -> None:
+    def __init__(self, view: dict[str, Any], *, status_code: int = 200) -> None:
         super().__init__()
         self.view = view
+        self.status_code = status_code
         self.views: list[WorkItemRequestView] = []
 
     async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:
@@ -70,6 +71,8 @@ class _ApiRequestView(_WorkItems):
 
         def answer(request: httpx.Request) -> httpx.Response:
             assert request.url.path == f"/v1/internal/work-items/requests/{request_id}"
+            if self.status_code != 200:
+                return httpx.Response(self.status_code, json={"detail": "unavailable"})
             return httpx.Response(200, json=body)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
@@ -154,20 +157,54 @@ def test_an_ask_that_posted_nothing_still_gets_the_continuation(make_harness) ->
     asyncio.run(exercise())
 
 
-def test_an_older_api_without_the_field_keeps_the_continuation(make_harness) -> None:
-    """Liveness: an API replica built before the field answers without it."""
+def _older_api_view() -> dict[str, Any]:
+    view = dict(VECTOR["request_view"])
+    view.pop("questions_posted")
+    return view
+
+
+def test_an_unconfirmed_ask_is_not_reprompted(make_harness) -> None:
+    """A turn that called ask_questions whose round the API did not confirm.
+
+    An older API replica omits the field, or the status read fails: the ask
+    may have posted, so the request ends rather than continuing to publish.
+    """
 
     async def exercise() -> None:
-        view = {key: value for key, value in VECTOR["request_view"].items()}
-        view.pop("questions_posted")
-        items = _ApiRequestView(view)
-        opened, items, _ = await _run_execute(
-            make_harness,
-            [_asked_then_ended("Asked."), [_done("I could not finish.")]],
-            work_items=items,
-        )
+        for items in (_ApiRequestView(_older_api_view()), _ApiRequestView({}, status_code=503)):
+            opened, items, _ = await _run_execute(
+                make_harness,
+                [_asked_then_ended("Asked."), [_done("continued after asking")]],
+                work_items=items,
+            )
 
-        assert len(opened) == 2
-        assert [v.questions_posted for v in items.views] == [False]
+            assert opened == [ISSUE_PROMPT]
+            [finish] = items.finishes
+            assert finish["detail"] == "Asked."
+
+    asyncio.run(exercise())
+
+
+def test_a_turn_that_never_asked_keeps_the_continuation_on_an_unconfirmed_read(
+    make_harness,
+) -> None:
+    """Liveness: with no ask, an older API or a failed read re-prompts as before."""
+
+    async def exercise() -> None:
+        never_asked = [
+            _frames(
+                [
+                    {"type": "tool_note", "text": "running tool Bash", "tool": "Bash"},
+                    {"type": "text_delta", "text": "Working."},
+                    {"type": "final", "text": "Working.", "status": "done"},
+                ]
+            ),
+            [_done("I could not finish.")],
+        ]
+        for items in (_ApiRequestView(_older_api_view()), _ApiRequestView({}, status_code=503)):
+            opened, items, _ = await _run_execute(make_harness, never_asked, work_items=items)
+
+            assert len(opened) == 2
+            assert "publish_changes" in opened[1]
 
     asyncio.run(exercise())

@@ -1,14 +1,37 @@
 {
-  "description": "The halted turn of a factory run that posted its question round (#5785, ADR 0286 decisions 2 and 11). runner_frames are the ACI frames the runner emits on the real bundled CLI when the model calls ask_questions, the route answers 200, and the model then tries Bash; pinned by runner/tests/test_question_halt_real_cli.py without version, token counts or call arguments. request_view is the API's internal request view for that request while it runs, pinned by apps/api/tests/test_factory_question_ending.py. worker_finish is what the worker reports when it replays both, pinned by apps/worker/tests/kernel/test_question_halt_handoff.py, and the API settles it completed questions_asked.",
+  "description": "The halted turn of a factory run that posted its question round (#5785, ADR 0286 decisions 2 and 11). runner_frames are the ACI frames the runner emits on the real bundled CLI when the model calls ask_questions, the route answers 200, and the platform then ends the turn before the model is asked again; pinned by runner/tests/test_question_halt_real_cli.py without version, token counts or call arguments. request_view is the API's internal request view for that request while it runs, pinned by apps/api/tests/test_factory_question_ending.py. worker_finish is what the worker reports when it replays both, pinned by apps/worker/tests/kernel/test_question_halt_handoff.py, and the API settles it completed questions_asked.",
   "runner_frames": [
-    {"type": "tool_note", "text": "running tool mcp__curie__ask_questions", "tool": "mcp__curie__ask_questions"},
-    {"type": "side_effect_flag", "tool": "mcp__curie__ask_questions", "detail": "non-idempotent tool executed", "call_id": "toolu_ask01"},
-    {"type": "side_effect_flag", "tool": "mcp__curie__ask_questions", "detail": "non-idempotent tool completed", "call_id": "toolu_ask01", "failed": false},
-    {"type": "tool_note", "text": "running tool Bash", "tool": "Bash"},
-    {"type": "side_effect_flag", "tool": "Bash", "detail": "non-idempotent tool executed", "call_id": "toolu_bash01"},
-    {"type": "side_effect_flag", "tool": "Bash", "detail": "non-idempotent tool completed", "call_id": "toolu_bash01", "failed": true},
-    {"type": "final", "text": "", "status": "done"}
+    {
+      "type": "tool_note",
+      "text": "running tool mcp__curie__ask_questions",
+      "tool": "mcp__curie__ask_questions"
+    },
+    {
+      "type": "side_effect_flag",
+      "tool": "mcp__curie__ask_questions",
+      "detail": "non-idempotent tool executed",
+      "call_id": "toolu_ask01"
+    },
+    {
+      "type": "side_effect_flag",
+      "tool": "mcp__curie__ask_questions",
+      "detail": "non-idempotent tool completed",
+      "call_id": "toolu_ask01",
+      "failed": false
+    },
+    {
+      "type": "final",
+      "text": "",
+      "status": "done"
+    }
   ],
-  "request_view": {"status": "running", "questions_posted": true},
-  "worker_finish": {"outcome": "failed", "cause": "no_pull_request", "detail": null}
+  "request_view": {
+    "status": "running",
+    "questions_posted": true
+  },
+  "worker_finish": {
+    "outcome": "failed",
+    "cause": "no_pull_request",
+    "detail": null
+  }
 }

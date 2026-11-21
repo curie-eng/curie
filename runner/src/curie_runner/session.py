@@ -2518,6 +2518,10 @@ class SessionRunner:
 
     def _has_unhandled_publication(self, state: TurnState) -> bool:
         gate = self._approval_gate
+        if gate is not None and gate.questions_posted:
+            # ADR 0286 decision 2 (#5785): a posted question round ends the
+            # request, so a publication call beside the ask is not one to record.
+            return False
         return any(
             gate is None or not gate.publication_refused(tool_use_id)
             for tool_use_id, _ in state.publication_calls
@@ -2796,6 +2800,17 @@ class SessionRunner:
 
         gate = self._approval_gate
         if gate is None:
+            return
+        if gate.questions_posted:
+            # ADR 0286 decisions 2 and 11 (#5785): the turn ended because its
+            # question round was posted, so it is the question ending and never
+            # an approval pause, even for a call the model sent beside the ask.
+            state.approval_summary = None
+            state.approval_display = None
+            state.approval_route = None
+            state.approval_gate_kind = None
+            state.approval_granted_tool = None
+            state.approval_granted_arguments = None
             return
 
         permission_is_actionable_tool = (

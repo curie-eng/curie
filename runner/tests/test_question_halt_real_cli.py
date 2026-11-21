@@ -55,6 +55,8 @@ IMPLEMENTATION = {
 }
 ASK_ID = "toolu_ask01"
 BASH_ID = "toolu_bash01"
+PUBLISH_ID = "toolu_publish01"
+PUBLISH_TOOL = f"mcp__{APPROVAL_SERVER_NAME}__publish_changes"
 QUESTION_TOOL = f"mcp__{APPROVAL_SERVER_NAME}__ask_questions"
 ASK_INPUT = {
     "summary": "The importer reproduces the duplicate on a second run.",
@@ -66,6 +68,7 @@ _BODIES = web.AppKey("bodies", list[dict[str, Any]])
 _MARKER = web.AppKey("marker", str)
 _ANSWER = web.AppKey("answer", tuple[int, Any])
 _ASKED = web.AppKey("asked", list[tuple[Any, str | None]])
+_SCRIPT = web.AppKey("script", str)
 
 
 def _sse(event: str, data: dict[str, Any]) -> bytes:
@@ -85,12 +88,61 @@ def _tool_results(body: dict[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
+def _ask_block() -> tuple[dict[str, Any], dict[str, Any]]:
+    return (
+        {"type": "tool_use", "id": ASK_ID, "name": QUESTION_TOOL, "input": {}},
+        {"type": "input_json_delta", "partial_json": json.dumps(ASK_INPUT)},
+    )
+
+
+def _bash_block(marker: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    command = {"command": f"touch {marker}", "description": "keep working"}
+    return (
+        {"type": "tool_use", "id": BASH_ID, "name": "Bash", "input": {}},
+        {"type": "input_json_delta", "partial_json": json.dumps(command)},
+    )
+
+
+def _publish_block() -> tuple[dict[str, Any], dict[str, Any]]:
+    proposal = {"title": "Replace the rows on a re-run", "body": "Done."}
+    return (
+        {"type": "tool_use", "id": PUBLISH_ID, "name": PUBLISH_TOOL, "input": {}},
+        {"type": "input_json_delta", "partial_json": json.dumps(proposal)},
+    )
+
+
+def _text_block() -> tuple[dict[str, Any], dict[str, Any]]:
+    return (
+        {"type": "text", "text": ""},
+        {"type": "text_delta", "text": "Kept working after asking."},
+    )
+
+
+def _step(app: web.Application, answered: int) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """What the scripted model answers after ``answered`` tool results."""
+
+    marker = app[_MARKER]
+    script = app[_SCRIPT]
+    if script == "sequential":
+        steps = [[_ask_block()], [_bash_block(marker)]]
+    elif script == "same-message-bash":
+        steps = [[_ask_block(), _bash_block(marker)]]
+    else:
+        steps = [[_ask_block(), _publish_block()]]
+    taken = 0
+    for blocks in steps:
+        if answered == taken:
+            return blocks
+        taken += len(blocks)
+    return [_text_block()]
+
+
 async def _messages(request: web.Request) -> web.StreamResponse:
-    """The scripted model: ask, then try Bash, then end with text."""
+    """The scripted model, one step per request, chosen by the results so far."""
 
     body = await request.json()
     request.app[_BODIES].append(body)
-    answered = len(_tool_results(body))
+    blocks = _step(request.app, len(_tool_results(body)))
     response = web.StreamResponse(headers={"content-type": "text/event-stream"})
     await response.prepare(request)
     message = {
@@ -103,29 +155,23 @@ async def _messages(request: web.Request) -> web.StreamResponse:
         "stop_sequence": None,
         "usage": {"input_tokens": 1, "output_tokens": 1},
     }
-    block: dict[str, Any]
-    delta: dict[str, Any]
-    if answered == 0:
-        stop_reason = "tool_use"
-        block = {"type": "tool_use", "id": ASK_ID, "name": QUESTION_TOOL, "input": {}}
-        delta = {"type": "input_json_delta", "partial_json": json.dumps(ASK_INPUT)}
-    elif answered == 1:
-        stop_reason = "tool_use"
-        block = {"type": "tool_use", "id": BASH_ID, "name": "Bash", "input": {}}
-        command = {"command": f"touch {request.app[_MARKER]}", "description": "keep working"}
-        delta = {"type": "input_json_delta", "partial_json": json.dumps(command)}
-    else:
-        stop_reason = "end_turn"
-        block = {"type": "text", "text": ""}
-        delta = {"type": "text_delta", "text": "Kept working after asking."}
+    stop_reason = "tool_use" if blocks[0][0]["type"] == "tool_use" else "end_turn"
     events: list[tuple[str, dict[str, Any]]] = [
-        ("message_start", {"type": "message_start", "message": message}),
-        (
-            "content_block_start",
-            {"type": "content_block_start", "index": 0, "content_block": block},
-        ),
-        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
-        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_start", {"type": "message_start", "message": message})
+    ]
+    for index, (block, delta) in enumerate(blocks):
+        events += [
+            (
+                "content_block_start",
+                {"type": "content_block_start", "index": index, "content_block": block},
+            ),
+            (
+                "content_block_delta",
+                {"type": "content_block_delta", "index": index, "delta": delta},
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": index}),
+        ]
+    events += [
         (
             "message_delta",
             {
@@ -174,7 +220,13 @@ class _Turn:
         self.marker = marker
 
 
-def _run_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, answer: tuple[int, Any]) -> _Turn:
+def _run_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    answer: tuple[int, Any],
+    script: str = "sequential",
+) -> _Turn:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     cwd = tmp_path / "workspace"
@@ -190,6 +242,7 @@ def _run_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, answer: tuple[
         app[_MARKER] = str(marker)
         app[_ANSWER] = answer
         app[_ASKED] = []
+        app[_SCRIPT] = script
         app.router.add_post("/v1/messages", _messages)
         app.router.add_post(CONTRACT_PATH, _contract)
         app.router.add_post(QUESTIONS_PATH, _questions)
@@ -268,25 +321,24 @@ def _pinned(frames: list[Any]) -> list[dict[str, Any]]:
     return pinned
 
 
-def test_a_posted_round_stops_the_turn_before_the_next_tool_call(
+def test_a_posted_round_ends_the_turn_before_the_model_is_asked_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Decision 11: after a 200 the model's next call never runs and the turn ends.
+    """Decision 11: after a 200 the turn ends at once; the next call never runs.
 
-    Red without the halt: the Bash call creates the marker and the model is
-    asked again, ending on its own text.
+    Red without the halt: the model is asked again, its Bash call creates the
+    marker, and it ends on its own text.
     """
 
     turn = _run_turn(tmp_path, monkeypatch, answer=(200, {"round": 1, "rounds_limit": 3}))
 
     assert turn.asked == [(ASK_INPUT, CAPABILITY)]
     assert not turn.marker.exists(), "a tool call ran after the questions were posted"
-    # The model was never asked again after the refused call: the turn ended.
-    assert len(turn.bodies) == 2
+    # The model is never asked again: no request carries the ask's result.
+    assert len(turn.bodies) == 1
     assert turn.gate.questions_posted is True
     assert turn.final.status is SessionStatus.DONE
     assert turn.final.approval_summary is None
-    assert BASH_ID in turn.gate.refused_call_ids
 
     # The worker's handoff test replays exactly these frames.
     vector = json.loads(VECTOR.read_text(encoding="utf-8"))
@@ -301,8 +353,49 @@ def test_a_same_body_replay_also_ends_the_turn(
     turn = _run_turn(tmp_path, monkeypatch, answer=(200, {"round": 2, "rounds_limit": 3}))
 
     assert not turn.marker.exists()
-    assert len(turn.bodies) == 2
+    assert len(turn.bodies) == 1
     assert turn.final.status is SessionStatus.DONE
+
+
+def test_a_call_sent_beside_a_posted_ask_never_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model sends Bash in the same message as the ask: it is refused."""
+
+    turn = _run_turn(
+        tmp_path,
+        monkeypatch,
+        answer=(200, {"round": 1, "rounds_limit": 3}),
+        script="same-message-bash",
+    )
+
+    assert turn.asked == [(ASK_INPUT, CAPABILITY)]
+    assert not turn.marker.exists(), "a sibling call ran after the questions were posted"
+    assert len(turn.bodies) == 1
+    assert turn.final.status is SessionStatus.DONE
+
+
+def test_a_publish_sent_beside_a_posted_ask_does_not_park_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A publication proposal beside the ask is no approval: the turn ends done.
+
+    Red without the session rule: the stream observer records the proposal
+    and the final pauses for approval, so the request is held, not settled.
+    """
+
+    turn = _run_turn(
+        tmp_path,
+        monkeypatch,
+        answer=(200, {"round": 1, "rounds_limit": 3}),
+        script="same-message-publish",
+    )
+
+    assert turn.asked == [(ASK_INPUT, CAPABILITY)]
+    assert len(turn.bodies) == 1
+    assert turn.final.status is SessionStatus.DONE
+    assert turn.final.approval_summary is None
+    assert turn.final.approval_granted_tool is None
 
 
 @pytest.mark.parametrize(
@@ -327,3 +420,20 @@ def test_a_refused_or_failed_ask_does_not_halt(
     assert turn.gate.questions_posted is False
     assert turn.final.status is SessionStatus.DONE
     assert len(turn.bodies) == 3
+
+
+def test_a_refused_publish_beside_a_refused_ask_still_pauses_for_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Liveness for the session rule: with nothing posted, publication pauses as before."""
+
+    turn = _run_turn(
+        tmp_path,
+        monkeypatch,
+        answer=(409, {"code": "already_asked"}),
+        script="same-message-publish",
+    )
+
+    assert turn.gate.questions_posted is False
+    assert turn.final.status is SessionStatus.AWAITING_APPROVAL
+    assert turn.final.approval_granted_tool == PUBLISH_TOOL
