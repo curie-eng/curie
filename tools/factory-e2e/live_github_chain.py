@@ -44,6 +44,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -262,8 +263,16 @@ def readiness_verdict(
     issue_body: str,
     blocker_nodes: Mapping[int, Mapping[str, Any] | None],
     is_ancestor: Callable[[str], bool],
+    absent: Callable[[str], str | None],
 ) -> Readiness:
-    """Every blocker has a closing pull request merged into next and in the candidate."""
+    """Every blocker has a closing pull request merged into next, in the candidate's
+    ancestry, and with its change still in the candidate tree.
+
+    ``absent(merge commit)`` is None when the pull request's change is present
+    and otherwise says why it is not (see ``git_presence``); it is asked only
+    for merge commits the candidate descends from, so a candidate that reverts
+    a merged blocker fails here though its ancestry passes.
+    """
 
     numbers = blocker_numbers(issue_body)
     if not numbers:
@@ -284,13 +293,25 @@ def readiness_verdict(
         ]
         for pull in into_next:
             pull["ancestor"] = bool(is_ancestor(str(pull["merge_commit"])))
+            if pull["ancestor"]:
+                reason = absent(str(pull["merge_commit"]))
+                pull["present"] = reason is None
+                if reason is not None:
+                    pull["absent"] = reason
         evidence.append({"issue": number, "state": node.get("state"), "closing_pulls": pulls})
+        ancestors = [pull for pull in into_next if pull["ancestor"]]
         if not into_next:
             missing.append(f"#{number}: no merged pull request into {INTEGRATION_BRANCH} closes it")
-        elif not any(pull["ancestor"] for pull in into_next):
+        elif not ancestors:
             names = ", ".join(f"#{pull['number']}" for pull in into_next)
             missing.append(
                 f"#{number}: pull request {names} merge commit is not an ancestor of the candidate"
+            )
+        elif not any(pull["present"] for pull in ancestors):
+            missing.extend(
+                f"#{number}: pull request #{pull['number']} merge commit {pull['merge_commit']} "
+                f"is not present in the candidate tree: {pull['absent']}"
+                for pull in ancestors
             )
     return Readiness(not missing, tuple(missing), tuple(evidence))
 
@@ -335,6 +356,72 @@ def git_ancestry(repo_root: Path, candidate: str) -> Callable[[str], bool]:
     return is_ancestor
 
 
+# Settings that would change what ``git diff`` writes or what ``git apply``
+# accepts: a prefixless diff, external diff drivers and textconv filters write
+# patches ``apply`` cannot read, and a whitespace error setting refuses a patch
+# whose change is absent.
+_DIFF = ["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false"]
+_DIFF_FLAGS = ["--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-color"]
+
+
+def git_presence(repo_root: Path, candidate: str) -> Callable[[str], str | None]:
+    """Whether a merged pull request's change is still in the candidate tree.
+
+    For a merge commit ``M`` the pull request's change is ``git diff M^1 M``.
+    It is checked against an index read from the candidate's tree (a temporary
+    ``GIT_INDEX_FILE``, so the working tree and the real index are untouched)
+    with ``git apply --cached --check``. A patch applies forward cleanly only
+    when the tree still holds the pre-change content, that is when the change
+    is absent or was reverted; so a clean forward apply is the refusal, and a
+    refused forward apply counts as present.
+
+    By design, a later partial or conflicting edit of the same lines also makes
+    the forward apply refuse, and is accepted as present: the check catches an
+    absent or reverted change, not every later edit of it.
+
+    It fails closed: a merge commit, a first parent or a candidate tree that
+    cannot be read (a shallow clone, a missing object) and an empty diff each
+    return a reason instead of None.
+    """
+
+    root = str(repo_root)
+
+    def absent(oid: str) -> str | None:
+        if not re.fullmatch(r"[0-9a-f]{40}", oid):
+            return "the merge commit id is not a full object id"
+        diff = subprocess.run(
+            ["git", *_DIFF, "-C", root, "diff", *_DIFF_FLAGS, f"{oid}^1", oid],
+            capture_output=True,
+            check=False,
+        )
+        if diff.returncode != 0:
+            return "its diff against its first parent could not be read (shallow or missing object)"
+        if not diff.stdout.strip():
+            return "its diff against its first parent is empty, so its presence cannot be shown"
+        with tempfile.TemporaryDirectory(prefix="live-chain-index-") as scratch:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            read = subprocess.run(
+                ["git", "-C", root, "read-tree", candidate],
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+            if read.returncode != 0:
+                return "the candidate tree could not be read"
+            forward = subprocess.run(
+                ["git", "-C", root, "apply", "--cached", "--check", "--whitespace=nowarn", "-"],
+                input=diff.stdout,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+        if forward.returncode == 0:
+            return "its change applies forward cleanly, so it is absent or reverted"
+        return None
+
+    return absent
+
+
 def check_readiness(
     token: str,
     *,
@@ -342,6 +429,7 @@ def check_readiness(
     candidate: str,
     query: Callable[[str, str, Mapping[str, Any]], Any] = graphql,
     ancestry: Callable[[Path, str], Callable[[str], bool]] = git_ancestry,
+    presence: Callable[[Path, str], Callable[[str], str | None]] = git_presence,
 ) -> Readiness:
     names = {"owner": PRODUCT_OWNER, "name": PRODUCT_NAME}
     try:
@@ -355,7 +443,9 @@ def check_readiness(
             nodes[number] = graphql_issue(query(token, BLOCKER_QUERY, {**names, "number": number}))
         except (OSError, ValueError):
             nodes[number] = None
-    return readiness_verdict(issue_body, nodes, ancestry(repo_root, candidate))
+    return readiness_verdict(
+        issue_body, nodes, ancestry(repo_root, candidate), presence(repo_root, candidate)
+    )
 
 
 def reader_account_id(environ: Mapping[str, str]) -> int:
@@ -392,6 +482,7 @@ def before_run(p: fe.Preflight) -> None:
         candidate=p.candidate,
         query=graphql,
         ancestry=git_ancestry,
+        presence=git_presence,
     )
     chain.readiness = readiness
     p.evidence["live_chain_readiness"] = readiness.evidence()

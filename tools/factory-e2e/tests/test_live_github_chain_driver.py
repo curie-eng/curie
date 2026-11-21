@@ -1638,6 +1638,12 @@ def _body() -> str:
     return str(lgc.graphql_issue(_captured("chain-issue-5808.json"))["body"])
 
 
+def _present(_oid: str) -> str | None:
+    """The presence check's answer for a change still in the candidate tree."""
+
+    return None
+
+
 def _open_nodes() -> dict[int, Any]:
     return {int(k): lgc.graphql_issue(v) for k, v in _captured("blockers-open.json").items()}
 
@@ -1659,7 +1665,7 @@ def test_readiness_parser_reads_the_real_graphql_answers() -> None:
 
 
 def test_readiness_refuses_todays_six_open_blockers_naming_all_six() -> None:
-    verdict = lgc.readiness_verdict(_body(), _open_nodes(), lambda _oid: True)
+    verdict = lgc.readiness_verdict(_body(), _open_nodes(), lambda _oid: True, _present)
     assert not verdict.passed
     assert verdict.missing == tuple(
         f"#{n}: no merged pull request into next closes it"
@@ -1670,7 +1676,7 @@ def test_readiness_refuses_todays_six_open_blockers_naming_all_six() -> None:
 def test_readiness_refuses_a_blocker_merged_into_next_outside_the_candidate() -> None:
     body = "## Blocked by\n\n1. #5787.\n"
     node = lgc.graphql_issue(_captured("blocker-merged-into-next.json"))
-    verdict = lgc.readiness_verdict(body, {5787: node}, lambda _oid: False)
+    verdict = lgc.readiness_verdict(body, {5787: node}, lambda _oid: False, _present)
     assert verdict.missing == (
         "#5787: pull request #5849 merge commit is not an ancestor of the candidate",
     )
@@ -1679,7 +1685,7 @@ def test_readiness_refuses_a_blocker_merged_into_next_outside_the_candidate() ->
 def test_readiness_refuses_a_blocker_closed_by_a_merge_into_main() -> None:
     body = "## Blocked by\n\n1. #5814.\n"
     node = lgc.graphql_issue(_captured("blocker-merged-into-main.json"))
-    verdict = lgc.readiness_verdict(body, {5814: node}, lambda _oid: True)
+    verdict = lgc.readiness_verdict(body, {5814: node}, lambda _oid: True, _present)
     assert verdict.missing == ("#5814: no merged pull request into next closes it",)
 
 
@@ -1697,7 +1703,7 @@ def test_readiness_passes_when_every_blocker_is_merged_into_next_and_in_the_cand
     # Liveness, built from the real merged-into-next shape.
     nodes = {n: _merged_into_next_for(n) for n in lgc.blocker_numbers(_body())}
     asked: list[str] = []
-    verdict = lgc.readiness_verdict(_body(), nodes, lambda oid: asked.append(oid) or True)
+    verdict = lgc.readiness_verdict(_body(), nodes, lambda oid: asked.append(oid) or True, _present)
     assert verdict.passed, verdict.missing
     assert len(asked) == 6
 
@@ -1713,10 +1719,12 @@ def test_readiness_refuses_a_fork_pull_request_into_its_own_next() -> None:
             assert source["baseRepository"] == {"nameWithOwner": "curie-eng/curie"}
             source["baseRepository"] = {"nameWithOwner": "someone/curie"}
     body = "## Blocked by\n\n1. #5787.\n"
-    verdict = lgc.readiness_verdict(body, {5787: node}, lambda _o: True)
+    verdict = lgc.readiness_verdict(body, {5787: node}, lambda _o: True, _present)
     assert verdict.missing == ("#5787: no merged pull request into next closes it",)
     # Liveness: the unchanged capture is counted.
-    real = lgc.readiness_verdict(body, {5787: _merged_into_next_for(5787)}, lambda _o: True)
+    real = lgc.readiness_verdict(
+        body, {5787: _merged_into_next_for(5787)}, lambda _o: True, _present
+    )
     assert real.passed, real.missing
 
 
@@ -1730,7 +1738,9 @@ def test_readiness_does_not_count_a_reference_without_a_closing_keyword() -> Non
         source = item.get("source") or {}
         if source.get("__typename") == "PullRequest":
             source["body"] = "Part of #5787."
-    verdict = lgc.readiness_verdict("## Blocked by\n\n1. #5787.\n", {5787: node}, lambda _o: True)
+    verdict = lgc.readiness_verdict(
+        "## Blocked by\n\n1. #5787.\n", {5787: node}, lambda _o: True, _present
+    )
     assert verdict.missing == ("#5787: no merged pull request into next closes it",)
 
 
@@ -1745,20 +1755,26 @@ def test_readiness_check_reads_through_the_injected_query_and_ancestry() -> None
         seen.append((root, candidate))
         return lambda _oid: True
 
+    def presence(root: Path, candidate: str) -> Callable[[str], str | None]:
+        seen.append((root, candidate))
+        return _present
+
     verdict = lgc.check_readiness(
         "token",
         repo_root=REPO_ROOT,
         candidate="c" * 40,
         query=_fake_graphql(nodes),
         ancestry=ancestry,
+        presence=presence,
     )
-    assert verdict.passed and seen == [(REPO_ROOT, "c" * 40)]
+    assert verdict.passed and seen == [(REPO_ROOT, "c" * 40)] * 2
     unreadable = lgc.check_readiness(
         "token",
         repo_root=REPO_ROOT,
         candidate="c" * 40,
         query=lambda *_a: {"errors": [{"message": "rate limited"}]},
         ancestry=ancestry,
+        presence=presence,
     )
     assert not unreadable.passed and "could not be read" in unreadable.missing[0]
 
@@ -1783,6 +1799,137 @@ def test_readiness_git_ancestry_treats_an_unknown_object_as_not_an_ancestor(
     assert check(parent) is True
     assert check("f" * 40) is False
     assert check("not-a-sha") is False
+
+
+def _git(repo: Path, *argv: str) -> str:
+    """git in a throwaway repository, isolated from the host's git configuration."""
+
+    env = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "Fixture",
+        "GIT_AUTHOR_EMAIL": "fixture@example.com",
+        "GIT_COMMITTER_NAME": "Fixture",
+        "GIT_COMMITTER_EMAIL": "fixture@example.com",
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+    }
+    result = subprocess.run(
+        ["git", "-C", str(repo), *argv], capture_output=True, text=True, check=True, env=env
+    )
+    return result.stdout.strip()
+
+
+def _merged_blocker_repo(root: Path) -> tuple[Path, str]:
+    """A throwaway repository whose ``next`` merged a blocker's branch with a merge commit."""
+
+    repo = root / "product"
+    repo.mkdir()
+    _git(repo, "init", "--quiet", "--initial-branch", "next")
+    (repo / "conv.py").write_text("def scale():\n    return 1\n\n\ndef other():\n    return 2\n")
+    _git(repo, "add", "conv.py")
+    _git(repo, "commit", "--quiet", "-m", "base")
+    _git(repo, "checkout", "--quiet", "-b", "blocker")
+    (repo / "conv.py").write_text("def scale():\n    return 3\n\n\ndef other():\n    return 2\n")
+    (repo / "added.py").write_text("FLAG = True\n")
+    _git(repo, "add", "conv.py", "added.py")
+    _git(repo, "commit", "--quiet", "-m", "the blocker's change")
+    _git(repo, "checkout", "--quiet", "next")
+    (repo / "unrelated.txt").write_text("a later unrelated change on next\n")
+    _git(repo, "add", "unrelated.txt")
+    _git(repo, "commit", "--quiet", "-m", "unrelated")
+    _git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge the blocker", "blocker")
+    return repo, _git(repo, "rev-parse", "HEAD")
+
+
+def _merged_node(number: int, merge_commit: str) -> Any:
+    node = _merged_into_next_for(number)
+    for item in node["timelineItems"]["nodes"]:
+        source = item.get("source") or {}
+        if source.get("__typename") == "PullRequest":
+            source["mergeCommit"] = {"oid": merge_commit}
+    return node
+
+
+def _real_readiness(repo: Path, candidate: str, merge: str) -> lgc.Readiness:
+    return lgc.check_readiness(
+        "token",
+        repo_root=repo,
+        candidate=candidate,
+        query=lambda _t, text, _v: (
+            {
+                "data": {
+                    "repository": {
+                        "issue": {"number": 5808, "body": "## Blocked by\n\n1. #5787.\n"}
+                    }
+                }
+            }
+            if text == lgc.BODY_QUERY
+            else {"data": {"repository": {"issue": _merged_node(5787, merge)}}}
+        ),
+    )
+
+
+def test_readiness_refuses_a_candidate_that_reverts_a_merged_blocker(tmp_path: Path) -> None:
+    # The production readiness check with the real git ancestry and presence
+    # on a throwaway repository: the blocker merged into next passes; a
+    # candidate that descends from that merge but reverts it fails, naming the
+    # blocker and its merge commit, though its ancestry still passes.
+    repo, merge = _merged_blocker_repo(tmp_path)
+    live = _real_readiness(repo, merge, merge)
+    assert live.passed, live.missing
+    assert live.blockers[0]["closing_pulls"][0]["present"] is True
+
+    _git(repo, "revert", "--quiet", "--no-edit", "-m", "1", merge)
+    reverted = _git(repo, "rev-parse", "HEAD")
+    verdict = _real_readiness(repo, reverted, merge)
+    assert not verdict.passed
+    assert verdict.missing == (
+        f"#5787: pull request #5849 merge commit {merge} is not present in the candidate "
+        "tree: its change applies forward cleanly, so it is absent or reverted",
+    )
+    pull = verdict.blockers[0]["closing_pulls"][0]
+    assert pull["ancestor"] is True and pull["present"] is False
+    # The working tree and the real index are untouched by the check.
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+def test_readiness_counts_a_later_partial_edit_of_a_blocker_as_present(tmp_path: Path) -> None:
+    # By design: a later edit of the same lines makes the forward apply refuse.
+    repo, merge = _merged_blocker_repo(tmp_path)
+    (repo / "conv.py").write_text("def scale():\n    return 4\n\n\ndef other():\n    return 2\n")
+    _git(repo, "commit", "--quiet", "-am", "a later edit of the blocker's line")
+    verdict = _real_readiness(repo, _git(repo, "rev-parse", "HEAD"), merge)
+    assert verdict.passed, verdict.missing
+
+
+def test_readiness_presence_fails_closed_on_a_shallow_clone_or_a_missing_object(
+    tmp_path: Path,
+) -> None:
+    repo, merge = _merged_blocker_repo(tmp_path)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "--branch",
+            "next",
+            f"file://{repo}",
+            str(shallow),
+        ],
+        capture_output=True,
+        check=True,
+        env={"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "PATH": "/usr/bin:/bin"},
+    )
+    reason = lgc.git_presence(shallow, merge)(merge)
+    assert reason is not None and "could not be read" in reason
+    assert lgc.git_presence(repo, merge)("f" * 40) is not None
+    assert lgc.git_presence(repo, "f" * 40)(merge) == "the candidate tree could not be read"
+    assert lgc.git_presence(repo, merge)("not-a-sha") is not None
+    # Liveness on the full clone.
+    assert lgc.git_presence(repo, merge)(merge) is None
 
 
 # --------------------------------------------------------------------------
