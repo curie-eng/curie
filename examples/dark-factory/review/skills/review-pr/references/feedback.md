@@ -43,14 +43,22 @@ mentioning the configured App. The feedback is a fresh PR conversation comment,
 a fresh inline review comment, or a submitted `commented` or `changes_requested`
 review. It counts only when its sender currently has write or admin permission,
 the PR is open and bound to the factory's lineage and installation, and the
-feedback is not an edit of an older comment or review, is not empty, and was made
-on the PR's current head. A submitted review is one revision: its body and its
-unedited inline comments are read together, whichever piece arrives first. An
-`approved` or dismissed review never starts a revision on its own. Its body or an
-inline comment in it is admitted only when that piece itself mentions the
-configured App and passes the same checks; a qualifying mention can then start a
-revision by itself. Feedback that mentions the App starts a revision through the
-same checks and is not counted toward the cap below.
+feedback is not an edit of an older comment, is not empty, and is current. A
+conversation comment carries no commit, so it is checked when it is admitted:
+the PR's current head must still be the head the factory recorded. An inline
+comment or review made on an older head is refused.
+
+A submitted review is one revision: its body and its unedited inline comments
+are read together, whichever piece arrives first. When an inline comment's
+delivery admits the review, the review summary is read fresh, so an edited
+summary is what counts, while an edited inline comment is left out.
+
+An `approved` or dismissed review's summary never starts a revision, even when
+it mentions the App. The only piece of such a review that can is an inline
+comment that itself mentions the configured App and passes the same checks; it
+is admitted on its own, and the other comments of that review are not its
+feedback. Feedback that mentions the App starts a revision through the same
+checks and is not counted toward the cap below.
 
 Each PR allows 10 revisions from feedback that does not mention the App. The
 revision that reaches 10 starts normally. The next plain feedback after that
@@ -59,9 +67,14 @@ mention is needed. From then on a request must mention the configured App and
 still pass the authority, lineage and head checks above. On GitLab and Bitbucket
 plain feedback never starts a revision: the comment must mention the identity
 configured as the factory's `mention` on that tracker, such as the factory token
-user's username on GitLab, and the same authority checks apply. Configuration and
-deployed versions can differ, so verify the available evidence for the target
-factory.
+user's username on GitLab. Authority differs by host. GitLab asks the host
+whether the author has write access. A Bitbucket access token cannot report
+write access, so a Bitbucket author must be listed in the binding's
+`reviewFeedbackAllowlist` (the Atlassian account id on Cloud, the numeric user
+id on Data Center). A writer outside that allowlist can post a valid mention and
+get no revision, so confirm the author is listed before promising one.
+Configuration and deployed versions can differ, so verify the available
+evidence for the target factory.
 
 Factory-owned feedback uses factory intake. Do not require the separate
 `githubReviewIngressEnabled` switch for every factory PR; that setting controls
