@@ -2240,11 +2240,15 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
     after = _wait_until("the review revision", deadline, revised)
     head = str(after["head"]["sha"])
 
+    ids = chain.record["identities"]
+    link = judge.review_url(ids["repository_url"], number, review_id)
+
     def replied() -> list[dict[str, Any]] | None:
         comments = issue_comments(p, number)
-        return comments if any(head in str(c.get("body")) for c in comments) else None
+        answered = judge.revision_replies(comments, ids, review["submitted_at"], link)
+        return comments if answered else None
 
-    pull_comments = _wait_until("the reply naming the revision commit", deadline, replied)
+    pull_comments = _wait_until("the App's reply to the review", deadline, replied)
     commit = _github(p, "GET", f"/repos/{repo}/commits/{head}")
     check_runs, combined_status, checks_observed_at = settled_checks(p, repo, head, deadline)
     chain.record["beat_c"] = beat_c_record(

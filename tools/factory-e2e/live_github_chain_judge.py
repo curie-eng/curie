@@ -50,8 +50,9 @@ Fields the driver part added to the record, each read as GitHub returns it:
    created or updated (status comments are edited in place) at or after the
    answer. ``beat_b["open_pulls"][i]["html_url"]`` is the pull request's URL.
 2. ``beat_c["pull_comments"]``: the pull request's conversation comments. One App
-   comment created or updated at or after the review's ``submitted_at`` must name
-   the revision head ``beat_c["pull_after"]["head"]["sha"]`` in full.
+   comment created or updated at or after the review's ``submitted_at`` must hold
+   :data:`REVISION_PUSHED_LINE` and the line ``In response to <review URL>`` for
+   the submitted review (:func:`revision_replies`).
 3. ``beat_c["revision_checks"]``: ``{"sha", "check_runs", "status",
    "observed_at"}``, the check runs (every page, collected to ``total_count``)
    and the combined status of that head as GitHub returns them, and when they
@@ -133,6 +134,11 @@ DECISIONS_HEADING = "## Decisions"
 # Mirror of curie_api.factory_questions.ANSWER_RECEIVED_LINE (a test pins equality):
 # the first line of the status comment of a request an answer started.
 ANSWER_RECEIVED_LINE = "Answer received. The factory is working on this ticket again."
+# The revision reply (``factory_notices.result_section`` for a completed request
+# with a feedback URL): this line, then "In response to <review URL>". It names
+# the revision commit only when the platform still watches its checks after the
+# run, so the reply is matched to its review, never to a commit.
+REVISION_PUSHED_LINE = "The requested revision is pushed to this pull request."
 # Mirror of the line curie_api.factory_notices writes once the pull request merged.
 MERGED_NOTICE_PREFIX = "Pull request merged: "
 # Check run conclusions (GitHub REST check runs): ``success`` is green; a run
@@ -732,6 +738,21 @@ def _app_comments_since(
     ]
 
 
+def revision_replies(
+    comments: Sequence[Mapping[str, Any]], ids: Mapping[str, Any], since: Any, review_link: str
+) -> list[Mapping[str, Any]]:
+    """App comments touched at or after ``since`` that report the revision pushed in
+    answer to the review at ``review_link`` (its own line, so another review's id
+    that starts with the same digits does not match)."""
+
+    answer = f"In response to {review_link}"
+    return [
+        c
+        for c in _app_comments_since(comments, ids, since, REVISION_PUSHED_LINE)
+        if answer in str(c["body"]).splitlines()
+    ]
+
+
 def checks_green(checks: Mapping[str, Any], sha: str) -> list[str]:
     """Why a head's checks are not green, or nothing when they are.
 
@@ -1058,8 +1079,9 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
         "the commit came late",
     )
     b.check(called_propose_rule(request), "the revision trajectory has no propose_rule")
-    replies = _app_comments_since(c["pull_comments"], ids, submitted, now["sha"])
-    b.check(bool(replies), "no App reply on the pull request names the revision commit")
+    link = review_url(ids["repository_url"], c["pull_number"], c["review"]["id"])
+    replies = revision_replies(c["pull_comments"], ids, submitted, link)
+    b.check(bool(replies), "no App reply on the pull request answers the submitted review")
     for reason in checks_green(c["revision_checks"], now["sha"]):
         b.check(False, reason)
     b.within(

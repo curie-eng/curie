@@ -969,10 +969,28 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "acknowledges the answer",
     ),
     (
-        "reply-names-the-old-head",
-        [("beat_c/pull_comments/0/body", lambda s: s.replace("b" * 40, "a" * 40))],
+        "reply-answers-another-review",
+        [
+            (
+                "beat_c/pull_comments/0/body",
+                lambda s: s.replace("pullrequestreview-7001", "pullrequestreview-70012"),
+            )
+        ],
         "beat_c",
-        "names the revision commit",
+        "answers the submitted review",
+    ),
+    (
+        "reply-not-a-pushed-revision",
+        [
+            (
+                "beat_c/pull_comments/0/body",
+                lambda s: s.replace(
+                    judge.REVISION_PUSHED_LINE, "No changes needed: this pull request is unchanged."
+                ),
+            )
+        ],
+        "beat_c",
+        "answers the submitted review",
     ),
     (
         "reply-older-than-the-review",
@@ -981,7 +999,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
             ("beat_c/pull_comments/0/updated_at", at(29)),
         ],
         "beat_c",
-        "names the revision commit",
+        "answers the submitted review",
     ),
     (
         "revision-head-has-no-check-run",
@@ -1525,6 +1543,22 @@ def test_a_third_attempt_is_within_the_cap() -> None:
     third = judge.judge_beat("attempts", broken(("attempt", 3)))
     assert third.passed and third.measures["attempt"] == 3.0
     assert judge.judge_chain(broken(("attempt", 3))).passed
+
+
+def test_a_revision_reply_without_a_checks_line_passes() -> None:
+    # The live shape when the revision's checks finish before the request ends:
+    # the platform watches nothing after the run, so the reply names no commit.
+    record = broken(("beat_c/pull_comments/0/body", lambda s: s.split("\n\n")[0]))
+    assert "b" * 40 not in record["beat_c"]["pull_comments"][0]["body"]
+    assert judge.judge_beat("beat_c", record).passed
+
+
+def test_revision_reply_lines_mirror_the_product() -> None:
+    from curie_api import factory_notices as notices
+
+    link = "https://code-host.example.invalid/o/r/pull/12#pullrequestreview-7001"
+    text = notices.result_section("completed", pr_url=None, feedback_url=link)
+    assert text.splitlines() == [judge.REVISION_PUSHED_LINE, f"In response to {link}"]
 
 
 def test_answer_received_line_mirrors_the_product() -> None:

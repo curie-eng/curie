@@ -262,7 +262,7 @@
     "pull_comments": [
       {
         "id": 21,
-        "body": "The requested revision is pushed to this pull request.\n\nChecks passed on head `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`, observed at 2030-01-01 00:41:00 UTC after the run ended.",
+        "body": "The requested revision is pushed to this pull request.\nIn response to https://code-host.example.invalid/fixture-owner/fixture-repo/pull/12#pullrequestreview-7001\n\nChecks passed on head `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`, observed at 2030-01-01 00:41:00 UTC after the run ended.",
         "created_at": "2030-01-01T00:40:30Z",
         "updated_at": "2030-01-01T00:41:00Z",
         "user": {

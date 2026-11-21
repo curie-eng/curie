@@ -2168,6 +2168,11 @@ def test_handoff_answer_acknowledgment_from_the_real_status_body() -> None:
 # so it satisfies exactly those assertions, file it under the path the API test
 # asserts, and read it back through the driver's own read of that path.
 NOTICES = json.loads((FIXTURES / "notices" / "api-asserted-posts.json").read_text())
+REVIEW_LINK = judge.review_url(
+    PASSING["identities"]["repository_url"],
+    PASSING["beat_c"]["pull_number"],
+    PASSING["beat_c"]["review"]["id"],
+)
 NOTICE_REPO = "fixture-owner/fixture-repo"
 
 
@@ -2195,24 +2200,26 @@ def test_handoff_revision_reply_on_the_path_the_api_tests_assert(
     fragment = f"pullrequestreview-{review}"
     revision = uuid.uuid5(uuid.NAMESPACE_URL, "revision")
     head = PASSING["beat_c"]["pull_after"]["head"]["sha"]
-    old_head = PASSING["beat_c"]["pull_before"]["head"]["sha"]
 
-    def reply(sha: str) -> str:
-        feedback = f"https://github.com/{NOTICE_REPO}/pull/{pr}#{fragment}"
+    def reply(link: str, *, checks_line: bool) -> str:
         body = notices.status_body(
             request_id=revision,
             card_url=None,
             pill_label="COMPLETED",
             phase_view=None,
-            result=notices.result_section("completed", pr_url=None, feedback_url=feedback),
+            result=notices.result_section("completed", pr_url=None, feedback_url=link),
         )
-        line = checks["format"].format(head=notices.code_span(sha), when="2030-01-01 00:41:00 UTC")
-        body += f"\n\n{line}"
-        values = {"repo": NOTICE_REPO, "pr": pr, "fragment": fragment}
-        for part in spec["body_contains"]:
-            expected = part.format(**values, marker=marker_for(revision))
-            assert expected in body, expected
+        if checks_line:
+            when = "2030-01-01 00:41:00 UTC"
+            body += "\n\n" + checks["format"].format(head=notices.code_span(head), when=when)
         return body
+
+    # The API test's own assertions hold for the body this test posts.
+    feedback = f"https://github.com/{NOTICE_REPO}/pull/{pr}#{fragment}"
+    values = {"repo": NOTICE_REPO, "pr": pr, "fragment": fragment}
+    for part in spec["body_contains"]:
+        expected = part.format(**values, marker=marker_for(revision))
+        assert expected in reply(feedback, checks_line=True), expected
 
     p, lists = _github_lists(tmp_path, monkeypatch)
 
@@ -2225,12 +2232,16 @@ def test_handoff_revision_reply_on_the_path_the_api_tests_assert(
         return judge.judge_beat("beat_c", _record_with("beat_c", section))
 
     on_pull = spec["post_path"].format(repo=NOTICE_REPO, pr=pr)
-    assert judged(on_pull, reply(head)).passed
-    stale = judged(on_pull, reply(old_head))
-    assert any("names the revision commit" in r for r in stale.reasons)
+    # The record's repository is the fixture's, so the judge reads its review link.
+    assert judged(on_pull, reply(REVIEW_LINK, checks_line=True)).passed
+    assert judged(on_pull, reply(REVIEW_LINK, checks_line=False)).passed
+    other = judged(on_pull, reply(f"{REVIEW_LINK}2", checks_line=True))
+    assert any("answers the submitted review" in r for r in other.reasons)
     # Counterexample: the reply posted on ticket A instead of the pull request.
-    on_ticket_a = judged(on_pull.replace(f"/issues/{pr}/", f"/issues/{issue}/"), reply(head))
-    assert any("names the revision commit" in r for r in on_ticket_a.reasons)
+    on_ticket_a = judged(
+        on_pull.replace(f"/issues/{pr}/", f"/issues/{issue}/"), reply(REVIEW_LINK, checks_line=True)
+    )
+    assert any("answers the submitted review" in r for r in on_ticket_a.reasons)
 
 
 def test_handoff_merge_notice_on_the_path_the_api_tests_assert(
@@ -2739,6 +2750,7 @@ def _beat_c(
         pull_comments=[
             _gh_comment(
                 21,
+                f"{judge.REVISION_PUSHED_LINE}\nIn response to {REVIEW_LINK}\n\n"
                 f"Checks passed on head `{sha}`, "
                 "observed at 2030-01-01 00:41:00 UTC after the run ended.",
                 app,
@@ -3167,10 +3179,10 @@ def _drive_beat_c(
             {"filename": "unitconv/tests/test_convert.py", "status": "modified", "patch": PATCH}
         ],
         f"/repos/{repo}/issues/12/comments": [
+            # The live shape: checks done before the request ended, so no commit line.
             _gh_comment(
                 21,
-                f"Checks passed on head `{after}`, observed at 2030-01-01 00:41:00 UTC "
-                "after the run ended.",
+                f"{judge.REVISION_PUSHED_LINE}\nIn response to {REVIEW_LINK}\n",
                 APP,
                 "2030-01-01T00:40:30Z",
                 "2030-01-01T00:41:00Z",
