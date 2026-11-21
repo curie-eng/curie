@@ -58,6 +58,7 @@ DIAGNOSTIC_UPLOADS = {
     "Retain safe namespace cleanup evidence",
     "Upload upgrade matrix evidence",
     "Upload scripted factory evidence",
+    "Upload scripted learned rules evidence",
 }
 
 

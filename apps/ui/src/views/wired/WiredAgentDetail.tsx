@@ -6,6 +6,7 @@ import { WiredAgentMemory } from "./WiredAgentMemory";
 import { WiredAgentState } from "./WiredAgentState";
 import { WiredThreadReset } from "./WiredThreadReset";
 import { WiredAgentBehaviorPacks } from "./WiredAgentBehaviorPacks";
+import { WiredAgentFactoryProgress } from "./WiredAgentFactoryProgress";
 import { useStore } from "../../state/store";
 import { useWired } from "../../state/wired";
 import { useAgentVersions, useVersionFiles } from "../../api/hooks";
@@ -587,6 +588,12 @@ export function WiredAgentDetail() {
               Sets CURIE_MODEL at boot; blank uses the platform default.
             </div>
           )}
+          <WiredAgentFactoryProgress
+            agentId={agent.id}
+            channel={agent.factory_slack_channel ?? null}
+            channels={agent.channels ?? []}
+            onSaved={refetch}
+          />
         </div>
       </div>
 
