@@ -27,8 +27,10 @@ from curie_runner.__main__ import build_runner
 from curie_runner.config import RunnerConfig
 from curie_runner.harness.claude.approval import (
     build_approval_hook,
+    build_approval_server,
     build_can_use_tool,
 )
+from mcp import types as mcp_types
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, validate_bundle
 
 # A budget high enough that default_turn's 8 output tokens never trip the halt
@@ -247,7 +249,7 @@ def _publication_bundle(tmp_path, gates: list[dict[str, str]]) -> str:
     return _write_manifest(tmp_path / "plugin", manifest)
 
 
-def _block_publication_on_boot_path(tmp_path, plugin_dir: str):
+def _record_publication_on_boot_path(tmp_path, plugin_dir: str):
     workspace = tmp_path / "workspace"
     (workspace / ".git").mkdir(parents=True)
     runner = build_runner(
@@ -258,29 +260,43 @@ def _block_publication_on_boot_path(tmp_path, plugin_dir: str):
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is not None
     gate.bind_publication_context(None)
-    hook = build_approval_hook(gate)["PreToolUse"][0].hooks[0]
+    hooks = build_approval_hook(gate)
+    pre = hooks["PreToolUse"][0].hooks[0]
+    post = hooks["PostToolUse"][0].hooks[-1]
+    tool_input = {"title": "Fix the README", "body": ""}
+    hook_input = {"tool_name": PLATFORM_PUBLISH_TOOL_NAME, "tool_input": tool_input}
 
     async def go() -> None:
-        result = await hook(
-            {
-                "tool_name": PLATFORM_PUBLISH_TOOL_NAME,
-                "tool_input": {"title": "Fix the README", "body": ""},
-            },
-            "toolu_publication_test",
+        # The runner's hook abstains on publish; the tool body records it.
+        assert await pre(hook_input, "toolu_publication_test", None) == {}
+        assert gate.pending_granted_tool is None
+        server = build_approval_server(gate, managed_workspace=True)
+        entry = server["instance"].get_request_handler("tools/call")
+        assert entry is not None
+        result = await entry.handler(
             None,
+            mcp_types.CallToolRequestParams(
+                name=PLATFORM_PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+                arguments=tool_input,
+            ),
         )
-        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert result.model_dump().get("is_error") is not True
+        # The PostToolUse halt ends the turn on the recorded publication.
+        stopped = await post(hook_input, "toolu_publication_test", None)
+        assert stopped.get("continue_") is False
 
     anyio.run(go)
+    assert gate.pending_gate_kind == "permission"
     assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+    assert gate.publication_title == "Fix the README"
     return gate
 
 
-def test_declared_publication_gate_route_reaches_the_blocked_publication(
+def test_declared_publication_gate_route_reaches_the_recorded_publication(
     tmp_path,
 ) -> None:
     """#2719: a bundle that declares the publication gate with a route must
-    validate and carry that route onto the blocked publication. Before #2776 the
+    validate and carry that route onto the recorded publication. Before #2776 the
     validator refused ``mcp__curie__publish_changes`` so no bundle could bind a
     route and #2705 was inert. The worker then passes ``pending_route`` as
     ``PublicationCreateRequest.route`` (pinned in the worker approval lifecycle
@@ -294,18 +310,18 @@ def test_declared_publication_gate_route_reaches_the_blocked_publication(
     validation = validate_bundle(plugin_dir)
     assert validation.valid, validation.errors
 
-    gate = _block_publication_on_boot_path(tmp_path, plugin_dir)
+    gate = _record_publication_on_boot_path(tmp_path, plugin_dir)
     assert gate.pending_route == "publish-approvers"
 
 
 def test_undeclared_publication_gate_leaves_the_publication_route_empty(
     tmp_path,
 ) -> None:
-    """Missing-route control: with no declared gate the publication still blocks
+    """Missing-route control: with no declared gate the publication still records
     but carries no route, which the API refuses to an operator principal."""
 
     plugin_dir = _publication_bundle(tmp_path, [])
     assert validate_bundle(plugin_dir).valid
 
-    gate = _block_publication_on_boot_path(tmp_path, plugin_dir)
+    gate = _record_publication_on_boot_path(tmp_path, plugin_dir)
     assert gate.pending_route is None

@@ -61,16 +61,35 @@ def transcript_for_jira(exchanges: list[dict[str, Any]]) -> list[dict[str, Any]]
     """The one-ticket transcript as the factory agent's Jira turns key it.
 
     The recording names the GitHub channel in the platform frame of each
-    factory turn; a Jira-bound agent's frame names ``jira``. Nothing else in
-    the transcript changes.
+    factory turn; a Jira-bound agent's frame names ``jira``. Its publication
+    cites the labeller's answer by the author a GitHub ticket read shows; a
+    Jira ticket read shows the labeller's display name, so that citation names
+    it instead. Nothing else in the transcript changes.
     """
 
     old, new = "\nchannel: github\n", f"\nchannel: {CHANNEL_KIND}\n"
     if not any(old in exchange["lane_key"] for exchange in exchanges):
         raise JiraOneTicketError("the transcript has no GitHub channel frame to key on Jira")
-    return [
-        {**exchange, "lane_key": exchange["lane_key"].replace(old, new)} for exchange in exchanges
-    ]
+    cited = one_ticket_run.answer_citation(one_ticket_run.ANSWER_AUTHOR)
+    jira_cited = one_ticket_run.answer_citation(ojt.LABELLER["display_name"])
+
+    def cite_on_jira(block: dict[str, Any]) -> dict[str, Any]:
+        if block.get("type") != "tool_use" or block.get("name") != one_ticket_run.PUBLISH_TOOL:
+            return block
+        body = block["input"]["body"].replace(cited, jira_cited)
+        return {**block, "input": {**block["input"], "body": body}}
+
+    rekeyed = []
+    for exchange in exchanges:
+        exchange = {**exchange, "lane_key": exchange["lane_key"].replace(old, new)}
+        message = exchange.get("message")
+        if isinstance(message, dict) and "content" in message:
+            exchange["message"] = {
+                **message,
+                "content": [cite_on_jira(b) for b in message["content"]],
+            }
+        rekeyed.append(exchange)
+    return rekeyed
 
 
 class JiraStubProcess:

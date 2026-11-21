@@ -567,6 +567,33 @@ def summarize_tool_call(tool_name: str, tool_input: dict[str, Any]) -> str:
     return f"{APPROVAL_SUMMARY_PREFIX}{tool_name} {rendered}"
 
 
+# The ``publish_changes`` body's answer in a session with no publication gate.
+# It is the body's own output, so a tool result carrying it proves the body ran
+# rather than a PreToolUse hook denying the call (see ``translate_message``).
+NO_PUBLICATION_GATE_TEXT = (
+    "No managed repository workspace is mounted at /workspace; "
+    "publication cannot be requested from this session."
+)
+
+
+@dataclass
+class PublicationLedger:
+    """Whether the ``publish_changes`` body ran in a session with no approval gate.
+
+    A session with an approval gate records that on the gate
+    (``ApprovalGate.refuse_publication``). A session with none has nowhere
+    else to keep it, so the runner gives the body and the session this one
+    object. Only the body sets ``refused``, and the CLI runs the body only
+    after every PreToolUse hook allowed the call, so a hook deny never sets
+    it, whatever its reason says (#2294).
+    """
+
+    refused: bool = False
+
+    def reset(self) -> None:
+        self.refused = False
+
+
 @dataclass
 class ApprovalGate:
     """Shared state between the ``can_use_tool`` callback and the session loop.
@@ -642,7 +669,12 @@ class ApprovalGate:
     publication_title: str | None = None
     publication_body: str | None = None
     publication_precheck: PublicationPrecheck | None = field(default=None, repr=False)
-    _publication_pending_id: str | None = None
+    # Whether the ``publish_changes`` tool body ran this turn, and the first
+    # reason a run of it recorded nothing (a malformed proposal). The body runs
+    # only after every PreToolUse hook allowed the call, so a call a bundle hook
+    # denied never sets either. Runner-internal, per turn, never serialized.
+    publication_attempted: bool = False
+    publication_unrecorded: str | None = None
     # Set by ``block()`` whenever the gate refuses a call (#1852). Since the
     # refusal now carries the SDK's turn-stopping flags, the CLI aborts the turn
     # and its terminal result arrives shaped like a failure; this marker is how
@@ -738,7 +770,8 @@ class ApprovalGate:
         self.policy_route = None
         self.publication_title = None
         self.publication_body = None
-        self._publication_pending_id = None
+        self.publication_attempted = False
+        self.publication_unrecorded = None
         if self.publication_precheck is not None:
             self.publication_precheck.clear()
         # Strictly per-turn, and cleared with the other pending state rather
@@ -770,36 +803,12 @@ class ApprovalGate:
         if self.publication_precheck is not None:
             self.publication_precheck.clear()
 
-    def publication_refused(self, tool_use_id: str | None) -> bool:
-        return (
-            self.publication_precheck is not None
-            and tool_use_id in self.publication_precheck.refused_ids
-        )
-
     async def check_publication(
         self, tool_use_id: str | None, tool_input: dict[str, Any]
     ) -> str | None:
         if self.publication_precheck is None:
             return None
-        refusal = await self.publication_precheck.decide(tool_use_id, tool_input)
-        if (
-            refusal is not None
-            and self.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
-            and self._publication_pending_id == tool_use_id
-        ):
-            # A conflicting observation invalidates this call's earlier record.
-            # Other tools retain ownership of their existing approval slot.
-            self.pending_summary = None
-            self.pending_display = None
-            self.pending_route = None
-            self.pending_gate_kind = None
-            self.pending_granted_tool = None
-            self.pending_granted_arguments = None
-            self.pending_halt = False
-            self.publication_title = None
-            self.publication_body = None
-            self._publication_pending_id = None
-        return refusal
+        return await self.publication_precheck.decide(tool_use_id, tool_input)
 
     def grant_argument_mismatch(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
         """Whether an unspent grant names ``tool_name`` but not these arguments (#3174)."""
@@ -931,13 +940,13 @@ class ApprovalGate:
     def _record_pending(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
         """Write the first pending record of the turn; report whether it wrote.
 
-        Extracted from ``block`` so the stream-side observer
-        (``observe_publication``, #2294) writes the IDENTICAL record a denying
-        gate layer writes -- the worker recognizes a publication by exactly this
-        runner-stamped provenance pair (``pending_gate_kind='permission'`` plus
-        ``pending_granted_tool``), so two spellings of it would be two
-        behaviors. It does NOT touch ``pending_halt``: asking the CLI to stop is
-        the caller's decision, not the record's.
+        Extracted from ``block`` so ``record_publication`` writes the IDENTICAL
+        record a denying gate layer writes -- the worker recognizes a
+        publication by exactly this runner-stamped provenance pair
+        (``pending_gate_kind='permission'`` plus ``pending_granted_tool``), so
+        two spellings of it would be two behaviors. It does NOT touch
+        ``pending_halt``: asking the CLI to stop is the caller's decision, not
+        the record's.
 
         Returns False when a record already stands (first-block-wins), True when
         this call created it. Raises ``ValueError`` on a malformed publication
@@ -971,29 +980,60 @@ class ApprovalGate:
         self.pending_granted_arguments = deepcopy(tool_input)
         return True
 
-    async def observe_publication(
-        self, tool_use_id: str | None, tool_input: dict[str, Any]
-    ) -> bool | None:
-        """Await the shared decision before recording a streamed publication.
+    def halt_after_publication(self) -> bool:
+        """Request the stop after a ``publish_changes`` body ran, if a record stands.
 
-        The real SDK may deliver the stream before either permission callback.
-        Every observer uses the exact call ID, so only one comparison runs and
-        a continuing refusal never creates pending state. An approval decision
-        records the first pending proposal without setting the halt marker;
-        only the SDK callbacks request that stop. This observer never grants
-        permission to execute the publication tool.
-
-        Return None for a continuing refusal, True for a new pending record,
-        and False when a previous record already owns the slot. A malformed
-        proposal raises ValueError for the existing terminal failure handling.
+        Called from the approval hook's PostToolUse callback (and the fake
+        tier's copy of it), so ``pending_halt`` is set exactly when the runner
+        asks the CLI to stop the turn, as ``block`` sets it on a deny.
         """
 
-        if await self.check_publication(tool_use_id, tool_input) is not None:
-            return None
-        recorded = self._record_pending(PLATFORM_PUBLISH_TOOL_NAME, tool_input)
-        if recorded:
-            self._publication_pending_id = tool_use_id
-        return recorded
+        if self.pending_summary is None:
+            return False
+        self.pending_halt = True
+        return True
+
+    def refuse_publication(self, reason: str) -> None:
+        """Note a ``publish_changes`` body run that recorded nothing, and why.
+
+        The first reason wins. The session fails such a turn closed when it
+        would otherwise end clean (#2294).
+        """
+
+        self.publication_attempted = True
+        self.publication_unrecorded = self.publication_unrecorded or reason
+
+    def record_publication(self, tool_input: dict[str, Any]) -> str | None:
+        """Record the publication whose ``publish_changes`` tool body is running.
+
+        The one recording path. The CLI runs the in-process tool body only
+        after every PreToolUse hook allowed the call: the runner's own gate and
+        precheck, and each bundle hook (the Decisions gate, the diff approval
+        publish gate). So a call any hook denied records nothing and halts
+        nothing, and the model receives that hook's reason and can correct the
+        call in the same turn. The approval hook's PostToolUse callback then
+        ends the turn right after it (``halt_after_publication``).
+
+        Returns None when this call owns the turn's pending record, else the
+        reason the model receives. A malformed proposal records nothing and
+        does not halt, so the corrected retry the reason asks for can record.
+        A record already standing (another gated call, or an earlier
+        publication this turn) keeps the slot, and the turn still halts on it.
+        Nothing here sets ``pending_halt``: only a requested stop does.
+        """
+
+        try:
+            recorded = self._record_pending(PLATFORM_PUBLISH_TOOL_NAME, tool_input)
+        except ValueError as exc:
+            self.refuse_publication(str(exc))
+            return f"Publication request was not recorded: {exc}. Correct it and retry."
+        self.publication_attempted = True
+        if not recorded:
+            return (
+                "Publication request was not recorded: another approval is already"
+                " pending this turn. End your turn."
+            )
+        return None
 
 
 class _GateDecision(NamedTuple):
@@ -1237,6 +1277,13 @@ async def _decide_gate(
         refusal = await gate.check_publication(tool_use_id, tool_input)
         if refusal is not None:
             return _GateDecision(blocked=False, ungated=False, refusal=refusal, continue_turn=True)
+        # Never recorded or halted here. The CLI runs the tool body only after
+        # every PreToolUse hook allowed the call, so the body records it
+        # (``record_publication``): a bundle hook's deny must win over a record
+        # this hook cannot take back. Abstaining also never grants: the body
+        # only records a request; publication happens outside the sandbox
+        # after human approval.
+        return _GateDecision(blocked=False, ungated=True)
     outcome = _tool_policy_outcome(gate, tool_name)
     if outcome is ToolPolicyDecision.DENY:
         if tool_use_id is not None:
@@ -1276,18 +1323,10 @@ async def _decide_gate(
         return _GateDecision(blocked=True, ungated=False)
     if tool_name not in gate.required:
         return _GateDecision(blocked=False, ungated=True)
-    # Publication is completed outside the sandbox after approval, so an
-    # injected or stale grant must never let the in-sandbox tool execute.
-    granted = (
-        gate.granted_with_ticket(tool_name, tool_input)
-        if tool_name != PLATFORM_PUBLISH_TOOL_NAME
-        else None
-    )
+    granted = gate.granted_with_ticket(tool_name, tool_input)
     if granted is not None:
         tool_input = granted
-    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.grant_argument_mismatch(
-        tool_name, tool_input
-    ):
+    if gate.grant_argument_mismatch(tool_name, tool_input):
         if tool_use_id is not None:
             gate.refused_call_ids.add(tool_use_id)
         return _GateDecision(
@@ -1296,17 +1335,11 @@ async def _decide_gate(
             refusal=_grant_mismatch_refusal(tool_name),
             continue_turn=True,
         )
-    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name, tool_input):
+    if gate.consume_grant(tool_name, tool_input):
         return _GateDecision(blocked=False, ungated=False, updated_input=granted)
     gate.block(tool_name, gate.carried_input(tool_name, tool_input))
     if tool_use_id is not None:
         gate.held_call_ids.add(tool_use_id)
-    if (
-        tool_name == PLATFORM_PUBLISH_TOOL_NAME
-        and gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
-        and gate._publication_pending_id is None
-    ):
-        gate._publication_pending_id = tool_use_id
     return _GateDecision(blocked=True, ungated=False)
 
 
