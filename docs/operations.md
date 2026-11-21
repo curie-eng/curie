@@ -2376,10 +2376,17 @@ One submitted review is one revision: its body and all its inline comments are
 read together once the review is submitted. An approving review never starts a
 revision unless a comment in it mentions the factory. Each pull request allows
 10 plain-comment revisions; after that the factory posts one notice on the pull
-request and a mention of the tracker's `mention` is required. A mention always
-works and is not counted. GitLab and Bitbucket still require the mention.
-The sender must have write access now, the PR must still be open at the
-recorded head, and the delivery must come from the work item's installation.
+request and a mention of the tracker's `mention` is required. A mention is not
+counted against that cap, and it does not replace authority, an open lineage or
+the checks below. GitLab and Bitbucket still require the mention.
+On GitHub the sender must have write access now, the PR must still be open at
+the recorded head, and the delivery must come from the work item's
+installation. GitLab and Bitbucket are polled instead: the lineage must be
+open, the host must confirm the comment is current, and its author must have
+write access (GitLab) or be on the binding's `reviewFeedbackAllowlist`
+(Bitbucket). Neither shipped Bitbucket adapter, Cloud or Data Center, can
+report write access, so on Bitbucket that list is required, and an author
+missing from it gets no revision; no head is compared.
 Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
 `sender_permission_refused`, `terminal_pull_request`, `active_request`, and
@@ -2860,9 +2867,10 @@ A release that selected personal mode by setting `FACTORY_MODEL_AUTH_MODE` in
 `api.extraEnv` and `worker.extraEnv` fails its next render, because the chart
 owns the variable now and retained values replay the old entries. In the same
 upgrade, give both lists again without the variable (`[]` when nothing else
-remains) and set `factory.modelAuthMode: personal` in one values file; the
-chart README section "Factory model auth mode" has the file and the
-`helm upgrade --reset-then-reuse-values -f` command. With `personal`, the
+remains) and set `factory.modelAuthMode: personal` in one values file;
+[the combined upgrade](#upgrade-with-retained-model-auth-entries-and-0188-pending)
+has the file and the exact `curie cluster upgrade` command, which also covers a
+pending revision 0188. With `personal`, the
 worker refuses to start with `personal_mode_requires_kubernetes` unless
 `CURIE_SANDBOX_SUBSTRATE` is `kubernetes`; the chart and `curie cluster
 factory` refuse a personal release whose `worker.extraEnv` selects another
@@ -4429,10 +4437,23 @@ release ever shipped them, so an install that came from a released version has
 nothing to lose. Because it is a contract revision, an upgrade that has it
 pending needs `curie cluster upgrade --forward-only`, or
 `api.migrate.forwardOnly=true` on a direct `helm upgrade`. Without it the
-schema check refuses the upgrade before any mutation. A local stack runs the
+upgrade is refused, but the guarantee depends on the path. With
+`curie cluster upgrade`, the CLI first records its upgrade ownership on the
+cluster, then Validate refuses before Helm Apply, so the release itself is not
+changed and the ownership record is released. With a direct `helm upgrade`,
+the chart's worker drain hook (pre-upgrade, weight -10) runs before the schema
+migration hook (weight -5) refuses, so new worker claims can already be paused
+when the refusal arrives. The final roll hold (`upgrade-drain-hold`, weight 10)
+runs after the migration hook, so it never runs, and the pause is only the
+300-second handoff lease on the pause marker, last renewed by the refusing
+migration process. Workers claim again once that lease lapses. After a direct
+refusal, wait out the 300 seconds before retrying (see the drain gate details
+under [curie cluster upgrade](#curie-cluster-upgrade)). Prefer the CLI, or
+set the forward-only value before the first direct attempt. A local stack runs the
 same check in its one-shot `curie-migrate` service, so follow the
 `CURIE_SCHEMA_FORWARD_ONLY=true` recipe at the end of the Slack route identity
-migration section above.
+migration section above. An upgrade that also retains `FACTORY_MODEL_AUTH_MODE`
+in `extraEnv` has [one combined recipe](#upgrade-with-retained-model-auth-entries-and-0188-pending).
 
 #### Before upgrading: an existing triage binding
 
@@ -4468,13 +4489,39 @@ label. Do them before the upgrade:
    `curie cluster surfaces <agent> --remove <KIND=ADDRESS>`, using a binding
    that `curie cluster surfaces <agent>` printed. When it is the agent's only
    surface, delete the agent with `curie cluster delete <agent> --yes` instead.
-   To replace the bundle and keep the agent, write the implementation bundle
-   with `curie example dark-factory render --out <dir>`, then run these in
+   To replace the bundle and keep the agent, first check the new label, before
+   deleting anything. The API refuses to add a
+   surface whose effective label another agent already serves on the same
+   location (409, naming that agent). Because step 4 runs after the old
+   binding is gone, a refusal there leaves the agent with no tracker
+   surface. List every other agent's bindings with
+   `curie cluster surfaces <other agent>` and confirm none on the same
+   location (for Jira, the same binding name) uses the new label, whether
+   set on the surface or inherited from the tracker's configured label.
+   Also record what the old binding carries, because the re-add creates a
+   fresh row. Its adapter name and caller list are readable
+   (`curie cluster surfaces <agent>`, `curie cluster callers <agent>
+   --surface <KIND=ADDRESS>`). Its reply endpoint is not: the API and the CLI
+   never return it on a read, so take it from wherever you first configured
+   the route, and write it down now. Without it a binding that had a reply
+   route cannot be rebuilt. Removing the row also invalidates every adapter
+   token minted for it.
+   Then write the implementation bundle
+   with `curie example dark-factory render --out <dir>` and run these in
    order:
    1. When the old binding is the agent's only surface, add a temporary one
-      at another location of the same kind (another repository for GitHub),
-      under a label no issue carries, so it admits nothing:
+      under a label no issue carries, so it admits nothing. For GitHub or
+      GitLab use another repository of the same kind:
       `curie cluster surfaces <agent> --add <KIND=OTHER_ADDRESS> --label <unused label>`.
+      GitLab accepts only a project that a configured GitLab binding lists.
+      Jira can use another location only when a second Jira binding is already
+      configured, since a Jira surface address is the name of a configured
+      binding and the API answers 422 `surface_unconfigured` for any other;
+      and an agent holds one surface per location, so a second surface on the
+      same binding is refused with 409. Without a second Jira binding, use a
+      GitHub surface as the temporary one, which the API accepts for any
+      repository name, and give it a repository no agent is bound to:
+      `curie cluster surfaces <agent> --add github=<OWNER/UNUSED_REPO> --label <unused label>`.
    2. Remove the old binding:
       `curie cluster surfaces <agent> --remove <KIND=ADDRESS>`.
    3. Deploy the implementation bundle:
@@ -4482,11 +4529,107 @@ label. Do them before the upgrade:
    4. Bind the agent again under a different label, on the same location or
       another one:
       `curie cluster surfaces <agent> --add <KIND=ADDRESS> --label <new label>`.
+      For Jira this is the original `jira=<binding-name>`. Pass the reply
+      route you recorded (`--adapter` and `--endpoint`, which a non-Slack
+      surface takes together) when the old binding had one, then restore the caller list with
+      `curie cluster callers <agent> --surface <KIND=ADDRESS> --set <ids>`
+      (`PUT /agents/{id}/channels/callers`), which replaces the list whole and
+      does not change the binding's generation. Then replace the adapter
+      token the removal invalidated: for the mail adapter,
+      `curie cluster channel-token <agent> --kind <KIND> --address <ADDRESS>`;
+      for another adapter, mint a new one through `POST /channels/token`.
    5. Remove the temporary surface, if you added one:
-      `curie cluster surfaces <agent> --remove <KIND=OTHER_ADDRESS>`.
+      `curie cluster surfaces <agent> --remove <KIND=OTHER_ADDRESS>`, or for
+      Jira `--remove github=<OWNER/UNUSED_REPO>`.
    No binding keeps the old label.
 4. Upgrade with `curie cluster upgrade --to <version> --forward-only`, or set
-   `api.migrate.forwardOnly=true` on a direct `helm upgrade`.
+   `api.migrate.forwardOnly=true` on a direct `helm upgrade`. When the release
+   also retains `FACTORY_MODEL_AUTH_MODE` in `api.extraEnv` or `worker.extraEnv`,
+   use the [one combined upgrade](#upgrade-with-retained-model-auth-entries-and-0188-pending)
+   below instead; either change alone is refused.
+
+#### Upgrade with retained model auth entries and 0188 pending
+
+This is the upgrade from the latest release to a build that carries both the
+typed `factory.modelAuthMode` value and revision 0188, for a release that
+selected personal mode through `FACTORY_MODEL_AUTH_MODE` in `api.extraEnv` and
+`worker.extraEnv`. Run it as one upgrade. The chart refuses the retained
+entries at render, and the schema check refuses the pending contract revision
+without `--forward-only`, so neither fix works alone. Do the steps in this
+order. Name one cluster target and carry it through every `curie cluster`
+command here, the binding commands in the triage steps and `status` included:
+`--context "$CONTEXT" --namespace "$NAMESPACE" --release "$RELEASE"`. Left out,
+each command falls back to the kubeconfig's current context, to the
+`CURIE_NAMESPACE` environment variable and then namespace `curie`, and to
+release `curie`, any of which may be another installation. `--context` is a
+flag of `curie cluster` itself, so it may sit before or after the subcommand.
+The binding commands (`surfaces`, `callers`, `kill`, `work-items`, `versions`,
+`delete`, `deploy`) also talk to the platform API, and when `CURIE_API_URL` is
+set (or `--api-url` passed) they dial that URL directly and ignore the context,
+namespace and release for that call. Unset it, or point it at the target
+release's API, and likewise `CURIE_API_KEY`, before running them.
+
+1. Finish [an existing triage binding](#before-upgrading-an-existing-triage-binding)
+   steps 1 to 3 when the release has such a binding, with the same target on
+   every command there.
+2. Back up the database. `--forward-only` gives up the patch rollback window
+   (see [cluster upgrade](#curie-cluster-upgrade)).
+3. Write a private values file that repeats each list without the variable
+   (keep every other entry; use `[]` for a list that becomes empty) and sets
+   the mode. A values file replaces a list whole, so these lists win over the
+   retained ones, and the upgrade renders `FACTORY_MODEL_AUTH_MODE=personal`
+   once in each of the API and the worker:
+
+   ```yaml
+   # model-auth-mode.yaml
+   factory:
+     modelAuthMode: personal
+   api:
+     extraEnv:
+       - name: ACME_API_EXTENSION   # every other retained api entry, unchanged
+         value: kept
+   worker:
+     extraEnv: []
+   ```
+
+4. Make sure the target checks ran, then rehearse. `--to <version>` is the
+   release you are upgrading to; its chart is the release asset the CLI
+   downloads. A dry run does not download it. When the archive is not already
+   cached, the dry run skips the rendered-chart, live-schema and Helm timeout
+   checks, prints `phase validate pending: chart metadata, schema
+   compatibility, and Helm timeout after release chart download from <url> to
+   <path>`, and can still exit 0. That exit proves only the retained
+   configuration checks. Warm the cache first by saving the asset at the
+   `<path>` that line names (by default
+   `${XDG_CACHE_HOME:-$HOME/.cache}/curie/v<version>/curie-<version>.tgz`, from
+   `https://github.com/curie-eng/curie/releases/download/v<version>/curie-<version>.tgz`),
+   then rerun. Stop if the plan still prints `phase validate pending`:
+   validation did not run. A plan that ends in a validate refusal exits
+   nonzero:
+
+   ```bash
+   curie cluster upgrade --context "$CONTEXT" \
+     --namespace "$NAMESPACE" --release "$RELEASE" \
+     --to <version> --values-file model-auth-mode.yaml --forward-only --dry-run
+   ```
+
+5. Run the same command with `--yes` in place of `--dry-run`. A real run
+   downloads the archive before Validate and refuses to start on a pending
+   release chart, so its checks always run, before Apply. Require a successful
+   exit, exact convergence and a passed canary, then confirm
+   `curie cluster status --context "$CONTEXT" --namespace "$NAMESPACE"
+   --release "$RELEASE"` prints `factory model auth mode: personal`.
+
+On a direct `helm upgrade` instead of the CLI, pass the same file and the
+forward-only value in one command, against the same target:
+`helm upgrade "$RELEASE" <chart> --kube-context "$CONTEXT" -n "$NAMESPACE"
+--reset-then-reuse-values -f model-auth-mode.yaml
+--set api.migrate.forwardOnly=true --timeout <minimum>s`. It has none of the
+CLI's validation, and its guarantees differ (see
+[Factory triage removal](#factory-triage-removal-alembic-revision-0188)). Setting only
+`factory.modelAuthMode` while the old entries are retained still fails the
+render. Later mode changes need only
+`curie cluster factory --model-auth-mode <mode>`.
 
 ### Before you upgrade, check what would be removed
 

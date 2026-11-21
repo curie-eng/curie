@@ -183,8 +183,16 @@ provide the equivalent provider-specific steps.
    (its body and all its inline comments together). An approving review starts
    none unless a comment mentions the factory. Each
    pull request allows 10 plain-comment revisions; the factory then posts one
-   notice and a mention, such as `@<app-slug>`, is required. A mention always
-   works and is not counted. GitLab and Bitbucket still require the mention.
+   notice and a mention, such as `@<app-slug>`, is required. A mention is not
+   counted against that cap, but it is not a bypass. On GitHub it starts a
+   revision only when its author currently has write or admin access, the pull
+   request is open and bound to the factory's lineage, and the comment or
+   review is against the pull request's current head. GitLab and Bitbucket
+   still require the mention and read it by polling: the lineage must be open,
+   the code host must confirm the comment is current, and its author must be
+   allowed (GitLab asks the host for write access; Bitbucket Cloud and Data
+   Center cannot report it, so Bitbucket requires the binding's
+   `reviewFeedbackAllowlist`). That path compares no head.
    To teach the factory a rule it keeps, turn on learned-rule proposals
    (`curie cluster overrides <agent> --memory-rule-proposals on`), give
    reusable feedback on an open factory pull request, and merge the revised

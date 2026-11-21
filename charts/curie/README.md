@@ -2741,32 +2741,13 @@ A release that selected personal mode through `FACTORY_MODEL_AUTH_MODE` in
 `api.extraEnv` and `worker.extraEnv` must drop those entries and set the value
 in one upgrade, because the new chart refuses the retained entries and
 `curie cluster factory --model-auth-mode` writes only `factory.modelAuthMode`.
-Write a private values file that repeats each list without the variable (keep
-every other entry; use `[]` for a list that becomes empty) and sets the mode:
-
-```yaml
-factory:
-  modelAuthMode: personal
-api:
-  extraEnv:
-    - name: ACME_API_EXTENSION   # every other retained api entry, unchanged
-      value: kept
-worker:
-  extraEnv: []
-```
-
-Then pass it in the same upgrade:
-
-```bash
-helm upgrade curie <new-chart> -n curie --reset-then-reuse-values \
-  -f model-auth-mode.yaml --timeout <minimum>s
-```
-
-Helm replaces a list whole, so the file's lists win over the retained ones and
-the render carries `FACTORY_MODEL_AUTH_MODE=personal` once in each of the API
-and the worker. Setting only `factory.modelAuthMode` while the old entries are
-retained still fails the render. Later mode changes need only
-`curie cluster factory --model-auth-mode <mode>`.
+Setting only `factory.modelAuthMode` while the old entries are retained still
+fails the render. When revision 0188 (the triage schema drop) is pending in
+the same upgrade, `--forward-only` is also required, or the schema check
+refuses it. The values file and the exact `curie cluster upgrade` command for
+both are in
+[Upgrade with retained model auth entries and 0188 pending](../../docs/operations.md#upgrade-with-retained-model-auth-entries-and-0188-pending).
+Later mode changes need only `curie cluster factory --model-auth-mode <mode>`.
 
 ### Reserved environment variables
 
