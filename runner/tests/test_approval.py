@@ -1261,9 +1261,10 @@ def test_publish_body_record_has_exact_trusted_provenance_and_no_route() -> None
         assert gate.pending_route is None
         assert gate.publication_title == "Update documentation"
         assert gate.publication_body == "Exact body\n" * 100
-        # The record asks for the halt, which the PostToolUse hook then applies.
-        assert gate.pending_halt is True
+        # The halt marker is set only when the PostToolUse hook asks for the stop.
+        assert gate.pending_halt is False
         assert (await _publish_post_tool_use(gate)).get("continue_") is False
+        assert gate.pending_halt is True
 
     anyio.run(go)
 
@@ -1293,6 +1294,7 @@ def test_invalid_publish_proposal_creates_no_pending_approval() -> None:
         is_error, _text = await _call_publish_body(gate, {"title": "Ship", "body": "b"})
         assert is_error is False
         assert gate.publication_title == "Ship"
+        assert (await _publish_post_tool_use(gate)).get("continue_") is False
         assert gate.pending_halt is True
 
     anyio.run(go)
@@ -1356,7 +1358,9 @@ def test_record_publication_records_the_pending_approval_and_halts() -> None:
     assert gate.pending_route is None
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "Full body"
-    # The body ran and recorded, so the turn halts for the human.
+    # The body ran and recorded; the halt is requested after it, not here.
+    assert gate.pending_halt is False
+    assert gate.halt_after_publication() is True
     assert gate.pending_halt is True
     assert gate.publication_attempted is True
     assert gate.publication_unrecorded is None
@@ -1377,7 +1381,7 @@ def test_record_publication_is_idempotent_for_a_duplicate_call() -> None:
     assert gate.pending_summary == first_summary
     assert gate.publication_title == "First proposal"
     assert gate.publication_body == "one"
-    assert gate.pending_halt is True
+    assert gate.halt_after_publication() is True
 
 
 def test_record_publication_rejects_a_malformed_title_and_records_nothing() -> None:
@@ -1421,6 +1425,7 @@ def test_record_publication_never_overwrites_a_standing_record() -> None:
     assert gate.publication_title is None
     assert gate.publication_body is None
     # The standing record still halts the turn.
+    assert gate.halt_after_publication() is True
     assert gate.pending_halt is True
 
 

@@ -344,9 +344,14 @@ def run_publish_turn(
     hook_command: str,
     script: list[str],
     extra_env: dict[str, str] | None = None,
+    publish_route: str | None = None,
 ) -> PublishTurn:
+    """Run one turn on the real CLI. ``publish_route`` binds the bundle's
+    approval route to ``publish_changes``, as an approval-gated bundle does."""
+
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
+    routes = {} if publish_route is None else {PLATFORM_PUBLISH_TOOL_NAME: publish_route}
+    gate = build_approval_gate(operator_tools=None, policy_routes=routes, managed_workspace=True)
     assert gate is not None
     assert PLATFORM_PUBLISH_TOOL_NAME in gate.required
     plugin = _plugin(tmp_path, hook_command)

@@ -21,6 +21,7 @@ from ...approval import (
     _DENY_MESSAGE,
     _TOOL_NAME,
     APPROVAL_SERVER_NAME,
+    NO_PUBLICATION_GATE_TEXT,
     ApprovalGate,
     _approval_error,
     _decide_gate,
@@ -184,20 +185,13 @@ def build_approval_server(
         # protocol. Authority is still mount-keyed in ``build_approval_gate``:
         # an unmounted session cannot create a publication approval, and a
         # direct invocation fails without mutating gate state.
-        if (
-            not managed_workspace
-            or gate is None
-            or PLATFORM_PUBLISH_TOOL_NAME not in gate.required
-        ):
+        if not managed_workspace or gate is None or PLATFORM_PUBLISH_TOOL_NAME not in gate.required:
             if gate is not None:
                 # The body ran, so the session fails the turn closed unless
                 # something else owns it (#2294). A gateless session is the
                 # session's own check.
                 gate.refuse_publication(_NO_PUBLICATION_GATE)
-            return _approval_error(
-                "No managed repository workspace is mounted at /workspace; "
-                "publication cannot be requested from this session."
-            )
+            return _approval_error(NO_PUBLICATION_GATE_TEXT)
         # The one recording path: the CLI runs this body only after every
         # PreToolUse hook, the bundle's included, allowed the call. Recording
         # never publishes; the platform does that after human approval.
@@ -449,8 +443,7 @@ _PUBLISH_STOP_REASON = "Paused for human approval: the publication request is re
 # The publish_changes tool result once the request is recorded. The PostToolUse
 # halt normally ends the turn before the model reads it.
 _PUBLISH_RECORDED_TEXT = (
-    "Publication requested. A human reviews it before the platform publishes. "
-    "End your turn now."
+    "Publication requested. A human reviews it before the platform publishes. End your turn now."
 )
 
 # Why the hook allows a call outright. Only ever emitted after the one-shot
@@ -651,7 +644,10 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         # A publication is recorded by the tool body, which the CLI runs only
         # after every PreToolUse hook allowed it, so the halt for approval
         # lands here, after the call ran, never on sight of the call.
-        if _hook_field(hook_input, "tool_name") == PLATFORM_PUBLISH_TOOL_NAME and gate.pending_halt:
+        if (
+            _hook_field(hook_input, "tool_name") == PLATFORM_PUBLISH_TOOL_NAME
+            and gate.halt_after_publication()
+        ):
             return {"continue_": False, "stopReason": _PUBLISH_STOP_REASON}
         return {}
 

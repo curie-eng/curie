@@ -46,6 +46,7 @@ from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from .adapter import PartialMessageBoundary
 from .approval import (
     APPROVAL_TOOL_NAME,
+    NO_PUBLICATION_GATE_TEXT,
     TURN_PROGRESS_TOOL_NAME,
     ApprovalGate,
     process_approval_request,
@@ -1241,11 +1242,8 @@ class FakeModelSession:
                         "the session carries no publication approval gate,"
                         " so the request could not be recorded"
                     )
-                    refusal = (
-                        "No managed repository workspace is mounted at /workspace; "
-                        "publication cannot be requested from this session."
-                    )
-                if gate.pending_halt:
+                    refusal = NO_PUBLICATION_GATE_TEXT
+                if gate.halt_after_publication():
                     # The approval hook's PostToolUse halt after the body ran.
                     answer = refusal or "Publication requested."
                     return (

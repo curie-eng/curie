@@ -428,7 +428,7 @@ def test_platform_publish_is_recordable_under_production_sre_tool_policy(
     assert gate.publication_title == "Workspace tool check"
     assert gate.publication_body == "prior-turn marker"
     assert gate.pending_granted_arguments == tool_input
-    assert gate.pending_halt is True
+    assert gate.halt_after_publication() is True
 
 
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])

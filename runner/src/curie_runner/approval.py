@@ -567,6 +567,15 @@ def summarize_tool_call(tool_name: str, tool_input: dict[str, Any]) -> str:
     return f"{APPROVAL_SUMMARY_PREFIX}{tool_name} {rendered}"
 
 
+# The ``publish_changes`` body's answer in a session with no publication gate.
+# It is the body's own output, so a tool result carrying it proves the body ran
+# rather than a PreToolUse hook denying the call (see ``translate_message``).
+NO_PUBLICATION_GATE_TEXT = (
+    "No managed repository workspace is mounted at /workspace; "
+    "publication cannot be requested from this session."
+)
+
+
 @dataclass
 class ApprovalGate:
     """Shared state between the ``can_use_tool`` callback and the session loop.
@@ -953,6 +962,19 @@ class ApprovalGate:
         self.pending_granted_arguments = deepcopy(tool_input)
         return True
 
+    def halt_after_publication(self) -> bool:
+        """Request the stop after a ``publish_changes`` body ran, if a record stands.
+
+        Called from the approval hook's PostToolUse callback (and the fake
+        tier's copy of it), so ``pending_halt`` is set exactly when the runner
+        asks the CLI to stop the turn, as ``block`` sets it on a deny.
+        """
+
+        if self.pending_summary is None:
+            return False
+        self.pending_halt = True
+        return True
+
     def refuse_publication(self, reason: str) -> None:
         """Note a ``publish_changes`` body run that recorded nothing, and why.
 
@@ -971,14 +993,15 @@ class ApprovalGate:
         precheck, and each bundle hook (the Decisions gate, the diff approval
         publish gate). So a call any hook denied records nothing and halts
         nothing, and the model receives that hook's reason and can correct the
-        call in the same turn. A recorded call sets ``pending_halt``, and the
-        approval hook's PostToolUse callback ends the turn right after it.
+        call in the same turn. The approval hook's PostToolUse callback then
+        ends the turn right after it (``halt_after_publication``).
 
         Returns None when this call owns the turn's pending record, else the
         reason the model receives. A malformed proposal records nothing and
         does not halt, so the corrected retry the reason asks for can record.
         A record already standing (another gated call, or an earlier
         publication this turn) keeps the slot, and the turn still halts on it.
+        Nothing here sets ``pending_halt``: only a requested stop does.
         """
 
         try:
@@ -987,7 +1010,6 @@ class ApprovalGate:
             self.refuse_publication(str(exc))
             return f"Publication request was not recorded: {exc}. Correct it and retry."
         self.publication_attempted = True
-        self.pending_halt = True
         if not recorded:
             return (
                 "Publication request was not recorded: another approval is already"

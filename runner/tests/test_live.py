@@ -1573,9 +1573,9 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_tool_body(
 
     With no hook and no permission callback the session runs bypassPermissions,
     so the in-process tool body executes. The body is the one recording path:
-    it records the pending approval and asks for the halt, so the turn parks
-    awaiting approval even with no hook to end it early. Before #2294 this
-    finalized DONE with nothing to approve.
+    it records the pending approval, so the turn parks awaiting approval even
+    with no hook to end it early. Before #2294 this finalized DONE with nothing
+    to approve.
     """
 
     runner, gate = _publish_runner("live-publish-ungated", gated=False)
@@ -1592,8 +1592,9 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_tool_body(
     assert final.approval_gate_kind == "permission"
     assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert gate.publication_title
-    # The tool body recorded it and asked for the halt.
-    assert gate.pending_halt is True
+    # The tool body recorded it. No hook is wired, so nothing asked the CLI to
+    # stop, and the clean final still carries the publication.
+    assert gate.pending_halt is False
 
 
 # --------------------------------------------------------------------------- #

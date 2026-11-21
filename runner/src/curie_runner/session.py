@@ -2456,12 +2456,10 @@ class SessionRunner:
             # request, so a publication call beside the ask is not one to record.
             return False
         if gate is None:
-            # No gate, so no hook of the runner's own and no body that can
-            # record: any publication call the model made is unrecordable.
+            # No gate, so no body that can record. The body's own answer
+            # proves it ran; a call a bundle hook denied ends normally.
             # A read-only turn captures no request (RUNNER-TOOL-ACCESS-3).
-            return state.tool_access is None and any(
-                name == PLATFORM_PUBLISH_TOOL_NAME for _, name, _, _ in state.tool_results
-            )
+            return state.tool_access is None and state.publication_body_refused
         return gate.publication_attempted
 
     def _log_publication_not_carried(self, state: TurnState, final: Final) -> None:

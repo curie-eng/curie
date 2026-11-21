@@ -18,6 +18,7 @@ refused body on sight of the first call, so that is the body the worker opens.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import sys
 import uuid
@@ -40,11 +41,25 @@ from .test_work_item_early_stop import (
 _RUNNER_TESTS = Path(__file__).resolve().parents[4] / "runner" / "tests"
 
 
-def _support(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    monkeypatch.syspath_prepend(str(_RUNNER_TESTS))
-    import runner_publish_hook_deny_support as support
+_SUPPORT_MODULE = "_worker_handoff_runner_publish_hook_deny_support"
 
-    return support
+
+def _support(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """Load the runner's turn helper under a private name, for this test only.
+
+    ``monkeypatch.setitem`` takes the entry back out at teardown, pass or fail,
+    and the private name never shadows the runner suite's own import.
+    """
+
+    spec = importlib.util.spec_from_file_location(
+        _SUPPORT_MODULE, _RUNNER_TESTS / "runner_publish_hook_deny_support.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Registered before it runs: its dataclasses resolve their module by name.
+    monkeypatch.setitem(sys.modules, _SUPPORT_MODULE, module)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _patch_runner_snapshot(
@@ -122,5 +137,3 @@ def test_the_corrected_publication_is_the_one_the_worker_opens(
     asyncio.run(exercise())
     # The runner ran the turn the handoff is about: two calls, the first denied.
     assert [call for call, _ in turn.emitted] == [support.call_id(0), support.call_id(1)]
-    # Leave no runner test helper importable by bare name for later tests.
-    sys.modules.pop("runner_publish_hook_deny_support", None)

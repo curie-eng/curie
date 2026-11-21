@@ -205,6 +205,62 @@ def test_the_review_gate_diff_approval_deny_holds(
     _assert_nothing_published(turn)
 
 
+_ROUTE = "publish-approvers"
+
+
+def test_an_approval_routed_publish_a_bundle_denies_creates_no_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A route-bound, approval-gated publish that a bundle hook always denies.
+
+    The runner's approval hook and the bundle's deny run on the same call. No
+    approval is parked, so the worker has nothing to create one from, and the
+    model sees the deny each time. Red before the fix: the approval hook parked
+    the first call on its route.
+    """
+
+    workspace = workspace_with_change(tmp_path)
+    turn = run_publish_turn(
+        tmp_path,
+        monkeypatch,
+        workspace=workspace,
+        hook_command=scripted_hook(tmp_path),
+        script=[REFUSED_BODY, REFUSED_BODY],
+        publish_route=_ROUTE,
+    )
+
+    assert turn.gate.route_by_tool[PLATFORM_PUBLISH_TOOL_NAME] == _ROUTE
+    assert len(turn.emitted) == 2
+    for index in range(2):
+        assert SCRIPTED_REFUSAL in turn.result_text(call_id(index))
+    assert turn.gate.pending_route is None
+    assert turn.final.approval_route is None
+    _assert_nothing_published(turn)
+
+
+def test_an_approval_routed_publish_parks_only_the_corrected_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same route-bound gate, denied once then allowed: one approval, on
+    the route, for the corrected body. Red before the fix: the refused body was
+    parked on the route."""
+
+    workspace = workspace_with_change(tmp_path)
+    turn = run_publish_turn(
+        tmp_path,
+        monkeypatch,
+        workspace=workspace,
+        hook_command=scripted_hook(tmp_path),
+        script=[REFUSED_BODY, CORRECTED_BODY],
+        publish_route=_ROUTE,
+    )
+
+    assert len(turn.emitted) == 2
+    assert SCRIPTED_REFUSAL in turn.result_text(call_id(0))
+    assert turn.final.approval_route == _ROUTE
+    _assert_published_once(turn, call_id(1), CORRECTED_BODY)
+
+
 def test_an_allowing_bundle_publishes_once_and_halts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

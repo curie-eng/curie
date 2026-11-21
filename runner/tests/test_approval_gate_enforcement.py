@@ -1501,12 +1501,10 @@ def test_publish_call_the_hooks_allowed_is_recorded_by_the_body_and_pauses(
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "The proposed change."
     assert runner.status == SessionStatus.AWAITING_APPROVAL
-    # The body recorded the call and asked for the halt.
+    # The body recorded the call and the post-hook asked for the halt.
     assert gate.publication_attempted is True
     assert gate.pending_halt is True
-    assert not any("not recorded" in record.getMessage() for record in caplog.records), (
-        caplog.text
-    )
+    assert not any("not recorded" in record.getMessage() for record in caplog.records), caplog.text
 
 
 def test_publish_call_a_pre_tool_use_hook_denied_records_nothing() -> None:
@@ -1763,28 +1761,51 @@ def test_publish_call_on_a_gate_that_does_not_carry_publish_fails_closed() -> No
     assert gate.pending_halt is False
 
 
-def test_publish_call_in_a_session_with_no_gate_fails_closed() -> None:
-    # revert: key the fail-closed rule on the gate alone -> a session with no
-    # approval gate at all (no managed workspace, no policy) answers the publish
-    # call with the tool body's error and the turn ends DONE, as if nothing had
-    # been asked for. No gate means no body that can record, so any publication
-    # call the model made fails the turn closed (#2294).
-    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+def _gateless_body_answer() -> str:
+    """What the real ``publish_changes`` body answers in a session with no gate."""
 
-    publish = _publish_block()
-    script = [
-        publish,
+    server = build_approval_server(None, managed_workspace=False)
+    entry = server["instance"].get_request_handler("tools/call")
+    assert entry is not None
+    result = anyio.run(
+        entry.handler,
+        None,
+        mcp_types.CallToolRequestParams(
+            name=PLATFORM_PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+            arguments={"title": "Ship changes", "body": "The proposed change."},
+        ),
+    )
+    payload = result.model_dump()
+    assert payload.get("is_error") is True
+    return " ".join(str(item.get("text") or "") for item in payload.get("content") or [])
+
+
+def _gateless_publish_turn(answer: str) -> list[Any]:
+    """A publish call the CLI answered with ``answer``, then a clean ending."""
+
+    return [
+        _publish_block(),
         UserMessage(
             content=[
                 ToolResultBlock(
                     tool_use_id="p1",
-                    content="No managed repository workspace is mounted at /workspace.",
+                    content=[{"type": "text", "text": answer}],
                     is_error=True,
                 )
             ]
         ),
         *_publish_then_clean_done()[1:],
     ]
+
+
+def test_publish_body_run_in_a_session_with_no_gate_fails_closed() -> None:
+    # revert: key the fail-closed rule on the gate alone -> a session with no
+    # approval gate at all (no managed workspace, no policy) answers the publish
+    # call with the tool body's error and the turn ends DONE, as if nothing had
+    # been asked for. The body's own answer proves it ran (#2294).
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    script = _gateless_publish_turn(_gateless_body_answer())
     runner, _session = _runner_over(script, gate=None)  # type: ignore[arg-type]
 
     events = parse_ndjson("".join(_run_lines(runner)))
@@ -1794,6 +1815,25 @@ def test_publish_call_in_a_session_with_no_gate_fails_closed() -> None:
     assert "no publication approval gate" in errors[0].message
     final = events[-1]
     assert final.status == SessionStatus.CLASSIFIED_FAILURE, final.status
+    assert final.approval_summary is None
+
+
+def test_publish_a_hook_denied_in_a_session_with_no_gate_ends_normally() -> None:
+    # Liveness: a bundle PreToolUse deny is not the body running. The model
+    # read the hook's reason and answered; the turn ends on its own text.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    script = _gateless_publish_turn("bundle gate: this publication body is refused")
+    runner, _session = _runner_over(script, gate=None)  # type: ignore[arg-type]
+
+    events = parse_ndjson("".join(_run_lines(runner)))
+
+    assert not any(
+        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+        for e in events
+    )
+    final = events[-1]
+    assert final.status == SessionStatus.DONE, final.status
     assert final.approval_summary is None
 
 
@@ -1893,7 +1933,7 @@ def test_a_recorded_publish_survives_a_later_malformed_body_run() -> None:
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "the proposal"
     assert gate.pending_granted_arguments == {"title": "Ship changes", "body": "the proposal"}
-    assert gate.pending_halt is True
+    assert gate.halt_after_publication() is True
 
 
 def test_another_gated_tools_approval_is_kept_when_a_publish_call_cannot_take_the_slot(
