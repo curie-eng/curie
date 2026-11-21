@@ -379,10 +379,31 @@ def desired_label(status: str) -> str:
     return _DESIRED_LABEL.get(status, "")
 
 
+def _workspace_retention_line(workspace_recovery_enabled: bool, work_item_id: str) -> str:
+    """The last line of a failed result, naming what happened to unpublished edits (#5446).
+
+    The line depends only on the installation setting, not on whether a capture
+    succeeded: capture runs in the worker and can finish after the notice is
+    rendered, so the setting is the only fact known at render time.
+    """
+
+    if workspace_recovery_enabled:
+        return (
+            "Unpublished edits are kept only if this run's recovery checkpoint was captured, "
+            f"for 24 hours; an operator can list it with GET /work-items/{work_item_id}/recovery. "
+            "A new run still starts again from the base.\n"
+        )
+    return (
+        "Unpublished edits from this run were not kept. A new run starts again from the base.\n"
+    )
+
+
 def result_section(
     cause: str,
     *,
     pr_url: str | None,
+    workspace_recovery_enabled: bool,
+    work_item_id: str,
     feedback_url: str | None = None,
     detail: str | None = None,
     unchanged: bool = False,
@@ -397,6 +418,10 @@ def result_section(
     this request and ``lost_retried`` whether its settlement admitted a
     successor (ADR 0206); together they choose the retry or exhausted sentence.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
+    Every failed result (the generic ``Could not complete:`` branch, including
+    the ``Retrying:`` owner-loss variant) ends with the workspace-retention line
+    from ``_workspace_retention_line``; completed, ``issue_cancelled`` and
+    ``lineage_closed`` results are unchanged.
     """
 
     if cause == "completed":
@@ -531,6 +556,11 @@ def result_section(
             text += f"Failure class: {failure_class}\n"
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"
+    if cause not in {"completed", "issue_cancelled", "lineage_closed"}:
+        # The last line of the failure result, after any agent message block and
+        # after the Cause: line, so the Cause: parse in tools/factory-e2e and the
+        # usage line appended by the caller are unchanged (#5446).
+        text += _workspace_retention_line(workspace_recovery_enabled, work_item_id)
     return text
 
 
@@ -1212,6 +1242,8 @@ async def _render(
             result = result_section(
                 cause,
                 pr_url=pr_url,
+                workspace_recovery_enabled=settings.workspace_recovery_enabled,
+                work_item_id=str(work_item.id),
                 feedback_url=request.reply_target_url,
                 detail=row.detail,
                 unchanged=unchanged,
