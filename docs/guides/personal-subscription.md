@@ -20,7 +20,7 @@ This page does not repeat it.
    `factory model auth mode: personal`. An installation that set
    `FACTORY_MODEL_AUTH_MODE` through `api.extraEnv` and `worker.extraEnv`
    must remove those entries and set `factory.modelAuthMode` in the same
-   upgrade; the chart README section "Factory model auth mode" shows how. See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue).
+   upgrade; [the combined upgrade recipe](../operations.md#upgrade-with-retained-model-auth-entries-and-0188-pending) shows how. See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue).
 2. `personalClaude.grantNamespace` names an existing namespace used only for
    personal grant custody. An empty value makes enrollment answer
    `custody_unconfigured`. See
