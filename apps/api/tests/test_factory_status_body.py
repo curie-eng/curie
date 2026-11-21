@@ -28,6 +28,7 @@ from curie_api.forges.types import (
 from curie_api.models import FactoryStatusComment
 
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
 CARD = "https://curie.example.com/v1/factory/cards/abc.svg"
 WAITING = "_Waiting for the agent to report progress._"
 
@@ -133,7 +134,13 @@ def test_a_final_phase_shows_where_the_run_stopped(cause: str, round_label: str 
         card_url=None,
         pill_label="FAILED",
         phase_view=view,
-        result=result_section(cause, pr_url=None, detail="The maintainer must choose a parser."),
+        result=result_section(
+            cause,
+            pr_url=None,
+            detail="The maintainer must choose a parser.",
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
+        ),
     )
 
     assert "- [ ] **Plan** (stopped here)" in body
@@ -190,7 +197,13 @@ def _assert_redacted(body: str) -> None:
 
 @pytest.mark.parametrize("cause", ["early_stop", "no_pull_request", "model_credit_exhausted"])
 def test_final_status_redacts_provider_metadata_in_quotes_and_cause_lines(cause: str) -> None:
-    result = result_section(cause, pr_url=None, detail=_PROVIDER_DETAIL)
+    result = result_section(
+        cause,
+        pr_url=None,
+        detail=_PROVIDER_DETAIL,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     result += f"Cause: key_id={_KEY_ID}; workspace: {_WORKSPACE}\n{_PR_URL}\n"
     body = status_body(
         request_id=REQUEST,
@@ -239,6 +252,8 @@ def test_status_redacts_contextual_names_without_removing_workspace_failure_text
         "workspace_error",
         pr_url=None,
         detail=f"The repository workspace could not be prepared. {metadata}",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     body = status_body(
         request_id=REQUEST,
@@ -263,6 +278,8 @@ def test_backtick_labels_and_escaped_json_values_are_redacted() -> None:
             f'`key_id`: "{_KEY_ID}"; `workspace`: "{_WORKSPACE}"\n'
             f'{{"workspace": "{escaped}", "key_id": "{_KEY_ID}"}}'
         ),
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     body = status_body(
         request_id=REQUEST,
@@ -278,7 +295,13 @@ def test_backtick_labels_and_escaped_json_values_are_redacted() -> None:
 
 
 def test_an_empty_key_label_does_not_consume_the_cause_line() -> None:
-    result = result_section("model_error", pr_url=None, detail="Key ID:")
+    result = result_section(
+        "model_error",
+        pr_url=None,
+        detail="Key ID:",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     body = status_body(
         request_id=REQUEST,
         card_url=None,
@@ -299,6 +322,8 @@ def test_bold_labels_and_capitalized_workspace_names_are_redacted() -> None:
         detail=(
             f'**key_id**: "{_KEY_ID}"; **workspace name**: {team}\n{{"key_id": "{escaped_key}"}}'
         ),
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     body = status_body(
         request_id=REQUEST,
@@ -319,6 +344,8 @@ def test_underscore_emphasis_labels_are_redacted() -> None:
         "model_error",
         pr_url=None,
         detail=(f'_key_id_: "{_KEY_ID}"; _workspace_: "{team}"\n__key_id__: "{_KEY_ID}"'),
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     body = status_body(
         request_id=REQUEST,
@@ -339,6 +366,8 @@ def test_equals_assignment_redacts_a_lowercase_workspace_name() -> None:
         "model_error",
         pr_url=None,
         detail=f"workspace={name}; workspace_name={name}",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     body = status_body(
         request_id=REQUEST,
@@ -357,6 +386,8 @@ def test_workspace_diagnostic_prose_stays_while_a_slug_is_redacted() -> None:
         "workspace_error",
         pr_url=None,
         detail=f"{prose}. workspace: {_WORKSPACE}",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     body = status_body(
         request_id=REQUEST,
@@ -385,7 +416,12 @@ def test_provider_key_url_with_pull_request_path_is_still_redacted() -> None:
 
 def test_github_pull_request_in_a_keys_repository_stays_usable() -> None:
     pr_url = "https://github.com/acme-corp/keys/pull/7#issuecomment-3936"
-    result = result_section("completed", pr_url=pr_url)
+    result = result_section(
+        "completed",
+        pr_url=pr_url,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     body = status_body(
         request_id=REQUEST,
         card_url=None,
@@ -608,7 +644,12 @@ def test_github_follow_up_recognition_is_unchanged() -> None:
 
 
 def test_admission_wait_expiry_result_uses_neutral_wording() -> None:
-    body = result_section("capacity_wait_expired", pr_url=None)
+    body = result_section(
+        "capacity_wait_expired",
+        pr_url=None,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert body.splitlines()[0] == (
         "Could not complete: sandbox admission did not complete before the wait expired."
     )
