@@ -11,6 +11,9 @@ use serde_json::Value;
 use crate::exit::CliError;
 use crate::ui::{CliOutput, Ui};
 
+/// A line that is exactly this ends the Decisions section, as the next `## ` heading
+/// does. The platform writes it before the lines it adds after the agent's text.
+const SECTION_END: &str = "---";
 const NONE_LINE: &str = "None: the change follows directly from the acceptance criteria.";
 const MAX_ENTRIES: usize = 7;
 const MAX_PAGES: usize = 10;
@@ -584,7 +587,7 @@ pub(crate) fn parse_decisions(body: &str) -> DecisionsParse {
         + 1;
     let mut section = Vec::new();
     for line in &lines[start..] {
-        if line.starts_with("## ") {
+        if line.starts_with("## ") || line == SECTION_END {
             break;
         }
         section.push(line.clone());
@@ -1107,6 +1110,66 @@ mod tests {
             let expected = case["entries"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{id} entries"));
+            if expected.is_empty() {
+                assert!(matches!(parsed, DecisionsParse::None), "{id}: {parsed:?}");
+                continue;
+            }
+            let DecisionsParse::Recorded(entries) = parsed else {
+                panic!("{id} should be recorded: {parsed:?}");
+            };
+            assert_eq!(entries.len(), expected.len(), "{id}");
+            for (entry, want) in entries.iter().zip(expected) {
+                assert_eq!(entry.n, want["n"].as_u64().unwrap(), "{id}");
+                assert_eq!(entry.choice, want["choice"].as_str().unwrap(), "{id}");
+                assert_eq!(entry.rejected, want["rejected"].as_str().unwrap(), "{id}");
+                assert_eq!(entry.reason, want["reason"].as_str().unwrap(), "{id}");
+                assert_eq!(entry.source, want["source"].as_str().unwrap(), "{id}");
+                assert_eq!(entry.evidence, want["evidence"].as_str().unwrap(), "{id}");
+            }
+        }
+    }
+
+    /// A body the platform published: the agent's text with the platform's own
+    /// text after it. The fixture is written by the Python producer and held to its
+    /// output byte for byte by `test_factory_decisions_trailer.py`.
+    #[test]
+    fn factory_published_decisions_vector() {
+        // The first file holds bodies the platform text helpers publish. The second
+        // holds bodies the publications route stored, with the per-run issue number
+        // and marker replaced by fixed text.
+        let mut cases: Vec<Value> = Vec::new();
+        for name in [
+            "factory-decisions-published.json",
+            "factory-decisions-published-route.json",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tests/vectors")
+                .join(name);
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {path:?}: {error}"));
+            let document: Value = serde_json::from_str(&raw).expect("vector json");
+            let file_cases = document["cases"].as_array().expect("cases").clone();
+            assert!(
+                file_cases.iter().any(|case| case["valid"] == true),
+                "{name}"
+            );
+            assert!(
+                file_cases.iter().any(|case| case["valid"] == false),
+                "{name}"
+            );
+            cases.extend(file_cases);
+        }
+        for case in &cases {
+            let id = case["id"].as_str().unwrap_or("?");
+            let parsed = parse_decisions(case["published_body"].as_str().expect("published body"));
+            if case["valid"].as_bool() != Some(true) {
+                assert!(
+                    matches!(parsed, DecisionsParse::Unparsed(_)),
+                    "{id} must stay unparsed: {parsed:?}"
+                );
+                continue;
+            }
+            let expected = case["entries"].as_array().expect("entries");
             if expected.is_empty() {
                 assert!(matches!(parsed, DecisionsParse::None), "{id}: {parsed:?}");
                 continue;

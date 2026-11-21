@@ -48,6 +48,9 @@ ASK_TOOL = "mcp__curie__ask_questions"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
 QUESTION_HEADING = "### Questions from the factory"
 CITATION = re.compile(r"^Answered on the ticket by \S")
+# A line that is exactly this ends the Decisions section, as `decisions_section.py`
+# reads it; a citation below it is not in the section. A test holds both to one text.
+DECISIONS_END = "---"
 STATE_NAME = "factory-investigation"
 STATE_DIRECTORY = ".curie/" + STATE_NAME
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
@@ -297,7 +300,7 @@ def cited(body: Any) -> bool:
         if line != "## Decisions":
             continue
         for entry in lines[index + 1 :]:
-            if entry.startswith("## "):
+            if entry.startswith("## ") or entry == DECISIONS_END:
                 break
             if CITATION.match(entry):
                 return True
