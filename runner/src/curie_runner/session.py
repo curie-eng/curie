@@ -2998,6 +2998,11 @@ class SessionRunner:
             return Final(text="run interrupted", status=final.status), False
         if final.status is not SessionStatus.DONE:
             return final, False
+        if self._questions_posted():
+            # ADR 0286 decision 2 (#5785): the posted question round is this
+            # turn's answer, and the halt ended the turn before any final text,
+            # so there is no candidate to validate and the turn is not a failure.
+            return final, False
         accepted = validation.accepts(final.text)
         if accepted:
             # Preserve the outbound security boundary. A candidate needing

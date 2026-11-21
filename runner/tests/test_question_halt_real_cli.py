@@ -34,6 +34,7 @@ from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.adapter import ClaudeAgentSession, build_options
 from curie_runner.approval import APPROVAL_SERVER_NAME, ApprovalGate, build_approval_gate
 from curie_runner.completion_contract import bind_completion_contract
+from curie_runner.final_answer import FinalAnswerPolicy
 from curie_runner.harness.claude.approval import (
     build_approval_hook,
     build_approval_server,
@@ -232,6 +233,7 @@ def _run_turn(
     script: str = "sequential",
     workspace: bool = True,
     next_turn: bool = False,
+    final_answer: FinalAnswerPolicy | None = None,
 ) -> _Turn:
     """One turn, wired as ``__main__`` wires a factory session.
 
@@ -310,6 +312,7 @@ def _run_turn(
                 model="claude-sonnet-5",
                 approval_gate=approval_gate,
                 question_gate=gate,
+                final_answer=final_answer,
             )
             lines: list[str] = []
             await runner.start()
@@ -488,6 +491,48 @@ def test_the_halt_does_not_outlive_its_turn_without_a_workspace(
     assert turn.final.status is SessionStatus.DONE
     assert turn.gate.questions_posted is False
     assert turn.posted_after_next_turn is False
+
+
+# A bundle that requires every turn's final answer to pass its validator tool.
+_EVERY_TURN_VALIDATED = FinalAnswerPolicy(tool="mcp__acme__validate_answer")
+
+
+def test_a_posted_round_settles_done_when_every_final_answer_is_validated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The posted round is the turn's answer, so final answer validation passes it.
+
+    Red without the session rule: the halted turn has no validated final text,
+    so it ends ``classified-failure`` and the worker escalates it instead of
+    settling ``questions_asked``.
+    """
+
+    turn = _run_turn(
+        tmp_path,
+        monkeypatch,
+        answer=(200, {"round": 1, "rounds_limit": 3}),
+        final_answer=_EVERY_TURN_VALIDATED,
+    )
+
+    assert turn.gate.questions_posted is True
+    assert len(turn.bodies) == 1
+    assert turn.final.status is SessionStatus.DONE
+
+
+def test_an_unposted_ask_still_needs_a_validated_final_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Liveness: with nothing posted, an unvalidated final still fails as before."""
+
+    turn = _run_turn(
+        tmp_path,
+        monkeypatch,
+        answer=(409, {"code": "already_asked"}),
+        final_answer=_EVERY_TURN_VALIDATED,
+    )
+
+    assert turn.gate.questions_posted is False
+    assert turn.final.status is SessionStatus.CLASSIFIED_FAILURE
 
 
 @pytest.mark.parametrize(
