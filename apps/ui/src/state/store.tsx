@@ -66,6 +66,8 @@ export function reducer(s: AppState, a: Action): AppState {
       };
     case "openTrace":
       return { ...s, traceOpen: a.id };
+    case "openFactoryTrace":
+      return { ...s, nav: "observability", obsTab: "traces", traceOpen: a.id, agentDetail: null, tracesAgentId: null, logsPod: null };
     case "closeTrace":
       return { ...s, traceOpen: null };
     case "openLogs":

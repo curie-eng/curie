@@ -8,7 +8,7 @@ prototypes/observability/read_tree.py).
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -37,11 +37,7 @@ def matching_traces(
     cap keeps the most recent matching runs.
     """
 
-    out = [
-        t
-        for t in traces
-        if isinstance(t.get("name"), str) and name_contains in t["name"]
-    ]
+    out = [t for t in traces if isinstance(t.get("name"), str) and name_contains in t["name"]]
     return out[:limit]
 
 
@@ -89,9 +85,7 @@ def _probe_attr(bag: Any, key: str, *, bare_key: str | None = None) -> str | Non
     return None
 
 
-def hoist_sandbox_id(
-    trace: dict[str, Any], observations: list[dict[str, Any]]
-) -> str | None:
+def hoist_sandbox_id(trace: dict[str, Any], observations: list[dict[str, Any]]) -> str | None:
     """Lift the runner's sandbox id out of a trace, or None when absent.
 
     Checks, in order, the trace-level resource/metadata attributes then the
@@ -145,9 +139,7 @@ def build_tree(observations: list[dict[str, Any]]) -> list[ObservationNode]:
     known_ids = {obs["id"] for obs in observations}
 
     def node_for(obs: dict[str, Any]) -> ObservationNode:
-        kids = sorted(
-            children.get(obs["id"], []), key=lambda o: o.get("startTime") or ""
-        )
+        kids = sorted(children.get(obs["id"], []), key=lambda o: o.get("startTime") or "")
         return ObservationNode(
             id=obs["id"],
             type=obs.get("type", ""),
@@ -162,8 +154,7 @@ def build_tree(observations: list[dict[str, Any]]) -> list[ObservationNode]:
     roots = [
         obs
         for obs in observations
-        if not obs.get("parentObservationId")
-        or obs.get("parentObservationId") not in known_ids
+        if not obs.get("parentObservationId") or obs.get("parentObservationId") not in known_ids
     ]
     roots.sort(key=lambda o: o.get("startTime") or "")
     return [node_for(root) for root in roots]
@@ -182,9 +173,7 @@ class LangfuseClient:
         self._client = client
 
     async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        resp = await self._client.get(
-            f"{self._base}{path}", params=params, auth=self._auth
-        )
+        resp = await self._client.get(f"{self._base}{path}", params=params, auth=self._auth)
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()
         return data
@@ -205,9 +194,7 @@ class LangfuseClient:
 
         items: list[dict[str, Any]] = []
         for page in range(1, max_pages + 1):
-            body = await self._get(
-                path, {**params, "page": page, "limit": _MAX_PAGE_SIZE}
-            )
+            body = await self._get(path, {**params, "page": page, "limit": _MAX_PAGE_SIZE})
             meta = body.get("meta") or {}
             if require_complete and int(meta.get("totalPages", page)) > max_pages:
                 raise LangfuseReadLimitExceeded("complete trace read exceeds page bound")
@@ -226,20 +213,53 @@ class LangfuseClient:
             return await self._get_all("/api/public/traces", {}, max_items=limit)
         # Filter to one agent's traces. Langfuse's list API has no substring
         # filter, so scan the most recent traces and match `name contains` here.
-        scanned = await self._get_all(
-            "/api/public/traces", {}, max_items=_TRACE_SCAN_LIMIT
-        )
+        scanned = await self._get_all("/api/public/traces", {}, max_items=_TRACE_SCAN_LIMIT)
         return matching_traces(scanned, name_contains, limit)
 
     async def get_trace(self, trace_id: str) -> dict[str, Any]:
         return await self._get(f"/api/public/traces/{trace_id}", {})
 
     async def get_observations(self, trace_id: str) -> list[dict[str, Any]]:
-        body = await self._get(
-            "/api/public/observations", {"traceId": trace_id, "limit": 100}
-        )
+        body = await self._get("/api/public/observations", {"traceId": trace_id, "limit": 100})
         observations: list[dict[str, Any]] = body.get("data", [])
         return observations
+
+    async def list_factory_traces(
+        self, session_id: str, started_at: datetime, terminal_at: datetime
+    ) -> tuple[list[str], str]:
+        """Find runner turns for one execution on the pinned Langfuse v3 API.
+
+        The worker gives every turn in a thread the same session ID. The
+        execution interval narrows the match to this request. Only identifiers
+        cross into Curie's report; observation content stays in Langfuse.
+        """
+
+        params: dict[str, Any] = {
+            "sessionId": session_id,
+            "name": f"curie-run:{session_id}",
+            "fromTimestamp": started_at.isoformat(),
+            "toTimestamp": (terminal_at + timedelta(microseconds=1)).isoformat(),
+            "limit": 100,
+            "page": 1,
+        }
+        trace_ids: list[str] = []
+        seen: set[str] = set()
+        for _ in range(10):
+            body = await self._get("/api/public/traces", params)
+            for row in body.get("data", []):
+                if (
+                    row.get("name") != f"curie-run:{session_id}"
+                    or row.get("sessionId") != session_id
+                ):
+                    continue
+                trace_id = row.get("id")
+                if isinstance(trace_id, str) and trace_id and trace_id not in seen:
+                    seen.add(trace_id)
+                    trace_ids.append(trace_id)
+            if params["page"] >= int((body.get("meta") or {}).get("totalPages", params["page"])):
+                return trace_ids, "time_matched" if trace_ids else "missing"
+            params["page"] += 1
+        return trace_ids, "truncated"
 
     async def list_traces_by_tags(
         self,
@@ -259,9 +279,7 @@ class LangfuseClient:
             params["fields"] = fields
         if order_by is not None:
             params["orderBy"] = order_by
-        return await self._get_all(
-            "/api/public/traces", params, require_complete=require_complete
-        )
+        return await self._get_all("/api/public/traces", params, require_complete=require_complete)
 
     async def query_metrics(self, query: dict[str, Any]) -> list[dict[str, Any]]:
         """Run a Langfuse Metrics API query and return its data rows.

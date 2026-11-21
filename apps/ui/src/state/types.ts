@@ -61,6 +61,7 @@ export type Action =
   | { type: "setObsTab"; tab: ObsTab }
   | { type: "viewTraces"; agentId: string | null }
   | { type: "openTrace"; id: string }
+  | { type: "openFactoryTrace"; id: string }
   | { type: "closeTrace" }
   | { type: "openLogs"; sandboxId: string }
   | { type: "openAgentDetail"; id: string }

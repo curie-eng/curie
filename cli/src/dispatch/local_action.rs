@@ -312,16 +312,19 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
         },
         LocalAction::WorkItems {
             id,
+            report,
             agent,
             api_url,
             api_key,
             dry_run,
         } => emit({
             let id = commands::validated_work_item_id(id)?;
+            let report = commands::validated_work_item_id(report)?;
             commands::work_items(commands::WorkItemsOpts {
                 api_url,
                 api_key,
                 id,
+                report,
                 agent,
                 dry_run,
                 tier: "local",

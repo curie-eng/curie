@@ -551,6 +551,8 @@ _HTTP_OPERATIONS = [
     "/work-items",
     "/work-items/issue-read",
     "/work-items/{work_item_id}",
+    "/work-items/{work_item_id}/runs/{request_id}/report",
+    "/work-items/runs/{request_id}/report",
     "/work-items/{work_item_id}/usage",
     "/work-items/{work_item_id}/recovery",
     "/work-items/{work_item_id}/recovery/{checkpoint_id}",

@@ -60,6 +60,7 @@ class WorkItemRequestOut(BaseModel):
     """Operator view of one ExecutionRequest (#2577). Built from an explicit
     allowlist dict, never from an ORM row, so no runtime-owner field leaks."""
 
+    id: uuid.UUID
     sequence: int
     status: str
     created_at: datetime
@@ -238,6 +239,47 @@ class WorkItemOutcomeList(BaseModel):
     items: list[WorkItemOutcomeOut]
     limit: int
     truncated: bool
+
+
+class FactoryRunEventOut(BaseModel):
+    id: str
+    at: datetime
+    kind: Literal["phase", "publication", "state", "terminal"]
+    text: str
+    reference_url: str | None = None
+    phase: str | None = None
+    round: int | None = None
+
+
+class FactoryRunEvidenceOut(BaseModel):
+    event_id: str
+    statement: str
+
+
+class FactoryRunAnalysisOut(BaseModel):
+    immediate_cause: str
+    summary: str
+    evidence: list[FactoryRunEvidenceOut]
+
+
+class FactoryRunSourcesOut(BaseModel):
+    phase_reports: Literal["complete", "missing", "truncated"]
+    state_changes: Literal["partial", "truncated"]
+    publications: Literal["complete", "missing", "truncated"]
+    traces: Literal["time_matched", "missing", "truncated", "unavailable"]
+    artifacts: Literal["complete", "unavailable", "truncated"]
+
+
+class FactoryRunReportOut(BaseModel):
+    work_item_id: uuid.UUID
+    execution_request_id: uuid.UUID
+    status: str
+    terminal_cause: str
+    terminal_at: datetime
+    sources: FactoryRunSourcesOut
+    trace_ids: list[str]
+    events: list[FactoryRunEventOut]
+    analysis: FactoryRunAnalysisOut
 
 
 # Every answer the factory Slack steering route gives (#5414). Each refusal is

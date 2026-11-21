@@ -23,6 +23,7 @@ vi.mock("../../api/client", async (importOriginal) => {
     listWorkItems: vi.fn(),
     getWorkItem: vi.fn(),
     getWorkItemUsage: vi.fn(),
+    getFactoryRunReport: vi.fn(),
   };
 });
 
@@ -502,6 +503,47 @@ describe("WiredFactory (#4102)", () => {
     // Read-only (Decision 2): the panel has no buttons, and the view has no write verbs.
     expect(within(panel).queryAllByRole("button")).toHaveLength(0);
     expect(screen.queryByRole("button", { name: /cancel|retry|pause/i })).toBeNull();
+  });
+
+  it("opens retained evidence for a terminal execution", async () => {
+    const item = outcome({
+      state: "completed_unpublished",
+      requests: [{
+        ...outcome().requests[0],
+        id: "req-1",
+        status: "failed",
+        terminal_at: iso(HOUR),
+        terminal_cause: "no_pull_request",
+      }],
+    });
+    vi.mocked(listWorkItems).mockResolvedValue(list([item]));
+    vi.mocked(getWorkItem).mockResolvedValue(item);
+    vi.mocked(client.getFactoryRunReport).mockResolvedValue({
+      work_item_id: "wi-1",
+      execution_request_id: "req-1",
+      status: "failed",
+      terminal_cause: "no_pull_request",
+      terminal_at: iso(HOUR),
+      sources: {
+        phase_reports: "missing",
+        state_changes: "partial",
+        publications: "missing",
+        traces: "time_matched",
+        artifacts: "unavailable",
+      },
+      trace_ids: ["trace-1"],
+      events: [{ id: "terminal", at: iso(HOUR), kind: "terminal", text: "No pull request", phase: null, round: null }],
+      analysis: { immediate_cause: "no_pull_request", summary: "Inspect linked Langfuse traces", evidence: [] },
+    });
+    renderView();
+    await userEvent.click((await screen.findAllByTestId("factory-card"))[0]);
+    await userEvent.click(await screen.findByRole("button", { name: "Inspect run" }));
+    await waitFor(() => expect(client.getFactoryRunReport).toHaveBeenCalledWith("wi-1", "req-1"));
+    const report = await screen.findByTestId("factory-run-report");
+    expect(report).toHaveTextContent("no_pull_request");
+    expect(report).toHaveTextContent("No pull request");
+    expect(report).toHaveTextContent("phases: missing");
+    expect(within(report).getByRole("button", { name: "Open trace trace-1" })).toBeTruthy();
   });
 
   it("keeps its detail cache apart from the Work items view", async () => {

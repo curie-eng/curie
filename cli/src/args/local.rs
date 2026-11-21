@@ -863,6 +863,9 @@ pub(crate) enum LocalAction {
         /// Work item id to read. Omit to list.
         #[arg(value_name = "ID")]
         id: Option<String>,
+        /// Read one terminal execution's retained report.
+        #[arg(long, value_name = "REQUEST_ID")]
+        report: Option<String>,
         /// Scope to one agent (name or id).
         #[arg(long, value_name = "NAME_OR_ID")]
         agent: Option<String>,

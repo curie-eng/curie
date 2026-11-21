@@ -1724,6 +1724,8 @@ pub struct WorkItemCi {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItemRequest {
     #[serde(default)]
+    pub id: String,
+    #[serde(default)]
     pub tenant_id: Option<String>,
     #[serde(default)]
     pub model_auth_mode: Option<String>,
@@ -4751,6 +4753,39 @@ impl ApiClient {
             .json()
             .await
             .context("decoding the work item")
+    }
+
+    /// Retained operator diagnostic for one terminal factory execution (#5601).
+    pub async fn get_work_item_report(
+        &self,
+        work_item_id: Option<&str>,
+        request_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let query: Vec<(&str, &str)> = agent_id.map(|id| ("agent_id", id)).into_iter().collect();
+        let path = match work_item_id {
+            Some(id) => format!("/work-items/{id}/runs/{request_id}/report"),
+            None => format!("/work-items/runs/{request_id}/report"),
+        };
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}{path}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query)
+                    .timeout(std::time::Duration::from_secs(30)),
+                "GET /work-items/runs/{request_id}/report",
+            )
+            .await?;
+        Self::expect_work_items_ok(
+            resp,
+            "reading the run report",
+            "run report not found or expired",
+        )
+        .await?
+        .json()
+        .await
+        .context("decoding the run report")
     }
 
     /// Status classes for the work item reads (ADR 0021/0041): 404 is a

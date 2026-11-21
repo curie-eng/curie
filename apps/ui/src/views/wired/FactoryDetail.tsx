@@ -1,16 +1,19 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { C } from "../../tokens";
-import { Card, Notice } from "../../primitives";
+import { Card, CliHint, Notice, cliCommand } from "../../primitives";
 import {
   ApiError,
+  getFactoryRunReport,
   getWorkItem,
   getWorkItemUsage,
   type WorkItemOutcome,
+  type FactoryRunReport,
   type WorkItemStage,
   type WorkItemUsage,
 } from "../../api/client";
 import { ExtLink, REFETCH_MS, STAGE_COLOR, StatePill, issueRef } from "./factoryParts";
+import { useStore } from "../../state/store";
 
 // The Factory detail panel (#4102 Decision 8). Read-only: no action buttons
 // (Decision 2). The detail and its usage refetch every 15 seconds (Decision 9).
@@ -57,6 +60,7 @@ function DetailBody({
   item: WorkItemOutcome;
   usage: { data?: Found<WorkItemUsage>; isPending: boolean; error: unknown };
 }) {
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const stages = item.progress?.stages ?? [];
   const note = item.progress?.note;
   return (
@@ -121,10 +125,73 @@ function DetailBody({
                 {r.status}
                 {r.terminal_cause && r.terminal_cause !== r.status ? <Muted>{` ${r.terminal_cause}`}</Muted> : null}
               </span>
+              {r.terminal_at ? (
+                <button
+                  type="button"
+                  onClick={() => setSelectedRunId(selectedRunId === r.id ? null : r.id)}
+                  style={{ marginLeft: "auto", color: C.link, background: "none", border: 0, cursor: "pointer" }}
+                >
+                  {selectedRunId === r.id ? "Hide report" : "Inspect run"}
+                </button>
+              ) : null}
             </div>
           ))}
+          {selectedRunId ? <RunReport itemId={item.id} requestId={selectedRunId} /> : null}
         </div>
       </Section>
+    </div>
+  );
+}
+
+function RunReport({ itemId, requestId }: { itemId: string; requestId: string }) {
+  const query = useQuery({
+    queryKey: ["factory", "runReport", itemId, requestId],
+    queryFn: () => orNotFound(() => getFactoryRunReport(itemId, requestId)),
+  });
+  if (query.isPending) return <Muted>Loading run report…</Muted>;
+  if (query.error) return <Notice>{`Could not load run report: ${String(query.error)}`}</Notice>;
+  if (query.data?.notFound || !query.data?.value) {
+    return <Muted>Report unavailable for this execution. It may predate capture or have expired.</Muted>;
+  }
+  return <RunReportBody report={query.data.value} />;
+}
+
+function RunReportBody({ report }: { report: FactoryRunReport }) {
+  const { state, dispatch } = useStore();
+  return (
+    <div data-testid="factory-run-report" style={{ borderTop: `1px solid ${C.border}`, paddingTop: 12, marginTop: 10 }}>
+      <CliHint command={cliCommand(state.env === "prod" ? "cluster.work-items" : "local.work-items", {
+        id: report.work_item_id,
+        report: report.execution_request_id,
+      })} />
+      <Row label="Terminal cause"><span style={{ fontFamily: C.mono }}>{report.terminal_cause}</span></Row>
+      <Row label="Analysis"><span>{report.analysis.summary}</span></Row>
+      <Row label="Sources">
+        <span>{`phases: ${report.sources.phase_reports}; state changes: ${report.sources.state_changes}; publications: ${report.sources.publications}; Langfuse traces: ${report.sources.traces}; artifacts: ${report.sources.artifacts}`}</span>
+      </Row>
+      {report.trace_ids.length ? <Muted>Traces match this thread and execution time window; exact request binding is unavailable.</Muted> : null}
+      {report.trace_ids.map((id) => (
+        <button key={id} type="button" onClick={() => dispatch({ type: "openFactoryTrace", id })} style={{ color: C.link, background: "none", border: 0, cursor: "pointer", marginRight: 8 }}>
+          {`Open trace ${id}`}
+        </button>
+      ))}
+      <div style={{ marginTop: 12, color: C.text2, fontSize: 12 }}>Timeline</div>
+      {report.events.map((event) => (
+        <div id={`factory-event-${event.id}`} key={event.id} style={{ borderLeft: `2px solid ${C.borderStrong}`, padding: "8px 12px", marginTop: 6 }}>
+          <div style={{ color: C.muted, fontSize: 11, fontFamily: C.mono }}>{`${event.at} · ${event.kind}`}</div>
+          <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: C.mono, fontSize: 11, margin: "5px 0 0" }}>{event.text}</pre>
+          {event.reference_url ? <ExtLink href={event.reference_url}>Open publication</ExtLink> : null}
+        </div>
+      ))}
+      {report.analysis.evidence.length ? (
+        <div style={{ marginTop: 10, fontSize: 11, color: C.text2 }}>
+          Evidence: {report.analysis.evidence.map((item) => (
+            <a key={item.event_id} href={`#factory-event-${item.event_id}`} style={{ color: C.link, marginRight: 8 }}>
+              {item.statement}
+            </a>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

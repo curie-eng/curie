@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from .. import transcripts
+from .. import factory_run_reports, transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
 from ..forges.errors import ForgeError
@@ -453,6 +453,7 @@ async def _queue_notice(
 
     if request.terminal_at is None:
         return
+    await factory_run_reports.capture(session, work_item, request, detail=detail)
     cause = request.terminal_cause
     if cause is None or not cause.strip():
         return
@@ -517,20 +518,28 @@ CancellationCause = Literal["issue_cancelled", "issue_deleted"]
 async def _cancel_queued_requests(
     session: AsyncSession, work_item_id: uuid.UUID, now: datetime, cause: CancellationCause
 ) -> None:
-    await session.execute(
-        update(ExecutionRequest)
-        .where(
-            ExecutionRequest.work_item_id == work_item_id,
-            ExecutionRequest.status == "queued",
-        )
-        .values(
-            status="cancelled",
-            terminal_at=now,
-            terminal_cause=cause,
-            version=ExecutionRequest.version + 1,
-            updated_at=func.clock_timestamp(),
+    cancelled = list(
+        await session.scalars(
+            update(ExecutionRequest)
+            .where(
+                ExecutionRequest.work_item_id == work_item_id,
+                ExecutionRequest.status == "queued",
+            )
+            .values(
+                status="cancelled",
+                terminal_at=now,
+                terminal_cause=cause,
+                version=ExecutionRequest.version + 1,
+                updated_at=func.clock_timestamp(),
+            )
+            .returning(ExecutionRequest.id)
         )
     )
+    if cancelled:
+        work_item = await reload_work_item(session, work_item_id)
+        for request_id in cancelled:
+            request = await reload_request(session, request_id)
+            await factory_run_reports.capture(session, work_item, request, detail=None)
 
 
 async def _opened_pull_request(
