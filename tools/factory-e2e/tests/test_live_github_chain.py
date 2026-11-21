@@ -1703,7 +1703,7 @@ def _published_cases() -> list[dict[str, Any]]:
 
 def _cited_inside(case: dict[str, Any]) -> str:
     body = str(case["published_body"])
-    if not case["entries"]:
+    if NONE_DECLARATION in body:
         # The sole None declaration takes no citation beside it; a citation alone is a section.
         return body.replace(NONE_DECLARATION, CITATION, 1)
     return body.replace("## Decisions\n", f"## Decisions\n\n{CITATION}\n", 1)
@@ -1737,29 +1737,32 @@ def test_shared_decisions_fixtures_read_alike_in_every_consumer(case: dict[str, 
             scripted(body)
         assert refused is not None and citations == []
         return
+    # The citations the agent wrote, which the platform's text follows.
+    written = [line for line in str(case["agent_body"]).splitlines() if gate.CITATION.match(line)]
     assert grammar.parse_decisions_section(body) == case["entries"]
     assert scripted(body) == len(case["entries"])
-    assert (citations, refused) == ([], None)
+    assert gate.cited(body) is bool(written)
+    assert (citations, refused) == (written, None)
     # A citation inside the section counts for each consumer.
     inside = _cited_inside(case)
     assert grammar.parse_decisions_section(inside) == case["entries"]
     assert scripted(inside) == len(case["entries"])
     assert gate.cited(inside) is True
-    assert judge.answer_citations(inside) == ([CITATION], None)
+    assert judge.answer_citations(inside) == ([CITATION, *written], None)
     # Counterexample: the same citation after the platform's text is outside
     # the section for each consumer.
     outside = _cited_after_the_platform_text(case)
     assert grammar.parse_decisions_section(outside) == case["entries"]
     assert scripted(outside) == len(case["entries"])
-    assert gate.cited(outside) is False
-    assert judge.answer_citations(outside) == ([], None)
+    assert gate.cited(outside) is bool(written)
+    assert judge.answer_citations(outside) == (written, None)
     # Counterexample: two spaces after "by". The grammar and the scripted check
     # tolerate the line; the publication gate refuses it, and so does the judge.
     spaced = inside.replace(CITATION, CITATION.replace(" by ", " by  ", 1), 1)
     assert grammar.parse_decisions_section(spaced) == case["entries"]
     assert scripted(spaced) == len(case["entries"])
-    assert gate.cited(spaced) is False
-    assert judge.answer_citations(spaced) == ([], None)
+    assert gate.cited(spaced) is bool(written)
+    assert judge.answer_citations(spaced) == (written, None)
 
 
 def test_shared_decisions_a_citation_alone_below_the_separator_is_no_section() -> None:
