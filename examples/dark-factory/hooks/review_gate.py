@@ -625,11 +625,16 @@ def save(path: Path, state: dict[str, Any]) -> None:
 
 
 def _emit(state: dict[str, Any], record: dict[str, Any]) -> None:
-    """Write one evidence line where the status card reads it: the pod log.
+    """Write one evidence line to the pod log, or to ``gate.log`` if that fails.
 
-    Our stderr is swallowed by the CLI that runs the hook, so the line goes to
-    the runner container's PID 1 stderr. ``DARK_FACTORY_PROGRESS_LOG`` redirects
-    it (tests, local runs).
+    The pod log is where the status card reads it. Our stderr is swallowed by
+    the CLI that runs the hook, so the line goes to the runner container's PID 1
+    stderr. ``DARK_FACTORY_PROGRESS_LOG`` redirects it (tests, local runs). When
+    that target cannot be opened or written, the line is appended to
+    ``gate.log`` in ``state_dir()``, which is ``DARK_FACTORY_STATE_DIR`` when
+    that is set. A reader inside the pod can read that file while the pod
+    exists, but a line there is not in the pod log. Only when that write also
+    fails does the line go to stderr.
     """
     state["seq"] += 1
     record["seq"] = state["seq"]

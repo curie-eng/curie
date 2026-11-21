@@ -158,9 +158,10 @@ exact checkout that last got `CHANGES` (no progress, so no round is spent),
 and it stops the run when the diff loop reaches its cap. A completed edit
 after a diff approval clears that approval. It refuses `publish_changes` until
 the diff reviewer approves the current checkout. It writes the `plan_review`
-and `review_diff` phase lines, with the round, to the pod log, along with
-`curie_gate` lines such as `review_refused` (its causes include `round_cap`,
-written when the diff loop reaches its cap), `review_incomplete`,
+and `review_diff` phase lines, with the round, to the pod log (or, when the pod
+log cannot be opened or written, to `gate.log` in the hook's state directory),
+along with `curie_gate` lines such as `review_refused` (its causes include
+`round_cap`, written when the diff loop reaches its cap), `review_incomplete`,
 `timing_recorded` and `timing_refused`. `report_progress` cannot record
 `implement` rounds 4 and 5 until #5203 is fixed, because the runner takes the
 `implement` cap from the `wait_ci` loop; the hook's own `review_diff` phase
@@ -217,6 +218,19 @@ through Bash). Its evidence lines share one `seq` counter per run:
 `curie_phase` lines carry `source: "hook"`, `curie_reported` lines record each
 `report_progress` call with the hook's last observed phase and `late: true`
 when the report trails it, and `curie_gate` lines record refusals.
+
+The evidence lines above go first to the progress target: the runner
+container's PID 1 stderr, which is the pod log, or the file
+`DARK_FACTORY_PROGRESS_LOG` names (tests and local runs use it). On the runner,
+PID 1 is non-dumpable, so the hook's open of `/proc/1/fd/2` fails with `EACCES`
+and the lines go to `gate.log` in `DARK_FACTORY_STATE_DIR` instead. A reader
+inside the pod can read that file while the pod exists. Lines in `gate.log` are
+not in the pod log, so `kubectl logs` does not show them. `gate.log` is one file
+for the whole state directory: lines from every run that uses that directory
+interleave, and `seq` restarts for each run, so order them by `ts`. With
+`DARK_FACTORY_STATE_DIR` unset, the state directory is a `dark-factory-review`
+folder under the system temp directory. Only when `gate.log` cannot be written
+either does the line go to stderr, which the CLI swallows.
 
 Both reviewers declare the `opus` alias. The runner resolves it to
 `claude-opus-5-5` for a direct Anthropic credential or
