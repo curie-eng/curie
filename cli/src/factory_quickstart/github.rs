@@ -94,6 +94,7 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
         private_key_file: input.private_key_file.as_ref().map(PathBuf::from),
         org: input.org.clone(),
         intake: Some(POLL_INTAKE.into()),
+        model_auth_mode: None,
         repo_runners: Vec::new(),
         registry: None,
         repo_docker: Vec::new(),

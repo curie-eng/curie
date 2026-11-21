@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/factory/v2.json",
+  "$id": "https://schemas.curietech.ai/cli/factory/v2.1.json",
   "title": "curie cluster factory --json",
-  "description": "The agent-facing payload of `curie cluster factory`: the dry-run plan, the GitHub App registration link when no App is configured, whether the GitHub factory intake is now enabled, and the App-derived settings when --app-id was given. Never carries the webhook secret or the App private key.",
+  "description": "The agent-facing payload of `curie cluster factory`: the dry-run plan, the GitHub App registration link when no App is configured, whether the GitHub factory intake is now enabled, the model auth mode a mode-only run set, and the App-derived settings when --app-id was given. Never carries the webhook secret or the App private key.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -128,6 +128,22 @@
       "required": [
         "factory_intake_enabled",
         "github_app"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "factory_model_auth_mode": {
+          "description": "`--model-auth-mode` alone: the factory.modelAuthMode this run wrote. Intake settings were left as recorded.",
+          "enum": [
+            "service",
+            "personal"
+          ]
+        }
+      },
+      "required": [
+        "factory_model_auth_mode"
       ]
     }
   ]

@@ -1524,8 +1524,9 @@ configuration loaded. No separate Helm upgrade is needed.
 
 Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
-is `poll` or `webhook`, and `poll` is the default. The API setting
-`FACTORY_MODEL_AUTH_MODE` (default `service`) selects the mode that GitHub and
+is `poll` or `webhook`, and `poll` is the default. `factory.modelAuthMode`
+(default `service`, set with `curie cluster factory --model-auth-mode
+personal`) selects the mode that GitHub and
 tracker intake, pull request review feedback, and
 [Slack steering](#factory-slack-steering) of a service WorkItem admit under.
 A labelled issue in `personal` mode names an owner when the labeller is linked
@@ -1537,8 +1538,9 @@ and, when a factory Slack channel is configured, one channel post. A WorkItem
 admitted as service before the switch refuses its tracker mentions, review
 feedback and Slack steering with `personal_owner_required`. No owner is
 invented for it. A personal WorkItem keeps its owner on every revision,
-whoever asked for it. It is an environment setting only,
-with no chart value, and the worker reads it too
+whoever asked for it. The chart renders the value as `FACTORY_MODEL_AUTH_MODE`
+into both the API and the worker, so the two cannot disagree; setting that
+variable through `api.extraEnv` or `worker.extraEnv` fails the render
 ([Personal Claude enrollment](#personal-claude-enrollment)). The `factory:`
 block replaces the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
 with `curie cluster factory`, use the
@@ -2843,10 +2845,27 @@ its transcript. Disconnect is never held. The CLI treats the refusal as
 transient (exit 3); retry once the rollout completes. Single-instance stacks
 outside Kubernetes set `CURIE_PERSONAL_ROLLOUT_HOLD=false`.
 
-The worker reads `FACTORY_MODEL_AUTH_MODE` too, and it must match the API's
-value. With `personal`, the worker refuses to start with
-`personal_mode_requires_kubernetes` unless `CURIE_SANDBOX_SUBSTRATE` is
-`kubernetes`, and it refuses every turn that has no owner (a plain run, a cron
+The worker reads the same `factory.modelAuthMode`, which the chart renders as
+`FACTORY_MODEL_AUTH_MODE` into the API and the worker alike. Select it with
+`curie cluster factory --model-auth-mode personal` (or `service`). Given alone,
+that flag writes only `factory.modelAuthMode` and leaves intake, its forges and
+`factory.enabled` as recorded. `curie cluster status` prints the mode as
+`factory model auth mode`.
+
+A release that selected personal mode by setting `FACTORY_MODEL_AUTH_MODE` in
+`api.extraEnv` and `worker.extraEnv` fails its next render, because the chart
+owns the variable now and retained values replay the old entries. In the same
+upgrade, give both lists again without the variable (`[]` when nothing else
+remains) and set `factory.modelAuthMode: personal` in one values file; the
+chart README section "Factory model auth mode" has the file and the
+`helm upgrade --reset-then-reuse-values -f` command. With `personal`, the
+worker refuses to start with `personal_mode_requires_kubernetes` unless
+`CURIE_SANDBOX_SUBSTRATE` is `kubernetes`; the chart and `curie cluster
+factory` refuse a personal release whose `worker.extraEnv` selects another
+substrate before anything is applied. They compare the literal as the worker
+does, with whitespace trimmed and case ignored, and refuse a `valueFrom` entry
+or an empty value. Changing the mode governs new admissions; an execution
+request already created keeps the mode it recorded. The worker also refuses every turn that has no owner (a plain run, a cron
 or webhook hook, an eval) with `personal_owner_required` before any claim. The
 protected hook lane is configured only from its provisioned `process.json`, so
 it does not read this setting and never runs WorkItem requests. In
@@ -3379,7 +3398,7 @@ A person steers a run by explicitly mentioning the app in that run's Slack threa
 1. `POST /identity/admin/{tenant_id}/code-host-links` with `principal_id`, `code_host_kind` (`github`), `host` (for example `github.com`), the numeric `account_id`, and `created_by_principal_id`. An account already actively linked answers 409 `link_exists`.
 2. `POST /identity/admin/{tenant_id}/links/{link_id}/revoke` ends a link. A revoked link, a disabled principal or a lost write permission refuses a mention that was queued before the change.
 
-A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `FACTORY_MODEL_AUTH_MODE=personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
+A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `factory.modelAuthMode` set to `personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
 
 The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, and for each top-level human mention whose text links an issue, before its dedupe claim, so the worker can verify the sender and the exact message. On a test installation it also stores one for a declared test driver's marked action in that driver's channel, at root or in a thread; that receipt is version 2 and names the declared bot user and bot id, never the event's user. Steering reads only a person's thread receipt and refuses any other; root receipts and version 2 receipts serve kickoff. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
 

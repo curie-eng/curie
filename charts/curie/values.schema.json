@@ -344,6 +344,7 @@
         "githubAppClientSecretExistingSecretKey": {"type": "string"},
         "enabled": {"type": "boolean"},
         "intake": {"type": "string", "enum": ["poll", "webhook"]},
+        "modelAuthMode": {"type": "string", "enum": ["service", "personal"]},
         "baseLabelSettleSeconds": {"type": "integer", "minimum": 0},
         "requesterCodingInstructions": {
           "type": "object",

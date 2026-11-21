@@ -5411,8 +5411,10 @@ def test_install_values_and_oidc_split_horizon() -> None:
     assert values["dispatcher"]["deploy"] is True
     assert values["dispatcher"]["slack"]["appTokenExistingSecret"] == f"{RELEASE}-slack-tokens"
     assert values["personalClaude"] == {"grantNamespace": f"{NAMESPACE}-grants"}
-    personal = {"name": "FACTORY_MODEL_AUTH_MODE", "value": sks.PERSONAL_MODE}
-    assert personal in values["api"]["extraEnv"] and personal in values["worker"]["extraEnv"]
+    assert values["factory"]["modelAuthMode"] == sks.PERSONAL_MODE
+    assert values["factory"]["intake"] == "poll" and values["factory"]["trackers"]
+    for workload in ("api", "worker"):
+        assert "FACTORY_MODEL_AUTH_MODE" not in json.dumps(values[workload]["extraEnv"])
     origin = {"name": "CURIE_CONSOLE_ORIGIN", "value": sks.CONSOLE_ORIGIN}
     assert origin in values["worker"]["extraEnv"]
     assert origin not in values["api"]["extraEnv"]
