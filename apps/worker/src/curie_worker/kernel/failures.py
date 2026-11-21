@@ -283,6 +283,8 @@ class TurnOutcome:
     # Every tool the turn called, the model's reply without the receipt, and
     # whether this outcome already includes the one factory continuation (#3128).
     tools_called: frozenset[str] = frozenset()
+    # An ``ask_questions`` call in this turn completed without failing (#5785).
+    questions_ask_succeeded: bool = False
     assistant_text: str = ""
     continued: bool = False
     # The kernel observed this turn end: the runner's final frame was applied,

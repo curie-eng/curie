@@ -136,19 +136,24 @@ def question_input_issues(args: Any) -> list[str]:
     return issues
 
 
+_POSTED_ENDING = (
+    "This session ends now: stop working, make no further changes and end "
+    "the turn without opening a pull request."
+)
+
+
 def _render_posted(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return _error("The questions answer could not be read. Retry shortly.")
-    number = payload.get("round")
-    limit = payload.get("rounds_limit")
+    # A 200 means the round is posted, so even an answer whose round number
+    # cannot be read is a success: the turn ends on it (ADR 0286 decision 11),
+    # and an error result would reach the CLI as a failed call instead.
+    number = payload.get("round") if isinstance(payload, dict) else None
+    limit = payload.get("rounds_limit") if isinstance(payload, dict) else None
     if type(number) is not int or number < 1:
-        return _error("The questions answer could not be read. Retry shortly.")
+        return _ok(f"The questions are posted on the ticket. {_POSTED_ENDING}")
     if type(limit) is not int or limit < 1:
         limit = ROUNDS_LIMIT
     return _ok(
-        f"The questions are posted on the ticket as round {number} of {limit}. "
-        "This session ends now: stop working, make no further changes and end "
-        "the turn without opening a pull request."
+        f"The questions are posted on the ticket as round {number} of {limit}. {_POSTED_ENDING}"
     )
 
 

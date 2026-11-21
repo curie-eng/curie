@@ -151,22 +151,20 @@ async def _bind_publication_context(
     return event.model_copy(update={"publication_context": context}), remaining_s
 
 
-async def _continuation_refused(
-    self: Kernel, run: WorkItemRun, tools_called: frozenset[str]
-) -> str | None:
+async def _continuation_refused(self: Kernel, run: WorkItemRun, asked: bool) -> str | None:
     """Why an unpublished turn must not be re-prompted, else None.
 
     The request status when it is readable and not running, or
     ``questions_asked`` when the API recorded this request's question round as
-    posted (ADR 0286 decision 2, #5785). A turn that called ``ask_questions``
-    whose round the API did not confirm either way (the read failed, or an
-    older API omits the field) is not re-prompted either, since the ask may
-    have posted. Any other unreadable request is re-prompted, as before.
+    posted (ADR 0286 decision 2, #5785). ``asked`` is an ``ask_questions`` call
+    whose result was not an error; when the API cannot confirm its round either
+    way (the read failed, or an older API omits the field) the turn is not
+    re-prompted either, since the round may be posted. A refused or failed ask,
+    or any other unreadable request, is re-prompted, as before.
     """
 
     if self._work_items is None:
         return None
-    asked = constants._QUESTION_TOOL_NAME in tools_called
     try:
         async with asyncio.timeout(constants._REQUEST_STATUS_READ_TIMEOUT_S):
             view = await self._work_items.get_request(run.request_id)
@@ -250,7 +248,7 @@ async def _continue_unpublished(
     # cancelled request is not re-prompted. ADR 0286 decision 2: neither is a
     # request whose question round the API recorded as posted, since asking
     # ends it. A refused or failed ask posted nothing and still continues.
-    status = await self._continuation_refused(run, outcome.tools_called)
+    status = await self._continuation_refused(run, outcome.questions_ask_succeeded)
     if status is not None:
         logger.info("work-item continuation skipped for %s: request %s", qevent.event_id, status)
         return outcome
@@ -423,6 +421,9 @@ async def _continue_unpublished(
             workspace_inferred_repo=inferred,
         )
         second.tools_called = outcome.tools_called | second.tools_called
+        second.questions_ask_succeeded = (
+            outcome.questions_ask_succeeded or second.questions_ask_succeeded
+        )
         second.saw_side_effect = outcome.saw_side_effect or second.saw_side_effect
         second.continued = True
         if not second.assistant_text.strip():

@@ -1126,8 +1126,8 @@ def build_runner(
     # hooks. A factory boot with no policy gate (no workspace, approval tools or
     # tool policy) still needs those hooks, so it gets a gate that gates
     # nothing and only carries the halt. It is never the session's approval
-    # gate: permissions, the pager and the session's pause rules are unchanged,
-    # and no turn start resets it, since a posted round ends the request.
+    # gate: permissions and the pager are unchanged. The session reads it as
+    # its question gate and resets it at each turn start.
     question_halt_gate = (
         approval_gate
         if approval_gate is not None
@@ -1790,6 +1790,7 @@ def build_runner(
             memory_store=memory_store,
             history_store=history_store,
             approval_gate=approval_gate,
+            question_gate=question_halt_gate,
             approval_resumed_kind=config.approval_resumed_kind,
             approval_decision=config.approval_decision,
             false_completion_check=config.false_completion_check,

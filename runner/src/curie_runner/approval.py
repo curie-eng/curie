@@ -835,10 +835,10 @@ class ApprovalGate:
 
         The request ends when the factory asks (decision 2) and the platform,
         not the model, enforces it (decision 11). This reuses the approval
-        halt: ``_decide_gate`` refuses every further call of the turn with the
-        turn-stopping flags a blocked call carries, so the model runs nothing
-        after its ask and the CLI ends the turn (``hook_stopped``, a done
-        final). No approval is recorded, so ``pending_halt`` stays unset: the
+        hook: its PostToolUse callback ends the turn right after the ask, and
+        ``_decide_gate`` refuses with the turn-stopping flags a blocked call
+        carries any call sent beside it, so the model runs nothing after its
+        ask. No approval is recorded, so ``pending_halt`` stays unset: the
         turn is not paused for a human.
         """
 

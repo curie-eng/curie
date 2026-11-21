@@ -127,6 +127,8 @@ def _step(app: web.Application, answered: int) -> list[tuple[dict[str, Any], dic
         steps = [[_ask_block()], [_bash_block(marker)]]
     elif script == "same-message-bash":
         steps = [[_ask_block(), _bash_block(marker)]]
+    elif script == "text":
+        steps = []
     else:
         steps = [[_ask_block(), _publish_block()]]
     taken = 0
@@ -211,8 +213,10 @@ class _Turn:
         asked: list[tuple[Any, str | None]],
         gate: ApprovalGate,
         marker: Path,
+        posted_after_next_turn: bool | None,
     ) -> None:
         self.final = final
+        self.posted_after_next_turn = posted_after_next_turn
         self.frames = frames
         self.bodies = bodies
         self.asked = asked
@@ -226,15 +230,31 @@ def _run_turn(
     *,
     answer: tuple[int, Any],
     script: str = "sequential",
+    workspace: bool = True,
+    next_turn: bool = False,
 ) -> _Turn:
+    """One turn, wired as ``__main__`` wires a factory session.
+
+    ``workspace`` False is a factory boot with no policy gate: the session gets
+    a gate that gates nothing as its question gate only. ``next_turn`` runs a
+    second, text-only turn on the same session and records the halt after it.
+    """
+
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     cwd = tmp_path / "workspace"
     (cwd / ".git").mkdir(parents=True)
     marker = tmp_path / "written-after-asking"
     # The gate a factory implementation session arms: a managed workspace.
-    gate = build_approval_gate(operator_tools=[], policy_routes={}, managed_workspace=True)
-    assert gate is not None
+    built = (
+        build_approval_gate(operator_tools=[], policy_routes={}, managed_workspace=True)
+        if workspace
+        else ApprovalGate()
+    )
+    assert built is not None
+    gate = built
+    approval_gate = gate if workspace else None
+    posted_after_next_turn: list[bool] = []
 
     async def scenario() -> tuple[Final, list[Any], list[dict[str, Any]], list[Any]]:
         app = web.Application()
@@ -262,11 +282,11 @@ def _run_turn(
                 resume=None,
                 cwd=str(cwd),
                 hooks=build_approval_hook(gate),
-                can_use_tool=build_can_use_tool(gate),
+                can_use_tool=build_can_use_tool(gate) if approval_gate is not None else None,
                 mcp_servers={
                     APPROVAL_SERVER_NAME: build_approval_server(
-                        gate,
-                        managed_workspace=True,
+                        approval_gate,
+                        managed_workspace=workspace,
                         include_request_approval=False,
                         question_tool=wrap_questions_handler(bound.question_handler),
                     )
@@ -288,7 +308,8 @@ def _run_turn(
                 trace_name="curie-run:acme-questions",
                 session_id="session-PLACEHOLDER",
                 model="claude-sonnet-5",
-                approval_gate=gate,
+                approval_gate=approval_gate,
+                question_gate=gate,
             )
             lines: list[str] = []
             await runner.start()
@@ -298,6 +319,14 @@ def _run_turn(
                         Event(type="message", text="build the ticket", user="U0EXAMPLE1", ts="1")
                     ):
                         lines.append(line)
+                if next_turn:
+                    app[_SCRIPT] = "text"
+                    with anyio.fail_after(_TURN_TIMEOUT_S):
+                        async for _line in runner.run_turn(
+                            Event(type="message", text="and now?", user="U0EXAMPLE1", ts="2")
+                        ):
+                            pass
+                    posted_after_next_turn.append(gate.questions_posted)
             finally:
                 await runner.close()
             frames = list(parse_ndjson("".join(lines)))
@@ -306,7 +335,8 @@ def _run_turn(
             return finals[0], frames, list(app[_BODIES]), list(app[_ASKED])
 
     final, frames, bodies, asked = anyio.run(scenario)
-    return _Turn(final, frames, bodies, asked, gate, marker)
+    after = posted_after_next_turn[0] if posted_after_next_turn else None
+    return _Turn(final, frames, bodies, asked, gate, marker, after)
 
 
 def _pinned(frames: list[Any]) -> list[dict[str, Any]]:
@@ -396,6 +426,68 @@ def test_a_publish_sent_beside_a_posted_ask_does_not_park_the_request(
     assert turn.final.status is SessionStatus.DONE
     assert turn.final.approval_summary is None
     assert turn.final.approval_granted_tool is None
+
+
+def test_a_posted_round_with_an_unreadable_answer_still_ends_the_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 200 whose round number cannot be read is still a posted round.
+
+    Red when that answer is an error result: the CLI reports a failed call,
+    the PostToolUse stop never runs and the model is asked again.
+    """
+
+    turn = _run_turn(tmp_path, monkeypatch, answer=(200, {}))
+
+    assert turn.gate.questions_posted is True
+    assert not turn.marker.exists()
+    assert len(turn.bodies) == 1
+    assert turn.final.status is SessionStatus.DONE
+
+
+def test_a_publish_beside_a_posted_ask_without_a_workspace_still_ends_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A factory boot with no policy gate: the publish beside the ask is not a failure.
+
+    Red when the session reads only its approval gate: it has none, so the
+    observed publication call fails the turn closed as unrecorded.
+    """
+
+    turn = _run_turn(
+        tmp_path,
+        monkeypatch,
+        answer=(200, {"round": 1, "rounds_limit": 3}),
+        script="same-message-publish",
+        workspace=False,
+    )
+
+    assert turn.asked == [(ASK_INPUT, CAPABILITY)]
+    assert len(turn.bodies) == 1
+    assert turn.final.status is SessionStatus.DONE
+    assert turn.final.approval_summary is None
+
+
+def test_the_halt_does_not_outlive_its_turn_without_a_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next turn on the same session starts with no halt.
+
+    Red when only the approval gate is reset at a turn start: the boot's
+    question gate keeps the halt and refuses every call of later turns.
+    """
+
+    turn = _run_turn(
+        tmp_path,
+        monkeypatch,
+        answer=(200, {"round": 1, "rounds_limit": 3}),
+        workspace=False,
+        next_turn=True,
+    )
+
+    assert turn.final.status is SessionStatus.DONE
+    assert turn.gate.questions_posted is False
+    assert turn.posted_after_next_turn is False
 
 
 @pytest.mark.parametrize(

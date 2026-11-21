@@ -70,6 +70,9 @@ class _StreamAccumulator:
     status: SessionStatus | None = None
     final_text: str | None = None
     tools_called: set[str] = field(default_factory=set)
+    # Whether an ``ask_questions`` call completed without failing, read from
+    # its closing side-effect frame (ADR 0286, #5785).
+    questions_ask_succeeded: bool = False
     approval_summary: str | None = None
     approval_route: str | None = None
     approval_gate_kind: str | None = None

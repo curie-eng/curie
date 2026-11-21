@@ -208,3 +208,38 @@ def test_a_turn_that_never_asked_keeps_the_continuation_on_an_unconfirmed_read(
             assert "publish_changes" in opened[1]
 
     asyncio.run(exercise())
+
+
+def _refused_ask_then_ended(text: str) -> list[OutboundEvent]:
+    """The ask's frames as a refused call closes them: its result was an error."""
+
+    frames = _asked_then_ended(text)
+    closing = [
+        index
+        for index, frame in enumerate(frames)
+        if getattr(frame, "tool", None) == QUESTION_TOOL and getattr(frame, "failed", None) is False
+    ]
+    assert len(closing) == 1, "the vector pins one closing frame for the ask"
+    frames[closing[0]] = frames[closing[0]].model_copy(update={"failed": True})
+    return frames
+
+
+def test_a_refused_ask_keeps_the_continuation_on_an_unconfirmed_read(make_harness) -> None:
+    """A refused ask (a 409) posted nothing, so an unconfirmed read still re-prompts.
+
+    Red when the worker treats the tool name alone as a possible post: the
+    older API view or the failed read would then skip the continuation.
+    """
+
+    async def exercise() -> None:
+        for items in (_ApiRequestView(_older_api_view()), _ApiRequestView({}, status_code=503)):
+            opened, items, _ = await _run_execute(
+                make_harness,
+                [_refused_ask_then_ended("The ask was refused."), [_done("I could not finish.")]],
+                work_items=items,
+            )
+
+            assert len(opened) == 2
+            assert "publish_changes" in opened[1]
+
+    asyncio.run(exercise())
