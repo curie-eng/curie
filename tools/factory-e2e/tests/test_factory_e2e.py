@@ -14,6 +14,7 @@ import base64
 import json
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -131,8 +132,13 @@ def test_secrets_stay_out_of_repr(tmp_path: Path) -> None:
 def test_cli_exits_2_with_clear_message_when_credentials_missing(
     tmp_path: Path, candidate_curie: Path
 ) -> None:
+    # sys.executable, not "python3": the restricted PATH below is the point
+    # (the CLI must report missing credentials, never find them), so the
+    # interpreter cannot come from it. A bare "python3" only resolves where
+    # /usr/bin/python3 exists; sys.executable is the interpreter already
+    # running this suite, on every machine.
     result = subprocess.run(
-        ["python3", str(REPO_ROOT / "tools/factory-e2e/factory_e2e.py"), "preflight"],
+        [sys.executable, str(REPO_ROOT / "tools/factory-e2e/factory_e2e.py"), "preflight"],
         env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CURIE_BIN": str(candidate_curie)},
         capture_output=True,
         text=True,
@@ -2407,7 +2413,8 @@ def test_install_creates_the_crds_it_adds_already_labelled_before_helm(
             assert args[1:] == ("--local", "-f", str(manifest), fe.OWNER_LABEL, "-o", "yaml")
             return "labelled-crd-yaml"
         if args[0] == "wait":
-            order.append(f"wait {args[2]}")
+            # Both waits name the same resource; args[1] tells them apart.
+            order.append(f"wait {args[1]} {args[2]}")
         return ""
 
     def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
@@ -2427,10 +2434,82 @@ def test_install_creates_the_crds_it_adds_already_labelled_before_helm(
         preflight.install()
     assert order == [
         "create crd",
-        "wait crd/sandboxes.agents.x-k8s.io",
+        "wait --for=jsonpath={.status.acceptedNames.plural}=sandboxes"
+        " crd/sandboxes.agents.x-k8s.io",
+        "wait --for=condition=Established crd/sandboxes.agents.x-k8s.io",
         "helm install",
     ]
     assert preflight.created_crds == ["sandboxes.agents.x-k8s.io"]
+
+
+def test_install_waits_for_each_created_crds_accepted_plural_before_the_established_condition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A fresh CRD is served with status.conditions: null until the naming
+    # controller writes status.acceptedNames and NamesAccepted in one status
+    # update, and kubectl --for=condition exits on that null instead of
+    # waiting (#5128). acceptedNames.plural is "" until that same update, so a
+    # jsonpath wait on it keeps waiting through the null state: awaiting the
+    # accepted plural before the Established condition is what makes the null
+    # first read harmless. The plural is the CRD name up to its first dot,
+    # the same correction as the chart CI script (#5125).
+    preflight = _preflight(tmp_path)
+    chart = tmp_path / "chart"
+    (chart / "crds").mkdir(parents=True)
+    # Filenames, not CRD names, pick the order: production sorts the manifest
+    # paths, so a-sandboxes.yaml is installed before b-sandboxclaims.yaml.
+    (chart / "crds" / "a-sandboxes.yaml").write_text(
+        "metadata:\n  name: sandboxes.agents.x-k8s.io\n"
+    )
+    (chart / "crds" / "b-sandboxclaims.yaml").write_text(
+        "metadata:\n  name: sandboxclaims.extensions.agents.x-k8s.io\n"
+    )
+    waits: list[list[str]] = []
+
+    def kubectl(*args: str, check: bool = True) -> str:
+        if args[0] == "wait":
+            waits.append(list(args))
+        if args[0] == "label":
+            return "labelled-crd-yaml"
+        return ""
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        if "install" in argv:
+            raise fe.PreflightFailed("helm install stopped by the test")
+        return ""
+
+    monkeypatch.setattr(preflight, "extract_chart", lambda: chart)
+    monkeypatch.setattr(preflight, "egress_cidrs", lambda: [])
+    monkeypatch.setattr(preflight, "kubectl", kubectl)
+    monkeypatch.setattr(fe, "run", fake_run)
+    with pytest.raises(fe.PreflightFailed):
+        preflight.install()
+    assert waits == [
+        [
+            "wait",
+            "--for=jsonpath={.status.acceptedNames.plural}=sandboxes",
+            "crd/sandboxes.agents.x-k8s.io",
+            "--timeout=120s",
+        ],
+        [
+            "wait",
+            "--for=condition=Established",
+            "crd/sandboxes.agents.x-k8s.io",
+            "--timeout=120s",
+        ],
+        [
+            "wait",
+            "--for=jsonpath={.status.acceptedNames.plural}=sandboxclaims",
+            "crd/sandboxclaims.extensions.agents.x-k8s.io",
+            "--timeout=120s",
+        ],
+        [
+            "wait",
+            "--for=condition=Established",
+            "crd/sandboxclaims.extensions.agents.x-k8s.io",
+            "--timeout=120s",
+        ],
+    ]
 
 
 @pytest.mark.parametrize(
