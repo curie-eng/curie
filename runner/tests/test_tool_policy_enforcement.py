@@ -48,9 +48,11 @@ from curie_runner.approval import (
 )
 from curie_runner.harness.claude.approval import (
     build_approval_hook,
+    build_approval_server,
     build_can_use_tool,
 )
 from mcp import Tool
+from mcp import types as mcp_types
 from mcp.types import ToolAnnotations
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, ToolPolicy
 
@@ -179,6 +181,26 @@ def _assert_no_approval_was_recorded(gate: ApprovalGate) -> None:
     assert gate.policy_rejected is False
     assert gate.policy_route is None
     assert gate.pending_halt is False
+
+
+def _run_publish_body(gate: ApprovalGate, tool_input: dict[str, Any]) -> tuple[bool, str]:
+    """Run the real ``publish_changes`` body, which the CLI reaches only after
+    every PreToolUse hook allowed the call. Returns ``(is_error, text)``."""
+
+    server = build_approval_server(gate, managed_workspace=True)
+    entry = server["instance"].get_request_handler("tools/call")
+    assert entry is not None
+    result = anyio.run(
+        entry.handler,
+        None,
+        mcp_types.CallToolRequestParams(
+            name=PLATFORM_PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+            arguments=tool_input,
+        ),
+    )
+    payload = result.model_dump()
+    text = " ".join(str(item.get("text") or "") for item in payload.get("content") or [])
+    return payload.get("is_error") is True, text
 
 
 def _probe_advertised_tools(
@@ -373,17 +395,19 @@ def test_a_builtin_is_untouched_by_a_policy_about_connectors() -> None:
 
 
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])
-def test_platform_publish_reaches_approval_gate_under_production_sre_tool_policy(
+def test_platform_publish_is_recordable_under_production_sre_tool_policy(
     interceptor: str,
 ) -> None:
-    """Bundle MCP policy must not swallow Curie's platform-owned publish gate."""
+    """Bundle MCP policy must not swallow Curie's platform-owned publish gate.
+
+    Neither interception point refuses the call under the shipped policy: both
+    abstain, so the CLI runs the tool body, which records the publication.
+    """
 
     gate = _production_sre_gate(managed_workspace=True)
     tool_input = {"title": "Workspace tool check", "body": "prior-turn marker"}
     if interceptor == "hook":
-        result = _hook_call(gate, PLATFORM_PUBLISH_TOOL_NAME, tool_input)
-        assert _denied(result)
-        reason = _reason(result)
+        assert _hook_call(gate, PLATFORM_PUBLISH_TOOL_NAME, tool_input) == {}
     else:
         result = anyio.run(
             build_can_use_tool(gate),
@@ -391,14 +415,20 @@ def test_platform_publish_reaches_approval_gate_under_production_sre_tool_policy
             tool_input,
             ToolPermissionContext(tool_use_id="toolu_policy_test"),
         )
-        assert isinstance(result, PermissionResultDeny)
-        reason = result.message
+        assert isinstance(result, PermissionResultAllow)
+    # Abstaining records nothing; the body is the one recording path.
+    _assert_no_approval_was_recorded(gate)
 
+    is_error, text = _run_publish_body(gate, tool_input)
+
+    assert is_error is False, text
+    assert "not permitted for this agent" not in text
     assert gate.pending_gate_kind == "permission"
     assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert gate.publication_title == "Workspace tool check"
     assert gate.publication_body == "prior-turn marker"
-    assert "not permitted for this agent" not in reason
+    assert gate.pending_granted_arguments == tool_input
+    assert gate.pending_halt is True
 
 
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])
@@ -606,13 +636,15 @@ def test_every_platform_owned_tool_escapes_the_production_sre_tool_policy(
     reason = _interception_reason(gate, tool_name, interceptor, _input_for(tool_name))
 
     assert "not permitted for this agent" not in reason
+    # Neither interception point records anything for a platform tool.
+    _assert_no_approval_was_recorded(gate)
     if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
-        # Blocked, and rightly so: the platform permission gate still owns
-        # publication. Outside policy scope is not permission to run.
+        # Outside policy scope is not permission to publish: the tool body
+        # still only records a request the platform gate owns.
+        is_error, text = _run_publish_body(gate, _input_for(tool_name))
+        assert is_error is False, text
         assert gate.pending_gate_kind == "permission"
         assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
-    else:
-        _assert_no_approval_was_recorded(gate)
 
     # A negative pin, not a restoration. The capability probe only ever observes
     # connector and bundle MCP servers, so a platform name never reaches this

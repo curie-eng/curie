@@ -730,7 +730,7 @@ def _post_tool_use_names(hooks: dict[str, Any]) -> list[str]:
 
 def test_no_observer_is_registered_without_a_hosted_connector() -> None:
     hooks = build_approval_hook(_gate(proxied=frozenset()))
-    assert _post_tool_use_names(hooks) == ["questions_stop"]
+    assert _post_tool_use_names(hooks) == ["turn_stop"]
 
 
 @pytest.mark.parametrize(("caller_token", "observed"), [("cct.a.b", True), (None, False)])

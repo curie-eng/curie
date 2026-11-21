@@ -43,6 +43,7 @@ from curie_runner.fake import (
     default_turn,
 )
 from curie_runner.harness.claude.approval import (
+    build_approval_hook,
     build_approval_server,
     build_can_use_tool,
 )
@@ -1180,7 +1181,40 @@ def test_bundle_may_attach_a_route_to_platform_publish() -> None:
     assert gate.route_by_tool[PLATFORM_PUBLISH_TOOL_NAME] == "bundle-selected-audience"
 
 
-def test_publish_permission_block_carries_policy_route() -> None:
+async def _call_publish_body(
+    gate: ApprovalGate | None, arguments: dict[str, object]
+) -> tuple[bool, str]:
+    """Run the real in-process ``publish_changes`` body, as the CLI does.
+
+    The CLI runs it only after every PreToolUse hook allowed the call, and it
+    is the one place a publication is recorded. Returns ``(is_error, text)``.
+    """
+
+    server = build_approval_server(gate, managed_workspace=True)
+    entry = server["instance"].get_request_handler("tools/call")  # type: ignore[index]
+    assert entry is not None
+    direct = await entry.handler(
+        None,
+        mcp_types.CallToolRequestParams(
+            name=PLATFORM_PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+            arguments=arguments,
+        ),
+    )
+    payload = direct.model_dump()
+    text = " ".join(str(item.get("text") or "") for item in payload.get("content") or [])
+    return payload.get("is_error") is True, text
+
+
+async def _publish_post_tool_use(gate: ApprovalGate) -> dict[str, object]:
+    """The approval hook's PostToolUse answer right after a publish call ran."""
+
+    (matcher,) = build_approval_hook(gate)["PostToolUse"]
+    return await matcher.hooks[-1](
+        {"tool_name": PLATFORM_PUBLISH_TOOL_NAME, "tool_input": {}}, "tuid-1", {"signal": None}
+    )
+
+
+def test_publish_body_record_carries_policy_route() -> None:
     async def go() -> None:
         gate = build_approval_gate(
             operator_tools=None,
@@ -1188,34 +1222,48 @@ def test_publish_permission_block_carries_policy_route() -> None:
             managed_workspace=True,
         )
         assert gate is not None
+        tool_input = {"title": "  Update documentation  ", "body": "Exact body\n" * 100}
+        # The callback abstains on publish: the body records, never the callback.
         result = await build_can_use_tool(gate)(
-            PLATFORM_PUBLISH_TOOL_NAME,
-            {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
-            ToolPermissionContext(),
+            PLATFORM_PUBLISH_TOOL_NAME, tool_input, ToolPermissionContext()
         )
-        assert isinstance(result, PermissionResultDeny)
+        assert isinstance(result, PermissionResultAllow)
+        assert gate.pending_summary is None
+
+        is_error, _text = await _call_publish_body(gate, tool_input)
+        assert is_error is False
         assert gate.pending_route == "bundle-selected-audience"
+        assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
     anyio.run(go)
 
 
-def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None:
+def test_publish_body_record_has_exact_trusted_provenance_and_no_route() -> None:
     async def go() -> None:
         gate = build_approval_gate(
             operator_tools=None, policy_routes={}, managed_workspace=True
         )
         assert gate is not None
+        tool_input = {"title": "  Update documentation  ", "body": "Exact body\n" * 100}
         result = await build_can_use_tool(gate)(
-            PLATFORM_PUBLISH_TOOL_NAME,
-            {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
-            ToolPermissionContext(),
+            PLATFORM_PUBLISH_TOOL_NAME, tool_input, ToolPermissionContext()
         )
-        assert isinstance(result, PermissionResultDeny)
+        assert isinstance(result, PermissionResultAllow)
+
+        is_error, text = await _call_publish_body(gate, tool_input)
+        assert is_error is False
+        assert "Publication requested" in text
+        assert gate.pending_summary is not None
+        assert gate.pending_summary.startswith(APPROVAL_SUMMARY_PREFIX)
         assert gate.pending_gate_kind == "permission"
         assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+        assert gate.pending_granted_arguments == tool_input
         assert gate.pending_route is None
         assert gate.publication_title == "Update documentation"
         assert gate.publication_body == "Exact body\n" * 100
+        # The record asks for the halt, which the PostToolUse hook then applies.
+        assert gate.pending_halt is True
+        assert (await _publish_post_tool_use(gate)).get("continue_") is False
 
     anyio.run(go)
 
@@ -1226,20 +1274,31 @@ def test_invalid_publish_proposal_creates_no_pending_approval() -> None:
             operator_tools=None, policy_routes={}, managed_workspace=True
         )
         assert gate is not None
-        result = await build_can_use_tool(gate)(
-            PLATFORM_PUBLISH_TOOL_NAME, {"title": "   ", "body": "ignored"}, ToolPermissionContext()
-        )
+        is_error, text = await _call_publish_body(gate, {"title": "   ", "body": "ignored"})
 
-        assert isinstance(result, PermissionResultDeny)
-        assert "not recorded" in result.message
+        assert is_error is True
+        assert "not recorded" in text
+        assert "Correct it and retry" in text
         assert gate.pending_summary is None
+        assert gate.pending_granted_tool is None
         assert gate.publication_title is None
         assert gate.publication_body is None
+        # No halt: the model must be able to correct the call in this turn.
+        assert gate.pending_halt is False
+        assert await _publish_post_tool_use(gate) == {}
+        assert gate.publication_attempted is True
+        assert gate.publication_unrecorded is not None
+
+        # The corrected retry records.
+        is_error, _text = await _call_publish_body(gate, {"title": "Ship", "body": "b"})
+        assert is_error is False
+        assert gate.publication_title == "Ship"
+        assert gate.pending_halt is True
 
     anyio.run(go)
 
 
-def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
+def test_publish_tool_never_consumes_a_resume_grant_and_only_records() -> None:
     async def go() -> None:
         gate = build_approval_gate(
             operator_tools=None,
@@ -1248,33 +1307,24 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
             managed_workspace=True,
         )
         assert gate is not None
+        # build_approval_gate refuses to carry a publish grant (safe_grant_tool).
+        assert gate.grant_tool is None
         result = await build_can_use_tool(gate)(
             PLATFORM_PUBLISH_TOOL_NAME, {"title": "Ship changes"}, ToolPermissionContext()
         )
-        assert isinstance(result, PermissionResultDeny)
+        # An abstaining allow, never a grant-spending one that rewrites input.
+        assert isinstance(result, PermissionResultAllow)
+        assert result.updated_input is None
         assert gate.grant_tool is None
-        assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
-        # Bypass the permission callback and call the in-process tool directly:
-        # it must still refuse, because publication belongs to the platform Job.
-        server = build_approval_server(gate, managed_workspace=True)
-        entry = server["instance"].get_request_handler("tools/call")
-        assert entry is not None
-        direct = await entry.handler(
-            None,
-            mcp_types.CallToolRequestParams(
-                name=PLATFORM_PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
-                arguments={"title": "Ship changes"},
-            ),
-        )
-        payload = direct.model_dump()
-        assert payload.get("is_error") is True
-        assert (
-            "platform"
-            in " ".join(
-                str(item.get("text") or "") for item in payload.get("content") or []
-            ).lower()
-        )
+        # The body only records a request; the platform publishes after a
+        # human approves it.
+        is_error, text = await _call_publish_body(gate, {"title": "Ship changes"})
+        assert is_error is False
+        assert "platform" in text.lower()
+        assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+        assert gate.grant_tool is None
+        assert gate.consume_grant(PLATFORM_PUBLISH_TOOL_NAME) is False
 
     anyio.run(go)
 
@@ -1288,19 +1338,15 @@ def _managed_publish_gate() -> ApprovalGate:
     return gate
 
 
-def test_observe_publication_records_the_pending_approval_without_a_halt() -> None:
-    # revert: drop observe_publication (or make it a no-op) -> this fails, and a
-    # publish call that neither gate layer saw leaves the turn with nothing to
-    # approve -- the #2294 defect. The record must be field-for-field what a hook
-    # block writes, because the worker keys the trusted publication path on that
-    # exact runner-stamped provenance.
+def test_record_publication_records_the_pending_approval_and_halts() -> None:
+    # The record must be field-for-field what a gate block writes, because the
+    # worker keys the trusted publication path on that exact runner-stamped
+    # provenance.
     gate = _managed_publish_gate()
 
-    recorded = anyio.run(
-        gate.observe_publication, "publish-1", {"title": "  Ship changes  ", "body": "Full body"}
-    )
+    refusal = gate.record_publication({"title": "  Ship changes  ", "body": "Full body"})
 
-    assert recorded is True
+    assert refusal is None
     assert gate.pending_summary is not None
     assert gate.pending_summary.startswith(APPROVAL_SUMMARY_PREFIX)
     assert PLATFORM_PUBLISH_TOOL_NAME in gate.pending_summary
@@ -1310,78 +1356,80 @@ def test_observe_publication_records_the_pending_approval_without_a_halt() -> No
     assert gate.pending_route is None
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "Full body"
-    # The stream observer never ASKED the CLI to stop, so it must not claim it
-    # did: pending_halt is what rescues an error-shaped terminal result, and
-    # setting it here would relabel an unrelated failure as awaiting-approval.
-    assert gate.pending_halt is False
+    # The body ran and recorded, so the turn halts for the human.
+    assert gate.pending_halt is True
+    assert gate.publication_attempted is True
+    assert gate.publication_unrecorded is None
 
 
-def test_observe_publication_is_idempotent_for_a_duplicate_call() -> None:
-    # revert: let a second observation overwrite the record -> a model that calls
+def test_record_publication_is_idempotent_for_a_duplicate_call() -> None:
+    # revert: let a second record overwrite the first -> a model that calls
     # publish_changes twice in one turn creates two approvals for one action, and
     # the human resolves against the second while the first stays pending.
     gate = _managed_publish_gate()
-    assert anyio.run(
-        gate.observe_publication, "publish-1", {"title": "First proposal", "body": "one"}
-    ) is True
+    assert gate.record_publication({"title": "First proposal", "body": "one"}) is None
     first_summary = gate.pending_summary
 
-    second = anyio.run(
-        gate.observe_publication, "publish-2", {"title": "Second proposal", "body": "two"}
-    )
+    second = gate.record_publication({"title": "Second proposal", "body": "two"})
 
-    assert second is False
+    assert second is not None
+    assert "not recorded" in second
     assert gate.pending_summary == first_summary
     assert gate.publication_title == "First proposal"
     assert gate.publication_body == "one"
-    assert gate.pending_halt is False
+    assert gate.pending_halt is True
 
 
-def test_observe_publication_rejects_a_malformed_title_and_records_nothing() -> None:
+def test_record_publication_rejects_a_malformed_title_and_records_nothing() -> None:
     # revert: swallow the validation (or record the raw input) -> a blank-titled
     # proposal becomes an approval card a human cannot act on, and the worker
-    # captures a patch with no title. The session turns this raise into a
-    # fail-closed classified failure; it must never be a silent pass.
+    # captures a patch with no title.
     gate = _managed_publish_gate()
 
-    with pytest.raises(ValueError):
-        anyio.run(gate.observe_publication, "publish-1", {"title": "   ", "body": "ignored"})
+    refusal = gate.record_publication({"title": "   ", "body": "ignored"})
 
+    assert refusal is not None
+    assert refusal.startswith("Publication request was not recorded: ")
+    assert refusal.endswith("Correct it and retry.")
     assert gate.pending_summary is None
     assert gate.pending_granted_tool is None
     assert gate.publication_title is None
     assert gate.publication_body is None
     assert gate.pending_halt is False
+    assert gate.publication_attempted is True
+    assert gate.publication_unrecorded is not None
+    assert "title" in gate.publication_unrecorded
 
 
-def test_observe_publication_never_overwrites_a_hook_recorded_block() -> None:
-    # revert: record unconditionally -> when the PreToolUse hook DID fire (the
-    # normal path) the stream observer would overwrite the hook's record and drop
-    # its halt-backed provenance, turning the working path into a second one.
-    gate = _managed_publish_gate()
-    gate.block(PLATFORM_PUBLISH_TOOL_NAME, {"title": "Hook recorded", "body": "hook body"})
-    hook_summary = gate.pending_summary
+def test_record_publication_never_overwrites_a_standing_record() -> None:
+    # revert: record unconditionally -> a publish call arriving after another
+    # gated call's block would overwrite the record that already owns the slot.
+    gate = build_approval_gate(
+        operator_tools=["Bash"], policy_routes={}, managed_workspace=True
+    )
+    assert gate is not None
+    gate.block("Bash", {"command": "git status"})
+    bash_summary = gate.pending_summary
 
-    assert anyio.run(
-        gate.observe_publication, "publish-1", {"title": "Stream observed", "body": "stream body"}
-    ) is False
+    refusal = gate.record_publication({"title": "Body recorded", "body": "body"})
 
-    assert gate.pending_summary == hook_summary
-    assert gate.publication_title == "Hook recorded"
-    assert gate.publication_body == "hook body"
+    assert refusal is not None
+    assert "not recorded" in refusal
+    assert gate.pending_summary == bash_summary
     assert gate.pending_gate_kind == "permission"
-    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
-    # The hook's own halt marker survives untouched: the observer only ever adds
-    # a record, it never edits what another layer already decided.
+    assert gate.pending_granted_tool == "Bash"
+    assert gate.publication_title is None
+    assert gate.publication_body is None
+    # The standing record still halts the turn.
     assert gate.pending_halt is True
 
 
-def test_observe_publication_never_mints_a_grant() -> None:
-    # revert: have observe_publication set (or restore) grant_tool, or let the
-    # publish tool consume a grant -> this fails. The observer is the one gate
-    # layer that can never ALLOW: publication happens outside the sandbox after
-    # approval, so an injected or stale grant must never let a second call walk
-    # through, and recording a request must never mint the allowance for it.
+def test_record_publication_never_mints_a_grant() -> None:
+    # revert: have record_publication set (or restore) grant_tool, or let the
+    # publish tool consume a grant -> this fails. Publication happens outside the
+    # sandbox after approval, so an injected or stale grant must never let a
+    # second call walk through, and recording a request must never mint the
+    # allowance for it.
     gate = build_approval_gate(
         operator_tools=None,
         policy_routes={},
@@ -1392,17 +1440,13 @@ def test_observe_publication_never_mints_a_grant() -> None:
     # build_approval_gate already refuses to carry a publish grant (safe_grant_tool).
     assert gate.grant_tool is None
 
-    assert anyio.run(
-        gate.observe_publication, "publish-1", {"title": "Ship changes", "body": "body"}
-    ) is True
+    assert gate.record_publication({"title": "Ship changes", "body": "body"}) is None
 
     assert gate.grant_tool is None
     assert gate.consume_grant(PLATFORM_PUBLISH_TOOL_NAME) is False
     # And the record it wrote is still the one-per-turn record: a second call
-    # blocks again rather than being waved through.
-    assert anyio.run(
-        gate.observe_publication, "publish-2", {"title": "Ship changes", "body": "body"}
-    ) is False
+    # records nothing rather than being waved through.
+    assert gate.record_publication({"title": "Ship changes", "body": "body"}) is not None
     assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
 
