@@ -39,6 +39,8 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _start_running,
 )
 
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
+
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
@@ -102,7 +104,12 @@ def _stream_event_ids() -> list[str]:
 
 
 def test_issue_cancelled_comment_is_a_plain_stop_notice() -> None:
-    body = result_section("issue_cancelled", pr_url=None)
+    body = result_section(
+        "issue_cancelled",
+        pr_url=None,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert "Stopped:" in body
     assert "Could not complete" not in body
 
