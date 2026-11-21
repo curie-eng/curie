@@ -53,6 +53,9 @@ GATEWAY_IMAGE = f"curie-{GATEWAY_COMPONENT}:local"
 # The tracker intake poll interval of this install.
 TRACKER_POLL_SECONDS = 5
 BOUND_SECONDS = 2400
+# The longest a learned-rules replay keeps its install for an external browser
+# check (``--hold-for-browser``); the run's own command bound pauses meanwhile.
+MAX_BROWSER_HOLD_SECONDS = 7200
 # The factory progress card must settle this long after the final issue comment.
 SLACK_PROGRESS_SECONDS = 180
 RECORD_BUDGET_USD = 20
@@ -89,6 +92,16 @@ def _module(name: str, path: Path) -> Any:
 def validate_configuration(args: argparse.Namespace) -> None:
     """Refuse malformed inputs before any external resource is created."""
 
+    hold = getattr(args, "hold_for_browser", None)
+    if hold is not None:
+        if args.scenario != LEARNED_RULES or args.record:
+            raise fe.ConfigError(
+                "--hold-for-browser holds a learned-rules replay; it never records"
+            )
+        if not 1 <= hold <= MAX_BROWSER_HOLD_SECONDS:
+            raise fe.ConfigError(
+                f"--hold-for-browser takes 1 to {MAX_BROWSER_HOLD_SECONDS} seconds"
+            )
     if args.scenario == "facts":
         if args.record:
             raise fe.ConfigError("the facts scenario never records or calls a model")

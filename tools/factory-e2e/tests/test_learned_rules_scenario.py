@@ -933,6 +933,116 @@ def test_a_refused_accept_stops_the_chain_before_ticket_b_is_labelled(
     run.cleanup()
 
 
+# The browser hold: one proposed rule kept up for an external Console check ---
+
+
+class _Clock:
+    """``learned_rules_run.time`` with a clock that each sleep advances."""
+
+    def __init__(self, on_sleep: Callable[[int], None] | None = None) -> None:
+        self.now = 1000.0
+        self.sleeps = 0
+        self.on_sleep = on_sleep
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps += 1
+        self.now += seconds
+        if self.on_sleep is not None:
+            self.on_sleep(self.sleeps)
+
+
+def _held_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold: int | None
+) -> tuple[lrr.LearnedRulesRun, list[tuple[str, ...]]]:
+    run, calls = _chain_run(tmp_path, monkeypatch, writer_code=None)
+    run.args.hold_for_browser = hold
+    run.workdir = tmp_path / "run"
+    run.workdir.mkdir()
+    run.env["KUBECONFIG"] = str(run.workdir / "kubeconfig")
+    run.deadline = 1000.0 + sk.BOUND_SECONDS
+    ports = {lrr.BROWSER_API_SERVICE: 8000, lrr.BROWSER_UI_SERVICE: 8080}
+    monkeypatch.setattr(run, "service_port", lambda name: ports[name])
+    return run, calls
+
+
+def test_hold_for_browser_keeps_one_proposed_rule_until_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The production chain with the hold flag: after the merge proposed the
+    # rule, the run writes the hold file, decides nothing and opens no ticket
+    # until the release file appears, then ends held for teardown.
+    run, calls = _held_run(tmp_path, monkeypatch, hold=600)
+    assert run.workdir is not None
+    release = run.workdir / "browser-hold.release"
+    monkeypatch.setattr(lrr, "time", _Clock(lambda n: release.touch() if n == 3 else None))
+    monkeypatch.setattr(run, "observe", lambda: None)
+    run.run_scenarios(object())
+
+    assert calls == [], "the hold decided a rule or opened a ticket"
+    assert run.chain["result"] == "held"
+    hold = run.workdir / "browser-hold.json"
+    assert hold.stat().st_mode & 0o777 == 0o600
+    held = json.loads(hold.read_text())
+    passing = {step["step"]: step for step in _passing()["steps"]}
+    assert held["rule"] == {
+        key: passing["c"]["rules"][0].get(key) for key in ("id", "version", "state")
+    }
+    assert held["rule"]["state"] == "proposed"
+    assert held["release_file"] == str(release)
+    assert held["services"] == {"curie-api": 8000, "curie-ui": 8080}
+    assert set(held["session_files"]) == {"writer", "reader"}
+    assert held["session_cookie"] == pto.SESSION_COOKIE
+    step = _step({"steps": run.chain["steps"]}, "hold")
+    assert step["held_seconds"] == 3 * lrr.POLL_SECONDS
+    assert step["rules_after_hold"][0]["state"] == "proposed"
+    run.cleanup()
+
+
+def test_hold_for_browser_without_a_release_fails_and_decides_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, calls = _held_run(tmp_path, monkeypatch, hold=10)
+    monkeypatch.setattr(lrr, "time", _Clock())
+    with pytest.raises(lrr.LearnedRulesError, match="without a release"):
+        run.run_chain(object())
+    assert calls == []
+    run.cleanup()
+
+
+def test_without_the_hold_the_chain_goes_on_to_the_decisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Liveness of the default: no hold flag, the reader and writer decide.
+    run, calls = _held_run(tmp_path, monkeypatch, hold=None)
+    with pytest.raises(_Stop):
+        run.run_chain(object())
+    assert calls[:2] == [("accept", "reader", "2"), ("accept", "writer", "2")]
+    assert run.workdir is not None
+    assert not (run.workdir / "browser-hold.json").exists()
+    run.cleanup()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--scenario", "publication", "--hold-for-browser", "60"],
+        ["--scenario", "learned-rules", "--hold-for-browser", "0"],
+        ["--scenario", "learned-rules", "--hold-for-browser", "7201"],
+        ["--scenario", "learned-rules", "--record", "--hold-for-browser", "60"],
+    ],
+)
+def test_hold_for_browser_is_refused_outside_a_learned_rules_replay(
+    argv: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "not-a-key")
+    args = fe.parse_args(["scripted", *argv])
+    with pytest.raises(fe.ConfigError, match="hold-for-browser"):
+        sk.validate_configuration(args)
+
+
 # Steps d to f on real-shaped inputs ------------------------------------------
 #
 # The live chain stores every step scrubbed while the driver reads raw values

@@ -74,6 +74,9 @@ STUB_HOST = "stub.example.test"
 REPOSITORY_REF = f"{lrs.REPOSITORY}#"
 REPOSITORY_REF_PLACEHOLDER = "<repository>#"
 POLL_SECONDS = 2.0
+# The release's Services a browser check reaches by port-forward (release ``curie``).
+BROWSER_API_SERVICE = "curie-api"
+BROWSER_UI_SERVICE = "curie-ui"
 
 
 class LearnedRulesError(sk.ScriptedScenarioError):
@@ -306,6 +309,10 @@ class LearnedRulesRun(sk.ScriptedRun):
         finally:
             if self.router is not None:
                 self.chain["lanes"] = self.router.evidence()
+        if self.args.hold_for_browser is not None:
+            # Steps a to c were judged as they landed; d to g are the browser's.
+            self.chain["result"] = "held"
+            return
         try:
             lrs.assert_chain(self.chain, record=bool(self.args.record))
         except lrs.LearnedRulesAssertionError as exc:
@@ -790,6 +797,9 @@ class LearnedRulesRun(sk.ScriptedRun):
         reply_url = self.judge(lrs.assert_revision, "b", pull_a)
         rule = self.promote(pull_a, raw_reply_url)
         rule = self.judge(lrs.assert_promoted, "c", pull_a, reply_url)
+        if self.args.hold_for_browser is not None:
+            self.hold_for_browser(rule, int(self.args.hold_for_browser))
+            return
         accepted = self.accept(rule)
         self.judge(lrs.assert_decided, "d", rule)
         self.ticket_b(github, rule)
@@ -797,6 +807,76 @@ class LearnedRulesRun(sk.ScriptedRun):
         self.ticket_c(github, accepted)
         self.judge(lrs.assert_ticket_c, "f", accepted)
         self.lanes_step()
+
+    def hold_for_browser(self, rule: Mapping[str, Any], seconds: int) -> None:
+        """Keep the install, the stub and the sessions up with one proposed rule.
+
+        Writes ``browser-hold.json`` (mode 0600) in the run directory: the kube
+        context and kubeconfig of the owned cluster, the namespace, the API URL
+        the run uses, the API and UI Services, the writer's and the reader's
+        session files (each holds a principal console session cookie value from
+        a real OIDC login) and the proposed rule. The run then waits until the
+        file named ``release_file`` exists, and tears down as usual. A hold that
+        reaches ``seconds`` without a release fails the run, so a browser check
+        that never ran is not reported as held.
+        """
+
+        assert self.workdir is not None
+        hold_file = self.workdir / "browser-hold.json"
+        release_file = self.workdir / "browser-hold.release"
+        services = {
+            name: self.service_port(name) for name in (BROWSER_API_SERVICE, BROWSER_UI_SERVICE)
+        }
+        write_private(
+            hold_file,
+            json.dumps(
+                {
+                    "context": self.context,
+                    "kubeconfig": self.env["KUBECONFIG"],
+                    "namespace": self.namespace,
+                    "api_url": self.api_url(),
+                    "services": services,
+                    "session_cookie": pto.SESSION_COOKIE,
+                    "session_files": {role: str(path) for role, path in self.session_files.items()},
+                    "rule": {key: rule.get(key) for key in ("id", "version", "state")},
+                    "release_file": str(release_file),
+                },
+                indent=2,
+            ),
+        )
+        print(
+            f"factory-e2e [{self.run_id}]: holding for a browser check; read {hold_file}, "
+            f"then create {release_file} to tear down",
+            file=sys.stderr,
+            flush=True,
+        )
+        started = time.monotonic()
+        while not release_file.exists():
+            if time.monotonic() - started >= seconds:
+                raise LearnedRulesError(
+                    f"the browser hold reached {seconds}s without a release; tearing down"
+                )
+            time.sleep(POLL_SECONDS)
+        held = round(time.monotonic() - started, 1)
+        # The command bound paused for the hold; the rule list after it shows
+        # what the browser check did.
+        if self.deadline is not None:
+            self.deadline += held
+        self.record_step(
+            "hold",
+            rule_id=rule.get("id"),
+            held_seconds=held,
+            rules_after_hold=self.list_rules(),
+        )
+
+    def service_port(self, name: str) -> int | None:
+        """The first port of the release's Service ``name`` in the namespace."""
+
+        service = json.loads(
+            self.kubectl("-n", self.namespace, "get", "service", name, "-o", "json")
+        )
+        ports = (service.get("spec") or {}).get("ports") or []
+        return int(ports[0]["port"]) if ports else None
 
     def judge(self, check: Callable[..., Any], name: str, *args: Any) -> Any:
         step = next(s for s in reversed(self.chain["steps"]) if s.get("step") == name)

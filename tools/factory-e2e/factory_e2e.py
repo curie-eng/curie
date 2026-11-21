@@ -6933,6 +6933,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     pairing.add_argument("--revision-file", type=Path, help="the review text")
     scripted.add_argument("--build-images", action="store_true")
     scripted.add_argument("--record", action="store_true")
+    scripted.add_argument(
+        "--hold-for-browser",
+        type=int,
+        metavar="SECONDS",
+        help=(
+            "learned-rules: once ticket A's merge proposed the rule, keep the install up for "
+            "a browser check of the Console for at most SECONDS (1 to 7200), skip the "
+            "remaining steps, and tear down when the hold file's release file appears"
+        ),
+    )
     return parser.parse_args(argv)
 
 
