@@ -4455,18 +4455,30 @@ label. Do them before the upgrade:
    `curie cluster observability runs --agent-id <agent id>` lists its recent
    runs. Both must show nothing unfinished. There is no single command that
    reports queued requests, so repeat the check until it stays clean.
-3. Remove the binding, or replace the bundle. To remove the binding, run
+3. Remove the binding, or replace the bundle. The API refuses to remove an
+   agent's final surface, and an agent serves a tracker location through one
+   surface, so a binding is never relabelled in place.
+   To remove the binding, run
    `curie cluster surfaces <agent> --remove <KIND=ADDRESS>`, using a binding
-   that `curie cluster surfaces <agent>` printed. The API refuses to remove an
-   agent's final surface, so either add its replacement first or delete the
-   agent with `curie cluster delete <agent> --yes`. To replace the bundle
-   instead, write the implementation bundle with
-   `curie example dark-factory render --out <dir>`, deploy it to the agent with
-   `curie cluster deploy --plugin-dir <dir> --agent <agent>`, and bind the
-   agent under a different label with
-   `curie cluster surfaces <agent> --add <KIND=ADDRESS> --label <new label>`,
-   then remove the old binding as above. A binding must not keep the old
-   label.
+   that `curie cluster surfaces <agent>` printed. When it is the agent's only
+   surface, delete the agent with `curie cluster delete <agent> --yes` instead.
+   To replace the bundle and keep the agent, write the implementation bundle
+   with `curie example dark-factory render --out <dir>`, then run these in
+   order:
+   1. When the old binding is the agent's only surface, add a temporary one
+      at another location of the same kind (another repository for GitHub),
+      under a label no issue carries, so it admits nothing:
+      `curie cluster surfaces <agent> --add <KIND=OTHER_ADDRESS> --label <unused label>`.
+   2. Remove the old binding:
+      `curie cluster surfaces <agent> --remove <KIND=ADDRESS>`.
+   3. Deploy the implementation bundle:
+      `curie cluster deploy --plugin-dir <dir> --agent <agent>`.
+   4. Bind the agent again under a different label, on the same location or
+      another one:
+      `curie cluster surfaces <agent> --add <KIND=ADDRESS> --label <new label>`.
+   5. Remove the temporary surface, if you added one:
+      `curie cluster surfaces <agent> --remove <KIND=OTHER_ADDRESS>`.
+   No binding keeps the old label.
 4. Upgrade with `curie cluster upgrade --to <version> --forward-only`, or set
    `api.migrate.forwardOnly=true` on a direct `helm upgrade`.
 
