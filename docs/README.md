@@ -39,6 +39,8 @@ they are not substitutes for a supported quickstart.
   structure and manual coverage and dependency mapping.
 - [Review factory PRs](guides/factory-pr-review.md): inspect changes, run local
   checks, and publish approved feedback or merge.
+- [Factory coding standards](guides/factory-coding-standards.md): where a run
+  reads your repository's coding instructions and which files win.
 
 ## Administer Software Factory
 
