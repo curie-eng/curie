@@ -626,11 +626,16 @@ def save(path: Path, state: dict[str, Any]) -> None:
 
 
 def _emit(state: dict[str, Any], record: dict[str, Any]) -> None:
-    """Write one evidence line where the status card reads it: the pod log.
+    """Write one evidence line to the pod log, or to ``gate.log`` if that fails.
 
-    Our stderr is swallowed by the CLI that runs the hook, so the line goes to
-    the runner container's PID 1 stderr. ``DARK_FACTORY_PROGRESS_LOG`` redirects
-    it (tests, local runs).
+    The pod log is where the status card reads it. Our stderr is swallowed by
+    the CLI that runs the hook, so the line goes to the runner container's PID 1
+    stderr. ``DARK_FACTORY_PROGRESS_LOG`` redirects it (tests, local runs). When
+    that target cannot be opened or written, the line is appended to
+    ``gate.log`` in ``state_dir()``, which is ``DARK_FACTORY_STATE_DIR`` when
+    that is set. A reader inside the pod can read that file while the pod
+    exists, but a line there is not in the pod log. Only when that write also
+    fails does the line go to stderr.
     """
     state["seq"] += 1
     record["seq"] = state["seq"]
@@ -640,8 +645,21 @@ def _emit(state: dict[str, Any], record: dict[str, Any]) -> None:
     try:
         with open(target, "a") as log:
             log.write(line + "\n")
+        return
     except OSError:
-        sys.stderr.write(line + "\n")
+        pass
+    # The runner's PID 1 marks itself non-dumpable, so its children get EACCES on
+    # /proc/1/fd/2. Keep the line in the hook's state directory, where a reader
+    # inside the pod can find it, before the swallowed stderr.
+    try:
+        gate_dir = state_dir()
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        with open(gate_dir / "gate.log", "a") as log:
+            log.write(line + "\n")
+        return
+    except OSError:
+        pass
+    sys.stderr.write(line + "\n")
 
 
 def emit_phase(state: dict[str, Any], phase: str, round_: int, note: str, **fields: Any) -> None:
