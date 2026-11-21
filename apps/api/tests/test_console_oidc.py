@@ -41,6 +41,7 @@ from typing import Any
 import httpx
 import pytest
 from curie_api.config import get_settings
+from curie_api.routers.identity_me import FLOW_COOKIE
 from fastapi.testclient import TestClient
 from redis.asyncio import Redis
 from sqlalchemy import event, text
@@ -1669,11 +1670,30 @@ def _assert_clears_session_cookie(response: httpx.Response) -> None:
     assert morsel.value in ("", '""'), morsel.OutputString()
 
 
+def _assert_clears_github_link_cookie(response: httpx.Response) -> None:
+    # The ten-minute GitHub link flow cookie (#5829): logout must clear it with
+    # the exact flags start_github_link sets, or the browser keeps it past the
+    # session it belonged to.
+    morsel = _set_cookies(response).get(FLOW_COOKIE)
+    assert morsel is not None, response.headers
+    assert morsel["path"] == "/"
+    assert morsel["secure"]
+    assert morsel["httponly"]
+    assert morsel["samesite"].lower() == "lax"
+    assert morsel["domain"] == ""
+    expired = morsel["max-age"] == "0"
+    if not expired and morsel["expires"]:
+        expired = parsedate_to_datetime(morsel["expires"]) <= datetime.now(UTC)
+    assert expired, morsel.OutputString()
+    assert morsel.value in ("", '""'), morsel.OutputString()
+
+
 def _assert_logged_out(response: httpx.Response) -> None:
     assert response.status_code == 204, response.text
     assert response.headers.get("cache-control") == "no-store"
     assert response.content == b""
     _assert_clears_session_cookie(response)
+    _assert_clears_github_link_cookie(response)
 
 
 def _logout(client: TestClient, headers: dict[str, str] | None = None) -> httpx.Response:
