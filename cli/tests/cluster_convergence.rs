@@ -584,10 +584,29 @@ fn sibling_tag_alias_requires_same_node_image_inventory_identity() {
 }
 
 #[test]
+fn sibling_alias_binds_when_one_entry_names_the_running_digest_under_two_repositories() {
+    // A kind node that loaded the same image on both sides of midnight UTC
+    // holds import-<day1>@D and import-<day2>@D on one inventory entry. Both
+    // names are the same manifest digest, so the alias is bound, not ambiguous.
+    for verb in ["status", "up"] {
+        let output = Fixture::new().run(verb, "alias-reimported-same-digest");
+        assert!(
+            output.status.success(),
+            "{verb}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if verb == "status" {
+            assert_eq!(Fixture::json(&output)["healthy"], true);
+        }
+    }
+}
+
+#[test]
 fn sibling_alias_refuses_unbound_inventory_and_unhealthy_or_stale_containers() {
     for scenario in [
         "alias-split-entry",
         "alias-ambiguous",
+        "alias-same-entry-two-digests",
         "alias-missing-entry",
         "alias-wrong-node",
         "alias-no-reported-alias",

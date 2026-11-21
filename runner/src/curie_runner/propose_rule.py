@@ -14,7 +14,7 @@ request bound capability, never from the model, so this handler posts exactly
 This module owns the schema, the description and the handler and stays free of
 the SDK (ADR 0140); `curie_runner.harness.claude.propose_rule_tool` wraps the
 handler as the SDK tool. The post, the body decoding and the refusal code
-reading are the helpers `curie_runner.tracker_result` already owns.
+reading are the helpers `curie_runner.completion_contract` already owns.
 
 Nothing here logs or renders the rule, the reason or the capability: a log
 line names the outcome only.
@@ -28,7 +28,7 @@ from typing import Any
 
 import aiohttp
 
-from .tracker_result import (
+from .completion_contract import (
     _CODE_RE,
     ResultHandler,
     _code,

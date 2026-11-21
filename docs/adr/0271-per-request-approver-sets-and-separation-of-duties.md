@@ -4,6 +4,13 @@ Date: 2026-11-05
 
 Status: Accepted
 
+**Partially superseded by [ADR 0288](0288-the-runner-carries-a-connector-approval-ticket-to-its-gated-call.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+only decision 3's opaque, unparsed transport of the ticket, that is, "Carry the
+opaque ticket" and "it does not parse". ADR 0288 has the runner read three
+untrusted claims to carry the connector's own ticket. The ticket shape, its
+signed facts and every verification step are unchanged.
+
 Accepted on 2026-11-07 with explicit maintainer approval from Brian Conn,
 before implementation. Implementation follows
 [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) and

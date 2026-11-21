@@ -69,7 +69,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -80,7 +80,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -218,6 +218,11 @@ jobs:
       # files and that a removed api.* factory key is refused (#4397).
       - name: helm render assertions (factory forges)
         run: bash charts/curie/ci/factory-forges-assertions.sh
+
+      # Prove factory.modelAuthMode renders one FACTORY_MODEL_AUTH_MODE into
+      # both the api and the worker, and that extraEnv cannot set it.
+      - name: helm render assertions (factory model auth mode)
+        run: bash charts/curie/ci/factory-model-auth-mode-assertions.sh
 
       - name: helm render assertions (GitHub account linking)
         run: bash charts/curie/ci/factory-github-link-assertions.sh
@@ -488,6 +493,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-recreate-assertions.sh
 
+      # Prove langfuse-web binds every interface (HOSTNAME=0.0.0.0) so that
+      # `kubectl port-forward`, and `curie cluster access`, can reach it.
+      - name: helm render assertions (langfuse web HOSTNAME)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-web-hostname-assertions.sh
+
   chart-assertions-2:
     name: Chart render assertions (2 of 3)
     runs-on: ubuntu-24.04
@@ -503,7 +515,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -514,7 +526,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -1138,7 +1150,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -1149,7 +1161,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -1220,7 +1232,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Back off before retrying Install Helm
@@ -1230,7 +1242,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Ensure kind-registry exists
@@ -1303,7 +1315,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Back off before retrying Install Helm
@@ -1313,7 +1325,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Concurrent automatic threads stay isolated

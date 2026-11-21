@@ -98,6 +98,9 @@ pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Op
         | ClusterAction::Status {
             namespace, release, ..
         }
+        | ClusterAction::Access {
+            namespace, release, ..
+        }
         | ClusterAction::Observability {
             namespace, release, ..
         }
@@ -241,6 +244,11 @@ pub(crate) fn retarget_cluster_action(
             ..
         }
         | ClusterAction::Status {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Access {
             namespace: current_namespace,
             release: current_release,
             ..

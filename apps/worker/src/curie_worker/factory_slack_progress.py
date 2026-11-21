@@ -51,7 +51,11 @@ existing records, with no lifecycle hook:
    request. A request is eligible when it was live at or after
    ``factory_slack_since`` (created then or later, still open, or ended then or
    later). ``first_sequence`` is the smallest eligible sequence, set once here
-   and never advanced (a kickoff thread's is its kickoff request's);
+   and never advanced (a kickoff thread's is its kickoff request's). A
+   configured thread with no root post yet, which Alembic revision 0188
+   records ahead of a WorkItem's next request, gets its root post once an
+   eligible request at or after its ``first_sequence`` exists, and its
+   ``first_sequence`` moves to that request;
 2. the card post described above;
 3. one ``needs_person`` reply per request at or after ``first_sequence`` that
    ended ``failed`` or ``expired`` with no automatic retry admitted, and one
@@ -667,7 +671,11 @@ class PostgresFactorySlackStore:
 
         # Discovery roots a configured thread in the agent's destination while
         # exactly one Slack binding there names an adapter. A kickoff thread is
-        # inserted rooted by the API, so the NOT EXISTS below skips it.
+        # inserted rooted by the API, so the NOT EXISTS below skips it. A
+        # configured thread recorded with no root post (revision 0188 records
+        # one ahead of a WorkItem's next request) is rooted at its first
+        # eligible request at or after its first sequence, by the same
+        # destination cutoff, in the destination's current binding.
         discover = text(
             f"""
             WITH discovered AS (
@@ -703,12 +711,58 @@ class PostgresFactorySlackStore:
                    )
                 ON CONFLICT (work_item_id) DO NOTHING
                 RETURNING t.work_item_id, t.first_sequence
+            ),
+            dormant AS (
+                SELECT t.work_item_id, b.adapters[1] AS channel_identity,
+                       a.factory_slack_channel AS channel, e.first_sequence
+                  FROM {self._threads} t
+                  JOIN {self._agents} a ON a.id = t.agent_id
+                  CROSS JOIN LATERAL (
+                      SELECT min(q.sequence) AS first_sequence
+                        FROM {self._requests} q
+                       WHERE q.work_item_id = t.work_item_id
+                         AND q.sequence >= t.first_sequence
+                         AND (q.created_at >= a.factory_slack_since
+                              OR q.terminal_at IS NULL
+                              OR q.terminal_at >= a.factory_slack_since)
+                  ) e
+                  CROSS JOIN LATERAL (
+                      SELECT array_agg(CAST(c.adapter AS text)) AS adapters
+                        FROM {self._channels} c
+                       WHERE c.agent_id = a.id
+                         AND c.kind = 'slack'
+                         AND c.address = a.factory_slack_channel
+                         AND c.adapter IS NOT NULL
+                  ) b
+                 WHERE t.origin = 'configured'
+                   AND t.root_ts IS NULL
+                   AND a.factory_slack_channel IS NOT NULL
+                   AND a.factory_slack_since IS NOT NULL
+                   AND e.first_sequence IS NOT NULL
+                   AND cardinality(b.adapters) = 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {self._posts} r
+                        WHERE r.work_item_id = t.work_item_id AND r.post_key = 'root'
+                   )
+            ),
+            woken AS (
+                UPDATE {self._threads} AS t
+                   SET channel_identity = d.channel_identity,
+                       channel = d.channel,
+                       first_sequence = d.first_sequence
+                  FROM dormant d
+                 WHERE t.work_item_id = d.work_item_id
+                RETURNING t.work_item_id, t.first_sequence
             )
             INSERT INTO {self._posts} AS p
                    (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
             SELECT d.work_item_id, 'root', 'root', 0, 0, 0,
                    {self._root_payload}
-              FROM discovered d
+              FROM (
+                  SELECT work_item_id, first_sequence FROM discovered
+                  UNION ALL
+                  SELECT work_item_id, first_sequence FROM woken
+              ) d
               JOIN {self._work_items} w ON w.id = d.work_item_id
               JOIN {self._requests} q
                 ON q.work_item_id = d.work_item_id AND q.sequence = d.first_sequence

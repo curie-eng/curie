@@ -9,25 +9,31 @@ text only) can assert on any of them.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+Severity = Literal["error", "warning"]
 
 
 @dataclass(frozen=True)
 class Finding:
-    """A single lint failure.
+    """A single lint finding.
 
     ``doc`` is the repo-relative path of the file the failure was found in.
     ``citation`` is the offending token: a citation string, a front-matter
     field name, a kind value, a coordinate, or a generated-marker name.
     ``reason`` explains the failure. ``line`` is the 1-based line number when
-    known, else ``None``.
+    known, else ``None``. ``severity`` is ``error`` (fails the gate) or
+    ``warning`` (printed in logs, exit 0).
     """
 
     doc: str
     citation: str
     reason: str
     line: int | None = None
+    severity: Severity = "error"
 
     def render(self) -> str:
         """One printable line naming the doc, the citation, and the reason."""
         location = self.doc if self.line is None else f"{self.doc}:{self.line}"
-        return f"{location}: {self.citation}: {self.reason}"
+        prefix = "warning: " if self.severity == "warning" else ""
+        return f"{prefix}{location}: {self.citation}: {self.reason}"

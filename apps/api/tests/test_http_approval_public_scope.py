@@ -7,6 +7,7 @@ Actual ASGI route and PostgreSQL rows; synthetic inputs only.
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 from aci_protocol.turn import DEFAULT_IDENTITY
@@ -106,3 +107,24 @@ def test_non_http_tenant_keeps_creation_on_an_ambiguous_unqualified_route(
         response = create(client, body)
         assert response.status_code == 201, response.text
     assert len(rows(body["dedupe_key"])) == 1
+
+
+def test_public_creation_refuses_an_ambiguous_route_but_accepts_the_legacy_binding(
+    creation_case: SimpleNamespace,
+) -> None:
+    case = creation_case
+    address = f"synthetic-room-{uuid.uuid4().hex}"
+    adopted = uuid.UUID(case.scope["agent"])
+    _, legacy_agent = seed([
+        {"kind": KIND, "address": address, "adapter": "a1", "agent": adopted},
+        {"kind": KIND, "address": address, "adapter": "a2"},
+    ])
+    lookups = len(case.provider.requests)
+    ambiguous = request(legacy_agent, KIND, address, None)
+    response = create(case.client, ambiguous)
+    assert (response.status_code, response.json()) == (409, {"detail": "unsupported_approval"})
+    assert rows(ambiguous["dedupe_key"]) == []
+    qualified = {**ambiguous, "reply_adapter": "a2"}
+    assert create(case.client, qualified).status_code == 201
+    assert len(rows(qualified["dedupe_key"])) == 1
+    assert len(case.provider.requests) == lookups

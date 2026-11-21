@@ -150,7 +150,7 @@ def assert_answer_admitted(
     _require(len(requests) == 2, f"expected two requests after the answer, found {len(requests)}")
     second = requests[1]
     _require(str(second["id"]) != asking_request, "the answer reused the asking request")
-    _require(second.get("completion_contract") == "implementation", "the answer is not a run")
+    _require(second.get("execution_kind") == "implementation", "the answer is not a run")
     _within(
         answer_at,
         instant(second["created_at"]),

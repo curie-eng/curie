@@ -762,33 +762,38 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                     std::path::Path::new("charts/curie").is_dir(),
                 )?;
                 let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-                emit(
-                    curie::factory_quickstart::quickstart(
-                        curie::factory_quickstart::QuickstartOpts {
-                            repos,
-                            app_id,
-                            private_key_file,
-                            context,
-                            namespace,
-                            release,
-                            org,
-                            kind_name,
-                            model,
-                            execution_deadline_seconds: execution_deadline,
-                            budget_usd: budget,
-                            output_tokens,
-                            agent,
-                            label,
-                            plugin_dir,
-                            chart,
-                            chart_explicit,
-                            candidate,
-                            dry_run,
-                            forge,
-                        },
-                    )
-                    .await?,
+                let (hint_namespace, hint_release) = (namespace.clone(), release.clone());
+                let output = curie::factory_quickstart::quickstart(
+                    curie::factory_quickstart::QuickstartOpts {
+                        repos,
+                        app_id,
+                        private_key_file,
+                        context,
+                        namespace,
+                        release,
+                        org,
+                        kind_name,
+                        model,
+                        execution_deadline_seconds: execution_deadline,
+                        budget_usd: budget,
+                        output_tokens,
+                        agent,
+                        label,
+                        plugin_dir,
+                        chart,
+                        chart_explicit,
+                        candidate,
+                        dry_run,
+                        forge,
+                    },
                 )
+                .await?;
+                let hint = output.console_access_hint(&hint_namespace, &hint_release);
+                emit(output)?;
+                if let Some(hint) = hint {
+                    ui::ui().payload(&hint);
+                }
+                Ok(())
             }
         },
         Some(Command::Cluster { action, context }) => cluster_action::run(action, context).await,

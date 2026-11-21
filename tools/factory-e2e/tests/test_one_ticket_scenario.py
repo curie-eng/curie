@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import importlib.util
 import json
+import re
 import ssl
 import sys
 from collections.abc import Iterator
@@ -73,7 +74,7 @@ def _request(
         "sequence": sequence,
         "status": status,
         "terminal_cause": cause,
-        "completion_contract": "implementation",
+        "execution_kind": "implementation",
         "created_at": created,
     }
 
@@ -614,3 +615,15 @@ def test_the_scenario_observation_names_only_the_fixture_issue() -> None:
     sql = run.observation_sql(ots.ISSUE)
     assert f"tracker_issue_id = '{ots.ISSUE}'" in sql
     assert sql.count("tracker_issue_id") == 4
+
+
+def test_the_scenario_observation_reads_only_columns_the_head_schema_has() -> None:
+    from curie_api.models import Base
+
+    sql = run.observation_sql(ots.ISSUE)
+    columns = {table.name: set(table.columns.keys()) for table in Base.metadata.tables.values()}
+    aliases = dict((alias, table) for table, alias in re.findall(r"curie\.(\w+) (\w)\b", sql))
+    references = set(re.findall(r"\b([a-z])\.(\w+)", sql))
+    assert set(aliases) == {alias for alias, _ in references}
+    missing = sorted(f"{aliases[a]}.{c}" for a, c in references if c not in columns[aliases[a]])
+    assert missing == []

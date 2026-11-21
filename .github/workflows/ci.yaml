@@ -548,7 +548,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -558,7 +558,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Ensure kind-registry exists
@@ -672,7 +672,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -682,7 +682,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Ensure kind-registry exists
@@ -734,6 +734,12 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      # ADR number uniqueness across open PRs (#1957): curie_doclint lists
+      # open pull-request file additions via gh so collisions this candidate
+      # claims fail the gate and other remote collisions warn in the log.
+      # contents:read alone is not enough for that listing under the
+      # restricted default token.
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -822,9 +828,13 @@ jobs:
       # each seam's front-matter, fail on drift, resolve every `curie ...`
       # command named in the agent verification contract (docs/agents.md)
       # against cli/command-manifest.json (#1041), then lint every citation
-      # under docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it
-      # runs right after ruff/mypy.
+      # under docs/ (excluding docs/adr/), and verify ADR numbers are unique
+      # across the working tree, origin/main, origin/next, and open PR
+      # additions (#1957). A cheap, cluster-free gate, so it runs right after
+      # ruff/mypy.
       - name: Docs gate (catalog drift + agent contract + citations)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/check-docs.sh
       # _AciModel tolerant-decode gate (#625, following #492): every direct
       # ClassName.model_validate*(...) call on an _AciModel subclass must thread
@@ -1267,7 +1277,7 @@ jobs:
           workspaces: cli
           shared-key: rust-test
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest@0.9.146
       - name: Build and archive the tests
@@ -1319,7 +1329,7 @@ jobs:
       - name: Toolchain
         run: rustc --version
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest@0.9.146
       # write_allowlist_bundle_passes_the_real_bundle_validator (AC3) shells out
@@ -1348,7 +1358,7 @@ jobs:
       - name: Install Helm for CLI consumer render tests
         id: install_helm_for_cli_consumer_render_tests
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm for CLI consumer render tests
@@ -1358,7 +1368,7 @@ jobs:
           sleep 15
       - name: Install Helm for CLI consumer render tests (retry)
         if: steps.install_helm_for_cli_consumer_render_tests.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
         with:
           version: v3.16.4
       - name: Download the test archive
@@ -1400,13 +1410,13 @@ jobs:
         working-directory: cli
         run: rustc --version
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest@0.9.146
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -1416,7 +1426,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
         with:
           version: v3.16.4
       # The tests create and delete their own clusters. The action only installs
@@ -3263,7 +3273,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The images come from the ci-images job, which built them once for this
@@ -3277,7 +3287,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The images come from the ci-images job, which built them once for this
@@ -3602,7 +3612,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -3612,7 +3622,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The driver creates and deletes its own cluster. The action only installs
@@ -3764,7 +3774,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -3774,7 +3784,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The driver creates and deletes its own cluster. The action only installs
@@ -3898,7 +3908,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -3908,7 +3918,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The driver creates and deletes its own cluster. The action only installs
@@ -3985,7 +3995,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -3995,7 +4005,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # disableDefaultCNI is load-bearing (#1153). kind's default kindnet
@@ -4353,7 +4363,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The images come from the ci-images job, which built them once for this
@@ -4367,7 +4377,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The images come from the ci-images job, which built them once for this
@@ -4590,7 +4600,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The images come from the ci-images job, which built them once for this
@@ -4604,7 +4614,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # The images come from the ci-images job, which built them once for this
@@ -4870,7 +4880,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -4880,7 +4890,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
@@ -5308,7 +5318,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -5318,7 +5328,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
@@ -5623,7 +5633,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Back off before retrying Install Helm
@@ -5633,7 +5643,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
       - name: Load the images built by the ci-images job

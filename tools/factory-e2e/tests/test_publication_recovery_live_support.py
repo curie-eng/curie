@@ -549,7 +549,6 @@ def _recovered(**override: Any) -> dict[str, Any]:
         "runtime_epoch": 2,
         "runtime_claim_name": "claim-b",
         "started_at": "2026-11-16T08:06:00+00:00",
-        "model_session_reserved_at": None,
         "recovery_candidate_id": CANDIDATE,
         "recovery_candidate_sha256": "c" * 64,
     }
@@ -629,7 +628,6 @@ def test_judge_recovery_accepts_a_capture_snapshot_with_no_flushed_tokens() -> N
         ({"successor": {"started_at": "2026-11-16T08:04:00+00:00"}}, "before the original"),
         ({"successor": {"recovery_candidate_id": "x"}}, "different candidate"),
         ({"successor": {"recovery_candidate_sha256": "e" * 64}}, "digest differs"),
-        ({"successor": {"model_session_reserved_at": "2026-11-16T08:06:01Z"}}, "model session"),
         (
             {"candidate_after": {**_candidate(), "patch": {"sha256": "9" * 64, "size_bytes": 1}}},
             "objects changed",

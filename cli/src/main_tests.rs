@@ -2686,3 +2686,64 @@ fn build_plugin_dir_registry_still_parses() {
         "--registry alone still needs a build input"
     );
 }
+
+#[test]
+fn cluster_factory_model_auth_mode_takes_service_or_personal_only() {
+    for mode in ["service", "personal"] {
+        assert!(
+            try_parse_from([
+                "curie",
+                "cluster",
+                "factory",
+                "--model-auth-mode",
+                mode,
+                "--dry-run"
+            ])
+            .is_ok(),
+            "{mode}"
+        );
+    }
+    let error = try_parse_from([
+        "curie",
+        "cluster",
+        "factory",
+        "--model-auth-mode",
+        "shared",
+        "--dry-run",
+    ])
+    .err()
+    .expect("an unknown mode must not parse");
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+}
+
+#[test]
+fn cluster_factory_model_auth_mode_conflicts_with_disable_and_repository_updates() {
+    for extra in [
+        vec!["--disable"],
+        vec!["--repo-docker", "acme/bot"],
+        vec![
+            "--repo-runner",
+            "acme/bot=bot.yaml",
+            "--registry",
+            "ghcr.io/acme",
+        ],
+    ] {
+        let mut argv = vec![
+            "curie",
+            "cluster",
+            "factory",
+            "--model-auth-mode",
+            "personal",
+            "--dry-run",
+        ];
+        argv.extend(extra.iter().copied());
+        let error = try_parse_from(argv.clone())
+            .err()
+            .unwrap_or_else(|| panic!("{argv:?} must not parse"));
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{argv:?}"
+        );
+    }
+}

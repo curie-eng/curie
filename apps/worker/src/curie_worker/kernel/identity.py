@@ -47,11 +47,18 @@ if TYPE_CHECKING:
 
 
 class HttpIdentityRefused(RuntimeError):
-    """@spec HTTP-INVOCATION-EXECUTION-18."""
+    """@spec HTTP-INVOCATION-EXECUTION-18.
 
-    def __init__(self) -> None:
+    ``notice`` is a fixed person-facing sentence the lifecycle owner may deliver
+    after the terminal marker, set only for a refusal that says nothing about
+    any person (ADR 0288 decision 3). None, the default, keeps the
+    refusal silent.
+    """
+
+    def __init__(self, *, notice: str | None = None) -> None:
         """@spec HTTP-INVOCATION-EXECUTION-18."""
         super().__init__("identity_invocation_refused")
+        self.notice = notice
 
 
 @dataclass

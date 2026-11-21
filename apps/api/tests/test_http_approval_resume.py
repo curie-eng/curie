@@ -43,6 +43,7 @@ from apps.api.tests.test_http_approval_creation import creation_case as creation
 from apps.api.tests.test_http_approval_legacy_writers import (
     created,
     lapse,
+    row_by_id,
     seed_rows,
 )
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
@@ -222,6 +223,30 @@ def test_revoked_original_invoker_leaves_the_wake_owed_and_appends_nothing(
     assert with_stores(case, body) == []
     assert refusals == ["caller_not_allowed"]
     assert rows(row["dedupe_key"])[0]["resumed_at"] is None
+
+
+def test_resume_queue_refuses_a_selected_row_without_a_seal(
+    creation_case: SimpleNamespace,
+) -> None:
+    case = creation_case
+    source = created(case)
+    resolved = datetime(2026, 1, 1)
+    selected, legacy = seed_rows(source, [
+        {"status": "rejected", "resolved": resolved},
+        {"status": "rejected", "resolved": resolved, "legacy": True},
+    ])
+    before = row_by_id(selected)
+
+    async def publish(stores: SimpleNamespace) -> None:
+        with pytest.raises(resume_module().ApprovalResumeRefused) as refused:
+            await stores.queue.enqueue_approval(selected)
+        assert refused.value.code == "unsupported_resume"
+        await stores.queue.enqueue_approval(legacy)
+
+    [(entry_id, fields)] = with_stores(case, publish)
+    assert entry_id
+    assert QueuedTurn.model_validate_json(fields["payload"]).event_id == resume_event_id(legacy)
+    assert row_by_id(selected) == before
 
 
 def test_a_legacy_row_keeps_its_existing_resume(creation_case: SimpleNamespace) -> None:
