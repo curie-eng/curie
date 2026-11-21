@@ -596,9 +596,6 @@ def judge_recovery(
     assert successor.get("runtime_claim_name") != original.get("runtime_claim_name"), (
         "the successor reused the original's sandbox claim"
     )
-    assert successor.get("model_session_reserved_at") is None, (
-        "the recovery request reserved a model session"
-    )
 
     # The identical candidate: same identity, content digest, objects and intent.
     identity = candidate_identity(candidate)

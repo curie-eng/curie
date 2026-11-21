@@ -1,0 +1,346 @@
+"""Platform text after the agent's text must not break a trailing Decisions section.
+
+The producer is the platform's own text helpers (`end_trailing_decisions`,
+`append_github_ask_line`). The consumers are the publish hook's grammar and, through
+the shared fixture, the Rust parser `curie factory explain` reads a published body
+with (`cli/src/commands/factory_explain.rs`, test `factory_published_decisions_vector`).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import pytest
+from curie_api.factory_comment_text import (
+    DECISIONS_SECTION_END,
+    append_github_ask_line,
+    github_ask_line,
+)
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "examples" / "dark-factory" / "hooks"))
+
+import decisions_section  # noqa: E402
+import reproduction_gate  # noqa: E402
+from decisions_section import parse_decisions_section  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from forge_fakes.github_comments import _rows, admitted, comments  # noqa: E402, F401
+from test_publications import (  # noqa: E402, F401
+    _factory_issue_marker,
+    _factory_publication_case,
+    _post_factory_publication,
+    _record_factory_verification,
+)
+
+FIXTURE = ROOT / "tests" / "vectors" / "factory-decisions-published.json"
+ROUTE_FIXTURE = ROOT / "tests" / "vectors" / "factory-decisions-published-route.json"
+MENTION = "curie-factory"
+SUMMARY = "The change updates the factory route.\n\n"
+TWO = (
+    "1. Keep the parser pure. Rejected: a cached parser, because the input is small. "
+    "(plan) Evidence: the plan review approved it.\n"
+    "2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. "
+    "(diff review) Evidence: the vector test covers both."
+)
+NONE = "None: the change follows directly from the acceptance criteria."
+LAST = f"{SUMMARY}## Decisions\n\n{TWO}\n"
+# A Decisions section that is really malformed: the entry has no rejected alternative.
+MALFORMED = f"{SUMMARY}## Decisions\n\n1. Keep the parser pure.\n"
+# A near miss of the break line. Both grammars read it as an ordinary line, and
+# the producer must not trim its trailing space into the break.
+NEAR_BREAK = f"{SUMMARY}## Decisions\n\n{TWO}\n--- \n"
+BEFORE_HEADING = f"{SUMMARY}## Decisions\n\n{TWO}\n\n## Reviews\n\nPlan review: APPROVE.\n"
+# An agent-written line that starts like the platform's ask line, inside the section.
+# It is the agent's text: dropping it would turn this malformed section into `None`.
+ASK_INSIDE = (
+    f"{SUMMARY}## Decisions\n\n{NONE}\nAsk the factory: this is invalid content inside Decisions.\n"
+)
+# Valid Decisions, then a last line that is a near miss of the break line. The
+# producer must keep its trailing space, or it becomes an exact break.
+EXISTING_BREAK_LAST = f"{SUMMARY}## Decisions\n\n{TWO}\n\n---\n\nPlan review: APPROVE.\n\n--- "
+REVIEWS_LAST = f"{SUMMARY}## Decisions\n\n{TWO}\n\n## Reviews\n\nPlan review: APPROVE.\n\n--- "
+# A ticket that carried questions: the agent cites each answer it relied on, one line
+# each, beside its numbered decisions. The citation is not a numbered decision.
+CITED_ONE = "Answered on the ticket by maintainer: use the shared grammar."
+CITED_TWO = "Answered on the ticket by reviewer: keep the parser pure."
+ANSWERED = f"{SUMMARY}## Decisions\n\n{TWO}\n{CITED_ONE}\n{CITED_TWO}\n"
+# Every decision was answered on the ticket, so the section holds only citations.
+ANSWERED_ONLY = f"{SUMMARY}## Decisions\n\n{CITED_ONE}\n"
+# A citation below the break line is not in the section. Here it is the only thing
+# after the heading, so the section is empty and malformed.
+CITED_BELOW_BREAK = f"{SUMMARY}## Decisions\n\n---\n\n{CITED_ONE}\n"
+# A citation line with nothing after the prefix names no author. It is not a
+# citation, so it is read as a numbered entry and rejected.
+CITED_NO_AUTHOR = f"{SUMMARY}## Decisions\n\n{TWO}\nAnswered on the ticket by \n"
+CITED_NO_AUTHOR_BLANK = f"{SUMMARY}## Decisions\n\n{TWO}\nAnswered on the ticket by    \n"
+CITED_NO_SPACE = f"{SUMMARY}## Decisions\n\n{TWO}\nAnswered on the ticket by\n"
+# The None declaration is the section's sole content; a citation beside it is not.
+CITED_BESIDE_NONE = f"{SUMMARY}## Decisions\n\n{NONE}\n{CITED_ONE}\n"
+
+
+def _producer_cases() -> list[dict[str, Any]]:
+    """Bodies the platform text helpers publish, from agent text it never saw."""
+    once = append_github_ask_line(LAST, MENTION)
+    return [
+        {"id": "ask-line-after-decisions-last", "agent_body": LAST, "published_body": once},
+        {
+            "id": "none-declaration-last",
+            "agent_body": f"{SUMMARY}## Decisions\n\n{NONE}",
+            "published_body": append_github_ask_line(f"{SUMMARY}## Decisions\n\n{NONE}", MENTION),
+        },
+        {
+            "id": "reappended-published-body",
+            "agent_body": LAST,
+            "published_body": append_github_ask_line(once, MENTION),
+        },
+        {
+            "id": "decisions-before-a-heading-is-untouched",
+            "agent_body": BEFORE_HEADING,
+            "published_body": append_github_ask_line(BEFORE_HEADING, MENTION),
+        },
+        {
+            # Named counterexample: a really malformed Decisions section stays
+            # unparsed once the platform text follows it. The break line must not
+            # launder it.
+            "id": "malformed-decisions-last",
+            "agent_body": MALFORMED,
+            "published_body": append_github_ask_line(MALFORMED, MENTION),
+        },
+        {
+            "id": "near-break-line-last-stays-malformed",
+            "agent_body": NEAR_BREAK,
+            "published_body": append_github_ask_line(NEAR_BREAK, MENTION),
+        },
+        {
+            # Named counterexample: dropping the agent's own ask-like line must not
+            # turn this malformed section into a valid `None` declaration.
+            "id": "ask-line-inside-decisions-stays-malformed",
+            "agent_body": ASK_INSIDE,
+            "published_body": append_github_ask_line(ASK_INSIDE, MENTION),
+        },
+        {
+            "id": "existing-break-keeps-the-trailing-space-line",
+            "agent_body": EXISTING_BREAK_LAST,
+            "published_body": append_github_ask_line(EXISTING_BREAK_LAST, MENTION),
+        },
+        {
+            "id": "reviews-last-keeps-the-trailing-space-line",
+            "agent_body": REVIEWS_LAST,
+            "published_body": append_github_ask_line(REVIEWS_LAST, MENTION),
+        },
+        {
+            "id": "answered-citations-beside-entries",
+            "agent_body": ANSWERED,
+            "published_body": append_github_ask_line(ANSWERED, MENTION),
+        },
+        {
+            "id": "answered-citation-only",
+            "agent_body": ANSWERED_ONLY,
+            "published_body": append_github_ask_line(ANSWERED_ONLY, MENTION),
+        },
+        {
+            "id": "citation-below-break-line-is-not-in-the-section",
+            "agent_body": CITED_BELOW_BREAK,
+            "published_body": append_github_ask_line(CITED_BELOW_BREAK, MENTION),
+        },
+        {
+            "id": "citation-with-no-author-stays-malformed",
+            "agent_body": CITED_NO_AUTHOR,
+            "published_body": append_github_ask_line(CITED_NO_AUTHOR, MENTION),
+        },
+        {
+            "id": "citation-with-blank-author-stays-malformed",
+            "agent_body": CITED_NO_AUTHOR_BLANK,
+            "published_body": append_github_ask_line(CITED_NO_AUTHOR_BLANK, MENTION),
+        },
+        {
+            "id": "citation-prefix-without-its-space-stays-malformed",
+            "agent_body": CITED_NO_SPACE,
+            "published_body": append_github_ask_line(CITED_NO_SPACE, MENTION),
+        },
+        {
+            "id": "citation-beside-none-declaration-stays-malformed",
+            "agent_body": CITED_BESIDE_NONE,
+            "published_body": append_github_ask_line(CITED_BESIDE_NONE, MENTION),
+        },
+    ]
+
+
+# The bodies the publications route is asked to publish, each built from the issue
+# number and marker the route will see. Their published text comes from the route
+# itself (the closing reference, issue marker and ask line it adds), with the
+# per-run issue number and marker replaced by fixed text.
+def _footer(issue: int, marker: str) -> str:
+    return f"Closes #{issue}\n\n{marker}"
+
+
+ROUTE_BODIES: dict[str, Callable[[int, str], str]] = {
+    "route-decisions-last": lambda issue, marker: LAST,
+    "route-malformed-decisions-last": lambda issue, marker: MALFORMED,
+    "route-near-break-line-last-stays-malformed": lambda issue, marker: NEAR_BREAK,
+    "route-ask-line-inside-decisions-stays-malformed": lambda issue, marker: ASK_INSIDE,
+    "route-existing-break-keeps-the-trailing-space-line": lambda issue, marker: (
+        f"{SUMMARY}## Decisions\n\n{TWO}\n\n---\n\n{_footer(issue, marker)}\n\n--- "
+    ),
+    "route-reviews-last-keeps-the-trailing-space-line": lambda issue, marker: (
+        f"{SUMMARY}## Decisions\n\n{TWO}\n\n## Reviews\n\nPlan review: APPROVE.\n\n"
+        f"{_footer(issue, marker)}\n\n--- "
+    ),
+}
+# Exact `---` lines the route's output must hold: the agent's own, no more.
+ROUTE_BREAKS = {
+    "route-existing-break-keeps-the-trailing-space-line": 1,
+    "route-reviews-last-keeps-the-trailing-space-line": 0,
+}
+FIXED_MARKER = "<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->"
+
+
+def _entry(case_id: str, agent_body: str, published_body: str) -> dict[str, Any]:
+    try:
+        entries: list[dict[str, Any]] | None = parse_decisions_section(agent_body)
+    except ValueError:
+        entries = None
+    return {
+        "id": case_id,
+        "agent_body": agent_body,
+        "published_body": published_body,
+        "valid": entries is not None,
+        "entries": entries or [],
+    }
+
+
+def _dump(cases: list[dict[str, Any]]) -> str:
+    return json.dumps({"cases": cases}, indent=2, ensure_ascii=False) + "\n"
+
+
+def _read_bytes(path: Path) -> str:
+    # Bytes, not text mode: newline translation must not hide a stale fixture.
+    return path.read_bytes().decode("utf-8")
+
+
+def _write_bytes(path: Path, text: str) -> None:
+    path.write_bytes(text.encode("utf-8"))
+
+
+def test_fixture_is_the_producer_output_byte_for_byte() -> None:
+    """The Rust test reads this file, so it must be what the producer writes now."""
+    text = _dump([_entry(c["id"], c["agent_body"], c["published_body"]) for c in _producer_cases()])
+    if os.environ.get("CURIE_WRITE_VECTORS") == "1":
+        _write_bytes(FIXTURE, text)
+    assert _read_bytes(FIXTURE) == text, (
+        "tests/vectors/factory-decisions-published.json is stale; "
+        "run this test with CURIE_WRITE_VECTORS=1 to rewrite it"
+    )
+
+
+@pytest.mark.parametrize("case", _producer_cases(), ids=lambda case: case["id"])
+def test_published_body_keeps_the_entries_the_agent_wrote(case: dict[str, Any]) -> None:
+    published = case["published_body"]
+    try:
+        before = parse_decisions_section(case["agent_body"])
+    except ValueError:
+        # A malformed section is still rejected after the append.
+        with pytest.raises(ValueError):
+            parse_decisions_section(published)
+        return
+    assert parse_decisions_section(published) == before
+    assert published.splitlines().count(github_ask_line(MENTION)) == 1
+
+
+def test_a_trailing_section_is_closed_by_exactly_the_text_all_readers_use() -> None:
+    assert DECISIONS_SECTION_END == decisions_section.SECTION_END == "---"
+    assert reproduction_gate.DECISIONS_END == DECISIONS_SECTION_END
+    assert append_github_ask_line("## Decisions\n\n" + TWO, MENTION).splitlines()[-3:] == [
+        "---",
+        "",
+        github_ask_line(MENTION),
+    ]
+
+
+def test_the_ask_line_alone_never_extends_a_section_that_is_not_last() -> None:
+    published = append_github_ask_line(BEFORE_HEADING, MENTION)
+    assert DECISIONS_SECTION_END not in published.splitlines()
+
+
+def test_a_citation_below_the_break_line_is_not_in_the_section() -> None:
+    cited = "Answered on the ticket by maintainer: use the shared grammar."
+    inside = f"## Decisions\n\n{TWO}\n{cited}\n"
+    below = f"## Decisions\n\n{TWO}\n\n---\n\n{cited}\n"
+    assert reproduction_gate.cited(inside)
+    assert not reproduction_gate.cited(below)
+
+
+@pytest.mark.parametrize(
+    ("agent_body", "breaks"),
+    [(EXISTING_BREAK_LAST, 1), (REVIEWS_LAST, 0)],
+    ids=["existing", "none"],
+)
+def test_the_agents_last_line_keeps_its_trailing_space(agent_body: str, breaks: int) -> None:
+    published = append_github_ask_line(agent_body, MENTION)
+    lines = published.splitlines()
+    assert "--- " in lines
+    assert lines.count(DECISIONS_SECTION_END) == breaks
+
+
+@pytest.mark.parametrize("case", _producer_cases(), ids=lambda case: case["id"])
+def test_reappending_is_idempotent(case: dict[str, Any]) -> None:
+    once = append_github_ask_line(case["published_body"], MENTION)
+    twice = append_github_ask_line(once, MENTION)
+    assert twice == once
+    assert once.splitlines().count(github_ask_line(MENTION)) == 1
+    assert once.splitlines().count(DECISIONS_SECTION_END) <= 1
+
+
+@pytest.mark.parametrize("case_id", list(ROUTE_BODIES))
+def test_the_route_publishes_the_fixture_body_byte_for_byte(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],  # noqa: F811
+    case_id: str,
+) -> None:
+    """The body the production route stores is what the Rust parser reads."""
+    client, request_id, payload = _factory_publication_case
+    issue = int(payload["reply_conversation_id"].removeprefix("issue-"))
+    marker = _factory_issue_marker(request_id)
+    agent_body = ROUTE_BODIES[case_id](issue, marker)
+    recorded = _record_factory_verification(client, request_id, outcome="passed")
+    assert recorded.status_code == 201, recorded.text
+    created = _post_factory_publication(client, {**payload, "body": agent_body})
+    assert created.status_code == 201, created.text
+    published = str(created.json()["body"])
+
+    lines = published.splitlines()
+    # The published body holds the closing reference, issue marker and ask line.
+    assert f"Closes #{issue}" in lines
+    assert marker in lines
+    assert github_ask_line("curie") in lines
+    if case_id in ROUTE_BREAKS:
+        assert lines.count(DECISIONS_SECTION_END) == ROUTE_BREAKS[case_id]
+        # The agent's last line keeps its trailing space.
+        assert "--- " in lines
+
+    def fixed(text: str) -> str:
+        return text.replace(f"Closes #{issue}", "Closes #1").replace(marker, FIXED_MARKER)
+
+    entry = _entry(case_id, fixed(agent_body), fixed(published))
+    if entry["valid"]:
+        assert parse_decisions_section(published) == entry["entries"]
+    else:
+        with pytest.raises(ValueError):
+            parse_decisions_section(published)
+
+    stored = json.loads(_read_bytes(ROUTE_FIXTURE)) if ROUTE_FIXTURE.exists() else {"cases": []}
+    by_id = {case["id"]: case for case in stored["cases"]}
+    if os.environ.get("CURIE_WRITE_VECTORS") == "1":
+        by_id[case_id] = entry
+        ordered = [by_id[name] for name in ROUTE_BODIES if name in by_id]
+        _write_bytes(ROUTE_FIXTURE, _dump(ordered))
+        by_id = {case["id"]: case for case in ordered}
+    assert by_id.get(case_id) == entry, (
+        "tests/vectors/factory-decisions-published-route.json is stale; "
+        "run this test with CURIE_WRITE_VECTORS=1 to rewrite it"
+    )

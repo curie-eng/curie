@@ -20,6 +20,7 @@ from _migration_support import (
     stamped_revision,
 )
 from alembic import command
+from alembic.script import ScriptDirectory
 from curie_api.config import get_settings
 from sqlalchemy.exc import IntegrityError
 from test_github_factory_review import _complete
@@ -123,7 +124,9 @@ def test_a_pull_request_bound_before_the_upgrade_takes_plain_feedback_after_it(
     past the cap (or with a capped time) refuses this first comment.
     """
 
-    isolated_migration_db.at(REVISION)
+    # The app under test is the head app, so it runs on the head schema; the
+    # downgrade below passes back through 0186 to the release below it.
+    isolated_migration_db.at("head")
     github = factory_github(monkeypatch, tmp_path)
     try:
         with running_factory(github, new_agent=True) as factory:
@@ -138,8 +141,8 @@ def test_a_pull_request_bound_before_the_upgrade_takes_plain_feedback_after_it(
         lineage_id = _own_pull_request(
             first["work_item_id"], pr, branch=branch, head=head, status="open"
         )
-        command.upgrade(config, REVISION)
-        assert stamped_revision() == REVISION
+        command.upgrade(config, "head")
+        assert stamped_revision() == ScriptDirectory.from_config(config).get_current_head()
 
         with running_factory(github, new_agent=False) as factory:
             _complete(factory.client, first["id"])

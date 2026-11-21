@@ -51,6 +51,7 @@ from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_internal.provider_scope import ProviderScope
 from curie_internal.turn_queue import to_stream_fields
 from curie_runner import RunTracer, SideEffectClassifier
+from curie_runner.completion_contract import bind_completion_contract
 from curie_runner.fake import FakeModelSession
 from curie_runner.issue_read import resolve_issue_read
 from curie_runner.memory_rules_context import MemoryRulesContextGate
@@ -58,7 +59,6 @@ from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
 from curie_runner.requester_context import RequesterContextGate
 from curie_runner.server import create_app as create_runner_app
 from curie_runner.session import SessionRunner
-from curie_runner.tracker_result import bind_completion_contract
 from curie_runner.verification import preflight_workspace_verification
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import FactoryWake

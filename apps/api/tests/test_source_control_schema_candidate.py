@@ -50,17 +50,14 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # raise the floor. Dynamic approval answers require the 0156 answer gate,
     # and the factory Slack progress loop reads the 0157 tables. GitHub host
     # namespaces require 0158. Execution owner reads require 0159, personal
-    # custody reads and enrollment fences require 0160, agent
-    # version reads select the 0162 result policy columns, factory CI
+    # custody reads and enrollment fences require 0160, factory CI
     # observations require the 0163 table, cached facts and request
     # delivery require the 0164 tables, and Slack kickoff thread origin
     # reads require 0166.
     # Owner coding profiles and tenant policies require 0165, which stays below
-    # this floor. Execution request reads select the 0167 completion contract
-    # columns. Intake notice storage requires 0168, which stays below this floor.
+    # this floor. Intake notice storage requires 0168, which stays below this floor.
     # Requester selection columns require 0169, which stays below this floor.
     # Refusal posts require 0170, which stays below this floor.
-    # Triage handoff storage requires 0171, which stays below this floor.
     # Factory retry allowance columns require 0172, which stays below this floor.
     # Factory resource gate columns require 0174, which stays below this floor.
     # Publication recovery requests require 0175, which stays below this floor.
@@ -74,7 +71,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # Factory question rounds require 0184.
     # Learned memory rules require 0185.
     # The plain feedback cap requires 0186.
-    assert window == {"schema_min": "0186", "schema_head": "0187"}
+    # The triage schema removal, a contract revision, requires 0188, the floor.
+    assert window == {"schema_min": "0188", "schema_head": "0189"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -105,7 +103,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-67:] == [
+    assert data["revisions"][-68:] == [
         "0095",
         "0096",
         "0097",
@@ -172,7 +170,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0184",
         "0185",
         "0186",
-        "0187",
+        "0188",
+        "0189",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -235,6 +234,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0184"] == "expand"
     assert kinds["0185"] == "expand"
     assert kinds["0186"] == "expand"
+    assert kinds["0188"] == "contract"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -292,7 +292,7 @@ def test_released_0076_startup_refuses_without_migrating_then_candidate_starts(
                 pass
         assert current_revision() == "0100"
         command.upgrade(alembic_config(), load_window().schema_head)
-        assert current_revision() == "0187"
+        assert current_revision() == "0189"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200
@@ -333,7 +333,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0187"
+    assert current_revision() == "0189"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
@@ -372,22 +372,9 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
         ("personal_claude_enrollments", "generation"),
         ("personal_claude_custody", "secret_uid"),
         ("factory_slack_threads", "origin"),
-        ("agent_versions", "result_policy_digest"),
-        ("factory_tracker_result_grants", "output_identity"),
-        ("factory_tracker_result_deliveries", "proposal_sha256"),
-        ("factory_tracker_result_deliveries", "create_attempted_at"),
-        ("factory_tracker_result_receipts", "result_comment_id"),
-        ("factory_tracker_result_artifacts", "content"),
         ("requester_coding_profiles", "revision"),
         ("requester_coding_profiles", "sha256"),
         ("requester_coding_policies", "enabled"),
-        ("execution_requests", "completion_contract"),
-        ("execution_requests", "result_policy_digest"),
-        ("execution_requests", "model_session_reserved_at"),
-        ("agent_versions", "result_policy"),
-        ("factory_tracker_result_grants", "source_content_sha256"),
-        ("factory_tracker_result_deliveries", "origin"),
-        ("factory_tracker_result_receipts", "result_comment_url"),
     } <= columns
     assert {
         ("tenant_identity_providers", "http_selection"),

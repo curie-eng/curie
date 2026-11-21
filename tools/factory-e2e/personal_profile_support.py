@@ -3157,7 +3157,6 @@ def install_values(
     return {
         "api": {
             "image": image("curie-api"),
-            "extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": PERSONAL_MODE}],
             "githubAppId": app_id,
             "githubAppExistingSecret": app_secret,
             "githubRepoAllowlist": [repo],
@@ -3204,6 +3203,9 @@ def install_values(
         "factory": {
             "enabled": True,
             "intake": "poll",
+            # The chart renders FACTORY_MODEL_AUTH_MODE into the api and the
+            # worker from this one value.
+            "modelAuthMode": PERSONAL_MODE,
             "codeHosts": [{**github, "credential": dict(credential)}],
             # Intake stays dormant: the label and the mention are this run's unused
             # value, and the one admission is the driver's trusted machine admission.

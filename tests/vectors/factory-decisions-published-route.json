@@ -1,0 +1,97 @@
+{
+  "cases": [
+    {
+      "id": "route-decisions-last",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\n\n---\n\n\nCloses #1\n\n<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie.",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the parser pure",
+          "rejected": "a cached parser",
+          "reason": "the input is small",
+          "source": "plan",
+          "evidence": "the plan review approved it"
+        },
+        {
+          "n": 2,
+          "choice": "Reuse the shared grammar",
+          "rejected": "a second grammar",
+          "reason": "two would drift",
+          "source": "diff review",
+          "evidence": "the vector test covers both"
+        }
+      ]
+    },
+    {
+      "id": "route-malformed-decisions-last",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure.\n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure.\n\n---\n\n\nCloses #1\n\n<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie.",
+      "valid": false,
+      "entries": []
+    },
+    {
+      "id": "route-near-break-line-last-stays-malformed",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\n--- \n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\n--- \n\n---\n\n\nCloses #1\n\n<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie.",
+      "valid": false,
+      "entries": []
+    },
+    {
+      "id": "route-ask-line-inside-decisions-stays-malformed",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\nNone: the change follows directly from the acceptance criteria.\nAsk the factory: this is invalid content inside Decisions.\n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\nNone: the change follows directly from the acceptance criteria.\nAsk the factory: this is invalid content inside Decisions.\n\n---\n\n\nCloses #1\n\n<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie.",
+      "valid": false,
+      "entries": []
+    },
+    {
+      "id": "route-existing-break-keeps-the-trailing-space-line",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\n\n---\n\nCloses #1\n\n<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->\n\n--- ",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\n\n---\n\nCloses #1\n\n<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->\n\n--- \n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie.",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the parser pure",
+          "rejected": "a cached parser",
+          "reason": "the input is small",
+          "source": "plan",
+          "evidence": "the plan review approved it"
+        },
+        {
+          "n": 2,
+          "choice": "Reuse the shared grammar",
+          "rejected": "a second grammar",
+          "reason": "two would drift",
+          "source": "diff review",
+          "evidence": "the vector test covers both"
+        }
+      ]
+    },
+    {
+      "id": "route-reviews-last-keeps-the-trailing-space-line",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\n\n## Reviews\n\nPlan review: APPROVE.\n\nCloses #1\n\n<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->\n\n--- ",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\n\n## Reviews\n\nPlan review: APPROVE.\n\nCloses #1\n\n<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->\n\n--- \n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie.",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the parser pure",
+          "rejected": "a cached parser",
+          "reason": "the input is small",
+          "source": "plan",
+          "evidence": "the plan review approved it"
+        },
+        {
+          "n": 2,
+          "choice": "Reuse the shared grammar",
+          "rejected": "a second grammar",
+          "reason": "two would drift",
+          "source": "diff review",
+          "evidence": "the vector test covers both"
+        }
+      ]
+    }
+  ]
+}

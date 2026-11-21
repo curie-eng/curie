@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.6.json",
+  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.7.json",
   "title": "curie cluster status --json",
-  "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), any `warnings` (diagnoses that could not be made, which never affect `healthy`), completion-delivery health, an overall `healthy` verdict, the current upgrade phase plus last known-good version, and each recorded forge credential's expiry.",
+  "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), any `warnings` (diagnoses that could not be made, which never affect `healthy`), completion-delivery health, an overall `healthy` verdict, the current upgrade phase plus last known-good version, each recorded forge credential's expiry, and the installation's factory model auth mode.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -264,6 +264,18 @@
               "warning"
             ]
           }
+        },
+        "factory_model_auth_mode": {
+          "description": "The installation's model auth mode, `factory.modelAuthMode` from the computed release values: `service` or `personal`. When the computed values lack the key (a release upgraded with retained values from an older chart), the literal of a retained `FACTORY_MODEL_AUTH_MODE` entry (name in any case) in `api.extraEnv` or `worker.extraEnv`, else `service`, which the chart renders. Null when the computed values are unavailable, the API and worker entries disagree, or a retained entry holds a value the services refuse.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "service",
+            "personal",
+            null
+          ]
         },
         "upgrade": {
           "type": "object",

@@ -1387,3 +1387,91 @@ fn mixed_case_reference_uses_the_canonical_repository() {
         "{paths:?}"
     );
 }
+
+/// The bodies the platform published for a factory pull request, written by the
+/// Python producer, including a ticket that carried questions and so cites the
+/// answers it relied on. Each body goes through the real `curie factory explain`
+/// binary, so the parse path is the one an operator runs.
+#[test]
+fn published_decisions_bodies_explain_as_the_python_parser_reads_them() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/vectors/factory-decisions-published.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path:?}: {error}"));
+    let document: Value = serde_json::from_str(&raw).expect("vector json");
+    let cases = document["cases"].as_array().expect("cases");
+    let wanted = [
+        "answered-citations-beside-entries",
+        "answered-citation-only",
+        "citation-below-break-line-is-not-in-the-section",
+        "citation-with-no-author-stays-malformed",
+        "citation-with-blank-author-stays-malformed",
+        "citation-prefix-without-its-space-stays-malformed",
+        "citation-beside-none-declaration-stays-malformed",
+        // The unanswered fixtures stay as they were.
+        "ask-line-after-decisions-last",
+        "none-declaration-last",
+        "malformed-decisions-last",
+        "ask-line-inside-decisions-stays-malformed",
+    ];
+    let mut failures = Vec::new();
+    for id in wanted {
+        let case = cases
+            .iter()
+            .find(|case| case["id"] == id)
+            .unwrap_or_else(|| panic!("fixture case {id}"));
+        let body = format!(
+            "{}\n{}",
+            case["published_body"].as_str().expect("published body"),
+            marker(12)
+        );
+        let server = serve(scene(
+            12,
+            vec![Pull {
+                number: 7,
+                created: "2026-03-01T00:00:00Z",
+                state: "closed",
+                merged: false,
+                body,
+                repo: "curie-eng/curie",
+            }],
+            false,
+        ));
+        let output = run(
+            &["curie-eng/curie#12", "--json"],
+            &server,
+            &[("GH_TOKEN", "token-from-env")],
+            None,
+        );
+        let explained = json_stdout(&output);
+        let decisions = &explained["pull_requests"][0]["decisions"];
+        let expected = case["entries"].as_array().expect("entries");
+        let status = if case["valid"] != true {
+            "unparsed"
+        } else if expected.is_empty() {
+            "none"
+        } else {
+            "recorded"
+        };
+        if decisions["status"] != status {
+            failures.push(format!("{id}: want {status}, got {}", decisions["status"]));
+            continue;
+        }
+        if status == "recorded" {
+            let entries = decisions["entries"].as_array().expect("entries");
+            if entries.len() != expected.len() {
+                failures.push(format!("{id}: entry count {}", entries.len()));
+                continue;
+            }
+            for (entry, want) in entries.iter().zip(expected) {
+                for field in ["n", "choice", "rejected", "reason", "source", "evidence"] {
+                    if entry[field] != want[field] {
+                        failures.push(format!("{id}: {field} differs"));
+                    }
+                }
+            }
+        }
+        println!("case {id}: {status}");
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

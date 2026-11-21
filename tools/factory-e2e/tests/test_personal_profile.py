@@ -1924,6 +1924,17 @@ def _values() -> dict[str, Any]:
     )
 
 
+def test_install_values_select_personal_mode_through_the_chart_value() -> None:
+    values = _values()
+    assert values["factory"]["modelAuthMode"] == pps.PERSONAL_MODE
+    # The rest of the factory block is still there beside it.
+    assert values["factory"]["intake"] == "poll"
+    assert values["factory"]["codeHosts"] and values["factory"]["trackers"]
+    for workload in ("api", "worker"):
+        env = values[workload].get("extraEnv", [])
+        assert "FACTORY_MODEL_AUTH_MODE" not in json.dumps(env), (workload, env)
+
+
 def test_factory_values_pass_the_api_forge_model() -> None:
     """The factory lists, keyed as the chart's curie.factory.forgesJson renders them."""
 

@@ -1524,8 +1524,9 @@ configuration loaded. No separate Helm upgrade is needed.
 
 Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
-is `poll` or `webhook`, and `poll` is the default. The API setting
-`FACTORY_MODEL_AUTH_MODE` (default `service`) selects the mode that GitHub and
+is `poll` or `webhook`, and `poll` is the default. `factory.modelAuthMode`
+(default `service`, set with `curie cluster factory --model-auth-mode
+personal`) selects the mode that GitHub and
 tracker intake, pull request review feedback, and
 [Slack steering](#factory-slack-steering) of a service WorkItem admit under.
 A labelled issue in `personal` mode names an owner when the labeller is linked
@@ -1537,8 +1538,9 @@ and, when a factory Slack channel is configured, one channel post. A WorkItem
 admitted as service before the switch refuses its tracker mentions, review
 feedback and Slack steering with `personal_owner_required`. No owner is
 invented for it. A personal WorkItem keeps its owner on every revision,
-whoever asked for it. It is an environment setting only,
-with no chart value, and the worker reads it too
+whoever asked for it. The chart renders the value as `FACTORY_MODEL_AUTH_MODE`
+into both the API and the worker, so the two cannot disagree; setting that
+variable through `api.extraEnv` or `worker.extraEnv` fails the render
 ([Personal Claude enrollment](#personal-claude-enrollment)). The `factory:`
 block replaces the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
 with `curie cluster factory`, use the
@@ -2843,10 +2845,27 @@ its transcript. Disconnect is never held. The CLI treats the refusal as
 transient (exit 3); retry once the rollout completes. Single-instance stacks
 outside Kubernetes set `CURIE_PERSONAL_ROLLOUT_HOLD=false`.
 
-The worker reads `FACTORY_MODEL_AUTH_MODE` too, and it must match the API's
-value. With `personal`, the worker refuses to start with
-`personal_mode_requires_kubernetes` unless `CURIE_SANDBOX_SUBSTRATE` is
-`kubernetes`, and it refuses every turn that has no owner (a plain run, a cron
+The worker reads the same `factory.modelAuthMode`, which the chart renders as
+`FACTORY_MODEL_AUTH_MODE` into the API and the worker alike. Select it with
+`curie cluster factory --model-auth-mode personal` (or `service`). Given alone,
+that flag writes only `factory.modelAuthMode` and leaves intake, its forges and
+`factory.enabled` as recorded. `curie cluster status` prints the mode as
+`factory model auth mode`.
+
+A release that selected personal mode by setting `FACTORY_MODEL_AUTH_MODE` in
+`api.extraEnv` and `worker.extraEnv` fails its next render, because the chart
+owns the variable now and retained values replay the old entries. In the same
+upgrade, give both lists again without the variable (`[]` when nothing else
+remains) and set `factory.modelAuthMode: personal` in one values file; the
+chart README section "Factory model auth mode" has the file and the
+`helm upgrade --reset-then-reuse-values -f` command. With `personal`, the
+worker refuses to start with `personal_mode_requires_kubernetes` unless
+`CURIE_SANDBOX_SUBSTRATE` is `kubernetes`; the chart and `curie cluster
+factory` refuse a personal release whose `worker.extraEnv` selects another
+substrate before anything is applied. They compare the literal as the worker
+does, with whitespace trimmed and case ignored, and refuse a `valueFrom` entry
+or an empty value. Changing the mode governs new admissions; an execution
+request already created keeps the mode it recorded. The worker also refuses every turn that has no owner (a plain run, a cron
 or webhook hook, an eval) with `personal_owner_required` before any claim. The
 protected hook lane is configured only from its provisioned `process.json`, so
 it does not read this setting and never runs WorkItem requests. In
@@ -3019,7 +3038,10 @@ Every request the factory admits from a labelled ticket runs under the implement
 completion contract and is served the rules pinned at admission; there is no separate
 triage path. A bundle that still carries the retired result declaration (a result.json
 file in its workflow directory) is refused at upload, push, deploy and promote with
-`bundle.result_declaration_retired`: delete the file and deploy again. The rule text rides the implementer's system prompt, so
+`bundle.result_declaration_retired`: delete the file and deploy again. An agent that is
+already deployed with it needs the steps in "Before upgrading: an existing triage
+binding" in the factory triage removal section before the upgrade.
+The rule text rides the implementer's system prompt, so
 the conversation transcript and its native checkpoint can retain it, under the transcript's
 own access controls and expiry and not the WorkItem snapshot's, as for requester
 preferences. A rule removed after a WorkItem was admitted can therefore remain in that
@@ -3379,7 +3401,7 @@ A person steers a run by explicitly mentioning the app in that run's Slack threa
 1. `POST /identity/admin/{tenant_id}/code-host-links` with `principal_id`, `code_host_kind` (`github`), `host` (for example `github.com`), the numeric `account_id`, and `created_by_principal_id`. An account already actively linked answers 409 `link_exists`.
 2. `POST /identity/admin/{tenant_id}/links/{link_id}/revoke` ends a link. A revoked link, a disabled principal or a lost write permission refuses a mention that was queued before the change.
 
-A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `FACTORY_MODEL_AUTH_MODE=personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
+A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `factory.modelAuthMode` set to `personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
 
 The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, and for each top-level human mention whose text links an issue, before its dedupe claim, so the worker can verify the sender and the exact message. On a test installation it also stores one for a declared test driver's marked action in that driver's channel, at root or in a thread; that receipt is version 2 and names the declared bot user and bot id, never the event's user. Steering reads only a person's thread receipt and refuses any other; root receipts and version 2 receipts serve kickoff. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
 
@@ -4392,6 +4414,73 @@ The work items API and `curie <tier> work-items --json` (schema
 
 A downgrade restores the GitHub columns and refuses while any row names a
 tracker or code host other than GitHub.
+
+### Factory triage removal (Alembic revision 0188)
+
+Revision 0188 is a contract migration. It drops schema that only integration
+branch installs carry: the separate triage path's tables and columns. No
+release ever shipped them, so an install that came from a released version has
+nothing to lose. Because it is a contract revision, an upgrade that has it
+pending needs `curie cluster upgrade --forward-only`, or
+`api.migrate.forwardOnly=true` on a direct `helm upgrade`. Without it the
+schema check refuses the upgrade before any mutation. A local stack runs the
+same check in its one-shot `curie-migrate` service, so follow the
+`CURIE_SCHEMA_FORWARD_ONLY=true` recipe at the end of the Slack route identity
+migration section above.
+
+#### Before upgrading: an existing triage binding
+
+An older triage example told operators to bind its bundle to a trigger label of
+their own choosing. An install that did so holds an agent whose deployed bundle
+carries `workflow/result.json`. <!-- doclint:ignore-line -->
+The platform refuses that declaration only at
+deploy, an already deployed version is not re-validated, and the intake still
+admits an issue that carries a configured trigger label. Without the steps
+below, that agent would run as an implementation agent on its old trigger
+label. Do them before the upgrade:
+
+1. Find the agent. The CLI has no command that lists a deployed bundle's files,
+   so check each factory agent in turn. `curie cluster versions <agent>` lists
+   its immutable versions, and `curie cluster surfaces <agent>` lists its
+   bindings with their trigger labels. An agent is the one you want when its
+   deployed bundle carries `workflow/result.json`, <!-- doclint:ignore-line -->
+   which you can confirm from
+   the repository or directory the bundle was deployed from, or when one of its
+   bindings uses a label that was chosen for triage.
+2. Stop its work. Remove the trigger label from every open issue that carries
+   it. Let in-flight runs finish, or cancel them with
+   `curie cluster kill <agent> --yes`, which stops the agent's runs. Then
+   confirm the agent has no queued or running request: `curie cluster work-items
+   --agent <agent>` lists its work items, and
+   `curie cluster observability runs --agent-id <agent id>` lists its recent
+   runs. Both must show nothing unfinished. There is no single command that
+   reports queued requests, so repeat the check until it stays clean.
+3. Remove the binding, or replace the bundle. The API refuses to remove an
+   agent's final surface, and an agent serves a tracker location through one
+   surface, so a binding is never relabelled in place.
+   To remove the binding, run
+   `curie cluster surfaces <agent> --remove <KIND=ADDRESS>`, using a binding
+   that `curie cluster surfaces <agent>` printed. When it is the agent's only
+   surface, delete the agent with `curie cluster delete <agent> --yes` instead.
+   To replace the bundle and keep the agent, write the implementation bundle
+   with `curie example dark-factory render --out <dir>`, then run these in
+   order:
+   1. When the old binding is the agent's only surface, add a temporary one
+      at another location of the same kind (another repository for GitHub),
+      under a label no issue carries, so it admits nothing:
+      `curie cluster surfaces <agent> --add <KIND=OTHER_ADDRESS> --label <unused label>`.
+   2. Remove the old binding:
+      `curie cluster surfaces <agent> --remove <KIND=ADDRESS>`.
+   3. Deploy the implementation bundle:
+      `curie cluster deploy --plugin-dir <dir> --agent <agent>`.
+   4. Bind the agent again under a different label, on the same location or
+      another one:
+      `curie cluster surfaces <agent> --add <KIND=ADDRESS> --label <new label>`.
+   5. Remove the temporary surface, if you added one:
+      `curie cluster surfaces <agent> --remove <KIND=OTHER_ADDRESS>`.
+   No binding keeps the old label.
+4. Upgrade with `curie cluster upgrade --to <version> --forward-only`, or set
+   `api.migrate.forwardOnly=true` on a direct `helm upgrade`.
 
 ### Before you upgrade, check what would be removed
 
