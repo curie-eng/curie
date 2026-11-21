@@ -3639,3 +3639,103 @@ def test_shape_sanitizer_identifiers_name_every_role_and_keep_the_owner_as_write
         == "<fixture-repo> by <writer>"
     )
     assert "fixture-app[bot]" in set(_iterate(ids))
+
+
+# --- Saved record and logs ------------------------------------------------------
+
+
+def test_finish_saves_a_record_that_replays_to_the_same_verdict_without_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _preflight(tmp_path, stop_after=None, attempt=1)
+    chain = lgc.chain_of(p)
+    chain.record = {k: copy.deepcopy(v) for k, v in PASSING.items() if k != "teardown"}
+    chain.minted.append("minted-session-value")
+    leak = "ghp_" + "A" * 36
+    chain.record["beat_a"]["note"] = (
+        f"{p.config.actor_token} {leak} minted-session-value {p.config.webhook_secret}"
+    )
+    monkeypatch.setattr(lgc, "namespace_gone", lambda _p: True)
+    lgc.finish(p, [])
+    saved = p.evidence["live_chain_record"]
+    # Offline replay: the saved record alone gives the verdict the run stored.
+    assert judge.judge_chain(saved).evidence() == p.evidence["live_chain"]
+    assert saved["beat_a"]["quiet_snapshot"] == PASSING["beat_a"]["quiet_snapshot"]
+    text = json.dumps(saved)
+    for secret in (p.config.actor_token, leak, "minted-session-value", p.config.webhook_secret):
+        assert secret not in text
+    assert saved["beat_a"]["note"].count("[REDACTED]") == 4
+
+
+LOG_TENANT = "00000000-0000-4000-8000-00000000000e"
+LOG_WORK_ITEM = "00000000-0000-4000-8000-0000000000a1"
+LOG_ASKER = "00000000-0000-4000-8000-0000000000a2"
+LOG_FOLLOWED = "00000000-0000-4000-8000-0000000000a3"
+LOG_OTHER = "00000000-0000-4000-8000-0000000000a4"
+
+
+def test_save_logs_keeps_the_run_lines_and_drops_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _preflight(tmp_path, stop_after=None, attempt=1)
+    chain = lgc.chain_of(p)
+    chain.opened_issues = [4]
+    chain.tenant_id = LOG_TENANT
+    chain.record = {
+        "beat_a": {
+            "work_item_id": LOG_WORK_ITEM,
+            "quiet_snapshot": {"requests": [{"id": LOG_ASKER}]},
+        }
+    }
+    token, app_token = p.config.actor_token, "ghs_" + "b" * 36
+    model_key = "sk-or-v1-" + "c" * 24
+    worker = "\n".join(
+        [
+            f"tenant={LOG_TENANT} thread github:o%2Fr:issue-4 suspended request_id={LOG_FOLLOWED}",
+            f"request {LOG_FOLLOWED} finished status=completed",
+            f"request {LOG_OTHER} for thread github:o%2Fr:issue-40",
+            f"tenant {LOG_TENANT} heartbeat",
+            f"work item {LOG_WORK_ITEM} claimed with {token}",
+            f"asker {LOG_ASKER} auth {app_token}",
+        ]
+    )
+    api = f"POST /factory/questions {LOG_ASKER}\nGET /healthz"
+    texts = {
+        f"deployment/{p.release}-worker": worker,
+        f"deployment/{p.release}-api": api,
+        "pod/sbx-a": f"turn start\nmodel key {model_key}",
+    }
+
+    def kubectl(*args: str, check: bool = True) -> str:
+        assert check is False
+        if "get" in args:
+            assert lgc.RUNNER_SELECTOR in args
+            return "pod/sbx-a\n"
+        return texts[args[args.index("logs") + 1]]
+
+    monkeypatch.setattr(p, "kubectl", kubectl)
+    detail = lgc.save_logs(p, chain)
+    assert p.evidence["live_chain_logs"] == {
+        "api": [f"POST /factory/questions {LOG_ASKER}"],
+        "worker": [
+            f"tenant={LOG_TENANT} thread github:o%2Fr:issue-4 suspended request_id={LOG_FOLLOWED}",
+            f"request {LOG_FOLLOWED} finished status=completed",
+            f"work item {LOG_WORK_ITEM} claimed with [REDACTED]",
+            f"asker {LOG_ASKER} auth [REDACTED]",
+        ],
+        "runner sbx-a": ["turn start", "model key [REDACTED]"],
+    }
+    assert detail == {"lines": {"api": 1, "worker": 4, "runner sbx-a": 2}}
+
+
+def test_full_mode_saves_the_logs_before_the_namespace_is_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p, _calls = _drive_to_links(tmp_path, monkeypatch, kind="principal")
+    p.teardown.push("delete namespaces", lambda: None)
+    lgc.chain_of(p).stop_after = None
+    monkeypatch.setattr(lgc, "run_beats", lambda _p, _chain: None)
+    lgc.drive(p)
+    steps = [r["step"] for r in p.teardown.run()]
+    assert steps.index(lgc.LOGS_STEP) < steps.index("delete namespaces")
+    assert p.evidence["live_chain_logs"] == {"api": [], "worker": []}

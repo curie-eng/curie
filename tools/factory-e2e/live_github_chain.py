@@ -23,8 +23,9 @@ Order, each stage a step of the evidence:
 3. ``drive``: the first check (no open item, no work item), two real OIDC
    logins, the session probe, the code host links,
    then either the stop or beats (a) to (h).
-4. ``finish`` (after teardown): the teardown section, the verdict, and the
-   run's pass or fail.
+4. ``finish`` (after teardown): the teardown section, the verdict, the
+   redacted record for an offline replay, and the run's pass or fail. A full
+   run's teardown first saves the run's pod logs (``save_logs``).
 
 Standard library only, like ``factory_e2e.py``.
 """
@@ -118,6 +119,15 @@ DEX_STEP = "delete live chain dex and oidc secret"
 SESSION_STEP = "delete live chain session files"
 LINKS_STEP = "revoke live chain code host links"
 ISSUES_STEP = "close live chain issues"
+LOGS_STEP = "save live chain logs"
+# The run's pod logs kept in the evidence: the API's and the worker's lines
+# about the run's own tickets and requests, and each runner pod's tail.
+LOG_TAIL_LINES = 20000
+LOG_KEEP_LINES = 3000
+LOG_LINE_CHARS = 2000
+LOG_COMPONENTS = ("api", "worker")
+RUNNER_SELECTOR = "app.kubernetes.io/component in (runner,runner-sandbox)"
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 PORT_FORWARD_STEP = "stop live chain dex port-forward"
 DEFAULT_BRANCH_STEP = "restore live chain default branch"
 LABEL_STEP = "delete live chain unbound label"
@@ -138,7 +148,7 @@ class ChainStopped(fe.PreflightFailed):
 
 @dataclasses.dataclass
 class ChainRun:
-    """What one run carries between its stages; never written to evidence whole."""
+    """What one run carries between its stages; ``finish`` writes only the redacted record."""
 
     stop_after: str | None = None
     attempt: int = 1
@@ -152,6 +162,9 @@ class ChainRun:
     link_ids: list[str] = dataclasses.field(default_factory=list)
     opened_issues: list[int] = dataclasses.field(default_factory=list)
     dex: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Values minted during the run (the OIDC client secret, the sessions) that
+    # the saved record and logs must never hold.
+    minted: list[str] = dataclasses.field(default_factory=list, repr=False)
 
 
 def chain_of(p: fe.Preflight) -> ChainRun:
@@ -749,6 +762,7 @@ def install_values(p: fe.Preflight) -> fe.ValuesTransform:
     # Pushed before the first create, so an ambiguous create is still undone.
     p.teardown.push(DEX_STEP, lambda: delete_dex(p))
     secret = secrets.token_urlsafe(32)
+    chain.minted.append(secret)
     _kubectl_create(p, client_secret_manifest(p.namespace, secret))
     objects = dex_objects(p.namespace, issuer=issuer, redirect_uri=redirect_uri, secret=secret)
     _kubectl_create(p, {"apiVersion": "v1", "kind": "List", "items": objects})
@@ -1940,6 +1954,7 @@ def stage_logins(p: fe.Preflight, chain: ChainRun) -> None:
         except pto.LoginFailed as exc:
             raise ChainStopped(f"the {role} OIDC login failed at {exc.step}") from None
         chain.sessions[role] = held
+        chain.minted.append(held.reveal())
         write_session_file(files[role], held.reveal())
     p.step("live chain sessions minted", roles=list(ROLES))
 
@@ -2008,6 +2023,8 @@ def drive(p: fe.Preflight) -> dict[str, Any]:
         # The fake model is installed, no ticket exists and the seed issue is
         # off: no model request was possible.
         return stop_evidence(chain)
+    # Pushed after the namespace's own teardown, so it runs before the delete.
+    p.teardown.push(LOGS_STEP, lambda: save_logs(p, chain))
     run_beats(p, chain)
     return {"stop_after": None, "attempt": chain.attempt, "beats": sorted(chain.record)}
 
@@ -2565,6 +2582,128 @@ def run_beats(p: fe.Preflight, chain: ChainRun) -> None:
 
 
 # --------------------------------------------------------------------------
+# Saved record and logs
+# --------------------------------------------------------------------------
+
+
+def run_secrets(p: fe.Preflight, chain: ChainRun) -> list[str | None]:
+    """Every credential the run holds; the saved record and logs drop each one."""
+
+    return [
+        p.config.actor_token,
+        p.config.webhook_secret,
+        p.config.model_api_key,
+        p.api_key,
+        p.worker_token,
+        *chain.minted,
+    ]
+
+
+def redacted(value: Any, secrets_: Sequence[str | None]) -> Any:
+    """``value`` with known secrets and credential-shaped strings replaced in every string."""
+
+    if isinstance(value, Mapping):
+        return {str(k): redacted(v, secrets_) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redacted(v, secrets_) for v in value]
+    if isinstance(value, str):
+        return fe.redact_agent_text(value, secrets_)[0]
+    return value
+
+
+def record_request_ids(record: Any, parent: str = "") -> set[str]:
+    """The work item and request ids the record names (``*_id`` keys and request rows)."""
+
+    found: set[str] = set()
+    if isinstance(record, Mapping):
+        for key, value in record.items():
+            named = key in ("work_item_id", "request_id") or (parent == "requests" and key == "id")
+            if named and isinstance(value, str) and _UUID.fullmatch(value.lower()):
+                found.add(value.lower())
+            found |= record_request_ids(value, str(key))
+    elif isinstance(record, (list, tuple)):
+        for item in record:
+            found |= record_request_ids(item, parent)
+    return found
+
+
+def run_log_lines(
+    text: str, seeds: Iterable[str], issues: Iterable[int], exclude: Iterable[str] = ()
+) -> list[str]:
+    """The lines of ``text`` about the run's tickets and requests, newest last, bounded.
+
+    A line is the run's when it names a seed id or one of the run's tickets
+    (``issue-N`` as the thread key writes it). The ids such a line names join
+    the seeds once, so a request first seen beside its ticket is followed
+    through the lines that name only the request.
+    """
+
+    lines = text.splitlines()
+    skip = {e.lower() for e in exclude}
+    tickets = [rf"issue-{int(n)}(?!\d)" for n in issues]
+
+    def matcher(ids: set[str]) -> re.Pattern[str] | None:
+        parts = [*tickets, *(re.escape(i) for i in sorted(ids))]
+        return re.compile("|".join(parts), re.IGNORECASE) if parts else None
+
+    first = matcher({s.lower() for s in seeds} - skip)
+    if first is None:
+        return []
+    ids = {s.lower() for s in seeds}
+    for line in lines:
+        if first.search(line):
+            ids |= {m.lower() for m in _UUID.findall(line.lower())}
+    second = matcher(ids - skip)
+    assert second is not None
+    kept = [line[:LOG_LINE_CHARS] for line in lines if second.search(line)]
+    return kept[-LOG_KEEP_LINES:]
+
+
+def save_logs(p: fe.Preflight, chain: ChainRun) -> dict[str, Any]:
+    """Keep the API's, the worker's and the runners' logs of the run, before the namespace goes.
+
+    Every line is redacted of the run's credentials here and its identifiers
+    are replaced when the evidence is written. A pod whose logs cannot be
+    read is recorded as such; the step never fails the teardown.
+    """
+
+    secrets_ = run_secrets(p, chain)
+    seeds = record_request_ids(chain.record)
+    logs: dict[str, Any] = {}
+    for component in LOG_COMPONENTS:
+        text = p.kubectl(
+            "-n",
+            p.namespace,
+            "logs",
+            f"deployment/{p.release}-{component}",
+            "--all-containers",
+            f"--tail={LOG_TAIL_LINES}",
+            check=False,
+        )
+        logs[component] = run_log_lines(
+            text, seeds, chain.opened_issues, exclude=[chain.tenant_id] if chain.tenant_id else []
+        )
+    pods = p.kubectl(
+        "-n", p.namespace, "get", "pods", "-l", RUNNER_SELECTOR, "-o", "name", check=False
+    ).split()
+    for pod in pods:
+        text = p.kubectl(
+            "-n",
+            p.namespace,
+            "logs",
+            pod,
+            "--all-containers",
+            f"--tail={LOG_KEEP_LINES}",
+            check=False,
+        )
+        logs[f"runner {pod.rsplit('/', 1)[-1]}"] = [
+            line[:LOG_LINE_CHARS] for line in text.splitlines()[-LOG_KEEP_LINES:]
+        ]
+    p.evidence["live_chain_logs"] = redacted(logs, secrets_)
+    return {"lines": {name: len(lines) for name, lines in logs.items()}}
+
+
+# --------------------------------------------------------------------------
 # finish
 # --------------------------------------------------------------------------
 
@@ -2586,6 +2725,9 @@ def finish(p: fe.Preflight, results: list[dict[str, Any]]) -> bool:
     else:
         verdict = judge.judge_chain(record)
     p.evidence["live_chain"] = verdict.evidence()
+    # The whole record, so a failed run replays offline through every judge;
+    # the evidence serializer replaces its identifiers when it is written.
+    p.evidence["live_chain_record"] = redacted(record, run_secrets(p, chain))
     for beat in verdict.beats:
         if not beat.passed:
             fe.log(f"live chain {beat.beat} failed: {'; '.join(beat.reasons)}")

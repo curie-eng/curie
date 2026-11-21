@@ -1894,6 +1894,16 @@ the next starts.
    --candidate <commit>`, on the same candidate. It repeats the readiness
    check and refuses an unready candidate.
 
+### Replaying a failed run
+
+The evidence keeps the whole chain record as `live_chain_record`, so
+`live_github_chain_judge.judge_chain` on it alone gives the verdict the run
+stored, with no cluster. A full run also keeps `live_chain_logs`, saved before
+the namespace is deleted: the API's and the worker's lines that name the run's
+tickets or requests (a request first seen beside its ticket is followed through
+the lines that name only the request), and each runner pod's tail. Both pass
+through the run's credential redaction and then the identifier sanitizer.
+
 ## Live one-ticket on Jira Cloud (#5793)
 
 `factory_e2e.py run --scenario one-ticket --forge jira_cloud --answer-file
