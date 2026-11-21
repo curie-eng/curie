@@ -356,67 +356,187 @@ def git_ancestry(repo_root: Path, candidate: str) -> Callable[[str], bool]:
     return is_ancestor
 
 
-# Settings that would change what ``git diff`` writes or what ``git apply``
-# accepts: a prefixless diff, external diff drivers and textconv filters write
-# patches ``apply`` cannot read, and a whitespace error setting refuses a patch
-# whose change is absent.
-_DIFF = ["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false"]
-_DIFF_FLAGS = ["--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-color"]
+_HUNK_HEADER = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
+
+
+def _zero_context_ranges(diff: bytes) -> list[tuple[int, int, int, int]]:
+    """``(old_start, old_count, new_start, new_count)`` of each hunk of a ``-U0`` diff.
+
+    A start is zero-based; for a zero count it is the index the lines go at.
+    """
+
+    ranges = []
+    for match in _HUNK_HEADER.finditer(diff):
+        a, b, c, d = match.groups()
+        old_count = 1 if b is None else int(b)
+        new_count = 1 if d is None else int(d)
+        old_start = int(a) - (1 if old_count else 0)
+        new_start = int(c) - (1 if new_count else 0)
+        ranges.append((old_start, old_count, new_start, new_count))
+    return ranges
+
+
+class _FileRevert:
+    """Reverts chosen hunks of a change on the candidate's copy of one file."""
+
+    def __init__(
+        self,
+        scratch: str,
+        current: bytes,
+        before: bytes,
+        after: bytes,
+        ranges: list[tuple[int, int, int, int]],
+    ) -> None:
+        self.scratch = scratch
+        self.current = current
+        self.old_lines = before.splitlines(keepends=True)
+        self.new_lines = after.splitlines(keepends=True)
+        self.ranges = ranges
+        Path(scratch, "ours").write_bytes(current)
+        Path(scratch, "base").write_bytes(after)
+
+    def revert(self, first: int, last: int) -> int | None:
+        """Hunks ``first`` to ``last`` reverted: 0 unchanged, 1 changed, None conflicted.
+
+        Raises OSError when ``git merge-file`` cannot run.
+        """
+
+        undone = list(self.new_lines)
+        for old_start, old_count, new_start, new_count in reversed(self.ranges[first : last + 1]):
+            undone[new_start : new_start + new_count] = self.old_lines[
+                old_start : old_start + old_count
+            ]
+        Path(self.scratch, "theirs").write_bytes(b"".join(undone))
+        merged = subprocess.run(
+            ["git", "merge-file", "-p", "-q", "ours", "base", "theirs"],
+            cwd=self.scratch,
+            capture_output=True,
+            check=False,
+        )
+        if not 0 <= merged.returncode <= 127:
+            raise OSError(merged.returncode)
+        if merged.returncode:
+            return None
+        return 0 if merged.stdout == self.current else 1
 
 
 def git_presence(repo_root: Path, candidate: str) -> Callable[[str], str | None]:
-    """Whether a merged pull request's change is still in the candidate tree.
+    """Whether a merged pull request's own change is still in the candidate tree.
 
-    For a merge commit ``M`` the pull request's change is ``git diff M^1 M``.
-    It is checked against an index read from the candidate's tree (a temporary
-    ``GIT_INDEX_FILE``, so the working tree and the real index are untouched)
-    with ``git apply --cached --check``. A patch applies forward cleanly only
-    when the tree still holds the pre-change content, that is when the change
-    is absent or was reverted; so a clean forward apply is the refusal, and a
-    refused forward apply counts as present.
+    For a merge commit ``M`` the pull request's change is ``M^1`` to ``M``,
+    split into hunks by ``git diff -U0``. Each hunk is judged on its own by
+    reverting that hunk alone on the candidate's copy of the file with a
+    three-way merge, ``git merge-file`` with base ``M``'s file, ours the
+    candidate's and theirs ``M``'s file with only that hunk put back as it was:
 
-    By design, a later partial or conflicting edit of the same lines also makes
-    the forward apply refuse, and is accepted as present: the check catches an
-    absent or reverted change, not every later edit of it.
+    1. present when the revert changes the candidate's file, so the candidate
+       still holds lines the hunk wrote;
+    2. absent when the revert leaves the candidate's file as it is, which a
+       three-way merge does only where the candidate already holds the
+       pre-change lines of that hunk;
+    3. on a conflict, the revert widens to the neighbouring hunks one at a time
+       and is judged again, because a merge can align hunks a line or two apart
+       as one region, so one of them reverted alone conflicts with a candidate
+       that reverted them all. A conflict that remains with every hunk of the
+       file reverted is a later edit of the change's own lines, which is not a
+       revert, so the hunk is present.
 
-    It fails closed: a merge commit, a first parent or a candidate tree that
-    cannot be read (a shallow clone, a missing object) and an empty diff each
-    return a reason instead of None.
+    A path the change added, deleted or changed without text hunks (binary,
+    mode) is judged by its entry: an added path is present while the candidate
+    has it, a deleted one while the candidate lacks it, any other while the
+    candidate's entry differs from the one before the change. A changed file
+    the candidate later deleted is present: a revert would restore it.
+
+    Every hunk must be present. A three-way merge reads the hunk's own lines
+    and not their surroundings, so a later edit next to a reverted hunk does
+    not make it present, and a copy of the old lines elsewhere in the file does
+    not make a present hunk absent. The check reads objects and runs
+    ``git merge-file`` on temporary files; it writes no object, ref, index or
+    working tree file in the repository.
+
+    It fails closed: a merge commit, a first parent or a candidate that cannot
+    be read (a shallow clone, a missing object), an empty change and a merge
+    that git cannot run each return a reason instead of None.
     """
 
     root = str(repo_root)
+    env = {**os.environ, "GIT_LITERAL_PATHSPECS": "1"}
+    # Plain hunks: no colour, no external driver or text conversion, no renames.
+    diff = ("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames")
+
+    def git(*argv: str, cwd: str = root) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(["git", "-C", cwd, *argv], capture_output=True, check=False, env=env)
+
+    def entry(rev: str, path: str) -> bytes | None:
+        listed = git("ls-tree", "-z", "--full-tree", rev, "--", path)
+        if listed.returncode != 0:
+            raise OSError(rev)
+        return listed.stdout.split(b"\t", 1)[0] if listed.stdout else None
 
     def absent(oid: str) -> str | None:
         if not re.fullmatch(r"[0-9a-f]{40}", oid):
             return "the merge commit id is not a full object id"
-        diff = subprocess.run(
-            ["git", *_DIFF, "-C", root, "diff", *_DIFF_FLAGS, f"{oid}^1", oid],
-            capture_output=True,
-            check=False,
-        )
-        if diff.returncode != 0:
+        changed = git(*diff, "--name-only", "-z", f"{oid}^1", oid)
+        if changed.returncode != 0:
             return "its diff against its first parent could not be read (shallow or missing object)"
-        if not diff.stdout.strip():
+        paths = [path.decode("utf-8", "surrogateescape") for path in changed.stdout.split(b"\0")]
+        paths = [path for path in paths if path]
+        if not paths:
             return "its diff against its first parent is empty, so its presence cannot be shown"
-        with tempfile.TemporaryDirectory(prefix="live-chain-index-") as scratch:
-            env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
-            read = subprocess.run(
-                ["git", "-C", root, "read-tree", candidate],
-                capture_output=True,
-                check=False,
-                env=env,
+        if git("rev-parse", "--verify", "--quiet", f"{candidate}^{{tree}}").returncode != 0:
+            return "the candidate tree could not be read"
+        hunks = 0
+        missing: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="curie-presence-") as scratch:
+            for path in paths:
+                try:
+                    before, after, now = (entry(rev, path) for rev in (f"{oid}^1", oid, candidate))
+                except OSError:
+                    return "an entry it changed could not be read in the candidate or the change"
+                ranges = (
+                    _zero_context_ranges(git(*diff, "-U0", f"{oid}^1", oid, "--", path).stdout)
+                    if before is not None and after is not None
+                    else []
+                )
+                if not ranges:
+                    hunks += 1
+                    if after is None:
+                        kept = now is None
+                    elif before is None:
+                        kept = now is not None
+                    else:
+                        kept = now != before
+                    if not kept:
+                        missing.append(path)
+                    continue
+                hunks += len(ranges)
+                if now is None:
+                    continue
+                blobs = [git("cat-file", "blob", f"{rev}:{path}") for rev in (f"{oid}^1", oid)]
+                current = git("cat-file", "blob", f"{candidate}:{path}")
+                if any(blob.returncode != 0 for blob in (*blobs, current)):
+                    return "a file it changed could not be read in the candidate or the change"
+                file = _FileRevert(
+                    scratch, current.stdout, blobs[0].stdout, blobs[1].stdout, ranges
+                )
+                try:
+                    for index in range(len(ranges)):
+                        first = last = index
+                        outcome = file.revert(first, last)
+                        while outcome is None and (first > 0 or last < len(ranges) - 1):
+                            first, last = max(first - 1, 0), min(last + 1, len(ranges) - 1)
+                            outcome = file.revert(first, last)
+                        if outcome == 0:
+                            missing.append(path)
+                except OSError:
+                    return "reverting it on the candidate could not be computed"
+        if missing:
+            places = list(dict.fromkeys(missing))
+            shown = ", ".join(places[:3]) + (", ..." if len(places) > 3 else "")
+            return (
+                f"{len(missing)} of the {hunks} hunks it changed hold their pre-change "
+                f"content, so it is absent or reverted there ({shown})"
             )
-            if read.returncode != 0:
-                return "the candidate tree could not be read"
-            forward = subprocess.run(
-                ["git", "-C", root, "apply", "--cached", "--check", "--whitespace=nowarn", "-"],
-                input=diff.stdout,
-                capture_output=True,
-                check=False,
-                env=env,
-            )
-        if forward.returncode == 0:
-            return "its change applies forward cleanly, so it is absent or reverted"
         return None
 
     return absent
@@ -1181,6 +1301,7 @@ def beat_c_record(
     pull_comments: Sequence[Mapping[str, Any]],
     check_runs: Mapping[str, Any],
     combined_status: Mapping[str, Any],
+    checks_observed_at: str,
 ) -> dict[str, Any]:
     after = pull_record(pull_after)
     return {
@@ -1201,10 +1322,16 @@ def beat_c_record(
         # created_at and updated_at stay so the evidence shows GitHub's real gap
         # between them on a submitted review's inline comment (submission bumps
         # updated_at without an edit; the product allows 5 seconds for it).
+        # original_commit_id and original_line are where the comment was made;
+        # line and commit_id are where GitHub shows it now, which moves or turns
+        # null once the revision lands, so the judge reads the original pair.
         "review_comments": [
             {
                 "path": c.get("path"),
                 "line": c.get("line"),
+                "commit_id": c.get("commit_id"),
+                "original_line": c.get("original_line"),
+                "original_commit_id": c.get("original_commit_id"),
                 "body": c.get("body"),
                 "pull_request_review_id": c.get("pull_request_review_id"),
                 "created_at": c.get("created_at"),
@@ -1221,6 +1348,7 @@ def beat_c_record(
             "sha": after["head"]["sha"],
             "check_runs": dict(check_runs),
             "status": dict(combined_status),
+            "observed_at": checks_observed_at,
         },
     }
 
@@ -1568,13 +1696,16 @@ def check_runs_of(p: fe.Preflight, repo: str, sha: str) -> dict[str, Any]:
 
 
 def checks_settled(check_runs: Mapping[str, Any], status: Mapping[str, Any]) -> bool:
-    """Whether every check of a commit reached a final result, green or not.
+    """Whether every check context of a commit reached a final result, green or not.
 
     ``check_runs`` is what ``check_runs_of`` returns and ``status`` the
     combined status (https://docs.github.com/en/rest/commits/statuses). A
     commit whose check suites have not created a run yet, a run that is not
-    ``completed`` and a combined status still ``pending`` are not settled;
-    whether the settled result is green is the judge's call.
+    ``completed``, a combined status listing fewer contexts than it counts and
+    any commit status context still ``pending`` are not settled. The combined
+    ``state`` is not read: GitHub reports ``failure`` as soon as one context
+    fails while others still run. Whether the settled result is green is the
+    judge's call.
     """
 
     runs = list(check_runs.get("check_runs") or [])
@@ -1582,24 +1713,30 @@ def checks_settled(check_runs: Mapping[str, Any], status: Mapping[str, Any]) -> 
         return False
     if any(run.get("status") != "completed" for run in runs):
         return False
-    return not (int(status.get("total_count") or 0) and status.get("state") == "pending")
+    contexts = list(status.get("statuses") or [])
+    if len(contexts) < int(status.get("total_count") or 0):
+        return False
+    return all(context.get("state") not in (None, "pending") for context in contexts)
 
 
 def settled_checks(
     p: fe.Preflight, repo: str, sha: str, deadline: float
-) -> tuple[dict[str, Any], Any]:
-    """The check runs and combined status of ``sha`` once they settle, or at ``deadline``.
+) -> tuple[dict[str, Any], Any, str]:
+    """The check runs, combined status and read time of ``sha`` once settled, or at ``deadline``.
 
     A revision whose checks are still running when its reply lands is healthy,
-    so the beat waits for a final result within its own bound; the last read is
-    what the judge gets, so a run still in progress at the deadline fails there.
+    so the beat waits for a final result within its own bound. The last read is
+    what the judge gets with the time it was read, so a context still running at
+    the deadline fails as not final and a result read after the bound fails as
+    late.
     """
 
     while True:
         runs = check_runs_of(p, repo, sha)
         status = _github(p, "GET", f"/repos/{repo}/commits/{sha}/status")
+        observed_at = now_iso()
         if checks_settled(runs, status) or time.monotonic() >= deadline:
-            return runs, status
+            return runs, status, observed_at
         time.sleep(fe.POLL_SECONDS)
 
 
@@ -1627,6 +1764,12 @@ def installation_get(p: fe.Preflight, path: str) -> Any:
 
 def _wait(what: str, timeout: float, probe: Callable[[], Any]) -> Any:
     return fe._wait(what, timeout, probe, interval=fe.POLL_SECONDS)
+
+
+def _wait_until(what: str, deadline: float, probe: Callable[[], Any]) -> Any:
+    """``_wait`` for what is left of a ``time.monotonic()`` deadline (one probe at least)."""
+
+    return _wait(what, max(deadline - time.monotonic(), 0.0), probe)
 
 
 def _session_headers(chain: ChainRun, role: str) -> dict[str, str]:
@@ -2040,9 +2183,9 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
     files = p._paged(f"/repos/{repo}/pulls/{number}/files")
     path, line = review_target(added_lines_by_path(files))
     posted = review_body(str(before["head"]["sha"]), path, line)
-    # The beat's bound runs from the review: the revision, its reply and its
-    # final checks all land inside it.
-    deadline = time.monotonic() + judge.PULL_REQUEST_WITHIN + 60
+    # One bound for the whole beat, from the review: the revision, its reply
+    # and its final checks all land inside it, as the judge measures them.
+    deadline = time.monotonic() + judge.PULL_REQUEST_WITHIN
     review = _github(p, "POST", f"/repos/{repo}/pulls/{number}/reviews", posted)
     review_id = int(review["id"])
     revision_id = judge.revision_request_id(
@@ -2057,18 +2200,16 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
         after = _github(p, "GET", f"/repos/{repo}/pulls/{number}")
         return after if after["head"]["sha"] != before["head"]["sha"] else None
 
-    after = _wait("the review revision", judge.PULL_REQUEST_WITHIN + 60, revised)
+    after = _wait_until("the review revision", deadline, revised)
     head = str(after["head"]["sha"])
 
     def replied() -> list[dict[str, Any]] | None:
         comments = issue_comments(p, number)
         return comments if any(head in str(c.get("body")) for c in comments) else None
 
-    pull_comments = _wait(
-        "the reply naming the revision commit", judge.PULL_REQUEST_WITHIN, replied
-    )
+    pull_comments = _wait_until("the reply naming the revision commit", deadline, replied)
     commit = _github(p, "GET", f"/repos/{repo}/commits/{head}")
-    check_runs, combined_status = settled_checks(p, repo, head, deadline)
+    check_runs, combined_status, checks_observed_at = settled_checks(p, repo, head, deadline)
     chain.record["beat_c"] = beat_c_record(
         repo=repo,
         pull_number=number,
@@ -2087,6 +2228,7 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
         pull_comments=pull_comments,
         check_runs=check_runs,
         combined_status=combined_status,
+        checks_observed_at=checks_observed_at,
     )
     sample_usage(p, chain, "after_c")
 

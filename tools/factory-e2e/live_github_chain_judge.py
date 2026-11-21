@@ -52,9 +52,11 @@ Fields the driver part added to the record, each read as GitHub returns it:
 2. ``beat_c["pull_comments"]``: the pull request's conversation comments. One App
    comment created or updated at or after the review's ``submitted_at`` must name
    the revision head ``beat_c["pull_after"]["head"]["sha"]`` in full.
-3. ``beat_c["revision_checks"]``: ``{"sha", "check_runs", "status"}``, the check
-   runs (every page, collected to ``total_count``) and the combined status of
-   that head as GitHub returns them. Green is every check run read, every one
+3. ``beat_c["revision_checks"]``: ``{"sha", "check_runs", "status",
+   "observed_at"}``, the check runs (every page, collected to ``total_count``)
+   and the combined status of that head as GitHub returns them, and when they
+   were read; the read must fall within :data:`PULL_REQUEST_WITHIN` of the
+   review. Green is every check run read, every one
    ``completed``, at least one with conclusion ``success`` and none with a
    conclusion other than ``success``, ``skipped`` or ``neutral``; and either no
    commit status at all or every commit status ``success``.
@@ -107,27 +109,27 @@ QUESTIONS_MARKER_LINE = re.compile(
 QUESTIONS_LABEL = "curie-factory:questions"
 
 
-def _decisions_grammar() -> ModuleType:
-    """The default bundle's Decisions grammar (``hooks/decisions_section.py``).
+def _bundle_hook(name: str) -> ModuleType:
+    """A hook module of the default bundle (``examples/dark-factory/hooks/<name>.py``).
 
-    Its review gate refuses a publication whose Decisions section does not
-    parse, and its reproduction gate reads answer citations with the same
-    boundary, so the judge reads the section through that module instead of a
-    heading rule of its own.
+    The judge reads a publication's Decisions section through the bundle's own
+    modules instead of rules of its own: ``decisions_section`` is the grammar
+    the review gate refuses a body by, and ``reproduction_gate`` holds the
+    citation check that gates publishing after a question was asked.
     """
 
-    path = Path(__file__).resolve().parents[2] / "examples/dark-factory/hooks/decisions_section.py"
-    spec = importlib.util.spec_from_file_location("factory_decisions_grammar", path)
+    path = Path(__file__).resolve().parents[2] / f"examples/dark-factory/hooks/{name}.py"
+    spec = importlib.util.spec_from_file_location(f"factory_bundle_{name}", path)
     if spec is None or spec.loader is None:  # pragma: no cover -- a source checkout has it
-        raise ImportError(f"cannot load the Decisions grammar from {path}")
+        raise ImportError(f"cannot load the bundle hook {name} from {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-DECISIONS_GRAMMAR = _decisions_grammar()
+DECISIONS_GRAMMAR = _bundle_hook("decisions_section")
+PUBLICATION_GATE = _bundle_hook("reproduction_gate")
 DECISIONS_HEADING = "## Decisions"
-ANSWERED_PREFIX: str = DECISIONS_GRAMMAR.CITATION_PREFIX
 # Mirror of curie_api.factory_questions.ANSWER_RECEIVED_LINE (a test pins equality):
 # the first line of the status comment of a request an answer started.
 ANSWER_RECEIVED_LINE = "Answer received. The factory is working on this ticket again."
@@ -675,7 +677,11 @@ def answer_citations(body: Any) -> tuple[list[str], str | None]:
     The section is the one the grammar parses: the lines after the single
     exact ``## Decisions`` line, up to the next ``## `` line or the exact
     ``---`` line the platform writes before its own text. A citation below that
-    line is outside the section and does not count.
+    line is outside the section and does not count. A citation is a line the
+    publication gate's own pattern (``reproduction_gate.CITATION``) matches, so
+    a line the grammar tolerates but the gate refuses, such as two spaces after
+    "by", is no citation; and the gate's ``cited`` must agree, so the judge
+    never passes a body production would refuse to publish.
     """
 
     try:
@@ -686,10 +692,12 @@ def answer_citations(body: Any) -> tuple[list[str], str | None]:
     start = lines.index(DECISIONS_HEADING) + 1
     citations: list[str] = []
     for line in lines[start:]:
-        if line.startswith("## ") or line == DECISIONS_GRAMMAR.SECTION_END:
+        if line.startswith("## ") or line == PUBLICATION_GATE.DECISIONS_END:
             break
-        if line.startswith(ANSWERED_PREFIX) and line[len(ANSWERED_PREFIX) :].strip():
+        if PUBLICATION_GATE.CITATION.match(line):
             citations.append(line)
+    if bool(citations) != PUBLICATION_GATE.cited(body):
+        return [], "the publication gate reads its citations differently"
     return citations, None
 
 
@@ -983,18 +991,25 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
         return
     comment, sent = read[0], posted[0]
     _review_comment_timing(b, comment, c["review"])
+    # Where the comment was made, not where GitHub shows it now: once the
+    # revision lands, ``line`` may move or read null and ``commit_id`` follows
+    # the new head, while the original pair stays as posted.
+    made_on = comment["original_line"]
+    b.check(
+        comment["original_commit_id"] == body["commit_id"],
+        "the inline comment was not made on the reviewed head",
+    )
     b.check(
         sent["body"].strip() == REVIEW_RULE_TEXT, "the posted inline comment is not the rule text"
     )
     b.check(
-        (sent["path"], sent["line"], sent["body"])
-        == (comment["path"], comment["line"], comment["body"]),
+        (sent["path"], sent["line"], sent["body"]) == (comment["path"], made_on, comment["body"]),
         "the posted and the read back inline comment differ",
     )
     b.check(comment["body"].strip() == REVIEW_RULE_TEXT, "the inline comment is not the rule text")
     b.check("@" not in comment["body"], "the inline comment mentions an account")
     b.check(
-        comment["line"] in c["diff_added_lines"].get(comment["path"], []),
+        made_on in c["diff_added_lines"].get(comment["path"], []),
         "the inline comment is not on a line the diff adds",
     )
     review = c["review"]
@@ -1047,6 +1062,13 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
     b.check(bool(replies), "no App reply on the pull request names the revision commit")
     for reason in checks_green(c["revision_checks"], now["sha"]):
         b.check(False, reason)
+    b.within(
+        "checks_seconds",
+        submitted,
+        c["revision_checks"]["observed_at"],
+        PULL_REQUEST_WITHIN,
+        "the revision's checks were read as final late",
+    )
 
 
 def _judge_beat_d(b: _Beat, rec: Mapping[str, Any]) -> None:

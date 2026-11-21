@@ -815,10 +815,12 @@ class LearnedRulesRun(sk.ScriptedRun):
         context and kubeconfig of the owned cluster, the namespace, the API URL
         the run uses, the API and UI Services, the writer's and the reader's
         session files (each holds a principal console session cookie value from
-        a real OIDC login) and the proposed rule. The run then waits until the
-        file named ``release_file`` exists, and tears down as usual. A hold that
-        reaches ``seconds`` without a release fails the run, so a browser check
-        that never ran is not reported as held.
+        a real OIDC login), the proposed rule and the candidate commit the
+        images were built from (``validate_browser_candidate`` pinned it). The
+        run then waits until the file named ``release_file`` exists, and tears
+        down as usual. A hold whose release is not seen before ``seconds`` fails
+        the run, so a browser check that never ran, or ran past its bound, is
+        not reported as held.
         """
 
         assert self.workdir is not None
@@ -839,6 +841,7 @@ class LearnedRulesRun(sk.ScriptedRun):
                     "session_cookie": pto.SESSION_COOKIE,
                     "session_files": {role: str(path) for role, path in self.session_files.items()},
                     "rule": {key: rule.get(key) for key in ("id", "version", "state")},
+                    "candidate": self.args.candidate,
                     "release_file": str(release_file),
                 },
                 indent=2,
@@ -851,19 +854,26 @@ class LearnedRulesRun(sk.ScriptedRun):
             flush=True,
         )
         started = time.monotonic()
-        while not release_file.exists():
-            if time.monotonic() - started >= seconds:
+        while True:
+            # Read the release, then the clock: a release first seen at or past
+            # the bound came too late, however near the bound it was written.
+            released = release_file.exists()
+            elapsed = time.monotonic() - started
+            if elapsed >= seconds:
                 raise LearnedRulesError(
-                    f"the browser hold reached {seconds}s without a release; tearing down"
+                    f"the browser hold reached {seconds}s without a release in time; tearing down"
                 )
+            if released:
+                break
             time.sleep(POLL_SECONDS)
-        held = round(time.monotonic() - started, 1)
+        held = round(elapsed, 1)
         # The command bound paused for the hold; the rule list after it shows
         # what the browser check did.
         if self.deadline is not None:
             self.deadline += held
         self.record_step(
             "hold",
+            candidate=self.args.candidate,
             rule_id=rule.get("id"),
             held_seconds=held,
             rules_after_hold=self.list_rules(),

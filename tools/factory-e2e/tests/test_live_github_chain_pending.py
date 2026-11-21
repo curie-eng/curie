@@ -131,11 +131,118 @@ def test_pending_5852_vector_matches_the_product() -> None:
     assert _load(product) == _load(RULES_VECTOR)
 
 
-def test_pending_5852_refusal_codes_match_the_product() -> None:
-    source = REPO_ROOT / "apps" / "api" / "src" / "curie_api" / "routers" / "memory_rules.py"
-    text = source.read_text()
-    for code in judge.READER_REFUSAL_CODES:
-        assert f'"{code.split(".", 1)[1]}"' in text, code
+class _CodeHost:
+    """The code host port ``_write_refusal`` reads, answering one account's write access."""
+
+    def __init__(self, *, writes: bool, fails: bool = False) -> None:
+        from curie_api.forges.capabilities import Operation, Support
+
+        self.capabilities = {
+            Operation.ACCOUNT_LOGIN: Support.SUPPORTED,
+            Operation.USER_CAN_WRITE: Support.SUPPORTED,
+        }
+        self.writes, self.fails = writes, fails
+
+    async def resolve_repository(self, project_id: str) -> Any:
+        from curie_api.forges.types import RepositoryRef
+
+        return RepositoryRef("github", "github.com", project_id, "example-org/unitconv")
+
+    async def account_login(self, _repository: Any, account_id: str) -> str:
+        return f"account-{account_id}"
+
+    async def user_can_write(self, _repository: Any, _actor: Any) -> bool:
+        if self.fails:
+            from curie_api.forges.errors import Unavailable
+
+            raise Unavailable("the code host did not answer")
+        return self.writes
+
+
+class _Registry:
+    def __init__(self, host: _CodeHost | None) -> None:
+        self.host = host
+
+    def code_host_for(self, _kind: str, _host: str) -> Any:
+        from curie_api.forges.errors import Unavailable
+
+        if self.host is None:
+            raise Unavailable("no code host connection")
+        host = self.host
+        return type("Connection", (), {"adapter": lambda _self, _client, repository: host})()
+
+
+def _reader_refusal(monkeypatch: pytest.MonkeyPatch, host: _CodeHost | None) -> str | None:
+    """The product's write refusal for the reader, rendered as the CLI prints it.
+
+    ``routers.memory_rules._write_refusal`` is what accept, reject and remove
+    run before any write; its ``HTTPException`` detail is the route's body, and
+    the CLI (``memory_rules_refusal`` in ``cli/src/api.rs``) prints
+    ``{"error": "<code>: <message>", "fix": <fix>}`` from it.
+    """
+
+    import asyncio
+
+    import httpx
+    from curie_api.routers import memory_rules
+
+    monkeypatch.setattr(memory_rules, "forges_registry", lambda _settings: _Registry(host))
+    scope = memory_rules._Scope("github", "github.com", "4242", "example-org/unitconv")
+
+    async def run() -> Any:
+        async with httpx.AsyncClient() as client:
+            return await memory_rules._write_refusal(client, scope, "1001")
+
+    refusal = asyncio.run(run())
+    if refusal is None:
+        return None
+    detail = refusal.detail
+    output = {"error": f"{detail['code']}: {detail['message']}", "fix": detail["fix"]}
+    return judge.refusal_code(output)
+
+
+def test_pending_5852_refusal_codes_match_the_product(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The product's own refusals for an account that cannot write, and for a
+    # code host it cannot ask, read through the judge's reader of the CLI output.
+    produced = {
+        _reader_refusal(monkeypatch, _CodeHost(writes=False)),
+        _reader_refusal(monkeypatch, None),
+    }
+    assert produced == judge.READER_REFUSAL_CODES
+    # Liveness: an account that can write is not refused.
+    assert _reader_refusal(monkeypatch, _CodeHost(writes=True)) is None
+    # Counterexample: a code host failure is not a write refusal the judge accepts.
+    failed = _reader_refusal(monkeypatch, _CodeHost(writes=False, fails=True))
+    assert failed == "memory_rules.code_host_unavailable"
+    assert failed not in judge.READER_REFUSAL_CODES
+    # The CLI renders the refusal as `<code>: <message>`, which the judge reads.
+    cli = (REPO_ROOT / "cli" / "src" / "api.rs").read_text()
+    formatter = cli[cli.index("fn memory_rules_refusal(") :]
+    assert 'message: format!("{code}: {message}")' in formatter[: formatter.index("\n}\n")]
+
+
+def test_pending_active_request_states_match_the_product() -> None:
+    # The judge's live states are the statuses the request state shape check
+    # lets stand without terminal_at, and the ones the lifecycle counts active.
+    from curie_api.models import ExecutionRequest
+    from curie_api.workitems import lifecycle
+    from sqlalchemy import CheckConstraint
+
+    shape = next(
+        str(c.sqltext)
+        for c in ExecutionRequest.__table__.constraints
+        if isinstance(c, CheckConstraint) and c.name == "execution_requests_state_shape_ck"
+    )
+    branches = re.split(r"\(status = '", shape)[1:]
+    statuses = {branch.split("'", 1)[0] for branch in branches}
+    live = {
+        branch.split("'", 1)[0]
+        for branch in branches
+        if "terminal_at IS NULL" in branch and "terminal_at IS NOT NULL" not in branch
+    }
+    assert judge.ACTIVE_REQUEST_STATES <= statuses
+    assert live == judge.ACTIVE_REQUEST_STATES
+    assert {"queued", *lifecycle._ACTIVE_STATUSES} == judge.ACTIVE_REQUEST_STATES
 
 
 # --------------------------------------------------------------------------
@@ -397,20 +504,51 @@ def test_pending_5794_review_request_id_matches_the_product() -> None:
     assert judge.revision_request_id(repository_id, pull, review) != str(old)
 
 
-def test_pending_5794_review_source_url_matches_the_product() -> None:
-    # The URL admission stores for a review keyed request, which the rule's
-    # source_url carries: the product's builder, with the fragment the
-    # admission path passes it.
-    from curie_api.factory_reply_target import feedback_url
+API = REPO_ROOT / "apps" / "api"
+REVIEW_URL_CALL = re.compile(
+    r"url = feedback_url\(\s*settings\.github_html_base,\s*work_item\.repository_path,"
+    r"\s*feedback\.pr_number,\s*f\"([^\"]+)\",?\s*\)"
+)
 
-    admission = REPO_ROOT / "apps" / "api" / "src" / "curie_api" / "github_factory_review.py"
-    source = _function_source(admission, "admit_parsed_feedback")
-    assert 'f"pullrequestreview-{review.id}"' in source
+
+def test_pending_5794_review_source_url_matches_the_product() -> None:
+    # The URL a rule's source_url carries, followed through its producers:
+    # admission builds it for a review keyed request and passes it as the
+    # request's reply URL; reply_columns stores it as reply_target_url; rule
+    # eligibility reads that column as the rule's source_url. The fragment is
+    # the one the admission source writes, not one this test supplies.
+    from curie_api.factory_reply_target import feedback_url, reply_columns
+    from curie_api.forges.types import PullRequestRef, ReplyTarget, RepositoryRef
+
+    admission = _function_source(
+        API / "src" / "curie_api" / "github_factory_review.py", "admit_parsed_feedback"
+    )
+    call = REVIEW_URL_CALL.search(admission)
+    assert call is not None, "admission no longer builds the review URL with feedback_url"
+    template = call.group(1)
+    assert template.count("{") == 1 and "{review.id}" in template, template
+    assert "reply_url=url" in admission
     c = PASSING["beat_c"]
     base, path = "https://github.com", "example-org/unitconv"
     pull, review = c["pull_number"], c["review"]["id"]
-    product = feedback_url(base, path, int(pull), f"pullrequestreview-{review}")
-    assert judge.review_url(f"{base}/{path}", pull, review) == product
+    admitted = feedback_url(base, path, int(pull), template.replace("{review.id}", str(review)))
+    repository = RepositoryRef("github", "github.com", "4242", path)
+    target = ReplyTarget.on_pull_request(PullRequestRef(repository, str(pull)))
+    stored = reply_columns(target, admitted)["reply_target_url"]
+    eligibility = _function_source(
+        API / "src" / "curie_api" / "memory_rule_lifecycle.py", "rule_proposal_eligibility"
+    )
+    assert "ExecutionRequest.reply_target_url," in eligibility
+    assert "source_url=target_url," in eligibility
+    assert judge.review_url(f"{base}/{path}", pull, review) == stored
+    # What the API's own tests assert about the stored rule and request.
+    proposal = (API / "tests" / "test_memory_rule_proposal.py").read_text()
+    assert 'assert rule["source_url"] == run.reply_target_url' in proposal
+    assert 'assert rule["source_url"].startswith(f"{_pr_url(run.pr)}#pullrequestreview-")' in (
+        proposal
+    )
+    link = _function_source(API / "tests" / "test_github_factory_review.py", "_feedback_link")
+    assert 'return f"{_pr_url(pr)}#pullrequestreview-{fid + 500000}"' in link
     # Counterexample: the inline comment's URL is not the review's.
     comment = feedback_url(base, path, int(pull), f"discussion_r{review}")
     assert judge.review_url(f"{base}/{path}", pull, review) != comment

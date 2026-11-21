@@ -16,6 +16,7 @@ from typing import Any
 
 import live_github_chain_judge as judge
 import pytest
+import scripted_kind
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "live-github-chain"
 PASSING: dict[str, Any] = json.loads((FIXTURES / "record-pass.json").read_text())
@@ -235,6 +236,19 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "Decisions section lacks",
     ),
     (
+        # The grammar counts it, the publication gate's pattern does not: production
+        # refuses to publish this body after a question, so the judge refuses it too.
+        "answered-line-with-two-spaces-after-by",
+        [
+            (
+                "beat_b/open_pulls/0/body",
+                lambda s: s.replace("Answered on the ticket by ", "Answered on the ticket by  "),
+            )
+        ],
+        "beat_b",
+        "Decisions section lacks",
+    ),
+    (
         "decisions-section-the-bundle-grammar-refuses",
         [("beat_b/open_pulls/0/body", lambda s: s.replace("## Decisions", "## Decisions\n\n1. x"))],
         "beat_b",
@@ -334,6 +348,27 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         [("beat_c/diff_added_lines", {"unitconv/tests/test_convert.py": [1, 2]})],
         "beat_c",
         "line the diff adds",
+    ),
+    (
+        "inline-comment-made-on-a-line-the-diff-does-not-add",
+        [
+            ("beat_c/review_comments/0/original_line", 1),
+            ("beat_c/post/body/comments/0/line", 1),
+        ],
+        "beat_c",
+        "line the diff adds",
+    ),
+    (
+        "inline-comment-made-on-another-line-than-posted",
+        [("beat_c/review_comments/0/original_line", 39)],
+        "beat_c",
+        "differ",
+    ),
+    (
+        "inline-comment-made-on-another-commit-than-the-reviewed-head",
+        [("beat_c/review_comments/0/original_commit_id", "c" * 40)],
+        "beat_c",
+        "not made on the reviewed head",
     ),
     (
         "inline-comment-mentions-the-factory",
@@ -978,6 +1013,12 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "combined status",
     ),
     (
+        "revision-checks-read-as-final-after-the-bound",
+        [("beat_c/revision_checks/observed_at", "2030-01-01T01:30:01Z")],
+        "beat_c",
+        "read as final late",
+    ),
+    (
         "checks-read-for-the-old-head",
         [("beat_c/revision_checks/sha", "a" * 40)],
         "beat_c",
@@ -1203,6 +1244,22 @@ def test_judge_accepts_a_fully_passing_record_set() -> None:
     assert verdict.passed
     assert verdict.attempt == 1
     assert verdict.beats[2].measures["status_seconds"] == 20
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [
+        [("beat_c/review_comments/0/line", None)],
+        [("beat_c/review_comments/0/line", 47)],
+        [("beat_c/review_comments/0/commit_id", "b" * 40)],
+    ],
+    ids=["line-null-after-the-revision", "line-shifted", "commit-id-on-the-new-head"],
+)
+def test_judge_reads_an_inline_comment_where_it_was_made(edits: list[tuple[str, Any]]) -> None:
+    # Once the revision lands GitHub may read the comment's current line as
+    # null or shifted and its commit_id as the new head. The original line
+    # and commit are what was reviewed, so the beat still passes.
+    assert failed_beats(broken(*edits)) == {}
 
 
 @pytest.mark.parametrize(
@@ -1622,7 +1679,8 @@ def test_sanitizer_refuses_percent_encoded_leftovers() -> None:
 # --------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-HOOKS = REPO_ROOT / "examples" / "dark-factory" / "hooks"
+BUNDLE = REPO_ROOT / "examples" / "dark-factory"
+HOOKS = BUNDLE / "hooks"
 PUBLISHED_VECTORS = ("factory-decisions-published.json", "factory-decisions-published-route.json")
 
 
@@ -1661,29 +1719,47 @@ def test_shared_decisions_fixtures_read_alike_in_every_consumer(case: dict[str, 
     # factory" line after the agent's text) through every Python consumer of a
     # Decisions section on the integration branch: the bundle's grammar (its
     # review gate refuses a body it rejects), the reproduction gate's citation
-    # check, and this judge. The Rust reader behind `curie factory explain`
-    # reads the same vector files in its own tests.
+    # check, the scripted replay's check of the stub pull request
+    # (scripted_kind.assert_pull_request_decisions), and this judge. The Rust
+    # reader behind `curie factory explain` reads the same vector files in its
+    # own tests.
     grammar, gate = _hook("decisions_section"), _hook("reproduction_gate")
+
+    def scripted(text: str) -> int:
+        return scripted_kind.assert_pull_request_decisions(BUNDLE, {"body": text})
+
     body = str(case["published_body"])
     citations, refused = judge.answer_citations(body)
     if not case["valid"]:
         with pytest.raises(ValueError):
             grammar.parse_decisions_section(body)
+        with pytest.raises(scripted_kind.ScriptedScenarioError):
+            scripted(body)
         assert refused is not None and citations == []
         return
     assert grammar.parse_decisions_section(body) == case["entries"]
+    assert scripted(body) == len(case["entries"])
     assert (citations, refused) == ([], None)
     # A citation inside the section counts for each consumer.
     inside = _cited_inside(case)
     assert grammar.parse_decisions_section(inside) == case["entries"]
+    assert scripted(inside) == len(case["entries"])
     assert gate.cited(inside) is True
     assert judge.answer_citations(inside) == ([CITATION], None)
     # Counterexample: the same citation after the platform's text is outside
     # the section for each consumer.
     outside = _cited_after_the_platform_text(case)
     assert grammar.parse_decisions_section(outside) == case["entries"]
+    assert scripted(outside) == len(case["entries"])
     assert gate.cited(outside) is False
     assert judge.answer_citations(outside) == ([], None)
+    # Counterexample: two spaces after "by". The grammar and the scripted check
+    # tolerate the line; the publication gate refuses it, and so does the judge.
+    spaced = inside.replace(CITATION, CITATION.replace(" by ", " by  ", 1), 1)
+    assert grammar.parse_decisions_section(spaced) == case["entries"]
+    assert scripted(spaced) == len(case["entries"])
+    assert gate.cited(spaced) is False
+    assert judge.answer_citations(spaced) == ([], None)
 
 
 def test_shared_decisions_a_citation_alone_below_the_separator_is_no_section() -> None:

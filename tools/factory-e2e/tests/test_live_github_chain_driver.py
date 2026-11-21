@@ -1819,19 +1819,70 @@ def _git(repo: Path, *argv: str) -> str:
     return result.stdout.strip()
 
 
-def _merged_blocker_repo(root: Path) -> tuple[Path, str]:
-    """A throwaway repository whose ``next`` merged a blocker's branch with a merge commit."""
+class _ReadinessDriver:
+    """``live_github_chain`` as the readiness command loads it, with a fixed verdict."""
+
+    def __init__(self, verdict: lgc.Readiness) -> None:
+        self.verdict = verdict
+        self.calls: list[tuple[str, Path, str]] = []
+
+    def check_readiness(self, token: str, *, repo_root: Path, candidate: str) -> lgc.Readiness:
+        self.calls.append((token, repo_root, candidate))
+        return self.verdict
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_live_chain_readiness_command_runs_the_check_on_the_resolved_candidate(
+    passed: bool, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The explicit step after the last blocker merges: the same check the run
+    # makes, on the commit a ref names, exiting 0 only when it is met.
+    missing = () if passed else ("#5807: no merged pull request into next closes it",)
+    driver = _ReadinessDriver(lgc.Readiness(passed, missing, ()))
+    monkeypatch.setattr(fe, "load_live_github_chain", lambda: driver)
+    monkeypatch.setenv("CURIE_FACTORY_ACTOR_TOKEN", "fixture-token")
+    head = _git(REPO_ROOT, "rev-parse", "HEAD")
+    assert fe.main(["live-chain-readiness", "--candidate", "HEAD"]) == (0 if passed else 1)
+    assert driver.calls == [("fixture-token", REPO_ROOT, head)]
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == {
+        "candidate": head,
+        "passed": passed,
+        "missing": list(missing),
+        "blockers": [],
+    }
+
+
+def test_live_chain_readiness_command_refuses_without_a_token_or_a_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _ReadinessDriver(lgc.Readiness(True, (), ()))
+    monkeypatch.setattr(fe, "load_live_github_chain", lambda: driver)
+    monkeypatch.delenv("CURIE_FACTORY_ACTOR_TOKEN", raising=False)
+    assert fe.main(["live-chain-readiness", "--candidate", "HEAD"]) == fe.EXIT_CONFIG
+    monkeypatch.setenv("CURIE_FACTORY_ACTOR_TOKEN", "fixture-token")
+    assert fe.main(["live-chain-readiness", "--candidate", "f" * 40]) == fe.EXIT_CONFIG
+    assert driver.calls == []
+
+
+def _merge_into_next(root: Path, base: dict[str, str], change: dict[str, str]) -> tuple[Path, str]:
+    """A throwaway repository whose ``next`` merged a blocker's branch with a merge commit.
+
+    ``next`` starts from ``base``, the blocker's branch writes ``change``, and
+    ``next`` gains an unrelated commit before the ``--no-ff`` merge.
+    """
 
     repo = root / "product"
     repo.mkdir()
     _git(repo, "init", "--quiet", "--initial-branch", "next")
-    (repo / "conv.py").write_text("def scale():\n    return 1\n\n\ndef other():\n    return 2\n")
-    _git(repo, "add", "conv.py")
+    for name, text in base.items():
+        (repo / name).write_text(text)
+    _git(repo, "add", *base)
     _git(repo, "commit", "--quiet", "-m", "base")
     _git(repo, "checkout", "--quiet", "-b", "blocker")
-    (repo / "conv.py").write_text("def scale():\n    return 3\n\n\ndef other():\n    return 2\n")
-    (repo / "added.py").write_text("FLAG = True\n")
-    _git(repo, "add", "conv.py", "added.py")
+    for name, text in change.items():
+        (repo / name).write_text(text)
+    _git(repo, "add", *change)
     _git(repo, "commit", "--quiet", "-m", "the blocker's change")
     _git(repo, "checkout", "--quiet", "next")
     (repo / "unrelated.txt").write_text("a later unrelated change on next\n")
@@ -1839,6 +1890,29 @@ def _merged_blocker_repo(root: Path) -> tuple[Path, str]:
     _git(repo, "commit", "--quiet", "-m", "unrelated")
     _git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge the blocker", "blocker")
     return repo, _git(repo, "rev-parse", "HEAD")
+
+
+FILLER = "".join(f"# filler line {n}\n" for n in range(10))
+CONV_BEFORE = (
+    "def scale():\n    return 1\n\n\ndef helper():\n    return 0\n\n\n"
+    + FILLER
+    + "\n\ndef other():\n    return 2\n"
+)
+CONV_AFTER = CONV_BEFORE.replace("return 1", "return 3").replace("return 2", "return 5")
+
+
+def _merged_blocker_repo(root: Path) -> tuple[Path, str]:
+    """The blocker changes two separate lines of ``conv.py`` and adds ``added.py``."""
+
+    return _merge_into_next(
+        root, {"conv.py": CONV_BEFORE}, {"conv.py": CONV_AFTER, "added.py": "FLAG = True\n"}
+    )
+
+
+def _commit(repo: Path, name: str, text: str, message: str) -> str:
+    (repo / name).write_text(text)
+    _git(repo, "commit", "--quiet", "-am", message)
+    return _git(repo, "rev-parse", "HEAD")
 
 
 def _merged_node(number: int, merge_commit: str) -> Any:
@@ -1885,7 +1959,8 @@ def test_readiness_refuses_a_candidate_that_reverts_a_merged_blocker(tmp_path: P
     assert not verdict.passed
     assert verdict.missing == (
         f"#5787: pull request #5849 merge commit {merge} is not present in the candidate "
-        "tree: its change applies forward cleanly, so it is absent or reverted",
+        "tree: 3 of the 3 hunks it changed hold their pre-change content, so it is absent "
+        "or reverted there (added.py, conv.py)",
     )
     pull = verdict.blockers[0]["closing_pulls"][0]
     assert pull["ancestor"] is True and pull["present"] is False
@@ -1893,11 +1968,98 @@ def test_readiness_refuses_a_candidate_that_reverts_a_merged_blocker(tmp_path: P
     assert _git(repo, "status", "--porcelain") == ""
 
 
-def test_readiness_counts_a_later_partial_edit_of_a_blocker_as_present(tmp_path: Path) -> None:
-    # By design: a later edit of the same lines makes the forward apply refuse.
+def test_readiness_counts_a_later_edit_of_a_blockers_own_lines_as_present(
+    tmp_path: Path,
+) -> None:
+    # By design: a later edit of the change's own lines conflicts with the
+    # revert, which is not a revert of the change.
     repo, merge = _merged_blocker_repo(tmp_path)
-    (repo / "conv.py").write_text("def scale():\n    return 4\n\n\ndef other():\n    return 2\n")
-    _git(repo, "commit", "--quiet", "-am", "a later edit of the blocker's line")
+    later = _commit(
+        repo, "conv.py", CONV_AFTER.replace("return 3", "return 4"), "a later edit of its line"
+    )
+    verdict = _real_readiness(repo, later, merge)
+    assert verdict.passed, verdict.missing
+
+
+def test_readiness_refuses_a_revert_with_a_later_edit_next_to_it(tmp_path: Path) -> None:
+    # The blocker is reverted, then a neighbouring helper inside the change's
+    # diff context is renamed. The surroundings moved, the change's own lines
+    # are back to their pre-change content: the change is absent.
+    repo, merge = _merged_blocker_repo(tmp_path)
+    _git(repo, "revert", "--quiet", "--no-edit", "-m", "1", merge)
+    renamed = _commit(
+        repo,
+        "conv.py",
+        CONV_BEFORE.replace("def helper", "def assist"),
+        "rename the neighbouring helper",
+    )
+    verdict = _real_readiness(repo, renamed, merge)
+    assert not verdict.passed
+    assert verdict.missing[0].endswith(
+        "3 of the 3 hunks it changed hold their pre-change content, so it is absent or "
+        "reverted there (added.py, conv.py)"
+    )
+
+
+def test_readiness_refuses_a_candidate_that_reverts_one_hunk_of_a_blocker(
+    tmp_path: Path,
+) -> None:
+    repo, merge = _merged_blocker_repo(tmp_path)
+    partly = _commit(
+        repo, "conv.py", CONV_AFTER.replace("return 5", "return 2"), "undo one of its lines"
+    )
+    verdict = _real_readiness(repo, partly, merge)
+    assert not verdict.passed
+    assert verdict.missing[0].endswith(
+        "1 of the 3 hunks it changed hold their pre-change content, so it is absent or "
+        "reverted there (conv.py)"
+    )
+
+
+def test_readiness_passes_a_present_blocker_with_a_copy_of_its_old_lines_elsewhere(
+    tmp_path: Path,
+) -> None:
+    # A later commit appends a copy of the pre-change lines with their
+    # surroundings. The change itself is untouched, so it is present. The
+    # padding keeps the change's hunk off the first and last lines, where a
+    # patch would be anchored to the file's ends.
+    pad = "".join(f"# pad {n}\n" for n in range(4))
+    before = pad + "def scale():\n    return 1\n\n\ndef other():\n    return 2\n" + pad
+    repo, merge = _merge_into_next(
+        tmp_path, {"conv.py": before}, {"conv.py": before.replace("return 1", "return 3")}
+    )
+    copied = _commit(
+        repo,
+        "conv.py",
+        before.replace("return 1", "return 3") + "\n\n" + before,
+        "keep a copy of the old lines",
+    )
+    verdict = _real_readiness(repo, copied, merge)
+    assert verdict.passed, verdict.missing
+
+
+def test_readiness_refuses_a_revert_of_hunks_the_merge_aligns_as_one_region(
+    tmp_path: Path,
+) -> None:
+    # Two hunks one line apart. With both reverted, reverting the first alone
+    # conflicts, because the merge aligns the two as one region; the check
+    # widens the revert to the neighbouring hunk and finds the pair reverted.
+    before, after = "b\nc\na\na\n}\n", "\n}\na\n"
+    repo, merge = _merge_into_next(tmp_path, {"pair.txt": before}, {"pair.txt": after})
+    _git(repo, "revert", "--quiet", "--no-edit", "-m", "1", merge)
+    verdict = _real_readiness(repo, _git(repo, "rev-parse", "HEAD"), merge)
+    assert not verdict.passed
+    assert verdict.missing[0].endswith(
+        "2 of the 2 hunks it changed hold their pre-change content, so it is absent or "
+        "reverted there (pair.txt)"
+    )
+
+
+def test_readiness_counts_a_changed_file_deleted_later_as_present(tmp_path: Path) -> None:
+    # A revert would restore the file; deleting it is a later change.
+    repo, merge = _merged_blocker_repo(tmp_path)
+    _git(repo, "rm", "--quiet", "conv.py")
+    _git(repo, "commit", "--quiet", "-m", "retire the module")
     verdict = _real_readiness(repo, _git(repo, "rev-parse", "HEAD"), merge)
     assert verdict.passed, verdict.missing
 
@@ -2517,8 +2679,10 @@ def _beat_c(
                 "pull_request_review_id": 7001,
                 "path": path,
                 "line": 40,
+                "original_line": 40,
                 "body": rule,
                 "commit_id": "a" * 40,
+                "original_commit_id": "a" * 40,
                 "created_at": "2030-01-01T00:30:00Z",
                 "updated_at": "2030-01-01T00:30:01Z",
             }
@@ -2576,6 +2740,7 @@ def _beat_c(
         },
         # https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
         combined_status={"state": "pending", "sha": sha, "total_count": 0, "statuses": []},
+        checks_observed_at="2030-01-01T00:41:00Z",
     )
 
 
@@ -2754,6 +2919,76 @@ def test_wiring_beat_c_records_checks_still_running_at_its_deadline(
     assert any("not completed" in reason for reason in verdict.reasons), verdict.reasons
 
 
+def _contexts(*states: str) -> dict[str, Any]:
+    """A combined status as GitHub reports it: ``failure`` once any context fails."""
+
+    combined = (
+        "failure"
+        if {"failure", "error"} & set(states)
+        else "pending"
+        if "pending" in states
+        else "success"
+    )
+    return {
+        "state": combined,
+        "sha": "b" * 40,
+        "total_count": len(states),
+        "statuses": [{"context": f"ci/{n}", "state": state} for n, state in enumerate(states)],
+    }
+
+
+def test_checks_settled_waits_for_every_commit_status_context() -> None:
+    runs = _check_sample("success")[0]
+    # One context failed and one still runs: GitHub's combined state is
+    # already failure, but the commit's checks have not all settled.
+    assert not lgc.checks_settled(runs, _contexts("failure", "pending"))
+    assert not lgc.checks_settled(runs, _contexts("success", "pending"))
+    listed_short = {**_contexts("success"), "total_count": 2}
+    assert not lgc.checks_settled(runs, listed_short)
+    assert lgc.checks_settled(runs, _contexts("failure", "success"))
+    assert lgc.checks_settled(runs, _contexts("success", "success"))
+    assert lgc.checks_settled(runs, _contexts())
+
+
+def test_wiring_beat_c_reads_until_every_commit_status_context_is_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs = _check_sample("success")[0]
+    # The first sample is the one in place before the first read.
+    pending = (runs, _contexts("failure", "pending"))
+    samples = [pending, pending, (runs, _contexts("success", "success"))]
+    chain, _queries, _revision = _drive_beat_c(
+        tmp_path, monkeypatch, (PROPOSE,), check_samples=samples
+    )
+    assert samples == [], "beat (c) stopped reading with a commit status still pending"
+    status = chain.record["beat_c"]["revision_checks"]["status"]
+    assert [s["state"] for s in status["statuses"]] == ["success", "success"]
+    verdict = judge.judge_beat("beat_c", chain.record)
+    assert verdict.passed, verdict.reasons
+
+
+def test_wiring_beat_c_shares_one_deadline_across_its_waits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each clock read advances 1000 s. The revision, the reply and the checks
+    # each get only what is left of the one bound set at the review, never a
+    # fresh budget of their own.
+    clock = iter(range(0, 10**7, 1000))
+    monkeypatch.setattr(lgc.time, "monotonic", lambda: float(next(clock)))
+    budgets: list[float] = []
+
+    def wait(what: str, timeout: float, probe: Any, interval: float = 3) -> Any:
+        budgets.append(timeout)
+        return probe()
+
+    monkeypatch.setattr(fe, "_wait", wait)
+    chain, _queries, _revision = _drive_beat_c(tmp_path, monkeypatch, (PROPOSE,))
+    assert len(budgets) == 2
+    assert all(budget <= judge.PULL_REQUEST_WITHIN for budget in budgets), budgets
+    assert budgets[0] > budgets[1], budgets
+    assert chain.record["beat_c"]["revision_checks"]["observed_at"] == "2030-01-01T00:41:00Z"
+
+
 def _drive_beat_c(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2766,6 +3001,7 @@ def _drive_beat_c(
     repeated; by default the passing record's."""
 
     monkeypatch.setattr(fe, "POLL_SECONDS", 0)
+    monkeypatch.setattr(lgc, "now_iso", lambda: "2030-01-01T00:41:00Z")
     p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
     repo = "fixture-owner/fixture-repo"
     p.config = dataclasses.replace(p.config, repo=repo)

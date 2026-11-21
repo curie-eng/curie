@@ -89,6 +89,61 @@ def _module(name: str, path: Path) -> Any:
     return module
 
 
+def checkout_state(root: Path) -> tuple[str | None, list[str]]:
+    """The checkout's HEAD commit (None when unreadable) and every changed or
+    untracked path that is not ignored: what ``docker build .`` would add."""
+
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "-z"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if head.returncode != 0 or status.returncode != 0:
+        return None, []
+    return head.stdout.strip(), [entry[3:] for entry in status.stdout.split("\0") if entry]
+
+
+def validate_browser_candidate(args: argparse.Namespace) -> None:
+    """Pin a browser hold to the final candidate: images freshly built from a
+    checkout of exactly ``--candidate``, so the Console reviewed is that commit.
+
+    ``--build-images`` is required because the default reuses whatever local
+    ``curie-*:local`` tags a previous run left. The checkout must be at the
+    candidate with no changed or untracked file the build context would carry.
+    """
+
+    if not args.build_images:
+        raise fe.ConfigError(
+            "--hold-for-browser needs --build-images: the default reuses local image tags "
+            "that another build may have written"
+        )
+    candidate = getattr(args, "candidate", None) or ""
+    if not re.fullmatch(r"[0-9a-f]{40}", candidate):
+        raise fe.ConfigError(
+            "--hold-for-browser needs --candidate with the final candidate's full commit id"
+        )
+    head, changed = checkout_state(REPO_ROOT)
+    if head is None:
+        raise fe.ConfigError("--hold-for-browser could not read the checkout's commit")
+    if head != candidate:
+        raise fe.ConfigError(
+            f"--hold-for-browser builds the checkout, which is at {head}, not the "
+            f"--candidate {candidate}; check out the candidate first"
+        )
+    if changed:
+        raise fe.ConfigError(
+            f"--hold-for-browser builds the checkout, which has {len(changed)} changed or "
+            "untracked paths beside the candidate; build from a clean checkout"
+        )
+
+
 def validate_configuration(args: argparse.Namespace) -> None:
     """Refuse malformed inputs before any external resource is created."""
 
@@ -102,6 +157,7 @@ def validate_configuration(args: argparse.Namespace) -> None:
             raise fe.ConfigError(
                 f"--hold-for-browser takes 1 to {MAX_BROWSER_HOLD_SECONDS} seconds"
             )
+        validate_browser_candidate(args)
     if args.scenario == "facts":
         if args.record:
             raise fe.ConfigError("the facts scenario never records or calls a model")

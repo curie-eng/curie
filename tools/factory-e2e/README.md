@@ -1868,6 +1868,32 @@ links, the run's unbound label (read back as gone), closes the run's issues,
 moves the default branch back to its head before the merge (read back), and
 deletes the namespace. The verdict fails unless every step is verified.
 
+### Procedure for a candidate
+
+The steps run in this order on one candidate commit, and each must pass before
+the next starts.
+
+1. Readiness. Once the last blocker of #5808 merges into `next`, rebase onto
+   that `next` and take the result's head as the candidate. Run
+   `curie dev factory-e2e live-chain-readiness --candidate <commit>`. It makes
+   the readiness check the full run makes before it installs anything, prints
+   the verdict as JSON and exits 0 only when every blocker has a pull request
+   merged into `next` whose merge commit is in the candidate and whose own
+   change is still in the candidate's tree. It needs only
+   `CURIE_FACTORY_ACTOR_TOKEN`. A rebase or any new commit makes a new
+   candidate, so run it again.
+2. Browser check of the Console. Check out exactly the candidate with no
+   changed or untracked file, then run the learned-rules replay with
+   `--build-images --candidate <commit> --hold-for-browser <seconds>`. The hold
+   refuses a checkout at another commit, a checkout with changes, and a run
+   without `--build-images` (the default reuses local image tags another build
+   may have written), so the Console checked is built from the candidate. The
+   hold file records the candidate. Create its release file before the bound;
+   a release first seen at or past the bound fails the run.
+3. The full run, `run --scenario live-github-chain --candidate-images build
+   --candidate <commit>`, on the same candidate. It repeats the readiness
+   check and refuses an unready candidate.
+
 ## Live one-ticket on Jira Cloud (#5793)
 
 `factory_e2e.py run --scenario one-ticket --forge jira_cloud --answer-file

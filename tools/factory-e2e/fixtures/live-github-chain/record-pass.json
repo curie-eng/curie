@@ -196,6 +196,9 @@
       {
         "path": "unitconv/tests/test_convert.py",
         "line": 40,
+        "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "original_line": 40,
+        "original_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "body": "Use `self.assertAlmostEqual(..., places=6)` for every floating point result; every float assertion in this repository's tests does that.",
         "pull_request_review_id": 7001,
         "created_at": "2030-01-01T00:30:00Z",
@@ -287,7 +290,8 @@
         "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "total_count": 0,
         "statuses": []
-      }
+      },
+      "observed_at": "2030-01-01T00:41:00Z"
     }
   },
   "beat_d": {

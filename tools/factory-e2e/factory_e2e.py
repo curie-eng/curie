@@ -6912,6 +6912,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=Path("tools/model-script/transcripts/unitconv-issue.json"),
     )
 
+    readiness = sub.add_parser(
+        "live-chain-readiness",
+        help=(
+            "live-github-chain: check that every blocker of #5808 is merged into next and "
+            "present in a candidate commit; reads GitHub with CURIE_FACTORY_ACTOR_TOKEN only"
+        ),
+    )
+    readiness.add_argument("--candidate", required=True, help="the commit or ref to check")
+
     pairings = _acceptance_module().PAIRINGS
     pairing = sub.add_parser(
         "acceptance",
@@ -6933,6 +6942,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     pairing.add_argument("--revision-file", type=Path, help="the review text")
     scripted.add_argument("--build-images", action="store_true")
     scripted.add_argument("--record", action="store_true")
+    scripted.add_argument(
+        "--candidate",
+        metavar="COMMIT",
+        help=(
+            "--hold-for-browser (required with it, as is --build-images): the full commit id "
+            "of the final candidate; the checkout must be exactly that commit, clean"
+        ),
+    )
     scripted.add_argument(
         "--hold-for-browser",
         type=int,
@@ -7430,6 +7447,8 @@ def main(argv: list[str] | None = None) -> int:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return int(module.main(args))
+    if args.mode == "live-chain-readiness":
+        return live_chain_readiness(args.candidate, os.environ)
     if args.mode == "acceptance":
         acceptance = _acceptance_module()
         if args.dry_run:
@@ -7752,6 +7771,36 @@ def load_live_github_chain() -> Any:
     """Load the live-github-chain driver once (live_github_chain.py, #5808)."""
 
     return _load_by_path("live_github_chain", Path(__file__).with_name("live_github_chain.py"))
+
+
+def live_chain_readiness(candidate: str, env: Mapping[str, str]) -> int:
+    """The live chain's readiness check alone, before any install: 0 ready, 1 not.
+
+    The same check the full run makes before it installs anything (every
+    blocker of #5808 closed by a pull request merged into next, its merge
+    commit an ancestor of the candidate and its own change present in the
+    candidate tree), so a candidate can be judged after a blocker merges
+    without starting a run. It prints the verdict as one JSON object.
+    """
+
+    token = env.get("CURIE_FACTORY_ACTOR_TOKEN", "")
+    if not token:
+        print("factory-e2e: live-chain-readiness reads CURIE_FACTORY_ACTOR_TOKEN", file=sys.stderr)
+        return EXIT_CONFIG
+    root = _repo_root()
+    resolved = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if resolved.returncode != 0:
+        print("factory-e2e: the candidate is not a commit of this checkout", file=sys.stderr)
+        return EXIT_CONFIG
+    commit = resolved.stdout.strip()
+    verdict = load_live_github_chain().check_readiness(token, repo_root=root, candidate=commit)
+    print(json.dumps({"candidate": commit, **verdict.evidence()}, indent=2))
+    return 0 if verdict.passed else EXIT_FAILED
 
 
 def _drive_live_github_chain(p: Preflight) -> dict[str, Any]:

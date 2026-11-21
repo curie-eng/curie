@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import ssl
+import subprocess
 import urllib.parse
 import uuid
 from collections.abc import Callable, Iterator
@@ -954,11 +955,15 @@ class _Clock:
             self.on_sleep(self.sleeps)
 
 
+CANDIDATE = "c" * 40
+
+
 def _held_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold: int | None
 ) -> tuple[lrr.LearnedRulesRun, list[tuple[str, ...]]]:
     run, calls = _chain_run(tmp_path, monkeypatch, writer_code=None)
     run.args.hold_for_browser = hold
+    run.args.candidate = CANDIDATE
     run.workdir = tmp_path / "run"
     run.workdir.mkdir()
     run.env["KUBECONFIG"] = str(run.workdir / "kubeconfig")
@@ -995,6 +1000,7 @@ def test_hold_for_browser_keeps_one_proposed_rule_until_released(
     assert held["services"] == {"curie-api": 8000, "curie-ui": 8080}
     assert set(held["session_files"]) == {"writer", "reader"}
     assert held["session_cookie"] == pto.SESSION_COOKIE
+    assert held["candidate"] == CANDIDATE
     step = _step({"steps": run.chain["steps"]}, "hold")
     assert step["held_seconds"] == 3 * lrr.POLL_SECONDS
     assert step["rules_after_hold"][0]["state"] == "proposed"
@@ -1008,6 +1014,22 @@ def test_hold_for_browser_without_a_release_fails_and_decides_nothing(
     monkeypatch.setattr(lrr, "time", _Clock())
     with pytest.raises(lrr.LearnedRulesError, match="without a release"):
         run.run_chain(object())
+    assert calls == []
+    run.cleanup()
+
+
+def test_hold_for_browser_refuses_a_release_first_seen_after_its_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The release appears during the poll that carries the hold past its
+    # bound (2 s with a 1 s bound): it came too late, so the run fails.
+    run, calls = _held_run(tmp_path, monkeypatch, hold=1)
+    assert run.workdir is not None
+    release = run.workdir / "browser-hold.release"
+    monkeypatch.setattr(lrr, "time", _Clock(lambda n: release.touch() if n == 1 else None))
+    with pytest.raises(lrr.LearnedRulesError, match="without a release in time"):
+        run.run_chain(object())
+    assert release.exists()
     assert calls == []
     run.cleanup()
 
@@ -1041,6 +1063,87 @@ def test_hold_for_browser_is_refused_outside_a_learned_rules_replay(
     args = fe.parse_args(["scripted", *argv])
     with pytest.raises(fe.ConfigError, match="hold-for-browser"):
         sk.validate_configuration(args)
+
+
+def _browser_args(*extra: str) -> Any:
+    return fe.parse_args(
+        ["scripted", "--scenario", "learned-rules", "--hold-for-browser", "60", *extra]
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "state", "refusal"),
+    [
+        (["--candidate", CANDIDATE], (CANDIDATE, []), "needs --build-images"),
+        (["--build-images"], (CANDIDATE, []), "needs --candidate"),
+        (["--build-images", "--candidate", "main"], ("main", []), "needs --candidate"),
+        (
+            ["--build-images", "--candidate", CANDIDATE],
+            ("d" * 40, []),
+            "not the --candidate",
+        ),
+        (
+            ["--build-images", "--candidate", CANDIDATE],
+            (CANDIDATE, ["apps/ui/src/App.tsx"]),
+            "1 changed or untracked paths",
+        ),
+        (["--build-images", "--candidate", CANDIDATE], (None, []), "could not read"),
+    ],
+    ids=[
+        "reused-local-images",
+        "no-candidate",
+        "candidate-not-a-commit-id",
+        "checkout-at-another-commit",
+        "checkout-with-a-changed-file",
+        "checkout-unreadable",
+    ],
+)
+def test_hold_for_browser_is_pinned_to_a_fresh_build_of_the_candidate(
+    extra: list[str],
+    state: tuple[str | None, list[str]],
+    refusal: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sk, "checkout_state", lambda _root: state)
+    with pytest.raises(fe.ConfigError, match=refusal):
+        sk.validate_configuration(_browser_args(*extra))
+
+
+def test_hold_for_browser_accepts_a_fresh_build_of_a_clean_candidate_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "checkout_state", lambda _root: (CANDIDATE, []))
+    sk.validate_configuration(
+        _browser_args(
+            "--build-images",
+            "--candidate",
+            CANDIDATE,
+            "--transcript",
+            str(_transcripts(tmp_path)),
+        )
+    )
+
+
+def test_checkout_state_reads_head_and_untracked_paths(tmp_path: Path) -> None:
+    tmp_path = tmp_path / "checkout"
+    tmp_path.mkdir()
+    env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "PATH": "/usr/bin:/bin"}
+    ident = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com"]
+
+    def run(*argv: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(tmp_path), *argv], capture_output=True, text=True, check=True, env=env
+        )
+
+    run("init", "--quiet")
+    (tmp_path / "tracked.txt").write_text("one\n")
+    run("add", "tracked.txt")
+    run(*ident, "commit", "--quiet", "-m", "base")
+    head = run("rev-parse", "HEAD").stdout.strip()
+    assert sk.checkout_state(tmp_path) == (head, [])
+    (tmp_path / "untracked.txt").write_text("context\n")
+    assert sk.checkout_state(tmp_path) == (head, ["untracked.txt"])
+    assert sk.checkout_state(tmp_path / "missing") == (None, [])
 
 
 # Steps d to f on real-shaped inputs ------------------------------------------
