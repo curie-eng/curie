@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -56,12 +56,14 @@ from .models import (
     WorkItem,
 )
 from .personal_execution import (
+    ContextConflict,
     ModelAuthMode,
     OwnerContext,
     OwnerRefusal,
     OwnerRefusalCode,
     existing_work_item_refusal,
     new_work_item_owner,
+    revalidate_for_owner_admission,
 )
 from .requester_instruction_admission import requester_is_active
 from .threadkeys import (
@@ -490,6 +492,65 @@ async def admit(
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
     return await _admit_new(session, facts, resolved.adapter)
+
+
+async def admit_for_verified_owner(
+    session: AsyncSession,
+    facts: Admission,
+    *,
+    work_item_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    admit: Callable[[AsyncSession, Admission], Awaitable[DispatchResult | DispatchConflict]],
+) -> DispatchResult | DispatchConflict | ContextConflict:
+    """Apply an explicit owner resume and its successor as one write."""
+
+    work_item = await lock_work_item(session, work_item_id)
+    if (
+        work_item is None
+        or work_item.agent_id != facts.agent_id
+        or work_item.tracker_issue != facts.issue
+        or work_item.model_auth_mode != "personal"
+        or work_item.owner_principal_id != principal_id
+        or (facts.owner is not None and work_item.tenant_id != facts.owner.tenant_id)
+        or work_item.readmit_request_id == facts.request_id
+        or await session.get(ExecutionRequest, facts.request_id) is not None
+    ):
+        return await admit(session, facts)
+
+    async with session.begin_nested() as atomic:
+        rebound = await revalidate_for_owner_admission(session, work_item)
+        if isinstance(rebound, ContextConflict):
+            return (
+                ContextConflict("stale_version")
+                if rebound.code == "generation_current"
+                else rebound
+            )
+        if rebound is not None:
+            if facts.owner is not None:
+                facts = replace(
+                    facts,
+                    owner=replace(facts.owner, enrollment_generation=rebound.enrollment_generation),
+                )
+            # Lifecycle helpers commit intermediate steps. Their savepoints sit
+            # inside the savepoint that contains the rebind.
+            async with AsyncSession(
+                bind=await session.connection(),
+                join_transaction_mode="create_savepoint",
+                expire_on_commit=False,
+            ) as admission:
+                result = await admit(admission, facts)
+            if (
+                not isinstance(result, WorkItemOutcome)
+                or result.replayed
+                or result.request is None
+                or result.request.id != facts.request_id
+            ):
+                await atomic.rollback()
+                if isinstance(result, WorkItemOutcome) and not result.replayed:
+                    return DispatchConflict("active_request", work_item_id=work_item_id)
+            return result
+
+    return await admit(session, facts)
 
 
 async def admit_revision(
@@ -2354,12 +2415,14 @@ async def cancel(
     work_item_id: uuid.UUID,
     expected_version: int,
     cause: lifecycle.CancellationCause = "issue_cancelled",
+    retain_personal_resume: bool = False,
 ) -> WorkItemOutcome | WorkItemConflict:
     return await lifecycle.request_cancellation(
         session,
         work_item_id=work_item_id,
         expected_work_item_version=expected_version,
         cause=cause,
+        retain_personal_resume=retain_personal_resume,
     )
 
 

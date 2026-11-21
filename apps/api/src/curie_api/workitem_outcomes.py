@@ -27,6 +27,7 @@ from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Literal, cast
 
+from curie_internal.factory_cause import cause_text
 from curie_internal.factory_phase_view import phase_view
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -214,16 +215,9 @@ def _cause(
                 + _previous_start_failure(req)
             )
         text = f"failed: {cause}"
-        if cause == "enrollment_fenced":
-            text += (
-                "; the owner replaced or disconnected the personal Claude enrollment, "
-                "so the run was stopped; revalidate the enrollment to resume"
-            )
-        elif cause == "authentication_required":
-            text += (
-                "; the personal Claude grant was missing or refused, reconnect or "
-                "replace the enrollment, then revalidate to resume"
-            )
+        if cause in {"enrollment_fenced", "authentication_required"}:
+            guidance = cause_text(cause)
+            text += f". {guidance[:1].upper()}{guidance[1:]}"
         elif cause == "deadline_halted":
             text += (
                 "; the run hit the delivery budget, raise "

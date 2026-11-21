@@ -6,12 +6,13 @@ route names the resolved sender as the owner, at the sender's current
 enrollment generation, and the existing owner admission compares that with the
 locked WorkItem's tuple. Only the WorkItem's owner steers it: another
 principal is refused even with write access to the repository, and so are a
-Slack account that now resolves to someone else, a WorkItem bound to an older
-enrollment generation, an inactive enrollment, an identity that changes while
-the decision is made, and a WorkItem of another tenant. Each refusal creates no
-runnable request and leaves every owner tuple as it was. An admitted revision
-copies the locked WorkItem's tuple, whether the installation runs service or
-personal mode, and a redelivery admits it once.
+Slack account that now resolves to someone else, an inactive enrollment, an
+identity that changes while the decision is made, and a WorkItem of another
+tenant. When the owner's enrollment advances, an owner mention can rebind the
+WorkItem after teardown is confirmed. A live runtime causes a ``runtime_live``
+refusal. Each refusal leaves the runnable requests and owner tuples unchanged.
+An admitted revision copies the locked WorkItem's tuple in either installation
+mode, and a redelivery admits it once.
 
 The boundary is ``test_factory_slack_runtime``'s steering stack: the real API
 served over HTTP and the worker as ``run.build`` composes it, over real Postgres
@@ -37,6 +38,7 @@ import test_factory_slack_runtime as runtime
 from curie_api.models import DEFAULT_TENANT_ID
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from test_factory_slack_runtime import OwnerTuple, Person, SteeringStack, SteerRun
+from test_personal_execution_revalidation import _confirm_resume_teardown, _resume_requests
 
 # The owner's enrollment generation when its WorkItem is admitted. Not 1, so a
 # tuple that names a default generation instead of the bound one is caught.
@@ -224,10 +226,11 @@ REFUSALS = [
 def test_each_steer_by_anyone_but_the_current_owner_is_refused_beside_the_owners_admission(
     steering: SteeringStack, case: str
 ) -> None:
-    """AC5: wrong owner, changed identity and stale generation queue nothing.
+    """AC5: wrong owner, changed identity and live runtime queue nothing.
 
     Every refused mention answers ``admission_refused`` with its named owner
-    code (``authority_changed`` for the identity changed mid-decision), creates
+    code (``authority_changed`` for the identity changed mid-decision and
+    ``runtime_live`` when the generation advanced while the run is live), creates
     no request, leaves no runnable request beside the owner's, and moves no
     owner tuple. The owner's own mention, in the same root, is admitted.
 
@@ -274,11 +277,10 @@ def test_each_steer_by_anyone_but_the_current_owner_is_refused_beside_the_owners
         _relink_slack(owner.slack_user, other.principal_id)
         refused(owner.slack_user, "owner_mismatch")
     elif case == "advanced_generation":
-        # The owner replaced their subscription; the WorkItem is still bound to
-        # the old generation until the versioned revalidation rebinds it.
+        # The previous run is still live after the owner replaces enrollment.
         live()
         assert _advance(owner) == GENERATION + 1
-        refused(owner.slack_user, "enrollment_generation_mismatch")
+        refused(owner.slack_user, "runtime_live")
     elif case == "disconnected_enrollment":
         live()
         _disconnect(owner)
@@ -352,3 +354,40 @@ def test_a_personal_work_item_of_another_tenant_refuses_a_steer_resolved_in_the_
     assert runtime.owner_tuples(run.work_item_id) == owned
     assert runtime.runnable_requests() == set()
     runtime._assert_no_sandbox(stack)
+
+
+def test_owner_slack_steer_resumes_at_current_generation_after_teardown(
+    steering: SteeringStack,
+) -> None:
+    owner = steering.person()
+    other = steering.person()
+    _enroll(owner, generation=1)
+    _enroll(other)
+    run = steering.open_steered_run(owner=runtime._owner(owner.principal_id))
+    support.finish_failed(run.request_id, run.epoch, cause="authentication_required")
+    runtime._set_enrollment(owner.principal_id, generation=2, active=True)
+    old: OwnerTuple = (DEFAULT_TENANT_ID, "personal", owner.principal_id, 1)
+    before = _resume_requests(run.work_item_id)
+
+    another = steering.steer_queued(other.slack_user, "Please resume.", thread_ts=run.root_ts)
+    runtime._api_refused(another, "admission_refused", "owner_mismatch")
+    refused = steering.steer_queued(owner.slack_user, "Please resume.", thread_ts=run.root_ts)
+    runtime._api_refused(refused, "admission_refused", "runtime_live")
+    assert "try again shortly" in refused.edits[-1].text.lower()
+    assert runtime.owner_tuples(run.work_item_id) == {run.work_item_id: old, run.request_id: old}
+    assert _resume_requests(run.work_item_id) == before
+
+    _confirm_resume_teardown(run.request_id)
+    [before] = _resume_requests(run.work_item_id)
+    resumed = steering.steer_queued(owner.slack_user, "Please resume.", thread_ts=run.root_ts)
+    runtime._admitted(resumed)
+    predecessor, successor = _resume_requests(run.work_item_id)
+    assert predecessor == before
+    assert (successor["enrollment_generation"], successor["status"]) == (2, "waiting")
+    new: OwnerTuple = (DEFAULT_TENANT_ID, "personal", owner.principal_id, 2)
+    assert runtime.owner_tuples(run.work_item_id) == {
+        run.work_item_id: new,
+        run.request_id: old,
+        successor["id"]: new,
+    }
+    runtime._assert_no_sandbox(steering)

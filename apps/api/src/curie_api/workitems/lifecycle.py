@@ -120,12 +120,11 @@ AUTOMATIC_RETRY_JITTER = 0.2
 # Started terminal statuses whose runtime teardown an enrollment fence can owe
 # (#5377). A force-settled ``cancelled`` request owes one too, by its own path.
 TEARDOWN_TERMINAL_STATUSES = ("completed", "failed", "expired")
-# A personal request ending with one of these is resumed by its owner after a
-# replace or reconnect, so its WorkItem keeps its transcript (#5377). A personal
-# request whose start deferrals ran out (``start_failed``, #5378) is resumed the
-# same way, after reconnect and revalidation.
+# Keep the transcript for owner resume by verified re-label or via an app
+# mention in the Slack thread when the run has an open pull request. A personal
+# start failure also keeps it (#5378).
 _RESUMABLE_PERSONAL_CAUSES = frozenset(
-    {"enrollment_fenced", "authentication_required", "start_failed"}
+    {"authentication_required", "enrollment_fenced", "start_failed"}
 )
 
 
@@ -582,9 +581,12 @@ async def settle_terminal(
     revision, an active request (an owner_lost successor, ADR 0206) or a
     pending relabel continues the WorkItem, so its transcript survives. So
     does a personal request stopped by an enrollment fence or ending
-    authentication-required on an uncancelled WorkItem (#5377, ADR 0268
-    section 3): its owner resumes it after a replace or reconnect. A personal
-    request that ended ``start_failed`` keeps it too (#5378).
+    authentication-required (#5377, ADR 0268 section 3). Removing the trigger
+    label preserves a pending enrollment fence so teardown can retain the
+    transcript. After replacing or reconnecting, the owner can remove and
+    reapply the trigger label, or mention the app in the Slack thread if the
+    run has an open pull request. A personal request that ended
+    ``start_failed`` keeps the transcript too (#5378).
     """
 
     if request.terminal_at is None:
@@ -602,7 +604,7 @@ async def settle_terminal(
     resumable = (
         request.model_auth_mode == "personal"
         and request.terminal_cause in _RESUMABLE_PERSONAL_CAUSES
-        and work_item.cancelled_at is None
+        and (work_item.cancelled_at is None or request.terminal_cause == "enrollment_fenced")
     )
     if continuing is None and work_item.readmit_request_id is None and not resumable:
         await transcripts.expire_for_work_item(session, work_item)
@@ -2596,6 +2598,7 @@ async def request_cancellation(
     work_item_id: uuid.UUID,
     expected_work_item_version: int,
     cause: CancellationCause = "issue_cancelled",
+    retain_personal_resume: bool = False,
 ) -> WorkItemResult:
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
@@ -2605,6 +2608,14 @@ async def request_cancellation(
     if work_item.cancelled_at is not None:
         active = await lock_active_request(session, work_item_id)
         await _cancel_queued_requests(session, work_item_id, await database_now(session), cause)
+        if not retain_personal_resume:
+            if active is None:
+                await transcripts.expire_for_work_item(session, work_item)
+            elif (
+                active.status == "cancellation_requested"
+                and active.terminal_cause == "enrollment_fenced"
+            ):
+                active = await _supersede_stop_cause(session, active, cause)
         if work_item.readmit_request_id is None:
             return await outcome(session, work_item, active, replayed=True)
         # The last label action wins: an unlabel drops a pending relabel.
@@ -2689,28 +2700,45 @@ async def request_cancellation(
         active is not None
         and active.status == "cancellation_requested"
         and active.terminal_cause in ("execution_deadline", "owner_lost", "enrollment_fenced")
+        and not (retain_personal_resume and active.terminal_cause == "enrollment_fenced")
     ):
-        await session.execute(
-            update(ExecutionRequest)
-            .where(
-                ExecutionRequest.id == active.id,
-                ExecutionRequest.work_item_id == work_item_id,
-                ExecutionRequest.version == active.version,
-                ExecutionRequest.status == "cancellation_requested",
-            )
-            .values(
-                terminal_cause=cause,
-                version=ExecutionRequest.version + 1,
-                updated_at=func.clock_timestamp(),
-            )
-        )
-        active = await reload_request(session, active.id)
+        active = await _supersede_stop_cause(session, active, cause)
     work_item = await reload_work_item(session, work_item_id)
     if active is None:
+        retain = False
+        if retain_personal_resume and work_item.model_auth_mode == "personal":
+            latest_cause = await session.scalar(
+                select(ExecutionRequest.terminal_cause)
+                .where(ExecutionRequest.work_item_id == work_item_id)
+                .order_by(ExecutionRequest.sequence.desc())
+                .limit(1)
+            )
+            retain = latest_cause in _RESUMABLE_PERSONAL_CAUSES
         # Nothing is left to run, so the cancelled WorkItem is terminal now. A
-        # waiting or running request expires the transcript when it settles.
-        await transcripts.expire_for_work_item(session, work_item)
+        # verified unlabel can be the first half of an owner's re-label.
+        if not retain:
+            await transcripts.expire_for_work_item(session, work_item)
     return await outcome(session, work_item, active)
+
+
+async def _supersede_stop_cause(
+    session: AsyncSession, request: ExecutionRequest, cause: CancellationCause
+) -> ExecutionRequest:
+    await session.execute(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.work_item_id == request.work_item_id,
+            ExecutionRequest.version == request.version,
+            ExecutionRequest.status == "cancellation_requested",
+        )
+        .values(
+            terminal_cause=cause,
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+    )
+    return await reload_request(session, request.id)
 
 
 async def readmit(

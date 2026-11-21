@@ -116,6 +116,7 @@ from channel_protocol.reply import (
     ReplyUpdate,
 )
 from curie_channel_gateway.reply_errors import InvalidReplyTargetError
+from curie_internal.factory_cause import PERSONAL_RESUME_STEPS
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -390,7 +391,7 @@ def render_grant_notice(payload: dict[str, Any]) -> tuple[str, tuple[MessageLink
     titled = f" {_escaped(title)}" if title else ""
     line = (
         "Your Claude plan was rejected when Curie tried to use it, so your factory run for "
-        f"{key}{titled} stopped. The work is kept."
+        f"{key}{titled} stopped. The work is kept. {PERSONAL_RESUME_STEPS}"
     )
     url = payload.get("reconnect_url")
     links: tuple[MessageLink, ...] = ()

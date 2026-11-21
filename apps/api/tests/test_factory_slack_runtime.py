@@ -5332,6 +5332,13 @@ def test_grant_notice_is_owed_once_while_that_generation_is_still_active(stack: 
     assert owed[0]["posted_at"] is not None
     assert owed[0]["payload"]["issue_key"] == f"#{first}"
     assert owed[0]["payload"]["title"] == "Fix the greeting"
+    (dm,) = [
+        call
+        for call in stack.slack.calls
+        if call.method == "chat.postMessage" and call.params.get("channel") == slack_user
+    ]
+    assert "remove and reapply the issue's trigger label" in dm.text
+    assert "Slack thread if the run has an open pull request" in dm.text
     assert f"#{second}" not in json.dumps(owed[0]["payload"])
     assert _grant_rows(disconnected) == []
     assert _grant_rows(replaced) == []
@@ -5363,7 +5370,10 @@ def test_grant_notice_card_names_the_claude_plan_page(stack: Stack) -> None:
     stack.drain()
 
     card = _last_card(stack, work_item_id)
-    assert "Your Claude plan was rejected. Reconnect it on the Claude plan page." in card
+    assert "Your Claude plan was rejected." in card
+    assert "Claude plan page" in card
+    assert "remove and reapply the issue's trigger label" in card
+    assert "Slack thread if the run has an open pull request" in card
     assert "personal Claude grant was missing" not in card
     assert _replies(stack, root, NEEDS_YOU) == [
         f"{NEEDS_YOU}{cause_text('authentication_required')}"
@@ -5378,7 +5388,7 @@ def test_grant_notice_card_keeps_a_rejection_after_the_owner_reconnects(stack: S
     the Claude plan sentence. The notify reply keeps the shared cause sentence.
     """
 
-    rejection = "Your Claude plan was rejected. Reconnect it on the Claude plan page."
+    rejection = "Your Claude plan was rejected."
     _seed_receiving_identity(stack.identity)
 
     def ended_card(owner: uuid.UUID, *, active: bool, generation: int) -> tuple[str, str]:

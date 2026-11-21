@@ -25,8 +25,9 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 from starlette.concurrency import run_in_threadpool
 
 from . import factory_intake_notices, github_factory
@@ -43,7 +44,7 @@ from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .models import AgentChannel, FactoryPollCursor, WorkItem
+from .models import AgentChannel, FactoryPollCursor, ThreadTranscript, WorkItem
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name
 from .workspace_policy import repository_is_allowed
 
@@ -69,9 +70,26 @@ async def bound_repositories(session: AsyncSession) -> list[str]:
     return list(rows)
 
 
+def cancellable_github_item() -> ColumnElement[bool]:
+    """An open item or one whose retained resume transcript still needs close handling."""
+
+    retained = (
+        select(ThreadTranscript.id)
+        .where(
+            ThreadTranscript.agent_id == WorkItem.agent_id,
+            ThreadTranscript.binding_scope.is_(None),
+            ThreadTranscript.thread_key == WorkItem.conversation_id,
+        )
+        .exists()
+    )
+    return or_(
+        WorkItem.cancelled_at.is_(None),
+        and_(WorkItem.model_auth_mode == "personal", retained),
+    )
+
+
 async def open_work_item_repositories(session: AsyncSession) -> list[str]:
-    """The repositories of GitHub WorkItems not cancelled (#4361 decision 10,
-    R2 finding 3).
+    """The repositories of GitHub WorkItems that still need cancellation checks.
 
     Cancellation never resolves a binding, so a repository whose last surface
     was removed still owes its open WorkItems a cancellation pass; callers
@@ -80,7 +98,7 @@ async def open_work_item_repositories(session: AsyncSession) -> list[str]:
 
     rows = await session.scalars(
         select(WorkItem.repository_path)
-        .where(WorkItem.tracker_kind == GITHUB, WorkItem.cancelled_at.is_(None))
+        .where(WorkItem.tracker_kind == GITHUB, cancellable_github_item())
         .distinct()
     )
     return list(rows)
