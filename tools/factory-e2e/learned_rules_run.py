@@ -816,7 +816,8 @@ class LearnedRulesRun(sk.ScriptedRun):
         the run uses, the API and UI Services, the writer's and the reader's
         session files (each holds a principal console session cookie value from
         a real OIDC login), the proposed rule and the candidate commit the
-        images were built from (``validate_browser_candidate`` pinned it). The
+        images were built from (``validate_browser_candidate`` pinned it) with
+        the image ids the install imported. The
         run then waits until the file named ``release_file`` exists, and tears
         down as usual. A hold whose release is not seen before ``seconds`` fails
         the run, so a browser check that never ran, or ran past its bound, is
@@ -842,6 +843,7 @@ class LearnedRulesRun(sk.ScriptedRun):
                     "session_files": {role: str(path) for role, path in self.session_files.items()},
                     "rule": {key: rule.get(key) for key in ("id", "version", "state")},
                     "candidate": self.args.candidate,
+                    "images": self.evidence.get("loaded_images"),
                     "release_file": str(release_file),
                 },
                 indent=2,

@@ -1146,6 +1146,102 @@ def test_checkout_state_reads_head_and_untracked_paths(tmp_path: Path) -> None:
     assert sk.checkout_state(tmp_path / "missing") == (None, [])
 
 
+class _Engine:
+    """A Docker engine and kind node as the scripted build and import call them:
+    each build gives its tag a new image id, and an import records the id the
+    imported tag named at that moment."""
+
+    SNAPSHOTTER = '[plugins."io.containerd.grpc.v1.cri".containerd]\nsnapshotter = "overlayfs"\n'
+
+    def __init__(self) -> None:
+        self.tags: dict[str, str] = {}
+        self.imported: dict[str, str] = {}
+        self.builds = 0
+
+    def build(self, tag: str) -> None:
+        self.builds += 1
+        self.tags[tag] = f"sha256:{self.builds:064x}"
+
+    def __call__(self, *argv: str, timeout: float = 900) -> str:
+        if argv[:2] == ("docker", "build"):
+            self.build(argv[argv.index("-t") + 1])
+            return ""
+        if argv[1:3] == ("build", "--tag"):
+            self.build(argv[3])
+            return ""
+        if argv[:4] == ("docker", "image", "inspect", "--format"):
+            return self.tags[argv[5]] + "\n"
+        if argv[:3] == ("docker", "image", "inspect"):
+            return json.dumps([{"Size": 1, "Id": self.tags[ref]} for ref in argv[3:]])
+        if argv[:2] == ("docker", "version"):
+            return "linux/amd64\n"
+        if argv[:3] == ("kind", "get", "nodes"):
+            return "fixture-control-plane\n"
+        if argv[:2] == ("docker", "exec") and "config" in argv:
+            return self.SNAPSHOTTER
+        if argv[0] == "bash" and "kind-image-import" in argv:
+            self.imported[argv[-1]] = self.tags[argv[-1]]
+            return ""
+        raise AssertionError(f"unexpected engine call {argv[:3]}")
+
+
+def _built_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[lrr.LearnedRulesRun, _Engine]:
+    for name in ("DOCKER_HOST", "DOCKER_CONTEXT", "CURIE_LOCAL_STUB_HOST"):
+        monkeypatch.delenv(name, raising=False)
+    args = fe.parse_args(
+        [
+            "scripted",
+            "--scenario",
+            "learned-rules",
+            "--build-images",
+            "--transcript",
+            str(_transcripts(tmp_path)),
+        ]
+    )
+    run = lrr.LearnedRulesRun(args)
+    engine = _Engine()
+    run.curie = "curie"
+    monkeypatch.setattr(run, "command", engine)
+    monkeypatch.setattr(run, "check_disk", lambda *_a, **_k: None)
+    return run, engine
+
+
+def test_a_build_on_the_shared_tags_between_build_and_import_changes_nothing_imported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Another checkout builds the shared tags on the same engine after this
+    # run built its images and before it imports them. The import, the install
+    # values and the recorded ids are still this run's own builds.
+    run, engine = _built_run(tmp_path, monkeypatch)
+    run.build_candidate_images()
+    built = dict(run.built_image_ids)
+    for ref in (*sk.IMAGES, sk.GATEWAY_IMAGE):
+        engine.build(ref)
+    run.load_candidate_images()
+    assert engine.imported == built
+    assert set(built) == set(run.image_refs)
+    assert all(ref.endswith(f":run-{run.run_id}") for ref in built)
+    assert run.evidence["candidate_images"] == run.evidence["loaded_images"] == built
+    values = {component: {"image": {"tag": "local"}} for component in run.built_components()}
+    run.pin_built_images(values)
+    assert {values[c]["image"]["tag"] for c in values} == {f"run-{run.run_id}"}
+    assert run.runner_ref == f"curie-runner:run-{run.run_id}"
+    assert set(run.created_images) == set(built)
+
+
+def test_an_image_changed_after_its_build_is_not_imported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, engine = _built_run(tmp_path, monkeypatch)
+    run.build_candidate_images()
+    engine.build(f"curie-ui:run-{run.run_id}")
+    with pytest.raises(sk.ScriptedScenarioError, match="changed after their build"):
+        run.load_candidate_images()
+    assert engine.imported == {}
+
+
 # Steps d to f on real-shaped inputs ------------------------------------------
 #
 # The live chain stores every step scrubbed while the driver reads raw values

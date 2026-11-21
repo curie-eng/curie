@@ -2989,19 +2989,64 @@ def test_wiring_beat_c_shares_one_deadline_across_its_waits(
     assert chain.record["beat_c"]["revision_checks"]["observed_at"] == "2030-01-01T00:41:00Z"
 
 
+def test_wiring_beat_c_counts_its_deadline_from_the_review_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GitHub records the submission 10 s after the POST started; the checks
+    # turn green 3595 s after the submission. The judge counts from
+    # submitted_at, so the driver must wait for them: a deadline counted from
+    # the POST start would stop at 3590 s and record the checks still running.
+    submitted = judge.parse_time("2030-01-01T00:30:00Z")
+    clock = {"now": 0.0}
+    origin = submitted - dt.timedelta(seconds=10)
+    reads = {"checks": 0}
+
+    def on_call(method: str, path: str) -> None:
+        if method == "POST" and path.endswith("/reviews"):
+            clock["now"] += 10
+        if path.endswith("/check-runs?per_page=100&page=1"):
+            reads["checks"] += 1
+            if reads["checks"] == 1:
+                clock["now"] = 10 + 3595 - 1
+
+    def now() -> str:
+        return (origin + dt.timedelta(seconds=clock["now"])).isoformat().replace("+00:00", "Z")
+
+    monkeypatch.setattr(lgc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(lgc.time, "sleep", lambda _s: clock.__setitem__("now", clock["now"] + 1))
+    pending = _check_sample(None)
+    samples = [pending, pending, _check_sample("success")]
+    chain, _queries, _revision = _drive_beat_c(
+        tmp_path, monkeypatch, (PROPOSE,), check_samples=samples, now=now, on_call=on_call
+    )
+    checks = chain.record["beat_c"]["revision_checks"]
+    assert checks["check_runs"]["check_runs"][0]["status"] == "completed"
+    assert checks["observed_at"] == "2030-01-01T01:29:55Z"
+    verdict = judge.judge_beat("beat_c", chain.record)
+    assert verdict.passed, verdict.reasons
+    assert verdict.measures["checks_seconds"] == 3595
+
+
+def test_review_deadline_needs_a_submission_time() -> None:
+    with pytest.raises(fe.PreflightFailed, match="no submitted_at"):
+        lgc.review_deadline({"id": 7001, "submitted_at": None})
+
+
 def _drive_beat_c(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     revision_tools: tuple[str, ...],
     *,
     check_samples: list[tuple[dict[str, Any], dict[str, Any]]] | None = None,
+    now: Callable[[], str] | None = None,
+    on_call: Callable[[str, str], None] | None = None,
 ) -> tuple[lgc.ChainRun, list[str], str]:
     """``beat_c`` against a fake GitHub and install. ``check_samples`` are the
     revision head's check runs and combined status, one per read, the last
     repeated; by default the passing record's."""
 
     monkeypatch.setattr(fe, "POLL_SECONDS", 0)
-    monkeypatch.setattr(lgc, "now_iso", lambda: "2030-01-01T00:41:00Z")
+    monkeypatch.setattr(lgc, "now_iso", now or (lambda: "2030-01-01T00:41:00Z"))
     p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
     repo = "fixture-owner/fixture-repo"
     p.config = dataclasses.replace(p.config, repo=repo)
@@ -3082,6 +3127,8 @@ def _drive_beat_c(
     }
 
     def as_actor(method: str, path: str, body: Any = None) -> Any:
+        if on_call is not None:
+            on_call(method, path)
         if method == "GET" and path in check_paths:
             return 200, check_read(check_paths[path])
         if method == "GET" and path == f"/repos/{repo}/pulls/12":

@@ -1766,6 +1766,21 @@ def _wait(what: str, timeout: float, probe: Callable[[], Any]) -> Any:
     return fe._wait(what, timeout, probe, interval=fe.POLL_SECONDS)
 
 
+def review_deadline(review: Mapping[str, Any]) -> float:
+    """The ``time.monotonic()`` instant :data:`judge.PULL_REQUEST_WITHIN` after the
+    review's ``submitted_at``, read against this host's clock as ``observed_at`` is.
+
+    A review without ``submitted_at`` stops the beat: the judge has no origin
+    to measure from.
+    """
+
+    submitted = review.get("submitted_at")
+    if not submitted:
+        raise fe.PreflightFailed("the submitted review has no submitted_at")
+    since = (judge.parse_time(now_iso()) - judge.parse_time(submitted)).total_seconds()
+    return time.monotonic() + judge.PULL_REQUEST_WITHIN - since
+
+
 def _wait_until(what: str, deadline: float, probe: Callable[[], Any]) -> Any:
     """``_wait`` for what is left of a ``time.monotonic()`` deadline (one probe at least)."""
 
@@ -2183,11 +2198,12 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
     files = p._paged(f"/repos/{repo}/pulls/{number}/files")
     path, line = review_target(added_lines_by_path(files))
     posted = review_body(str(before["head"]["sha"]), path, line)
-    # One bound for the whole beat, from the review: the revision, its reply
-    # and its final checks all land inside it, as the judge measures them.
-    deadline = time.monotonic() + judge.PULL_REQUEST_WITHIN
     review = _github(p, "POST", f"/repos/{repo}/pulls/{number}/reviews", posted)
     review_id = int(review["id"])
+    # One bound for the whole beat: the revision, its reply and its final
+    # checks all land inside it, counted from the review's submitted_at as the
+    # judge counts, not from when the POST started.
+    deadline = review_deadline(review)
     revision_id = judge.revision_request_id(
         chain.record["identities"]["repository_id"], number, review_id
     )

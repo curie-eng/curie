@@ -530,13 +530,28 @@ class ScriptedRun:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.run_id = uuid.uuid4().hex[:8]
-        self.image_refs = (
-            IMAGES + ((GATEWAY_IMAGE,) if self.gateway_enabled() else ())
-            if args.scenario != "facts"
-            else tuple(
+        # A build names its images for this run, never the shared ``:local``
+        # tags another checkout's build on the same engine may rewrite between
+        # this run's build and its import.
+        self.run_tag = (
+            f"run-{self.run_id}" if args.build_images and args.scenario != "facts" else None
+        )
+        self.runner_ref = (
+            f"curie-runner:{self.run_tag}" if self.run_tag is not None else "curie-runner:latest"
+        )
+        if args.scenario == "facts":
+            self.image_refs: tuple[str, ...] = tuple(
                 f"curie-{component}:facts-{self.run_id}" for component in ("api", "worker", "ui")
             )
-        )
+        elif self.run_tag is not None:
+            self.image_refs = (
+                *(f"curie-{component}:{self.run_tag}" for component in self.built_components()),
+                self.runner_ref,
+            )
+        else:
+            self.image_refs = IMAGES + ((GATEWAY_IMAGE,) if self.gateway_enabled() else ())
+        # Image id of each ref, read once its build finished.
+        self.built_image_ids: dict[str, str] = {}
         self.created_images: list[str] = []
         self.facts_runner_images: dict[str, str] = {}
         self.cluster = f"curie-factory-scripted-{self.run_id}"
@@ -803,6 +818,77 @@ class ScriptedRun:
 
         self.recording_closed = True
 
+    def built_components(self) -> list[str]:
+        """The chart components a build makes: api, worker, ui, and the dispatcher
+        the channel gateway runs on when it is enabled."""
+
+        components = ["api", "worker", "ui"]
+        if self.gateway_enabled():
+            components.append(GATEWAY_COMPONENT)
+        return components
+
+    def build_candidate_images(self) -> None:
+        """Build each component and the runner under this run's own tags, then
+        record each image id, so the import and install use exactly these builds."""
+
+        for component in self.built_components():
+            ref = (
+                f"curie-{component}:facts-{self.run_id}"
+                if self.args.scenario == "facts"
+                else f"curie-{component}:{self.run_tag}"
+            )
+            self.check_disk(f"building {component}")
+            dockerfile = f"apps/{component}/Dockerfile"
+            self.command("docker", "build", "-f", dockerfile, "-t", ref, ".", timeout=1800)
+            self.created_images.append(ref)
+            self.check_disk(f"built {component}")
+        if self.args.scenario != "facts":
+            self.check_disk("building runner")
+            self.command(self.curie, "build", "--tag", self.runner_ref, timeout=1800)
+            self.created_images.append(self.runner_ref)
+            self.check_disk("built runner")
+        self.built_image_ids = self.current_image_ids()
+        self.evidence["candidate_images"] = dict(self.built_image_ids)
+
+    def pin_built_images(self, values: dict[str, Any]) -> None:
+        """Point each built chart component at this run's tag (the runner goes
+        through the run's registry, tagged from ``runner_ref``)."""
+
+        if self.run_tag is None:
+            return
+        for component in self.built_components():
+            values[component]["image"]["tag"] = self.run_tag
+
+    def current_image_ids(self) -> dict[str, str]:
+        """The image id each of ``image_refs`` names now, from one inspect."""
+
+        records = json.loads(
+            self.command("docker", "image", "inspect", *self.image_refs, timeout=30)
+        )
+        ids = [record.get("Id") for record in records]
+        if len(ids) != len(self.image_refs) or not all(isinstance(i, str) and i for i in ids):
+            raise ScriptedScenarioError("candidate image ids are missing")
+        return dict(zip(self.image_refs, ids, strict=True))
+
+    def load_candidate_images(self) -> None:
+        """Import the candidate images into the kind node. After this run's own
+        build it refuses any image whose id changed since, and records the ids
+        the install runs."""
+
+        required = kind_images.import_budget(self.command, self.image_refs)
+        self.check_disk("loading candidate images", required_bytes=required)
+        if self.built_image_ids:
+            now = self.current_image_ids()
+            changed = [ref for ref, built in self.built_image_ids.items() if now.get(ref) != built]
+            if changed:
+                raise ScriptedScenarioError(
+                    f"candidate images changed after their build: {', '.join(changed)}"
+                )
+        kind_images.load_images(self.command, self.cluster, self.image_refs)
+        if self.built_image_ids:
+            self.evidence["loaded_images"] = now
+        self.check_disk("loaded candidate images", required_bytes=kind_images.RUNTIME_RESERVE_BYTES)
+
     def prerequisites(self) -> None:
         for binary in ("docker", "kind", "helm", "kubectl", "openssl", "git"):
             if shutil.which(binary) is None:
@@ -816,30 +902,7 @@ class ScriptedRun:
         if self.args.record:
             self.prepare_recording()
         if self.args.build_images:
-            components = ["api", "worker", "ui"]
-            if self.gateway_enabled():
-                components.append(GATEWAY_COMPONENT)
-            for component in components:
-                self.check_disk(f"building {component}")
-                self.command(
-                    "docker",
-                    "build",
-                    "-f",
-                    f"apps/{component}/Dockerfile",
-                    "-t",
-                    f"curie-{component}:facts-{self.run_id}"
-                    if self.args.scenario == "facts"
-                    else f"curie-{component}:local",
-                    ".",
-                    timeout=1800,
-                )
-                if self.args.scenario == "facts":
-                    self.created_images.append(f"curie-{component}:facts-{self.run_id}")
-                self.check_disk(f"built {component}")
-            if self.args.scenario != "facts":
-                self.check_disk("building runner")
-                self.command(self.curie, "build", "--tag", "curie-runner:latest", timeout=1800)
-                self.check_disk("built runner")
+            self.build_candidate_images()
         for image in self.image_refs:
             try:
                 self.command("docker", "image", "inspect", image, timeout=30)
@@ -905,16 +968,13 @@ class ScriptedRun:
             stub_host=self.env.get("CURIE_LOCAL_STUB_HOST"),
             gateway=gateway,
         )
-        required = kind_images.import_budget(self.command, self.image_refs)
-        self.check_disk("loading candidate images", required_bytes=required)
-        kind_images.load_images(self.command, self.cluster, self.image_refs)
-        self.check_disk("loaded candidate images", required_bytes=kind_images.RUNTIME_RESERVE_BYTES)
+        self.load_candidate_images()
         # curie build resolves the runner base with buildx imagetools, which
         # reads a registry and never the local daemon, so the base goes to the
         # run's own registry before the chart names it.
         runner_image = f"{registry_ref}/curie-runner"
         if self.args.scenario != "facts":
-            self.command("docker", "tag", "curie-runner:latest", f"{runner_image}:latest")
+            self.command("docker", "tag", self.runner_ref, f"{runner_image}:latest")
             self.command("docker", "push", f"{runner_image}:latest", timeout=900)
         else:
             self.build_facts_runner_images(registry_ref)
@@ -1034,6 +1094,7 @@ class ScriptedRun:
             )
             values["agentSandbox"]["runnerImages"] = self.facts_runner_images
             values["worker"]["replicas"] = 0
+        self.pin_built_images(values)
         self.extend_install_values(values)
         # Direct Helm installation follows the existing factory preflight.
         # Generate the same sealed credential/caller inputs as cluster up,
@@ -1591,7 +1652,7 @@ class ScriptedRun:
         self.evidence["agent_id"] = agent["id"]
         bundle = self.workdir / "bundle"
         shutil.copytree(REPO_ROOT / "examples/dark-factory", bundle)
-        layer_bytes = kind_images.runner_layer_budget(self.command, "curie-runner:latest")
+        layer_bytes = kind_images.runner_layer_budget(self.command, self.runner_ref)
         self.check_disk("building the runner layer", required_bytes=layer_bytes)
         runner_base = f"{registry_ref}/curie-runner:latest"
         self.command(

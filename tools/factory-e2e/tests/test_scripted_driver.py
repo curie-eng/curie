@@ -2330,9 +2330,11 @@ def test_enabled_gateway_builds_and_imports_the_dispatcher_image_the_chart_names
         slack_api_base_url="http://192.0.2.1:7/api/",
     )
     assert values["dispatcher"]["slack"]["botToken"], "the gateway is enabled"
+    # A build runs under this run's own tag, never the shared :local one.
+    run.pin_built_images(values)
     image = values["dispatcher"]["image"]
     chart_image = f"{image['repository']}:{image['tag']}"
-    assert chart_image == sk.GATEWAY_IMAGE
+    assert chart_image == f"curie-dispatcher:run-{run.run_id}"
 
     monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
     monkeypatch.setattr(sk.ScriptedRun, "check_disk", lambda _self, _stage, **_kwargs: None)
@@ -2348,7 +2350,7 @@ def test_enabled_gateway_builds_and_imports_the_dispatcher_image_the_chart_names
             return "kind v0.24.0"
         if argv[:3] == ("docker", "image", "inspect"):
             inspected.update(argv[3:])
-            return json.dumps([{"Size": 1024} for _ in argv[3:]])
+            return json.dumps([{"Size": 1024, "Id": f"sha256:{ref}"} for ref in argv[3:]])
         if argv[:2] == ("docker", "build"):
             builds[argv[argv.index("-t") + 1]] = argv[argv.index("-f") + 1]
         if argv[:2] == ("docker", "inspect"):
