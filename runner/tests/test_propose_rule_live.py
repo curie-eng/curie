@@ -122,8 +122,6 @@ class _PlatformStub:
             return web.json_response(
                 {
                     "completion_contract": "implementation",
-                    "result_kinds": [],
-                    "session_usd_allowance": None,
                     "execution": None,
                     "rule_proposal": True,
                 }

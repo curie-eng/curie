@@ -8,7 +8,7 @@ has three question rounds in all.
 This module owns the schema, the bounds check and the handler and stays free
 of the SDK (ADR 0140); `curie_runner.harness.claude.question_tool` wraps the
 handler as the SDK tool. The post, the body decoding and the refusal code
-reading are the helpers `curie_runner.tracker_result` already owns, so the two
+reading are the helpers `curie_runner.completion_contract` already owns, so the two
 tools share one copy.
 
 The bounds are checked here before any request, so a malformed call costs no
@@ -25,7 +25,7 @@ from typing import Any
 
 import aiohttp
 
-from .tracker_result import (
+from .completion_contract import (
     _CODE_RE,
     ResultHandler,
     _code,

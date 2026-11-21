@@ -880,8 +880,7 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
     # report_progress mounts only when the worker injected the progress env
     # (#3077); its name is exempt regardless, like an omitted request_approval.
-    # get_issue (ADR 0187) mounts only with the worker's issue read env, and
-    # submit_tracker_result (ADR 0277) only under a tracker_result contract,
+    # get_issue (ADR 0187) mounts only with the worker's issue read env,
     # ask_questions (ADR 0286) only under an implementation contract, and
     # propose_rule (ADR 0287) only when the contract offers it.
     from curie_runner.approval import (
@@ -889,13 +888,11 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
         PROGRESS_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
         QUESTION_TOOL_NAME,
-        TRACKER_RESULT_TOOL_NAME,
     )
 
     assert _published_live_tool_names(mounted) == platform_tool_names(state_server_mounted=True) - {
         PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
-        TRACKER_RESULT_TOOL_NAME,
         QUESTION_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
     }
@@ -905,15 +902,14 @@ def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch)
     # ADR 0187: an execution with a WorkItem boots with the API's issue read
     # route and capability, and only that boot publishes get_issue. Its boot
     # asks the API's completion contract route (ADR 0277); an implementation
-    # answer publishes no submit_tracker_result, and one without a rule
-    # proposal offer publishes no propose_rule (ADR 0287).
+    # answer without a rule proposal offer publishes no propose_rule
+    # (ADR 0287).
     from aiohttp import web
     from aiohttp.test_utils import TestServer
     from curie_runner.approval import (
         ISSUE_TOOL_NAME,
         PROGRESS_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
-        TRACKER_RESULT_TOOL_NAME,
         platform_tool_names,
     )
     from runner_boot_session import initialized_session
@@ -922,8 +918,8 @@ def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch)
         return web.json_response(
             {
                 "completion_contract": "implementation",
-                "result_kinds": [],
-                "session_usd_allowance": None,
+                "execution": None,
+                "rule_proposal": False,
             }
         )
 
@@ -959,7 +955,6 @@ def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch)
     assert ISSUE_TOOL_NAME in published
     assert published == platform_tool_names(state_server_mounted=True) - {
         PROGRESS_TOOL_NAME,
-        TRACKER_RESULT_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
     }
 
@@ -992,13 +987,11 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
         PROGRESS_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
         QUESTION_TOOL_NAME,
-        TRACKER_RESULT_TOOL_NAME,
     )
 
     assert published == platform_tool_names(state_server_mounted=False) - {
         PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
-        TRACKER_RESULT_TOOL_NAME,
         QUESTION_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
     }

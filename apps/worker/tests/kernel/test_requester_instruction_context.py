@@ -65,6 +65,7 @@ from curie_internal.requester_coding_instructions import text_sha256
 from curie_runner import RunnerConfig, RunTracer, SideEffectClassifier
 from curie_runner import __main__ as runner_boot
 from curie_runner.__main__ import build_runner
+from curie_runner.completion_contract import fetch_completion_contract, sibling_urls
 from curie_runner.fake import FakeModelSession
 from curie_runner.issue_read import ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
@@ -79,7 +80,6 @@ from curie_runner.requester_context import (
 from curie_runner.server import bind_status_attestation
 from curie_runner.server import create_app as create_runner_app
 from curie_runner.session import SessionRunner
-from curie_runner.tracker_result import fetch_completion_contract, sibling_urls
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import memory_rules_context
 from curie_worker.binding import FactoryWake

@@ -1,10 +1,9 @@
-"""The completion contract and ``submit_tracker_result`` (ADR 0277, #5586).
+"""The completion contract (ADR 0277, #5586).
 
 A factory execution learns from the API, over the issue read capability the
-worker already injects, whether it ends in an implementation or a tracker
-result. A tracker result session mounts ``submit_tracker_result``, cannot use
-``Task`` or ``Agent``, spends at most the API's allowance, and gets exactly one
-model session per request. Every way the contract can fail blocks the model.
+worker already injects, how it must end: an implementation, or a publication
+recovery that runs no model. Every way the contract can fail, an answer naming
+a contract the runner does not know included, blocks the model.
 
 Every HTTP case runs against a real local aiohttp server that records what it
 received; nothing of ours is mocked.
@@ -24,67 +23,64 @@ import pytest
 from aci_protocol import BootEnv
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_runner import RunnerConfig, tracker_result
+from curie_runner import RunnerConfig, completion_contract
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
-from curie_runner.approval import (
-    APPROVAL_SERVER_NAME,
-    TRACKER_RESULT_TOOL_NAME,
-    is_platform_owned_tool,
-)
-from curie_runner.fake import FakeModelSession
-from curie_runner.harness.claude.approval import build_approval_server
-from curie_runner.harness.claude.preflight_blocked import PreflightBlockedSession
-from curie_runner.harness.claude.tracker_result_tool import build_tracker_result_tool
-from curie_runner.issue_read import CAPABILITY_HEADER, ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
-from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
-from curie_runner.side_effects import PLATFORM_IDEMPOTENT_TOOLS
-from curie_runner.tracker_result import (
+from curie_runner.approval import APPROVAL_SERVER_NAME
+from curie_runner.completion_contract import (
     CONTRACT_ATTEMPTS,
     PUBLICATION_RECOVERY_EXPLANATION,
-    REASON_ALLOWANCE_INVALID,
     REASON_BODY_INVALID,
     REASON_CONTRACT_UNKNOWN,
     REASON_DEADLINE_EXCEEDED,
     REASON_INTERNAL_ERROR,
-    REASON_RESULT_KINDS_INVALID,
     REASON_ROUTE_INVALID,
-    REASON_SESSION_ALREADY_STARTED,
     REASON_STATUS_REFUSED,
     REASON_STATUS_TRANSIENT,
     REASON_TRANSPORT_FAILED,
-    TRACKER_RESULT_DISALLOWED_TOOLS,
     CompletionContract,
     ContractUnavailable,
     fetch_completion_contract,
-    session_limits,
     sibling_urls,
 )
+from curie_runner.fake import FakeModelSession
+from curie_runner.harness.claude.preflight_blocked import PreflightBlockedSession
+from curie_runner.issue_read import CAPABILITY_HEADER, ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
+from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
+from curie_runner.requester_context import ExecutionBinding
 from runner_boot_session import initialized_session
 
 CAPABILITY = "wir.example-capability.signature"
 CONTRACT_PATH = "/work-items/completion-contract"
-RESULT_PATH = "/work-items/tracker-result"
 ISSUE_READ_PATH = "/work-items/issue-read"
 BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
-ALLOWANCE = 4.25
 
-TRACKER = {
-    "completion_contract": "tracker_result",
-    "result_kinds": ["ticket", "findings"],
-    "session_usd_allowance": ALLOWANCE,
+# The negative control of this file: the triage contract the API stopped
+# answering. It is written once, here, and referenced by name below.
+RETIRED_TRIAGE_CONTRACT = "tracker_result"
+
+TENANT = "00000000-0000-4000-8000-000000000001"
+WORK_ITEM = "00000000-0000-4000-8000-000000000002"
+REQUEST = "00000000-0000-4000-8000-000000000003"
+EXECUTION = {
+    "tenant_id": TENANT,
+    "work_item_id": WORK_ITEM,
+    "execution_request_id": REQUEST,
+    "execution_fence": 1,
 }
+# The answer keys the API sends: the contract, the execution binding and the
+# rule proposal offer, and nothing else.
 IMPLEMENTATION = {
     "completion_contract": "implementation",
-    "result_kinds": [],
-    "session_usd_allowance": None,
+    "execution": None,
+    "rule_proposal": False,
 }
 RECOVERY = {
     "completion_contract": "publication_recovery",
-    "result_kinds": [],
-    "session_usd_allowance": None,
     "execution": None,
+    "rule_proposal": False,
 }
+
 
 # The boot env field set before #5586: the runner learns the contract from the
 # API through the existing issue read fields, never a new boot field.
@@ -153,7 +149,7 @@ def _text(result: dict[str, Any]) -> str:
 
 
 class _Api:
-    """A local API answering the contract and result routes, recording each call.
+    """A local API answering the contract route, recording each call.
 
     ``drops`` closes the connection on that many first contract calls (a real
     transport failure). ``contract`` is a list of answers, one per contract
@@ -164,16 +160,13 @@ class _Api:
         self,
         contract: list[tuple[int, Any]] | None = None,
         *,
-        result: tuple[int, Any] | None = None,
         drops: int = 0,
         stall: bool = False,
     ) -> None:
         self.contract = contract or [(200, IMPLEMENTATION)]
-        self.result = result or (200, {})
         self.drops = drops
         self.stall = stall
         self.contract_calls: list[tuple[Any, str | None]] = []
-        self.result_calls: list[tuple[Any, str | None]] = []
 
     def app(self) -> web.Application:
         app = web.Application()
@@ -194,15 +187,7 @@ class _Api:
                 return web.Response(status=status, body=payload)
             return web.json_response(payload, status=status)
 
-        async def result(request: web.Request) -> web.Response:
-            self.result_calls.append((await request.json(), request.headers.get(CAPABILITY_HEADER)))
-            status, payload = self.result
-            if isinstance(payload, bytes):
-                return web.Response(status=status, body=payload)
-            return web.json_response(payload, status=status)
-
         app.router.add_post(CONTRACT_PATH, contract)
-        app.router.add_post(RESULT_PATH, result)
         return app
 
 
@@ -211,7 +196,6 @@ async def _no_delay(_seconds: float) -> None:
 
 
 # --- Boot ----------------------------------------------------------------------
-
 
 class _ModelSession:
     """The real-model session stand in: records every model session started."""
@@ -271,7 +255,7 @@ def _boot(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         boot,
         "bind_completion_contract",
-        functools.partial(tracker_result.bind_completion_contract, delay=_no_delay),
+        functools.partial(completion_contract.bind_completion_contract, delay=_no_delay),
     )
     monkeypatch.delenv(ISSUE_READ_URL_ENV, raising=False)
     monkeypatch.delenv(ISSUE_READ_TOKEN_ENV, raising=False)
@@ -283,13 +267,13 @@ def _config(tmp_path: Path) -> RunnerConfig:
     plugin = tmp_path / "bundle"
     (plugin / ".claude-plugin").mkdir(parents=True, exist_ok=True)
     (plugin / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps({"name": "triage", "version": "0.1.0", "description": "t"}), encoding="utf-8"
+        json.dumps({"name": "contract", "version": "0.1.0", "description": "t"}), encoding="utf-8"
     )
     return RunnerConfig.from_env(
         {
             "CURIE_PLUGIN_DIR": str(plugin),
-            "CURIE_SESSION_ID": "s-triage",
-            "CURIE_SANDBOX_ID": "b-triage",
+            "CURIE_SESSION_ID": "s-contract",
+            "CURIE_SANDBOX_ID": "b-contract",
             "CURIE_BUDGET": BUDGET,
         }
     )
@@ -328,32 +312,20 @@ def _curie_tools(options: Any) -> set[str]:
     return anyio.run(names)
 
 
+
+
 def test_the_boot_env_field_set_is_unchanged() -> None:
     assert frozenset(BootEnv.env_keys()) == BOOT_ENV_KEYS
 
 
-def test_a_tracker_result_contract_mounts_the_tool_denies_subagents_and_caps_spend(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    api = _Api([(200, TRACKER)])
-    session = _boot_session(monkeypatch, tmp_path, api)
-    assert isinstance(session, _ModelSession)
-    assert api.contract_calls == [({}, CAPABILITY)]
-    assert {"submit_tracker_result", "get_issue"} <= _curie_tools(session.options)
-    assert {"Task", "Agent"} <= set(session.options.disallowed_tools)
-    assert session.options.max_budget_usd == ALLOWANCE
-
-
-def test_an_implementation_contract_boots_exactly_as_before(
+def test_an_implementation_contract_boots_a_model_session_with_the_configured_limits(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     api = _Api([(200, IMPLEMENTATION)])
     session = _boot_session(monkeypatch, tmp_path, api)
     assert isinstance(session, _ModelSession)
     assert api.contract_calls == [({}, CAPABILITY)]
-    tools = _curie_tools(session.options)
-    assert "get_issue" in tools
-    assert "submit_tracker_result" not in tools
+    assert "get_issue" in _curie_tools(session.options)
     assert not {"Task", "Agent"} & set(session.options.disallowed_tools)
     assert session.options.max_budget_usd == 1.0
 
@@ -361,11 +333,10 @@ def test_an_implementation_contract_boots_exactly_as_before(
 def test_no_capability_makes_no_contract_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    api = _Api([(200, TRACKER)])
+    api = _Api([(200, IMPLEMENTATION)])
     session = _boot_session(monkeypatch, tmp_path, api, issue_read_path=None)
     assert isinstance(session, _ModelSession)
     assert api.contract_calls == []
-    assert "submit_tracker_result" not in _curie_tools(session.options)
     assert not {"Task", "Agent"} & set(session.options.disallowed_tools)
 
 
@@ -374,7 +345,7 @@ def test_the_fake_model_without_a_capability_stays_offline(
 ) -> None:
     # Only the route without its capability: resolve_issue_read answers None,
     # so the fake makes no contract call at all.
-    api = _Api([(200, TRACKER)])
+    api = _Api([(200, IMPLEMENTATION)])
 
     async def go() -> Any:
         async with TestServer(api.app()) as server:
@@ -388,47 +359,39 @@ def test_the_fake_model_without_a_capability_stays_offline(
     assert not {"Task", "Agent"} & set(session._disallowed_tools)  # noqa: SLF001
 
 
-@pytest.mark.parametrize(("contract", "denied"), [(TRACKER, True), (IMPLEMENTATION, False)])
-def test_the_fake_model_session_denies_subagents_only_for_tracker_result(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contract: dict[str, Any], denied: bool
+def test_the_fake_model_session_keeps_the_configured_tool_catalogue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    api = _Api([(200, contract)])
+    api = _Api([(200, IMPLEMENTATION)])
     session = _boot_session(monkeypatch, tmp_path, api, fake_model=True)
     assert isinstance(session, _FakeSession)
     assert api.contract_calls == [({}, CAPABILITY)]
-    disallowed = set(session._disallowed_tools)  # noqa: SLF001 - the fake's catalogue
-    assert ({"Task", "Agent"} <= disallowed) is denied
-    assert bool({"Task", "Agent"} & disallowed) is denied
+    assert not {"Task", "Agent"} & set(session._disallowed_tools)  # noqa: SLF001 - the fake's catalogue
 
 
 @pytest.mark.parametrize(
     ("api", "path"),
     [
-        pytest.param(_Api([(200, TRACKER)]), "/work-items/issue-reader", id="bad-suffix"),
-        pytest.param(_Api([(200, TRACKER)]), "/issue-read", id="no-work-items"),
-        pytest.param(_Api([(200, TRACKER)], drops=99), ISSUE_READ_PATH, id="transport"),
+        pytest.param(_Api([(200, IMPLEMENTATION)]), "/work-items/issue-reader", id="bad-suffix"),
+        pytest.param(_Api([(200, IMPLEMENTATION)]), "/issue-read", id="no-work-items"),
+        pytest.param(_Api([(200, IMPLEMENTATION)], drops=99), ISSUE_READ_PATH, id="transport"),
         pytest.param(_Api([(500, {"code": "boom"})]), ISSUE_READ_PATH, id="500"),
         pytest.param(_Api([(200, b"not json")]), ISSUE_READ_PATH, id="non-json"),
-        pytest.param(_Api([(200, ["tracker_result"])]), ISSUE_READ_PATH, id="non-object"),
+        pytest.param(_Api([(200, ["implementation"])]), ISSUE_READ_PATH, id="non-object"),
         pytest.param(
-            _Api([(200, {**TRACKER, "completion_contract": "review"})]),
+            _Api([(200, {**IMPLEMENTATION, "completion_contract": "review"})]),
             ISSUE_READ_PATH,
             id="unknown-contract",
         ),
         pytest.param(
-            _Api([(200, {k: v for k, v in TRACKER.items() if k != "session_usd_allowance"})]),
+            _Api([(200, {**IMPLEMENTATION, "completion_contract": RETIRED_TRIAGE_CONTRACT})]),
             ISSUE_READ_PATH,
-            id="missing-allowance",
+            id="retired-triage-contract",
         ),
         pytest.param(
-            _Api([(200, {**TRACKER, "session_usd_allowance": 0})]),
+            _Api([(409, {"detail": {"code": "invalid_context"}})]),
             ISSUE_READ_PATH,
-            id="zero-allowance",
-        ),
-        pytest.param(
-            _Api([(409, {"detail": {"code": "session_already_started"}})]),
-            ISSUE_READ_PATH,
-            id="session-already-started",
+            id="refused-409",
         ),
     ],
 )
@@ -463,6 +426,23 @@ def test_a_blocked_session_answers_offline_without_the_capability(
 
 
 # --- A publication recovery process runs no model (#5429) ------------------------
+
+
+def _runner_against(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api: _Api, scenario: Any
+) -> None:
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            monkeypatch.setenv(ISSUE_READ_URL_ENV, str(server.make_url(ISSUE_READ_PATH)))
+            monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, CAPABILITY)
+            runner = build_runner(_config(tmp_path), mcp_capability=PROBE)
+            try:
+                await runner.start()
+                await scenario(runner)
+            finally:
+                await runner.close()
+
+    anyio.run(go)
 
 
 @pytest.mark.parametrize("fake_model", [False, True])
@@ -501,72 +481,6 @@ def test_reset_and_replacement_construct_no_model_session_for_publication_recove
     assert len(_ModelSession.started) == sessions
 
 
-# --- One model session per tracker result request --------------------------------
-
-
-def _runner_against(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api: _Api, scenario: Any
-) -> None:
-    async def go() -> None:
-        async with TestServer(api.app()) as server:
-            monkeypatch.setenv(ISSUE_READ_URL_ENV, str(server.make_url(ISSUE_READ_PATH)))
-            monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, CAPABILITY)
-            runner = build_runner(_config(tmp_path), mcp_capability=PROBE)
-            try:
-                await runner.start()
-                await scenario(runner)
-            finally:
-                await runner.close()
-
-    anyio.run(go)
-
-
-@pytest.mark.parametrize(("contract", "sessions"), [(TRACKER, 1), (IMPLEMENTATION, 2)])
-def test_reset_starts_no_second_model_session_for_tracker_result(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contract: dict[str, Any], sessions: int
-) -> None:
-    async def scenario(runner: Any) -> None:
-        await runner.reset()
-
-    _runner_against(monkeypatch, tmp_path, _Api([(200, contract)]), scenario)
-    assert len(_ModelSession.started) == sessions
-
-
-@pytest.mark.parametrize(("contract", "sessions"), [(TRACKER, 1), (IMPLEMENTATION, 2)])
-def test_session_replacement_starts_no_second_model_session_for_tracker_result(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contract: dict[str, Any], sessions: int
-) -> None:
-    async def scenario(runner: Any) -> None:
-        await runner._replace_session()  # noqa: SLF001 - the replacement path is the subject
-
-    _runner_against(monkeypatch, tmp_path, _Api([(200, contract)]), scenario)
-    assert len(_ModelSession.started) == sessions
-
-
-def test_a_second_process_for_the_request_starts_no_model_session(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # The API reserves the one session at the first contract call; a restarted
-    # runner process for the same request is refused and starts nothing.
-    api = _Api([(200, TRACKER), (409, {"detail": {"code": "session_already_started"}})])
-
-    async def go() -> tuple[Any, Any]:
-        async with TestServer(api.app()) as server:
-            monkeypatch.setenv(ISSUE_READ_URL_ENV, str(server.make_url(ISSUE_READ_PATH)))
-            monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, CAPABILITY)
-            first = await initialized_session(build_runner(_config(tmp_path), mcp_capability=PROBE))
-            second = await initialized_session(
-                build_runner(_config(tmp_path), mcp_capability=PROBE)
-            )
-            return first, second
-
-    first, second = anyio.run(go)
-    assert isinstance(first, _ModelSession)
-    assert isinstance(second, PreflightBlockedSession)
-    assert len(_ModelSession.started) == 1
-    assert len(api.contract_calls) == 2
-
-
 # --- The contract call ------------------------------------------------------------
 
 
@@ -590,10 +504,15 @@ def _refusal(api: _Api, **kwargs: Any) -> ContractUnavailable:
 
 def test_sibling_urls_replace_only_the_last_segment() -> None:
     urls = sibling_urls("https://api.example:8443/v1/runner/work-items/issue-read")
-    assert urls.completion_contract == (
-        "https://api.example:8443/v1/runner/work-items/completion-contract"
-    )
-    assert urls.tracker_result == "https://api.example:8443/v1/runner/work-items/tracker-result"
+    base = "https://api.example:8443/v1/runner/work-items/"
+    assert urls.completion_contract == base + "completion-contract"
+    assert urls.questions == base + "questions"
+    assert urls.rule_proposal == base + "rule-proposal"
+
+
+def test_the_sibling_routes_are_exactly_the_surviving_set() -> None:
+    urls = sibling_urls("https://api.example/work-items/issue-read")
+    assert set(vars(urls)) == {"completion_contract", "questions", "rule_proposal"}
 
 
 @pytest.mark.parametrize(
@@ -617,18 +536,46 @@ def test_any_other_issue_read_url_is_a_contract_failure(url: str) -> None:
 
 
 def test_the_contract_call_presents_the_capability_with_an_empty_body() -> None:
-    api = _Api([(200, TRACKER)])
+    api = _Api([(200, IMPLEMENTATION)])
     contract = _fetch(api)
     assert api.contract_calls == [({}, CAPABILITY)]
-    assert contract.tracker_result
-    assert contract.result_kinds == ("findings", "ticket")
-    assert contract.session_usd_allowance == ALLOWANCE
+    assert contract.kind == "implementation"
 
 
-def test_an_implementation_answer_is_the_implementation_contract() -> None:
-    contract = _fetch(_Api([(200, IMPLEMENTATION)]))
-    assert not contract.tracker_result
-    assert contract.session_usd_allowance is None
+def test_an_implementation_answer_carries_its_execution_binding_and_rule_proposal() -> None:
+    answer = {**IMPLEMENTATION, "execution": EXECUTION, "rule_proposal": True}
+    contract = _fetch(_Api([(200, answer)]))
+    assert contract.kind == "implementation"
+    assert contract.execution == ExecutionBinding(
+        tenant_id=TENANT,
+        work_item_id=WORK_ITEM,
+        execution_request_id=REQUEST,
+        execution_fence=1,
+    )
+    assert contract.rule_proposal is True
+    assert not contract.publication_recovery
+
+
+def test_an_implementation_answer_without_either_is_the_bare_implementation_contract() -> None:
+    contract = _fetch(_Api([(200, {"completion_contract": "implementation"})]))
+    assert contract == completion_contract.IMPLEMENTATION
+    assert contract.execution is None
+    assert contract.rule_proposal is False
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        "not-an-object",
+        {**EXECUTION, "tenant_id": "not-a-uuid"},
+        {**EXECUTION, "execution_fence": 0},
+        {**EXECUTION, "execution_fence": True},
+        {key: value for key, value in EXECUTION.items() if key != "work_item_id"},
+    ],
+)
+def test_a_malformed_execution_binding_is_refused(execution: Any) -> None:
+    answer = {**IMPLEMENTATION, "execution": execution}
+    assert _refusal(_Api([(200, answer)]), delay=_no_delay).reason == REASON_BODY_INVALID
 
 
 def test_transport_failures_retry_with_the_injected_delay_then_succeed() -> None:
@@ -637,8 +584,8 @@ def test_transport_failures_retry_with_the_injected_delay_then_succeed() -> None
     async def delay(seconds: float) -> None:
         waits.append(seconds)
 
-    api = _Api([(200, TRACKER)], drops=CONTRACT_ATTEMPTS - 1)
-    assert _fetch(api, delay=delay).tracker_result
+    api = _Api([(200, IMPLEMENTATION)], drops=CONTRACT_ATTEMPTS - 1)
+    assert _fetch(api, delay=delay).kind == "implementation"
     assert len(api.contract_calls) == CONTRACT_ATTEMPTS
     assert len(waits) == CONTRACT_ATTEMPTS - 1
 
@@ -649,7 +596,7 @@ def test_transport_failure_after_the_bounded_attempts_is_refused() -> None:
     async def delay(seconds: float) -> None:
         waits.append(seconds)
 
-    api = _Api([(200, TRACKER)], drops=99)
+    api = _Api([(200, IMPLEMENTATION)], drops=99)
     assert _refusal(api, delay=delay).reason == REASON_TRANSPORT_FAILED
     assert len(api.contract_calls) == CONTRACT_ATTEMPTS
     assert len(waits) == CONTRACT_ATTEMPTS - 1
@@ -662,22 +609,13 @@ def test_transport_failure_after_the_bounded_attempts_is_refused() -> None:
         ((404, {"detail": "Not Found"}), REASON_STATUS_REFUSED),
         ((302, {}), REASON_STATUS_REFUSED),
         ((409, {"detail": {"code": "invalid_context"}}), REASON_STATUS_REFUSED),
-        ((409, {"code": "session_already_started"}), REASON_SESSION_ALREADY_STARTED),
-        ((409, {"detail": {"code": "session_already_started"}}), REASON_SESSION_ALREADY_STARTED),
+        ((409, {"code": "invalid_context"}), REASON_STATUS_REFUSED),
+        ((409, {}), REASON_STATUS_REFUSED),
         ((200, b"{not json"), REASON_BODY_INVALID),
         ((200, b"x" * 70_000), REASON_BODY_INVALID),
         ((200, ["implementation"]), REASON_BODY_INVALID),
         ((200, {"completion_contract": "review"}), REASON_CONTRACT_UNKNOWN),
         ((200, {}), REASON_CONTRACT_UNKNOWN),
-        ((200, {**TRACKER, "result_kinds": []}), REASON_RESULT_KINDS_INVALID),
-        ((200, {**TRACKER, "result_kinds": ["pull_request"]}), REASON_RESULT_KINDS_INVALID),
-        ((200, {**TRACKER, "result_kinds": ["ticket", "ticket"]}), REASON_RESULT_KINDS_INVALID),
-        ((200, {**TRACKER, "result_kinds": "ticket"}), REASON_RESULT_KINDS_INVALID),
-        ((200, {**TRACKER, "session_usd_allowance": None}), REASON_ALLOWANCE_INVALID),
-        ((200, {**TRACKER, "session_usd_allowance": -1}), REASON_ALLOWANCE_INVALID),
-        ((200, {**TRACKER, "session_usd_allowance": 0.0}), REASON_ALLOWANCE_INVALID),
-        ((200, {**TRACKER, "session_usd_allowance": "5"}), REASON_ALLOWANCE_INVALID),
-        ((200, {**TRACKER, "session_usd_allowance": True}), REASON_ALLOWANCE_INVALID),
     ],
 )
 def test_every_unusable_answer_is_refused_and_never_retried(
@@ -688,47 +626,52 @@ def test_every_unusable_answer_is_refused_and_never_retried(
     assert len(api.contract_calls) == 1
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param({}, id="bare"),
+        pytest.param({"execution": EXECUTION}, id="with-an-execution-binding"),
+        # The execution binding is malformed: the contract is still unknown,
+        # never a body error, so no later parse step can map the value away.
+        pytest.param({"execution": "not-an-object"}, id="with-a-malformed-binding"),
+        pytest.param({"rule_proposal": True}, id="offering-a-rule-proposal"),
+    ],
+)
+def test_the_retired_triage_contract_is_unknown(extra: dict[str, Any]) -> None:
+    answer = {"completion_contract": RETIRED_TRIAGE_CONTRACT, **extra}
+    api = _Api([(200, answer)])
+    assert _refusal(api, delay=_no_delay).reason == REASON_CONTRACT_UNKNOWN
+    assert len(api.contract_calls) == 1
+
+
+def test_the_retired_triage_contract_starts_no_model_session_and_is_never_an_implementation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A runner booted against the former answer, with everything an
+    # implementation answer carries, still starts no model and mounts nothing.
+    answer = {**IMPLEMENTATION, "completion_contract": RETIRED_TRIAGE_CONTRACT}
+    session = _boot_session(monkeypatch, tmp_path, _Api([(200, answer)]))
+    assert isinstance(session, PreflightBlockedSession)
+    assert _ModelSession.started == []
+    assert _FakeSession.started == []
+
+
 def test_a_publication_recovery_answer_is_the_recovery_contract() -> None:
     contract = _fetch(_Api([(200, RECOVERY)]))
     assert contract.publication_recovery
-    assert not contract.tracker_result
     assert contract.execution is None
-    assert contract.result_kinds == ()
-    assert contract.session_usd_allowance is None
     # The bare kind, with nothing else, is the same contract.
     assert _fetch(_Api([(200, {"completion_contract": "publication_recovery"})])) == contract
 
 
-@pytest.mark.parametrize(
-    ("answer", "reason"),
-    [
-        (
-            {
-                **RECOVERY,
-                "execution": {
-                    "tenant_id": "00000000-0000-4000-8000-000000000001",
-                    "work_item_id": "00000000-0000-4000-8000-000000000002",
-                    "execution_request_id": "00000000-0000-4000-8000-000000000003",
-                    "execution_fence": 1,
-                },
-            },
-            REASON_BODY_INVALID,
-        ),
-        ({**RECOVERY, "session_usd_allowance": 1.0}, REASON_BODY_INVALID),
-        ({**RECOVERY, "result_kinds": ["findings"]}, REASON_RESULT_KINDS_INVALID),
-        ({**RECOVERY, "result_kinds": "findings"}, REASON_RESULT_KINDS_INVALID),
-    ],
-)
-def test_a_publication_recovery_answer_carrying_anything_else_is_refused(
-    answer: dict[str, Any], reason: str
-) -> None:
-    assert _refusal(_Api([(200, answer)]), delay=_no_delay).reason == reason
+def test_a_publication_recovery_answer_carrying_an_execution_binding_is_refused() -> None:
+    answer = {**RECOVERY, "execution": EXECUTION}
+    assert _refusal(_Api([(200, answer)]), delay=_no_delay).reason == REASON_BODY_INVALID
 
 
 # --- The rule proposal offer (ADR 0287, #5796) -----------------------------------
 
 
-@pytest.mark.parametrize("answer", [IMPLEMENTATION, TRACKER], ids=["implementation", "tracker"])
 @pytest.mark.parametrize(
     ("offer", "offered"),
     [
@@ -742,13 +685,14 @@ def test_a_publication_recovery_answer_carrying_anything_else_is_refused(
     ],
 )
 def test_only_json_true_offers_a_rule_proposal_and_nothing_else_blocks_the_run(
-    answer: dict[str, Any], offer: dict[str, Any], offered: bool
+    offer: dict[str, Any], offered: bool
 ) -> None:
     # Absent reads false, so a runner newer than its API mounts nothing; a
     # malformed value reads false too and never fails the contract.
+    answer = {key: value for key, value in IMPLEMENTATION.items() if key != "rule_proposal"}
     contract = _fetch(_Api([(200, {**answer, **offer})]))
     assert contract.rule_proposal is offered
-    assert contract.kind == answer["completion_contract"]
+    assert contract.kind == "implementation"
 
 
 def test_a_publication_recovery_answer_with_rule_proposal_false_parses() -> None:
@@ -762,11 +706,6 @@ def test_a_publication_recovery_answer_offering_a_rule_proposal_is_refused(value
     assert _refusal(_Api([(200, answer)]), delay=_no_delay).reason == REASON_BODY_INVALID
 
 
-def test_the_rule_proposal_route_sits_beside_the_issue_read_route() -> None:
-    urls = sibling_urls("https://api.example:8443/v1/runner/work-items/issue-read")
-    assert urls.rule_proposal == "https://api.example:8443/v1/runner/work-items/rule-proposal"
-
-
 def test_a_transient_status_then_success_returns_the_contract() -> None:
     waits: list[float] = []
 
@@ -775,7 +714,7 @@ def test_a_transient_status_then_success_returns_the_contract() -> None:
 
     api = _Api([(500, {"code": "boom"}), (200, IMPLEMENTATION)])
     contract = _fetch(api, delay=delay)
-    assert not contract.tracker_result
+    assert contract.kind == "implementation"
     assert len(api.contract_calls) == 2
     assert len(waits) == 1
 
@@ -793,225 +732,18 @@ def test_a_forbidden_answer_is_final_after_one_call() -> None:
     assert len(api.contract_calls) == 1
 
 
-def test_session_already_started_is_final_after_one_call() -> None:
-    api = _Api([(409, {"detail": {"code": "session_already_started"}}), (200, IMPLEMENTATION)])
-    assert _refusal(api, delay=_no_delay).reason == REASON_SESSION_ALREADY_STARTED
-    assert len(api.contract_calls) == 1
-
-
 def test_the_deadline_fires_when_the_server_stalls() -> None:
-    api = _Api([(200, TRACKER)], stall=True)
+    api = _Api([(200, IMPLEMENTATION)], stall=True)
     assert _refusal(api, delay=_no_delay, deadline_s=0.2).reason == REASON_DEADLINE_EXCEEDED
 
 
 def test_the_internal_deadline_is_refused() -> None:
-    assert _refusal(_Api([(200, TRACKER)]), deadline_s=0).reason == REASON_DEADLINE_EXCEEDED
+    assert _refusal(_Api([(200, IMPLEMENTATION)]), deadline_s=0).reason == REASON_DEADLINE_EXCEEDED
 
 
 def test_the_gate_denies_on_its_own_exception() -> None:
     async def broken(_seconds: float) -> None:
         raise RuntimeError("delay broke")
 
-    api = _Api([(200, TRACKER)], drops=1)
+    api = _Api([(200, IMPLEMENTATION)], drops=1)
     assert _refusal(api, delay=broken).reason == REASON_INTERNAL_ERROR
-
-
-def test_session_limits_change_only_a_tracker_result_session() -> None:
-    configured = ("Write",)
-    implementation = session_limits(
-        CompletionContract("implementation"), disallowed_tools=configured, max_budget_usd=2.0
-    )
-    assert implementation.disallowed_tools == configured
-    assert implementation.max_budget_usd == 2.0
-    tracker = session_limits(
-        CompletionContract("tracker_result", ("findings",), 0.5),
-        disallowed_tools=(*configured, "Task"),
-        max_budget_usd=2.0,
-    )
-    assert tracker.disallowed_tools == ("Write", "Task", "Agent")
-    assert set(TRACKER_RESULT_DISALLOWED_TOOLS) <= set(tracker.disallowed_tools)
-    assert tracker.max_budget_usd == 0.5
-
-
-# --- The submission tool ------------------------------------------------------------
-
-TICKET = {
-    "kind": "ticket",
-    "title": "Crash on empty config",
-    "body": "The service crashes when the config file is empty.",
-    "reproduction": {
-        "command": "make repro",
-        "observed": "KeyError: 'name'",
-        "revision": "a" * 40,
-    },
-}
-FINDINGS = {
-    "kind": "findings",
-    "reason": "not_reproduced",
-    "tried": "Ran the reported command at the reported revision.",
-    "missing": "A config that triggers the crash.",
-}
-
-
-def _submit(api: _Api, args: dict[str, Any]) -> dict[str, Any]:
-    async def go() -> dict[str, Any]:
-        async with TestServer(api.app()) as server:
-            tool = build_tracker_result_tool(str(server.make_url(RESULT_PATH)), CAPABILITY)
-            return await tool.handler(args)
-
-    return anyio.run(go)
-
-
-def test_the_curie_server_carries_the_tool_only_when_given() -> None:
-    async def names(server: Any) -> set[str]:
-        entry = server["instance"].get_request_handler("tools/list")
-        assert entry is not None
-        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
-        return {tool["name"] for tool in result.model_dump()["tools"]}
-
-    tool = build_tracker_result_tool("http://api/work-items/tracker-result", CAPABILITY)
-    assert TRACKER_RESULT_TOOL_NAME == "mcp__curie__submit_tracker_result"
-    with_tool = anyio.run(names, build_approval_server(tracker_result_tool=tool))
-    without = anyio.run(names, build_approval_server())
-    assert with_tool == without | {"submit_tracker_result"}
-
-
-def test_the_tool_is_platform_owned_and_never_idempotent() -> None:
-    assert is_platform_owned_tool(TRACKER_RESULT_TOOL_NAME, state_server_mounted=False)
-    assert TRACKER_RESULT_TOOL_NAME not in PLATFORM_IDEMPOTENT_TOOLS
-
-
-@pytest.mark.parametrize("proposal", [TICKET, FINDINGS])
-def test_a_submission_posts_the_proposal_with_the_capability(proposal: dict[str, Any]) -> None:
-    api = _Api(
-        result=(
-            200,
-            {
-                "result_kind": proposal["kind"],
-                "state": "delivered",
-                "result_comment_url": "https://tracker.example/issues/7#comment-1",
-                "ticket_url": (
-                    "https://tracker.example/issues/8" if proposal["kind"] == "ticket" else None
-                ),
-            },
-        )
-    )
-    result = _submit(api, proposal)
-    assert result.get("is_error") is not True, _text(result)
-    assert api.result_calls == [({"proposal": proposal}, CAPABILITY)]
-    text = _text(result)
-    assert proposal["kind"] in text
-    assert "https://tracker.example/issues/7#comment-1" in text
-    assert ("https://tracker.example/issues/8" in text) is (proposal["kind"] == "ticket")
-    assert CAPABILITY not in text
-
-
-def test_an_owed_delivery_is_accepted() -> None:
-    api = _Api(
-        result=(
-            200,
-            {
-                "result_kind": "findings",
-                "state": "owed",
-                "result_comment_url": None,
-                "ticket_url": None,
-            },
-        )
-    )
-    result = _submit(api, FINDINGS)
-    assert result.get("is_error") is not True
-    assert "findings" in _text(result)
-
-
-def test_a_failed_delivery_is_a_tool_error() -> None:
-    api = _Api(
-        result=(
-            200,
-            {
-                "result_kind": "ticket",
-                "state": "failed",
-                "result_comment_url": None,
-                "ticket_url": None,
-            },
-        )
-    )
-    assert _submit(api, TICKET).get("is_error") is True
-
-
-def test_link_values_that_are_not_plain_web_urls_are_dropped() -> None:
-    api = _Api(
-        result=(
-            200,
-            {
-                "result_kind": "ticket",
-                "state": "delivered",
-                "result_comment_url": "javascript:alert(1)",
-                "ticket_url": "https://user:secret@tracker.example/issues/8",
-            },
-        )
-    )
-    text = _text(_submit(api, TICKET))
-    assert "javascript" not in text
-    assert "secret" not in text
-
-
-@pytest.mark.parametrize(
-    "code", ["result_already_submitted", "source_fingerprint_changed", "not_tracker_result"]
-)
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_a_409_refusal_renders_its_code(code: str, wrapped: bool) -> None:
-    body = {"code": code, "message": "refused"}
-    api = _Api(result=(409, {"detail": body} if wrapped else body))
-    result = _submit(api, TICKET)
-    assert result.get("is_error") is True
-    assert code in _text(result)
-    assert "refused" in _text(result)
-
-
-def test_a_409_code_that_is_not_a_plain_code_is_not_echoed() -> None:
-    api = _Api(result=(409, {"code": f"echo {CAPABILITY}"}))
-    result = _submit(api, TICKET)
-    assert result.get("is_error") is True
-    assert CAPABILITY not in _text(result)
-
-
-def test_a_422_renders_field_and_code_pairs_only() -> None:
-    api = _Api(
-        result=(
-            422,
-            {
-                "detail": {
-                    "code": "proposal_invalid",
-                    "issues": [
-                        {"field": "reproduction.revision", "code": "revision"},
-                        {"field": "", "code": "unknown_field"},
-                        {"field": "title", "code": "length", "message": "LEAKED TEXT"},
-                        {"field": "body; DROP", "code": "type"},
-                    ],
-                }
-            },
-        )
-    )
-    result = _submit(api, TICKET)
-    text = _text(result)
-    assert result.get("is_error") is True
-    assert "reproduction.revision: revision" in text
-    assert "unknown_field" in text
-    assert "title: length" in text
-    assert "LEAKED TEXT" not in text
-    assert "DROP" not in text
-
-
-def test_a_503_and_a_transport_failure_ask_for_a_retry_without_diagnostics() -> None:
-    result = _submit(_Api(result=(503, {"code": "tracker_unavailable"})), TICKET)
-    assert result.get("is_error") is True
-    tool = build_tracker_result_tool("http://127.0.0.1:9" + RESULT_PATH, CAPABILITY)
-    unreachable = anyio.run(tool.handler, TICKET)
-    assert unreachable.get("is_error") is True
-    assert "127.0.0.1" not in _text(unreachable)
-    assert CAPABILITY not in _text(unreachable)
-
-
-def test_an_unreadable_answer_is_a_tool_error() -> None:
-    assert _submit(_Api(result=(200, b"<html>")), TICKET).get("is_error") is True
-    assert _submit(_Api(result=(200, {"state": "elsewhere"})), TICKET).get("is_error") is True
