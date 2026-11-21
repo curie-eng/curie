@@ -306,6 +306,11 @@ async def _attempt_turn(
     )
     aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(attachment_turn)
     attachment_intent = not lazy and self._attachments is not None and bool(qevent.attachments)
+    attachment_handed_off = False
+
+    def record_attachment_handoff() -> None:
+        nonlocal attachment_handed_off
+        attachment_handed_off = True
 
     # Critical section: decide steer-vs-new-turn and, if new, open the turn so
     # it is active before we release the Valkey lock (rule 1: no two live
@@ -421,6 +426,7 @@ async def _attempt_turn(
                     boot_env,
                     agent_id,
                     packs,
+                    record_handoff=record_attachment_handoff,
                     workspace_deployment_id=workspace_deployment_id,
                     agent_name=agent_name,
                     runner_resources=runner_resources,
@@ -762,9 +768,8 @@ async def _attempt_turn(
         return failures.TurnOutcome(
             terminal_ok=False,
             classification="runner-error",
-            runner_unreachable=isinstance(
-                exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError)
-            ),
+            runner_unreachable=not attachment_handed_off
+            and isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError)),
         )
     assert routed is not None
     record_reclaimed_retry()

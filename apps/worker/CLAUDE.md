@@ -41,7 +41,9 @@ stop -- that is scope creep on the sacred module.
    `max_attempts` but are counted in the escalation text; each sleep is capped
    at 5 s and the wait runs between attempts, outside the thread lock (#4733).
    Cron deliveries and deliveries with a persisted side-effect flag get no
-   window. `workspace-error` (#2004) is a workspace
+   window. An attempt that performed an eager attachment handoff skips the
+   window and consumes the regular attempt budget.
+   `workspace-error` (#2004) is a workspace
    preparation FAULT before the turn was accepted; it must log a WARNING naming
    the agent, deployment, repository and stage, because a silent one acks the
    turn and creates no sandbox with nothing in the log to find it by. A
