@@ -649,6 +649,11 @@ class ApprovalGate:
     # ``SessionRunner`` knows the runner itself requested that stop. It is
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
+    # Set by ``halt_for_questions`` once ``ask_questions`` has posted this
+    # turn's round (ADR 0286 decisions 2 and 11, #5785). From then on every
+    # tool call of the turn is refused with the same turn-stopping flags a
+    # blocked call carries. Runner-internal, per turn, never serialized.
+    questions_posted: bool = False
     # The metric observer must attribute a hold to the exact SDK call. A tool
     # name is insufficient when a granted call and a held sibling share it.
     held_call_ids: set[str] = field(default_factory=set)
@@ -740,6 +745,7 @@ class ApprovalGate:
         # than with the boot-turn grant below: a halt that leaked forward would
         # make every later errored turn finalize as awaiting-approval (#1852).
         self.pending_halt = False
+        self.questions_posted = False
         self.held_call_ids.clear()
         self.refused_call_ids.clear()
         # Boot-turn-only grant: keep it on the first reset (the boot turn),
@@ -823,6 +829,20 @@ class ApprovalGate:
         self.grant_tool = None
         self.grant_arguments = None
         return True
+
+    def halt_for_questions(self) -> None:
+        """End this turn because its questions are posted (ADR 0286, #5785).
+
+        The request ends when the factory asks (decision 2) and the platform,
+        not the model, enforces it (decision 11). This reuses the approval
+        hook: its PostToolUse callback ends the turn right after the ask, and
+        ``_decide_gate`` refuses with the turn-stopping flags a blocked call
+        carries any call sent beside it, so the model runs nothing after its
+        ask. No approval is recorded, so ``pending_halt`` stays unset: the
+        turn is not paused for a human.
+        """
+
+        self.questions_posted = True
 
     def observe_tool_result(self, tool_name: str, response: Any) -> int:
         """Remember the approval tickets a hosted connector tool returned (ADR 0288).
@@ -1176,6 +1196,12 @@ def _canonical_arguments(arguments: dict[str, Any]) -> str:
     return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+_QUESTIONS_POSTED_REFUSAL = (
+    "The questions are posted on the ticket, so this session has ended. This "
+    "call was not run. Make no further changes."
+)
+
+
 def _grant_mismatch_refusal(tool_name: str) -> str:
     return (
         f"The approval for {action_label(tool_name)} covers only the approved details, "
@@ -1201,6 +1227,12 @@ async def _decide_gate(
     flag) -- this function decides, it does not render.
     """
 
+    if gate.questions_posted:
+        # ADR 0286 decision 11: nothing runs after the questions are posted,
+        # and the refusal stops the turn (``continue_turn`` stays False).
+        if tool_use_id is not None:
+            gate.refused_call_ids.add(tool_use_id)
+        return _GateDecision(blocked=False, ungated=False, refusal=_QUESTIONS_POSTED_REFUSAL)
     if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
         refusal = await gate.check_publication(tool_use_id, tool_input)
         if refusal is not None:

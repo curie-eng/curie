@@ -1121,6 +1121,20 @@ def build_runner(
     # The GitHub factory issue read (ADR 0187) is present only for an execution
     # with a WorkItem whose worker injected the route and capability.
     issue_read = resolve_issue_read(os.environ)
+    # ADR 0286 decision 11 (#5785): a factory execution may mount
+    # ``ask_questions``, and a posted round ends its turn through the approval
+    # hooks. A factory boot with no policy gate (no workspace, approval tools or
+    # tool policy) still needs those hooks, so it gets a gate that gates
+    # nothing and only carries the halt. It is never the session's approval
+    # gate: permissions and the pager are unchanged. The session reads it as
+    # its question gate and resets it at each turn start.
+    question_halt_gate = (
+        approval_gate
+        if approval_gate is not None
+        else ApprovalGate()
+        if issue_read is not None
+        else None
+    )
     # The accepted standing rules of a run with no work item (#5801). A factory
     # run (``wir`` or the work-item progress URL, which survives a failed
     # issue-read mint) never uses them: its rules and its ``propose_rule`` come
@@ -1353,7 +1367,11 @@ def build_runner(
         session_hooks = front_pre_tool_use_hooks(
             _merge_pre_tool_use_hooks(
                 build_gated_pre_tool_use_hooks(
-                    build_approval_hook(approval_gate) if approval_gate is not None else None,
+                    (
+                        build_approval_hook(question_halt_gate)
+                        if question_halt_gate is not None
+                        else None
+                    ),
                     connector_availability,
                 ),
                 bundle_hooks,
@@ -1617,7 +1635,15 @@ def build_runner(
             reason: str | None = None
             try:
                 bound_contract = await bind_completion_contract(
-                    issue_read, fake_model=fake_model
+                    issue_read,
+                    fake_model=fake_model,
+                    # ADR 0286 decision 11: a posted round ends the turn
+                    # through the approval halt.
+                    on_questions_posted=(
+                        question_halt_gate.halt_for_questions
+                        if question_halt_gate is not None
+                        else None
+                    ),
                 )
             except ContractUnavailable as exc:
                 reason = exc.reason
@@ -1764,6 +1790,7 @@ def build_runner(
             memory_store=memory_store,
             history_store=history_store,
             approval_gate=approval_gate,
+            question_gate=question_halt_gate,
             approval_resumed_kind=config.approval_resumed_kind,
             approval_decision=config.approval_decision,
             false_completion_check=config.false_completion_check,

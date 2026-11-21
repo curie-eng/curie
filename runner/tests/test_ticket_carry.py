@@ -722,8 +722,15 @@ def test_json_scalars_do_not_stop_the_carry() -> None:
     assert _held_arguments(gate, {**_ARGS, "approval_ticket": _damaged(ticket)}) == restored
 
 
+def _post_tool_use_names(hooks: dict[str, Any]) -> list[str]:
+    """The PostToolUse callbacks by name. The question stop (#5785) is always there."""
+
+    return [hook.__name__ for matcher in hooks.get("PostToolUse", []) for hook in matcher.hooks]
+
+
 def test_no_observer_is_registered_without_a_hosted_connector() -> None:
-    assert set(build_approval_hook(_gate(proxied=frozenset()))) == {"PreToolUse"}
+    hooks = build_approval_hook(_gate(proxied=frozenset()))
+    assert _post_tool_use_names(hooks) == ["questions_stop"]
 
 
 @pytest.mark.parametrize(("caller_token", "observed"), [("cct.a.b", True), (None, False)])
@@ -758,7 +765,7 @@ def test_the_boot_registers_the_observer_only_for_proxied_connectors(
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config, fake_model=False)
     options = initialized_session_sync(runner).options
-    assert ("PostToolUse" in options.hooks) is observed
+    assert ("ticket_observer" in _post_tool_use_names(options.hooks)) is observed
     if observed:
         gate = runner._approval_gate
         assert gate is not None

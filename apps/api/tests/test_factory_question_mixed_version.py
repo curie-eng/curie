@@ -67,10 +67,12 @@ from test_factory_question_ending import (
     _request,
     _requests,
     _round_row,
+    _running,
     _state_labels,
     _status_body,
     _take_over,
     _versions,
+    _view,
 )
 from test_factory_terminus import _reconcile
 from test_factory_tracker_answer_intake import (
@@ -1018,6 +1020,42 @@ def test_a_plain_answer_after_an_older_finish_is_the_one_continuation(
     assert _request(answer)["status"] == "running"
 
 
+def test_the_request_view_beside_an_older_replica_reports_only_a_posted_round(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker reads ``questions_posted`` on the request view to decide
+    whether an unpublished turn is re-prompted (#5785), and during a roll it can
+    read the view from either replica. A new replica reports the round a new
+    replica posted, whatever an older replica did to the request since: the
+    read takes no lock and writes nothing, so the round stays outstanding and
+    the asker still ends with the question after the roll. An older replica's
+    view has no such field, which the worker reads as unconfirmed (proved in
+    its handoff test). A request whose ask posted nothing, as on an older
+    replica that answers the questions route 404, reads unposted."""
+
+    number = 1301
+    _client, _github, sink = admitted
+    job = _asked(admitted, monkeypatch, number)
+    assert (_view(job)["status"], _view(job)["questions_posted"]) == ("running", True)
+
+    with _older_replica():
+        tr._finish(job, "failed", "no_pull_request")
+        _reconcile()
+        # A new replica serves the view while the older one settled the asker.
+        mid = _view(job)
+    assert (mid["status"], mid["questions_posted"]) == ("failed", True)
+    assert _round_row(job.work_item_id)["state"] == "outstanding"  # type: ignore[index]
+
+    _after_the_roll()
+    _shows_the_question(sink, job, number)
+    after = _view(job)
+    assert (after["status"], after["questions_posted"]) == ("completed", True)
+
+    unasked = _running(admitted, monkeypatch, number + 1)
+    assert _round_row(unasked.work_item_id) is None
+    assert (_view(unasked)["status"], _view(unasked)["questions_posted"]) == ("running", False)
+
+
 # Guard: every reader and writer of the round state is covered above --------------------
 
 _API_SRC = Path(__file__).resolve().parents[1] / "src" / "curie_api"
@@ -1105,6 +1143,11 @@ _EXPECTED_USES = {
         "input_valid",
         "post_and_record",
     },
+    # The internal request view reports whether this request's round is
+    # posted (#5785). It reads the row state only and writes nothing; proved
+    # beside an older finish in
+    # test_the_request_view_beside_an_older_replica_reports_only_a_posted_round.
+    "curie_api/routers/work_items.py": {"round_posted"},
     # An answer's follow-up refused a start on a merged or closed pull request
     # ends at that refusal (#5786). It only reads the answer receipt and writes
     # no round state; an older replica keeps deferring the same request to its

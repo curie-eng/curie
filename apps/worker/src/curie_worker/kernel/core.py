@@ -385,6 +385,7 @@ class Kernel:
     _require_channel_read = channel_read._require_channel_read
     _bind_publication_context = publication._bind_publication_context
     _request_not_running = publication._request_not_running
+    _continuation_refused = publication._continuation_refused
     _continue_unpublished = publication._continue_unpublished
     _recover_publication = publication_recovery._recover_publication
     _target_for = routing._kernel_target_for

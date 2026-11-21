@@ -571,6 +571,27 @@ async def question_ending(
     return None
 
 
+async def round_posted(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
+) -> bool:
+    """Whether ``request_id``'s question round is posted, read without a lock.
+
+    The same rule as ``question_ending`` returning ``questions_asked``, for a
+    reader that holds no WorkItem lock and must not wait on an ask that is
+    writing to the tracker (the internal request view, #5785).
+    """
+
+    row = (
+        await session.execute(
+            select(FactoryQuestionRound.state).where(
+                FactoryQuestionRound.work_item_id == work_item_id,
+                FactoryQuestionRound.asking_request_id == request_id,
+            )
+        )
+    ).first()
+    return row is not None and row.state in (OUTSTANDING, ANSWERED)
+
+
 async def rounds_exhausted_for(
     session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
 ) -> bool:

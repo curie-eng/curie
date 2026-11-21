@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -159,11 +160,17 @@ def bound(monkeypatch: pytest.MonkeyPatch) -> list[BoundContract]:
     recorded: list[BoundContract] = []
 
     async def recording(
-        issue_read: tuple[str, str] | None, *, fake_model: bool = False
+        issue_read: tuple[str, str] | None,
+        *,
+        fake_model: bool = False,
+        on_questions_posted: Callable[[], None] | None = None,
     ) -> BoundContract:
         # The contract call's retry waits are injected, never slept.
         result = await completion_contract.bind_completion_contract(
-            issue_read, fake_model=fake_model, delay=_no_delay
+            issue_read,
+            fake_model=fake_model,
+            delay=_no_delay,
+            on_questions_posted=on_questions_posted,
         )
         recorded.append(result)
         return result
