@@ -69,10 +69,13 @@ marked and described:
 4. `may_start` decides whether that actor may start a run. A native tracker
    checks write access to its own repository. A tracker-only kind checks the
    binding's allowlist or group.
-5. `read_ticket` returns the ticket as markdown for the sandbox. Nothing is
-   stored. The Jira and GitLab trackers cap the comments they read and keep
-   the newest ones, rendered oldest first after a line saying earlier comments
-   were not read, so a recent answer to the factory's questions is read.
+5. `read_ticket` returns the title and description, chronological discussion,
+   and comment provenance for the execution's issue read. The adapters cap
+   long threads and note when they omit earlier comments. `read_answer_comment`
+   reads the current unedited comment and its immutable author on this issue
+   at admission. The API can prove an answer for a specific execution by
+   matching its receipt to the tracker content. Only the fingerprint and
+   identifiers are stored.
 6. `ticket_labels` returns the issue's current labels and component names,
    which admission reads for repository routing and label conflicts. Sandbox
    acquisition and base reconciliation read them again for the current `base:`

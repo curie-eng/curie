@@ -129,6 +129,7 @@ def graph_payload() -> dict[str, Any]:
         ("0185", False),
         ("0186", False),
         ("0188", True),
+        ("0189", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -183,7 +184,7 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     """
     window = shared().load_metadata().window
     assert window.schema_min == "0188"
-    assert window.schema_head == "0188"
+    assert window.schema_head == "0189"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

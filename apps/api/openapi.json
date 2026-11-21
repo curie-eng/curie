@@ -1070,6 +1070,30 @@
         "title": "AdmissionOut",
         "type": "object"
       },
+      "AdmittedIssueAnswer": {
+        "description": "A tracker comment whose content matches this execution's answer receipt.",
+        "properties": {
+          "author_id": {
+            "title": "Author Id",
+            "type": "string"
+          },
+          "comment_id": {
+            "title": "Comment Id",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "comment_id",
+          "author_id",
+          "text"
+        ],
+        "title": "AdmittedIssueAnswer",
+        "type": "object"
+      },
       "AgentAccessPolicyOut": {
         "description": "An agent's policy; version 0 and no ``updated_at`` mean none was set.",
         "properties": {
@@ -11744,8 +11768,19 @@
         "type": "object"
       },
       "IssueReadResult": {
-        "description": "The ticket as its tracker renders it in markdown (title, description and\ncomments), its link, and the execution deadline and total allowed seconds.\n\nThe platform parses and stores none of the ticket content.",
+        "description": "The ticket, thread context and verified answers for this execution.\n\nThe platform stores receipts and fingerprints. Ticket text stays on the tracker.",
         "properties": {
+          "admitted_answers": {
+            "items": {
+              "$ref": "#/components/schemas/AdmittedIssueAnswer"
+            },
+            "title": "Admitted Answers",
+            "type": "array"
+          },
+          "answer_attempt": {
+            "title": "Answer Attempt",
+            "type": "boolean"
+          },
           "execution_deadline": {
             "format": "date-time",
             "title": "Execution Deadline",
@@ -11755,8 +11790,16 @@
             "title": "Execution Seconds",
             "type": "integer"
           },
+          "has_question_history": {
+            "title": "Has Question History",
+            "type": "boolean"
+          },
           "issue": {
             "title": "Issue",
+            "type": "string"
+          },
+          "thread_context": {
+            "title": "Thread Context",
             "type": "string"
           },
           "ticket": {
@@ -11772,6 +11815,10 @@
           "issue",
           "url",
           "ticket",
+          "thread_context",
+          "answer_attempt",
+          "admitted_answers",
+          "has_question_history",
           "execution_deadline",
           "execution_seconds"
         ],

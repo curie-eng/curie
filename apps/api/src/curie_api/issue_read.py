@@ -6,8 +6,8 @@ tracker's `Tracker.read_ticket`, for every tracker kind: a GitHub issue with
 an App installation token minted fresh on every read, only for the
 installation the WorkItem recorded, so a run longer than the token's one hour
 lifetime keeps reading; a Jira issue with the tracker's own credential.
-Nothing is parsed, modelled or stored: the ticket is returned as the
-tracker's markdown.
+The tracker returns the issue description and discussion as Markdown, along
+with the comment fingerprints used to prove which replies this run can rely on.
 """
 
 from __future__ import annotations
@@ -25,9 +25,10 @@ from .config import Settings
 from .forges.errors import ForgeError
 from .forges.registry import forges_registry
 from .forges.trackers import tracker_for_work_item
-from .forges.types import GITHUB, RepositoryRef, TrackerIssueRef
+from .forges.types import GITHUB, RepositoryRef, TicketRead, TrackerIssueRef
 from .github_app import GitHubAppError
 from .models import MAX_EXECUTION_DEADLINE_SECONDS, ExecutionRequest, WorkItem
+from .workitems.lifecycle import AUTOMATIC_RETRY_LIMIT
 
 ISSUE_READ_TIMEOUT_SECONDS = 20.0
 _PROVIDER_TIMEOUT_SECONDS = 5.0
@@ -51,6 +52,7 @@ class IssueReadUnavailable(RuntimeError):
 class IssueReadAuthority:
     work_item_id: uuid.UUID
     execution_request_id: uuid.UUID
+    retry_of_request_id: uuid.UUID | None
     issue: TrackerIssueRef
     repository: RepositoryRef
     code_host_installation_id: int | None
@@ -102,6 +104,7 @@ async def read_issue_authority(
     return IssueReadAuthority(
         work_item_id=item.id,
         execution_request_id=execution.id,
+        retry_of_request_id=execution.retry_of_request_id,
         issue=item.tracker_issue,
         repository=item.repository,
         code_host_installation_id=item.code_host_installation_id,
@@ -110,9 +113,35 @@ async def read_issue_authority(
     )
 
 
+async def answer_receipt_request_ids(
+    session: AsyncSession, authority: IssueReadAuthority
+) -> list[uuid.UUID]:
+    """A retry carries the answer receipts of the requests it replaces."""
+
+    request_ids = [authority.execution_request_id]
+    parent_id = authority.retry_of_request_id
+    for _ in range(AUTOMATIC_RETRY_LIMIT):
+        if parent_id is None or parent_id in request_ids:
+            break
+        parent = (
+            await session.execute(
+                select(ExecutionRequest.id, ExecutionRequest.retry_of_request_id).where(
+                    ExecutionRequest.id == parent_id,
+                    ExecutionRequest.work_item_id == authority.work_item_id,
+                    ExecutionRequest.status == "failed",
+                )
+            )
+        ).one_or_none()
+        if parent is None:
+            break
+        request_ids.append(parent.id)
+        parent_id = parent.retry_of_request_id
+    return request_ids
+
+
 async def read_issue(
     authority: IssueReadAuthority, *, settings: Settings, client: httpx.AsyncClient
-) -> str:
+) -> TicketRead:
     """The WorkItem's ticket as markdown, through its own tracker.
 
     A GitHub issue is addressed by its repository's numeric id, so a rename or

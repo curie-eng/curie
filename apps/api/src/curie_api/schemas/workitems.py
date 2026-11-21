@@ -38,16 +38,27 @@ class IssueReadContext(BaseModel):
     capability: str
 
 
-class IssueReadResult(BaseModel):
-    """The ticket as its tracker renders it in markdown (title, description and
-    comments), its link, and the execution deadline and total allowed seconds.
+class AdmittedIssueAnswer(BaseModel):
+    """A tracker comment whose content matches this execution's answer receipt."""
 
-    The platform parses and stores none of the ticket content.
+    comment_id: str
+    author_id: str
+    text: str
+
+
+class IssueReadResult(BaseModel):
+    """The ticket, thread context and verified answers for this execution.
+
+    The platform stores receipts and fingerprints. Ticket text stays on the tracker.
     """
 
     issue: str
     url: str
     ticket: str
+    thread_context: str
+    answer_attempt: bool
+    admitted_answers: list[AdmittedIssueAnswer]
+    has_question_history: bool
     execution_deadline: AwareDatetime
     execution_seconds: int
 

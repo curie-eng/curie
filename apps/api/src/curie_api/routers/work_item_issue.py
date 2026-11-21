@@ -24,6 +24,7 @@ from redis.exceptions import RedisError
 from sqlalchemy import select
 
 from curie_api.schemas.workitems import (
+    AdmittedIssueAnswer,
     CompletionContractOut,
     IssueReadContext,
     IssueReadContextMint,
@@ -50,11 +51,12 @@ from ..issue_read import (
     IssueReadAuthority,
     IssueReadRefused,
     IssueReadUnavailable,
+    answer_receipt_request_ids,
     read_issue,
     read_issue_authority,
 )
 from ..issue_read_token import IssueReadClaims, mint, verify_claims
-from ..models import ExecutionRequest
+from ..models import ExecutionRequest, FactoryAnswerReceipt, FactoryQuestionRoundCount
 from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
@@ -206,8 +208,29 @@ async def read_work_item_issue(
         if not _claims_match(claims, authority):
             raise IssueReadRefused
         await charge_issue_read_attempt(request.app.state.valkey, claims.execution_request_id)
-        ticket = await read_issue(
+        content = await read_issue(
             authority, settings=settings, client=request.app.state.http_client
+        )
+        answer_request_ids = await answer_receipt_request_ids(session, authority)
+        receipts = (
+            await session.scalars(
+                select(FactoryAnswerReceipt)
+                .where(
+                    FactoryAnswerReceipt.work_item_id == authority.work_item_id,
+                    FactoryAnswerReceipt.request_id.in_(answer_request_ids),
+                    FactoryAnswerReceipt.outcome.in_(questions_core.ANSWER_RECEIPT_OUTCOMES),
+                )
+                .order_by(
+                    (FactoryAnswerReceipt.outcome == questions_core.COALESCED),
+                    FactoryAnswerReceipt.created_at,
+                    FactoryAnswerReceipt.comment_key,
+                )
+            )
+        ).all()
+        rounds = await session.scalar(
+            select(FactoryQuestionRoundCount.rounds_used).where(
+                FactoryQuestionRoundCount.work_item_id == authority.work_item_id
+            )
         )
         # Cancellation or the deadline may land during the tracker read.
         current = await read_issue_authority(
@@ -228,10 +251,22 @@ async def read_work_item_issue(
         url = issue_link(forges_registry(settings), current.issue, current.repository)
     except ForgeError:
         raise _unavailable() from None
+    candidates = {comment.comment_id: comment for comment in content.answer_comments}
     return IssueReadResult(
         issue=display_reference(current.issue, current.repository.path),
         url=url,
-        ticket=ticket,
+        ticket=content.ticket,
+        thread_context=content.thread_context,
+        answer_attempt=any(r.outcome in questions_core.ANSWER_STARTED_OUTCOMES for r in receipts),
+        admitted_answers=[
+            AdmittedIssueAnswer(
+                comment_id=comment.comment_id, author_id=comment.author_id, text=comment.text
+            )
+            for receipt in receipts
+            if (comment := candidates.get(receipt.comment_key)) is not None
+            and comment.fingerprint == receipt.answer_fingerprint
+        ],
+        has_question_history=bool(rounds),
         execution_deadline=current.execution_deadline,
         execution_seconds=int((current.execution_deadline - current.started_at).total_seconds()),
     )

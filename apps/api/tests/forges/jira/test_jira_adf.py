@@ -48,7 +48,8 @@ async def test_jira_adf_read_ticket_recorded_description_and_comments_match_the_
     issue = _recorded(fake)
     tracker = jira_tracker(fake)
 
-    markdown = await tracker.read_ticket(fake.ref(issue))
+    ticket = await tracker.read_ticket(fake.ref(issue))
+    markdown = ticket.ticket + "\n" + ticket.thread_context
 
     golden = (GOLDENS / "read_ticket.md").read_text()
     assert markdown.rstrip("\n") == golden.rstrip("\n")
@@ -67,7 +68,8 @@ async def test_jira_adf_comments_are_read_oldest_first_across_pages() -> None:
         fake.add_comment(issue.id, reader, f"Comment {minute}", at=base + minute * 60_000)
     tracker = jira_tracker(fake)
 
-    markdown = await tracker.read_ticket(fake.ref(issue))
+    ticket = await tracker.read_ticket(fake.ref(issue))
+    markdown = ticket.ticket + "\n" + ticket.thread_context
 
     order = [line for line in markdown.splitlines() if line.startswith("Comment ")]
     assert order == [f"Comment {minute}" for minute in range(5)]
@@ -86,7 +88,8 @@ async def test_jira_adf_read_ticket_keeps_the_newest_100_comments_with_a_note() 
         fake.add_comment(issue.id, reader, f"Comment number {n:03d}")
     tracker = jira_tracker(fake)
 
-    markdown = await tracker.read_ticket(fake.ref(issue))
+    ticket = await tracker.read_ticket(fake.ref(issue))
+    markdown = ticket.ticket + "\n" + ticket.thread_context
 
     assert markdown.count("## Comment by Human 1 at ") == 100
     assert "Comment number 000" not in markdown
@@ -102,6 +105,7 @@ async def test_jira_adf_an_issue_without_description_or_comments_is_its_title() 
     issue = fake.seed_issue("Lonely ticket")
     tracker = jira_tracker(fake)
 
-    markdown = await tracker.read_ticket(fake.ref(issue))
+    ticket = await tracker.read_ticket(fake.ref(issue))
+    markdown = ticket.ticket + "\n" + ticket.thread_context
 
     assert markdown.rstrip("\n") == "# Lonely ticket"

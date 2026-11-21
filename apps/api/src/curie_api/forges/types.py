@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import base64
 import enum
+import hashlib
+import json
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -608,6 +610,49 @@ class SourceContent:
 
     title: str
     body: str
+
+
+@dataclass(frozen=True)
+class AnswerComment:
+    """A tracker comment with an immutable author and an unedited revision."""
+
+    comment_id: str
+    author_id: str
+    created_at: datetime
+    text: str
+    fingerprint: str
+
+    @classmethod
+    def unedited(
+        cls,
+        comment_id: str,
+        author_id: str,
+        created_at: datetime | None,
+        updated_at: datetime | None,
+        text: str,
+        *,
+        source: str,
+    ) -> AnswerComment | None:
+        if (
+            not comment_id
+            or not author_id
+            or created_at is None
+            or created_at.utcoffset() is None
+            or created_at != updated_at
+        ):
+            return None
+        material = json.dumps([author_id, created_at.astimezone(UTC).isoformat(), source])
+        fingerprint = hashlib.sha256(material.encode()).hexdigest()
+        return cls(comment_id, author_id, created_at, text, fingerprint)
+
+
+@dataclass(frozen=True)
+class TicketRead:
+    """The tracker renders the ticket and thread separately for the run."""
+
+    ticket: str
+    thread_context: str = ""
+    answer_comments: tuple[AnswerComment, ...] = ()
 
 
 @dataclass(frozen=True)

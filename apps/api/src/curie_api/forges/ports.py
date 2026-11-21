@@ -15,6 +15,7 @@ from typing import Protocol
 from curie_api.forges.capabilities import Operation, Support
 from curie_api.forges.types import (
     Actor,
+    AnswerComment,
     CiReport,
     CiRollup,
     Commit,
@@ -37,6 +38,7 @@ from curie_api.forges.types import (
     SourceContent,
     StoredEvidence,
     TicketLabels,
+    TicketRead,
     TrackerComment,
     TrackerIssueRef,
     UpsertResult,
@@ -163,8 +165,14 @@ class Tracker(Protocol):
         """Whether ``actor`` may start a run on ``issue`` (ADR 0197, "Authority")."""
         ...
 
-    async def read_ticket(self, issue: TrackerIssueRef) -> str:
-        """The ticket as markdown for the sandbox. Nothing is stored."""
+    async def read_ticket(self, issue: TrackerIssueRef) -> TicketRead:
+        """Read the ticket and thread for the sandbox without storing content."""
+        ...
+
+    async def read_answer_comment(
+        self, issue: TrackerIssueRef, comment_id: str
+    ) -> AnswerComment | None:
+        """Read the unedited comment on this issue for admission."""
         ...
 
     async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:

@@ -94,7 +94,8 @@ def _read(total: int, *, with_last: bool = True) -> tuple[str, list[int]]:
                 app_id="51",
                 own_login=own_login,
             )
-            return await tracker.read_ticket(tracker.issue(NUMBER))
+            ticket = await tracker.read_ticket(tracker.issue(NUMBER))
+            return ticket.ticket + "\n" + ticket.thread_context
 
     return asyncio.run(run()), requested
 

@@ -48,6 +48,7 @@ from curie_api.forges.jira_cloud.transport import Forbidden, JiraTransport
 from curie_api.forges.types import (
     JIRA_CLOUD,
     Actor,
+    AnswerComment,
     Disposition,
     MarkedNotice,
     NoticePage,
@@ -55,6 +56,7 @@ from curie_api.forges.types import (
     RepositoryRef,
     SourceContent,
     TicketLabels,
+    TicketRead,
     TrackerIssueRef,
 )
 
@@ -725,27 +727,58 @@ class JiraTracker:
         """The notice's comment is still on this issue by the same author, and,
         for a mention, still mentions the bot."""
 
-        if not notice.event_id.isdigit():
-            return False
+        comment = await self._comment_on_issue(issue_id, notice.event_id)
+        return (
+            comment is not None
+            and _actor(comment.get("author")) == notice.actor
+            and (not mention or mentions(comment.get("body"), self._mention))
+        )
+
+    async def _comment_on_issue(self, issue_id: str, comment_id: str) -> Mapping[str, Any] | None:
+        if not comment_id.isdecimal():
+            return None
         # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/#api-rest-api-3-comment-list-post
         page = await self._transport.post(
-            "/comment/list", what="comment_list", json={"ids": [int(notice.event_id)]}
+            "/comment/list", what="comment_list", json={"ids": [int(comment_id)]}
         )
         values = page.get("values") if isinstance(page, dict) else None
         if not isinstance(values, list):
             raise Unavailable("comment_list")
         for comment in values:
-            if not isinstance(comment, dict) or str(comment.get("id")) != notice.event_id:
+            if not isinstance(comment, dict) or str(comment.get("id")) != comment_id:
                 continue
             located = _COMMENT_SELF.search(str(comment.get("self", "")))
-            author = _actor(comment.get("author"))
-            return (
-                located is not None
-                and located.group(1) == issue_id
-                and author == notice.actor
-                and (not mention or mentions(comment.get("body"), self._mention))
-            )
-        return False
+            if located is not None and located.group(1) == issue_id:
+                return comment
+        return None
+
+    def _answer_comment(self, comment: Mapping[str, Any]) -> AnswerComment | None:
+        actor = self._human(comment.get("author"))
+        comment_id, body = str(comment.get("id")), comment.get("body")
+        created = jira_ms(comment.get("created"))
+        if (
+            actor is None
+            or not comment_id.isdecimal()
+            or not isinstance(body, dict)
+            or created is None
+            or created != jira_ms(comment.get("updated"))
+        ):
+            return None
+        timestamp = datetime.fromtimestamp(created / 1000, UTC)
+        return AnswerComment.unedited(
+            comment_id,
+            actor.id,
+            timestamp,
+            timestamp,
+            adf.to_markdown(body),
+            source=json.dumps(body, sort_keys=True, separators=(",", ":")),
+        )
+
+    async def read_answer_comment(
+        self, issue: TrackerIssueRef, comment_id: str
+    ) -> AnswerComment | None:
+        comment = await self._comment_on_issue(self._issue_id(issue), comment_id)
+        return self._answer_comment(comment) if comment is not None else None
 
     async def marking_actor(self, issue: TrackerIssueRef, marker: str) -> Actor | None:
         issue_id = self._issue_id(issue)
@@ -787,7 +820,7 @@ class JiraTracker:
             raise Unavailable("user_groups")
         return any(isinstance(group, dict) and group.get("groupId") == group_id for group in groups)
 
-    async def read_ticket(self, issue: TrackerIssueRef) -> str:
+    async def read_ticket(self, issue: TrackerIssueRef) -> TicketRead:
         """Decision 14: title, description, then the newest 100 comments, oldest
         first (#5789 decision 7). When there were more, a line after the
         description says the earlier ones were not read."""
@@ -795,10 +828,10 @@ class JiraTracker:
         issue_id = self._issue_id(issue)
         fields = _fields(await self._read_issue(issue_id, "summary,description"))
         summary = fields.get("summary")
-        parts = [f"# {summary if isinstance(summary, str) else ''}"]
+        ticket = [f"# {summary if isinstance(summary, str) else ''}"]
         description = adf.to_markdown(fields.get("description"))
         if description:
-            parts.append(description)
+            ticket.append(description)
         newest, total = await self._transport.comments(
             issue_id,
             newest_first=True,
@@ -806,6 +839,8 @@ class JiraTracker:
             limit=TICKET_COMMENT_LIMIT,
         )
         comments = list(reversed(newest))
+        parts = []
+        answers = []
         if total > len(comments):
             parts.append(EARLIER_COMMENTS)
         for comment in comments:
@@ -817,7 +852,16 @@ class JiraTracker:
                 heading += f" at {created}"
             body = adf.to_markdown(comment.get("body"))
             parts.append(f"{heading}\n\n{body}" if body else heading)
-        return "\n\n".join(parts) + "\n"
+            located = _COMMENT_SELF.search(str(comment.get("self", "")))
+            if located is not None and located.group(1) == issue_id:
+                answer = self._answer_comment(comment)
+                if answer is not None:
+                    answers.append(answer)
+        return TicketRead(
+            ticket="\n\n".join(ticket) + "\n",
+            thread_context="\n\n".join(parts) + "\n" if parts else "",
+            answer_comments=tuple(answers),
+        )
 
     async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
         """The issue's ``summary`` and ``description`` fields from one issue read,

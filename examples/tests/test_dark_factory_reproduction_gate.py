@@ -47,9 +47,14 @@ def reason(result: dict) -> str:
     return str(result["hookSpecificOutput"]["permissionDecisionReason"])
 
 
-def issue_response(ticket: str) -> list[dict[str, str]]:
+def issue_response(ticket: str, *, has_questions: bool = False) -> list[dict[str, str]]:
     """The recorded PostToolUse shape of get_issue: one text block holding the JSON payload."""
-    payload = {"issue": "#7", "url": "https://github.com/Acme/bot/issues/7", "ticket": ticket}
+    payload = {
+        "issue": "#7",
+        "url": "https://github.com/Acme/bot/issues/7",
+        "ticket": ticket,
+        "has_question_history": has_questions,
+    }
     return [{"type": "text", "text": json.dumps(payload, indent=2)}]
 
 
@@ -132,8 +137,13 @@ class Session:
         reply = response if response is not None else [{"type": "text", "text": '{"posted":1}'}]
         return self.event("PostToolUse", ASK, QUESTIONS, tool_response=reply)
 
-    def read_issue(self, ticket: str) -> dict:
-        return self.event("PostToolUse", ISSUE_READ, {}, tool_response=issue_response(ticket))
+    def read_issue(self, ticket: str, *, has_questions: bool = False) -> dict:
+        return self.event(
+            "PostToolUse",
+            ISSUE_READ,
+            {},
+            tool_response=issue_response(ticket, has_questions=has_questions),
+        )
 
     def publish(self, body: str = CITED_BODY) -> dict:
         return self.event("PreToolUse", PUBLISH, {"title": "Restore addition (#7)", "body": body})
@@ -232,9 +242,9 @@ def test_rules_an_ask_the_tool_reported_as_an_error_is_not_recorded(session: Ses
 
 
 def test_rules_publish_needs_a_citation_line_after_a_question_heading(session: Session) -> None:
-    assert not denied(session.read_issue("# Fix add\n\nadd(2, 3) is wrong."))
+    assert not denied(session.read_issue(f"# Fix add\n\n{HEADING}"))
     assert not denied(session.publish(UNCITED_BODY))
-    assert not denied(session.read_issue(f"# Fix add\n\n{HEADING}\n\n1. Which result?"))
+    assert not denied(session.read_issue("# Fix add", has_questions=True))
     refusal = session.publish(UNCITED_BODY)
     assert denied(refusal)
     assert "Answered on the ticket by" in reason(refusal)
@@ -253,7 +263,7 @@ def test_rules_publish_needs_a_citation_line_after_a_question_heading(session: S
 
 
 def test_rules_the_heading_is_remembered_for_the_session(session: Session) -> None:
-    session.read_issue(f"{HEADING}\n\n1. Which result?")
+    session.read_issue("# Fix add", has_questions=True)
     session.read_issue("# Fix add\n\nNo questions in this read.")
     assert denied(session.publish(UNCITED_BODY))
     session.env["CURIE_SESSION_ID"] = "another-session"
@@ -645,7 +655,7 @@ def test_registered_hook_records_the_question_heading_from_get_issue(
     registered: Registered,
 ) -> None:
     out = registered.dispatch(
-        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response(f"{HEADING}\n\n1. Which?")
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response("# Fix add", has_questions=True)
     )
     assert out is not None and not denied(out)
     out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
@@ -710,6 +720,14 @@ def test_registered_hook_leaves_publication_open_after_a_decodable_ticket_withou
     assert out is not None and not denied(out)
 
 
+def test_only_the_platform_issue_read_sets_question_history(session: Session) -> None:
+    session.event(
+        "PostToolUse", "mcp__notes__get_issue", {},
+        tool_response=issue_response("# Notes", has_questions=True),
+    )
+    assert not denied(session.publish(UNCITED_BODY))
+
+
 def oversize_ticket_read(registered: Registered) -> None:
     ticket = f"{HEADING}\n\n1. Which?\n\n" + "comment text. " * (3 * 1024 * 1024 // 14)
     out = registered.dispatch("PostToolUse", ISSUE_READ, {}, tool_response=issue_response(ticket))
@@ -735,7 +753,9 @@ def test_registered_hook_still_requires_the_citation_when_a_retry_decodes_with_a
 ) -> None:
     oversize_ticket_read(registered)
     answered = f"{HEADING}\n\n1. Which?\n\nUse the second."
-    out = registered.dispatch("PostToolUse", ISSUE_READ, {}, tool_response=issue_response(answered))
+    out = registered.dispatch(
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response(answered, has_questions=True)
+    )
     assert out is not None and not denied(out)
     out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
     assert out is not None and denied(out)
@@ -747,7 +767,7 @@ def test_registered_hook_keeps_a_seen_heading_through_an_overflow_and_a_clean_re
     registered: Registered,
 ) -> None:
     out = registered.dispatch(
-        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response(f"{HEADING}\n\n1. Which?")
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response("# Fix add", has_questions=True)
     )
     assert out is not None and not denied(out)
     oversize_ticket_read(registered)
@@ -763,7 +783,7 @@ def test_registered_hook_keeps_citations_through_a_checkout_cleanup(
     registered: Registered,
 ) -> None:
     out = registered.dispatch(
-        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response(f"{HEADING}\n\n1. Which?")
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response("# Fix add", has_questions=True)
     )
     assert out is not None and not denied(out)
     out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})

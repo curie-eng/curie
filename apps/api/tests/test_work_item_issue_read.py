@@ -64,8 +64,8 @@ COMMENTS = [
     {"user": {"login": "octocat"}, "created_at": "2026-10-01T01:00:00Z", "body": None},
 ]
 # The ticket the GitHub tracker composes from the issue and its comments.
-TICKET = (
-    f"# {TITLE}\n\n{BODY}\n\n"
+TICKET = f"# {TITLE}\n\n{BODY}\n"
+THREAD = (
     "## Comment by maintainer at 2026-10-01T00:00:00Z\n\nAlso docs.\n\n"
     "## Comment by octocat at 2026-10-01T01:00:00Z\n\n\n"
 )
@@ -410,6 +410,10 @@ def test_valid_read_returns_the_issue_and_comments_verbatim_and_stores_nothing(
         "issue": f"{REPO}#{ISSUE_NUMBER}",
         "url": ISSUE_URL,
         "ticket": TICKET,
+        "thread_context": THREAD,
+        "answer_attempt": False,
+        "admitted_answers": [],
+        "has_question_history": False,
         "execution_deadline": execution["execution_deadline"].isoformat().replace("+00:00", "Z"),
         "execution_seconds": int(
             (execution["execution_deadline"] - execution["started_at"]).total_seconds()
@@ -570,11 +574,12 @@ def test_a_jira_work_item_reads_its_ticket_through_the_jira_tracker(
     response = _read(case, context["capability"])
     assert response.status_code == 200, response.text
     result = response.json()
-    assert set(result) == {"issue", "url", "ticket", "execution_deadline", "execution_seconds"}
+    assert result["admitted_answers"] == []
+    assert result["answer_attempt"] is False
     assert result["issue"] == key
     assert result["url"] == f"https://{jira_fake.SITE_HOST}/browse/{key}"
     assert result["ticket"].startswith(f"# {JIRA_SUMMARY}\n\n{JIRA_DESCRIPTION}")
-    assert "Also handle a trailing comma." in result["ticket"]
+    assert "Also handle a trailing comma." in result["thread_context"]
     # Read with the Jira credential only: no GitHub request and no App mint.
     assert _github_reads(case) == [] and case["minted"] == []
     jira: jira_fake.JiraFake = case["jira"]

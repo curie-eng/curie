@@ -5724,6 +5724,18 @@ export interface components {
             restricted: boolean;
         };
         /**
+         * AdmittedIssueAnswer
+         * @description A tracker comment whose content matches this execution's answer receipt.
+         */
+        AdmittedIssueAnswer: {
+            /** Author Id */
+            author_id: string;
+            /** Comment Id */
+            comment_id: string;
+            /** Text */
+            text: string;
+        };
+        /**
          * AgentAccessPolicyOut
          * @description An agent's policy; version 0 and no ``updated_at`` mean none was set.
          */
@@ -10186,12 +10198,15 @@ export interface components {
         };
         /**
          * IssueReadResult
-         * @description The ticket as its tracker renders it in markdown (title, description and
-         *     comments), its link, and the execution deadline and total allowed seconds.
+         * @description The ticket, thread context and verified answers for this execution.
          *
-         *     The platform parses and stores none of the ticket content.
+         *     The platform stores receipts and fingerprints. Ticket text stays on the tracker.
          */
         IssueReadResult: {
+            /** Admitted Answers */
+            admitted_answers: components["schemas"]["AdmittedIssueAnswer"][];
+            /** Answer Attempt */
+            answer_attempt: boolean;
             /**
              * Execution Deadline
              * Format: date-time
@@ -10199,8 +10214,12 @@ export interface components {
             execution_deadline: string;
             /** Execution Seconds */
             execution_seconds: number;
+            /** Has Question History */
+            has_question_history: boolean;
             /** Issue */
             issue: string;
+            /** Thread Context */
+            thread_context: string;
             /** Ticket */
             ticket: string;
             /** Url */

@@ -250,7 +250,8 @@ class InMemoryMarkedComments(_Declared):
     def seed_comment(self, target: ReplyTarget, author: Actor, body: str) -> str:
         """A comment someone else (or a past run) left; returns its id."""
 
-        comment = _Comment(self.comment_id(next(self._ids)), author, body, created_at=self.clock())
+        now = self.clock()
+        comment = _Comment(self.comment_id(next(self._ids)), author, body, now, now)
         self._accept(target).append(comment)
         return comment.id
 
@@ -685,10 +686,40 @@ class InMemoryTracker(_Declared):
         self._issue(issue)
         return actor.id in self._authorized and actor != self.identity
 
-    async def read_ticket(self, issue: TrackerIssueRef) -> str:
+    def _answer_comment(self, comment: _Comment) -> types.AnswerComment | None:
+        if comment.author == self.identity:
+            return None
+        return types.AnswerComment.unedited(
+            comment.id,
+            comment.author.id,
+            comment.created_at,
+            comment.updated_at,
+            comment.body,
+            source=comment.body,
+        )
+
+    async def read_answer_comment(
+        self, issue: TrackerIssueRef, comment_id: str
+    ) -> types.AnswerComment | None:
+        self._issue(issue)
+        comment = self._comments._find(ReplyTarget.on_issue(issue), comment_id)
+        return self._answer_comment(comment) if comment is not None else None
+
+    async def read_ticket(self, issue: TrackerIssueRef) -> types.TicketRead:
         self._gate(Operation.READ_TICKET)
         found = self._issue(issue)
-        return f"# {found.title}\n\n{found.body}"
+        comments = self._comments._accept(ReplyTarget.on_issue(issue))
+        return types.TicketRead(
+            ticket=f"# {found.title}\n\n{found.body}",
+            thread_context="\n\n".join(
+                f"## Comment by {comment.author.login}\n\n{comment.body}" for comment in comments
+            ),
+            answer_comments=tuple(
+                answer
+                for comment in comments
+                if (answer := self._answer_comment(comment)) is not None
+            ),
+        )
 
     async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
         self._gate(Operation.READ_TICKET)

@@ -2290,6 +2290,7 @@ class FactoryAnswerReceipt(Base):
     comment_key: Mapped[str] = mapped_column(Text, primary_key=True)
     outcome: Mapped[str] = mapped_column(Text)
     request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    answer_fingerprint: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

@@ -83,12 +83,16 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
 from redis.asyncio import Redis
 from test_factory_question_ending import (
     _ask,
+    _finish_clean,
+    _lose_owner,
+    _queue_revision,
     _request,
     _requests,
     _round_row,
     _status_body,
     _take_over,
 )
+from test_factory_retry import _make_due
 from test_factory_terminus import _reconcile
 
 PATHS = ("webhook", "poll")
@@ -150,8 +154,24 @@ def world(comments: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
     github.grant(WRITER, "write")
     github.grant(MAINTAINER, "maintain")
     github.grant(READER, "read")
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        numeric_path = f"/repositories/{REPO_ID}/issues/"
+        if request.method == "GET" and request.url.path.startswith(numeric_path):
+            number_path = request.url.path.removeprefix(numeric_path)
+            url = request.url.copy_with(path=f"/repos/{REPO}/issues/{number_path}")
+            request = httpx.Request("GET", url, headers=request.headers)
+            response = await github.handle_async(request)
+            if number_path.isdecimal() and response.status_code == 200:
+                issue = response.json()
+                issue.setdefault("title", "Keep the report format")
+                issue.setdefault("body", "Export all report rows.")
+                return httpx.Response(200, json=issue)
+            return response
+        return await github.handle_async(request)
+
     with TestClient(create_app()) as client:
-        external = httpx.AsyncClient(transport=httpx.MockTransport(github.handle_async))
+        external = httpx.AsyncClient(transport=httpx.MockTransport(handle))
         client.app.state.http_client = external
         created = client.post(
             "/agents",
@@ -566,8 +586,126 @@ def test_coalesce_two_answers_before_the_start(world: World, path: str) -> None:
     assert _request(started)["status"] == "waiting"
     assert _receipts(job) == {
         str(first["id"]): ("admitted", started),
-        str(second["id"]): ("coalesced", None),
+        str(second["id"]): ("coalesced", started),
     }
+
+
+def _run_issue(run: tr._Run) -> dict[str, Any]:
+    response = run.client.post(
+        "/work-items/issue-read", headers={"X-Curie-Issue-Read": run.capability}
+    )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_issue_read_separates_exact_answers_from_thread_context(world: World, path: str) -> None:
+    number = 6280
+    asking = _outstanding(world, number)
+    exact = "Keep the original filename.\n\n  Include λ.  "
+    start = world.github.add_comment(number, exact, user=WRITER)
+    _deliver(world, path, start, number)
+    folded = world.github.add_comment(number, "Keep the header row.", user=MAINTAINER)
+    _deliver(world, path, folded, number)
+    reader = world.github.add_comment(number, exact, user=READER)
+    _deliver(world, path, reader, number)
+    _deliver(world, path, start, number)
+    run_id = _answer_id(asking, start)
+    assert _ids(asking) == [asking.request_id, run_id]
+    run = _take_over(asking, run_id)
+
+    read = _run_issue(run)
+    assert read["answer_attempt"] is True
+    assert read["has_question_history"] is True
+    assert read["admitted_answers"] == [
+        {"comment_id": str(start["id"]), "author_id": str(WRITER["id"]), "text": exact},
+        {
+            "comment_id": str(folded["id"]),
+            "author_id": str(MAINTAINER["id"]),
+            "text": folded["body"],
+        },
+    ]
+    assert read["thread_context"].count(exact) == 2
+    assert exact not in read["ticket"]
+
+    unrelated = _run_issue(_running(world, number + 1))
+    assert unrelated["answer_attempt"] is False
+    assert unrelated["admitted_answers"] == []
+    assert exact not in unrelated["thread_context"]
+
+
+@pytest.mark.parametrize("change", ["edit", "missing_author"])
+def test_issue_read_withholds_an_unproven_answer(world: World, change: str) -> None:
+    number = 6282
+    asking = _outstanding(world, number)
+    comment = _admits(world, "webhook", asking, number)
+    request = _answer_id(asking, comment)
+    if change == "edit":
+        world.github.edit_comment(comment["id"], "Use the updated filename.")
+    else:
+        comment["user"].pop("id")
+    read = _run_issue(_take_over(asking, request))
+    assert read["answer_attempt"] is True
+    assert read["admitted_answers"] == []
+    assert comment["body"] in read["thread_context"]
+
+
+def test_issue_read_preserves_answer_authority_through_automatic_retries(world: World) -> None:
+    number = 6283
+    asking = _outstanding(world, number)
+    starter = _admits(world, "webhook", asking, number)
+    folded = world.github.add_comment(number, "Keep the header row.", user=MAINTAINER)
+    _deliver(world, "webhook", folded, number)
+    answer = _take_over(asking, _answer_id(asking, starter))
+
+    _lose_owner(answer)
+    assert _request(answer.request_id)["terminal_cause"] == "owner_lost"
+    lost_id = _requests(answer.work_item_id)[-1]["id"]
+    assert lost_id != answer.request_id
+    retry = _take_over(answer, lost_id)
+    after_owner_loss = _run_issue(retry)
+
+    _finish_clean(retry, "sandbox_node_disrupted")
+    assert _request(retry.request_id)["terminal_cause"] == "sandbox_node_disrupted"
+    retry_id = _requests(retry.work_item_id)[-1]["id"]
+    assert retry_id != retry.request_id
+    _make_due(retry_id)
+    successor = _take_over(retry, retry_id)
+    after_retry = _run_issue(successor)
+
+    for read in (after_owner_loss, after_retry):
+        assert read["answer_attempt"] is True
+        assert read["has_question_history"] is True
+        assert read["admitted_answers"] == [
+            {"comment_id": str(starter["id"]), "author_id": str(WRITER["id"]), "text": ANSWER},
+            {
+                "comment_id": str(folded["id"]),
+                "author_id": str(MAINTAINER["id"]),
+                "text": folded["body"],
+            },
+        ]
+
+    world.github.edit_comment(starter["id"], "Use the updated filename.")
+    world.github.edit_comment(folded["id"], "Drop the header row.")
+    edited = _run_issue(successor)
+    assert edited["answer_attempt"] is True
+    assert edited["admitted_answers"] == []
+    assert "Use the updated filename." in edited["thread_context"]
+
+
+def test_issue_read_does_not_inherit_answers_on_an_independent_revision(world: World) -> None:
+    number = 6284
+    asking = _outstanding(world, number)
+    starter = _admits(world, "webhook", asking, number)
+    answer = _take_over(asking, _answer_id(asking, starter))
+    revision_id = _queue_revision(answer)
+    tr._finish(answer, "failed", "no_pull_request")
+
+    independent = _run_issue(_take_over(answer, revision_id))
+    assert independent["has_question_history"] is True
+    assert independent["answer_attempt"] is False
+    assert independent["admitted_answers"] == []
+    assert ANSWER in independent["thread_context"]
 
 
 @pytest.mark.parametrize("path", PATHS)
@@ -576,7 +714,7 @@ def test_follow_up_queues_behind_the_running_answer(world: World, path: str) -> 
     job = _outstanding(world, number)
     first = _admits(world, path, job, number)
     running = _answer_id(job, first)
-    _take_over(job, running)
+    running_turn = _take_over(job, running)
     assert _request(running)["status"] == "running"
     third = world.github.add_comment(number, "One more detail.", user=WRITER)
 
@@ -589,6 +727,9 @@ def test_follow_up_queues_behind_the_running_answer(world: World, path: str) -> 
     assert _request(running)["status"] == "running"
     assert _request(follow_up)["status"] == "queued"
     assert _receipts(job)[str(third["id"])] == ("queued_follow_up", follow_up)
+    assert [a["comment_id"] for a in _run_issue(running_turn)["admitted_answers"]] == [
+        str(first["id"])
+    ]
 
 
 # Criterion 6: a mention is an answer while a question is open; facts keep theirs ------

@@ -463,7 +463,8 @@ async def test_jira_comments_read_ticket_keeps_the_newest_100_of_130_in_order() 
 
     fake, tracker, ref = _busy(130)
 
-    markdown = await tracker.read_ticket(ref)
+    ticket = await tracker.read_ticket(ref)
+    markdown = ticket.ticket + "\n" + ticket.thread_context
 
     assert _read_bodies(markdown) == [f"Comment number {n:03d}" for n in range(30, 130)]
     assert markdown.startswith(f"# Busy ticket\n\nBody.\n\n{EARLIER}\n\n## Comment by Human 1")
@@ -477,7 +478,8 @@ async def test_jira_comments_read_ticket_keeps_the_newest_100_of_130_in_order() 
 async def test_jira_comments_read_ticket_with_exactly_100_has_no_earlier_line() -> None:
     fake, tracker, ref = _busy(100)
 
-    markdown = await tracker.read_ticket(ref)
+    ticket = await tracker.read_ticket(ref)
+    markdown = ticket.ticket + "\n" + ticket.thread_context
 
     assert _read_bodies(markdown) == [f"Comment number {n:03d}" for n in range(100)]
     assert EARLIER not in markdown
