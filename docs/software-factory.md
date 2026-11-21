@@ -127,10 +127,10 @@ below. The skill does not deploy a factory or guarantee that a task can finish.
 
 ## Read a factory pull request
 
-After a factory run, `curie factory explain` reads that issue's factory pull requests with your own GitHub login. Pass `owner/repo#number` or a github.com issue URL:
+After a factory run, `curie factory explain` reads that issue's factory pull requests with your own GitHub login. Pass `owner/repo#number` or a github.com issue URL. The reference must be an issue, not a pull request; a pull request reference exits 2 with a usage error:
 
 ```bash
-curie factory explain curie-eng/curie#120 --json
+curie factory explain curie-eng/curie#5239 --json
 ```
 
 The command checks `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. It never reads the Curie platform key. Each match prints the pull request summary, the parsed Decisions entries, verification counts, review text, forge review states, and head-commit checks. The pull request summary and the Decisions entries are the plan record. Zero matches print `no factory pull request`. A pull request that never wrote `## Decisions` reports `not recorded`. A Decisions section ends at the next `## ` heading or at a line that is exactly `---`; the platform writes that line before the closing reference, issue marker and ask line it adds after the agent's text, so a section the agent left last still parses. A section that is malformed reports `unparsed`.

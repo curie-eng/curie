@@ -38,13 +38,18 @@ current intake support. Do not change factory configuration or relabel issues
 just to make a review trigger. If evidence is unavailable, explain exactly what
 is unknown and keep any trigger claim conditional.
 
-The GitHub factory-owned PR route accepts fresh PR conversation comments,
-submitted `commented` or `changes_requested` reviews and inline review comments
-when they include the configured App mention and pass its authority and lineage
-checks. It verifies an open owned PR, current head and the sender's current write
-or admin permission. Editing an old conversation comment is not a new trigger;
-an `approved` review is not a revision request. Configuration and deployed
-versions can differ, so verify the available evidence for the target factory.
+The GitHub factory-owned PR route needs no mention. A fresh PR conversation
+comment, inline review comment or submitted `commented` or `changes_requested`
+review from a person with current write or admin permission on an open owned PR
+starts a revision on the current head. One submitted review is one revision: its
+body and all its inline comments count together. An `approved` review starts
+nothing unless a comment mentions the configured App, and editing an old
+conversation comment is not a new trigger. Each PR allows 10 revisions from
+feedback without a mention; after that the factory posts one notice and the
+next request must mention the configured App, which always works and is not
+counted. GitLab and Bitbucket still require the mention. Configuration and
+deployed versions can differ, so verify the available evidence for the target
+factory.
 
 Factory-owned feedback uses factory intake. Do not require the separate
 `githubReviewIngressEnabled` switch for every factory PR; that setting controls
@@ -52,13 +57,17 @@ a different review route. Webhook subscriptions or supported polling must delive
 the feedback, and the factory must have the required repository binding and
 publication authority. A portable local skill does not provide those services.
 
-Prefer one consolidated approved request per revision round. When posting a
-review with several inline findings, put the configured mention in the review
-summary only, with the decisions and requested changes; avoid triggering separate
-factory work from every inline comment. If the host cannot submit that review,
-offer a single approved PR conversation comment. Do not publish both a triggering
-review and a duplicate triggering comment. Informational feedback can be posted
-without a trigger when the human chooses that action.
+Because plain feedback starts a revision, any comment, review or inline comment
+posted on a factory-owned GitHub PR from an authorized account asks for work,
+including feedback the human thinks of as informational. Say so before posting,
+and offer to keep notes local or to post an approval when the human wants no
+revision. Prefer one consolidated approved request per revision round: submit
+one review whose summary carries the decisions and requested changes, with the
+inline findings attached, so the round is one revision. If the host cannot
+submit that review, offer a single approved PR conversation comment. Do not
+publish both a review and a duplicate conversation comment. Add the configured
+App mention only when the factory is past the plain-feedback cap or runs on
+GitLab or Bitbucket.
 
 After posting, look for factory acknowledgment or execution evidence identifying
 this request and PR. Separate feedback persisted, revision requested, admission

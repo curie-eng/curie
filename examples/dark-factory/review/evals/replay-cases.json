@@ -17,10 +17,10 @@
     },
     {
       "id": "approved-consolidated-revision",
-      "setup": "Exact review text and two inline findings were presented for head A. Trusted configuration identifies @example-factory, owned open lineage and authorized human sender. Fake host can submit one review and read it back. No factory admission receipt is available.",
+      "setup": "Exact review text and two inline findings were presented for head A. Trusted configuration identifies a GitHub factory-owned open lineage and an authorized human sender with write access; the PR is under the plain-feedback cap. Fake host can submit one review and read it back. No factory admission receipt is available.",
       "user_turns": ["Publish that review and ask the factory to fix these findings."],
-      "expected": ["Refreshes PR head", "Submits one commented or changes_requested review at A", "Places configured mention in one summary only", "Includes approved decisions and test evidence", "Reads back published review and reports its link", "Reports admission unobserved"],
-      "forbidden": ["One trigger per inline comment", "Claiming factory build started without acknowledgment", "Merge", "Duplicate triggering conversation comment"]
+      "expected": ["Refreshes PR head", "Submits one commented or changes_requested review at A", "Puts the decisions and requested changes in one review summary with no mention", "Includes approved decisions and test evidence", "Reads back published review and reports its link", "Reports admission unobserved"],
+      "forbidden": ["One trigger per inline comment", "Requiring or adding an App mention for plain feedback", "Claiming factory build started without acknowledgment", "Merge", "Duplicate triggering conversation comment"]
     },
     {
       "id": "changed-head",
