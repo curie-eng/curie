@@ -953,6 +953,16 @@ class ApprovalGate:
         self.pending_granted_arguments = deepcopy(tool_input)
         return True
 
+    def refuse_publication(self, reason: str) -> None:
+        """Note a ``publish_changes`` body run that recorded nothing, and why.
+
+        The first reason wins. The session fails such a turn closed when it
+        would otherwise end clean (#2294).
+        """
+
+        self.publication_attempted = True
+        self.publication_unrecorded = self.publication_unrecorded or reason
+
     def record_publication(self, tool_input: dict[str, Any]) -> str | None:
         """Record the publication whose ``publish_changes`` tool body is running.
 
@@ -971,12 +981,12 @@ class ApprovalGate:
         publication this turn) keeps the slot, and the turn still halts on it.
         """
 
-        self.publication_attempted = True
         try:
             recorded = self._record_pending(PLATFORM_PUBLISH_TOOL_NAME, tool_input)
         except ValueError as exc:
-            self.publication_unrecorded = self.publication_unrecorded or str(exc)
+            self.refuse_publication(str(exc))
             return f"Publication request was not recorded: {exc}. Correct it and retry."
+        self.publication_attempted = True
         self.pending_halt = True
         if not recorded:
             return (

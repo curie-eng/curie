@@ -1712,7 +1712,7 @@ def test_two_publish_calls_in_one_turn_record_exactly_one_approval() -> None:
     assert gate.pending_summary == final.approval_summary
 
 
-def test_publish_call_on_a_gate_that_does_not_carry_publish_records_nothing() -> None:
+def test_publish_call_on_a_gate_that_does_not_carry_publish_fails_closed() -> None:
     # revert: record the publication anyway when the tool is not gated -> a model
     # that names publish_changes where it is not mounted (no managed workspace)
     # mints an approval for an action the platform has no checkout to perform,
@@ -1738,22 +1738,63 @@ def test_publish_call_on_a_gate_that_does_not_carry_publish_records_nothing() ->
     text = " ".join(str(item.get("text") or "") for item in payload.get("content") or [])
     assert "no managed repository workspace" in text.lower()
     assert gate.pending_summary is None
-    assert gate.publication_attempted is False
+    # The body ran, so the attempt counts against the turn.
+    assert gate.publication_attempted is True
 
-    # And a whole turn: never AWAITING_APPROVAL, nothing recorded or halted.
+    # And a whole turn: never AWAITING_APPROVAL, never DONE: fail closed.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
     runner, _session = _publish_runner(_publish_then_clean_done(), gate=gate)
 
     events = parse_ndjson("".join(_run_lines(runner)))
 
+    assert any(
+        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+        for e in events
+    ), [e.type for e in events]
     final = events[-1]
     assert final.type == "final"
     assert final.status != SessionStatus.AWAITING_APPROVAL
-    assert final.status == SessionStatus.DONE, final.status
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE, final.status
     assert final.approval_summary is None
     assert final.approval_granted_tool is None
     assert gate.pending_summary is None
     assert gate.publication_title is None
     assert gate.pending_halt is False
+
+
+def test_publish_call_in_a_session_with_no_gate_fails_closed() -> None:
+    # revert: key the fail-closed rule on the gate alone -> a session with no
+    # approval gate at all (no managed workspace, no policy) answers the publish
+    # call with the tool body's error and the turn ends DONE, as if nothing had
+    # been asked for. No gate means no body that can record, so any publication
+    # call the model made fails the turn closed (#2294).
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    publish = _publish_block()
+    script = [
+        publish,
+        UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="p1",
+                    content="No managed repository workspace is mounted at /workspace.",
+                    is_error=True,
+                )
+            ]
+        ),
+        *_publish_then_clean_done()[1:],
+    ]
+    runner, _session = _runner_over(script, gate=None)  # type: ignore[arg-type]
+
+    events = parse_ndjson("".join(_run_lines(runner)))
+
+    errors = [e for e in events if e.type == "error"]
+    assert [e.classification for e in errors] == [PUBLICATION_UNRECORDED_CLASSIFICATION]
+    assert "no publication approval gate" in errors[0].message
+    final = events[-1]
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE, final.status
+    assert final.approval_summary is None
 
 
 def test_operator_interrupt_outranks_a_recorded_publication() -> None:
@@ -1835,55 +1876,24 @@ def test_malformed_publish_followed_by_a_valid_one_pauses_on_the_valid_record() 
     assert runner.status == SessionStatus.AWAITING_APPROVAL
 
 
-def test_hook_recorded_publish_survives_a_later_malformed_stream_observation() -> None:
+def test_a_recorded_publish_survives_a_later_malformed_body_run() -> None:
     # revert: validate the publication proposal BEFORE the first-record-wins guard
     # in _record_pending -> this fails, because the malformed second call would
     # raise on a turn that already holds a good record and fail the turn closed,
     # discarding an approval a human could have acted on. A record that already
     # stands is never re-derived from a later attempt.
-    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
-
     gate = _managed_publish_gate()
-    script = [
-        _publish_block("Ship changes", "the proposal", call_id="p1"),
-        _publish_block("", "second attempt", call_id="p2"),
-        AssistantMessage(content=[TextBlock(text="Requested publication.")], model="m"),
-        ResultMessage(
-            subtype="success",
-            duration_ms=1,
-            duration_api_ms=1,
-            is_error=False,
-            num_turns=1,
-            session_id="s",
-            result="Requested publication.",
-        ),
-    ]
-    runner, _session = _runner_over(
-        script,
-        gate=gate,
-        # The gate layer records the FIRST call, exactly as the PreToolUse hook
-        # does in production (the fake tier does not run hooks; see _recording_deny).
-        can_use_tool=_recording_deny(gate, interrupt=False),
-        truncate_on_interrupt=False,
-    )
+    gate.reset()
 
-    events = parse_ndjson("".join(_run_lines(runner)))
+    assert gate.record_publication({"title": "Ship changes", "body": "the proposal"}) is None
+    refusal = gate.record_publication({"title": "", "body": "second attempt"})
 
-    assert not any(
-        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
-        for e in events
-    ), "a later malformed attempt must not poison the record the hook already wrote"
-    final = events[-1]
-    assert final.type == "final"
-    assert final.status == SessionStatus.AWAITING_APPROVAL
-    assert final.status != SessionStatus.CLASSIFIED_FAILURE
-    assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
-    # The hook's own record, untouched by the second observation.
+    assert refusal is not None and "another approval is already pending" in refusal
+    assert gate.publication_unrecorded is None
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "the proposal"
-    assert final.approval_summary == gate.pending_summary
-    assert "Ship changes" in (final.approval_summary or "")
+    assert gate.pending_granted_arguments == {"title": "Ship changes", "body": "the proposal"}
+    assert gate.pending_halt is True
 
 
 def test_another_gated_tools_approval_is_kept_when_a_publish_call_cannot_take_the_slot(

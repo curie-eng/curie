@@ -189,6 +189,11 @@ def build_approval_server(
             or gate is None
             or PLATFORM_PUBLISH_TOOL_NAME not in gate.required
         ):
+            if gate is not None:
+                # The body ran, so the session fails the turn closed unless
+                # something else owns it (#2294). A gateless session is the
+                # session's own check.
+                gate.refuse_publication(_NO_PUBLICATION_GATE)
             return _approval_error(
                 "No managed repository workspace is mounted at /workspace; "
                 "publication cannot be requested from this session."
@@ -437,6 +442,9 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
 # ``pending_summary``, built by ``summarize_tool_call``).
 _HOOK_STOP_REASON = "Paused for human approval: an approval-required tool call was denied."
 _QUESTIONS_STOP_REASON = "The questions are posted on the ticket, so this session has ended."
+_NO_PUBLICATION_GATE = (
+    "the session carries no publication approval gate, so the request could not be recorded"
+)
 _PUBLISH_STOP_REASON = "Paused for human approval: the publication request is recorded."
 # The publish_changes tool result once the request is recorded. The PostToolUse
 # halt normally ends the turn before the model reads it.

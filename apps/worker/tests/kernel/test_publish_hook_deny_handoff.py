@@ -1,29 +1,30 @@
 """A bundle-denied publication through the worker's completion path (ADR 0286, #5785).
 
-``tests/vectors/publish-hook-deny-turn.json`` pins what the runner emits on
-the real bundled CLI when a bundle PreToolUse hook denies the first
-``publish_changes`` call and allows the corrected one
-(runner/tests/test_publish_hook_deny_real_cli.py): the turn's frames and the
-title and body the runner's gate holds, which ``/v1/snapshot`` returns. This
-case replays both through the real kernel and its publication path: the
-frames from the conftest runner, the gate's title and body from the snapshot.
+The runner turn here is real: the real bundled Claude CLI, the runner's
+session and approval wiring, and a local bundle whose hooks.json denies the
+first ``publish_changes`` body and allows the corrected one
+(``runner/tests/runner_publish_hook_deny_support.py``, the same turn the
+runner's case (a) asserts on). Its frames go to the real kernel through the
+conftest runner, and the title and body its gate holds are what the runner's
+``/v1/snapshot`` returns, so the worker publishes from exactly what the runner
+recorded.
 
 The worker opens exactly one publication, carrying the corrected body, and
 holds the request for approval. The body the hook refused reaches no
-publication request.
+publication request. Red with the runner fix reverted: the runner records the
+refused body on sight of the first call, so that is the body the worker opens.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from types import ModuleType
 
 import pytest
-from aci_protocol import OutboundEvent, parse_ndjson
-from aci_protocol.version import PROTOCOL_VERSION
 
 from .test_work_item_early_stop import (
     ISSUE_PROMPT,
@@ -36,20 +37,20 @@ from .test_work_item_early_stop import (
     _Workspace,
 )
 
-VECTOR = json.loads(
-    (
-        Path(__file__).resolve().parents[4] / "tests" / "vectors" / "publish-hook-deny-turn.json"
-    ).read_text(encoding="utf-8")
-)
+_RUNNER_TESTS = Path(__file__).resolve().parents[4] / "runner" / "tests"
 
 
-def _frames(pinned: list[dict[str, Any]]) -> list[OutboundEvent]:
-    lines = "".join(json.dumps({**frame, "version": PROTOCOL_VERSION}) + "\n" for frame in pinned)
-    return list(parse_ndjson(lines))
+def _support(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    monkeypatch.syspath_prepend(str(_RUNNER_TESTS))
+    import runner_publish_hook_deny_support as support
+
+    return support
 
 
-def _patch_runner_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The runner's /v1/snapshot answer: its gate's pinned title and body."""
+def _patch_runner_snapshot(
+    h: object, monkeypatch: pytest.MonkeyPatch, *, title: str, body: str
+) -> None:
+    """The runner's /v1/snapshot answer: its gate's title and body."""
 
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
 
@@ -60,8 +61,8 @@ def _patch_runner_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
             patch=b"diff --git a/README.md b/README.md\n",
             changed_paths=("README.md",),
             contains_workflow_files=False,
-            publication_title=VECTOR["publication"]["title"],
-            publication_body=VECTOR["publication"]["body"],
+            publication_title=title,
+            publication_body=body,
         )
 
     monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)  # type: ignore[attr-defined]
@@ -72,9 +73,20 @@ def _patch_runner_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_the_corrected_publication_is_the_one_the_worker_opens(
-    make_harness, monkeypatch: pytest.MonkeyPatch
+    make_harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One publication, the corrected body, and the request held for approval."""
+
+    support = _support(monkeypatch)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    turn = support.run_publish_turn(
+        tmp_path,
+        monkeypatch,
+        workspace=support.workspace_with_change(tmp_path),
+        hook_command=support.scripted_hook(tmp_path),
+        script=[support.REFUSED_BODY, support.CORRECTED_BODY],
+    )
+    gate = turn.gate
 
     async def exercise() -> None:
         publications = _PublicationApi()
@@ -85,8 +97,13 @@ def test_the_corrected_publication_is_the_one_the_worker_opens(
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
-            _patch_runner_snapshot(h, monkeypatch)
-            h.runner.turn_scripts = [_frames(VECTOR["runner_frames"])]
+            _patch_runner_snapshot(
+                h,
+                monkeypatch,
+                title=gate.publication_title or "",
+                body=gate.publication_body or "",
+            )
+            h.runner.turn_scripts = [list(turn.events)]
             h.runner.default_script = [_done("default script must not run")]
 
             await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
@@ -96,10 +113,14 @@ def test_the_corrected_publication_is_the_one_the_worker_opens(
             assert len(h.runner.opened) == 1
             [request] = publications.creates
             payload = request.to_json()  # type: ignore[attr-defined]
-            assert payload["title"] == VECTOR["publication"]["title"]
-            assert payload["body"] == VECTOR["publication"]["body"]
-            assert VECTOR["refused_body"] not in json.dumps(payload)
+            assert payload["title"] == support.TITLE
+            assert payload["body"] == support.CORRECTED_BODY
+            assert support.REFUSED_BODY not in json.dumps(payload)
             assert items.finishes == []
             assert "hold_for_approval" in items.calls
 
     asyncio.run(exercise())
+    # The runner ran the turn the handoff is about: two calls, the first denied.
+    assert [call for call, _ in turn.emitted] == [support.call_id(0), support.call_id(1)]
+    # Leave no runner test helper importable by bare name for later tests.
+    sys.modules.pop("runner_publish_hook_deny_support", None)

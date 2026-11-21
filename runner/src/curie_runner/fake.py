@@ -1234,12 +1234,17 @@ class FakeModelSession:
                 # The in-process ``publish_changes`` body, which the CLI runs
                 # only once every PreToolUse decision allowed the call.
                 gate = self._approval_gate
-                refusal = (
-                    gate.record_publication(dict(block.input))
-                    if PLATFORM_PUBLISH_TOOL_NAME in gate.required
-                    else "No managed repository workspace is mounted at /workspace; "
-                    "publication cannot be requested from this session."
-                )
+                if PLATFORM_PUBLISH_TOOL_NAME in gate.required:
+                    refusal = gate.record_publication(dict(block.input))
+                else:
+                    gate.refuse_publication(
+                        "the session carries no publication approval gate,"
+                        " so the request could not be recorded"
+                    )
+                    refusal = (
+                        "No managed repository workspace is mounted at /workspace; "
+                        "publication cannot be requested from this session."
+                    )
                 if gate.pending_halt:
                     # The approval hook's PostToolUse halt after the body ran.
                     answer = refusal or "Publication requested."

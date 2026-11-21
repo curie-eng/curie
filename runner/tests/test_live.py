@@ -1540,9 +1540,9 @@ def test_live_publish_with_both_gate_layers_pauses_awaiting_approval(
 ) -> None:
     """L1, the production shape: hook + can_use_tool wired.
 
-    The publish call is denied before execution, recorded once, and the turn ends
-    awaiting-approval carrying the trusted permission-gate provenance the worker
-    keys the publication path on.
+    Both allow the publish call, its tool body records it once, and the turn
+    ends awaiting-approval carrying the trusted permission-gate provenance the
+    worker keys the publication path on.
     """
 
     runner, gate = _publish_runner("live-publish-gated", gated=True)
@@ -1558,31 +1558,24 @@ def test_live_publish_with_both_gate_layers_pauses_awaiting_approval(
     assert final.approval_gate_kind == "permission"
     assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert gate.publication_title
-    # A gate layer denied the call and asked the CLI to stop the turn.
+    # The tool body recorded it and the PostToolUse halt stopped the turn.
     assert gate.pending_halt is True
-    # And therefore no layer missed it. The real SDK streams the ToolUseBlock
-    # BEFORE dispatching the PreToolUse hook, so the stream observer writes the
-    # record first even here -- "who wrote it first" must NOT be what the warning
-    # keys on, or it fires on the fully-gated production path (observed live).
-    assert not any(
-        "fallback" in record.getMessage().lower() for record in caplog.records
-    ), caplog.text
 
 
 @pytest.mark.skipif(
     not (_HAS_CRED or _OPENROUTER_KEY),
     reason="no live credential (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY / OPENROUTER_API_KEY)",
 )
-def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
+def test_live_publish_without_gate_layers_still_pauses_via_the_tool_body(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """L2, the observed failing shape (#2294): neither gate layer is wired.
 
     With no hook and no permission callback the session runs bypassPermissions,
-    so the in-process tool body executes and returns its defensive ``is_error``
-    and the turn ends clean. The runner-owned stream observer is then the only
-    thing that can record the pending approval -- before #2294 this finalized
-    DONE with nothing to approve.
+    so the in-process tool body executes. The body is the one recording path:
+    it records the pending approval and asks for the halt, so the turn parks
+    awaiting approval even with no hook to end it early. Before #2294 this
+    finalized DONE with nothing to approve.
     """
 
     runner, gate = _publish_runner("live-publish-ungated", gated=False)
@@ -1599,16 +1592,8 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
     assert final.approval_gate_kind == "permission"
     assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert gate.publication_title
-    # Nothing in this path may claim a halt the runner never requested -- and
-    # that absence is precisely what proves neither gate layer ever denied it.
-    assert gate.pending_halt is False
-    # So the operator-visible warning MUST fire here: a layer that was supposed
-    # to decide did not.
-    assert any(
-        "publication" in record.getMessage().lower()
-        and "fallback" in record.getMessage().lower()
-        for record in caplog.records
-    ), caplog.text
+    # The tool body recorded it and asked for the halt.
+    assert gate.pending_halt is True
 
 
 # --------------------------------------------------------------------------- #

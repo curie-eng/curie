@@ -2450,13 +2450,19 @@ class SessionRunner:
         model why it could not.
         """
 
-        del state
         gate = self._approval_gate
         if self._questions_posted():
             # ADR 0286 decision 2 (#5785): a posted question round ends the
             # request, so a publication call beside the ask is not one to record.
             return False
-        return gate is not None and gate.publication_attempted
+        if gate is None:
+            # No gate, so no hook of the runner's own and no body that can
+            # record: any publication call the model made is unrecordable.
+            # A read-only turn captures no request (RUNNER-TOOL-ACCESS-3).
+            return state.tool_access is None and any(
+                name == PLATFORM_PUBLISH_TOOL_NAME for _, name, _, _ in state.tool_results
+            )
+        return gate.publication_attempted
 
     def _log_publication_not_carried(self, state: TurnState, final: Final) -> None:
         """Warn when a parked turn carries a DIFFERENT approval than the publish.
@@ -2507,7 +2513,12 @@ class SessionRunner:
 
     def _publication_unrecorded_reason(self) -> str | None:
         gate = self._approval_gate
-        return gate.publication_unrecorded if gate is not None else None
+        if gate is None:
+            return (
+                "the session carries no publication approval gate, so the"
+                " request could not be recorded"
+            )
+        return gate.publication_unrecorded
 
     def _publication_unrecorded_lines(self, state: TurnState, final: Final) -> list[str]:
         """The fail-closed error+final pair for an unrecordable publication (#2294).
