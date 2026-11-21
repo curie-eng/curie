@@ -395,6 +395,7 @@ async def bind_completion_contract(
     fake_model: bool = False,
     delay: Delay = anyio.sleep,
     deadline_s: float = CONTRACT_DEADLINE_SECONDS,
+    on_questions_posted: Callable[[], None] | None = None,
 ) -> BoundContract:
     """Discover this execution's contract from the injected issue read capability.
 
@@ -404,7 +405,8 @@ async def bind_completion_contract(
     contract with nothing (the process then constructs no model session).
     An implementation contract that offers a rule proposal also comes back
     with the ``propose_rule`` handler (ADR 0287, #5796), except for the fake
-    model (``fake_model``), which never gets one.
+    model (``fake_model``), which never gets one. ``on_questions_posted`` is
+    what ``ask_questions`` calls once its round is posted, to end the turn.
     """
 
     if issue_read is None:
@@ -429,6 +431,8 @@ async def bind_completion_contract(
 
     return BoundContract(
         contract,
-        question_handler=questions_handler(urls.questions, token),
+        question_handler=questions_handler(
+            urls.questions, token, on_posted=on_questions_posted
+        ),
         rule_handler=rule_handler,
     )

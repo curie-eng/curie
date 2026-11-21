@@ -546,7 +546,13 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             return {}
         # A policy-bearing bundle must classify every MCP call in this hook;
         # unlike can_use_tool, PreToolUse cannot be shadowed by another allow.
-        if gate.tool_policy is None and tool_name not in gate.required:
+        # A posted question round (ADR 0286 decision 11) refuses every tool,
+        # gated or not, so the hook decides even for an ungated one.
+        if (
+            gate.tool_policy is None
+            and tool_name not in gate.required
+            and not gate.questions_posted
+        ):
             return {}
 
         raw_input = _hook_field(hook_input, "tool_input")

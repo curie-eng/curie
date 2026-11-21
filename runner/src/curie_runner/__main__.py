@@ -1617,7 +1617,13 @@ def build_runner(
             reason: str | None = None
             try:
                 bound_contract = await bind_completion_contract(
-                    issue_read, fake_model=fake_model
+                    issue_read,
+                    fake_model=fake_model,
+                    # ADR 0286 decision 11: a posted round ends the turn
+                    # through the approval halt.
+                    on_questions_posted=(
+                        approval_gate.halt_for_questions if approval_gate is not None else None
+                    ),
                 )
             except ContractUnavailable as exc:
                 reason = exc.reason

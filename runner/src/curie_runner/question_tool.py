@@ -21,6 +21,7 @@ import asyncio
 import logging
 import re
 import unicodedata
+from collections.abc import Callable
 from typing import Any
 
 import aiohttp
@@ -151,8 +152,17 @@ def _render_posted(payload: Any) -> dict[str, Any]:
     )
 
 
-def questions_handler(url: str, token: str) -> ResultHandler:
+def questions_handler(
+    url: str, token: str, *, on_posted: Callable[[], None] | None = None
+) -> ResultHandler:
     """The handler of ``ask_questions``, closed over the route and capability.
+
+    ``on_posted`` runs once the route answers 200, a first post or a replay of
+    the same body: the round is posted, so the session must end (ADR 0286
+    decisions 2 and 11). The runner passes the approval gate's
+    ``halt_for_questions``, which stops the turn before the model's next tool
+    call. A refusal, a 503 or a transport failure posts nothing and does not
+    halt.
 
     Calls run one at a time. The route lets a retry of a round still
     ``posting`` write again (the lost-response path), so two parallel calls
@@ -191,6 +201,8 @@ def questions_handler(url: str, token: str) -> ResultHandler:
         except ValueError:
             payload = None
         if status == 200:
+            if on_posted is not None:
+                on_posted()
             return _render_posted(payload)
         if status == 409:
             code = _code(payload)

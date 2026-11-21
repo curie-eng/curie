@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 from curie_api.workitems.lifecycle import RetryConditionFact, WorkItemConflict, WorkItemOutcome
 
 from .. import (
+    factory_questions,
     memory_rules_context,
     personal_execution,
     requester_instruction_context,
@@ -420,7 +421,14 @@ async def get_work_item_request(
     row = await workitem_dispatch.get_request(session, request_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": "not_found"})
-    return workitem_dispatch.request_view(row)
+    view = workitem_dispatch.request_view(row)
+    # ADR 0286 decision 2 (#5785): the worker does not re-prompt a request
+    # whose question round is posted, since asking ends it.
+    view["questions_posted"] = (
+        await factory_questions.question_ending(session, row.work_item_id, row.id)
+        == factory_questions.QUESTIONS_ASKED
+    )
+    return view
 
 
 @router.post("/{work_item_id}/cancel")

@@ -151,6 +151,26 @@ async def _bind_publication_context(
     return event.model_copy(update={"publication_context": context}), remaining_s
 
 
+async def _continuation_refused(self: Kernel, run: WorkItemRun) -> str | None:
+    """Why an unpublished turn must not be re-prompted, else None.
+
+    The request status when it is readable and not running, or
+    ``questions_asked`` when the API recorded this request's question round as
+    posted (#5785). An unreadable request is re-prompted, as before.
+    """
+
+    if self._work_items is None:
+        return None
+    try:
+        async with asyncio.timeout(constants._REQUEST_STATUS_READ_TIMEOUT_S):
+            view = await self._work_items.get_request(run.request_id)
+    except (WorkItemConflict, WorkItemTransportError, TimeoutError):
+        return None
+    if view.status != "running":
+        return view.status
+    return "questions_asked" if view.questions_posted else None
+
+
 async def _request_not_running(self: Kernel, run: WorkItemRun) -> str | None:
     """The request status when it is readable and not running, else None."""
 
@@ -217,8 +237,10 @@ async def _continue_unpublished(
     if left is not None and left <= constants._MIN_ATTEMPT_BUDGET_S:
         return outcome
     # #4191: the request status is the authority for a requested cancel; a
-    # cancelled request is not re-prompted.
-    status = await self._request_not_running(run)
+    # cancelled request is not re-prompted. ADR 0286 decision 2: neither is a
+    # request whose question round the API recorded as posted, since asking
+    # ends it. A refused or failed ask posted nothing and still continues.
+    status = await self._continuation_refused(run)
     if status is not None:
         logger.info("work-item continuation skipped for %s: request %s", qevent.event_id, status)
         return outcome
