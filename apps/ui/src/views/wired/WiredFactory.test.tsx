@@ -291,6 +291,18 @@ describe("WiredFactory (#4102)", () => {
     }
   });
 
+  it("keeps each lane at least 200px wide and scrolls the lanes instead of shrinking them (#5174)", async () => {
+    vi.mocked(listWorkItems).mockResolvedValue(list([outcome({ state: "queued" })]));
+    renderView();
+    await screen.findAllByTestId("factory-card");
+
+    // The lane sections sit in the lane grid, which sits in its wrapper.
+    const grid = lane("queued").parentElement!;
+    expect(grid.style.gridTemplateColumns).toBe("repeat(4, minmax(200px, 1fr))");
+    const wrap = grid.parentElement!;
+    expect(wrap.style.overflowX).toBe("auto");
+  });
+
   it("omits the cancelled line when nothing is cancelled", async () => {
     vi.mocked(listWorkItems).mockResolvedValue(list([outcome()]));
     renderView();
