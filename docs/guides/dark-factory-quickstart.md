@@ -214,8 +214,12 @@ authorized human. On GitHub this requires repository write or admin access;
 on GitLab it requires Developer access or higher; on Jira use the allowed
 `accountId`. Wait for the status comment and linked PR or merge request.
 Read the issue's final `Status:` line after CI. An open PR or merge request
-alone is not completion. The [user guide](factory-user-guide.md) shows a
-GitHub example.
+alone is not completion. If the issue stays queued, or a work pod stays
+Pending, do not just wait: a pod that reports `Insufficient memory` will never
+schedule on that node. See [local kind capacity and
+recovery](factory-quickstart-reference.md#local-kind-capacity-and-recovery) for
+the inspection and recovery steps. The [user guide](factory-user-guide.md)
+shows a GitHub example.
 
 ## Clean up
 
