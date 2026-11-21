@@ -443,6 +443,39 @@ def test_trigger_label_binding_repost_other_label_is_refused(
     assert _github_channels(client, agent[0]) == [(REPO, FAST)]
 
 
+def _remove(client: TestClient, agent_id: str, kind: str, address: str) -> Any:
+    return client.request(
+        "DELETE",
+        f"/agents/{agent_id}/channels",
+        headers=_headers(),
+        params={"kind": kind, "address": address},
+    )
+
+
+def test_trigger_label_binding_relabels_a_sole_surface_through_a_temporary_one(
+    github_install: tuple[TestClient, TestClient],
+) -> None:
+    """The docs/operations.md step for an agent whose only surface stays on its
+    repository under a new label. Neither direct write works: adding the new
+    label is the one-surface-per-location 409 and removing the old binding is
+    the last-binding 409. A temporary surface at another location, under a
+    label no issue carries, lets the binding go and come back relabelled."""
+
+    client, _rival = github_install
+    old, new, hold = "acme-triage", "acme-implement", "acme-relabel-hold"
+    agent = _agent(client, _github(label=old))
+
+    assert _add(client, agent[0], _github(label=new)).status_code == 409
+    assert _remove(client, agent[0], "github", REPO).status_code == 409
+    assert _github_channels(client, agent[0]) == [(REPO, old)]
+
+    assert _add(client, agent[0], _github(OTHER_REPO, hold)).status_code == 201
+    assert _remove(client, agent[0], "github", REPO).status_code == 204
+    assert _add(client, agent[0], _github(label=new)).status_code == 201
+    assert _remove(client, agent[0], "github", OTHER_REPO).status_code == 204
+    assert _github_channels(client, agent[0]) == [(REPO, new)]
+
+
 # --- refused writes -------------------------------------------------------------
 
 

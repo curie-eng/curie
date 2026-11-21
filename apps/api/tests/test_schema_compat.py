@@ -71,16 +71,13 @@ CONTRACT = "0041"
 # dynamic approval answers require the 0156 answer gate. The factory Slack
 # progress loop reads the 0157 thread tables. GitHub host namespaces require
 # 0158; owner tuple reads require 0159; personal custody reads and the
-# enrollment_fenced cause require 0160; agent version reads select the 0162
-# result policy columns, factory CI observations require the 0163 table,
-# cached facts and request delivery require the 0164 tables, and Slack
-# kickoff thread origin reads require 0166.
+# enrollment_fenced cause require 0160; factory CI observations require the
+# 0163 table, cached facts and request delivery require the 0164 tables, and
+# Slack kickoff thread origin reads require 0166.
 # Owner coding profiles and tenant policies require 0165, which stays below
-# this floor. Execution request reads select the 0167 completion contract
-# columns. Intake notice storage requires 0168, which stays below this floor.
+# this floor. Intake notice storage requires 0168, which stays below this floor.
 # Requester selection columns require 0169, which stays below this floor.
 # Refusal posts require 0170, which stays below this floor.
-# Triage handoff storage requires 0171, which stays below this floor.
 # Factory retry allowance columns require 0172, which stays below this floor.
 # Factory resource gate columns require 0174, which stays below this floor.
 # Publication recovery requests require 0175, which stays below this floor.
@@ -94,7 +91,8 @@ CONTRACT = "0041"
 # Factory question rounds require 0184.
 # Learned memory rules require 0185.
 # The plain feedback cap requires 0186.
-APP_SCHEMA_MIN = "0186"
+# The triage schema removal, a contract revision, requires 0188, the floor.
+APP_SCHEMA_MIN = "0188"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -127,7 +125,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
-    assert HEAD == "0186"
+    assert HEAD == "0188"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -159,6 +157,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0184"] == KIND_EXPAND
     assert kinds["0185"] == KIND_EXPAND
     assert kinds["0186"] == KIND_EXPAND
+    assert kinds["0188"] == KIND_CONTRACT
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
@@ -258,6 +257,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0184",
             "0185",
             "0186",
+            "0188",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -328,8 +328,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0184",
             "0185",
             "0186",
+            "0188",
         }
-    assert current_revision() == "0186"
+    assert current_revision() == "0188"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -434,16 +435,13 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # dynamic approval answers require the 0156 answer gate. Factory Slack
     # progress reads the 0157 tables. GitHub host namespaces require 0158,
     # execution owner reads require 0159, personal custody reads and
-    # enrollment fences require 0160, agent version reads select the 0162
-    # result policy columns, factory CI observations require the 0163 table,
-    # cached facts and request delivery require the 0164 tables, and Slack
-    # kickoff thread origin reads require 0166.
+    # enrollment fences require 0160, factory CI observations require the 0163
+    # table, cached facts and request delivery require the 0164 tables, and
+    # Slack kickoff thread origin reads require 0166.
     # Owner coding profiles and tenant policies require 0165, which stays below
-    # this floor. Execution request reads select the 0167 completion contract
-    # columns. Intake notice storage requires 0168, which stays below this
+    # this floor. Intake notice storage requires 0168, which stays below this
     # floor. Requester selection columns require 0169, which stays below this
     # floor. Refusal posts require 0170, which stays below this floor.
-    # Triage handoff storage requires 0171, which stays below this floor.
     # Factory retry allowance columns require 0172, which stays below this
     # floor. Factory resource gate columns require 0174, which stays below this
     # floor. Publication recovery requests require 0175, which stays below this
@@ -457,7 +455,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # Factory question rounds require 0184.
     # Learned memory rules require 0185.
     # The plain feedback cap requires 0186.
-    for revision in sorted(known - {"0186"}):
+    # The triage schema removal, a contract revision, requires 0188, the floor.
+    for revision in sorted(known - {"0188"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -500,7 +499,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0183", window, known) is False
     assert can_serve("0184", window, known) is False
     assert can_serve("0185", window, known) is False
-    assert can_serve("0186", window, known) is True
+    assert can_serve("0186", window, known) is False
+    assert can_serve("0188", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

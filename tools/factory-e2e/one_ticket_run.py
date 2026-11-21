@@ -71,7 +71,7 @@ def observation_sql(issue: int) -> str:
         f"FROM curie.work_items w WHERE w.tracker_issue_id = '{number}'),"
         "'requests',(SELECT coalesce(json_agg(json_build_object("
         "'id',r.id,'sequence',r.sequence,'status',r.status,"
-        "'terminal_cause',r.terminal_cause,'completion_contract',r.completion_contract,"
+        "'terminal_cause',r.terminal_cause,'execution_kind',r.execution_kind,"
         "'reply_target_kind',r.reply_target_kind,'created_at',r.created_at,"
         "'terminal_at',r.terminal_at) ORDER BY r.sequence),'[]'::json) "
         "FROM curie.execution_requests r JOIN curie.work_items w ON w.id=r.work_item_id "

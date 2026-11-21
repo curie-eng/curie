@@ -6,10 +6,10 @@
         "workflow/result.json": "{}"
       },
       "api_status": 422,
-      "api_body_text": "{\"detail\":{\"detail\":\"bundle failed validation\",\"errors\":[{\"code\":\"bundle.result_declaration_retired\",\"message\":\"workflow/result.json is no longer supported: the separate triage flow was removed. Delete the file; the default factory bundle investigates and asks questions on the ticket itself.\",\"location\":\"workflow/result.json\"}]}}",
+      "api_body_text": "{\"detail\":{\"detail\":\"bundle failed validation\",\"errors\":[{\"code\":\"bundle.result_declaration_retired\",\"message\":\"workflow/result.json is no longer supported: the separate triage flow was removed. An agent that is already deployed with this declaration must have its binding removed or replaced first, or it would run as an implementation agent on its old trigger label; see Before upgrading: an existing triage binding in docs/operations.md. For a new upload, delete the file and deploy again.\",\"location\":\"workflow/result.json\"}]}}",
       "cli_exit_code": 1,
       "cli_stdout": {
-        "error": "uploading the bundle failed with 422 Unprocessable Entity: {\"detail\":{\"detail\":\"bundle failed validation\",\"errors\":[{\"code\":\"bundle.result_declaration_retired\",\"message\":\"workflow/result.json is no longer supported: the separate triage flow was removed. Delete the file; the default factory bundle investigates and asks questions on the ticket itself.\",\"location\":\"workflow/result.json\"}]}}",
+        "error": "uploading the bundle failed with 422 Unprocessable Entity: {\"detail\":{\"detail\":\"bundle failed validation\",\"errors\":[{\"code\":\"bundle.result_declaration_retired\",\"message\":\"workflow/result.json is no longer supported: the separate triage flow was removed. An agent that is already deployed with this declaration must have its binding removed or replaced first, or it would run as an implementation agent on its old trigger label; see Before upgrading: an existing triage binding in docs/operations.md. For a new upload, delete the file and deploy again.\",\"location\":\"workflow/result.json\"}]}}",
         "fix": null
       }
     },

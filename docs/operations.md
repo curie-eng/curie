@@ -3038,7 +3038,10 @@ Every request the factory admits from a labelled ticket runs under the implement
 completion contract and is served the rules pinned at admission; there is no separate
 triage path. A bundle that still carries the retired result declaration (a result.json
 file in its workflow directory) is refused at upload, push, deploy and promote with
-`bundle.result_declaration_retired`: delete the file and deploy again. The rule text rides the implementer's system prompt, so
+`bundle.result_declaration_retired`: delete the file and deploy again. An agent that is
+already deployed with it needs the steps in "Before upgrading: an existing triage
+binding" in the factory triage removal section before the upgrade.
+The rule text rides the implementer's system prompt, so
 the conversation transcript and its native checkpoint can retain it, under the transcript's
 own access controls and expiry and not the WorkItem snapshot's, as for requester
 preferences. A rule removed after a WorkItem was admitted can therefore remain in that
@@ -4411,6 +4414,73 @@ The work items API and `curie <tier> work-items --json` (schema
 
 A downgrade restores the GitHub columns and refuses while any row names a
 tracker or code host other than GitHub.
+
+### Factory triage removal (Alembic revision 0188)
+
+Revision 0188 is a contract migration. It drops schema that only integration
+branch installs carry: the separate triage path's tables and columns. No
+release ever shipped them, so an install that came from a released version has
+nothing to lose. Because it is a contract revision, an upgrade that has it
+pending needs `curie cluster upgrade --forward-only`, or
+`api.migrate.forwardOnly=true` on a direct `helm upgrade`. Without it the
+schema check refuses the upgrade before any mutation. A local stack runs the
+same check in its one-shot `curie-migrate` service, so follow the
+`CURIE_SCHEMA_FORWARD_ONLY=true` recipe at the end of the Slack route identity
+migration section above.
+
+#### Before upgrading: an existing triage binding
+
+An older triage example told operators to bind its bundle to a trigger label of
+their own choosing. An install that did so holds an agent whose deployed bundle
+carries `workflow/result.json`. <!-- doclint:ignore-line -->
+The platform refuses that declaration only at
+deploy, an already deployed version is not re-validated, and the intake still
+admits an issue that carries a configured trigger label. Without the steps
+below, that agent would run as an implementation agent on its old trigger
+label. Do them before the upgrade:
+
+1. Find the agent. The CLI has no command that lists a deployed bundle's files,
+   so check each factory agent in turn. `curie cluster versions <agent>` lists
+   its immutable versions, and `curie cluster surfaces <agent>` lists its
+   bindings with their trigger labels. An agent is the one you want when its
+   deployed bundle carries `workflow/result.json`, <!-- doclint:ignore-line -->
+   which you can confirm from
+   the repository or directory the bundle was deployed from, or when one of its
+   bindings uses a label that was chosen for triage.
+2. Stop its work. Remove the trigger label from every open issue that carries
+   it. Let in-flight runs finish, or cancel them with
+   `curie cluster kill <agent> --yes`, which stops the agent's runs. Then
+   confirm the agent has no queued or running request: `curie cluster work-items
+   --agent <agent>` lists its work items, and
+   `curie cluster observability runs --agent-id <agent id>` lists its recent
+   runs. Both must show nothing unfinished. There is no single command that
+   reports queued requests, so repeat the check until it stays clean.
+3. Remove the binding, or replace the bundle. The API refuses to remove an
+   agent's final surface, and an agent serves a tracker location through one
+   surface, so a binding is never relabelled in place.
+   To remove the binding, run
+   `curie cluster surfaces <agent> --remove <KIND=ADDRESS>`, using a binding
+   that `curie cluster surfaces <agent>` printed. When it is the agent's only
+   surface, delete the agent with `curie cluster delete <agent> --yes` instead.
+   To replace the bundle and keep the agent, write the implementation bundle
+   with `curie example dark-factory render --out <dir>`, then run these in
+   order:
+   1. When the old binding is the agent's only surface, add a temporary one
+      at another location of the same kind (another repository for GitHub),
+      under a label no issue carries, so it admits nothing:
+      `curie cluster surfaces <agent> --add <KIND=OTHER_ADDRESS> --label <unused label>`.
+   2. Remove the old binding:
+      `curie cluster surfaces <agent> --remove <KIND=ADDRESS>`.
+   3. Deploy the implementation bundle:
+      `curie cluster deploy --plugin-dir <dir> --agent <agent>`.
+   4. Bind the agent again under a different label, on the same location or
+      another one:
+      `curie cluster surfaces <agent> --add <KIND=ADDRESS> --label <new label>`.
+   5. Remove the temporary surface, if you added one:
+      `curie cluster surfaces <agent> --remove <KIND=OTHER_ADDRESS>`.
+   No binding keeps the old label.
+4. Upgrade with `curie cluster upgrade --to <version> --forward-only`, or set
+   `api.migrate.forwardOnly=true` on a direct `helm upgrade`.
 
 ### Before you upgrade, check what would be removed
 
