@@ -26,11 +26,19 @@ For Claude Code, use `--agent claude-code`. Other supported clients are `copilot
 `gemini` and `cursor`. The same [client directories and refresh behavior](factory-preparation.md#get-the-skill)
 apply, with the folder named `review-pr`. Add `--global` for use across
 repositories, `--dir DIR` for an exact existing project directory, or `--dry-run`
-to inspect the destinations. The command installs both `prepare-factory-ticket`
-and `review-pr` offline, with only Markdown payloads.
+to inspect the destinations. The command installs the bundled factory skills,
+including `prepare-factory-ticket` and `review-pr`, offline with only Markdown
+payloads.
 It requires no Python, Docker or running Curie deployment. Project tests still
 require the project's tooling. Installer receipts prove copied files, not client
 activation or access to a factory.
+
+Claude Cowork uses skills uploaded to the Claude account, not files installed in
+Claude Code's local `.claude/skills/` directory. To use this skill in Cowork,
+ZIP the `review-pr/` folder with its `SKILL.md` and both `references/` files,
+then upload it in Claude under Customize > Skills > + Create skill > Upload a
+skill. Enable the uploaded skill before opening a new Cowork task. The CLI
+installer's `--agent claude-code` option does not upload a skill to Cowork.
 
 In Codex, refresh the session if necessary, then start with:
 
@@ -60,10 +68,26 @@ reapply customizations. There is no automatic update checker or version resolver
 
 The agent pins the PR head and base, preserves your checkout and explains:
 
-* The components, their files and how calls or data move between them.
-* Significant diff changes and observable changes to behavior.
-* New test scenarios and assertions, relevant existing regression tests, and gaps.
-* How the implementation meets the issue's criteria, including deferred checks.
+* Whether the PR is a fix, documentation change, feature slice or other type,
+  with its purpose, one line summary and related feature context.
+* Numbered test scenarios with a one line behavior summary, linked test,
+  actual assertion and execution status. End to end tests stay separate from
+  plan tests, unit tests, author reported live runs and current head CI evidence.
+* Changed, new and removed components, each with a brief account of its role.
+* A sequence diagram for material runtime flows and fallback paths. The agent
+  uses Mermaid where it renders and otherwise draws a wider monospaced swimlane
+  inline, with aligned actor columns, labeled alternate groups and separate
+  numbered state notes.
+* Added unit scenarios and algorithm changes. Schema changes appear in a
+  before and after table, with every new table and all its columns inventoried,
+  followed by migration and compatibility steps. Every new API is listed with
+  its inputs, responses, errors, authorization and intended consumer.
+* Security, production and operational consequences, with links to specific
+  diff lines and an explicit account of remaining gaps. Findings come near the
+  end, after the purpose, architecture, behavior and test evidence.
+
+The review says when a category does not apply. It does not call a plan test
+end to end proof or assume a passing check establishes a live outcome.
 
 Ask to inspect a component more deeply at any point. For example:
 
