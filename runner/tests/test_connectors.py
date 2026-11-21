@@ -888,12 +888,14 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
         PROGRESS_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
         QUESTION_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
     )
 
     assert _published_live_tool_names(mounted) == platform_tool_names(state_server_mounted=True) - {
         PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
         QUESTION_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
     }
 
@@ -910,6 +912,7 @@ def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch)
         ISSUE_TOOL_NAME,
         PROGRESS_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
         platform_tool_names,
     )
     from runner_boot_session import initialized_session
@@ -955,6 +958,7 @@ def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch)
     assert ISSUE_TOOL_NAME in published
     assert published == platform_tool_names(state_server_mounted=True) - {
         PROGRESS_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
     }
 
@@ -987,12 +991,14 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
         PROGRESS_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
         QUESTION_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
     )
 
     assert published == platform_tool_names(state_server_mounted=False) - {
         PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
         QUESTION_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
     }
     assert not any(name.startswith(f"mcp__{STATE_SERVER_NAME}__") for name in published)
@@ -1232,7 +1238,8 @@ def test_undeclared_stdio_does_not_receive_hosted_connector_secret(
     monkeypatch.delenv("CURIE_STATE_URL", raising=False)
     monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "example-hosted-connector-token")
     root = _bundle(
-        tmp_path, GITHUB,
+        tmp_path,
+        GITHUB,
         mcp={"mcpServers": {"unrelated": {"command": "node"}}},
     )
     config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")

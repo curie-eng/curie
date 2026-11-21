@@ -575,8 +575,9 @@ their deployed versions, and their run history. That console URL includes a
 `?api=1` parameter; leave it as-is when you open it, it's just what points
 the console at this release's Curie API. The console opens on a login screen:
 run `curie cluster console login --subject <you>` and paste the code it prints.
-The session cookie is `__Host-` prefixed and `Secure`, so browsers store it only
-over HTTPS or from `http://localhost` / a loopback host. A sealed cluster console
+The session cookie is `__Host-` prefixed and `Secure`, so browsers store it over
+HTTPS. Chrome also accepts it from `http://localhost` for local port forwarding;
+Safari requires HTTPS even on localhost. A sealed cluster console
 reached over plain HTTP from a non-loopback host cannot sign in; reach it through
 `curie cluster access` (loopback `kubectl port-forward` for the Console and Langfuse, for as long as it runs) or a kind `extraPortMappings` entry on localhost, or
 serve it over HTTPS ([#3968](https://github.com/curie-eng/curie/issues/3968)).

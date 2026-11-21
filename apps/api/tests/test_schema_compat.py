@@ -91,8 +91,8 @@ CONTRACT = "0041"
 # Factory question rounds require 0184.
 # Learned memory rules require 0185.
 # The plain feedback cap requires 0186.
-# The triage schema removal, a contract revision, requires 0188, the floor.
-APP_SCHEMA_MIN = "0188"
+# The 0188 triage contract precedes the 0189 run-handoff schema floor.
+APP_SCHEMA_MIN = "0189"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -125,7 +125,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
-    assert HEAD == "0188"
+    assert HEAD == "0189"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -158,6 +158,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0185"] == KIND_EXPAND
     assert kinds["0186"] == KIND_EXPAND
     assert kinds["0188"] == KIND_CONTRACT
+    assert kinds["0189"] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
@@ -258,6 +259,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0185",
             "0186",
             "0188",
+            "0189",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -329,8 +331,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0185",
             "0186",
             "0188",
+            "0189",
         }
-    assert current_revision() == "0188"
+    assert current_revision() == "0189"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -455,8 +458,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # Factory question rounds require 0184.
     # Learned memory rules require 0185.
     # The plain feedback cap requires 0186.
-    # The triage schema removal, a contract revision, requires 0188, the floor.
-    for revision in sorted(known - {"0188"}):
+    # The 0188 triage contract precedes the 0189 run-handoff schema floor.
+    for revision in sorted(known - {"0189"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -500,7 +503,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0184", window, known) is False
     assert can_serve("0185", window, known) is False
     assert can_serve("0186", window, known) is False
-    assert can_serve("0188", window, known) is True
+    assert can_serve("0188", window, known) is False
+    assert can_serve("0189", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

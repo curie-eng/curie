@@ -260,8 +260,7 @@ def test_cancelled_status_sync_releases_claim_and_replacement_finalizes(admitted
             > 0
         )
         assert (
-            await sync_status_comments(maker, get_settings(), owner="status-owner-c", limit=1)
-            == 0
+            await sync_status_comments(maker, get_settings(), owner="status-owner-c", limit=1) == 0
         )
 
     client.portal.call(go)
@@ -694,7 +693,7 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert WAITING in body
     assert FINAL_MARKER not in body
     assert "![Curie status]" not in body
-    _assert_one_current_ask_line(body)
+    assert "Ask the factory:" not in body
     assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # Human and admission labels are never touched.
     assert {LABEL, "bug"} <= sink.issue_labels[number]
@@ -756,10 +755,10 @@ def test_a_card_url_replaces_the_checklist_as_phases_advance(
     assert "Read issue" not in body
     assert WAITING not in body
     assert marker_for(request_id) in body
-    _assert_one_current_ask_line(body)
+    assert "Ask the factory:" not in body
 
 
-def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
+def test_github_issue_status_comment_omits_pull_request_ask_line(admitted: Any) -> None:  # noqa: F811
     client, github, sink = admitted
     number = 9929
     request_id = _admit(client, github, sink, number)
@@ -770,8 +769,8 @@ def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> 
     assert "Status: QUEUED" in body
     assert WAITING in body
     assert marker_for(request_id) in body
-    _assert_one_current_ask_line(body)
-    assert body.count(ask) == 1
+    assert ask not in body
+    assert "Ask the factory:" not in body
 
 
 def _assert_one_current_ask_line(body: str) -> None:
@@ -789,11 +788,12 @@ def _assert_one_current_ask_line(body: str) -> None:
     assert f"mention @{MENTION} on this pull request" not in body
 
 
-def test_status_comment_replaces_the_previous_ask_wording(admitted: Any) -> None:  # noqa: F811
+def test_pull_request_follow_up_replaces_the_previous_ask_wording(admitted: Any) -> None:  # noqa: F811
     client, github, sink = admitted
-    request_id = _admit(client, github, sink, 9930)
+    _number, request_id = _running_revision(client, github, sink, "issuecomment-9930")
     _reconcile()
-    body = _posts(sink)[0][1] or ""
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
     old = f"Ask the factory: mention @{MENTION} on this pull request."
     seeded = body.replace(github_ask_line(MENTION), old)
     assert old in seeded and github_ask_line(MENTION) not in seeded
@@ -1280,6 +1280,8 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
     assert body.startswith("Could not complete:")
+    assert "## Run outcome" not in body
+    assert "## Additional run evidence" not in body
     assert "Details: the tool call kept failing" in body
     assert "Provider message" not in body
     assert "Cause: runner_escalated" in body
@@ -1308,6 +1310,7 @@ def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> N
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
     assert body.startswith("Could not complete: the sandbox terminated")
+    assert "## Run outcome" not in body
     assert f"Details: {detail}" in body
     assert "Provider message:" not in body
     assert "Cause: sandbox_terminated" in body
@@ -1534,6 +1537,7 @@ def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
     assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
+    assert "## Run outcome" not in body
     headline = body.splitlines()[0]
     assert headline.startswith("Could not complete:")
     if field is None:
@@ -1598,14 +1602,14 @@ def _defer_start(client: Any, request_id: uuid.UUID, times: int) -> None:
         async with client.app.state.sessionmaker() as session:
             for _ in range(times):
                 generation = await session.scalar(
-                    text(
-                        "SELECT dispatch_generation FROM curie.execution_requests "
-                        "WHERE id = :id"
-                    ),
+                    text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
                     {"id": request_id},
                 )
                 acquired = await acquire(
-                    session, request_id, owner="factory-owner", generation=generation,
+                    session,
+                    request_id,
+                    owner="factory-owner",
+                    generation=generation,
                     wake=await factory_wake(session, request_id),
                     context=None,
                     client=client.app.state.http_client,
@@ -1644,7 +1648,8 @@ def test_start_failed_comment_names_the_attempts_and_last_reason(
     assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert body.splitlines()[0] == START_FAILED_SENTENCE
+    assert body.startswith(START_FAILED_SENTENCE)
+    assert "## Run outcome" not in body
     assert "Cause: start_failed" in body
     assert "Provider message:" not in body
     assert "Status: NEEDS HUMAN" in body
@@ -2507,7 +2512,9 @@ def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
 
 @pytest.mark.parametrize("terminal", ["failed", "expired", "completed"])
 def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotently(
-    admitted: Any, terminal: str, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+    admitted: Any,  # noqa: F811
+    terminal: str,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
 ) -> None:
     import hashlib
 
@@ -2568,9 +2575,11 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
     (updated,) = _marked(sink, request_id)
     assert updated["id"] == comment["id"]
     if terminal == "completed":
-        assert updated["body"].split("\n\n")[0].rstrip("\n").splitlines()[-1] == (
-            f"Pull request merged: https://github.com/{REPO}/pull/77"
-        )
+        merged_line = f"Pull request merged: https://github.com/{REPO}/pull/77"
+        assert updated["body"].startswith("Completed:")
+        assert "## Run outcome" not in updated["body"]
+        assert updated["body"].splitlines().count(merged_line) == 1
+        assert updated["body"].index(merged_line) < updated["body"].index("Status:")
     else:
         assert f"Cause: {request['terminal_cause']}" in updated["body"]
         assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in updated["body"]
@@ -2814,6 +2823,7 @@ def test_a_running_pull_request_follow_up_hides_the_checklist_until_a_later_phas
     assert _READING in comment["body"]
     assert "Status: RUNNING" in comment["body"]
     assert _checklist_lines(comment["body"]) == []
+    assert comment["body"].rstrip().endswith(github_ask_line(MENTION))
 
     assert report(client, revision, "read_issue").status_code == 201
     _execute(
@@ -2827,8 +2837,7 @@ def test_a_running_pull_request_follow_up_hides_the_checklist_until_a_later_phas
     assert _READING in comment["body"]
     assert "Status: RUNNING" in comment["body"]
     assert _checklist_lines(comment["body"]) == []
-    for label in _NINE_STEPS:
-        assert label not in comment["body"]
+    assert "**Running · Read issue**" in comment["body"]
 
     assert report(client, revision, "plan", round=1).status_code == 201
     sink.requests.clear()
@@ -2873,6 +2882,53 @@ def test_an_unchanged_follow_up_is_answered_without_a_checklist(
     client, github, sink = admitted
     _number, revision = _running_revision(client, github, sink, fragment)
     assert report(client, revision, "plan", round=1).status_code == 201
+    _reconcile()
+    (live_comment,) = _marked(sink, revision)
+    assert "Running" in live_comment["body"]
+    assert "No progress note reported" in live_comment["body"]
+    incomplete = client.post(
+        f"/v1/work-item-progress/{revision}/handoff",
+        headers={"X-API-Key": progress_token(revision)},
+        json={
+            "next_owner": "human",
+            "next_action": "Review the feedback answer",
+            "verification": [
+                {
+                    "check": "Existing decision covers the feedback",
+                    "state": "unverified",
+                    "source": "agent_reported",
+                }
+            ],
+        },
+    )
+    assert incomplete.status_code == 422
+    handoff = client.post(
+        f"/v1/work-item-progress/{revision}/handoff",
+        headers={"X-API-Key": progress_token(revision)},
+        json={
+            "next_owner": "human",
+            "next_action": "Review the feedback answer",
+            "human_decision": "Confirm the existing decision",
+            "findings": [
+                {
+                    "summary": "Decision confirmation remains open",
+                    "owner": "human",
+                    "next_step": "Confirm the answer",
+                    "source": "agent_reported",
+                }
+            ],
+            "verification": [
+                {
+                    "check": "Existing decision covers the feedback",
+                    "command": "uv run pytest apps/api/tests/test_factory_status_comment.py",
+                    "state": "unverified",
+                    "source": "agent_reported",
+                    "acceptance_criteria": ["AC1"],
+                }
+            ],
+        },
+    )
+    assert handoff.status_code == 201, handoff.text
     detail = "No changes needed: Decisions entry 2 already records this approach."
     finished = _finish_unpublished(client, revision, cause="no_pull_request", detail=detail)
     assert finished.status_code == 200, finished.text
@@ -2881,6 +2937,13 @@ def test_an_unchanged_follow_up_is_answered_without_a_checklist(
 
     (comment,) = _marked(sink, revision)
     body = comment["body"]
+    assert body.startswith("## Run outcome\n")
+    assert "**Next owner:** human (agent reported)" in body
+    assert "**Next action:** Review the feedback answer (agent reported)" in body
+    assert "Decision confirmation remains open" in body
+    assert "**No pull request was published.**" not in body
+    assert "**AC1 — Existing decision covers the feedback:** unverified" in body
+    assert f"In response to https://github.com/{REPO}/pull/" in body
     assert "Status: ANSWERED" in body
     assert "Status: SUCCEEDED" not in body
     assert detail in body

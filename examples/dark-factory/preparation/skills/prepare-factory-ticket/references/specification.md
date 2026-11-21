@@ -9,14 +9,16 @@ This reference supplies no parser or connected deployment validator.
 ## Existing material
 
 Preserve the source structure, wording and criterion identifiers when requirements,
-scope, decisions, base, prerequisites and verification are sufficiently clear.
+scope, decisions, base, prerequisites and verification are sufficiently clear,
+except for a developer-requested, fully reviewed priority-order revision.
 These facts may be conveyed by existing sections, links to accessible repository
 material and repository evidence recorded in the local report. Literal canonical
 headings, consecutive numbering and `Verified by:` or `Runs in:` fields are not
 required in an existing issue. A missing heading is not a missing requirement.
 
 Assess every criterion with the feasibility procedure below. Use existing
-criterion identifiers or stable local report IDs without renumbering the issue.
+criterion identifiers or stable local report IDs until a reviewed revision
+renumbers them; keep the old-to-new map with the source snapshot.
 Put material proposed tests, verification requirements, prerequisites and approved
 external qualification in appropriate existing sections so the factory can read
 them. Necessary local decisions or context must be incorporated in the issue or
@@ -24,10 +26,23 @@ accessible repository material; the factory does not inherit the local session.
 
 Show a gap assessment and propose only changes needed for actual missing substance
 or conflicts. Preserve settled decisions; ask about them only when new evidence
-or an explicit change exposes a consequential conflict. If a source is sufficient,
-keep its exact title and body unchanged, save its snapshot and assessment, present
+or an explicit change exposes a consequential conflict. If a source is sufficient
+and no readability revision was requested, keep its exact title and body unchanged,
+save its snapshot and assessment, present
 it for complete review and offer the applicable handoff. Source preservation is
 not permission to select work with unresolved core verification gaps.
+
+### Priority ordering of numbered items
+
+For a new draft, order Decisions and Acceptance criteria by the review priority
+defined in the skill before assigning numbers. For an existing issue, prepare a
+separate proposed canonical revision: move whole numbered items, keeping each
+item's full description, `Verified by:` and `Runs in:` fields together. Renumber
+consecutively; update every internal mention of a moved Decision or criterion,
+including the At a glance acceptance map and any prose referring to an item ID.
+Keep a complete old-to-new ID table in the local report. Verify the mapping and
+show the full revised body for developer review before any tracker write. A
+renumbering that cannot be checked against all references remains a local draft.
 
 For local plans or discussions, preserve their established organization where
 usable, but distinguish them from a published tracker issue. Draft a new issue or
@@ -188,7 +203,10 @@ headings. Use the developer's preferred filenames and preserve existing output.
   These identify local instructions, not deployment compatibility.
 - **Readiness:** deployment readiness `unvalidated`; connected validation pending,
   with no invented report ID, manifest digest, timestamp or fingerprint.
-  Local format review is manual, not a parser result.
+  Local format review is manual, not a parser result. Separately record
+  preparation selection as eligible or blocked. For every start gate, cite its
+  source clause, required action, owner, observed completion evidence or its
+  absence, and the condition for reassessment.
 - **Checklist and unresolved register:** every missing fact, assumption or choice,
   affected section/criterion, its resolving question and relevant prerequisite
   or operator action. An empty register is not deployment validation.
@@ -271,7 +289,9 @@ After the developer approves that complete specification, offer these choices:
   may use the deployment's model budget.
 - **Keep local drafts:** make no tracker changes.
 
-Offer publish-and-start when the approved implementation scope has meaningful
+Offer publish-and-start only when no pre-implementation human review, approval,
+prerequisite merge, or other start gate remains unresolved, and the approved
+implementation scope has meaningful
 sandbox or supported CI verification, including tests to add during implementation.
 Flagged external qualification outside that scope does not block selection once
 the developer approves the boundary. If a core verification gap remains, explain

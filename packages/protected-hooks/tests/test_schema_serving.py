@@ -128,7 +128,8 @@ def graph_payload() -> dict[str, Any]:
         ("0184", False),
         ("0185", False),
         ("0186", False),
-        ("0188", True),
+        ("0188", False),
+        ("0189", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -179,11 +180,11 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     Factory question rounds require 0184.
     Learned memory rules require 0185.
     The plain feedback cap requires 0186.
-    The triage schema removal, a contract revision, requires 0188, the floor.
+    The 0188 triage contract precedes the 0189 run-handoff schema floor.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0188"
-    assert window.schema_head == "0188"
+    assert window.schema_min == "0189"
+    assert window.schema_head == "0189"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

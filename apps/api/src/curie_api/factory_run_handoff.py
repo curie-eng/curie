@@ -1,0 +1,175 @@
+"""Bounded, agent-sourced facts for a terminal tracker summary (#5771)."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Sequence
+
+from curie_internal.factory_run_handoff import RunHandoff as RunHandoff
+
+from .factory_comment_text import redact_factory_comment
+from .factory_no_change import no_change_marker_line
+
+_MARKDOWN = re.compile(r"([\\`*_{}\[\]()#+.!|>])")
+_CUSTOMER_IDENTIFIER = re.compile(
+    r"(?<![./@-])\b(?P<label>(?i:customer|client|tenant|account|organization|org))"
+    r"(?P<separator>\s*(?:[:#=]\s*|\s+))"
+    r"(?P<value>(?!(?i:to|for|needs|should|is|has|can|must|will|the|a|an|with)\b)"
+    r"[A-Za-z0-9._-]+(?:\s+[A-Z][A-Za-z0-9._-]+){0,3})\b"
+)
+
+
+def redact_tracker_text(value: str) -> str:
+    """Redact known credentials and explicit customer identifier labels."""
+
+    line = " ".join(redact_factory_comment(value).split())
+    return _CUSTOMER_IDENTIFIER.sub(
+        lambda match: f"{match['label']}{match['separator']}[REDACTED:customer_identifier]",
+        line,
+    )
+
+
+def safe_tracker_line(value: str) -> str:
+    """One inert tracker line, after the shared credential redactor."""
+
+    line = redact_tracker_text(value)
+    line = line.replace("<!--", "<\u200b!--").replace("@", "@\u200b")
+    return _MARKDOWN.sub(r"\\\1", line)
+
+
+def format_handoff(
+    handoff: RunHandoff,
+    *,
+    no_pull_request: bool,
+    platform_checks: Sequence[tuple[str, str | None, str, str]] = (),
+) -> str:
+    """Present only attributed agent claims; publication remains a platform fact."""
+
+    lines = ["## Run outcome"]
+    decision = (
+        f"{safe_tracker_line(handoff.human_decision)} (agent reported)"
+        if handoff.human_decision
+        else "None recorded"
+    )
+    if no_pull_request:
+        lines.append("**No pull request was published.**")
+    lines.extend(
+        [
+            f"**Next owner:** {handoff.next_owner} (agent reported)",
+            f"**Next action:** {safe_tracker_line(handoff.next_action)} (agent reported)",
+            f"**Human decision now:** {decision}",
+            "",
+            "### Open findings",
+        ]
+    )
+    lines.extend(
+        f"- {safe_tracker_line(item.summary)} · owner: {item.owner} · "
+        f"next: {safe_tracker_line(item.next_step)} (agent reported)"
+        for item in handoff.findings
+    )
+    if not handoff.findings:
+        lines.append("None reported; this is not a finding-free verification.")
+    lines.extend(["", "### Verification against acceptance criteria"])
+    mapped = [item for item in handoff.verification if item.acceptance_criteria]
+    for item in mapped:
+        for criterion in item.acceptance_criteria:
+            command = safe_tracker_line(item.command) if item.command else "not reported"
+            lines.append(
+                f"- **{criterion} — {safe_tracker_line(item.check)}:** "
+                f"{item.state.replace('_', ' ')} (agent reported) · **Command:** {command}"
+            )
+    if not mapped:
+        lines.append("No acceptance-criterion results reported.")
+    lines.extend(["", "### Other verification observations"])
+    for check, platform_command, state, source in platform_checks:
+        command_text = safe_tracker_line(platform_command) if platform_command else "not recorded"
+        lines.append(
+            f"- **{safe_tracker_line(check)}:** {state} ({source}) · **Command:** {command_text}"
+        )
+    for item in handoff.verification:
+        if item.acceptance_criteria:
+            continue
+        command = safe_tracker_line(item.command) if item.command else "not reported"
+        lines.append(
+            f"- **Unmapped check — {safe_tracker_line(item.check)}:** "
+            f"{item.state.replace('_', ' ')} (agent reported) · **Command:** {command}"
+        )
+    if not platform_checks and all(item.acceptance_criteria for item in handoff.verification):
+        lines.append("No other checks reported.")
+    if handoff.later_gate:
+        lines.extend(
+            ["", f"**Later merge gate:** {safe_tracker_line(handoff.later_gate)} (agent reported)"]
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def fallback_summary(
+    *,
+    platform_checks: Sequence[tuple[str, str | None, str, str]] = (),
+    agent_detail: str | None = None,
+    agent_answer: str | None = None,
+) -> str:
+    """Show only evidence absent from the recorded result when no handoff exists."""
+
+    reason, question = _agent_failure_lines(agent_detail)
+    if not (reason or question or agent_answer or platform_checks):
+        return ""
+    lines = ["## Additional run evidence"]
+    if reason is not None:
+        lines.append(f"**Agent-reported reason:** {reason}")
+    if question is not None:
+        lines.append(f"**Human decision now:** {question} (agent reported)")
+    if agent_answer is not None:
+        lines.append(f"**Agent-reported answer:** {agent_answer}")
+    if platform_checks:
+        lines.extend(["", "### Platform verification observations"])
+        for check, command, state, source in platform_checks:
+            command_text = safe_tracker_line(command) if command else "not recorded"
+            lines.append(
+                f"- **{safe_tracker_line(check)}:** {state} ({source}) "
+                f"· **Command:** {command_text}"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _agent_failure_lines(detail: str | None) -> tuple[str | None, str | None]:
+    """Take only the declared reason and first question from an agent final."""
+
+    if not detail:
+        return None, None
+    lines = [line.strip() for line in detail.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+    if not lines or not lines[0].startswith("Could not complete:"):
+        return None, None
+
+    def bounded(value: str) -> str | None:
+        rendered = safe_tracker_line(value.strip())
+        if not rendered:
+            return None
+        return rendered if len(rendered) <= 240 else rendered[:237].rstrip() + "..."
+
+    reason = bounded(lines[0].removeprefix("Could not complete:"))
+    question = None
+    if "Decisions needed:" in lines:
+        after = lines.index("Decisions needed:") + 1
+        if after < len(lines):
+            match = re.fullmatch(r"[1-9][0-9]*\.\s+(.+)", lines[after])
+            if match:
+                question = bounded(match.group(1))
+    return reason, question
+
+
+def agent_no_change_answer(detail: str | None) -> str | None:
+    """Extract one bounded, inert answer from a declared no-change final."""
+
+    marker = no_change_marker_line(detail)
+    if marker is None:
+        return None
+    answer = marker.removeprefix("No changes needed:").strip()
+    if answer.startswith("** "):
+        answer = answer[3:]
+    rendered = safe_tracker_line(answer)
+    if not rendered:
+        return None
+    return rendered if len(rendered) <= 240 else rendered[:237].rstrip() + "..."

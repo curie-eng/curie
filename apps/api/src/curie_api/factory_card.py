@@ -19,6 +19,7 @@ from typing import Any
 from curie_internal.factory_phase_view import PhaseView, StageSlot
 
 from .factory_progress import pill_for
+from .factory_tracker_attention import live_lines
 
 WIDTH, HEIGHT = 878, 300
 _TITLE_MAX = 85
@@ -103,6 +104,11 @@ class CardInput:
     cause_text: str | None
     # This failed request's settlement admitted an automatic successor (ADR 0269).
     retrying: bool = False
+    note_at: datetime | None = None
+    wait_at: datetime | None = None
+    no_pull_request: bool = False
+    pr_open: bool = False
+    next_owner: str | None = None
 
 
 def _text(value: object, limit: int | None = None) -> str:
@@ -261,6 +267,18 @@ def render_card(card: CardInput) -> str:
     reviewer = card.phase_view.reviewer_model
     cap = max((loop.cap for loop in card.phase_view.loops), default=None)
     review_text = ""
+    state_line, update_line = live_lines(
+        status=card.status,
+        publishing=card.publishing,
+        retrying=card.retrying,
+        view=card.phase_view,
+        note=card.note,
+        note_at=card.note_at,
+        wait_at=card.wait_at,
+        pr_open=card.pr_open,
+    )
+    if card.no_pull_request:
+        state_line = "No pull request published"
     if reviewer:
         review_text = f"reviewer {reviewer}"
     if cap is not None and card.phase_view.staged:
@@ -271,32 +289,37 @@ def render_card(card: CardInput) -> str:
         f'viewBox="0 0 {WIDTH} {HEIGHT}" role="img">',
         f"<style>{_STYLE}</style>",
         f'<rect class="bg" x="0.5" y="0.5" width="{WIDTH - 1}" height="{HEIGHT - 1}" rx="8"/>',
-        f'<text class="title fg" x="24" y="32">'
-        f"{_text(title_line, _TITLE_MAX)}</text>",
+        f'<text class="title fg" x="24" y="32">{_text(title_line, _TITLE_MAX)}</text>',
         f'<rect x="{pill_x}" y="18" width="{pill_width}" height="24" rx="12" fill="{color}"/>',
         f'<circle class="{dot_class}" cx="{pill_x + 14}" cy="30" r="4" fill="#ffffff"/>',
         f'<text class="pill-text" x="{pill_x + 24}" y="35">{_text(label)}</text>',
         f'<text class="stats muted" x="24" y="61">'
-        f'{"  |  ".join(_text(s, 45) for s in stats)}</text>',
+        f"{'  |  '.join(_text(s, 45) for s in stats)}</text>",
     ]
-    if card.note:
+    parts.append(
+        f'<text class="fg" x="24" y="82">{_text(state_line, 55 if review_text else 95)}</text>'
+    )
+    if card.status in {"queued", "waiting", "running", "cancellation_requested"}:
+        parts.append(f'<text class="note" x="24" y="106">{_text(update_line, 95)}</text>')
+    elif card.status in {"completed", "failed", "expired", "cancelled"}:
+        owner = f"{card.next_owner} (agent reported)" if card.next_owner else "unknown"
+        parts.append(f'<text class="fg" x="24" y="106">Next owner: {_text(owner, 70)}</text>')
+    elif card.note:
         parts.append(
-            f'<text class="note" x="24" y="91" font-style="italic">'
+            f'<text class="note" x="24" y="106" font-style="italic">'
             f"{_text(card.note, 60 if review_text else _NOTE_MAX)}</text>"
         )
     elif card.cause_text:
         parts.append(
-            f'<text class="fg" x="24" y="91">'
-            f'{_text(card.cause_text, 60 if review_text else _CAUSE_MAX)}</text>'
+            f'<text class="fg" x="24" y="106">'
+            f"{_text(card.cause_text, 60 if review_text else _CAUSE_MAX)}</text>"
         )
-    if card.note and card.cause_text:
-        parts.append(
-            f'<text class="fg" x="24" y="108">{_text(card.cause_text, _CAUSE_MAX)}</text>'
-        )
+    if card.cause_text:
+        parts.append(f'<text class="fg" x="24" y="123">{_text(card.cause_text, _CAUSE_MAX)}</text>')
     if review_text:
         parts.append(
             f'<text class="review-meta muted" x="{WIDTH - 24}" y="91" text-anchor="end">'
-            f'{_text(review_text, 52)}</text>'
+            f"{_text(review_text, 52)}</text>"
         )
     row_y = _row_y(card.phase_view)
     if card.phase_view.staged and card.phase_view.stages:

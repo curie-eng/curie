@@ -904,6 +904,7 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
         PROGRESS_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
         QUESTION_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         platform_tool_names,
     )
@@ -917,6 +918,7 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
     assert MEMORY_TOOLS <= published
     assert published == expected - {
         PROGRESS_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         APPROVAL_TOOL_NAME,
         ISSUE_TOOL_NAME,
