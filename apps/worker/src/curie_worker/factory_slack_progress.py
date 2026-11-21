@@ -60,10 +60,7 @@ existing records, with no lifecycle hook:
    kickoff sender, or for a configured thread the WorkItem owner's (else
    requester's) one active Slack link in the posting identity's workspace,
    and no one when there is none. A request a pre-card ``terminal`` or
-   ``pull_request`` post already announced owes neither. A tracker-result
-   request whose result is owed or delivered gets one ``triage`` post once
-   delivered instead (``factory_slack_triage``); a delegated ticket's post
-   waits for its handoff outcome (#5588).
+   ``pull_request`` post already announced owes neither.
 
 ``phase``, ``pull_request`` and ``terminal`` rows from before the card are
 never delivered and never hold a later post back.
@@ -129,7 +126,6 @@ from .factory_slack_card import (
     render_card,
     starting_text,
 )
-from .factory_slack_triage import TRIAGE_KIND, render_triage
 from .reply_sink import ReplySink, TargetRoute
 
 logger = logging.getLogger(__name__)
@@ -217,7 +213,7 @@ _ROOT_PAYLOAD_SQL = """
 """
 # The kinds this lane delivers. Rows of the pre-card kinds stay in the table
 # and neither deliver nor hold a later post back.
-_DELIVERED_KINDS_SQL = "'root', 'card', 'needs_person', 'ready', 'triage'"
+_DELIVERED_KINDS_SQL = "'root', 'card', 'needs_person', 'ready'"
 _LIVE_SQL = "'queued', 'waiting', 'running', 'cancellation_requested'"
 _CARD_SEND_TIMEOUT: Final = 30.0
 # The latest implementation request at or after the thread's first sequence,
@@ -227,7 +223,6 @@ _SHOWN_SQL = """
       FROM {requests} s
      WHERE s.work_item_id = t.work_item_id
        AND s.sequence >= t.first_sequence
-       AND s.completion_contract = 'implementation'
      ORDER BY s.sequence DESC
      LIMIT 1
 """
@@ -318,8 +313,6 @@ def render_post(kind: str, payload: dict[str, Any]) -> str:
         return needs_person_text(_user(payload), _str(payload.get("cause")))
     if kind == "ready":
         return ready_text(_user(payload), str(payload.get("url") or ""))
-    if kind == TRIAGE_KIND:
-        return _escaped(render_triage(payload))
     raise ValueError(f"unknown factory Slack post kind {kind!r}")
 
 
@@ -550,9 +543,6 @@ class PostgresFactorySlackStore:
         self._namespaces = f'"{schema}".identity_namespaces'
         self._links = f'"{schema}".identity_links'
         self._reconnect_url = reconnect_url_for(console_origin)
-        self._deliveries = f'"{schema}".factory_tracker_result_deliveries'
-        self._receipts = f'"{schema}".factory_tracker_result_receipts'
-        self._handoffs = f'"{schema}".factory_triage_handoffs'
         self._issue_url = _ISSUE_URL_SQL.format(requests=self._requests)
         self._root_payload = _ROOT_PAYLOAD_SQL.format(issue_url=self._issue_url)
         self._shown = _SHOWN_SQL.format(requests=self._requests)
@@ -807,15 +797,6 @@ class PostgresFactorySlackStore:
                       AND x.post_key = 'terminal:' || q.id
                       AND x.posted_at IS NOT NULL
                )
-               AND (
-                   q.completion_contract <> 'tracker_result'
-                   OR NOT EXISTS (
-                       SELECT 1
-                         FROM {self._deliveries} d
-                        WHERE d.execution_request_id = q.id
-                          AND d.state IN ('owed', 'delivered')
-                   )
-               )
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
@@ -841,7 +822,6 @@ class PostgresFactorySlackStore:
                 ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
              WHERE l.pr_url IS NOT NULL
                AND l.status = 'open'
-               AND q.completion_contract = 'implementation'
                AND EXISTS (
                    SELECT 1
                      FROM {self._publications} b
@@ -890,49 +870,12 @@ class PostgresFactorySlackStore:
             ON CONFLICT (notice_id) DO NOTHING
             """
         )
-        # One triage post per delivered result. The kind literal matches TRIAGE_KIND.
-        # A delegated ticket's post waits for its handoff outcome (#5588), so
-        # the one line carries the ticket and the implementation disposition.
-        # The receipt transaction writes the handoff, so a ticket with none
-        # (no delegation, or findings) posts at once and never waits.
-        triages = text(
-            f"""
-            INSERT INTO {self._posts} AS p
-                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
-            SELECT t.work_item_id, 'triage:' || q.id, 'triage', q.sequence, 3, 0,
-                   jsonb_build_object(
-                       'result_kind', r.result_kind,
-                       'reason', r.reason,
-                       'revision', r.revision,
-                       'ticket_url', r.output_url,
-                       'result_comment_url', r.result_comment_url,
-                       'handoff_admitted', CASE h.outcome
-                           WHEN 'admitted' THEN true
-                           WHEN 'refused' THEN false
-                       END,
-                       'implementation_status_url',
-                           CASE WHEN h.outcome = 'admitted' THEN h.output_url END,
-                       'refusal_reason', CASE WHEN h.outcome = 'refused' THEN h.reason END
-                   )
-              FROM ({live_threads}) t
-              JOIN {self._requests} q
-                ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
-              JOIN {self._receipts} r
-                ON r.execution_request_id = q.id
-              LEFT JOIN {self._handoffs} h
-                ON h.source_execution_request_id = q.id
-             WHERE q.completion_contract = 'tracker_result'
-               AND (r.result_kind <> 'ticket' OR h.id IS NULL OR h.outcome IS NOT NULL)
-            ON CONFLICT (work_item_id, post_key) DO NOTHING
-            """
-        )
         async with self._engine.begin() as connection:
             await connection.execute(discover)
             await connection.execute(refresh_roots)
             await connection.execute(cards)
             await connection.execute(needs_person)
             await connection.execute(ready)
-            await connection.execute(triages)
             await connection.execute(refusals)
             await connection.execute(self._grant_notices(), {"reconnect_url": self._reconnect_url})
 

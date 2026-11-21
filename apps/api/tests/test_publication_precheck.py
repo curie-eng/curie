@@ -1340,27 +1340,17 @@ def test_worker_mint_requires_its_own_credential_and_matching_deployment(
     assert _pull_reads(case) == []
 
 
-@pytest.mark.parametrize("contract", ["tracker_result", "implementation"])
-def test_a_tracker_result_request_is_refused_at_the_precheck_mint_and_at_creation(
-    precheck_case: dict[str, Any], contract: str
+def test_an_implementation_request_mints_the_precheck_and_publishes(
+    precheck_case: dict[str, Any],
 ) -> None:
-    """ADR 0277 decision 7 (#5586): a tracker result request never pushes a
-    branch or opens a pull request. Both publication boundaries refuse it
-    ``publication.tracker_result_request`` before any provider read or durable
-    write; an implementation request still mints and publishes."""
+    """Both publication boundaries accept an implementation request: the
+    precheck mint answers 200 and the publication is created."""
 
     case = precheck_case
     _execute(
         "UPDATE curie.publications SET outcome_history_ready_at = now() WHERE id = :id",
         {"id": uuid.UUID(case["publication_id"])},
     )
-    if contract == "tracker_result":
-        _execute(
-            "UPDATE curie.execution_requests SET completion_contract = 'tracker_result', "
-            "result_policy_digest = :digest WHERE id = :id",
-            {"digest": "ef" * 32, "id": case["request_id"]},
-        )
-    before = _durable_snapshot()
     minted = case["client"].post(MINT_URL, json=_mint_body(case), headers=WORKER_HEADERS)
     payload = _publication_payload(
         case["deployment"]["id"],
@@ -1381,12 +1371,5 @@ def test_a_tracker_result_request_is_refused_at_the_precheck_mint_and_at_creatio
         observed_lineage_version=case["lineage"]["version"],
     )
     created = case["client"].post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
-    if contract == "implementation":
-        assert minted.status_code == 200, minted.text
-        assert created.status_code == 201, created.text
-        return
-    for refused in (minted, created):
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"]["code"] == "publication.tracker_result_request"
-    assert _pull_reads(case) == []
-    assert _durable_snapshot() == before
+    assert minted.status_code == 200, minted.text
+    assert created.status_code == 201, created.text

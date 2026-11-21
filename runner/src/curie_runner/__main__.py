@@ -70,6 +70,15 @@ from .channel_memory_rules import (
     load_channel_rules,
     rules_url,
 )
+from .completion_contract import (
+    CONTRACT_BLOCKED_EXPLANATION,
+    IMPLEMENTATION,
+    PUBLICATION_RECOVERY_EXPLANATION,
+    REASON_INTERNAL_ERROR,
+    BoundContract,
+    ContractUnavailable,
+    bind_completion_contract,
+)
 from .config import (
     ALLOW_TOKENLESS_ENV,
     RunnerConfig,
@@ -103,7 +112,6 @@ from .harness.claude.propose_rule_tool import (
 )
 from .harness.claude.question_tool import wrap_questions_handler
 from .harness.claude.requester_guard import build_learned_rules_guard, build_subagent_guard
-from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
@@ -198,18 +206,6 @@ from .state import (
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
 from .tool_names import STATE_SERVER_NAME, platform_slack_tool_names
-from .tracker_result import (
-    CONTRACT_BLOCKED_EXPLANATION,
-    IMPLEMENTATION,
-    PUBLICATION_RECOVERY_EXPLANATION,
-    REASON_INTERNAL_ERROR,
-    SECOND_SESSION_EXPLANATION,
-    BoundContract,
-    ContractUnavailable,
-    SingleModelSession,
-    bind_completion_contract,
-    session_limits,
-)
 from .turn_progress import (
     PROGRESS_PREAMBLE,
     TurnProgress,
@@ -1406,7 +1402,6 @@ def build_runner(
         # the platform supplies one. The generic pager is independently omitted
         # when the observed surface has no actionable tools.
         def curie_server(
-            tracker_result_tool: SdkMcpTool[Any] | None = None,
             question_tool: SdkMcpTool[Any] | None = None,
             propose_rule_tool: SdkMcpTool[Any] | None = None,
         ) -> McpSdkServerConfig:
@@ -1444,7 +1439,6 @@ def build_runner(
                     build_attachment_tools(attachment_access)
                     if attachment_access is not None else ()
                 ),
-                tracker_result_tool=tracker_result_tool,
                 question_tool=question_tool,
                 # The factory's tool when the contract offered it; otherwise the
                 # channel one (#5801). The two never coexist: the channel one
@@ -1478,31 +1472,16 @@ def build_runner(
 
         def options_for(system_prompt: str | None, bound: BoundContract) -> ClaudeAgentOptions:
             # Built by ``initialize`` once the preflight has shaped the prompt
-            # and the API has answered the completion contract. A tracker
-            # result contract mounts ``submit_tracker_result`` on the ``curie``
-            # server, denies Task and Agent and spends at most its allowance.
-            limits = session_limits(
-                bound.contract,
-                disallowed_tools=config.catalogue_disallowed_tools,
-                max_budget_usd=config.max_usd_per_day,
-            )
-            # An implementation contract mounts ``ask_questions`` (#5785) the
-            # same way; ``bind_completion_contract`` sets at most one of the two.
-            # Either contract may also mount ``propose_rule`` (ADR 0287, #5796)
-            # when the API offered it; the binding never sets it for the fake.
+            # and the API has answered the completion contract. An
+            # implementation contract mounts ``ask_questions`` (#5785) on the
+            # ``curie`` server, and ``propose_rule`` (ADR 0287, #5796) when the
+            # API offered it; the binding never sets it for the fake.
             session_platform_servers = (
                 platform_servers
-                if bound.result_handler is None
-                and bound.question_handler is None
-                and bound.rule_handler is None
+                if bound.question_handler is None and bound.rule_handler is None
                 else {
                     **platform_servers,
                     APPROVAL_SERVER_NAME: curie_server(
-                        (
-                            wrap_tracker_result_handler(bound.result_handler)
-                            if bound.result_handler is not None
-                            else None
-                        ),
                         (
                             wrap_questions_handler(bound.question_handler)
                             if bound.question_handler is not None
@@ -1529,7 +1508,7 @@ def build_runner(
                 reviewer_model=config.reviewer_model,
                 system_prompt=system_prompt,
                 max_turns=config.max_turns,
-                max_budget_usd=limits.max_budget_usd,
+                max_budget_usd=config.max_usd_per_day,
                 # Curie's durable contract is ordered role/content messages. The
                 # Claude adapter prefers its optional opaque checkpoint to preserve
                 # native cache shape, and otherwise materializes a deterministic
@@ -1575,7 +1554,7 @@ def build_runner(
                 cwd=workspace_cwd,
                 web_search_enabled=web_search_enabled,
                 policy_disallowed_tools=policy_hidden_tools,
-                disallowed_tools=limits.disallowed_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
                 hidden_restore_tools=hidden_restore_tools(
                     derived_mcp_servers,
                     capability.observed_tools,
@@ -1633,9 +1612,8 @@ def build_runner(
         if preflight_block is None:
             # The completion contract (ADR 0277, #5586), only when the worker
             # injected the issue read capability: no capability (local, eval,
-            # fake) makes no call. For a tracker result this call reserves the
-            # request's one model session, so it runs after the preflight,
-            # which could still block the model. Any failure blocks the model.
+            # fake) makes no call. It runs after the preflight, which could
+            # still block the model. Any failure blocks the model.
             reason: str | None = None
             try:
                 bound_contract = await bind_completion_contract(
@@ -1659,11 +1637,6 @@ def build_runner(
                 # context, and any turn sent to it answers offline.
                 logger.info("completion contract publication_recovery; the model will not start")
                 preflight_block = PUBLICATION_RECOVERY_EXPLANATION
-            elif bound_contract.contract.tracker_result:
-                logger.info(
-                    "completion contract tracker_result result_kinds=%s",
-                    ",".join(bound_contract.contract.result_kinds),
-                )
             if reason is None and bound_contract.rule_handler is not None:
                 logger.info("completion contract offers propose_rule")
         if preflight_block is not None:
@@ -1695,17 +1668,12 @@ def build_runner(
             real_options = build_real_options(compose_system_prompt(verification), bound_contract)
 
     sdk_generation = 0
-    single_session = SingleModelSession()
 
     def factory() -> ModelSession:
         # Every session the runner asks for passes here: boot, ``reset`` and
-        # the session replacement alike. A blocked boot answers offline, and a
-        # tracker result process gets exactly one model session (#5586).
+        # the session replacement alike. A blocked boot answers offline.
         if preflight_block is not None:
             return PreflightBlockedSession(preflight_block, model=config.model)
-        if bound_contract.contract.tracker_result and not single_session.admit():
-            logger.warning("tracker result session already used; the model will not start")
-            return PreflightBlockedSession(SECOND_SESSION_EXPLANATION, model=config.model)
         return model_session()
 
     def model_session() -> ModelSession:
@@ -1727,11 +1695,7 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
-                disallowed_tools=session_limits(
-                    bound_contract.contract,
-                    disallowed_tools=config.catalogue_disallowed_tools,
-                    max_budget_usd=None,
-                ).disallowed_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
                 # The same holder the SDK tool closes over, so the scripted
                 # progress demo runs the real handler (ADR 0130).
                 turn_progress=turn_progress,

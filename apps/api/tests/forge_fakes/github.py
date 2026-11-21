@@ -892,16 +892,13 @@ def _comment_event(number: int, body: str, comment_id: int) -> dict[str, Any]:
 # https://docs.github.com/en/rest/git/commits#create-a-commit
 # https://docs.github.com/en/rest/git/refs#create-a-reference
 # https://docs.github.com/en/rest/issues/issues#list-repository-issues
-# https://docs.github.com/en/rest/issues/issues#create-an-issue
 # https://docs.github.com/en/rest/issues/issues#get-an-issue
 #
 # Issues follow the REST issue object: ``number``, ``title``, ``body``,
 # ``state``, ``labels`` as objects with a ``name``, ``user`` with ``id``,
 # ``login`` and ``type``, and ``html_url``. A pull request is an issue too: the
 # repository issue listing returns it with a ``pull_request`` key, and its
-# ``creator`` filter matches the opening account's login. An issue the
-# adapter's installation token creates is authored by ``bot_user`` with
-# ``performed_via_github_app``.
+# ``creator`` filter matches the opening account's login.
 #
 # Pull request reviews (#5794), as GitHub's REST and webhook documentation
 # describes them:
@@ -1111,23 +1108,10 @@ class GitHubRepositoryFake:
         self.evidence_refs: dict[str, str] = {}
         self.raw_requests: list[httpx.Request] = []
         self._write_faults: list[list[Any]] = []
-        # Writes applied whose answer is then lost: [pattern, status, count].
-        self._lost_writes: list[list[Any]] = []
         # Every request the fake answered, in order.
         self.http_requests: list[httpx.Request] = []
-        # The JSON body of every `POST /repos/{REPO}/issues`, in order.
-        self.issue_posts: list[dict[str, Any]] = []
         # Who an issue or pull request the adapter's token opens is authored by.
         self.bot_user: dict[str, Any] = dict(CONTRACT_BOT)
-        # False models a listing that ignores ``creator``, so an adapter's own
-        # owner check is all that keeps another account's issue out.
-        self.honour_creator = True
-        # Listing lag: issue numbers absent from the repository issue listing,
-        # yet readable directly, as a fresh issue is for a few seconds on
-        # GitHub. While ``hide_new_from_listing`` is set every issue the
-        # adapter creates starts hidden.
-        self.hidden_from_listing: set[int] = set()
-        self.hide_new_from_listing = False
         # Reads that answer an injected status: [pattern, status, count].
         self._read_faults: list[list[Any]] = []
         self.label_requests: list[httpx.Request] = []
@@ -1783,32 +1767,11 @@ class GitHubRepositoryFake:
 
         self._write_faults.append([re.compile(pattern), status, count])
 
-    def lose_write_responses(
-        self, pattern: str, count: int = 1, *, status: int | None = 502
-    ) -> None:
-        """The next ``count`` writes whose ``"<METHOD> <path>"`` matches
-        ``pattern`` are applied, then their answer is lost: ``status`` with a
-        body that is not JSON (502 a server error, 201 an unreadable success),
-        or a transport error when ``status`` is None."""
-
-        self._lost_writes.append([re.compile(pattern), status, count])
-
     def fail_reads(self, pattern: str, status: int, count: int = 1) -> None:
         """The next ``count`` GET requests whose ``"GET <path>"`` matches
         ``pattern`` answer ``status`` (``{"message": "injected"}``)."""
 
         self._read_faults.append([re.compile(pattern), status, count])
-
-    def _lost_answer(self, request: httpx.Request, path: str) -> httpx.Response | None:
-        subject = f"{request.method} {path}"
-        for fault in self._lost_writes:
-            pattern, status, remaining = fault
-            if remaining > 0 and pattern.search(subject):
-                fault[2] = remaining - 1
-                if status is None:
-                    raise httpx.ReadError("connection lost", request=request)
-                return httpx.Response(status, content=b"<html>lost</html>")
-        return None
 
     def raw(self, commit_sha: str, path: str) -> bytes | None:
         """The bytes ``path`` names in ``commit_sha``'s tree, or None."""
@@ -1956,13 +1919,10 @@ class GitHubRepositoryFake:
         path = request.url.path
         if request.url.host == "github.com":
             return self._raw(request, path)
-        # Creating an issue shares the issue listing's path but is no listing.
-        creates_issue = request.method == "POST" and path == f"/repos/{REPO}/issues"
-        if not creates_issue and self._listing_fails(path):
+        if self._listing_fails(path):
             return httpx.Response(502, json={"message": "injected"})
         if request.method != "GET":
-            answer = self._write(request, path)
-            return self._lost_answer(request, path) or answer
+            return self._write(request, path)
         injected = self._injected_read(request, path)
         if injected is not None:
             return injected
@@ -1996,10 +1956,8 @@ class GitHubRepositoryFake:
             issue
             for _, issue in sorted(self.issues.items(), reverse=params.get("direction") != "asc")
             if (state == "all" or issue.get("state") == state)
-            and issue["number"] not in self.hidden_from_listing
             and (
                 creator is None
-                or not self.honour_creator
                 or issue.get("user", {}).get("login", "").casefold() == creator.casefold()
             )
         ]
@@ -2173,8 +2131,6 @@ class GitHubRepositoryFake:
         if injected is not None:
             return injected
         body = json.loads(request.content) if request.content else {}
-        if request.method == "POST" and path == f"/repos/{REPO}/issues":
-            return self._create_issue(body)
         reviewed = self._write_reviews(request, path, body)
         if reviewed is not None:
             return reviewed
@@ -2206,30 +2162,6 @@ class GitHubRepositoryFake:
             issue["labels"] = [{"name": name} for name in names]
             return httpx.Response(200, json=issue["labels"])
         return self._write_code(request, path, body)
-
-    def _create_issue(self, body: dict[str, Any]) -> httpx.Response:
-        """Create an issue as the installation token's bot user.
-
-        https://docs.github.com/en/rest/issues/issues#create-an-issue
-        201 with the full issue object.
-        """
-
-        self.issue_posts.append(body)
-        number = self._number()
-        issue = {
-            "number": number,
-            "title": body["title"],
-            "body": body.get("body"),
-            "state": "open",
-            "labels": [{"name": name} for name in body.get("labels", [])],
-            "user": dict(self.bot_user),
-            "html_url": f"https://github.com/{REPO}/issues/{number}",
-            "performed_via_github_app": {"id": CONTRACT_APP_ID},
-        }
-        self.issues[number] = issue
-        if self.hide_new_from_listing:
-            self.hidden_from_listing.add(number)
-        return httpx.Response(201, json=issue)
 
     def _write_code(
         self, request: httpx.Request, path: str, body: dict[str, Any]

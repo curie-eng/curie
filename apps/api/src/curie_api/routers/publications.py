@@ -46,9 +46,12 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..factory_comment_text import append_github_ask_line
+from ..factory_comment_text import (
+    append_github_ask_line,
+    end_trailing_decisions,
+    without_trailing_blank_lines,
+)
 from ..factory_rediscovery import issue_marker, publishing_code_host
-from ..factory_tracker_result_runtime import CONTRACT_TRACKER_RESULT
 from ..forges.config import RepositoryBindingConfig
 from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
 from ..forges.hosts import code_host_for, forge_code_host, pull_request_url
@@ -200,25 +203,6 @@ async def _work_item_policy(
     )
 
 
-_TRACKER_RESULT_REFUSAL = {
-    "code": "publication.tracker_result_request",
-    "message": "this work item request completes with a tracker result, not a publication",
-}
-
-
-async def _refuse_tracker_result_request(session: AsyncSession, request_id: uuid.UUID) -> None:
-    """Refuse 409 ``publication.tracker_result_request`` before anything is read
-    or written: a tracker result request never pushes a branch or opens a pull
-    request (ADR 0277 decision 7)."""
-
-    contract = await session.scalar(
-        select(ExecutionRequest.completion_contract).where(ExecutionRequest.id == request_id)
-    )
-    if contract == CONTRACT_TRACKER_RESULT:
-        await session.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, dict(_TRACKER_RESULT_REFUSAL))
-
-
 router = APIRouter(
     prefix="/publications",
     tags=["publications"],
@@ -254,16 +238,6 @@ async def mint_publication_context(
 ) -> PublicationContext | Response:
     response.headers["Cache-Control"] = "no-store"
     settings = get_settings()
-    contract = await session.scalar(
-        select(ExecutionRequest.completion_contract).where(
-            ExecutionRequest.id == data.execution_request_id
-        )
-    )
-    if contract == CONTRACT_TRACKER_RESULT:
-        await session.rollback()
-        raise precheck_error(
-            409, _TRACKER_RESULT_REFUSAL["code"], _TRACKER_RESULT_REFUSAL["message"]
-        )
     try:
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
             await lifecycle.adopt_orphan_publication_lineage(
@@ -568,7 +542,11 @@ async def create_publication(
 
     if data.work_item_request_id is not None:
         work_item_request_id = data.work_item_request_id
-        await _refuse_tracker_result_request(session, work_item_request_id)
+        # Everything the platform adds below follows the agent's text. Close a
+        # trailing Decisions section first so none of it joins that section.
+        sectioned = end_trailing_decisions(data.body or "")
+        if sectioned != (data.body or ""):
+            data = data.model_copy(update={"body": sectioned})
         prior_paths = (
             await session.scalars(
                 select(Publication.changed_paths).where(
@@ -593,7 +571,7 @@ async def create_publication(
         if factory_ci.python_paths(changed_paths):
             try:
                 observations = await factory_progress.read_verification_observations(
-                    session, data.work_item_request_id
+                    session, work_item_request_id
                 )
             except ValueError as exc:
                 raise HTTPException(
@@ -656,7 +634,7 @@ async def create_publication(
             body = data.body or ""
             missing = [statement for statement in statements if statement not in body]
             if missing:
-                body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
+                body = f"{without_trailing_blank_lines(body)}\n\n{'\n'.join(missing)}"
                 data = data.model_copy(update={"body": body})
         # Every factory pull request body references its ticket (#4358 plan D7),
         # in the tracker's own form; a body that already carries it is kept.
@@ -670,7 +648,7 @@ async def create_publication(
                 body = f"{body}\n\n{reference}" if body else reference
             marker = issue_marker(issue)
             if marker not in (line.strip() for line in body.splitlines()):
-                body = f"{body.rstrip()}\n\n{marker}"
+                body = f"{without_trailing_blank_lines(body)}\n\n{marker}"
             if body != data.body:
                 data = data.model_copy(update={"body": body})
         # The ask line sits immediately before the ADR 0278 evidence line, which

@@ -5159,6 +5159,10 @@ SCRIPTED_PUBLICATION_COMMAND = (
 SCRIPTED_JIRA_COMMAND = (
     "python3 tools/factory-e2e/factory_e2e.py scripted --scenario jira-one-ticket"
 )
+SCRIPTED_LEARNED_RULES_COMMAND = (
+    "python3 tools/factory-e2e/factory_e2e.py scripted --scenario learned-rules"
+    " --transcript tools/model-script/transcripts/learned-rules-chain-a.json"
+)
 SCRIPTED_FACTORY_LEGS = (
     ("scenario", lambda run: run == SCRIPTED_PUBLICATION_COMMAND),
     ("jira-one-ticket", lambda run: run == SCRIPTED_JIRA_COMMAND),
@@ -5179,6 +5183,7 @@ SCRIPTED_FACTORY_LEGS = (
         "fresh-install",
         lambda run: run == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
     ),
+    ("learned-rules", lambda run: run == SCRIPTED_LEARNED_RULES_COMMAND),
 )
 SCRIPTED_FACTORY_EVIDENCE_STEP = "Upload scripted factory evidence"
 SCRIPTED_JIRA_EVIDENCE_STEP = "Upload scripted Jira one-ticket evidence"
@@ -5186,6 +5191,7 @@ SCRIPTED_JIRA_EVIDENCE_STEP = "Upload scripted Jira one-ticket evidence"
 SCRIPTED_FACTORY_EVIDENCE = {
     SCRIPTED_FACTORY_EVIDENCE_STEP: "always() && matrix.suite == 'scenario'",
     SCRIPTED_JIRA_EVIDENCE_STEP: "always() && matrix.suite == 'jira-one-ticket'",
+    "Upload scripted learned rules evidence": "always() && matrix.suite == 'learned-rules'",
 }
 
 
@@ -5245,7 +5251,7 @@ def _enable_fail_fast(job: dict[str, Any]) -> None:
 
 
 def _unguard_evidence(job: dict[str, Any]) -> None:
-    evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP)
+    evidence = next(s for s in job["steps"] if s.get("name") == "Upload scripted factory evidence")
     evidence["if"] = "always()"
 
 
@@ -5260,6 +5266,29 @@ def _run_publication_in_jira_leg(job: dict[str, Any]) -> None:
 def _upload_jira_evidence_only_on_success(job: dict[str, Any]) -> None:
     evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_JIRA_EVIDENCE_STEP)
     evidence["if"] = "matrix.suite == 'jira-one-ticket'"
+
+
+def _drop_learned_rules_leg(job: dict[str, Any]) -> None:
+    job["strategy"]["matrix"]["suite"].remove("learned-rules")
+
+
+def _unguard_learned_rules_evidence(job: dict[str, Any]) -> None:
+    evidence = next(
+        s for s in job["steps"] if s.get("name") == "Upload scripted learned rules evidence"
+    )
+    evidence["if"] = "always()"
+
+
+def _misdirect_learned_rules_evidence(job: dict[str, Any]) -> None:
+    evidence = next(
+        s for s in job["steps"] if s.get("name") == "Upload scripted learned rules evidence"
+    )
+    evidence["if"] = "always() && matrix.suite == 'scenario'"
+
+
+def _select_publication_in_learned_rules(job: dict[str, Any]) -> None:
+    step = _scripted_factory_step(job, "learned-rules")
+    step["run"] = step["run"].replace("--scenario learned-rules", "--scenario publication")
 
 
 def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
@@ -5279,6 +5308,10 @@ def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
         _drop_jira_leg,
         _run_publication_in_jira_leg,
         _upload_jira_evidence_only_on_success,
+        _drop_learned_rules_leg,
+        _unguard_learned_rules_evidence,
+        _misdirect_learned_rules_evidence,
+        _select_publication_in_learned_rules,
     ),
 )
 def test_scripted_factory_leg_mapping_rejects_skippable_shapes(

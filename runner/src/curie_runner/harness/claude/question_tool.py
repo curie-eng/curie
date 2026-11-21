@@ -11,9 +11,9 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
+from ...completion_contract import ResultHandler
 from ...question_tool import QUESTIONS_DESCRIPTION, QUESTIONS_SCHEMA
 from ...tool_names import QUESTION_TOOL
-from ...tracker_result import ResultHandler
 
 
 def wrap_questions_handler(handler: ResultHandler) -> SdkMcpTool[Any]:

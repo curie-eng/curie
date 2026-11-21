@@ -43,9 +43,9 @@ use curie::api::{
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
-    ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, HookFireOutput,
-    HookOutput, KillOutput, MemoryChannel, MemoryOutput, MemoryRulesOutput, OverridesOutput,
-    PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
+    ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, FactoryProgressOutput,
+    HookFireOutput, HookOutput, KillOutput, MemoryChannel, MemoryOutput, MemoryRulesOutput,
+    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
     SkillApprovalsOutput, SubscriptionOutput, SubscriptionVerb, VersionsOutput, WakeKeyOutput,
     WorkItemsOutput,
 };
@@ -408,6 +408,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         upgrade: curie::ops::UpgradeStatusView::idle(None),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials: Vec::new(),
+        factory_model_auth_mode: None,
     })
 }
 
@@ -467,6 +468,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                changed: false,
+            },
+        ],
+    );
+    m.insert(
+        "FactoryProgressOutput",
+        samples![
+            "DryRun" => FactoryProgressOutput::DryRun(plan()),
+            "Done" => FactoryProgressOutput::Done {
+                agent: "acme-bot".to_string(),
+                factory_slack_channel: Some("C0EXAMPLE1".to_string()),
                 changed: false,
             },
         ],
@@ -976,6 +988,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "DryRun" => FactoryIntakeOutput::DryRun(plan()),
             "Done" => FactoryIntakeOutput::Done { enabled: true },
             "RepositoriesUpdated" => FactoryIntakeOutput::RepositoriesUpdated { enabled: false, repos: vec!["acme/bot".into()] },
+            "ModelAuthModeSet" => FactoryIntakeOutput::ModelAuthModeSet { mode: "personal".into() },
         ],
     );
     m.insert(

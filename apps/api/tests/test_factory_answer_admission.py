@@ -32,7 +32,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import test_factory_tracker_results as tr
+import factory_run_support as tr
 from curie_api import factory_questions, workitem_dispatch
 from curie_api.factory_notices import INVESTIGATING_LINE
 from curie_api.factory_questions import AnswerFacts, AnswerOutcome
@@ -69,23 +69,21 @@ ANSWER_TEXT = "Replace the rows on a re-run."
 SECOND = timedelta(seconds=1)
 
 
-def _comment(triage: tr._Triage, text: str = ANSWER_TEXT, author: Actor = AUTHOR) -> str:
+def _comment(job: tr._Run, text: str = ANSWER_TEXT, author: Actor = AUTHOR) -> str:
     """A comment a person left on the ticket; the tracker's id for it."""
 
-    return triage.tracker.marked_comments.seed_comment(
-        ReplyTarget.on_issue(triage.issue), author, text
-    )
+    return job.tracker.marked_comments.seed_comment(ReplyTarget.on_issue(job.issue), author, text)
 
 
-def _fence(triage: tr._Triage) -> datetime:
-    row = _round_row(triage.work_item_id)
+def _fence(job: tr._Run) -> datetime:
+    row = _round_row(job.work_item_id)
     assert row is not None and row["answer_after"] is not None
     answer_after: datetime = row["answer_after"]
     return answer_after
 
 
 def _admit(
-    triage: tr._Triage,
+    job: tr._Run,
     comment_id: str,
     created_at: datetime | None,
     *,
@@ -93,23 +91,23 @@ def _admit(
     issue: TrackerIssueRef | None = None,
 ) -> AnswerOutcome:
     facts = AnswerFacts(
-        work_item_id=triage.work_item_id,
-        issue=issue or triage.issue,
+        work_item_id=job.work_item_id,
+        issue=issue or job.issue,
         comment_id=comment_id,
         created_at=created_at,
         requester=requester,
     )
 
     async def go() -> AnswerOutcome:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             return await factory_questions.admit_answer(session, facts)
 
-    result: AnswerOutcome = triage.client.portal.call(go)
+    result: AnswerOutcome = job.client.portal.call(go)
     return result
 
 
 def _answer(
-    triage: tr._Triage,
+    job: tr._Run,
     delta: timedelta = SECOND,
     *,
     text: str = ANSWER_TEXT,
@@ -117,8 +115,8 @@ def _answer(
 ) -> tuple[str, AnswerOutcome]:
     """A new comment created ``delta`` after the current round's fence."""
 
-    comment_id = _comment(triage, text)
-    return comment_id, _admit(triage, comment_id, _fence(triage) + delta, requester=requester)
+    comment_id = _comment(job, text)
+    return comment_id, _admit(job, comment_id, _fence(job) + delta, requester=requester)
 
 
 def _counts() -> tuple[int, int]:
@@ -140,40 +138,40 @@ def _receipts(work_item_id: uuid.UUID) -> dict[str, tuple[str, uuid.UUID | None]
 
 def _snapshot(request_id: uuid.UUID) -> dict[str, Any]:
     (row,) = _rows(
-        "SELECT status, objective, completion_contract, requester, reply_kind, reply_address, "
+        "SELECT status, objective, requester, reply_kind, reply_address, "
         "reply_conversation_id, reply_target_kind FROM curie.execution_requests WHERE id = :id",
         {"id": request_id},
     )
     return dict(row)
 
 
-def _replays(triage: tr._Triage, comment_id: str, stored: AnswerOutcome) -> None:
+def _replays(job: tr._Run, comment_id: str, stored: AnswerOutcome) -> None:
     """A redelivery returns the stored outcome and writes nothing, whatever
     its reported creation time."""
 
     before = _counts()
-    replay = _admit(triage, comment_id, datetime.now(UTC) + timedelta(hours=1))
+    replay = _admit(job, comment_id, datetime.now(UTC) + timedelta(hours=1))
     assert replay == AnswerOutcome(stored.outcome, stored.request_id, True)
     assert _counts() == before
 
 
-def _claimable(triage: tr._Triage) -> set[uuid.UUID]:
+def _claimable(job: tr._Run) -> set[uuid.UUID]:
     async def go() -> set[uuid.UUID]:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             return {claim.request_id for claim in await claim_due(session, "answer-probe", 10, 30)}
 
-    claimed: set[uuid.UUID] = triage.client.portal.call(go)
+    claimed: set[uuid.UUID] = job.client.portal.call(go)
     return claimed
 
 
-def _settled_asked(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
+def _settled_asked(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Run:
     """Asked round 1, then ended without a pull request: outstanding, nothing live."""
 
-    triage = _asked(admitted, monkeypatch, number)
-    tr._finish(triage, "failed", "no_pull_request")
-    row = _round_row(triage.work_item_id)
+    job = _asked(admitted, monkeypatch, number)
+    tr._finish(job, "failed", "no_pull_request")
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["pending_request_id"]) == ("outstanding", None)
-    return triage
+    return job
 
 
 # Criterion 1: an answer with nothing live admits one request -------------------------
@@ -182,32 +180,31 @@ def _settled_asked(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) 
 def test_admits_an_answer_on_an_outstanding_round_with_nothing_live(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5101)
-    before = _round_row(triage.work_item_id)
+    job = _settled_asked(admitted, monkeypatch, 5101)
+    before = _round_row(job.work_item_id)
     assert before is not None
 
-    comment_id, result = _answer(triage)
+    comment_id, result = _answer(job)
 
-    issue = triage.issue
+    issue = job.issue
     expected = uuid.uuid5(
         uuid.NAMESPACE_URL,
         f"curie-answer:{issue.kind}:{issue.host}:{issue.scope_id}:{issue.issue_id}:{comment_id}",
     )
     assert factory_questions.answer_request_id(issue, comment_id) == expected
     assert result == AnswerOutcome("admitted", expected, False)
-    assert [r["id"] for r in _requests(triage.work_item_id)] == [triage.request_id, expected]
-    first, created = _snapshot(triage.request_id), _snapshot(expected)
+    assert [r["id"] for r in _requests(job.work_item_id)] == [job.request_id, expected]
+    first, created = _snapshot(job.request_id), _snapshot(expected)
     assert created["status"] == "waiting"
     # The WorkItem's issue objective: the bare issue link the label admitted.
     assert created["objective"] == first["objective"]
     assert created["objective"].endswith("/issues/5101")
-    assert created["completion_contract"] == "implementation"
     assert created["requester"] == REQUESTER
     for column in ("reply_kind", "reply_address", "reply_conversation_id"):
         assert created[column] == first[column]
     assert created["reply_target_kind"] == "issue"
-    assert _receipts(triage.work_item_id) == {comment_id: ("admitted", expected)}
-    row = _round_row(triage.work_item_id)
+    assert _receipts(job.work_item_id) == {comment_id: ("admitted", expected)}
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"], row["rounds_used"]) == (
         "answered",
@@ -216,31 +213,31 @@ def test_admits_an_answer_on_an_outstanding_round_with_nothing_live(
     )
     assert row["answer_after"] == before["answer_after"]
     # The admission snapshot was written, so the dispatcher offers it.
-    assert expected in _claimable(triage)
+    assert expected in _claimable(job)
 
 
 def test_admits_refuses_a_comment_on_another_ticket_writing_nothing(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5102)
+    job = _settled_asked(admitted, monkeypatch, 5102)
     before = _counts()
-    other = TrackerIssueRef(triage.issue.kind, triage.issue.host, triage.issue.scope_id, "5999")
+    other = TrackerIssueRef(job.issue.kind, job.issue.host, job.issue.scope_id, "5999")
     with pytest.raises(ValueError):
-        _admit(triage, _comment(triage), _fence(triage) + SECOND, issue=other)
+        _admit(job, _comment(job), _fence(job) + SECOND, issue=other)
     with pytest.raises(ValueError):
-        _admit(triage, " ", _fence(triage) + SECOND)
+        _admit(job, " ", _fence(job) + SECOND)
     assert _counts() == before
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and row["state"] == "outstanding"
 
 
 def test_admits_nothing_when_the_snapshot_write_fails_and_the_caller_commits(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5103)
-    comment_id = _comment(triage)
-    answer_id = factory_questions.answer_request_id(triage.issue, comment_id)
-    created_at = _fence(triage) + SECOND
+    job = _settled_asked(admitted, monkeypatch, 5103)
+    comment_id = _comment(job)
+    answer_id = factory_questions.answer_request_id(job.issue, comment_id)
+    created_at = _fence(job) + SECOND
     original = workitem_dispatch._write_snapshot
 
     async def failing(*_args: Any, **_kwargs: Any) -> Any:
@@ -250,31 +247,31 @@ def test_admits_nothing_when_the_snapshot_write_fails_and_the_caller_commits(
     # released its savepoint.
     monkeypatch.setattr(workitem_dispatch, "_write_snapshot", failing)
     facts = AnswerFacts(
-        work_item_id=triage.work_item_id,
-        issue=triage.issue,
+        work_item_id=job.work_item_id,
+        issue=job.issue,
         comment_id=comment_id,
         created_at=created_at,
         requester=REQUESTER,
     )
 
     async def careless_caller() -> None:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             with pytest.raises(RuntimeError):
                 await factory_questions.admit_answer(session, facts)
             # The caller swallows the error and commits the same session.
             await session.commit()
 
-    triage.client.portal.call(careless_caller)
+    job.client.portal.call(careless_caller)
 
     assert _rows("SELECT id FROM curie.execution_requests WHERE id = :id", {"id": answer_id}) == []
-    assert [r["id"] for r in _requests(triage.work_item_id)] == [triage.request_id]
-    assert _receipts(triage.work_item_id) == {}
-    row = _round_row(triage.work_item_id)
+    assert [r["id"] for r in _requests(job.work_item_id)] == [job.request_id]
+    assert _receipts(job.work_item_id) == {}
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["pending_request_id"]) == ("outstanding", None)
 
     monkeypatch.setattr(workitem_dispatch, "_write_snapshot", original)
-    assert _admit(triage, comment_id, created_at) == AnswerOutcome("admitted", answer_id, False)
-    assert _snapshot(answer_id)["objective"] == _snapshot(triage.request_id)["objective"]
+    assert _admit(job, comment_id, created_at) == AnswerOutcome("admitted", answer_id, False)
+    assert _snapshot(answer_id)["objective"] == _snapshot(job.request_id)["objective"]
 
 
 # Criterion 2: answers before the attempt starts coalesce ----------------------------
@@ -283,24 +280,24 @@ def test_admits_nothing_when_the_snapshot_write_fails_and_the_caller_commits(
 def test_coalesce_a_second_answer_before_the_request_starts(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5111)
-    _first_id, first = _answer(triage)
+    job = _settled_asked(admitted, monkeypatch, 5111)
+    _first_id, first = _answer(job)
     assert first.outcome == "admitted" and first.request_id is not None
-    requests = _requests(triage.work_item_id)
+    requests = _requests(job.work_item_id)
 
-    second_id, second = _answer(triage, 2 * SECOND)
+    second_id, second = _answer(job, 2 * SECOND)
 
     assert second == AnswerOutcome("coalesced", None, False)
-    assert _requests(triage.work_item_id) == requests
-    assert _receipts(triage.work_item_id)[second_id] == ("coalesced", None)
-    row = _round_row(triage.work_item_id)
+    assert _requests(job.work_item_id) == requests
+    assert _receipts(job.work_item_id)[second_id] == ("coalesced", None)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"]) == ("answered", first.request_id)
 
-    _take_over(triage, first.request_id)
+    _take_over(job, first.request_id)
     assert _request(first.request_id)["status"] == "running"
-    _replays(triage, second_id, second)
-    assert _requests(triage.work_item_id)[-1]["id"] == first.request_id
+    _replays(job, second_id, second)
+    assert _requests(job.work_item_id)[-1]["id"] == first.request_id
 
 
 def test_an_answer_never_coalesces_into_a_request_past_its_wait_deadline(
@@ -313,8 +310,8 @@ def test_an_answer_never_coalesces_into_a_request_past_its_wait_deadline(
 
     import curie_api.workitems.lifecycle as workitems
 
-    triage = _settled_asked(admitted, monkeypatch, 5112)
-    _first_id, first = _answer(triage)
+    job = _settled_asked(admitted, monkeypatch, 5112)
+    _first_id, first = _answer(job)
     assert first.outcome == "admitted" and first.request_id is not None
     (row,) = _rows(
         "SELECT wait_deadline - clock_timestamp() AS remaining "
@@ -330,19 +327,19 @@ def test_an_answer_never_coalesces_into_a_request_past_its_wait_deadline(
     # The database clock crosses the stored deadline; the deadline stays.
     monkeypatch.setattr(workitems, "database_now", past_the_deadline)
 
-    second_id, second = _answer(triage, 2 * SECOND)
+    second_id, second = _answer(job, 2 * SECOND)
     _reconcile()
 
-    started = factory_questions.answer_request_id(triage.issue, second_id)
+    started = factory_questions.answer_request_id(job.issue, second_id)
     assert second.outcome in factory_questions.ANSWER_STARTED_OUTCOMES
     assert second.request_id == started
-    assert _receipts(triage.work_item_id)[second_id] == (second.outcome, started)
+    assert _receipts(job.work_item_id)[second_id] == (second.outcome, started)
     assert _request(first.request_id)["status"] not in {"waiting", "queued", "running"}
     assert _request(started)["status"] == "waiting"
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"]) == ("answered", started)
-    _replays(triage, second_id, second)
+    _replays(job, second_id, second)
 
 
 # Criterion 3: answers during the answered run queue one follow-up --------------------
@@ -351,26 +348,26 @@ def test_an_answer_never_coalesces_into_a_request_past_its_wait_deadline(
 def test_follow_up_queues_once_behind_the_running_answered_request(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5121)
-    _first_id, first = _answer(triage)
+    job = _settled_asked(admitted, monkeypatch, 5121)
+    _first_id, first = _answer(job)
     assert first.request_id is not None
-    _take_over(triage, first.request_id)
+    _take_over(job, first.request_id)
     assert _request(first.request_id)["status"] == "running"
 
-    third_id, third = _answer(triage, 3 * SECOND)
-    fourth_id, fourth = _answer(triage, 4 * SECOND)
+    third_id, third = _answer(job, 3 * SECOND)
+    fourth_id, fourth = _answer(job, 4 * SECOND)
 
-    follow_up = factory_questions.answer_request_id(triage.issue, third_id)
+    follow_up = factory_questions.answer_request_id(job.issue, third_id)
     assert third == AnswerOutcome("queued_follow_up", follow_up, False)
     assert fourth == AnswerOutcome("coalesced", None, False)
-    queued = [r["id"] for r in _requests(triage.work_item_id) if r["status"] == "queued"]
+    queued = [r["id"] for r in _requests(job.work_item_id) if r["status"] == "queued"]
     assert queued == [follow_up]
-    assert _snapshot(follow_up)["objective"] == _snapshot(triage.request_id)["objective"]
+    assert _snapshot(follow_up)["objective"] == _snapshot(job.request_id)["objective"]
     assert _request(first.request_id)["status"] == "running"
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"]) == ("answered", follow_up)
-    assert _receipts(triage.work_item_id)[fourth_id] == ("coalesced", None)
+    assert _receipts(job.work_item_id)[fourth_id] == ("coalesced", None)
 
 
 # Criterion 4: an answer while the asking request is still finishing -----------------
@@ -425,32 +422,32 @@ def test_asking_still_running_queues_one_follow_up_that_survives_settlement(
 def test_fence_refuses_a_comment_not_created_after_the_question(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5141)
-    fence = _fence(triage)
+    job = _settled_asked(admitted, monkeypatch, 5141)
+    fence = _fence(job)
     # A comment with no time, and with a time that names no zone. (The
     # tracker's ids order a comment against the question: see the
     # immediate-answer and late-delivery tests.)
     for created_at in (None, fence.replace(tzinfo=None) + SECOND):
         before = _counts()
-        comment_id = _comment(triage)
-        refused = _admit(triage, comment_id, created_at)
+        comment_id = _comment(job)
+        refused = _admit(job, comment_id, created_at)
         assert refused == AnswerOutcome("not_after_question", None, False)
         assert _counts() == (before[0], before[1] + 1)
-        assert _receipts(triage.work_item_id)[comment_id] == ("not_after_question", None)
-    row = _round_row(triage.work_item_id)
+        assert _receipts(job.work_item_id)[comment_id] == ("not_after_question", None)
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["pending_request_id"]) == ("outstanding", None)
 
 
 def test_fence_moves_to_the_second_round(admitted: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5142)
-    round_one = _fence(triage)
-    _first_id, first = _answer(triage)
+    job = _settled_asked(admitted, monkeypatch, 5142)
+    round_one = _fence(job)
+    _first_id, first = _answer(job)
     assert first.outcome == "admitted" and first.request_id is not None
 
     # The answer-started request asks round 2, then ends without a pull request.
-    successor = _take_over(triage, first.request_id)
+    successor = _take_over(job, first.request_id)
     # Written after round 1's question and before round 2's.
-    between_id = _comment(triage)
+    between_id = _comment(job)
     asked = _ask(successor, ["Round 2: which file holds the rows?"])
     assert asked.status_code == 200, asked.text
     assert asked.json() == {"round": 2, "rounds_limit": 3}
@@ -459,17 +456,17 @@ def test_fence_moves_to_the_second_round(admitted: Any, monkeypatch: pytest.Monk
         "status": "completed",
         "terminal_cause": "questions_asked",
     }
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["rounds_used"]) == ("outstanding", 2)
     round_two = row["answer_after"]
     assert round_two > round_one
 
     before = _counts()
-    between = _admit(triage, between_id, round_one + (round_two - round_one) / 2)
+    between = _admit(job, between_id, round_one + (round_two - round_one) / 2)
     assert between == AnswerOutcome("not_after_question", None, False)
     assert _counts() == (before[0], before[1] + 1)
 
-    _second_id, second = _answer(triage)
+    _second_id, second = _answer(job)
     assert second.outcome == "admitted"
 
 
@@ -485,17 +482,17 @@ def test_fence_admits_an_immediate_answer_in_the_question_s_second(
     question comment.
     """
 
-    triage = _settled_asked(admitted, monkeypatch, 5143)
-    fence = _fence(triage)
+    job = _settled_asked(admitted, monkeypatch, 5143)
+    fence = _fence(job)
     created_at = fence.replace(microsecond=0) if offset is None else fence + offset
-    requests = _requests(triage.work_item_id)
+    requests = _requests(job.work_item_id)
 
-    comment_id = _comment(triage)
-    result = _admit(triage, comment_id, created_at)
+    comment_id = _comment(job)
+    result = _admit(job, comment_id, created_at)
 
-    expected = factory_questions.answer_request_id(triage.issue, comment_id)
+    expected = factory_questions.answer_request_id(job.issue, comment_id)
     assert result == AnswerOutcome("admitted", expected, False)
-    assert [r["id"] for r in _requests(triage.work_item_id)] == [
+    assert [r["id"] for r in _requests(job.work_item_id)] == [
         *(r["id"] for r in requests),
         expected,
     ]
@@ -511,35 +508,35 @@ def test_fence_refuses_a_comment_written_before_the_question_delivered_late(
     when its reported time reads as later: in the same second, or on a tracker
     whose clock runs ahead of the database's."""
 
-    triage = _running(admitted, monkeypatch, 5144 if delta else 5145)
-    early_id = _comment(triage)
-    response = _ask(triage)
+    job = _running(admitted, monkeypatch, 5144 if delta else 5145)
+    early_id = _comment(job)
+    response = _ask(job)
     assert response.status_code == 200, response.text
-    tr._finish(triage, "failed", "no_pull_request")
-    fence = _fence(triage)
-    requests = _requests(triage.work_item_id)
+    tr._finish(job, "failed", "no_pull_request")
+    fence = _fence(job)
+    requests = _requests(job.work_item_id)
     before = _counts()
 
     created_at = fence.replace(microsecond=0) if not delta else fence + delta
-    refused = _admit(triage, early_id, created_at)
+    refused = _admit(job, early_id, created_at)
 
     assert refused == AnswerOutcome("not_after_question", None, False)
-    assert _requests(triage.work_item_id) == requests
+    assert _requests(job.work_item_id) == requests
     assert _counts() == (before[0], before[1] + 1)
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["pending_request_id"]) == ("outstanding", None)
 
 
-def _tracker_clock(triage: tr._Triage, at: datetime) -> list[datetime]:
+def _tracker_clock(job: tr._Run, at: datetime) -> list[datetime]:
     """Pin the tracker's own clock at ``at``; the returned cell moves it."""
 
     stamp = [at]
-    triage.tracker.marked_comments.clock = lambda: stamp[0]
+    job.tracker.marked_comments.clock = lambda: stamp[0]
     return stamp
 
 
-def _opaque_ids(triage: tr._Triage) -> None:
-    triage.tracker.marked_comments.comment_id = lambda n: f"comment-{n:x}"
+def _opaque_ids(job: tr._Run) -> None:
+    job.tracker.marked_comments.comment_id = lambda n: f"comment-{n:x}"
 
 
 def test_fence_admits_a_same_second_reply_whose_question_response_was_held(
@@ -549,20 +546,20 @@ def test_fence_admits_a_same_second_reply_whose_question_response_was_held(
     held past the boundary, so the database clock (or a tracker clock behind
     it) reads seconds later. A higher id in the question's second answers it."""
 
-    triage = _running(admitted, monkeypatch, 5146)
+    job = _running(admitted, monkeypatch, 5146)
     question_at = (datetime.now(UTC) - 3 * SECOND).replace(microsecond=900_000)
-    _tracker_clock(triage, question_at)
-    asked = _ask(triage)
+    _tracker_clock(job, question_at)
+    asked = _ask(job)
     assert asked.status_code == 200, asked.text
-    tr._finish(triage, "failed", "no_pull_request")
-    requests = _requests(triage.work_item_id)
+    tr._finish(job, "failed", "no_pull_request")
+    requests = _requests(job.work_item_id)
 
-    reply_id = _comment(triage)
-    result = _admit(triage, reply_id, question_at.replace(microsecond=0))
+    reply_id = _comment(job)
+    result = _admit(job, reply_id, question_at.replace(microsecond=0))
 
-    expected = factory_questions.answer_request_id(triage.issue, reply_id)
+    expected = factory_questions.answer_request_id(job.issue, reply_id)
     assert result == AnswerOutcome("admitted", expected, False)
-    assert [r["id"] for r in _requests(triage.work_item_id)] == [
+    assert [r["id"] for r in _requests(job.work_item_id)] == [
         *(r["id"] for r in requests),
         expected,
     ]
@@ -578,57 +575,55 @@ def test_fence_orders_opaque_ids_by_the_tracker_s_question_time(
     clock, and a reply the tracker stamps in a later second is admitted.
     """
 
-    triage = _running(admitted, monkeypatch, 5147)
-    _opaque_ids(triage)
+    job = _running(admitted, monkeypatch, 5147)
+    _opaque_ids(job)
     early_at = (datetime.now(UTC) + 5 * SECOND).replace(microsecond=100_000)
-    stamp = _tracker_clock(triage, early_at)
-    early_id = _comment(triage)
+    stamp = _tracker_clock(job, early_at)
+    early_id = _comment(job)
     stamp[0] = early_at + SECOND / 2
-    asked = _ask(triage)
+    asked = _ask(job)
     assert asked.status_code == 200, asked.text
-    tr._finish(triage, "failed", "no_pull_request")
-    row = _round_row(triage.work_item_id)
+    tr._finish(job, "failed", "no_pull_request")
+    row = _round_row(job.work_item_id)
     assert row is not None and row["comment_id"].startswith("comment-")
-    requests = _requests(triage.work_item_id)
+    requests = _requests(job.work_item_id)
     before = _counts()
 
-    refused = _admit(triage, early_id, early_at.replace(microsecond=0))
+    refused = _admit(job, early_id, early_at.replace(microsecond=0))
     assert refused == AnswerOutcome("not_after_question", None, False)
-    assert _requests(triage.work_item_id) == requests
+    assert _requests(job.work_item_id) == requests
     assert _counts() == (before[0], before[1] + 1)
 
     stamp[0] = early_at + SECOND
-    reply_id = _comment(triage)
-    result = _admit(triage, reply_id, (early_at + SECOND).replace(microsecond=0))
-    expected = factory_questions.answer_request_id(triage.issue, reply_id)
+    reply_id = _comment(job)
+    result = _admit(job, reply_id, (early_at + SECOND).replace(microsecond=0))
+    expected = factory_questions.answer_request_id(job.issue, reply_id)
     assert result == AnswerOutcome("admitted", expected, False)
 
 
 # Criterion 6: no open round, a cancelled WorkItem, and replays -------------------------
 
 
-def _absent(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
+def _absent(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Run:
     return _running(admitted, monkeypatch, number)
 
 
-def _posting(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
+def _posting(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Run:
     """The question write failed at the tracker, which leaves the round ``posting``."""
 
-    triage = _running(admitted, monkeypatch, number)
-    triage.tracker.write_faults.abort_before_next(
-        Operation.UPSERT_MARKED, Unavailable("tracker down")
-    )
-    assert _ask(triage).status_code == 503
-    return triage
+    job = _running(admitted, monkeypatch, number)
+    job.tracker.write_faults.abort_before_next(Operation.UPSERT_MARKED, Unavailable("tracker down"))
+    assert _ask(job).status_code == 503
+    return job
 
 
-def _cleared(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
-    triage = _asked(admitted, monkeypatch, number)
-    tr._finish(triage, "failed", "budget_exceeded")
-    return triage
+def _cleared(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Run:
+    job = _asked(admitted, monkeypatch, number)
+    tr._finish(job, "failed", "budget_exceeded")
+    return job
 
 
-_NO_OPEN_ROUND: dict[str, Callable[[Any, pytest.MonkeyPatch, int], tr._Triage]] = {
+_NO_OPEN_ROUND: dict[str, Callable[[Any, pytest.MonkeyPatch, int], tr._Run]] = {
     "absent": _absent,
     "posting": _posting,
     "cleared": _cleared,
@@ -643,8 +638,8 @@ _NO_OPEN_ROUND: dict[str, Callable[[Any, pytest.MonkeyPatch, int], tr._Triage]] 
 def test_not_outstanding_when_no_round_is_open(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, state: str, number: int
 ) -> None:
-    triage = _NO_OPEN_ROUND[state](admitted, monkeypatch, number)
-    row = _round_row(triage.work_item_id)
+    job = _NO_OPEN_ROUND[state](admitted, monkeypatch, number)
+    row = _round_row(job.work_item_id)
     if state == "absent":
         assert row is None
     else:
@@ -652,43 +647,43 @@ def test_not_outstanding_when_no_round_is_open(
     # A creation time the fence would pass, so only the round refuses it.
     fence = row["answer_after"] if row is not None else None
     created_at = (fence or datetime.now(UTC)) + SECOND
-    requests = _requests(triage.work_item_id)
+    requests = _requests(job.work_item_id)
     before = _counts()
 
-    comment_id = _comment(triage)
+    comment_id = _comment(job)
     if state == "posting":
         # The round's comment may already be on the ticket with this answer
         # after it (#5787 X2): nothing is written, so the answer is decided
         # again once the round is recorded ``outstanding``.
         for _delivery in range(2):
             with pytest.raises(factory_questions.AnswerNotAdmitted) as refused:
-                _admit(triage, comment_id, created_at)
+                _admit(job, comment_id, created_at)
             assert refused.value.code == factory_questions.QUESTION_POSTING
-            assert _requests(triage.work_item_id) == requests
+            assert _requests(job.work_item_id) == requests
             assert _counts() == before
-            assert _receipts(triage.work_item_id) == {}
-            assert _round_row(triage.work_item_id) == row
+            assert _receipts(job.work_item_id) == {}
+            assert _round_row(job.work_item_id) == row
         return
-    result = _admit(triage, comment_id, created_at)
+    result = _admit(job, comment_id, created_at)
 
     assert result == AnswerOutcome("not_outstanding", None, False)
-    assert _requests(triage.work_item_id) == requests
+    assert _requests(job.work_item_id) == requests
     assert _counts() == (before[0], before[1] + 1)
-    assert _receipts(triage.work_item_id) == {comment_id: ("not_outstanding", None)}
-    assert _round_row(triage.work_item_id) == row
-    _replays(triage, comment_id, result)
+    assert _receipts(job.work_item_id) == {comment_id: ("not_outstanding", None)}
+    assert _round_row(job.work_item_id) == row
+    _replays(job, comment_id, result)
 
 
 def test_not_outstanding_is_never_reported_for_a_missing_work_item_replay_safe(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5172)
-    missing = replace(triage, work_item_id=uuid.uuid4())
-    comment_id = _comment(triage)
+    job = _settled_asked(admitted, monkeypatch, 5172)
+    missing = replace(job, work_item_id=uuid.uuid4())
+    comment_id = _comment(job)
     before = _counts()
     for _delivery in range(2):
         with pytest.raises(factory_questions.AnswerNotAdmitted) as refused:
-            _admit(missing, comment_id, _fence(triage) + SECOND)
+            _admit(missing, comment_id, _fence(job) + SECOND)
         assert refused.value.code == "work_item_not_found"
         assert _counts() == before
 
@@ -696,20 +691,20 @@ def test_not_outstanding_is_never_reported_for_a_missing_work_item_replay_safe(
 def test_cancelled_work_item_takes_no_answer(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _settled_asked(admitted, monkeypatch, 5171)
-    fence = _fence(triage)
-    _cancel(triage)
-    requests = _requests(triage.work_item_id)
+    job = _settled_asked(admitted, monkeypatch, 5171)
+    fence = _fence(job)
+    _cancel(job)
+    requests = _requests(job.work_item_id)
     before = _counts()
 
-    comment_id = _comment(triage)
-    result = _admit(triage, comment_id, fence + SECOND)
+    comment_id = _comment(job)
+    result = _admit(job, comment_id, fence + SECOND)
 
     assert result == AnswerOutcome("work_item_cancelled", None, False)
-    assert _requests(triage.work_item_id) == requests
+    assert _requests(job.work_item_id) == requests
     assert _counts() == (before[0], before[1] + 1)
-    assert _receipts(triage.work_item_id) == {comment_id: ("work_item_cancelled", None)}
-    _replays(triage, comment_id, result)
+    assert _receipts(job.work_item_id) == {comment_id: ("work_item_cancelled", None)}
+    _replays(job, comment_id, result)
 
 
 def _every_outcome(
@@ -719,16 +714,14 @@ def _every_outcome(
     *,
     text: str = ANSWER_TEXT,
     requester: str = REQUESTER,
-) -> list[tuple[tr._Triage, str, AnswerOutcome]]:
+) -> list[tuple[tr._Run, str, AnswerOutcome]]:
     """One comment reaching each outcome, in the order they were admitted."""
 
-    reached: list[tuple[tr._Triage, str, AnswerOutcome]] = []
+    reached: list[tuple[tr._Run, str, AnswerOutcome]] = []
 
-    def admit(triage: tr._Triage, created_at: datetime | None) -> None:
-        comment_id = _comment(triage, text)
-        reached.append(
-            (triage, comment_id, _admit(triage, comment_id, created_at, requester=requester))
-        )
+    def admit(job: tr._Run, created_at: datetime | None) -> None:
+        comment_id = _comment(job, text)
+        reached.append((job, comment_id, _admit(job, comment_id, created_at, requester=requester)))
 
     asking = _asked(admitted, monkeypatch, base)
     admit(asking, None)  # no creation time: not after the question
@@ -761,8 +754,8 @@ def test_replay_of_every_outcome_returns_it_and_writes_nothing(
     asking = reached[0][0]
     tr._finish(asking, "failed", "no_pull_request")
     _promote(asking)
-    for triage, comment_id, outcome in reached:
-        _replays(triage, comment_id, outcome)
+    for job, comment_id, outcome in reached:
+        _replays(job, comment_id, outcome)
 
 
 # Criterion 7: the answer-received line --------------------------------------------------
@@ -772,21 +765,21 @@ def test_status_line_leads_an_admitted_answer_while_waiting_and_running(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 5191)
+    job = _asked(admitted, monkeypatch, 5191)
     _reconcile()
-    first_body = _status_body(sink, triage.request_id)
+    first_body = _status_body(sink, job.request_id)
     assert first_body.startswith(INVESTIGATING_LINE)
     assert ANSWER_LINE not in first_body
-    tr._finish(triage, "failed", "no_pull_request")
+    tr._finish(job, "failed", "no_pull_request")
 
-    _comment_id, result = _answer(triage)
+    _comment_id, result = _answer(job)
     assert result.outcome == "admitted" and result.request_id is not None
     _reconcile()
     waiting = _status_body(sink, result.request_id)
     assert waiting.startswith(ANSWER_LINE)
     assert INVESTIGATING_LINE not in waiting
 
-    _take_over(triage, result.request_id)
+    _take_over(job, result.request_id)
     assert _request(result.request_id)["status"] == "running"
     _reconcile()
     running = _status_body(sink, result.request_id)
@@ -798,13 +791,13 @@ def test_status_line_leads_an_answer_started_request_that_settled_before_its_fir
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _client, _github, sink = admitted
-    triage = _settled_asked(admitted, monkeypatch, 5194)
-    _comment_id, result = _answer(triage)
+    job = _settled_asked(admitted, monkeypatch, 5194)
+    _comment_id, result = _answer(job)
     assert result.outcome == "admitted" and result.request_id is not None
 
     # The attempt starts and settles through the worker finish path before
     # the reconciler first syncs its status comment.
-    started = _take_over(triage, result.request_id)
+    started = _take_over(job, result.request_id)
     tr._finish(started, "failed", "no_pull_request")
     assert _request(result.request_id)["status"] == "failed"
     _reconcile()
@@ -878,8 +871,8 @@ def test_log_records_of_every_outcome_carry_identifiers_only(
         text=f"Please replace the rows. {text_sentinel}",
         requester=f"github:{AUTHOR.id}:{login_sentinel}",
     )
-    triage, replayed_id, replayed = reached[1]
-    _replays(triage, replayed_id, replayed)
+    job, replayed_id, replayed = reached[1]
+    _replays(job, replayed_id, replayed)
 
     records = [
         record
@@ -890,7 +883,7 @@ def test_log_records_of_every_outcome_carry_identifiers_only(
     expected = [
         (outcome.outcome, t.work_item_id, comment_id, outcome.request_id)
         for t, comment_id, outcome in reached
-    ] + [(replayed.outcome, triage.work_item_id, replayed_id, replayed.request_id)]
+    ] + [(replayed.outcome, job.work_item_id, replayed_id, replayed.request_id)]
     assert [record.args for record in records] == expected
     assert "replayed" in records[-1].getMessage()
     for record, (outcome, work_item_id, comment_id, _request_id) in zip(

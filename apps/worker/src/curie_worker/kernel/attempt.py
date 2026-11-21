@@ -924,13 +924,6 @@ async def _attempt_turn(
                 outcome.approval_gate_kind,
                 outcome.approval_granted_tool,
             )
-            # ADR 0277 (#5586): a tracker_result run's publish request is
-            # refused unread; no snapshot of its workspace is taken.
-            and not (
-                owned_run is not None
-                and owned_run.event_id == qevent.event_id
-                and owned_run.is_tracker_result
-            )
         ):
             snapshot = None
             # The worker names the base the snapshot is anchored at: the

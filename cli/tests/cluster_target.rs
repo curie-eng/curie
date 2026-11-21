@@ -115,6 +115,10 @@ fn cluster_cases() -> Vec<ClusterCase> {
             args: &["publication-policy", "acme-bot", "--dry-run"],
         },
         ClusterCase {
+            name: "factory-progress",
+            args: &["factory-progress", "acme-bot", "--dry-run"],
+        },
+        ClusterCase {
             name: "surfaces",
             args: &["surfaces", "acme-bot", "--dry-run"],
         },
@@ -559,6 +563,10 @@ fn connection_backed_verbs_discover_the_file_target() {
         (
             "publication-policy",
             &["cluster", "publication-policy", "acme-bot"],
+        ),
+        (
+            "factory-progress",
+            &["cluster", "factory-progress", "acme-bot"],
         ),
         ("surfaces", &["cluster", "surfaces", "acme-bot"]),
         (

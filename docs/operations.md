@@ -1524,8 +1524,9 @@ configuration loaded. No separate Helm upgrade is needed.
 
 Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
-is `poll` or `webhook`, and `poll` is the default. The API setting
-`FACTORY_MODEL_AUTH_MODE` (default `service`) selects the mode that GitHub and
+is `poll` or `webhook`, and `poll` is the default. `factory.modelAuthMode`
+(default `service`, set with `curie cluster factory --model-auth-mode
+personal`) selects the mode that GitHub and
 tracker intake, pull request review feedback, and
 [Slack steering](#factory-slack-steering) of a service WorkItem admit under.
 A labelled issue in `personal` mode names an owner when the labeller is linked
@@ -1537,8 +1538,9 @@ and, when a factory Slack channel is configured, one channel post. A WorkItem
 admitted as service before the switch refuses its tracker mentions, review
 feedback and Slack steering with `personal_owner_required`. No owner is
 invented for it. A personal WorkItem keeps its owner on every revision,
-whoever asked for it. It is an environment setting only,
-with no chart value, and the worker reads it too
+whoever asked for it. The chart renders the value as `FACTORY_MODEL_AUTH_MODE`
+into both the API and the worker, so the two cannot disagree; setting that
+variable through `api.extraEnv` or `worker.extraEnv` fails the render
 ([Personal Claude enrollment](#personal-claude-enrollment)). The `factory:`
 block replaces the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
 with `curie cluster factory`, use the
@@ -2843,10 +2845,27 @@ its transcript. Disconnect is never held. The CLI treats the refusal as
 transient (exit 3); retry once the rollout completes. Single-instance stacks
 outside Kubernetes set `CURIE_PERSONAL_ROLLOUT_HOLD=false`.
 
-The worker reads `FACTORY_MODEL_AUTH_MODE` too, and it must match the API's
-value. With `personal`, the worker refuses to start with
-`personal_mode_requires_kubernetes` unless `CURIE_SANDBOX_SUBSTRATE` is
-`kubernetes`, and it refuses every turn that has no owner (a plain run, a cron
+The worker reads the same `factory.modelAuthMode`, which the chart renders as
+`FACTORY_MODEL_AUTH_MODE` into the API and the worker alike. Select it with
+`curie cluster factory --model-auth-mode personal` (or `service`). Given alone,
+that flag writes only `factory.modelAuthMode` and leaves intake, its forges and
+`factory.enabled` as recorded. `curie cluster status` prints the mode as
+`factory model auth mode`.
+
+A release that selected personal mode by setting `FACTORY_MODEL_AUTH_MODE` in
+`api.extraEnv` and `worker.extraEnv` fails its next render, because the chart
+owns the variable now and retained values replay the old entries. In the same
+upgrade, give both lists again without the variable (`[]` when nothing else
+remains) and set `factory.modelAuthMode: personal` in one values file; the
+chart README section "Factory model auth mode" has the file and the
+`helm upgrade --reset-then-reuse-values -f` command. With `personal`, the
+worker refuses to start with `personal_mode_requires_kubernetes` unless
+`CURIE_SANDBOX_SUBSTRATE` is `kubernetes`; the chart and `curie cluster
+factory` refuse a personal release whose `worker.extraEnv` selects another
+substrate before anything is applied. They compare the literal as the worker
+does, with whitespace trimmed and case ignored, and refuse a `valueFrom` entry
+or an empty value. Changing the mode governs new admissions; an execution
+request already created keeps the mode it recorded. The worker also refuses every turn that has no owner (a plain run, a cron
 or webhook hook, an eval) with `personal_owner_required` before any claim. The
 protected hook lane is configured only from its provisioned `process.json`, so
 it does not read this setting and never runs WorkItem requests. In
@@ -3015,9 +3034,11 @@ A pull request published for a request whose evidence is `applied` carries one l
 with `Learned rules:` is refused with `publication.learned_rules_annotation_reserved`
 before any other work.
 
-Only a request under the implementation completion contract is served the rules: a request
-under any other contract (the separate triage path) carries `memory_rules_evidence` `none`
-and is served an absent envelope. The rule text rides the implementer's system prompt, so
+Every request the factory admits from a labelled ticket runs under the implementation
+completion contract and is served the rules pinned at admission; there is no separate
+triage path. A bundle that still carries the retired result declaration (a result.json
+file in its workflow directory) is refused at upload, push, deploy and promote with
+`bundle.result_declaration_retired`: delete the file and deploy again. The rule text rides the implementer's system prompt, so
 the conversation transcript and its native checkpoint can retain it, under the transcript's
 own access controls and expiry and not the WorkItem snapshot's, as for requester
 preferences. A rule removed after a WorkItem was admitted can therefore remain in that
@@ -3352,7 +3373,7 @@ For the `local`-target equivalent (`curie local comms --slack`), see
 
 ### Factory Slack progress
 
-An agent opts in with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears), described in the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack). The channel must have exactly one Slack binding on that agent, whose app identity posts; otherwise the API answers 409 `factory_slack_channel_unbound`. Only runs live at or after the moment the channel was set are posted. Changing the channel keeps each existing WorkItem in its original thread while that channel keeps its binding; clearing it stops all posting.
+An agent opts in with `curie cluster factory-progress <agent> --slack-channel C0EXAMPLE1` (`--no-slack-channel` clears, no flag inspects; `curie local factory-progress` on the local stack) or in the Console agent page's "Slack progress channel" field, described in the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack). The channel must have exactly one Slack binding on that agent, whose app identity posts, if it does not, the command fails and names the fix. A missing binding is created with `curie cluster surfaces <agent> --add slack=C0EXAMPLE1`, or, when another agent already holds the default Slack identity on that channel, under a free declared identity with `curie cluster surfaces <agent> --add slack=C0EXAMPLE1 --adapter <identity>`. A channel bound under more than one Slack identity is fixed by listing the bindings with `curie cluster surfaces <agent>` and removing the extra with `curie cluster surfaces <agent> --remove slack=C0EXAMPLE1 --adapter <identity>`. Run each fix, and then the command again, against the same target as the failed command. As API reference, the command sends `PATCH /agents/{agent_id}` with `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears), and the API answers 409 `factory_slack_channel_unbound` when the agent does not have exactly one such binding. Only runs live at or after the moment the channel was set are posted. Changing the channel keeps each existing WorkItem in its original thread while that channel keeps its binding. Clearing it stops every thread the progress lane rooted for that channel: no new WorkItem roots there, and existing configured threads get no further replies and no further card edits. A thread started by a [Slack kickoff](#factory-slack-kickoff) keeps its own progress either way.
 
 The worker's progress lane derives what is owed from existing run records on each pass and keeps it in a durable outbox (`factory_slack_threads` binds each WorkItem to one Slack root for its whole life, `factory_slack_posts` holds the owed posts). Each thread records its origin. A `configured` thread is one this lane roots in `factory_slack_channel`, as above. A `kickoff` thread is the message that started the run from Slack ([Factory Slack kickoff](#factory-slack-kickoff)): no root post is owed, and it needs no `factory_slack_channel`, so setting, changing or clearing the channel neither stops nor moves it. Either origin is delivered only while its channel holds exactly one Slack binding of the agent and that binding names the thread's identity. Two settings govern it: `CURIE_FACTORY_SLACK_PROGRESS_ENABLED` (default true) and `CURIE_FACTORY_SLACK_INTERVAL_S` (default 2 seconds). With the progress switch off a worker posts nothing; a worker with it on later still finds and posts what is owed.
 
@@ -3377,7 +3398,7 @@ A person steers a run by explicitly mentioning the app in that run's Slack threa
 1. `POST /identity/admin/{tenant_id}/code-host-links` with `principal_id`, `code_host_kind` (`github`), `host` (for example `github.com`), the numeric `account_id`, and `created_by_principal_id`. An account already actively linked answers 409 `link_exists`.
 2. `POST /identity/admin/{tenant_id}/links/{link_id}/revoke` ends a link. A revoked link, a disabled principal or a lost write permission refuses a mention that was queued before the change.
 
-A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `FACTORY_MODEL_AUTH_MODE=personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
+A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `factory.modelAuthMode` set to `personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
 
 The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, and for each top-level human mention whose text links an issue, before its dedupe claim, so the worker can verify the sender and the exact message. On a test installation it also stores one for a declared test driver's marked action in that driver's channel, at root or in a thread; that receipt is version 2 and names the declared bot user and bot id, never the event's user. Steering reads only a person's thread receipt and refuses any other; root receipts and version 2 receipts serve kickoff. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
 

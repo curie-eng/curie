@@ -2235,8 +2235,9 @@ def two_owner_install_values(
     reference (the worker delivers each owner's grant per claim) and keeps
     CURIE_MAX_TURNS=32 and CLAUDE_CODE_MAX_OUTPUT_TOKENS=RESPONSE_OUTPUT_TOKENS,
     with ENABLE_TOOL_SEARCH=false. ``personalClaude.grantNamespace`` turns on
-    custody, FACTORY_MODEL_AUTH_MODE=personal is set on api and worker, the
-    api gets the CURIE_OIDC_* settings (client secret by secretKeyRef
+    custody, ``factory.modelAuthMode`` is personal (the chart renders
+    FACTORY_MODEL_AUTH_MODE into both the api and the worker), the api gets the
+    CURIE_OIDC_* settings (client secret by secretKeyRef
     ``client_secret_ref`` = (Secret name, key), admit-all true), the worker
     runs maxConcurrency 3 and the sandbox quota requests 16Gi. The result
     must pass ``installation_grant_findings``. ``base`` is not changed.
@@ -2267,22 +2268,17 @@ def two_owner_install_values(
     ]
     values.setdefault("personalClaude", {})["grantNamespace"] = grant_namespace
 
-    def without(entries: Any, prefix: str = "") -> list[Any]:
+    values.setdefault("factory", {})["modelAuthMode"] = pps.PERSONAL_MODE
+
+    def without(entries: Any, prefix: str) -> list[Any]:
         return [
             entry
             for entry in entries or []
-            if not (
-                isinstance(entry, dict)
-                and (
-                    entry.get("name") == "FACTORY_MODEL_AUTH_MODE"
-                    or (prefix and str(entry.get("name") or "").startswith(prefix))
-                )
-            )
+            if not (isinstance(entry, dict) and str(entry.get("name") or "").startswith(prefix))
         ]
 
     api = values.setdefault("api", {})
     api["extraEnv"] = without(api.get("extraEnv"), "CURIE_OIDC_") + [
-        _env("FACTORY_MODEL_AUTH_MODE", pps.PERSONAL_MODE),
         _env("CURIE_OIDC_ISSUER", issuer),
         _env("CURIE_OIDC_AUDIENCE", client_id),
         _env("CURIE_OIDC_JWKS_URL", f"{issuer}/keys"),
@@ -2295,9 +2291,6 @@ def two_owner_install_values(
         _env("CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "true"),
     ]
     worker = values.setdefault("worker", {})
-    worker["extraEnv"] = without(worker.get("extraEnv")) + [
-        _env("FACTORY_MODEL_AUTH_MODE", pps.PERSONAL_MODE)
-    ]
     worker["maxConcurrency"] = WORKER_MAX_CONCURRENCY
     worker["workItemMaxTurns"] = SESSION_TURNS
     values.setdefault("resourceQuota", {}).setdefault("hard", {})["requestsMemory"] = (

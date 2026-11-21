@@ -73,6 +73,10 @@ pub struct FactoryIntakeOpts {
     /// `factory.intake` when this run must select a mode. `None`
     /// leaves the recorded value unchanged.
     pub intake: Option<String>,
+    /// `factory.modelAuthMode` (`service` or `personal`) when this run must
+    /// select the installation's model auth mode. `None` leaves the recorded
+    /// value unchanged. Never written through `extraEnv`.
+    pub model_auth_mode: Option<String>,
     /// Digest-pinned runner image bound in the same upgrade as the intake
     /// settings. `None` leaves `agentSandbox.runnerImages` unchanged.
     pub runner_binding: Option<RunnerImageBinding>,
@@ -152,8 +156,18 @@ async fn release_minimum_helm_timeout(common: &CommonOpts) -> Option<u64> {
 
 pub enum FactoryIntakeOutput {
     DryRun(crate::ui::DryRunPlan),
-    Done { enabled: bool },
-    RepositoriesUpdated { enabled: bool, repos: Vec<String> },
+    Done {
+        enabled: bool,
+    },
+    RepositoriesUpdated {
+        enabled: bool,
+        repos: Vec<String>,
+    },
+    /// `--model-auth-mode` alone: only `factory.modelAuthMode` was written;
+    /// intake and its entries were left as recorded.
+    ModelAuthModeSet {
+        mode: String,
+    },
 }
 
 impl crate::ui::CliOutput for FactoryIntakeOutput {
@@ -163,6 +177,9 @@ impl crate::ui::CliOutput for FactoryIntakeOutput {
             FactoryIntakeOutput::Done { enabled }
             | FactoryIntakeOutput::RepositoriesUpdated { enabled, .. } => {
                 serde_json::json!({"factory_intake_enabled": enabled})
+            }
+            FactoryIntakeOutput::ModelAuthModeSet { mode } => {
+                serde_json::json!({"factory_model_auth_mode": mode})
             }
         }
     }
@@ -181,6 +198,9 @@ impl crate::ui::CliOutput for FactoryIntakeOutput {
                     repos.join(", ")
                 ));
             }
+            FactoryIntakeOutput::ModelAuthModeSet { mode } => ui.payload(&format!(
+                "factory model auth mode set to {mode}; intake settings unchanged"
+            )),
         }
     }
 }
@@ -431,6 +451,9 @@ pub fn intake_values(opts: &FactoryIntakeOpts) -> serde_json::Value {
     }
     if let Some(intake) = &opts.intake {
         factory.insert("intake".into(), serde_json::json!(intake));
+    }
+    if let Some(mode) = &opts.model_auth_mode {
+        factory.insert("modelAuthMode".into(), serde_json::json!(mode));
     }
     if !opts.repos.is_empty() {
         api.insert("githubRepoAllowlist".into(), serde_json::json!(opts.repos));
@@ -1006,6 +1029,166 @@ fn recorded_credential(recorded: &serde_json::Value) -> FactoryCredential {
     }
 }
 
+/// Personal mode needs the Kubernetes sandbox substrate: the worker refuses
+/// to start (`personal_mode_requires_kubernetes`) and the chart refuses the
+/// render when the recorded `worker.extraEnv` selects another
+/// `CURIE_SANDBOX_SUBSTRATE`. Refuse here first, before any Helm write, with
+/// what to change. An entry without a literal value (`valueFrom`) is not
+/// judged, matching the chart.
+fn refuse_personal_mode_substrate(
+    recorded: &serde_json::Value,
+    model_auth_mode: Option<&str>,
+) -> Result<()> {
+    if model_auth_mode != Some("personal") {
+        return Ok(());
+    }
+    let entries = recorded
+        .pointer("/worker/extraEnv")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let refuse = |problem: String, fix: &str| -> anyhow::Error {
+        CliError::usage(format!(
+            "--model-auth-mode personal needs the Kubernetes sandbox substrate, but the \
+             release's worker.extraEnv {problem}"
+        ))
+        .with_fix(format!("{fix}; nothing was applied"))
+        .into()
+    };
+    for entry in entries {
+        if entry.get("name").and_then(serde_json::Value::as_str) != Some("CURIE_SANDBOX_SUBSTRATE")
+        {
+            continue;
+        }
+        let substrate = match (entry.get("valueFrom"), entry.get("value")) {
+            (Some(_), _) | (None, None) => {
+                return Err(refuse(
+                    "sets CURIE_SANDBOX_SUBSTRATE from valueFrom, which cannot be verified \
+                     before the worker starts"
+                        .into(),
+                    "remove CURIE_SANDBOX_SUBSTRATE from worker.extraEnv (kubernetes is the \
+                     default) or give it the literal value kubernetes, then run again",
+                ));
+            }
+            (None, Some(serde_json::Value::String(text))) => text.clone(),
+            (None, Some(serde_json::Value::Null)) => String::new(),
+            (None, Some(other)) => other.to_string(),
+        };
+        if substrate.trim().is_empty() {
+            return Err(refuse(
+                "sets CURIE_SANDBOX_SUBSTRATE to an empty value, which the worker refuses \
+                 at startup"
+                    .into(),
+                "remove CURIE_SANDBOX_SUBSTRATE from worker.extraEnv (kubernetes is the \
+                 default) or set it to kubernetes, then run again",
+            ));
+        }
+        if !substrate.trim().eq_ignore_ascii_case("kubernetes") {
+            return Err(refuse(
+                format!("sets CURIE_SANDBOX_SUBSTRATE={substrate}"),
+                "remove CURIE_SANDBOX_SUBSTRATE from worker.extraEnv (kubernetes is the \
+                 default) and run again, or keep --model-auth-mode service",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `--model-auth-mode` with no other intake-affecting option: the run is a
+/// mode-only change. It skips App registration, preflight, the intake gate and
+/// every GitHub entry, so a GitLab-only or intake-disabled release keeps its
+/// intake exactly as recorded. Repository updates are excluded by clap and
+/// [`repository_updates_input`]. The dispatcher asks this before it resolves
+/// a webhook secret from the environment, so an exported
+/// `CURIE_GITHUB_WEBHOOK_SECRET` never turns a mode-only run into an intake
+/// run; `--webhook-secret-file` is an intake option there.
+pub fn model_auth_mode_only(opts: &FactoryIntakeOpts) -> Option<&str> {
+    let mode = opts.model_auth_mode.as_deref()?;
+    let other = !opts.repos.is_empty()
+        || opts.all_installed_repos
+        || opts.label.is_some()
+        || opts.mention.is_some()
+        || opts.card_base_url.is_some()
+        || opts.webhook_secret.is_some()
+        || !opts.forge_egress.is_empty()
+        || opts.disable
+        || opts.app_id.is_some()
+        || opts.private_key_file.is_some()
+        || opts.org.is_some()
+        || opts.intake.is_some()
+        || opts.runner_binding.is_some();
+    (!other).then_some(mode)
+}
+
+/// The whole values document a mode-only run applies with `--reuse-values`.
+fn model_auth_mode_only_values(mode: &str) -> serde_json::Value {
+    serde_json::json!({"factory": {"modelAuthMode": mode}})
+}
+
+async fn set_model_auth_mode_only(
+    opts: FactoryIntakeOpts,
+    mode: String,
+) -> Result<Box<dyn crate::ui::CliOutput>> {
+    if opts.common.dry_run {
+        let placeholder = Path::new("<private-values-file>");
+        let timeout = effective_helm_timeout(opts.timeout_seconds, None);
+        let lines = vec![
+            model_auth_mode_plan_note(&mode),
+            "# writes only factory.modelAuthMode; intake settings are unchanged; the upgrade \
+             changes the api and worker pod templates, so Helm rolls them"
+                .into(),
+            helm_upgrade(&opts.common, &opts.chart, placeholder, timeout).display(),
+        ];
+        return Ok(Box::new(FactoryIntakeOutput::DryRun(
+            crate::ui::DryRunPlan { lines },
+        )));
+    }
+    // Helm alone: the upgrade changes the api and worker pod templates, so
+    // Helm rolls them, and no rollout restart can fail on an api that this
+    // release does not deploy (api.deploy=false).
+    require_on_path("helm")?;
+    let Some(recorded) = fetch_release_values(&opts.common).await? else {
+        return Err(CliError::usage(format!(
+            "release {} was not found in namespace {}",
+            opts.common.release, opts.common.namespace
+        ))
+        .with_fix("install it with `curie cluster up`, or pass the --release and --namespace it was installed with; nothing was applied")
+        .into());
+    };
+    refuse_personal_mode_substrate(&recorded, Some(&mode))?;
+    let timeout = match opts.timeout_seconds {
+        Some(explicit) => explicit,
+        None => effective_helm_timeout(None, release_minimum_helm_timeout(&opts.common).await),
+    };
+    let ui = crate::ui::ui();
+    let cl = ui.checklist();
+    let file =
+        crate::ops::SecretValuesFileGuard::private_document(&model_auth_mode_only_values(&mode))?;
+    let cmd = crate::ops::quickstart_marked_release_write(&helm_upgrade(
+        &opts.common,
+        &opts.chart,
+        file.path(),
+        timeout,
+    ));
+    ui.plumbing(&format!("+ {}", cmd.display()));
+    let step = cl.step(&format!(
+        "setting the factory model auth mode to {mode} on release {}",
+        opts.common.release
+    ));
+    let (ok, _, stderr) = run_capture(&cmd).await?;
+    if !ok {
+        step.fail("helm upgrade failed");
+        return Err(CliError::failure(format!(
+            "helm upgrade of release {} failed: {}",
+            opts.common.release,
+            stderr.trim()
+        ))
+        .into());
+    }
+    step.done("set");
+    Ok(Box::new(FactoryIntakeOutput::ModelAuthModeSet { mode }))
+}
+
 /// The values this run applies: the intake document, the App's `api.*`
 /// values when it configures one, and the factory entries naming that App.
 /// A label or mention this run leaves unset keeps the recorded one, since the
@@ -1239,6 +1422,7 @@ type RepositoryIndices = BTreeMap<String, (usize, usize)>;
 fn repository_updates_input(opts: &FactoryIntakeOpts) -> Result<RepositoryUpdates> {
     if opts.disable
         || opts.intake.is_some()
+        || opts.model_auth_mode.is_some()
         || opts.label.is_some()
         || opts.mention.is_some()
         || opts.card_base_url.is_some()
@@ -1740,9 +1924,25 @@ fn app_arguments(opts: &FactoryIntakeOpts) -> Result<Option<(String, PathBuf)>> 
     Ok(args)
 }
 
+/// The dry-run line naming the model auth mode the private values file sets.
+fn model_auth_mode_plan_note(mode: &str) -> String {
+    let mut note = format!(
+        "# set factory.modelAuthMode={mode} (the chart renders FACTORY_MODEL_AUTH_MODE into the api and the worker)"
+    );
+    if mode == "personal" {
+        note.push_str(
+            "; refused before any write if the release's worker.extraEnv sets CURIE_SANDBOX_SUBSTRATE to anything but kubernetes",
+        );
+    }
+    note
+}
+
 pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate::ui::CliOutput>> {
     if !opts.repo_runners.is_empty() || !opts.repo_docker.is_empty() || opts.registry.is_some() {
         return update_repositories(opts).await;
+    }
+    if let Some(mode) = model_auth_mode_only(&opts).map(str::to_string) {
+        return set_model_auth_mode_only(opts, mode).await;
     }
     if let Some(mention) = opts.mention.as_deref() {
         if !opts.disable && !valid_github_login(mention) {
@@ -1780,6 +1980,9 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
                     "# GET {api}/users/{slug}[bot] for its publication author identity"
                 ));
             }
+        }
+        if let Some(mode) = &opts.model_auth_mode {
+            lines.push(model_auth_mode_plan_note(mode));
         }
         let timeout = effective_helm_timeout(opts.timeout_seconds, None);
         lines.extend(
@@ -1833,6 +2036,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         recorded = fetch_release_values(&opts.common)
             .await?
             .unwrap_or(serde_json::Value::Null);
+        refuse_personal_mode_substrate(&recorded, opts.model_auth_mode.as_deref())?;
         match &app_args {
             None if recorded_api_str(&recorded, "githubAppId").is_none() => {
                 // No App anywhere: print the registration link, apply nothing.
@@ -2080,6 +2284,7 @@ mod tests {
             private_key_file: None,
             org: None,
             intake: None,
+            model_auth_mode: None,
             runner_binding: None,
             repo_runners: Vec::new(),
             registry: None,
@@ -2989,5 +3194,295 @@ metadata:
             message.starts_with("factory.bindings names are not unique: x"),
             "{message}"
         );
+    }
+
+    fn model_auth_mode_opts(mode: Option<&str>) -> FactoryIntakeOpts {
+        let mut o = opts();
+        o.model_auth_mode = mode.map(str::to_string);
+        o
+    }
+
+    fn mentions_the_variable(values: &serde_json::Value) -> bool {
+        values.to_string().contains("FACTORY_MODEL_AUTH_MODE")
+    }
+
+    #[test]
+    fn model_auth_mode_writes_the_chart_value_and_never_extra_env() {
+        for mode in ["service", "personal"] {
+            let recorded = serde_json::json!({
+                "api": {"githubAppId": "7001"},
+                "factory": {"intake": "poll", "trackers": [
+                    {"name": "github", "kind": "github", "host": "github.com",
+                     "label": "factory", "mention": "curie-app"}]},
+            });
+            for values in [
+                intake_values(&model_auth_mode_opts(Some(mode))),
+                planned_values(&model_auth_mode_opts(Some(mode)), &recorded, None),
+            ] {
+                assert_eq!(values["factory"]["modelAuthMode"], mode, "{values}");
+                // The rest of the factory block is still written beside it.
+                assert_eq!(values["factory"]["enabled"], true, "{values}");
+                assert!(values.pointer("/factory/trackers/0").is_some(), "{values}");
+                assert!(values.pointer("/api/extraEnv").is_none(), "{values}");
+                assert!(values.pointer("/worker/extraEnv").is_none(), "{values}");
+                assert!(!mentions_the_variable(&values), "{values}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_auth_mode_omitted_keeps_the_recorded_value() {
+        let values = intake_values(&model_auth_mode_opts(None));
+        assert!(
+            values.pointer("/factory/modelAuthMode").is_none(),
+            "an omitted --model-auth-mode writes nothing, so --reuse-values keeps the release's: {values}"
+        );
+        assert!(!mentions_the_variable(&values), "{values}");
+    }
+
+    #[test]
+    fn model_auth_mode_cannot_ride_a_repository_update() {
+        let mut o = model_auth_mode_opts(Some("personal"));
+        o.label = None;
+        o.mention = None;
+        o.card_base_url = None;
+        o.webhook_secret = None;
+        o.forge_egress = Vec::new();
+        o.repo_docker = vec!["acme/widgets".into()];
+        let error = repository_updates_input(&o)
+            .err()
+            .expect("a repository update refuses --model-auth-mode");
+        assert!(error.to_string().contains("cannot be combined"), "{error}");
+    }
+
+    async fn model_auth_mode_plan(mode: &str) -> Vec<String> {
+        let mut o = model_auth_mode_opts(Some(mode));
+        o.mention = None;
+        let plan = factory_intake(o).await.expect("dry run").to_json();
+        plan["plan"]
+            .as_array()
+            .unwrap_or_else(|| panic!("dry run plan: {plan}"))
+            .iter()
+            .map(|line| line.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn model_auth_mode_dry_run_plans_the_chart_value_for_each_mode() {
+        let service = model_auth_mode_plan("service").await;
+        assert!(
+            service
+                .iter()
+                .any(|line| line.contains("factory.modelAuthMode=service")),
+            "{service:?}"
+        );
+        assert!(
+            !service
+                .iter()
+                .any(|line| line.contains("CURIE_SANDBOX_SUBSTRATE")),
+            "service mode has no substrate precondition: {service:?}"
+        );
+        let personal = model_auth_mode_plan("personal").await;
+        assert!(
+            personal
+                .iter()
+                .any(|line| line.contains("factory.modelAuthMode=personal")
+                    && line.contains("CURIE_SANDBOX_SUBSTRATE")),
+            "{personal:?}"
+        );
+        for lines in [&service, &personal] {
+            assert!(
+                lines.iter().any(|line| line.contains("helm upgrade")),
+                "{lines:?}"
+            );
+            // The mode travels in the private values file, never as a --set.
+            assert!(
+                !lines.iter().any(|line| line.contains("--set")),
+                "{lines:?}"
+            );
+        }
+        let omitted = {
+            let mut o = model_auth_mode_opts(None);
+            o.mention = None;
+            factory_intake(o)
+                .await
+                .expect("dry run")
+                .to_json()
+                .to_string()
+        };
+        assert!(!omitted.contains("modelAuthMode"), "{omitted}");
+    }
+
+    fn recorded_with_substrate(substrate: Option<serde_json::Value>) -> serde_json::Value {
+        let mut entries = vec![serde_json::json!({"name": "ACME_EXTENSION", "value": "1"})];
+        if let Some(value) = substrate {
+            entries.push(serde_json::json!({"name": "CURIE_SANDBOX_SUBSTRATE", "value": value}));
+        }
+        serde_json::json!({"worker": {"extraEnv": entries}})
+    }
+
+    #[test]
+    fn model_auth_mode_personal_refuses_a_non_kubernetes_substrate() {
+        for substrate in ["docker", "static", " Docker "] {
+            let recorded = recorded_with_substrate(Some(serde_json::json!(substrate)));
+            let error = refuse_personal_mode_substrate(&recorded, Some("personal"))
+                .expect_err("personal mode on a non-Kubernetes substrate is refused");
+            let cli = error
+                .downcast_ref::<CliError>()
+                .expect("the refusal is a CliError");
+            let text = format!("{cli:?}");
+            assert!(text.contains("CURIE_SANDBOX_SUBSTRATE"), "{text}");
+            assert!(text.contains("worker.extraEnv"), "{text}");
+            assert!(text.contains("nothing was applied"), "{text}");
+        }
+    }
+
+    #[test]
+    fn model_auth_mode_personal_refuses_an_unverifiable_or_empty_substrate() {
+        let from_config_map = serde_json::json!({"worker": {"extraEnv": [{
+            "name": "CURIE_SANDBOX_SUBSTRATE",
+            "valueFrom": {"configMapKeyRef": {"name": "acme-substrate", "key": "substrate"}},
+        }]}});
+        let cases = [
+            (from_config_map.clone(), "valueFrom"),
+            (
+                recorded_with_substrate(Some(serde_json::json!(""))),
+                "empty value",
+            ),
+            (
+                recorded_with_substrate(Some(serde_json::json!("  "))),
+                "empty value",
+            ),
+            (
+                recorded_with_substrate(Some(serde_json::Value::Null)),
+                "empty value",
+            ),
+        ];
+        for (recorded, needle) in cases {
+            let error = refuse_personal_mode_substrate(&recorded, Some("personal"))
+                .expect_err("personal mode needs a literal kubernetes substrate");
+            let text = format!("{:?}", error.downcast_ref::<CliError>().expect("CliError"));
+            assert!(text.contains(needle), "{recorded}: {text}");
+            assert!(text.contains("nothing was applied"), "{text}");
+        }
+        for mode in [None, Some("service")] {
+            refuse_personal_mode_substrate(&from_config_map, mode)
+                .expect("service mode keeps any substrate entry");
+        }
+    }
+
+    fn mode_only_opts(mode: &str) -> FactoryIntakeOpts {
+        let mut o = opts();
+        o.repos = Vec::new();
+        o.label = None;
+        o.mention = None;
+        o.card_base_url = None;
+        o.webhook_secret = None;
+        o.forge_egress = Vec::new();
+        o.model_auth_mode = Some(mode.into());
+        o
+    }
+
+    #[test]
+    fn model_auth_mode_alone_is_a_mode_only_run_writing_only_the_value() {
+        for mode in ["service", "personal"] {
+            let o = mode_only_opts(mode);
+            assert_eq!(model_auth_mode_only(&o), Some(mode));
+            assert_eq!(
+                model_auth_mode_only_values(mode),
+                serde_json::json!({"factory": {"modelAuthMode": mode}})
+            );
+        }
+        // Any other intake-affecting option takes the full intake flow, which
+        // also writes the mode.
+        let others: [fn(&mut FactoryIntakeOpts); 13] = [
+            |o| o.repos = vec!["acme/widgets".into()],
+            |o| o.all_installed_repos = true,
+            |o| o.label = Some("factory".into()),
+            |o| o.mention = Some("acme-bot".into()),
+            |o| o.card_base_url = Some("https://cards.example.com".into()),
+            |o| o.webhook_secret = Some(SECRET.into()),
+            |o| o.forge_egress = vec!["dark-factory".into()],
+            |o| o.disable = true,
+            |o| o.app_id = Some("7001".into()),
+            |o| o.private_key_file = Some("app.pem".into()),
+            |o| o.org = Some("acme-corp".into()),
+            |o| o.intake = Some("poll".into()),
+            |o| {
+                o.runner_binding = Some(RunnerImageBinding {
+                    agent: "acme".into(),
+                    image: "ghcr.io/acme/runner@sha256:0".into(),
+                })
+            },
+        ];
+        for set in others {
+            let mut o = mode_only_opts("personal");
+            set(&mut o);
+            assert_eq!(model_auth_mode_only(&o), None);
+        }
+        assert_eq!(
+            model_auth_mode_only(&opts()),
+            None,
+            "no mode, no mode-only run"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_auth_mode_alone_dry_run_plans_only_the_value() {
+        for mode in ["service", "personal"] {
+            let plan = factory_intake(mode_only_opts(mode))
+                .await
+                .expect("dry run")
+                .to_json();
+            let lines: Vec<&str> = plan["plan"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{plan}"))
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("factory.modelAuthMode={mode}"))),
+                "{lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("intake settings are unchanged")),
+                "{lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("helm upgrade")),
+                "{lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.contains("toolchain inference")),
+                "a mode-only run skips the intake preflight: {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.contains("kubectl")),
+                "Helm rolls the pods; a mode-only run plans no kubectl rollout: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_auth_mode_substrate_check_allows_service_and_kubernetes() {
+        let docker = recorded_with_substrate(Some(serde_json::json!("docker")));
+        for mode in [None, Some("service")] {
+            refuse_personal_mode_substrate(&docker, mode)
+                .expect("service mode keeps any substrate");
+        }
+        for recorded in [
+            recorded_with_substrate(Some(serde_json::json!("kubernetes"))),
+            recorded_with_substrate(Some(serde_json::json!(" KUBERNETES "))),
+            recorded_with_substrate(None),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            refuse_personal_mode_substrate(&recorded, Some("personal"))
+                .unwrap_or_else(|error| panic!("{recorded}: {error}"));
+        }
     }
 }

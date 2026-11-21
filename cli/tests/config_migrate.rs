@@ -2719,6 +2719,9 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "FACTORY_GITHUB_APP_CLIENT_ID",
     "FACTORY_GITHUB_APP_CLIENT_SECRET",
     "FACTORY_INTAKE",
+    // Personal mode moved from extraEnv to factory.modelAuthMode with no
+    // migration: the render refuses an extraEnv entry and names the key.
+    "FACTORY_MODEL_AUTH_MODE",
     "GITHUB_API_URL",
     "GITHUB_APP_ID",
     "GITHUB_APP_PRIVATE_KEY",

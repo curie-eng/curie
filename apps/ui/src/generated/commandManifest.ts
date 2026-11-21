@@ -3652,6 +3652,71 @@ export const commandManifest = {
           "name": "publication-policy"
         },
         {
+          "about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Post progress to this Slack channel id (public C..., private G...)",
+              "id": "slack_channel",
+              "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the configured progress channel",
+              "id": "no_slack_channel",
+              "long": "no-slack-channel",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie local surfaces <agent> --add slack=<CHANNEL_ID>` (when another agent already holds the default Slack identity on that channel, add it under a free declared identity with `--adapter <identity>`), or, when the channel is bound under several identities, remove the extra with `curie local surfaces <agent> --remove slack=<CHANNEL_ID> --adapter <identity>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears the configured progress channel: the progress lane stops rooting runs there and stops replying and editing cards in the threads it already rooted. A thread that a Slack kickoff started keeps its own progress either way.",
+          "name": "factory-progress"
+        },
+        {
           "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",
           "args": [
             {
@@ -6168,6 +6233,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Select the installation's model auth mode (factory.modelAuthMode): service or personal. Personal needs the Kubernetes sandbox substrate. Given alone, it writes only the mode and leaves intake as recorded. Omit to keep the recorded mode",
+              "id": "model_auth_mode",
+              "long": "model-auth-mode",
+              "positional": false,
+              "possible_values": [
+                "service",
+                "personal"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation. With --repo-runner/--repo-docker, selects advisory discovery only; the recorded intake allowlist stays unchanged",
               "id": "repos",
               "long": "repo",
@@ -7395,6 +7472,94 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "Read or set one agent's publication policy (`PATCH /agents/{id}`).\n\nWith no change flags this inspects. `approve` is the default and keeps the human gate. `auto` lets the platform resolve that same approval.",
           "name": "publication-policy"
+        },
+        {
+          "about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Post progress to this Slack channel id (public C..., private G...)",
+              "id": "slack_channel",
+              "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the configured progress channel",
+              "id": "no_slack_channel",
+              "long": "no-slack-channel",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>` (when another agent already holds the default Slack identity on that channel, add it under a free declared identity with `--adapter <identity>`), or, when the channel is bound under several identities, remove the extra with `curie cluster surfaces <agent> --remove slack=<CHANNEL_ID> --adapter <identity>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears the configured progress channel: the progress lane stops rooting runs there and stops replying and editing cards in the threads it already rooted. A thread that a Slack kickoff started keeps its own progress either way.",
+          "name": "factory-progress"
         },
         {
           "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",

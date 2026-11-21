@@ -423,6 +423,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         }
         ClusterAction::Factory {
             intake,
+            model_auth_mode,
             repos,
             all_installed_repos,
             label,
@@ -448,11 +449,6 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .as_deref()
                 .map(parse_runner_image_binding)
                 .transpose()?;
-            let webhook_secret = if disable || !repo_runners.is_empty() || !repo_docker.is_empty() {
-                None
-            } else {
-                curie::factory_intake::resolve_webhook_secret(webhook_secret_file.as_deref())?
-            };
             let resolved = artifacts::resolve_chart(
                 chart.as_deref(),
                 artifacts::Channel::current(),
@@ -461,34 +457,45 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 std::path::Path::new("charts/curie").is_dir(),
             )?;
             let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-            emit_boxed(
-                curie::factory_intake::factory_intake(curie::factory_intake::FactoryIntakeOpts {
-                    common: CommonOpts {
-                        namespace,
-                        release,
-                        dry_run,
-                    },
-                    chart,
-                    repos,
-                    all_installed_repos,
-                    label,
-                    mention,
-                    card_base_url,
-                    webhook_secret,
-                    forge_egress,
-                    disable,
-                    timeout_seconds: timeout,
-                    app_id,
-                    private_key_file,
-                    org,
-                    intake,
-                    runner_binding,
-                    repo_runners,
-                    registry,
-                    repo_docker,
-                })
-                .await?,
-            )
+            let mut opts = curie::factory_intake::FactoryIntakeOpts {
+                common: CommonOpts {
+                    namespace,
+                    release,
+                    dry_run,
+                },
+                chart,
+                repos,
+                all_installed_repos,
+                label,
+                mention,
+                card_base_url,
+                webhook_secret: None,
+                forge_egress,
+                disable,
+                timeout_seconds: timeout,
+                app_id,
+                private_key_file,
+                org,
+                intake,
+                model_auth_mode,
+                runner_binding,
+                repo_runners,
+                registry,
+                repo_docker,
+            };
+            // Decide mode-only first: an exported webhook secret must not turn
+            // `--model-auth-mode` alone into an intake run.
+            let mode_only = webhook_secret_file.is_none()
+                && curie::factory_intake::model_auth_mode_only(&opts).is_some();
+            if !(mode_only
+                || opts.disable
+                || !opts.repo_runners.is_empty()
+                || !opts.repo_docker.is_empty())
+            {
+                opts.webhook_secret =
+                    curie::factory_intake::resolve_webhook_secret(webhook_secret_file.as_deref())?;
+            }
+            emit_boxed(curie::factory_intake::factory_intake(opts).await?)
         }
         ClusterAction::Message {
             text,
@@ -1284,6 +1291,38 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     no_draft,
                     branch_prefix,
                     clear_branch_prefix,
+                )
+                .await?,
+            )
+        }
+        ClusterAction::FactoryProgress {
+            agent,
+            slack_channel,
+            no_slack_channel,
+            conn,
+            dry_run,
+        } => {
+            // Validate the id BEFORE discovering the connection: a malformed
+            // id is a usage error that needs no cluster lookup to report.
+            let change = commands::FactoryProgressChange::resolve(slack_channel, no_slack_channel)?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(
+                commands::factory_progress(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    "cluster",
+                    change,
                 )
                 .await?,
             )

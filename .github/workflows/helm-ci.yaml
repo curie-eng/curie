@@ -219,6 +219,11 @@ jobs:
       - name: helm render assertions (factory forges)
         run: bash charts/curie/ci/factory-forges-assertions.sh
 
+      # Prove factory.modelAuthMode renders one FACTORY_MODEL_AUTH_MODE into
+      # both the api and the worker, and that extraEnv cannot set it.
+      - name: helm render assertions (factory model auth mode)
+        run: bash charts/curie/ci/factory-model-auth-mode-assertions.sh
+
       - name: helm render assertions (GitHub account linking)
         run: bash charts/curie/ci/factory-github-link-assertions.sh
 

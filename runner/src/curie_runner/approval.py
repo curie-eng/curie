@@ -78,7 +78,6 @@ from .tool_names import (
     PROPOSE_RULE_TOOL,
     QUESTION_TOOL,
     STATE_TOOL_NAMES,
-    TRACKER_RESULT_TOOL,
     TURN_PROGRESS_TOOL,
 )
 
@@ -245,10 +244,6 @@ TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
 # The GitHub factory's platform issue read (ADR 0187), mounted on the same
 # server only when the worker injected the issue read route and capability.
 ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
-# The tracker result submission (ADR 0277, #5586), mounted on the same server
-# only for an execution whose API contract is tracker_result. It writes, so it
-# is never in ``side_effects.PLATFORM_IDEMPOTENT_TOOLS``.
-TRACKER_RESULT_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TRACKER_RESULT_TOOL}"
 # The factory question tool (#5785), mounted on the same server only for an
 # execution whose API contract is implementation and that holds the issue read
 # capability. It writes a ticket comment, so it is never idempotent (see
@@ -288,9 +283,6 @@ PROPOSE_RULE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{PROPOSE_RULE_TOOL}"
 # execution: it reports a phase and never acts, so it is never gated.
 # This also covers ``progress`` (ADR 0130), mounted only for eligible human
 # turns, and ``get_issue`` (ADR 0187), which reads only the execution's own issue.
-# ``submit_tracker_result`` (ADR 0277) is the run's one platform result: the
-# API, not toolPolicy, decides whether it is accepted, from the request bound
-# capability, and only the platform's own ``curie`` server publishes the name.
 # ``ask_questions`` (#5785) is exempt for the same reason: the API, not
 # toolPolicy, decides from the request bound capability whether the questions
 # are accepted, and only the platform's own ``curie`` server publishes the name.
@@ -304,7 +296,6 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
         PROGRESS_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
-        TRACKER_RESULT_TOOL_NAME,
         QUESTION_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
     }

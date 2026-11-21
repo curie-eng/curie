@@ -192,10 +192,6 @@
         {
           "field": "created_at",
           "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/channel only."
-        },
-        {
-          "field": "factory_slack_channel",
-          "why": "No CLI verb reads an agent's factory Slack progress channel; it is set through the agent API PATCH, so no agent response consumer reads it."
         }
       ]
     },
@@ -803,10 +799,6 @@
       "schema": "AgentUpdate",
       "omissions": [
         {
-          "field": "factory_slack_channel",
-          "why": "The factory Slack progress channel is set through the agent API PATCH directly; no CLI verb sends it."
-        },
-        {
           "field": "deploy_notifications",
           "why": "No CLI verb toggles deploy notices; the opt-in is set through the agent API directly, so a CLI PATCH never carries it."
         },
@@ -1022,6 +1014,12 @@
     },
     {
       "function": "update_agent",
+      "struct": "AgentUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}"
+    },
+    {
+      "function": "update_agent_factory_slack_channel",
       "struct": "AgentUpdate",
       "method": "patch",
       "path": "/agents/{agent_id}"
@@ -1307,6 +1305,7 @@
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
         {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."},
+        {"field": "factory_slack_channel", "why": "The factory Slack progress channel has its own operator command, factory-progress."},
         {"field": "connector_requester_identity", "why": "The connector requester identity flag belongs to approvals --requester-identity."},
         {"field": "connector_requester_identity_version", "why": "The connector requester identity flag belongs to approvals --requester-identity."}
       ]
@@ -1412,6 +1411,10 @@
         {
           "field": "publication_branch_prefix",
           "why": "Publication policy has its own verb. Emitting it from overrides would imply that verb can change it."
+        },
+        {
+          "field": "factory_slack_channel",
+          "why": "The factory Slack progress channel has its own verb, factory-progress. Emitting it from overrides would imply that verb can change it."
         },
         {
           "field": "hook_partitions",

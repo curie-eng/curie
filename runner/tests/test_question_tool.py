@@ -18,6 +18,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_runner.approval import QUESTION_TOOL_NAME, is_platform_owned_tool
+from curie_runner.completion_contract import bind_completion_contract, sibling_urls
 from curie_runner.issue_read import CAPABILITY_HEADER
 from curie_runner.question_tool import question_input_issues, questions_handler
 from curie_runner.side_effects import (
@@ -25,12 +26,10 @@ from curie_runner.side_effects import (
     PLATFORM_SIDE_EFFECTING_TOOLS,
     SideEffectClassifier,
 )
-from curie_runner.tracker_result import bind_completion_contract, sibling_urls
-from test_tracker_result import (
+from test_completion_contract import (
     CAPABILITY,
     IMPLEMENTATION,
     RECOVERY,
-    TRACKER,
     _Api,
     _boot,  # noqa: F401 - the autouse boot fixture of the sibling tests
     _boot_session,
@@ -130,19 +129,14 @@ def test_an_implementation_contract_with_the_capability_mounts_the_tool(
     assert isinstance(session, _ModelSession)
     tools = _curie_tools(session.options)
     assert "ask_questions" in tools
-    assert "submit_tracker_result" not in tools
 
 
-@pytest.mark.parametrize("contract", [TRACKER, RECOVERY])
-def test_other_contracts_do_not_mount_the_tool(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contract: dict[str, Any]
+def test_a_publication_recovery_contract_does_not_mount_the_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    session = _boot_session(monkeypatch, tmp_path, _QuestionsApi([(200, contract)]))
-    if isinstance(session, _ModelSession):
-        assert "ask_questions" not in _curie_tools(session.options)
-    else:
-        # A publication recovery constructs no model session at all.
-        assert not isinstance(session, _ModelSession)
+    session = _boot_session(monkeypatch, tmp_path, _QuestionsApi([(200, RECOVERY)]))
+    # A publication recovery constructs no model session at all.
+    assert not isinstance(session, _ModelSession)
 
 
 def test_without_the_capability_the_tool_is_not_mounted_and_nothing_is_called(
@@ -165,10 +159,6 @@ def test_the_binding_sets_the_handler_only_for_an_implementation_contract() -> N
 
     implementation = anyio.run(bind, IMPLEMENTATION)
     assert implementation.question_handler is not None
-    assert implementation.result_handler is None
-    tracker = anyio.run(bind, TRACKER)
-    assert tracker.question_handler is None
-    assert tracker.result_handler is not None
     assert anyio.run(bind, RECOVERY).question_handler is None
     assert anyio.run(bind_completion_contract, None).question_handler is None
 

@@ -642,6 +642,29 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             )
             .await?,
         ),
+        LocalAction::FactoryProgress {
+            agent,
+            slack_channel,
+            no_slack_channel,
+            api_url,
+            api_key,
+            dry_run,
+        } => {
+            let change = commands::FactoryProgressChange::resolve(slack_channel, no_slack_channel)?;
+            emit(
+                commands::factory_progress(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    "local",
+                    change,
+                )
+                .await?,
+            )
+        }
         LocalAction::Surfaces {
             target,
             add,

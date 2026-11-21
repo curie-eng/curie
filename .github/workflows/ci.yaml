@@ -3579,7 +3579,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [scenario, jira-one-ticket, initial-binding-1, initial-binding-2, initial-binding-3, static-token-rotation, fresh-install]
+        suite: [scenario, jira-one-ticket, initial-binding-1, initial-binding-2, initial-binding-3, static-token-rotation, fresh-install, learned-rules]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -3702,6 +3702,12 @@ jobs:
       - name: Run the fresh cluster install regression
         if: matrix.suite == 'fresh-install'
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_cluster_up.py::test_fresh_cluster_up_converges_without_rerun
+      - name: Run the scripted learned rules scenario
+        if: matrix.suite == 'learned-rules'
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          BUILDX_BUILDER: default
+        run: python3 tools/factory-e2e/factory_e2e.py scripted --scenario learned-rules --transcript tools/model-script/transcripts/learned-rules-chain-a.json
       - name: Upload scripted factory evidence
         continue-on-error: true
         if: always() && matrix.suite == 'scenario'
@@ -3716,6 +3722,14 @@ jobs:
         with:
           name: scripted-factory-jira-evidence-${{ github.sha }}
           path: target/factory-e2e/
+          if-no-files-found: warn
+      - name: Upload scripted learned rules evidence
+        continue-on-error: true
+        if: always() && matrix.suite == 'learned-rules'
+        uses: actions/upload-artifact@v7
+        with:
+          name: scripted-learned-rules-evidence-${{ github.sha }}
+          path: target/factory-e2e/scripted-*.json
           if-no-files-found: warn
 
   # The admitted agent runtime module (#4619) loads the candidate CLI built by

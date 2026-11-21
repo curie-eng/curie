@@ -20,7 +20,7 @@ import os
 import re
 import signal
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -280,8 +280,18 @@ class ModelScript:
         upstream: str = "https://openrouter.ai/api",
         host: str = "127.0.0.1",
         port: int = 0,
+        capture_dir: Path | None = None,
+        issue_of: Callable[[dict[str, Any]], int | None] | None = None,
+        tag: Callable[[dict[str, Any]], str | None] | None = None,
     ) -> None:
         self.transcript = transcript
+        # Tests only: one JSON file per Messages request, with the raw issue number
+        # and the system prompt, which the transcript itself never stores.
+        self.capture_dir = capture_dir
+        self._issue_of = issue_of
+        self._tag = tag
+        self._sequence = 0
+        self.recorded_tags: list[str | None] = []
         self.record = record
         self.upstream = upstream.rstrip("/")
         self.host = host
@@ -328,6 +338,7 @@ class ModelScript:
                 if path != "/v1/messages":
                     script._reject(self, "POST", path, body)
                     return
+                script._capture(body)
                 if script.record:
                     script._record(self, path, body)
                     return
@@ -388,6 +399,51 @@ class ModelScript:
             with self._idle:
                 self._in_flight -= 1
                 self._idle.notify_all()
+
+    def _capture(self, body: bytes) -> None:
+        if self.capture_dir is None:
+            return
+        request = _safe_json(body)
+        key = request_key(request)
+        if self._issue_of is not None:
+            issue = self._issue_of(request)
+        else:
+            found = _FIRST_ISSUE.search(_first_user_text(request))
+            issue = int(found.group(1)) if found else None
+        tools = request.get("tools")
+        system = request.get("system")
+        if isinstance(system, str):
+            system_text = system
+        elif isinstance(system, list):
+            system_text = "\n".join(
+                b["text"] for b in system if isinstance(b, dict) and isinstance(b.get("text"), str)
+            )
+        else:
+            system_text = ""
+        with self._lock:
+            self._sequence += 1
+            sequence = self._sequence
+            self.capture_dir.mkdir(parents=True, exist_ok=True)
+            (self.capture_dir / f"{sequence:06d}.json").write_text(
+                json.dumps(
+                    {
+                        "sequence": sequence,
+                        "lane_key": key[0] if key else None,
+                        "ordinal": key[1] if key else None,
+                        "issue": issue,
+                        "system": system_text,
+                        "tools": [
+                            t["name"]
+                            for t in tools
+                            if isinstance(t, dict) and isinstance(t.get("name"), str)
+                        ]
+                        if isinstance(tools, list)
+                        else [],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
 
     def _match(self, method: str, path: str, body: bytes) -> dict[str, Any] | None:
         if method != "POST" or path != "/v1/messages":
@@ -498,10 +554,13 @@ class ModelScript:
                     b'"provider returned no Messages response"}}'
                 )
             else:
+                tag = self._tag(_safe_json(body)) if self._tag is not None else None
                 with self._lock:
                     self._exchanges.append(
                         {"lane_key": key[0], "ordinal": key[1], "message": message}
                     )
+                    if self._tag is not None:
+                        self.recorded_tags.append(tag)
         handler.send_response(status)
         handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(payload)))
@@ -519,6 +578,25 @@ class ModelScript:
         handler.wfile.write(payload)
 
 
+_FIRST_ISSUE = re.compile(r"/issues/(\d+)\b")
+
+
+def _first_user_text(request: dict[str, Any]) -> str:
+    for message in request.get("messages") or []:
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "\n".join(
+                    b["text"]
+                    for b in content
+                    if isinstance(b, dict) and isinstance(b.get("text"), str)
+                )
+            return ""
+    return ""
+
+
 def _safe_json(body: bytes) -> dict[str, Any]:
     try:
         parsed = json.loads(body) if body else {}
@@ -534,11 +612,13 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--transcript", type=Path, required=True)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=0)
+    serve.add_argument("--capture-dir", type=Path, default=None)
     record = commands.add_parser("record", help="Proxy to a provider and write a transcript")
     record.add_argument("--output", type=Path, required=True)
     record.add_argument("--upstream", default="https://openrouter.ai/api")
     record.add_argument("--host", default="127.0.0.1")
     record.add_argument("--port", type=int, default=0)
+    record.add_argument("--capture-dir", type=Path, default=None)
     args = parser.parse_args(argv)
     recording = args.command == "record"
     try:
@@ -548,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
             upstream=getattr(args, "upstream", "https://openrouter.ai/api"),
             host=args.host,
             port=args.port,
+            capture_dir=args.capture_dir,
         )
     except (OSError, ValueError) as exc:
         parser.exit(1, f"model-script: {exc}\n")

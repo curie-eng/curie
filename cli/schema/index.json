@@ -115,7 +115,7 @@
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
-      "version": "1.6"
+      "version": "1.7"
     },
     {
       "result": "ClusterUpOutput",
@@ -199,13 +199,13 @@
       "result": "FactoryAppRegistrationOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "FactoryAppSetupOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "FactoryExplainOutput",
@@ -217,7 +217,7 @@
       "result": "FactoryIntakeOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "GithubAppOutput",
@@ -391,6 +391,12 @@
       "result": "PublicationPolicyOutput",
       "kind": "CliOutput",
       "schema": "publication-policy.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "FactoryProgressOutput",
+      "kind": "CliOutput",
+      "schema": "factory-progress.schema.json",
       "version": "1.0"
     },
     {

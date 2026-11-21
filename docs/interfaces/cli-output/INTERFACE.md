@@ -90,7 +90,7 @@ protected-process migration as one JSON object or a human confirmation.
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
   `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `MemoryGuidanceOutput`, `HookOutput`, `ApprovalsOutput`, `RequesterIdentityOutput`,
-  `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `WorkItemsOutput`, `WorkItemRetryOutput`,
+  `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `FactoryProgressOutput`, `WorkItemsOutput`, `WorkItemRetryOutput`,
   `SchedulesOutput`, `HookFireOutput`, `WakeKeyOutput` (the `local`/`cluster hook wake-key` read or rotation: the read carries the secret and generation, the rotation carries the generation only), `ChannelsOutput`, `CallersOutput`, `AccessPolicyOutput`,
   `DirectoryOutput` (a directory administration plan or tenant/resource API receipt),
   `ActionsOutput` (the `local`/`cluster actions` verbs and the action executor receipt),
@@ -161,7 +161,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   longer schema-free: there are 86 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 86 tests in `cli/tests/json_contract.rs`.
+  against real `to_json()` output across 87 tests in `cli/tests/json_contract.rs`.
   The dark factory render receipt uses schema version 2. Its `runner_image`
   and `runner_note` fields are required and accept a string or `null`; the
   binary render tests validate the actual receipt against the committed schema.

@@ -37,7 +37,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import factory_retry_policy
 from ..auth import AdministrativeActor
 from ..factory_retry_policy import Disposition, DispositionKind, RetryFacts, RetrySafety
-from ..factory_tracker_result_runtime import CONTRACT_TRACKER_RESULT
 from ..models import ExecutionRequest, WorkItemOperatorRetry
 from ..schemas.workitems import WorkItemRetryIn, WorkItemRetryOut
 from . import lifecycle
@@ -270,7 +269,7 @@ async def retry_work_item(
         facts = _facts(predecessor)
         safety = facts.safety
         disposition = factory_retry_policy.decide(facts)
-        if predecessor.completion_contract == CONTRACT_TRACKER_RESULT or cause == "budget_exceeded":
+        if cause == "budget_exceeded":
             raise await refuse("not_retryable", cause=cause, disposition=disposition.kind.value)
         if not disposition.successor:
             # A cause that would admit after a proven clean run names the

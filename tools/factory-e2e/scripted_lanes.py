@@ -141,15 +141,29 @@ class Lane:
 class LaneRouter:
     """Route each model request to its agent's lane on its issue."""
 
-    def __init__(self, agent_markers: dict[str, str], default_agent: str = IMPLEMENTATION) -> None:
+    def __init__(
+        self,
+        agent_markers: dict[str, str],
+        default_agent: str = IMPLEMENTATION,
+        *,
+        issue_of: Callable[[dict[str, Any]], int | None] = request_issue,
+        normalize_key: Callable[[str], str] | None = None,
+    ) -> None:
         # No marker at all is a router of one agent: every request is the default
         # agent's, and the lanes tell its issues apart.
         if default_agent in agent_markers:
             raise LaneError("name the non-default agents by their bundle system prompts")
         self.agent_markers = dict(agent_markers)
         self.default_agent = default_agent
+        self.issue_of = issue_of
+        # Applied to both lane keys before they are compared, for run-specific text
+        # the model server's scrub keeps (an address outside a URL, a branch id).
+        self.normalize_key = normalize_key
         self.lanes: dict[tuple[str, int], Lane] = {}
         self.unrouted: list[dict[str, Any]] = []
+        # One row per answered request: the lane, the answer's ordinal and the
+        # request's raw lane key, so a capture of that request can be tied to it.
+        self.served_log: list[dict[str, Any]] = []
         self.hooks: list[Callable[[Lane, int], None]] = []
         # Called for an (agent, issue) with no lane yet, for issues the platform
         # creates during the run; a resolver returns the lane or None.
@@ -172,16 +186,20 @@ class LaneRouter:
             raise LaneError("a request carries more than one agent's system prompt")
         return matches[0] if matches else self.default_agent
 
-    def install(self, script: Any, model_module: Any) -> None:
-        """Answer ``script``'s requests through the lanes; its own transcript is the fallback."""
+    def install(self, script: Any, model_module: Any, *, fallback: bool = True) -> None:
+        """Answer ``script``'s requests through the lanes.
 
-        self._fallback = script._match
+        Its own transcript is the fallback unless ``fallback`` is False, in which
+        case a request no lane claims is recorded in ``unrouted`` and refused.
+        """
+
+        self._fallback = script._match if fallback else None
         self._request_key = model_module.request_key
         self._parse = model_module._safe_json
         script._match = self.match
 
     def lane_for(self, request: dict[str, Any]) -> Lane | None:
-        issue = request_issue(request)
+        issue = self.issue_of(request)
         if issue is None:
             return None
         agent = self.agent_of(request)
@@ -200,6 +218,10 @@ class LaneRouter:
         lane = self.lane_for(request) if method == "POST" and path == "/v1/messages" else None
         if lane is None:
             if self._fallback is None:
+                if method == "POST" and path == "/v1/messages":
+                    self.unrouted.append(
+                        {"agent": self.agent_of(request), "issue": self.issue_of(request)}
+                    )
                 return None
             if self.agent_of(request) != self.default_agent:
                 # A non-default agent never borrows the default transcript.
@@ -207,8 +229,14 @@ class LaneRouter:
                 return None
             return self._fallback(method, path, body)
         wanted = self._request_key(request)
+        raw_key = wanted[0] if wanted is not None else None
+        normalize = self.normalize_key or (lambda key: key)
+        if wanted is not None:
+            wanted = (normalize(wanted[0]), wanted[1])
         for index, exchange in enumerate(lane.exchanges):
-            if index in lane.used or (exchange["lane_key"], exchange["ordinal"]) != wanted:
+            if index in lane.used:
+                continue
+            if (normalize(exchange["lane_key"]), exchange["ordinal"]) != wanted:
                 continue
             answer = copy.deepcopy(exchange)
             encoded = json.dumps(answer["message"])
@@ -221,6 +249,9 @@ class LaneRouter:
                 lane.revisions.append(revision)
             lane.used.add(index)
             lane.served.append(exchange["ordinal"])
+            self.served_log.append(
+                {"lane": lane.name, "ordinal": exchange["ordinal"], "key": raw_key}
+            )
             for hook in self.hooks:
                 hook(lane, exchange["ordinal"])
             return dict(answer)
