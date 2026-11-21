@@ -939,6 +939,27 @@ def _judge_beat_b(b: _Beat, rec: Mapping[str, Any]) -> None:
     b.check(bool(acks), "no App comment on ticket A acknowledges the answer")
 
 
+def _review_comment_timing(b: _Beat, comment: Mapping[str, Any], review: Mapping[str, Any]) -> None:
+    """Measures only: the writer's inline comment's ``updated_at`` after its
+    ``created_at`` and after the review's ``submitted_at``, in seconds.
+
+    The product's GitHub review snapshot (``SUBMISSION_SKEW``) allows 5 seconds
+    between submission and a comment's ``updated_at`` before it counts the
+    comment as edited; these measures record what GitHub really does.
+    """
+
+    try:
+        updated = parse_time(comment["updated_at"])
+        b.measures["review_comment_updated_after_created_seconds"] = (
+            updated - parse_time(comment["created_at"])
+        ).total_seconds()
+        b.measures["review_comment_updated_after_submitted_seconds"] = (
+            updated - parse_time(review["submitted_at"])
+        ).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return
+
+
 def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
     c, ids, a = rec["beat_c"], rec["identities"], rec["beat_a"]
     number = c["pull_number"]
@@ -961,6 +982,7 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
     if len(posted) != 1 or len(read) != 1:
         return
     comment, sent = read[0], posted[0]
+    _review_comment_timing(b, comment, c["review"])
     b.check(
         sent["body"].strip() == REVIEW_RULE_TEXT, "the posted inline comment is not the rule text"
     )

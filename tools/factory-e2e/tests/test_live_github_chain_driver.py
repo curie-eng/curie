@@ -2519,6 +2519,8 @@ def _beat_c(
                 "line": 40,
                 "body": rule,
                 "commit_id": "a" * 40,
+                "created_at": "2030-01-01T00:30:00Z",
+                "updated_at": "2030-01-01T00:30:01Z",
             }
         ],
         files=[
@@ -2674,6 +2676,96 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
     # passed=True is the liveness case. The counterexample has a stored rule
     # proposal row for the revision request but no recorded propose_rule call:
     # the row is no evidence of the call, so beat (c) fails.
+    chain, queries, revision = _drive_beat_c(tmp_path, monkeypatch, revision_tools)
+    recorded = chain.record["beat_c"]["requests"][-1]
+    assert recorded["id"] == revision
+    assert recorded["tool_notes"] == list(revision_tools)
+    assert not [q for q in queries if "memory_rules" in q]
+    verdict = judge.judge_beat("beat_c", chain.record)
+    assert verdict.passed is passed, verdict.reasons
+    if not passed:
+        assert verdict.reasons == ("the revision trajectory has no propose_rule",)
+
+
+def test_wiring_beat_c_keeps_the_review_comment_timestamps_for_the_edit_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The review comments answer keeps created_at and updated_at; the judge
+    # reports the gap in seconds (item 08's 5 second edit window, decided from
+    # GitHub's real timing). Counterexample: the record without them measures
+    # nothing.
+    chain, _queries, _revision = _drive_beat_c(tmp_path, monkeypatch, (PROPOSE,))
+    comment = chain.record["beat_c"]["review_comments"][0]
+    assert (comment["created_at"], comment["updated_at"]) == (
+        "2030-01-01T00:30:00Z",
+        "2030-01-01T00:30:01Z",
+    )
+    measures = judge.judge_beat("beat_c", chain.record).measures
+    assert measures["review_comment_updated_after_created_seconds"] == 1.0
+    assert measures["review_comment_updated_after_submitted_seconds"] == 1.0
+    for key in ("created_at", "updated_at"):
+        del comment[key]
+    measures = judge.judge_beat("beat_c", chain.record).measures
+    assert "review_comment_updated_after_created_seconds" not in measures
+
+
+def _check_sample(conclusion: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The passing record's revision checks with its first run ``conclusion``;
+    None leaves that run in progress."""
+
+    checks = copy.deepcopy(_beat_c(_transcript(PROPOSE))["revision_checks"])
+    run = checks["check_runs"]["check_runs"][0]
+    if conclusion is None:
+        run.update(status="in_progress", conclusion=None, completed_at=None)
+    else:
+        run.update(status="completed", conclusion=conclusion)
+    return checks["check_runs"], checks["status"]
+
+
+@pytest.mark.parametrize(
+    ("final", "passed"), [("success", True), ("failure", False)], ids=["success", "failure"]
+)
+def test_wiring_beat_c_waits_for_checks_still_running_on_the_revision(
+    final: str, passed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The passing replay with one check still in progress at the reply: beat
+    # (c) reads again until it completes. Success passes; a final failure fails.
+    samples = [_check_sample(None), _check_sample(None), _check_sample(final)]
+    chain, _queries, _revision = _drive_beat_c(
+        tmp_path, monkeypatch, (PROPOSE,), check_samples=samples
+    )
+    assert samples == [], "beat (c) stopped reading before the checks settled"
+    verdict = judge.judge_beat("beat_c", chain.record)
+    assert verdict.passed is passed, verdict.reasons
+    if not passed:
+        assert any("not passing" in reason for reason in verdict.reasons), verdict.reasons
+
+
+def test_wiring_beat_c_records_checks_still_running_at_its_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Counterexample of the bound: checks that never finish are recorded as
+    # read at the deadline, and the judge fails them as not completed.
+    monkeypatch.setattr(judge, "PULL_REQUEST_WITHIN", -120)
+    chain, _queries, _revision = _drive_beat_c(
+        tmp_path, monkeypatch, (PROPOSE,), check_samples=[_check_sample(None)]
+    )
+    verdict = judge.judge_beat("beat_c", chain.record)
+    assert any("not completed" in reason for reason in verdict.reasons), verdict.reasons
+
+
+def _drive_beat_c(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    revision_tools: tuple[str, ...],
+    *,
+    check_samples: list[tuple[dict[str, Any], dict[str, Any]]] | None = None,
+) -> tuple[lgc.ChainRun, list[str], str]:
+    """``beat_c`` against a fake GitHub and install. ``check_samples`` are the
+    revision head's check runs and combined status, one per read, the last
+    repeated; by default the passing record's."""
+
+    monkeypatch.setattr(fe, "POLL_SECONDS", 0)
     p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
     repo = "fixture-owner/fixture-repo"
     p.config = dataclasses.replace(p.config, repo=repo)
@@ -2726,6 +2818,19 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
         "submitted_at": "2030-01-01T00:30:00Z",
         "pull_request_url": f"https://api.code-host.example.invalid/repos/{repo}/pulls/12",
     }
+    samples = check_samples if check_samples is not None else []
+    default_sample = (
+        expected["revision_checks"]["check_runs"],
+        expected["revision_checks"]["status"],
+    )
+    current = [samples.pop(0) if samples else default_sample]
+
+    def check_read(index: int) -> Any:
+        # A check runs read starts a new sample; the status read that follows shares it.
+        if index == 0:
+            current[0] = samples.pop(0) if samples else current[0]
+        return copy.deepcopy(current[0][index])
+
     answers = {
         f"/repos/{repo}/commits/{after}": {
             "commit": {"committer": {"date": "2030-01-01T00:40:00Z"}}
@@ -2734,13 +2839,15 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
         f"/repos/{repo}/pulls/12/reviews/7001/comments": [
             {**expected["review_comments"][0], "id": 5}
         ],
-        f"/repos/{repo}/commits/{after}/check-runs?per_page=100&page=1": expected[
-            "revision_checks"
-        ]["check_runs"],
-        f"/repos/{repo}/commits/{after}/status": expected["revision_checks"]["status"],
+    }
+    check_paths = {
+        f"/repos/{repo}/commits/{after}/check-runs?per_page=100&page=1": 0,
+        f"/repos/{repo}/commits/{after}/status": 1,
     }
 
     def as_actor(method: str, path: str, body: Any = None) -> Any:
+        if method == "GET" and path in check_paths:
+            return 200, check_read(check_paths[path])
         if method == "GET" and path == f"/repos/{repo}/pulls/12":
             sha = next(heads, after)
             return 200, _gh_pull(12, "", "2030-01-01T00:25:00Z", sha, "curie/issue-11")
@@ -2771,15 +2878,7 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
     chain.record["identities"] = {**chain.record["identities"], "repository_path": repo}
 
     lgc.beat_c(p, chain)
-
-    recorded = chain.record["beat_c"]["requests"][-1]
-    assert recorded["id"] == revision
-    assert recorded["tool_notes"] == list(revision_tools)
-    assert not [q for q in queries if "memory_rules" in q]
-    verdict = judge.judge_beat("beat_c", chain.record)
-    assert verdict.passed is passed, verdict.reasons
-    if not passed:
-        assert verdict.reasons == ("the revision trajectory has no propose_rule",)
+    return chain, queries, revision
 
 
 def test_shape_transcript_query_reads_columns_that_exist_now(

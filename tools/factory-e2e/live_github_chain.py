@@ -1198,12 +1198,17 @@ def beat_c_record(
             "user": {"id": (review.get("user") or {}).get("id")},
             "pull_request_url": review.get("pull_request_url"),
         },
+        # created_at and updated_at stay so the evidence shows GitHub's real gap
+        # between them on a submitted review's inline comment (submission bumps
+        # updated_at without an edit; the product allows 5 seconds for it).
         "review_comments": [
             {
                 "path": c.get("path"),
                 "line": c.get("line"),
                 "body": c.get("body"),
                 "pull_request_review_id": c.get("pull_request_review_id"),
+                "created_at": c.get("created_at"),
+                "updated_at": c.get("updated_at"),
             }
             for c in review_comments
         ],
@@ -1560,6 +1565,42 @@ def check_runs_of(p: fe.Preflight, repo: str, sha: str) -> dict[str, Any]:
         if not batch or len(runs) >= total:
             return {"total_count": total, "check_runs": runs}
         page += 1
+
+
+def checks_settled(check_runs: Mapping[str, Any], status: Mapping[str, Any]) -> bool:
+    """Whether every check of a commit reached a final result, green or not.
+
+    ``check_runs`` is what ``check_runs_of`` returns and ``status`` the
+    combined status (https://docs.github.com/en/rest/commits/statuses). A
+    commit whose check suites have not created a run yet, a run that is not
+    ``completed`` and a combined status still ``pending`` are not settled;
+    whether the settled result is green is the judge's call.
+    """
+
+    runs = list(check_runs.get("check_runs") or [])
+    if not runs or len(runs) < int(check_runs.get("total_count") or 0):
+        return False
+    if any(run.get("status") != "completed" for run in runs):
+        return False
+    return not (int(status.get("total_count") or 0) and status.get("state") == "pending")
+
+
+def settled_checks(
+    p: fe.Preflight, repo: str, sha: str, deadline: float
+) -> tuple[dict[str, Any], Any]:
+    """The check runs and combined status of ``sha`` once they settle, or at ``deadline``.
+
+    A revision whose checks are still running when its reply lands is healthy,
+    so the beat waits for a final result within its own bound; the last read is
+    what the judge gets, so a run still in progress at the deadline fails there.
+    """
+
+    while True:
+        runs = check_runs_of(p, repo, sha)
+        status = _github(p, "GET", f"/repos/{repo}/commits/{sha}/status")
+        if checks_settled(runs, status) or time.monotonic() >= deadline:
+            return runs, status
+        time.sleep(fe.POLL_SECONDS)
 
 
 def _github(p: fe.Preflight, method: str, path: str, body: Any = None, *, want: int = 200) -> Any:
@@ -1999,6 +2040,9 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
     files = p._paged(f"/repos/{repo}/pulls/{number}/files")
     path, line = review_target(added_lines_by_path(files))
     posted = review_body(str(before["head"]["sha"]), path, line)
+    # The beat's bound runs from the review: the revision, its reply and its
+    # final checks all land inside it.
+    deadline = time.monotonic() + judge.PULL_REQUEST_WITHIN + 60
     review = _github(p, "POST", f"/repos/{repo}/pulls/{number}/reviews", posted)
     review_id = int(review["id"])
     revision_id = judge.revision_request_id(
@@ -2024,6 +2068,7 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
         "the reply naming the revision commit", judge.PULL_REQUEST_WITHIN, replied
     )
     commit = _github(p, "GET", f"/repos/{repo}/commits/{head}")
+    check_runs, combined_status = settled_checks(p, repo, head, deadline)
     chain.record["beat_c"] = beat_c_record(
         repo=repo,
         pull_number=number,
@@ -2040,8 +2085,8 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
         committed_at=str(commit["commit"]["committer"]["date"]),
         branches=p._paged(f"/repos/{repo}/branches"),
         pull_comments=pull_comments,
-        check_runs=check_runs_of(p, repo, head),
-        combined_status=_github(p, "GET", f"/repos/{repo}/commits/{head}/status"),
+        check_runs=check_runs,
+        combined_status=combined_status,
     )
     sample_usage(p, chain, "after_c")
 
