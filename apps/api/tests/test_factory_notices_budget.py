@@ -26,6 +26,8 @@ from test_factory_usage import (  # noqa: F401 (fixtures)
     priced,
 )
 
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
+
 USD_DETAIL = "USD budget exceeded (max_usd_per_day=50.0)"
 USD_HEADLINE = (
     "Could not complete: the run reached its USD cap (max_usd_per_day=50.0) "
@@ -344,7 +346,14 @@ def test_progress_notes_stay_off_running_and_other_terminal_comments(
     ],
 )
 def test_unknown_budget_detail_does_not_guess_an_sdk_price_difference(detail: str | None) -> None:
-    body = result_section("budget_exceeded", pr_url=None, detail=detail, run_cost_usd=Decimal("0"))
+    body = result_section(
+        "budget_exceeded",
+        pr_url=None,
+        detail=detail,
+        run_cost_usd=Decimal("0"),
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert "cannot identify which limit" in body
     assert "SDK" not in body
@@ -354,7 +363,9 @@ def test_unknown_budget_detail_does_not_guess_an_sdk_price_difference(detail: st
 def test_output_token_budget_keeps_its_sentence_with_recorded_cost() -> None:
     detail = "output token budget exceeded (max_output_tokens_per_run=64000)"
     body = result_section(
-        "budget_exceeded", pr_url=None, detail=detail, run_cost_usd=Decimal("1.33")
+        "budget_exceeded", pr_url=None, detail=detail, run_cost_usd=Decimal("1.33"),
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     assert body.splitlines()[0] == (
@@ -382,6 +393,8 @@ def test_usd_comparison_preserves_decimal_precision_and_usage_rounding(
         pr_url=None,
         detail=f"USD budget exceeded (max_usd_per_day={cap})",
         run_cost_usd=Decimal(cost),
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     assert f"cap (max_usd_per_day={cap})" in body
