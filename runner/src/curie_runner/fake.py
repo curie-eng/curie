@@ -1242,10 +1242,9 @@ class FakeModelSession:
                 )
                 if gate.pending_halt:
                     # The approval hook's PostToolUse halt after the body ran.
+                    answer = refusal or "Publication requested."
                     return (
-                        _tool_result(
-                            block.id, refusal or "Publication requested.", is_error=refusal is not None
-                        ),
+                        _tool_result(block.id, answer, is_error=refusal is not None),
                         _result(terminal_reason="hook_stopped"),
                     )
                 self._pending_refusals.append(
