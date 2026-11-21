@@ -1,0 +1,67 @@
+{
+  "description": "A factory turn whose first publish_changes call a bundle PreToolUse hook denied and whose corrected call was recorded. runner_frames are the ACI frames the runner emits on the real bundled CLI, without version or token counts; publication is the title and body the runner's gate holds for /v1/snapshot; refused_body is the body the hook denied. All three are pinned by runner/tests/test_publish_hook_deny_real_cli.py, and apps/worker/tests/kernel/test_publish_hook_deny_handoff.py replays them through the worker's completion path.",
+  "runner_frames": [
+    {
+      "type": "tool_note",
+      "text": "running tool mcp__curie__publish_changes",
+      "tool": "mcp__curie__publish_changes"
+    },
+    {
+      "type": "side_effect_flag",
+      "tool": "mcp__curie__publish_changes",
+      "detail": "non-idempotent tool executed",
+      "call_id": "toolu_publish_0",
+      "arguments": {
+        "title": "Keep the documentation parser output stable",
+        "body": "Keeps the parser output stable.\n\n## Decisions\n1. Keep the parser. Rejected: a rewrite, because it changes the \"output.\" (plan) Evidence: the plan.\n"
+      }
+    },
+    {
+      "type": "side_effect_flag",
+      "tool": "mcp__curie__publish_changes",
+      "detail": "non-idempotent tool completed",
+      "call_id": "toolu_publish_0",
+      "failed": true
+    },
+    {
+      "type": "tool_note",
+      "text": "running tool mcp__curie__publish_changes",
+      "tool": "mcp__curie__publish_changes"
+    },
+    {
+      "type": "side_effect_flag",
+      "tool": "mcp__curie__publish_changes",
+      "detail": "non-idempotent tool executed",
+      "call_id": "toolu_publish_1",
+      "arguments": {
+        "title": "Keep the documentation parser output stable",
+        "body": "Keeps the parser output stable.\n\n## Decisions\n1. Keep the parser. Rejected: a rewrite, because it changes the output. (plan) Evidence: the plan.\n"
+      }
+    },
+    {
+      "type": "side_effect_flag",
+      "tool": "mcp__curie__publish_changes",
+      "detail": "non-idempotent tool completed",
+      "call_id": "toolu_publish_1",
+      "failed": false
+    },
+    {
+      "type": "final",
+      "text": "",
+      "status": "awaiting-approval",
+      "approval_summary": "Tool call awaiting approval: mcp__curie__publish_changes {\"body\": \"Keeps the parser output stable.\\n\\n## Decisions\\n1. Keep the parser. Rejected: a rewrite, because it changes the output. (plan) Evidence: the plan.\\n\", \"title\": \"Keep the documentation parser output stable\"}",
+      "approval_gate_kind": "permission",
+      "approval_granted_tool": "mcp__curie__publish_changes",
+      "approval_granted_arguments": {
+        "title": "Keep the documentation parser output stable",
+        "body": "Keeps the parser output stable.\n\n## Decisions\n1. Keep the parser. Rejected: a rewrite, because it changes the output. (plan) Evidence: the plan.\n"
+      },
+      "approval_display": "Approve publish changes. Body: Keeps the parser output stable.\n\n## Decisions\n1. Keep the parser. Rejected: a rewrite, because it changes the output. (plan) Evidence: the plan.\n; Title: Keep the documentation parser output stable"
+    }
+  ],
+  "publication": {
+    "title": "Keep the documentation parser output stable",
+    "body": "Keeps the parser output stable.\n\n## Decisions\n1. Keep the parser. Rejected: a rewrite, because it changes the output. (plan) Evidence: the plan.\n"
+  },
+  "refused_body": "Keeps the parser output stable.\n\n## Decisions\n1. Keep the parser. Rejected: a rewrite, because it changes the \"output.\" (plan) Evidence: the plan.\n"
+}

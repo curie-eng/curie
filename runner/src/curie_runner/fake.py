@@ -1226,6 +1226,31 @@ class FakeModelSession:
                         ),
                         _result(is_error=True, subtype="error_during_execution"),
                     )
+            if (
+                block.name == PLATFORM_PUBLISH_TOOL_NAME
+                and self._approval_gate is not None
+                and block.id not in self._denied_ids
+            ):
+                # The in-process ``publish_changes`` body, which the CLI runs
+                # only once every PreToolUse decision allowed the call.
+                gate = self._approval_gate
+                refusal = (
+                    gate.record_publication(dict(block.input))
+                    if PLATFORM_PUBLISH_TOOL_NAME in gate.required
+                    else "No managed repository workspace is mounted at /workspace; "
+                    "publication cannot be requested from this session."
+                )
+                if gate.pending_halt:
+                    # The approval hook's PostToolUse halt after the body ran.
+                    return (
+                        _tool_result(
+                            block.id, refusal or "Publication requested.", is_error=refusal is not None
+                        ),
+                        _result(terminal_reason="hook_stopped"),
+                    )
+                self._pending_refusals.append(
+                    _tool_result(block.id, refusal or "Publication requested.", is_error=True)
+                )
         return None
 
     def _without_refused_results(self, message: Any) -> Any:

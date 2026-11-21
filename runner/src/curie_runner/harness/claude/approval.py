@@ -179,23 +179,27 @@ def build_approval_server(
     tools: list[SdkMcpTool[Any]] = [request_approval] if include_request_approval else []
 
     @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
-    async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
+    async def publish_changes(args: dict[str, Any]) -> dict[str, Any]:
         # Discovery is unconditional so every session carries the publication
         # protocol. Authority is still mount-keyed in ``build_approval_gate``:
         # an unmounted session cannot create a publication approval, and a
         # direct invocation fails without mutating gate state.
-        if not managed_workspace:
+        if (
+            not managed_workspace
+            or gate is None
+            or PLATFORM_PUBLISH_TOOL_NAME not in gate.required
+        ):
             return _approval_error(
                 "No managed repository workspace is mounted at /workspace; "
                 "publication cannot be requested from this session."
             )
-        # Defence in depth: the permission callback must deny the call before
-        # execution. If a harness bypasses that callback, the in-process tool
-        # still performs no action and grants no capability.
-        return _approval_error(
-            "Publication is performed only by the platform after human approval; "
-            "this sandbox tool cannot execute it directly."
-        )
+        # The one recording path: the CLI runs this body only after every
+        # PreToolUse hook, the bundle's included, allowed the call. Recording
+        # never publishes; the platform does that after human approval.
+        refusal = gate.record_publication(args if isinstance(args, dict) else {})
+        if refusal is not None:
+            return _approval_error(refusal)
+        return {"content": [{"type": "text", "text": _PUBLISH_RECORDED_TEXT}]}
 
     tools.append(publish_changes)
     if progress_tool is not None:
@@ -405,17 +409,7 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
         # exactly this tool lets one call through (no block recorded, the
         # approved action completes) and re-arms the gate. ``_decide_gate``
         # applies this rule (shared with the hook below).
-        try:
-            decision = await _decide_gate(gate, tool_name, tool_input, _context.tool_use_id)
-        except ValueError as exc:
-            # #4460: a malformed publication proposal is denied WITHOUT the
-            # interrupt, so the model receives the reason and can correct the
-            # call in this same turn. The fail-closed session rule still ends
-            # the turn classified-failure if nothing valid is ever recorded.
-            return PermissionResultDeny(
-                message=f"Publication request was not recorded: {exc}. Correct it and retry.",
-                interrupt=False,
-            )
+        decision = await _decide_gate(gate, tool_name, tool_input, _context.tool_use_id)
         if decision.refusal is not None:
             return PermissionResultDeny(
                 message=decision.refusal, interrupt=not decision.continue_turn
@@ -443,6 +437,13 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
 # ``pending_summary``, built by ``summarize_tool_call``).
 _HOOK_STOP_REASON = "Paused for human approval: an approval-required tool call was denied."
 _QUESTIONS_STOP_REASON = "The questions are posted on the ticket, so this session has ended."
+_PUBLISH_STOP_REASON = "Paused for human approval: the publication request is recorded."
+# The publish_changes tool result once the request is recorded. The PostToolUse
+# halt normally ends the turn before the model reads it.
+_PUBLISH_RECORDED_TEXT = (
+    "Publication requested. A human reviews it before the platform publishes. "
+    "End your turn now."
+)
 
 # Why the hook allows a call outright. Only ever emitted after the one-shot
 # post-approval grant (#430) has actually been spent, so it can state that.
@@ -488,7 +489,8 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
 
     Returns the ``{"PreToolUse": [HookMatcher], "PostToolUse": [HookMatcher]}``
     mapping ``__main__`` MERGES into the bundle's own hooks (#272); the
-    PostToolUse matcher only ends the turn after a posted question round.
+    PostToolUse matcher only ends the turn after a posted question round or a
+    recorded publication.
     Note that the CLI dispatches every matcher on one event **concurrently**
     (``types.py:1956-1961``), so this hook must not assume it runs before a
     bundle's hook, and its position in the merged list is construction order,
@@ -564,23 +566,7 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         # ``_decide_gate`` applies the shared ungated/granted/blocked rule (also
         # used by ``build_can_use_tool`` above); the grant, if any, is spent as
         # a side effect of this call.
-        try:
-            decision = await _decide_gate(gate, tool_name, tool_input, _tool_use_id)
-        except ValueError as exc:
-            # #4460: deny without the turn-stopping control fields. Omitting
-            # ``continue_`` leaves the SDK's default (continue), so the model
-            # receives this reason as the tool result and can issue the
-            # corrected call in this same turn, which the reason itself asks
-            # for. The fail-closed session rule still ends the turn
-            # classified-failure if nothing valid is ever recorded.
-            reason = f"Publication request was not recorded: {exc}. Correct it and retry."
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                },
-            }
+        decision = await _decide_gate(gate, tool_name, tool_input, _tool_use_id)
         if decision.refusal is not None:
             if decision.continue_turn:
                 return {
@@ -642,8 +628,8 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             "stopReason": _HOOK_STOP_REASON,
         }
 
-    async def questions_stop(
-        _hook_input: Any,
+    async def turn_stop(
+        hook_input: Any,
         _tool_use_id: str | None,
         _context: Any,
     ) -> dict[str, Any]:
@@ -652,9 +638,14 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         # end the turn right after that call, before the model is asked again.
         # The PreToolUse refusal stays as the backstop for any call the CLI
         # had already dispatched beside it.
-        if not gate.questions_posted:
-            return {}
-        return {"continue_": False, "stopReason": _QUESTIONS_STOP_REASON}
+        if gate.questions_posted:
+            return {"continue_": False, "stopReason": _QUESTIONS_STOP_REASON}
+        # A publication is recorded by the tool body, which the CLI runs only
+        # after every PreToolUse hook allowed it, so the halt for approval
+        # lands here, after the call ran, never on sight of the call.
+        if _hook_field(hook_input, "tool_name") == PLATFORM_PUBLISH_TOOL_NAME and gate.pending_halt:
+            return {"continue_": False, "stopReason": _PUBLISH_STOP_REASON}
+        return {}
 
     # ``Any`` for the same reason ``hooks.py::_make_callback`` uses it: the SDK's
     # ``HookCallback`` alias is typed against its TypedDict union, and a plain
@@ -666,7 +657,7 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         # return. PostToolUse runs before the model sees the result, so a
         # ticket is remembered before any call that copies it can be decided.
         post.append(build_ticket_observer(gate))
-    post.append(questions_stop)
+    post.append(turn_stop)
     return {
         "PreToolUse": [HookMatcher(matcher=None, hooks=[callback])],
         "PostToolUse": [HookMatcher(matcher=None, hooks=post)],

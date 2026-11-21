@@ -2140,11 +2140,6 @@ class SessionRunner:
                 events = translate_message(
                     message, state, self._classifier, gen, activity=self._progress_activity
                 )
-                # Synchronous, on the very iteration that delivered the block and
-                # strictly before any ResultMessage iteration classifies the turn
-                # (#2294). Never a task, and nothing is awaited between observing a
-                # publication call and classifying the turn that made it.
-                await self._observe_publication_calls(state)
                 # The tool result counter (#3486), on the same iteration: a held
                 # call's gate record is standing when its deny result arrives.
                 self._observe_tool_results(state)
@@ -2245,7 +2240,6 @@ class SessionRunner:
                             for line in unrecorded:
                                 yield line
                             return
-                        self._log_publication_fallback_alone(state)
                         self._log_publication_not_carried(state, final)
                         for line in self._approval_not_acted_lines(state, final):
                             yield line
@@ -2330,7 +2324,6 @@ class SessionRunner:
             for line in unrecorded:
                 yield line
             return
-        self._log_publication_fallback_alone(state)
         self._log_publication_not_carried(state, final)
         for line in self._approval_not_acted_lines(state, final):
             yield line
@@ -2370,85 +2363,6 @@ class SessionRunner:
         else:
             yield to_ndjson_line(self._with_connector_notice(final))
 
-    async def _observe_publication_calls(self, state: TurnState) -> None:
-        """Record every publication call the runner sees on the stream (#2294).
-
-        The runner's own observer, alongside the PreToolUse hook (#1852) and
-        ``can_use_tool`` (#245). Against the real SDK it is normally the FIRST
-        writer, not a rare backstop: the ``AssistantMessage`` carrying the
-        ``ToolUseBlock`` reaches this loop before the CLI dispatches PreToolUse
-        (observed live, #2294), so the hook's own ``block`` then finds the
-        record already standing and only adds its halt marker. The fake tier is
-        the inverted case -- its gate seam runs before the block is delivered,
-        so there the observation is the duplicate.
-
-        Either ordering yields exactly one record with identical fields, which
-        is the point. What this closes is the case the live run hit: neither SDK
-        layer recorded the call at all, the in-process tool body ran and
-        returned its defensive ``is_error``, and the turn was about to finalize
-        DONE with nothing for a human to approve.
-
-        It can only record or fail closed -- it never allows a call and never
-        mints a grant. Called on every message of the turn, it acts only on
-        calls it has not seen yet, and it is deliberately synchronous: the
-        record must stand before the ResultMessage iteration classifies the
-        turn (see the call site in ``_drive_turn``).
-
-        A call it cannot record stores the FIRST such reason in
-        ``state.publication_unrecorded``, for the fail-closed error message
-        ONLY. It is deliberately NOT sticky: observation continues over every
-        later call in the turn, because the gate's own deny text tells the model
-        to "Correct it and retry", so a malformed first attempt must not poison
-        the corrected record that follows it. Whether the turn actually fails
-        closed is decided from the OUTCOME at classification time -- see
-        ``_publication_unrecorded_lines``.
-        """
-
-        gate = self._approval_gate
-        while state.publication_calls_observed < len(state.publication_calls):
-            tool_use_id, payload = state.publication_calls[state.publication_calls_observed]
-            state.publication_calls_observed += 1
-            if gate is None or PLATFORM_PUBLISH_TOOL_NAME not in gate.required:
-                # The model named the publication tool where the platform has no
-                # gated checkout to publish from. Recording it anyway would ask a
-                # human to authorize an action that cannot exist, so fail closed.
-                state.publication_unrecorded = state.publication_unrecorded or (
-                    "the session carries no publication approval gate, so the"
-                    " request could not be recorded"
-                )
-                continue
-            try:
-                recorded = await gate.observe_publication(tool_use_id, payload)
-            except ValueError as exc:
-                # First reason wins for the message; the loop carries on so a
-                # corrected retry later in the same turn can still record.
-                state.publication_unrecorded = state.publication_unrecorded or str(exc)
-                continue
-            if recorded is None:
-                continue
-            if recorded:
-                # Neutral wording, and NOT a warning: against the real SDK this
-                # observer is normally the FIRST writer, because the
-                # AssistantMessage carrying the ToolUseBlock reaches this loop
-                # before the CLI dispatches PreToolUse (observed live, #2294,
-                # session=live-publish-gated). Writing first proves nothing about
-                # whether a gate layer decided, so claiming "no layer recorded
-                # this" here fired on the fully gated path too. The real
-                # layer-missed signal is at turn end, in
-                # ``_log_publication_fallback_alone``.
-                logger.debug(
-                    "publication call observed on the stream and recorded session=%s",
-                    self._session_id,
-                )
-            else:
-                # A record already stands. On the fake tier that is the gate
-                # layer's (it runs before the block is delivered); on the real
-                # path it is this observer's own earlier call in the same turn.
-                logger.debug(
-                    "publication already recorded this turn session=%s",
-                    self._session_id,
-                )
-
     def _observe_tool_results(self, state: TurnState) -> None:
         """Count every tool result that closed a call this turn (#3486).
 
@@ -2470,7 +2384,7 @@ class SessionRunner:
         cut off, and the catalog did not confirm unavailable. Each connector
         error logs one WARNING naming the server and the tool,
         because the metric may carry no identifier; the line never carries the
-        call's arguments or its result. Like ``_observe_publication_calls`` it
+        call's arguments or its result. Like the other wire-level captures it
         runs on every message and acts only on results it has not counted yet.
         """
 
@@ -2527,59 +2441,22 @@ class SessionRunner:
         return gate is not None and gate.questions_posted
 
     def _has_unhandled_publication(self, state: TurnState) -> bool:
+        """Whether the ``publish_changes`` tool body ran this turn.
+
+        The body runs only after every PreToolUse hook allowed the call, so a
+        call a hook denied (the runner's precheck or any bundle hook) is not
+        one: the model received that hook's reason and the request was never
+        made. A call whose body ran either recorded the publication or told the
+        model why it could not.
+        """
+
+        del state
         gate = self._approval_gate
         if self._questions_posted():
             # ADR 0286 decision 2 (#5785): a posted question round ends the
             # request, so a publication call beside the ask is not one to record.
             return False
-        return any(
-            gate is None or not gate.publication_refused(tool_use_id)
-            for tool_use_id, _ in state.publication_calls
-        )
-
-    def _log_publication_fallback_alone(self, state: TurnState) -> None:
-        """Warn when the stream observer was the ONLY layer that decided (#2294).
-
-        The honest "a gate layer missed this call" signal, and it can only be
-        computed at turn end. Per-call it is unknowable: against the real SDK the
-        stream delivers the ``ToolUseBlock`` to ``_drive_turn`` BEFORE the CLI
-        dispatches PreToolUse, so the observer writes first on every real
-        publication call, gated or not (observed live, #2294). Only the fake tier
-        runs its gate seam ahead of the block, so "the hook got there first"
-        describes that tier alone.
-
-        ``pending_halt`` is the discriminator: it is set by ``ApprovalGate.block``
-        and by nothing else, so ONLY the PreToolUse hook (#1852) or
-        ``can_use_tool`` (#245) can set it. The observer deliberately never does.
-        A turn that observed a publication call, ends holding its record, and
-        still has ``pending_halt`` False is therefore a turn in which neither SDK
-        layer denied the call -- the exact #2294 condition, and the one an
-        operator needs to see, because a gate that reports itself armed while
-        deciding nothing is the one they trust.
-
-        Called from the two Final emission sites, which are mutually exclusive
-        (each returns after yielding), so this logs at most once per turn.
-        Skipped on the interrupt/timeout paths: neither ran the gate to a
-        decision, so neither says anything about the layers.
-        """
-
-        gate = self._approval_gate
-        if (
-            not self._has_unhandled_publication(state)
-            or gate is None
-            or gate.pending_summary is None
-            or gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME
-            or gate.pending_halt
-            or self._interrupt_requested
-            or self._timeout_requested
-        ):
-            return
-        logger.warning(
-            "publication stream fallback stood alone session=%s: neither the"
-            " PreToolUse hook nor can_use_tool denied this publication call;"
-            " the pending approval was recorded from the stream",
-            self._session_id,
-        )
+        return gate is not None and gate.publication_attempted
 
     def _log_publication_not_carried(self, state: TurnState, final: Final) -> None:
         """Warn when a parked turn carries a DIFFERENT approval than the publish.
@@ -2605,7 +2482,8 @@ class SessionRunner:
             or final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
         ):
             return
-        if state.publication_unrecorded is not None:
+        unrecorded = self._publication_unrecorded_reason()
+        if unrecorded is not None:
             # Not slot contention: this request was never recordable in the
             # first place (a malformed proposal, or a gate without the publish
             # tool). Naming only the other approval here would misreport it and
@@ -2615,7 +2493,7 @@ class SessionRunner:
                 " request itself could not be recorded: %s; the turn is awaiting"
                 " a different approval (%s)",
                 self._session_id,
-                state.publication_unrecorded,
+                unrecorded,
                 final.approval_granted_tool or final.approval_gate_kind or "unknown",
             )
             return
@@ -2626,6 +2504,10 @@ class SessionRunner:
             self._session_id,
             final.approval_granted_tool or final.approval_gate_kind or "unknown",
         )
+
+    def _publication_unrecorded_reason(self) -> str | None:
+        gate = self._approval_gate
+        return gate.publication_unrecorded if gate is not None else None
 
     def _publication_unrecorded_lines(self, state: TurnState, final: Final) -> list[str]:
         """The fail-closed error+final pair for an unrecordable publication (#2294).
@@ -2671,7 +2553,7 @@ class SessionRunner:
             or self._timeout_requested
         ):
             return []
-        reason = state.publication_unrecorded or (
+        reason = self._publication_unrecorded_reason() or (
             "the publication call was not recorded by any approval gate layer"
         )
         logger.error("publication request not recorded session=%s: %s", self._session_id, reason)
