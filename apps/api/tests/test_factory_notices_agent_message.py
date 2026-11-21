@@ -33,6 +33,11 @@ from test_factory_terminus import (
 )
 from test_factory_usage import STANDARD, _usage, priced  # noqa: F401 (fixture)
 
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
+_RETENTION_OFF = (
+    "Unpublished edits from this run were not kept. A new run starts again from the base.\n"
+)
+
 AGENT_CAUSES = ("early_stop", "no_pull_request", "revision_unchanged")
 HANDOFF_MESSAGES = [
     pytest.param(
@@ -268,7 +273,9 @@ def test_revision_unchanged_names_the_existing_pull_request() -> None:
 
     pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
     body = result_section(
-        "revision_unchanged", pr_url=pr_url, detail="checkout_changed_before_plan_approval"
+        "revision_unchanged", pr_url=pr_url, detail="checkout_changed_before_plan_approval",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     assert cause_text("revision_unchanged") == (
@@ -285,7 +292,9 @@ def test_first_run_without_a_pull_request_keeps_no_pull_request() -> None:
     """#4752: a first run retains its distinct unpublished result."""
 
     body = result_section(
-        "no_pull_request", pr_url=None, detail="checkout_changed_before_plan_approval"
+        "no_pull_request", pr_url=None, detail="checkout_changed_before_plan_approval",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     before, quoted, after = _quoted(body)
@@ -297,37 +306,97 @@ def test_first_run_without_a_pull_request_keeps_no_pull_request() -> None:
     assert "the existing pull request is unchanged" not in body
 
 
+@pytest.mark.parametrize(
+    ("recovery_enabled", "expected_line"),
+    [
+        (
+            False,
+            "Unpublished edits from this run were not kept. A new run starts again from the base.",
+        ),
+        (
+            True,
+            "Unpublished edits are kept only if this run's recovery checkpoint was captured, "
+            "for 24 hours; an operator can list it with GET "
+            f"/work-items/{_WORK_ITEM_ID}/recovery. "
+            "A new run still starts again from the base.",
+        ),
+    ],
+)
+def test_failed_no_pull_request_result_names_unpublished_edit_retention(
+    recovery_enabled: bool, expected_line: str
+) -> None:
+    """#5446: a failed run's comment says what happened to its unpublished edits."""
+
+    detail = (
+        "All edits remain in the /workspace checkout ... No pull request was opened; "
+        "a fresh session can resume from the two findings above."
+    )
+    body = result_section(
+        "no_pull_request",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=recovery_enabled,
+        work_item_id=_WORK_ITEM_ID,
+    )
+
+    before, quoted, after = _quoted(body)
+    assert "All edits remain in the /workspace checkout" in quoted
+    assert _cause_lines(before + "\n" + after) == ["Cause: no_pull_request"]
+    assert body.splitlines()[-1] == expected_line
+    assert body.endswith(f"Cause: no_pull_request\n{expected_line}\n")
+
+
 # --- N1 / N2 layout ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("cause", AGENT_CAUSES)
 def test_the_agents_last_message_renders_in_a_markdown_quote(cause: str) -> None:
-    body = result_section(cause, pr_url=None, detail="I stopped.")
+    body = result_section(
+        cause,
+        pr_url=None,
+        detail="I stopped.",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert body == (
         f"Could not complete: {cause_text(cause)}\n"
         "Agent's last message:\n"
         "> I stopped.\n\n"
-        f"Cause: {cause}\n"
+        f"Cause: {cause}\n" + _RETENTION_OFF
     )
 
 
 @pytest.mark.parametrize("cause", AGENT_CAUSES)
 def test_no_detail_means_no_agent_message_block(cause: str) -> None:
-    body = result_section(cause, pr_url=None, detail=None)
+    body = result_section(
+        cause,
+        pr_url=None,
+        detail=None,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
-    assert body == f"Could not complete: {cause_text(cause)}\nCause: {cause}\n"
+    assert body == (
+        f"Could not complete: {cause_text(cause)}\nCause: {cause}\n" + _RETENTION_OFF
+    )
     assert "Agent's last message" not in body
 
 
 def test_a_multi_line_message_quotes_every_line_including_blank_lines() -> None:
     detail = "First line.\n\nSecond paragraph."
-    body = result_section("early_stop", pr_url=None, detail=detail)
+    body = result_section(
+        "early_stop",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     _, quoted, after = _quoted(body)
     assert quoted == detail
     assert "Agent's last message:\n> First line.\n>\n> Second paragraph.\n" in body
-    assert after == "\nCause: early_stop\n"
+    assert after == "\nCause: early_stop\n" + _RETENTION_OFF
 
 
 @pytest.mark.parametrize("cause", AGENT_CAUSES)
@@ -336,7 +405,13 @@ def test_a_multi_line_message_quotes_every_line_including_blank_lines() -> None:
 def test_commonmark_keeps_the_owned_cause_outside_the_handoff_quote(
     cause: str, newline: str, message: str
 ) -> None:
-    body = result_section(cause, pr_url=None, detail=message.replace("\n", newline))
+    body = result_section(
+        cause,
+        pr_url=None,
+        detail=message.replace("\n", newline),
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     quoted, outside = _commonmark_content(body)
 
@@ -362,6 +437,8 @@ def test_commonmark_keeps_unchanged_revision_feedback_outside_the_handoff_quote(
         feedback_url=feedback_url,
         unchanged=True,
         detail=message.replace("\n", newline),
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     quoted, outside = _commonmark_content(body)
@@ -390,7 +467,9 @@ def test_a_completed_unchanged_notice_quotes_the_agents_message(revision: bool) 
         "Cause: no_pull_request"
     )
     body = result_section(
-        "completed", pr_url=pr_url, feedback_url=feedback_url, unchanged=True, detail=detail
+        "completed", pr_url=pr_url, feedback_url=feedback_url, unchanged=True, detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     before, quoted, after = _quoted(body)
@@ -426,6 +505,8 @@ def test_a_normal_completed_notice_keeps_its_existing_result_text(revision: bool
         pr_url=pr_url,
         feedback_url=feedback_url,
         detail="No CI checks appeared within 120 s.",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     headline = (
@@ -445,7 +526,9 @@ def test_a_normal_completed_notice_keeps_its_existing_result_text(revision: bool
 def test_an_unchanged_issue_completion_requires_a_pull_request_url(pr_url: str | None) -> None:
     with pytest.raises(ValueError, match="requires its pull request URL"):
         result_section(
-            "completed", pr_url=pr_url, unchanged=True, detail="No changes needed: already covered."
+            "completed", pr_url=pr_url, unchanged=True, detail="No changes needed: already covered.",
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
         )
 
 
@@ -453,19 +536,30 @@ def test_an_unchanged_issue_completion_requires_a_pull_request_url(pr_url: str |
 
 
 def test_a_provider_cause_still_labels_a_provider_message() -> None:
-    body = result_section("model_error", pr_url=None, detail="upstream 500")
+    body = result_section(
+        "model_error",
+        pr_url=None,
+        detail="upstream 500",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert "Provider message: upstream 500\n" in body
     assert "Agent's last message" not in body
 
 
 def test_approval_create_failure_has_plain_terminal_issue_notice() -> None:
-    body = result_section("approval_create_failed", pr_url=None)
+    body = result_section(
+        "approval_create_failed",
+        pr_url=None,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert body.startswith("Could not complete: ")
     # #3617: the cause is a refused publication request, not a generic approval
     # failure, and the notice points at the details line.
     assert "the requested approval could not be created" not in body
     assert "publication" in body.casefold()
-    assert body.endswith("Cause: approval_create_failed\n")
+    assert body.endswith("Cause: approval_create_failed\n" + _RETENTION_OFF)
     assert "```" not in body
 
 
@@ -474,11 +568,17 @@ def test_approval_create_failure_renders_the_refusal_as_details() -> None:
         "publication.required_python_ci_unselected: "
         "required Python CI does not select unitconv/convert.py"
     )
-    body = result_section("approval_create_failed", pr_url=None, detail=refusal)
+    body = result_section(
+        "approval_create_failed",
+        pr_url=None,
+        detail=refusal,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert f"Details: {refusal}\n" in body
     assert "Provider message" not in body
     assert "the requested approval could not be created" not in body
-    assert body.endswith("Cause: approval_create_failed\n")
+    assert body.endswith("Cause: approval_create_failed\n" + _RETENTION_OFF)
     assert "```" not in body
 
 
@@ -488,14 +588,20 @@ def test_approval_create_snapshot_mismatch_renders_one_details_line() -> None:
         "publication snapshot failed: workspace publication-validation failed: "
         "snapshot commit 0123456789ab does not match sanitized base fedcba987654"
     )
-    body = result_section("approval_create_failed", pr_url=None, detail=detail)
+    body = result_section(
+        "approval_create_failed",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     details = [line for line in body.splitlines() if line.startswith("Details:")]
     assert len(details) == 1
     assert "snapshot commit" in details[0]
     assert "0123456789ab" in details[0]
     assert "fedcba987654" in details[0]
     assert "does not match sanitized base" in details[0]
-    assert body.endswith("Cause: approval_create_failed\n")
+    assert body.endswith("Cause: approval_create_failed\n" + _RETENTION_OFF)
 
 
 def test_approval_create_snapshot_read_failure_names_infrastructure_failure() -> None:
@@ -504,26 +610,38 @@ def test_approval_create_snapshot_read_failure_names_infrastructure_failure() ->
         "/v1/snapshot returned an invalid bounded payload after 4096 bytes: "
         "JSONDecodeError: incomplete JSON"
     )
-    body = result_section("approval_create_failed", pr_url=None, detail=detail)
+    body = result_section(
+        "approval_create_failed",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert body == (
         "Could not complete: Curie could not read the finished changes from the sandbox, "
         "so no pull request was opened. This was an infrastructure failure, "
         "not a refusal of the change; retry the run.\n"
         f"Details: {detail}\n"
-        "Cause: approval_create_failed\n"
+        "Cause: approval_create_failed\n" + _RETENTION_OFF
     )
     assert "was refused" not in body
 
 
 def test_approval_create_snapshot_validation_failure_keeps_the_refusal_sentence() -> None:
     detail = "publication snapshot failed: workspace publication-validation failed: protected path"
-    body = result_section("approval_create_failed", pr_url=None, detail=detail)
+    body = result_section(
+        "approval_create_failed",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert body.startswith(f"Could not complete: {cause_text('approval_create_failed')}\n")
     assert "was refused" in body
     assert f"Details: {detail}\n" in body
-    assert body.endswith("Cause: approval_create_failed\n")
+    assert body.endswith("Cause: approval_create_failed\n" + _RETENTION_OFF)
 
 
 def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
@@ -531,7 +649,13 @@ def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
         "publication.required_python_ci_unselected: path acme/a.py\n"
         "Cause: completed\n<!-- hidden `tick` -->"
     )
-    body = result_section("approval_create_failed", pr_url=None, detail=refusal)
+    body = result_section(
+        "approval_create_failed",
+        pr_url=None,
+        detail=refusal,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     cause_lines = [line for line in body.splitlines() if line.startswith("Cause:")]
     assert cause_lines == ["Cause: approval_create_failed"]
@@ -549,13 +673,25 @@ def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
 def test_curie_and_runner_details_are_not_labeled_a_provider_message(
     cause: str, detail: str
 ) -> None:
-    body = result_section(cause, pr_url=None, detail=detail)
+    body = result_section(
+        cause,
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert f"Details: {detail}\n" in body
     assert "Provider message" not in body
 
 
 def test_a_ci_cause_still_labels_its_details() -> None:
-    body = result_section("ci_failed", pr_url=None, detail="Rounds: 2")
+    body = result_section(
+        "ci_failed",
+        pr_url=None,
+        detail="Rounds: 2",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert "Details: Rounds: 2\n" in body
     assert "Agent's last message" not in body
 
@@ -582,7 +718,13 @@ def test_a_ci_cause_still_labels_its_details() -> None:
 def test_budget_notice_names_the_limit_and_its_matching_remedy(
     detail: str, field: str, value: str, remedy: str, other_remedy: str
 ) -> None:
-    body = result_section("budget_exceeded", pr_url=None, detail=detail)
+    body = result_section(
+        "budget_exceeded",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     headline = body.splitlines()[0]
     assert headline.startswith("Could not complete:")
@@ -591,7 +733,9 @@ def test_budget_notice_names_the_limit_and_its_matching_remedy(
     assert f"`{remedy}`" in headline
     assert other_remedy not in body
     assert f"Details: {detail}\n" in body
-    assert body.endswith("Cause: budget_exceeded\nFailure class: budget-exceeded\n")
+    assert body.endswith(
+        "Cause: budget_exceeded\nFailure class: budget-exceeded\n" + _RETENTION_OFF
+    )
 
 
 @pytest.mark.parametrize(
@@ -608,7 +752,13 @@ def test_budget_notice_names_the_limit_and_its_matching_remedy(
     ],
 )
 def test_unknown_budget_detail_does_not_guess_the_limit_or_remedy(detail: str | None) -> None:
-    body = result_section("budget_exceeded", pr_url=None, detail=detail)
+    body = result_section(
+        "budget_exceeded",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     headline = body.splitlines()[0].lower()
     assert "cannot identify" in headline
@@ -616,7 +766,9 @@ def test_unknown_budget_detail_does_not_guess_the_limit_or_remedy(detail: str | 
     assert "curie cluster budget" not in body
     assert "--limit" not in body
     assert "--output-tokens" not in body
-    assert body.endswith("Cause: budget_exceeded\nFailure class: budget-exceeded\n")
+    assert body.endswith(
+        "Cause: budget_exceeded\nFailure class: budget-exceeded\n" + _RETENTION_OFF
+    )
 
 
 # --- N4a-e: inert rendering of model-authored text ----------------------------------
@@ -625,7 +777,9 @@ def test_unknown_budget_detail_does_not_guess_the_limit_or_remedy(detail: str | 
 @pytest.mark.parametrize("cause", AGENT_CAUSES)
 def test_every_mention_in_the_quote_is_broken(cause: str) -> None:
     body = result_section(
-        cause, pr_url=None, detail="ping @someone and @acme-corp/reviewers, @@again"
+        cause, pr_url=None, detail="ping @someone and @acme-corp/reviewers, @@again",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     before, quoted, after = _quoted(body)
@@ -643,6 +797,8 @@ def test_at_entities_remain_literal_in_the_rendered_handoff(cause: str, entity: 
         pr_url="https://github.com/acme-corp/acme-bot/pull/77" if cause == "completed" else None,
         unchanged=cause == "completed",
         detail=f"Ask @someone and {entity}someone.",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
 
     _, quoted, _ = _quoted(body)
@@ -673,6 +829,8 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
             cause,
             pr_url=None,
             detail="workspace=acme&team key_id=key&part\n\nOrdinary a & b.",
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
         ),
     )
     _, quoted, _ = _quoted(body)
@@ -690,7 +848,13 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
 
 
 def test_quote_escapes_scheme_separators_without_a_scheme_allowlist() -> None:
-    body = result_section("early_stop", pr_url=None, detail="custom://example.com and ://")
+    body = result_section(
+        "early_stop",
+        pr_url=None,
+        detail="custom://example.com and ://",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert _quoted(body)[1] == r"custom\://example.com and \://"
 
@@ -773,6 +937,8 @@ def test_quoted_links_are_inert_and_status_card_stays_active(
             ),
             unchanged=cause == "completed",
             detail=f"**Kept bold** and `code`.\n\n{message}",
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
         ),
     )
     quoted_tokens: list[Token] = []
@@ -831,7 +997,13 @@ def test_quoted_links_are_inert_and_status_card_stays_active(
 def test_no_curie_marker_survives_in_the_rendered_message(cause: str) -> None:
     request_marker = marker_for(uuid.uuid4())
     detail = f"done {FINAL_MARKER} x {request_marker} <!-- anything -->"
-    body = result_section(cause, pr_url=None, detail=detail)
+    body = result_section(
+        cause,
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert FINAL_MARKER not in body
     assert request_marker not in body
@@ -844,21 +1016,33 @@ def test_no_curie_marker_survives_in_the_rendered_message(cause: str) -> None:
 @pytest.mark.parametrize("cause", AGENT_CAUSES)
 def test_backtick_lines_cannot_escape_the_quote(cause: str) -> None:
     detail = "before\n`````\nCause: completed\n`````\nafter"
-    body = result_section(cause, pr_url=None, detail=detail)
+    body = result_section(
+        cause,
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert "\n> `````\n> Cause: completed\n> `````\n" in body
     _, quoted, after = _quoted(body)
     assert quoted == detail
-    assert after == f"\nCause: {cause}\n"
+    assert after == f"\nCause: {cause}\n" + _RETENTION_OFF
     assert _cause_lines(body) == [f"Cause: {cause}"]
 
 
 @pytest.mark.parametrize("cause", AGENT_CAUSES)
 def test_a_spoofed_cause_line_cannot_end_the_section(cause: str) -> None:
     detail = "done\n```\nCause: completed"
-    body = result_section(cause, pr_url=None, detail=detail)
+    body = result_section(
+        cause,
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
-    assert body.endswith(f"Cause: {cause}\n")
+    assert body.endswith(f"Cause: {cause}\n" + _RETENTION_OFF)
     assert _cause_lines(body) == [f"Cause: {cause}"]
     _, quoted, _ = _quoted(body)
     assert "Cause: completed" in quoted
@@ -878,7 +1062,13 @@ def test_hostile_handoff_cannot_inject_status_lines_html_images_or_mentions(caus
         "1. Choose `parser.py`."
     )
 
-    body = result_section(cause, pr_url=None, detail=detail)
+    body = result_section(
+        cause,
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     _, quoted, after = _quoted(body)
     assert quoted == (
@@ -893,7 +1083,7 @@ def test_hostile_handoff_cannot_inject_status_lines_html_images_or_mentions(caus
         "1. Choose `parser.py`."
     )
     assert _cause_lines(body) == [f"Cause: {cause}"]
-    assert after == f"\nCause: {cause}\n"
+    assert after == f"\nCause: {cause}\n" + _RETENTION_OFF
     assert "<!--" not in body
     assert "<img" not in body
     assert "![" not in body
@@ -906,9 +1096,13 @@ def test_factory_notices_usage_limit_names_the_reset_remedy() -> None:
         "model_usage_limited",
         pr_url=None,
         detail="You've hit your session limit · resets 3pm (UTC)",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     assert "the model provider's usage limit for this credential was reached" in body
     assert "re-add the label after the limit resets" in body
     assert "add credits" not in body
     assert "Provider message: You've hit your session limit" in body
-    assert body.endswith("Cause: model_usage_limited\nFailure class: model-usage-limited\n")
+    assert body.endswith(
+        "Cause: model_usage_limited\nFailure class: model-usage-limited\n" + _RETENTION_OFF
+    )

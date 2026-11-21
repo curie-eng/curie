@@ -57,12 +57,19 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
+
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 
 def test_completed_issue_comment_body_requires_pull_request_url() -> None:
     with pytest.raises(ValueError, match="requires its pull request URL"):
-        result_section("completed", pr_url=None)
+        result_section(
+            "completed",
+            pr_url=None,
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
+        )
 
 
 def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None:
@@ -70,6 +77,8 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "model_credit_exhausted",
         pr_url=None,
         detail="API Error: 402 This request requires more credits",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     headline = body.splitlines()[0]
     assert headline.startswith("Could not complete: the model provider refused")
@@ -139,7 +148,12 @@ _PUBLICATION_FAILED_SENTENCE = (
 
 
 def test_publication_failed_result_section_warns_that_remote_work_may_exist() -> None:
-    body = result_section("publication_failed", pr_url=None)
+    body = result_section(
+        "publication_failed",
+        pr_url=None,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert cause_text("publication_failed") == _PUBLICATION_FAILED_SENTENCE
     assert body.splitlines()[0] == f"Could not complete: {_PUBLICATION_FAILED_SENTENCE}"
@@ -148,7 +162,13 @@ def test_publication_failed_result_section_warns_that_remote_work_may_exist() ->
 
 def test_publication_unrecorded_result_section_labels_its_details() -> None:
     detail = "The publication record did not match the requested repository."
-    body = result_section("publication_unrecorded", pr_url=None, detail=detail)
+    body = result_section(
+        "publication_unrecorded",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
 
     assert body.splitlines()[0] == f"Could not complete: {_PUBLICATION_UNRECORDED_SENTENCE}"
     assert f"Details: {detail}" in body
@@ -162,6 +182,8 @@ def test_model_unreachable_result_section_names_the_network_path_and_its_class()
         "model_unreachable",
         pr_url=None,
         detail="model error: server_error: API Error: Connection refused (ECONNREFUSED)",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     headline = body.splitlines()[0]
     assert headline == f"Could not complete: {_MODEL_UNREACHABLE_SENTENCE}"
@@ -176,13 +198,24 @@ def test_model_unreachable_result_section_names_the_network_path_and_its_class()
 def test_the_result_section_carries_no_marker() -> None:
     """The marker belongs to the whole status comment, not to its result lines."""
 
-    body = result_section("runner_failed", pr_url=None)
+    body = result_section(
+        "runner_failed",
+        pr_url=None,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert "curie-execution-request" not in body
     assert FINAL_MARKER not in body
 
 
 def test_superseded_cancel_says_a_new_run_replaced_this_one() -> None:
-    body = result_section("issue_cancelled", pr_url=None, superseded=True)
+    body = result_section(
+        "issue_cancelled",
+        pr_url=None,
+        superseded=True,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert body == (
         "Stopped: the label was added again, so a new run replaced this one.\n"
         "Cause: issue_cancelled\n"
@@ -190,7 +223,12 @@ def test_superseded_cancel_says_a_new_run_replaced_this_one() -> None:
 
 
 def test_unknown_cause_still_gets_a_sentence_and_its_code() -> None:
-    body = result_section("something_new", pr_url=None)
+    body = result_section(
+        "something_new",
+        pr_url=None,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert body.splitlines()[0] == (
         "Could not complete: the run stopped for a reason Curie did not recognize."
     )
@@ -203,7 +241,13 @@ def test_ci_failed_notice_labels_its_details_not_a_provider_message() -> None:
         'Rounds: 3\nTried: round 2: "Fix the test" (1 files: src/app.py)\n'
         "Failing checks: unit-tests (failure)"
     )
-    body = result_section("ci_failed", pr_url=None, detail=detail)
+    body = result_section(
+        "ci_failed",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert body.startswith("Could not complete:")
     assert "3 rounds" in body.splitlines()[0]
     assert "Provider message:" not in body
@@ -213,7 +257,13 @@ def test_ci_failed_notice_labels_its_details_not_a_provider_message() -> None:
 
 
 def test_ci_unverified_notice_says_it_is_not_a_success() -> None:
-    body = result_section("ci_unverified", pr_url=None, detail="Reason: github_forbidden")
+    body = result_section(
+        "ci_unverified",
+        pr_url=None,
+        detail="Reason: github_forbidden",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert body.startswith("Could not complete:")
     assert "CI could not be verified" in body.splitlines()[0]
     assert "Reason: github_forbidden" in body
@@ -222,7 +272,13 @@ def test_ci_unverified_notice_says_it_is_not_a_success() -> None:
 
 def test_completed_notice_carries_the_no_ci_note() -> None:
     url = f"https://github.com/{REPO}/pull/77"
-    body = result_section("completed", pr_url=url, detail="No CI checks appeared within 120 s.")
+    body = result_section(
+        "completed",
+        pr_url=url,
+        detail="No CI checks appeared within 120 s.",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert body.startswith(f"Completed: {url}")
     assert "Note: No CI checks appeared within 120 s." in body
 
@@ -234,6 +290,8 @@ def test_revision_completed_notice_carries_the_no_ci_note() -> None:
         pr_url=url,
         feedback_url=f"{url}#issuecomment-1",
         detail="No CI checks appeared within 120 s.",
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
     )
     assert body.startswith("The requested revision is pushed")
     assert "Note: No CI checks appeared within 120 s." in body
@@ -1072,7 +1130,12 @@ def test_a_crash_between_commit_and_post_still_posts_once(admitted: Any) -> None
     sink.comments.append(
         {
             "id": 7444,
-            "body": result_section("issue_cancelled", pr_url=None)
+            "body": result_section(
+                "issue_cancelled",
+                pr_url=None,
+                workspace_recovery_enabled=False,
+                work_item_id=_WORK_ITEM_ID,
+            )
             + f"\n{FINAL_MARKER}\n{marker_for(row['id'])}\n",
         }
     )
@@ -2382,6 +2445,8 @@ def test_a_marker_already_on_the_pull_request_is_not_posted_again(
                 "completed",
                 pr_url=None,
                 feedback_url=f"https://github.com/{REPO}/pull/{pr}#{fragment}",
+                workspace_recovery_enabled=False,
+                work_item_id=_WORK_ITEM_ID,
             )
             + f"\n{marker_for(revision)}\n",
         }

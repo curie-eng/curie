@@ -2760,6 +2760,8 @@ def test_model_context_window_follows_the_selected_model(tmp_path: Path) -> None
 # --- #3128: early_stop endings and the durable agent message ---------------------
 
 
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
+
 def _early_stop_comment(message: str) -> str:
     from curie_api.factory_notices import result_section, status_body
 
@@ -2768,7 +2770,13 @@ def _early_stop_comment(message: str) -> str:
         card_url=None,
         pill_label="FAILED",
         phase_view=None,
-        result=result_section("early_stop", pr_url=None, detail=message),
+        result=result_section(
+            "early_stop",
+            pr_url=None,
+            detail=message,
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
+        ),
     )
 
 
