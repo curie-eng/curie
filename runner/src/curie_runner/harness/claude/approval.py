@@ -489,9 +489,10 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
     Returns the ``{"PreToolUse": [HookMatcher], "PostToolUse": [HookMatcher]}``
     mapping ``__main__`` MERGES into the bundle's own hooks (#272); the
     PostToolUse matcher only ends the turn after a posted question round.
-    Note that the CLI dispatches every matcher on one event **concurrently** (``types.py:1956-1961``), so this hook
-    must not assume it runs before a bundle's hook, and its position in the
-    merged list is construction order, not precedence.
+    Note that the CLI dispatches every matcher on one event **concurrently**
+    (``types.py:1956-1961``), so this hook must not assume it runs before a
+    bundle's hook, and its position in the merged list is construction order,
+    not precedence.
 
     Three outcomes, keyed on gate membership:
 
