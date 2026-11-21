@@ -65,7 +65,7 @@ from .adapter import (
     StreamedToolUseBoundary,
     model_message_to_conversation,
 )
-from .approval import ApprovalGate, is_mcp_tool, platform_tool_names
+from .approval import ApprovalGate, PublicationLedger, is_mcp_tool, platform_tool_names
 from .attachment_access import LAZY_ATTACHMENT_NOTICE, AttachmentAccessTurn
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .final_answer import (
@@ -423,6 +423,7 @@ class SessionRunner:
         history_store: TranscriptStore | None = None,
         approval_gate: ApprovalGate | None = None,
         question_gate: ApprovalGate | None = None,
+        publication_ledger: PublicationLedger | None = None,
         approval_resumed_kind: str | None = None,
         approval_decision: str | None = None,
         false_completion_check: bool = False,
@@ -533,6 +534,9 @@ class SessionRunner:
         # The gate that carries the question halt (ADR 0286, #5785): the
         # approval gate, or a factory boot's gate that gates nothing.
         self._question_gate = question_gate if question_gate is not None else approval_gate
+        # Where the publish body notes that it ran when there is no approval
+        # gate (#2294); the same object the body closes over.
+        self._publication_ledger = publication_ledger
         # The SDK's init catalog is the evidence a CLI unknown-tool result
         # needs before it can be separated from a connector's own error text.
         # None means no trustworthy catalog has arrived; fail closed to error.
@@ -1521,6 +1525,8 @@ class SessionRunner:
                 self._approval_gate.bind_publication_context(event.publication_context)
             if self._question_gate is not None and self._question_gate is not self._approval_gate:
                 self._question_gate.reset()
+            if self._publication_ledger is not None:
+                self._publication_ledger.reset()
             tracker = BudgetTracker(ceiling=self._ceiling)
             metric_outcome = "interrupted"
             metric_attributes = {
@@ -2456,10 +2462,12 @@ class SessionRunner:
             # request, so a publication call beside the ask is not one to record.
             return False
         if gate is None:
-            # No gate, so no body that can record. The body's own answer
-            # proves it ran; a call a bundle hook denied ends normally.
-            # A read-only turn captures no request (RUNNER-TOOL-ACCESS-3).
-            return state.tool_access is None and state.publication_body_refused
+            # No gate, so no body that can record. The runner's ledger says
+            # whether the body ran; a call a hook denied never reaches it,
+            # whatever the deny says. A read-only turn captures no request
+            # (RUNNER-TOOL-ACCESS-3).
+            ledger = self._publication_ledger
+            return state.tool_access is None and ledger is not None and ledger.refused
         return gate.publication_attempted
 
     def _log_publication_not_carried(self, state: TurnState, final: Final) -> None:

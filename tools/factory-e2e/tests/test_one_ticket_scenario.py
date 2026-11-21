@@ -604,28 +604,30 @@ def test_the_asked_questions_are_exactly_two_and_the_publication_closes_the_issu
     assert "3815" not in json.dumps(exchanges)
 
 
-def test_the_scripted_publication_passes_the_bundle_gates_on_an_answered_ticket() -> None:
-    """The session 2 body is one the dark factory's own publish gates allow.
+def test_the_github_lane_publication_cites_the_answer_its_labeller_posted() -> None:
+    """Session 2's body cites the answer the GitHub lane admits, by its author.
 
-    Session 2 reads a ticket that carries the factory's questions, so the
-    bundle's reproduction gate refuses a body whose Decisions section cites no
-    answer, and the review gate refuses a section outside its grammar. The
-    runner now honours those PreToolUse denies, so a scripted body either gate
-    refuses would be denied in the run and the model asked for an exchange
-    the transcript does not hold.
+    The lane's one authorized answer is ``ANSWER_TEXT``, posted by the stub's
+    labeller, and a GitHub ticket read names a comment's author by login. The
+    body must carry that citation, which is also what the dark factory's
+    reproduction gate requires once the ticket carries the factory's questions,
+    inside a Decisions section the review gate's grammar accepts. The runner
+    honours those gates' denies, so a body either refuses would be denied in
+    the run and the model asked for an exchange the transcript does not hold.
     """
 
     reproduction = _load("one_ticket_reproduction_gate", REPRODUCTION_GATE)
     decisions = _load("one_ticket_decisions_section", DECISIONS_SECTION)
     model = _load("one_ticket_model_script_gates", MODEL_SCRIPT)
-    calls = [
-        block
-        for exchange in model.load_transcript(run.TRANSCRIPT)
-        for block in exchange["message"]["content"]
-        if block.get("type") == "tool_use" and block["name"] == "mcp__curie__publish_changes"
-    ]
-    (publish,) = calls
-    body = publish["input"]["body"]
+    (body,) = run.publication_bodies(model.load_transcript(run.TRANSCRIPT))
+
+    assert run.ANSWER_AUTHOR == GITHUB.HUMAN["login"]
+    citation = f"Answered on the ticket by {GITHUB.HUMAN['login']}: {run.ANSWER_TEXT}"
+    assert run.answer_citation(GITHUB.HUMAN["login"]) == citation
+    assert body.splitlines().count(citation) == 1
+    assert [
+        line for line in body.splitlines() if line.startswith("Answered on the ticket by ")
+    ] == [citation]
     assert reproduction.cited(body)
     assert len(decisions.parse_decisions_section(body)) == 2
 

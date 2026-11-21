@@ -577,6 +577,24 @@ NO_PUBLICATION_GATE_TEXT = (
 
 
 @dataclass
+class PublicationLedger:
+    """Whether the ``publish_changes`` body ran in a session with no approval gate.
+
+    A session with an approval gate records that on the gate
+    (``ApprovalGate.refuse_publication``). A session with none has nowhere
+    else to keep it, so the runner gives the body and the session this one
+    object. Only the body sets ``refused``, and the CLI runs the body only
+    after every PreToolUse hook allowed the call, so a hook deny never sets
+    it, whatever its reason says (#2294).
+    """
+
+    refused: bool = False
+
+    def reset(self) -> None:
+        self.refused = False
+
+
+@dataclass
 class ApprovalGate:
     """Shared state between the ``can_use_tool`` callback and the session loop.
 

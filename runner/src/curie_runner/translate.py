@@ -44,9 +44,8 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 from curie_internal.provider_scope import ProviderScope
 from curie_telemetry.redact import redact_text
-from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
-from .approval import APPROVAL_TOOL_NAME, NO_PUBLICATION_GATE_TEXT, guard_reserved_summary
+from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
 from .final_answer import (
     FINAL_ANSWER_CLASSIFICATION,
     FinalAnswerValidation,
@@ -322,10 +321,6 @@ class TurnState:
     # reported as errored *because we interrupted it*, instead of reporting a
     # failure with nothing to approve.
     approval_halt_requested: bool = False
-    # Whether a ``publish_changes`` body answered this turn that the session
-    # has no publication gate. Only the body's own text sets it, so a call a
-    # PreToolUse hook denied never does. Runner-internal, never a wire field.
-    publication_body_refused: bool = False
     # Call id -> live tool name for EVERY call seen this turn (#3486), read-only
     # ones included, unlike ``pending_actions``. Popped by the result that
     # closes the call, so a result for an id this turn never saw, or a second
@@ -610,15 +605,6 @@ def _translate_user(
             state.tool_results.append(
                 (block.tool_use_id, called, block.is_error is True, unknown_marker)
             )
-            if (
-                called == PLATFORM_PUBLISH_TOOL_NAME
-                and block.is_error is True
-                and NO_PUBLICATION_GATE_TEXT in _result_text(block.content)
-            ):
-                # The publish body's own answer in a session with no
-                # publication gate: the body ran, so the session fails the turn
-                # closed (#2294). A PreToolUse hook's deny never carries it.
-                state.publication_body_refused = True
             if called in _SUBAGENT_TOOLS and block.is_error is True:
                 # A reviewer refusal is terminal even if the parent recovers.
                 # Subscription limits take precedence over financial limits,

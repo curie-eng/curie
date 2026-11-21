@@ -23,6 +23,7 @@ from ...approval import (
     APPROVAL_SERVER_NAME,
     NO_PUBLICATION_GATE_TEXT,
     ApprovalGate,
+    PublicationLedger,
     _approval_error,
     _decide_gate,
     process_approval_request,
@@ -134,6 +135,7 @@ def build_approval_server(
     attachment_tools: Sequence[SdkMcpTool[Any]] = (),
     question_tool: SdkMcpTool[Any] | None = None,
     propose_rule_tool: SdkMcpTool[Any] | None = None,
+    publication_ledger: PublicationLedger | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -171,6 +173,9 @@ def build_approval_server(
 
     ``propose_rule_tool`` (ADR 0287, #5796) is ``propose_rule``, appended only
     when the API's contract answer offered a rule proposal to a real model.
+
+    ``publication_ledger`` is where the ``publish_changes`` body notes that it
+    ran in a session with no ``gate``; the session reads the same object.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
@@ -186,11 +191,13 @@ def build_approval_server(
         # an unmounted session cannot create a publication approval, and a
         # direct invocation fails without mutating gate state.
         if not managed_workspace or gate is None or PLATFORM_PUBLISH_TOOL_NAME not in gate.required:
+            # The body ran, so the session fails the turn closed unless
+            # something else owns it (#2294). A session with no gate reads the
+            # runner's ledger instead, never this answer's text.
             if gate is not None:
-                # The body ran, so the session fails the turn closed unless
-                # something else owns it (#2294). A gateless session is the
-                # session's own check.
                 gate.refuse_publication(_NO_PUBLICATION_GATE)
+            elif publication_ledger is not None:
+                publication_ledger.refused = True
             return _approval_error(NO_PUBLICATION_GATE_TEXT)
         # The one recording path: the CLI runs this body only after every
         # PreToolUse hook, the bundle's included, allowed the call. Recording

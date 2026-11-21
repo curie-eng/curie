@@ -49,6 +49,7 @@ from .approval import (
     NO_PUBLICATION_GATE_TEXT,
     TURN_PROGRESS_TOOL_NAME,
     ApprovalGate,
+    PublicationLedger,
     process_approval_request,
 )
 from .connectors import CALLER_HEADER
@@ -901,6 +902,7 @@ class FakeModelSession:
         post_tool_use_hook: Callable[[Any, str | None, Any], Awaitable[dict[str, Any]]]
         | None = None,
         approval_gate: ApprovalGate | None = None,
+        publication_ledger: PublicationLedger | None = None,
         replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
@@ -940,6 +942,9 @@ class FakeModelSession:
         # the fake tier omits the sole-route auto-bind / unknown-route refusal and
         # silently widens the card -- the exact real-path regression #544 closed.
         self._approval_gate = approval_gate
+        # With no gate, the scripted publish body notes its run here, as the
+        # real body does (#2294).
+        self._publication_ledger = publication_ledger
         self.replay_messages = replay_messages
         self.connected = False
         self.queries: list[str] = []
@@ -1252,6 +1257,17 @@ class FakeModelSession:
                     )
                 self._pending_refusals.append(
                     _tool_result(block.id, refusal or "Publication requested.", is_error=True)
+                )
+            elif (
+                block.name == PLATFORM_PUBLISH_TOOL_NAME
+                and self._approval_gate is None
+                and self._publication_ledger is not None
+                and block.id not in self._denied_ids
+            ):
+                # The same body with no gate: it refuses and notes the run.
+                self._publication_ledger.refused = True
+                self._pending_refusals.append(
+                    _tool_result(block.id, NO_PUBLICATION_GATE_TEXT, is_error=True)
                 )
         return None
 

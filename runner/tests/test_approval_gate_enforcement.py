@@ -77,8 +77,10 @@ from curie_runner.approval import (
     APPROVAL_SERVER_NAME,
     APPROVAL_SUMMARY_PREFIX,
     APPROVAL_TOOL_NAME,
+    NO_PUBLICATION_GATE_TEXT,
     ApprovalGate,
     ApprovalPolicyError,
+    PublicationLedger,
     build_approval_gate,
 )
 from curie_runner.config import RunnerConfig
@@ -1761,10 +1763,29 @@ def test_publish_call_on_a_gate_that_does_not_carry_publish_fails_closed() -> No
     assert gate.pending_halt is False
 
 
-def _gateless_body_answer() -> str:
-    """What the real ``publish_changes`` body answers in a session with no gate."""
+def _gateless_runner(script: list[Any], ledger: PublicationLedger, **kw: Any):
+    """A session with no approval gate, sharing ``ledger`` with its publish body."""
 
-    server = build_approval_server(None, managed_workspace=False)
+    session = FakeModelSession(lambda: script, publication_ledger=ledger, **kw)
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=lambda: session,
+        ceiling=10_000,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        approval_gate=None,
+        publication_ledger=ledger,
+    )
+    return runner
+
+
+def test_the_real_publish_body_notes_its_run_on_the_ledger_with_no_gate() -> None:
+    # The real in-process body is the one writer of the ledger: with no gate it
+    # refuses, and the runner, not the answer's text, keeps that it ran.
+    ledger = PublicationLedger()
+    server = build_approval_server(None, managed_workspace=False, publication_ledger=ledger)
     entry = server["instance"].get_request_handler("tools/call")
     assert entry is not None
     result = anyio.run(
@@ -1777,39 +1798,23 @@ def _gateless_body_answer() -> str:
     )
     payload = result.model_dump()
     assert payload.get("is_error") is True
-    return " ".join(str(item.get("text") or "") for item in payload.get("content") or [])
-
-
-def _gateless_publish_turn(answer: str) -> list[Any]:
-    """A publish call the CLI answered with ``answer``, then a clean ending."""
-
-    return [
-        _publish_block(),
-        UserMessage(
-            content=[
-                ToolResultBlock(
-                    tool_use_id="p1",
-                    content=[{"type": "text", "text": answer}],
-                    is_error=True,
-                )
-            ]
-        ),
-        *_publish_then_clean_done()[1:],
-    ]
+    assert NO_PUBLICATION_GATE_TEXT in json.dumps(payload.get("content"))
+    assert ledger.refused is True
 
 
 def test_publish_body_run_in_a_session_with_no_gate_fails_closed() -> None:
     # revert: key the fail-closed rule on the gate alone -> a session with no
     # approval gate at all (no managed workspace, no policy) answers the publish
     # call with the tool body's error and the turn ends DONE, as if nothing had
-    # been asked for. The body's own answer proves it ran (#2294).
+    # been asked for. The ledger the body wrote proves it ran (#2294).
     from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
 
-    script = _gateless_publish_turn(_gateless_body_answer())
-    runner, _session = _runner_over(script, gate=None)  # type: ignore[arg-type]
+    ledger = PublicationLedger()
+    runner = _gateless_runner(_publish_then_clean_done(), ledger)
 
     events = parse_ndjson("".join(_run_lines(runner)))
 
+    assert ledger.refused is True
     errors = [e for e in events if e.type == "error"]
     assert [e.classification for e in errors] == [PUBLICATION_UNRECORDED_CLASSIFICATION]
     assert "no publication approval gate" in errors[0].message
@@ -1818,16 +1823,41 @@ def test_publish_body_run_in_a_session_with_no_gate_fails_closed() -> None:
     assert final.approval_summary is None
 
 
-def test_publish_a_hook_denied_in_a_session_with_no_gate_ends_normally() -> None:
-    # Liveness: a bundle PreToolUse deny is not the body running. The model
-    # read the hook's reason and answered; the turn ends on its own text.
+def test_a_hook_deny_quoting_the_no_gate_text_is_not_an_unrecorded_publication() -> None:
+    # A PreToolUse deny whose reason is exactly the body's no-gate text: the
+    # body never ran, so nothing is classified, and the turn ends on the
+    # model's own text. revert: infer the body's run from that text in the
+    # tool result -> the deny is classified as an unrecorded publication.
     from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
 
-    script = _gateless_publish_turn("bundle gate: this publication body is refused")
-    runner, _session = _runner_over(script, gate=None)  # type: ignore[arg-type]
+    async def deny(_input: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": NO_PUBLICATION_GATE_TEXT,
+            }
+        }
+
+    script = [
+        _publish_block(),
+        UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="p1",
+                    content=[{"type": "text", "text": NO_PUBLICATION_GATE_TEXT}],
+                    is_error=True,
+                )
+            ]
+        ),
+        *_publish_then_clean_done()[1:],
+    ]
+    ledger = PublicationLedger()
+    runner = _gateless_runner(script, ledger, pre_tool_use_hook=deny)
 
     events = parse_ndjson("".join(_run_lines(runner)))
 
+    assert ledger.refused is False
     assert not any(
         e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
         for e in events

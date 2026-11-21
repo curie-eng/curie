@@ -38,6 +38,29 @@ QUIET_POLLS = 3
 READER = {"id": 6610, "login": "onlooker", "type": "User"}
 OTHER_BOT = {"id": 6611, "login": "helper-bot[bot]", "type": "Bot"}
 ANSWER_TEXT = "Accept `k` and also `kelvin`. Refuse a Kelvin value below zero with an error."
+# The labeller's answer as the GitHub ticket read names its author: the stub
+# labeller's login. The transcript's publishing session cites it.
+ANSWER_AUTHOR = "octocat"
+PUBLISH_TOOL = "mcp__curie__publish_changes"
+
+
+def answer_citation(author: str) -> str:
+    """The Decisions line citing the labeller's answer, by the author the lane's
+    ticket read shows. The dark factory's reproduction gate refuses a
+    publication without one once the ticket carries the factory's questions."""
+
+    return f"Answered on the ticket by {author}: {ANSWER_TEXT}"
+
+
+def publication_bodies(exchanges: list[dict[str, Any]]) -> list[str]:
+    """Every ``publish_changes`` body the transcript's model sends."""
+
+    return [
+        block["input"]["body"]
+        for exchange in exchanges
+        for block in (exchange.get("message") or {}).get("content") or []
+        if block.get("type") == "tool_use" and block.get("name") == PUBLISH_TOOL
+    ]
 
 
 class OneTicketError(RuntimeError):
