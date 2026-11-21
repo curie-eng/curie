@@ -89,6 +89,8 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _start_running,
 )
 
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
+
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
@@ -1506,7 +1508,13 @@ def test_start_failed_result_section_uses_the_detail_as_the_sentence() -> None:
     detail = (
         "the sandbox did not start after 5 attempts. Last reason: not_started:classified_failure."
     )
-    body = result_section("start_failed", pr_url=None, detail=detail)
+    body = result_section(
+        "start_failed",
+        pr_url=None,
+        detail=detail,
+        workspace_recovery_enabled=False,
+        work_item_id=_WORK_ITEM_ID,
+    )
     assert body.startswith(f"{START_FAILED_SENTENCE}\n")
     assert "Cause: start_failed" in body
     assert "Provider message:" not in body
