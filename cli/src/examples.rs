@@ -854,7 +854,10 @@ pub fn install_curie_skills(
         (
             "environment",
             "factory-environment-setup",
-            &["a828913e1486f3dd8d7409f4a6f551c5e7d386230c3f8198b8f447ca3f753d6e"][..],
+            &[
+                "a828913e1486f3dd8d7409f4a6f551c5e7d386230c3f8198b8f447ca3f753d6e",
+                "8ac17b7cd4b4e680da68e5c991a704a9b93b7c843f551d4ed6193d632cb762f0",
+            ][..],
         ),
         (
             "environment",

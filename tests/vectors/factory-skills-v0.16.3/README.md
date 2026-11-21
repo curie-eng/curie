@@ -1,6 +1,7 @@
-# Released v0.16.3 review skill
+# Released v0.16.3 factory skills
 
-This directory holds the exact `review-pr` skill files shipped in the v0.16.3
-release. Keep their bytes unchanged: the upgrade process test installs this
-version and checks that the current CLI recognizes its directory digest. This is
-a compatibility fixture, not a prompt wording assertion.
+These four directories hold the exact public skill files shipped in the v0.16.3
+release. Keep their bytes unchanged: the upgrade process tests install this
+version and check that the current CLI recognizes every directory digest, so an
+untouched v0.16.3 install upgrades cleanly. This is a compatibility fixture, not
+a prompt wording assertion.

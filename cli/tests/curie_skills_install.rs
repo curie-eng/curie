@@ -340,6 +340,58 @@ fn edited_v0_16_3_review_skill_still_refuses_the_whole_set() {
     }
 }
 
+/// The class guard: every skill the CLI ships must either equal its v0.16.3
+/// release or have that release's digest registered, so an untouched install of
+/// any released skill upgrades. A skill edited without registering the prior
+/// digest makes the whole set refuse here, naming the conflicting skill.
+#[test]
+fn every_shipped_skill_upgrades_from_its_v0_16_3_release() {
+    let f = Fixture::new();
+    let root = f.project.join(".agents/skills");
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/vectors/factory-skills-v0.16.3");
+    let mut changed = Vec::new();
+    for (skill, files) in SKILLS {
+        for (name, current_bytes) in files {
+            let released = fs::read(fixtures.join(skill).join(name))
+                .unwrap_or_else(|_| panic!("v0.16.3 fixture is missing {skill}/{name}"));
+            if released != *current_bytes && !changed.contains(&skill) {
+                changed.push(skill);
+            }
+            let path = root.join(skill).join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, released).unwrap();
+        }
+        assert_eq!(
+            files_under(&fixtures.join(skill)).len(),
+            files.len(),
+            "{skill} fixture holds exactly the released files the CLI ships"
+        );
+    }
+    let before = files_under(&f.project);
+    let plan = success(&f.run(&["--agent", "codex", "--dry-run"]));
+    assert_eq!(files_under(&f.project), before, "dry run is read only");
+    let upgrades = plan["plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|line| line.as_str().unwrap().contains("Upgrade unmodified skill"))
+        .count();
+    assert_eq!(upgrades, changed.len(), "{changed:?}");
+
+    let result = success(&f.run(&["--agent", "codex"]));
+    for receipt in result["skills"].as_array().unwrap() {
+        let skill = receipt["skill"].as_str().unwrap();
+        let expected = if changed.contains(&skill) {
+            "upgraded"
+        } else {
+            "unchanged"
+        };
+        assert_eq!(receipt["status"], expected, "{skill}");
+    }
+    installed(&f.project, ".agents/skills");
+}
+
 #[test]
 fn conflict_in_either_skill_prevents_any_new_sibling_writes() {
     for (conflicting, _) in SKILLS {
