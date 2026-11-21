@@ -276,13 +276,14 @@ with urllib.request.urlopen(request,timeout=30) as response:
         values_path.write_text(yaml.safe_dump(values))
         since = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         if entry == "upgrade":
+            # The baseline predates contract revisions, so both entry points go forward only.
             result = cli(binary, namespace, release, chart, "upgrade", "--to", version,
-                         "--values-file", values_path, "--yes", timeout=900)
+                         "--values-file", values_path, "--forward-only", "--yes", timeout=900)
             body = json.loads(result.stdout)
             require(body["status"] == "succeeded" and body["canary"]["passed"], "upgrade did not pass its canary")
         else:
             cli(binary, namespace, release, chart, "up", "--fake-model", "--no-expose",
-                "--values-file", values_path, timeout=900)
+                "--values-file", values_path, "--forward-only", timeout=900)
         retained = snapshot(namespace, fullname)
         for kind in ("credentials", "pvcs"):
             changed = [key for key, value in before[kind].items() if retained[kind].get(key) != value]

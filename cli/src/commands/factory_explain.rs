@@ -14,6 +14,9 @@ use crate::ui::{CliOutput, Ui};
 /// A line that is exactly this ends the Decisions section, as the next `## ` heading
 /// does. The platform writes it before the lines it adds after the agent's text.
 const SECTION_END: &str = "---";
+/// A line citing an answer given on the ticket. It is not a numbered decision, so
+/// it does not count toward the seven. It needs a nonblank author after the prefix.
+const CITATION_PREFIX: &str = "Answered on the ticket by ";
 const NONE_LINE: &str = "None: the change follows directly from the acceptance criteria.";
 const MAX_ENTRIES: usize = 7;
 const MAX_PAGES: usize = 10;
@@ -602,15 +605,25 @@ pub(crate) fn parse_decisions(body: &str) -> DecisionsParse {
     if section_characters > MAX_SECTION_CHARACTERS {
         return DecisionsParse::Unparsed(section);
     }
-    let content: Vec<&str> = section
+    let nonblank: Vec<&str> = section
         .iter()
         .map(String::as_str)
         .filter(|line| !blank(line))
         .collect();
+    let citations = nonblank.iter().filter(|line| is_citation(line)).count();
+    let content: Vec<&str> = nonblank
+        .into_iter()
+        .filter(|line| !is_citation(line))
+        .collect();
+    // A section of citations alone records no numbered decision, as a None
+    // declaration does. The None declaration is the sole content or it is nothing.
+    if content.is_empty() && citations > 0 {
+        return DecisionsParse::None;
+    }
     if content.is_empty() {
         return DecisionsParse::Unparsed(section);
     }
-    if content.len() == 1 && content[0] == NONE_LINE {
+    if content.len() == 1 && content[0] == NONE_LINE && citations == 0 {
         return DecisionsParse::None;
     }
     if content.iter().any(|line| line.starts_with("None:")) {
@@ -632,6 +645,11 @@ pub(crate) fn parse_decisions(body: &str) -> DecisionsParse {
         return DecisionsParse::Unparsed(section);
     }
     DecisionsParse::Recorded(entries)
+}
+
+fn is_citation(line: &str) -> bool {
+    line.strip_prefix(CITATION_PREFIX)
+        .is_some_and(|author| !blank(author))
 }
 
 fn normalized_lines(body: &str) -> Vec<String> {

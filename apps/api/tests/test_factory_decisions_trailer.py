@@ -65,6 +65,23 @@ ASK_INSIDE = (
 # producer must keep its trailing space, or it becomes an exact break.
 EXISTING_BREAK_LAST = f"{SUMMARY}## Decisions\n\n{TWO}\n\n---\n\nPlan review: APPROVE.\n\n--- "
 REVIEWS_LAST = f"{SUMMARY}## Decisions\n\n{TWO}\n\n## Reviews\n\nPlan review: APPROVE.\n\n--- "
+# A ticket that carried questions: the agent cites each answer it relied on, one line
+# each, beside its numbered decisions. The citation is not a numbered decision.
+CITED_ONE = "Answered on the ticket by maintainer: use the shared grammar."
+CITED_TWO = "Answered on the ticket by reviewer: keep the parser pure."
+ANSWERED = f"{SUMMARY}## Decisions\n\n{TWO}\n{CITED_ONE}\n{CITED_TWO}\n"
+# Every decision was answered on the ticket, so the section holds only citations.
+ANSWERED_ONLY = f"{SUMMARY}## Decisions\n\n{CITED_ONE}\n"
+# A citation below the break line is not in the section. Here it is the only thing
+# after the heading, so the section is empty and malformed.
+CITED_BELOW_BREAK = f"{SUMMARY}## Decisions\n\n---\n\n{CITED_ONE}\n"
+# A citation line with nothing after the prefix names no author. It is not a
+# citation, so it is read as a numbered entry and rejected.
+CITED_NO_AUTHOR = f"{SUMMARY}## Decisions\n\n{TWO}\nAnswered on the ticket by \n"
+CITED_NO_AUTHOR_BLANK = f"{SUMMARY}## Decisions\n\n{TWO}\nAnswered on the ticket by    \n"
+CITED_NO_SPACE = f"{SUMMARY}## Decisions\n\n{TWO}\nAnswered on the ticket by\n"
+# The None declaration is the section's sole content; a citation beside it is not.
+CITED_BESIDE_NONE = f"{SUMMARY}## Decisions\n\n{NONE}\n{CITED_ONE}\n"
 
 
 def _producer_cases() -> list[dict[str, Any]]:
@@ -116,6 +133,41 @@ def _producer_cases() -> list[dict[str, Any]]:
             "id": "reviews-last-keeps-the-trailing-space-line",
             "agent_body": REVIEWS_LAST,
             "published_body": append_github_ask_line(REVIEWS_LAST, MENTION),
+        },
+        {
+            "id": "answered-citations-beside-entries",
+            "agent_body": ANSWERED,
+            "published_body": append_github_ask_line(ANSWERED, MENTION),
+        },
+        {
+            "id": "answered-citation-only",
+            "agent_body": ANSWERED_ONLY,
+            "published_body": append_github_ask_line(ANSWERED_ONLY, MENTION),
+        },
+        {
+            "id": "citation-below-break-line-is-not-in-the-section",
+            "agent_body": CITED_BELOW_BREAK,
+            "published_body": append_github_ask_line(CITED_BELOW_BREAK, MENTION),
+        },
+        {
+            "id": "citation-with-no-author-stays-malformed",
+            "agent_body": CITED_NO_AUTHOR,
+            "published_body": append_github_ask_line(CITED_NO_AUTHOR, MENTION),
+        },
+        {
+            "id": "citation-with-blank-author-stays-malformed",
+            "agent_body": CITED_NO_AUTHOR_BLANK,
+            "published_body": append_github_ask_line(CITED_NO_AUTHOR_BLANK, MENTION),
+        },
+        {
+            "id": "citation-prefix-without-its-space-stays-malformed",
+            "agent_body": CITED_NO_SPACE,
+            "published_body": append_github_ask_line(CITED_NO_SPACE, MENTION),
+        },
+        {
+            "id": "citation-beside-none-declaration-stays-malformed",
+            "agent_body": CITED_BESIDE_NONE,
+            "published_body": append_github_ask_line(CITED_BESIDE_NONE, MENTION),
         },
     ]
 
