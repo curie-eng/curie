@@ -7,3 +7,4 @@ Add `r` (Rankine) to the temperature units accepted by `unitconv`.
 3. Preserve the existing conversions, including identity conversions.
 4. Add regression tests in `unitconv/tests/test_convert.py` for the new directions and Rankine identity.
 5. `python3 -m unittest discover -s unitconv/tests -v` passes.
+6. `python -m unitconv` prints every result with a fixed number of places after the point, replacing its current `.4g` format. How many places is a maintainer's choice this ticket does not make.

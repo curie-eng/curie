@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -1532,7 +1533,15 @@ def test_fixture_texts_equal_the_judges_constants() -> None:
     assert (FIXTURES / "requester-instructions.md").read_text().strip() == (
         "Use `assertEqual` for every assertion."
     )
-    assert "decimal" not in (FIXTURES / "issue-a.md").read_text().lower()
+    ticket_a = (FIXTURES / "issue-a.md").read_text()
+    assert "decimal" not in ticket_a.lower()
+    # The one missing decision is explicit: the ticket replaces the fixture CLI's
+    # own format, so the repository cannot settle it, and names no count.
+    cli = (FIXTURES.parent / "unitconv" / "unitconv" / "__main__.py").read_text()
+    assert 'print(f"{result:.4g}")' in cli
+    [open_line] = [line for line in ticket_a.splitlines() if "places" in line]
+    assert "`.4g`" in open_line and "not make" in open_line
+    assert not re.search(r"\d", open_line.replace("`.4g`", "").split(".", 1)[1])
 
 
 # --- Sanitizer ---------------------------------------------------------------------
