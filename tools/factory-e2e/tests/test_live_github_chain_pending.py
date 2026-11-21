@@ -1,17 +1,22 @@
-"""Routes the live chain needs that are still in open pull requests (#5808).
+"""Routes the live chain needs, first copied from open pull requests (#5808).
 
-Each fixture under ``fixtures/live-github-chain/pending/`` is copied from a
+Each fixture under ``fixtures/live-github-chain/pending/`` was copied from a
 pull request head. The handoff tests feed it through the driver's builder into
-the judge. The parity tests compare it with the product once that pull request
-has merged, and skip with ``pending #NNNN`` until then. Every test name carries
-``pending`` so the coordinator can rerun exactly these after a merge.
+the judge. The parity tests compare it with the product. Every pull request
+they waited on has merged into the integration branch, so none of them skips
+any more: a product change that drifts from a fixture or from the judge's
+assumed constant fails here. Every test name keeps ``pending`` so the
+coordinator can rerun exactly these.
 """
 
 from __future__ import annotations
 
 import copy
+import io
 import json
 import re
+import shutil
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -123,18 +128,12 @@ def test_pending_5852_accept_output_feeds_beat_e_into_the_judge() -> None:
 
 def test_pending_5852_vector_matches_the_product() -> None:
     product = REPO_ROOT / "tests" / "vectors" / "memory-rules-responses.json"
-    if not product.exists():
-        pytest.skip(
-            "pending #5852: tests/vectors/memory-rules-responses.json is not on this checkout"
-        )
     assert _load(product) == _load(RULES_VECTOR)
 
 
 def test_pending_5852_refusal_codes_match_the_product() -> None:
     source = REPO_ROOT / "apps" / "api" / "src" / "curie_api" / "routers" / "memory_rules.py"
-    text = source.read_text() if source.exists() else ""
-    if "write_access_required" not in text:
-        pytest.skip("pending #5852: the memory_rules refusal codes are not on this checkout")
+    text = source.read_text()
     for code in judge.READER_REFUSAL_CODES:
         assert f'"{code.split(".", 1)[1]}"' in text, code
 
@@ -204,8 +203,7 @@ def test_pending_5857_recorded_propose_rule_call_becomes_a_tool_note_the_judge_r
 def test_pending_5857_overrides_schema_matches_the_product() -> None:
     schema = _load(REPO_ROOT / "cli" / "schema" / "overrides.schema.json")
     fixture = _load(OVERRIDES)
-    if schema["$id"] != fixture["schema_id"]:
-        pytest.skip(f"pending #5857: overrides schema is {schema['$id']} on this checkout")
+    assert schema["$id"] == fixture["schema_id"]
     result = next(entry for entry in schema["oneOf"] if "required" in entry)
     assert result["required"] == fixture["required"]
     assert set(fixture["output"]) == set(result["properties"])
@@ -214,8 +212,7 @@ def test_pending_5857_overrides_schema_matches_the_product() -> None:
 def test_pending_5857_propose_rule_tool_name_matches_the_runner() -> None:
     source = (REPO_ROOT / "runner" / "src" / "curie_runner" / "tool_names.py").read_text()
     found = re.search(r'^PROPOSE_RULE_TOOL(?:: Final)? = "([^"]+)"', source, re.MULTILINE)
-    if found is None:
-        pytest.skip("pending #5857: runner tool_names.PROPOSE_RULE_TOOL is not on this checkout")
+    assert found is not None, "runner tool_names.PROPOSE_RULE_TOOL is gone"
     assert found.group(1) == _load(OVERRIDES)["propose_rule_tool"] == judge.PROPOSE_RULE_TOOL
 
 
@@ -261,11 +258,9 @@ def test_pending_5859_absent_rules_feed_beat_g() -> None:
 
 
 def test_pending_5859_learned_line_and_metadata_match_the_product() -> None:
-    try:
-        from curie_api import memory_rules_context as context
-        from curie_api.schemas.workitems import MemoryRulesMetadata  # type: ignore[attr-defined]
-    except ImportError:
-        pytest.skip("pending #5859: curie_api.memory_rules_context is not on this checkout")
+    from curie_api import memory_rules_context as context
+    from curie_api.schemas.workitems import MemoryRulesMetadata
+
     fixture = _load(WORK_ITEM_RULES)
     applied = context.AppliedRules(rule_numbers=(1,), sha256=fixture["selected"]["sha256"])
     assert context.applied_line(applied) == fixture["applied_line"]
@@ -276,15 +271,79 @@ def test_pending_5859_learned_line_and_metadata_match_the_product() -> None:
 
 
 # --------------------------------------------------------------------------
-# #5804: the retired result declaration refusal (no open pull request yet)
+# #5804: the retired result declaration refusal
 # --------------------------------------------------------------------------
 
 
-def test_pending_5804_retired_code_matches_the_product() -> None:
-    sources = (REPO_ROOT / "apps" / "api" / "src" / "curie_api").rglob("*.py")
-    if not any(judge.BUNDLE_RETIRED_CODE in path.read_text() for path in sources):
-        pytest.skip(f"pending #5804: {judge.BUNDLE_RETIRED_CODE} is not on this checkout")
-    assert judge.BUNDLE_RETIRED_CODE == "bundle.result_declaration_retired"
+class _Deployed:
+    """The two Preflight fields ``retired_bundle_copy`` reads."""
+
+    def __init__(self, deployed_bundle: Path | None, workdir: Path) -> None:
+        self.deployed_bundle = deployed_bundle
+        self.workdir = workdir
+
+
+def _tar_gz(root: Path) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path in sorted(root.rglob("*")):
+            archive.add(path, arcname=str(path.relative_to(root)), recursive=False)
+    return buffer.getvalue()
+
+
+def _upload_refusal(bundle: Path) -> tuple[int, str]:
+    """The bundle through the upload route's own validation, as the CLI renders it.
+
+    ``deploy.validate_archive`` is what ``PUT /agents/{id}/versions/{id}/bundle``
+    (``routers/bundles.py`` ``upload_bundle``) runs before it stores anything;
+    a refusal becomes that route's 422 body, which the CLI's ``expect_ok``
+    carries inside its ``{"error", "fix"}`` envelope with exit 1.
+    """
+
+    from curie_api import deploy
+    from curie_api.config import Settings
+
+    try:
+        deploy.validate_archive(_tar_gz(bundle), Settings())
+    except deploy.BundleInvalid as exc:
+        body = {"detail": {"detail": "bundle failed validation", "errors": exc.errors}}
+        error = f"bundle upload failed with 422 Unprocessable Entity: {json.dumps(body)}"
+        return 1, json.dumps({"error": error, "fix": "Fix the bundle and deploy again."})
+    return 0, json.dumps({"deployed": True})
+
+
+def _retired_h(deploy_result: tuple[int, str]) -> dict[str, Any]:
+    h = PASSING["beat_h"]
+    retired = h["retired_bundle"]
+    return lgc.beat_h_record(
+        label=h["label"],
+        observed_at=h["observed_at"],
+        work_items=h["work_items"],
+        comments=h["comments"],
+        events=h["label_events"],
+        deploy=deploy_result,
+        version_before=retired["version_before"],
+        version_after=retired["version_after"],
+    )
+
+
+def test_pending_5804_the_products_retired_refusal_feeds_beat_h(tmp_path: Path) -> None:
+    # The driver's own retired copy of the default bundle, through the API's
+    # upload validation, into the driver's record and the judge.
+    deployed = tmp_path / "deployed"
+    shutil.copytree(REPO_ROOT / "examples" / "dark-factory", deployed)
+    retired = lgc.retired_bundle_copy(_Deployed(deployed, tmp_path))  # type: ignore[arg-type]
+    refusal = _upload_refusal(retired)
+    assert refusal[0] == 1
+    section = _retired_h(refusal)
+    assert judge.BUNDLE_RETIRED_CODE in judge.deploy_refusal_codes(
+        section["retired_bundle"]["output"]
+    )
+    assert judge.judge_beat("beat_h", _record_with("beat_h", section)).passed
+    # Counterexample: the same bundle without the file is not refused for it.
+    clean = _upload_refusal(deployed)
+    refused = judge.judge_beat("beat_h", _record_with("beat_h", _retired_h(clean)))
+    assert f"the deploy refusal is not {judge.BUNDLE_RETIRED_CODE}" in refused.reasons
 
 
 # --------------------------------------------------------------------------
@@ -312,9 +371,46 @@ def test_pending_notice_assertions_match_the_api_tests(notice: str) -> None:
     path, _, name = entry["source"].partition("::")
     source = _function_source(REPO_ROOT / path, name)
     missing = [line for line in entry["asserted_lines"] if line not in source]
-    if not source or missing:
-        pytest.skip(
-            f"pending a re-copy: {entry['source']} no longer asserts {missing or 'anything'}; "
-            "refresh fixtures/live-github-chain/notices/api-asserted-posts.json"
-        )
-    assert not missing
+    assert source and not missing, (
+        f"{entry['source']} no longer asserts {missing or 'anything'}; re-copy "
+        "fixtures/live-github-chain/notices/api-asserted-posts.json"
+    )
+
+
+# --------------------------------------------------------------------------
+# #5794 (merged as #5869): the review keyed request id and the source URL
+# --------------------------------------------------------------------------
+
+
+def test_pending_5794_review_request_id_matches_the_product() -> None:
+    # The judge's beat (c) key against the producer the admission path calls.
+    from curie_api.forges.github.review_snapshot import event_request_id, review_request_id
+
+    c = PASSING["beat_c"]
+    repository_id = PASSING["identities"]["repository_id"]
+    pull, review = c["pull_number"], c["review"]["id"]
+    assert judge.revision_request_id(repository_id, pull, review) == str(
+        review_request_id(int(repository_id), int(pull), int(review))
+    )
+    # Counterexample: the per-event key the product used before #5794.
+    old = event_request_id(int(repository_id), "pull_request_review", int(review))
+    assert judge.revision_request_id(repository_id, pull, review) != str(old)
+
+
+def test_pending_5794_review_source_url_matches_the_product() -> None:
+    # The URL admission stores for a review keyed request, which the rule's
+    # source_url carries: the product's builder, with the fragment the
+    # admission path passes it.
+    from curie_api.factory_reply_target import feedback_url
+
+    admission = REPO_ROOT / "apps" / "api" / "src" / "curie_api" / "github_factory_review.py"
+    source = _function_source(admission, "admit_parsed_feedback")
+    assert 'f"pullrequestreview-{review.id}"' in source
+    c = PASSING["beat_c"]
+    base, path = "https://github.com", "example-org/unitconv"
+    pull, review = c["pull_number"], c["review"]["id"]
+    product = feedback_url(base, path, int(pull), f"pullrequestreview-{review}")
+    assert judge.review_url(f"{base}/{path}", pull, review) == product
+    # Counterexample: the inline comment's URL is not the review's.
+    comment = feedback_url(base, path, int(pull), f"discussion_r{review}")
+    assert judge.review_url(f"{base}/{path}", pull, review) != comment
