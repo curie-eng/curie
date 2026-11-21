@@ -46,7 +46,11 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..factory_comment_text import append_github_ask_line, end_trailing_decisions
+from ..factory_comment_text import (
+    append_github_ask_line,
+    end_trailing_decisions,
+    without_trailing_blank_lines,
+)
 from ..factory_rediscovery import issue_marker, publishing_code_host
 from ..forges.config import RepositoryBindingConfig
 from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
@@ -630,7 +634,7 @@ async def create_publication(
             body = data.body or ""
             missing = [statement for statement in statements if statement not in body]
             if missing:
-                body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
+                body = f"{without_trailing_blank_lines(body)}\n\n{'\n'.join(missing)}"
                 data = data.model_copy(update={"body": body})
         # Every factory pull request body references its ticket (#4358 plan D7),
         # in the tracker's own form; a body that already carries it is kept.
@@ -644,7 +648,7 @@ async def create_publication(
                 body = f"{body}\n\n{reference}" if body else reference
             marker = issue_marker(issue)
             if marker not in (line.strip() for line in body.splitlines()):
-                body = f"{body.rstrip()}\n\n{marker}"
+                body = f"{without_trailing_blank_lines(body)}\n\n{marker}"
             if body != data.body:
                 data = data.model_copy(update={"body": body})
         # The ask line sits immediately before the ADR 0278 evidence line, which

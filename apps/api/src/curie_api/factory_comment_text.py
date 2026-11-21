@@ -31,6 +31,34 @@ _DECISIONS_HEADING = "## Decisions"
 DECISIONS_SECTION_END = "---"
 
 
+def without_trailing_blank_lines(body: str) -> str:
+    """The body with the blank lines after its last text removed.
+
+    Unlike ``rstrip()`` it keeps the spaces at the end of that last line: they are
+    the agent's own, and trimming them could turn a malformed ``--- `` line into
+    the exact ``---`` that ends a Decisions section.
+    """
+
+    stripped = body.rstrip()
+    spaces = re.match(r"[^\S\r\n]*", body[len(stripped) :])
+    return stripped + (spaces[0] if spaces else "")
+
+
+def _decisions_lines(lines: list[str]) -> set[int]:
+    """The indexes of the lines inside a Decisions section, as the grammar reads it."""
+
+    inside: set[int] = set()
+    open_section = False
+    for index, line in enumerate(lines):
+        if line == _DECISIONS_HEADING:
+            open_section = True
+        elif open_section and (line.startswith("## ") or line == DECISIONS_SECTION_END):
+            open_section = False
+        elif open_section:
+            inside.add(index)
+    return inside
+
+
 def end_trailing_decisions(body: str) -> str:
     """The body with its trailing Decisions section closed off from platform text.
 
@@ -48,10 +76,7 @@ def end_trailing_decisions(body: str) -> str:
     for line in lines[headings[-1] + 1 :]:
         if line.startswith("## ") or line == DECISIONS_SECTION_END:
             return body
-    # Only newlines come off: trailing spaces on the agent's last line are its own,
-    # and trimming them could turn a malformed `--- ` line into the break.
-    text = body.rstrip("\r\n")
-    closed = f"{text}\n\n{DECISIONS_SECTION_END}"
+    closed = f"{without_trailing_blank_lines(body)}\n\n{DECISIONS_SECTION_END}"
     return f"{closed}\n" if body.endswith("\n") else closed
 
 
@@ -59,19 +84,23 @@ def append_github_ask_line(body: str, mention: str) -> str:
     """Put that line last, dropping every earlier ask line, whatever its wording.
 
     A trailing Decisions section is closed off first (`end_trailing_decisions`),
-    so the line never becomes part of it.
+    so the line never becomes part of it. A line inside a Decisions section is the
+    agent's text, not an earlier ask line: it stays, so the section reads as the
+    agent wrote it and a malformed one is never made valid by dropping that line.
     """
 
     line = github_ask_line(mention)
+    lines = body.splitlines()
+    protected = _decisions_lines(lines)
     kept: list[str] = []
-    for part in body.splitlines():
-        if part.strip().startswith(_ASK_PREFIX):
+    for index, part in enumerate(lines):
+        if index not in protected and part.strip().startswith(_ASK_PREFIX):
             # Take the blank line that separated it too, so no gap is left behind.
             if kept and not kept[-1].strip():
                 kept.pop()
             continue
         kept.append(part)
-    text = end_trailing_decisions("\n".join(kept)).rstrip()
+    text = without_trailing_blank_lines(end_trailing_decisions("\n".join(kept)))
     text = f"{text}\n\n{line}" if text else line
     if body.endswith("\n"):
         text += "\n"

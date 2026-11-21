@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +56,15 @@ MALFORMED = f"{SUMMARY}## Decisions\n\n1. Keep the parser pure.\n"
 # the producer must not trim its trailing space into the break.
 NEAR_BREAK = f"{SUMMARY}## Decisions\n\n{TWO}\n--- \n"
 BEFORE_HEADING = f"{SUMMARY}## Decisions\n\n{TWO}\n\n## Reviews\n\nPlan review: APPROVE.\n"
-LEGACY = f"{LAST}\n{github_ask_line('old-mention')}\n"
+# An agent-written line that starts like the platform's ask line, inside the section.
+# It is the agent's text: dropping it would turn this malformed section into `None`.
+ASK_INSIDE = (
+    f"{SUMMARY}## Decisions\n\n{NONE}\nAsk the factory: this is invalid content inside Decisions.\n"
+)
+# Valid Decisions, then a last line that is a near miss of the break line. The
+# producer must keep its trailing space, or it becomes an exact break.
+EXISTING_BREAK_LAST = f"{SUMMARY}## Decisions\n\n{TWO}\n\n---\n\nPlan review: APPROVE.\n\n--- "
+REVIEWS_LAST = f"{SUMMARY}## Decisions\n\n{TWO}\n\n## Reviews\n\nPlan review: APPROVE.\n\n--- "
 
 
 def _producer_cases() -> list[dict[str, Any]]:
@@ -72,11 +81,6 @@ def _producer_cases() -> list[dict[str, Any]]:
             "id": "reappended-published-body",
             "agent_body": LAST,
             "published_body": append_github_ask_line(once, MENTION),
-        },
-        {
-            "id": "legacy-published-body-without-a-break",
-            "agent_body": LAST,
-            "published_body": append_github_ask_line(LEGACY, MENTION),
         },
         {
             "id": "decisions-before-a-heading-is-untouched",
@@ -96,16 +100,51 @@ def _producer_cases() -> list[dict[str, Any]]:
             "agent_body": NEAR_BREAK,
             "published_body": append_github_ask_line(NEAR_BREAK, MENTION),
         },
+        {
+            # Named counterexample: dropping the agent's own ask-like line must not
+            # turn this malformed section into a valid `None` declaration.
+            "id": "ask-line-inside-decisions-stays-malformed",
+            "agent_body": ASK_INSIDE,
+            "published_body": append_github_ask_line(ASK_INSIDE, MENTION),
+        },
+        {
+            "id": "existing-break-keeps-the-trailing-space-line",
+            "agent_body": EXISTING_BREAK_LAST,
+            "published_body": append_github_ask_line(EXISTING_BREAK_LAST, MENTION),
+        },
+        {
+            "id": "reviews-last-keeps-the-trailing-space-line",
+            "agent_body": REVIEWS_LAST,
+            "published_body": append_github_ask_line(REVIEWS_LAST, MENTION),
+        },
     ]
 
 
-# The bodies the publications route is asked to publish. Their published text comes
-# from the route itself (the closing reference, issue marker and ask line it adds),
-# with the per-run issue number and marker replaced by fixed text.
-ROUTE_BODIES = {
-    "route-decisions-last": LAST,
-    "route-malformed-decisions-last": MALFORMED,
-    "route-near-break-line-last-stays-malformed": NEAR_BREAK,
+# The bodies the publications route is asked to publish, each built from the issue
+# number and marker the route will see. Their published text comes from the route
+# itself (the closing reference, issue marker and ask line it adds), with the
+# per-run issue number and marker replaced by fixed text.
+def _footer(issue: int, marker: str) -> str:
+    return f"Closes #{issue}\n\n{marker}"
+
+
+ROUTE_BODIES: dict[str, Callable[[int, str], str]] = {
+    "route-decisions-last": lambda issue, marker: LAST,
+    "route-malformed-decisions-last": lambda issue, marker: MALFORMED,
+    "route-near-break-line-last-stays-malformed": lambda issue, marker: NEAR_BREAK,
+    "route-ask-line-inside-decisions-stays-malformed": lambda issue, marker: ASK_INSIDE,
+    "route-existing-break-keeps-the-trailing-space-line": lambda issue, marker: (
+        f"{SUMMARY}## Decisions\n\n{TWO}\n\n---\n\n{_footer(issue, marker)}\n\n--- "
+    ),
+    "route-reviews-last-keeps-the-trailing-space-line": lambda issue, marker: (
+        f"{SUMMARY}## Decisions\n\n{TWO}\n\n## Reviews\n\nPlan review: APPROVE.\n\n"
+        f"{_footer(issue, marker)}\n\n--- "
+    ),
+}
+# Exact `---` lines the route's output must hold: the agent's own, no more.
+ROUTE_BREAKS = {
+    "route-existing-break-keeps-the-trailing-space-line": 1,
+    "route-reviews-last-keeps-the-trailing-space-line": 0,
 }
 FIXED_MARKER = "<!-- curie-issue kind=github host=github.com scope=1 issue=1 -->"
 
@@ -159,7 +198,7 @@ def test_published_body_keeps_the_entries_the_agent_wrote(case: dict[str, Any]) 
             parse_decisions_section(published)
         return
     assert parse_decisions_section(published) == before
-    assert sum(line.startswith("Ask the factory:") for line in published.splitlines()) == 1
+    assert published.splitlines().count(github_ask_line(MENTION)) == 1
 
 
 def test_a_trailing_section_is_closed_by_exactly_the_text_all_readers_use() -> None:
@@ -185,12 +224,24 @@ def test_a_citation_below_the_break_line_is_not_in_the_section() -> None:
     assert not reproduction_gate.cited(below)
 
 
+@pytest.mark.parametrize(
+    ("agent_body", "breaks"),
+    [(EXISTING_BREAK_LAST, 1), (REVIEWS_LAST, 0)],
+    ids=["existing", "none"],
+)
+def test_the_agents_last_line_keeps_its_trailing_space(agent_body: str, breaks: int) -> None:
+    published = append_github_ask_line(agent_body, MENTION)
+    lines = published.splitlines()
+    assert "--- " in lines
+    assert lines.count(DECISIONS_SECTION_END) == breaks
+
+
 @pytest.mark.parametrize("case", _producer_cases(), ids=lambda case: case["id"])
 def test_reappending_is_idempotent(case: dict[str, Any]) -> None:
     once = append_github_ask_line(case["published_body"], MENTION)
     twice = append_github_ask_line(once, MENTION)
     assert twice == once
-    assert once.count("Ask the factory:") == 1
+    assert once.splitlines().count(github_ask_line(MENTION)) == 1
     assert once.splitlines().count(DECISIONS_SECTION_END) <= 1
 
 
@@ -201,7 +252,9 @@ def test_the_route_publishes_the_fixture_body_byte_for_byte(
 ) -> None:
     """The body the production route stores is what the Rust parser reads."""
     client, request_id, payload = _factory_publication_case
-    agent_body = ROUTE_BODIES[case_id]
+    issue = int(payload["reply_conversation_id"].removeprefix("issue-"))
+    marker = _factory_issue_marker(request_id)
+    agent_body = ROUTE_BODIES[case_id](issue, marker)
     recorded = _record_factory_verification(client, request_id, outcome="passed")
     assert recorded.status_code == 201, recorded.text
     created = _post_factory_publication(client, {**payload, "body": agent_body})
@@ -209,15 +262,19 @@ def test_the_route_publishes_the_fixture_body_byte_for_byte(
     published = str(created.json()["body"])
 
     lines = published.splitlines()
-    # The route added its closing reference, issue marker and ask line.
-    issue = int(payload["reply_conversation_id"].removeprefix("issue-"))
+    # The published body holds the closing reference, issue marker and ask line.
     assert f"Closes #{issue}" in lines
-    marker = _factory_issue_marker(request_id)
     assert marker in lines
-    assert sum(line.startswith("Ask the factory:") for line in lines) == 1
-    normalized = published.replace(f"Closes #{issue}", "Closes #1").replace(marker, FIXED_MARKER)
+    assert github_ask_line("curie") in lines
+    if case_id in ROUTE_BREAKS:
+        assert lines.count(DECISIONS_SECTION_END) == ROUTE_BREAKS[case_id]
+        # The agent's last line keeps its trailing space.
+        assert "--- " in lines
 
-    entry = _entry(case_id, agent_body, normalized)
+    def fixed(text: str) -> str:
+        return text.replace(f"Closes #{issue}", "Closes #1").replace(marker, FIXED_MARKER)
+
+    entry = _entry(case_id, fixed(agent_body), fixed(published))
     if entry["valid"]:
         assert parse_decisions_section(published) == entry["entries"]
     else:
