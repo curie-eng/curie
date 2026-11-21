@@ -147,6 +147,72 @@
           "evidence": "the vector test covers both"
         }
       ]
+    },
+    {
+      "id": "answered-citations-beside-entries",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\nAnswered on the ticket by maintainer: use the shared grammar.\nAnswered on the ticket by reviewer: keep the parser pure.\n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\nAnswered on the ticket by maintainer: use the shared grammar.\nAnswered on the ticket by reviewer: keep the parser pure.\n\n---\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie-factory.\n",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the parser pure",
+          "rejected": "a cached parser",
+          "reason": "the input is small",
+          "source": "plan",
+          "evidence": "the plan review approved it"
+        },
+        {
+          "n": 2,
+          "choice": "Reuse the shared grammar",
+          "rejected": "a second grammar",
+          "reason": "two would drift",
+          "source": "diff review",
+          "evidence": "the vector test covers both"
+        }
+      ]
+    },
+    {
+      "id": "answered-citation-only",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\nAnswered on the ticket by maintainer: use the shared grammar.\n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\nAnswered on the ticket by maintainer: use the shared grammar.\n\n---\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie-factory.\n",
+      "valid": true,
+      "entries": []
+    },
+    {
+      "id": "citation-below-break-line-is-not-in-the-section",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n---\n\nAnswered on the ticket by maintainer: use the shared grammar.\n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n---\n\nAnswered on the ticket by maintainer: use the shared grammar.\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie-factory.\n",
+      "valid": false,
+      "entries": []
+    },
+    {
+      "id": "citation-with-no-author-stays-malformed",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\nAnswered on the ticket by \n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\nAnswered on the ticket by \n\n---\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie-factory.\n",
+      "valid": false,
+      "entries": []
+    },
+    {
+      "id": "citation-with-blank-author-stays-malformed",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\nAnswered on the ticket by    \n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\nAnswered on the ticket by    \n\n---\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie-factory.\n",
+      "valid": false,
+      "entries": []
+    },
+    {
+      "id": "citation-prefix-without-its-space-stays-malformed",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\nAnswered on the ticket by\n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\n1. Keep the parser pure. Rejected: a cached parser, because the input is small. (plan) Evidence: the plan review approved it.\n2. Reuse the shared grammar. Rejected: a second grammar, because two would drift. (diff review) Evidence: the vector test covers both.\nAnswered on the ticket by\n\n---\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie-factory.\n",
+      "valid": false,
+      "entries": []
+    },
+    {
+      "id": "citation-beside-none-declaration-stays-malformed",
+      "agent_body": "The change updates the factory route.\n\n## Decisions\n\nNone: the change follows directly from the acceptance criteria.\nAnswered on the ticket by maintainer: use the shared grammar.\n",
+      "published_body": "The change updates the factory route.\n\n## Decisions\n\nNone: the change follows directly from the acceptance criteria.\nAnswered on the ticket by maintainer: use the shared grammar.\n\n---\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @curie-factory.\n",
+      "valid": false,
+      "entries": []
     }
   ]
 }
