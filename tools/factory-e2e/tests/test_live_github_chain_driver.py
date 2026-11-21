@@ -1479,11 +1479,33 @@ def test_wiring_beat_a_keeps_the_first_read_of_the_investigating_lead(
     monkeypatch.setattr(p, "as_actor", lambda *_a, **_k: (200, labels))
     monkeypatch.setattr(fe, "POLL_SECONDS", 0)
     _fake_cli(monkeypatch, lambda args: (0, "{}" if "on" in args else _overrides(True), 0.1))
+    labelled_event = {
+        "event": "labeled",
+        "label": {"name": judge.QUESTIONS_LABEL},
+        "created_at": "2000-01-01T00:05:03Z",
+        "actor": app,
+    }
+    events = [labelled_event, {"event": "closed", "created_at": "2000-01-01T00:09:00Z"}]
+    monkeypatch.setattr(
+        p,
+        "_paged",
+        lambda path: copy.deepcopy(events) if path.endswith("/issues/11/events") else [],
+    )
+    clock = iter(f"2000-01-01T00:{m:02d}:00Z" for m in range(10, 60))
+    monkeypatch.setattr(lgc, "now_iso", lambda: next(clock))
 
     lgc.beat_a(p, chain)
 
     a = chain.record["beat_a"]
     verdict = judge.judge_beat("beat_a", chain.record)
+    # The observation times: when the questions were first read, and the label
+    # events with when they were read, beside the product's own times.
+    reads_before_questions = next(i for i, read in enumerate(reads) if "questions" in read)
+    assert a["questions_observed_at"] == f"2000-01-01T00:{10 + reads_before_questions:02d}:00Z"
+    assert a["label_events"] == [
+        {"event": "labeled", "label": judge.QUESTIONS_LABEL, "created_at": "2000-01-01T00:05:03Z"}
+    ]
+    assert a["label_events_observed_at"] > a["questions_observed_at"]
     if reason is None:
         assert verdict.passed, verdict.reasons
         assert a["investigating"]["comment"]["id"] == status
@@ -2470,6 +2492,9 @@ def _beat_a(
         ),
         observed_at="2030-01-01T00:06:10Z",
         work_item_id="work-item-a",
+        questions_observed_at="2030-01-01T00:05:02Z",
+        events=[],
+        events_observed_at="2030-01-01T00:06:10Z",
     )
 
 

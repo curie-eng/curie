@@ -1204,8 +1204,16 @@ def beat_a_record(
     quiet_rows: Sequence[Mapping[str, Any]],
     observed_at: str,
     work_item_id: str,
+    questions_observed_at: str,
+    events: Sequence[Mapping[str, Any]],
+    events_observed_at: str,
 ) -> dict[str, Any]:
-    """``investigating`` is the first read showing the lead: the comment and when it was read."""
+    """``investigating`` is the first read showing the lead: the comment and when it was read.
+
+    The observation times (when the driver first read the questions comment,
+    and the ticket's label events with when they were read) let the questions
+    window be split into product time and the driver's own polling.
+    """
 
     return {
         "issue_number": issue_number,
@@ -1219,6 +1227,17 @@ def beat_a_record(
         "issue_labels": [str(label.get("name")) for label in labels],
         "quiet_snapshot": {"observed_at": observed_at, "requests": request_records(quiet_rows)},
         "work_item_id": work_item_id,
+        "questions_observed_at": questions_observed_at,
+        "label_events": [
+            {
+                "event": e.get("event"),
+                "label": (e.get("label") or {}).get("name"),
+                "created_at": e.get("created_at"),
+            }
+            for e in events
+            if e.get("event") in ("labeled", "unlabeled")
+        ],
+        "label_events_observed_at": events_observed_at,
     }
 
 
@@ -2145,16 +2164,19 @@ def beat_a(p: fe.Preflight, chain: ChainRun) -> None:
     repository_id = int(chain.record["identities"]["repository_id"])
     # The first read, from label time on, that shows the investigating lead.
     seen: list[tuple[Mapping[str, Any], str]] = []
+    asked_seen: list[str] = []
 
     def question() -> dict[str, Any] | None:
         comments = issue_comments(p, number)
+        read_at = now_iso()
         lead = investigating_comment(comments, app) if not seen else None
         if lead is not None:
-            seen.append((copy.deepcopy(dict(lead)), now_iso()))
+            seen.append((copy.deepcopy(dict(lead)), read_at))
         for comment in comments:
             if (comment.get("user") or {}).get("login") == app and judge.QUESTIONS_MARKER in str(
                 comment.get("body")
             ):
+                asked_seen.append(read_at)
                 return comment
         return None
 
@@ -2168,6 +2190,8 @@ def beat_a(p: fe.Preflight, chain: ChainRun) -> None:
     while dt.datetime.now(dt.UTC) < quiet_until:
         time.sleep(fe.POLL_SECONDS)
     observed_at = now_iso()
+    events = p._paged(f"/repos/{p.config.repo}/issues/{number}/events")
+    events_observed_at = now_iso()
     chain.record["beat_a"] = beat_a_record(
         issue_number=number,
         labelled_at=labelled_at,
@@ -2177,6 +2201,9 @@ def beat_a(p: fe.Preflight, chain: ChainRun) -> None:
         quiet_rows=request_rows(p, work_item_id),
         observed_at=observed_at,
         work_item_id=work_item_id,
+        questions_observed_at=asked_seen[0],
+        events=events,
+        events_observed_at=events_observed_at,
     )
     sample_usage(p, chain, "after_a")
 
