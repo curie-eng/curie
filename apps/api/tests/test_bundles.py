@@ -128,11 +128,30 @@ def test_a_retired_result_declaration_is_a_validation_issue(tmp_path: Path) -> N
         (
             "bundle.result_declaration_retired",
             "workflow/result.json",
-            "workflow/result.json is no longer supported: the separate triage flow was"
-            " removed. Delete the file; the default factory bundle investigates and asks"
-            " questions on the ticket itself.",
+            bundles.RETIRED_RESULT_DECLARATION_MESSAGE,
         )
     ]
+
+
+def test_retired_result_declaration_message_names_the_binding_step(tmp_path: Path) -> None:
+    _, _, result = bundles.extract_and_validate(
+        _tar_gz({**_valid_files(), **RETIRED_DECLARATION}), tmp_path
+    )
+
+    message = result.errors[0].message
+    assert bundles.RETIRED_RESULT_DECLARATION_DOCS_HEADING in message
+    assert "Before upgrading: an existing triage binding" in message
+    assert "remove" in message
+    assert "replace" in message
+
+
+def test_retired_result_declaration_heading_exists_in_the_operations_guide() -> None:
+    guide = Path(__file__).resolve().parents[3] / "docs" / "operations.md"
+    headings = {
+        line.lstrip("#").strip() for line in guide.read_text().splitlines() if line.startswith("#")
+    }
+
+    assert bundles.RETIRED_RESULT_DECLARATION_DOCS_HEADING in headings
 
 
 def test_a_result_declaration_path_that_is_a_directory_is_refused(tmp_path: Path) -> None:

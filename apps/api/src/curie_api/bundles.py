@@ -148,10 +148,13 @@ def extract_and_validate(
 
 RETIRED_RESULT_DECLARATION_FILE = "workflow/result.json"
 RETIRED_RESULT_DECLARATION_CODE = "bundle.result_declaration_retired"
+RETIRED_RESULT_DECLARATION_DOCS_HEADING = "Before upgrading: an existing triage binding"
 RETIRED_RESULT_DECLARATION_MESSAGE = (
     "workflow/result.json is no longer supported: the separate triage flow was removed."
-    " Delete the file; the default factory bundle investigates and asks questions on the"
-    " ticket itself."
+    " An agent that is already deployed with this declaration must have its binding"
+    " removed or replaced first, or it would run as an implementation agent on its old"
+    f" trigger label; see {RETIRED_RESULT_DECLARATION_DOCS_HEADING} in docs/operations.md."
+    " For a new upload, delete the file and deploy again."
 )
 
 
