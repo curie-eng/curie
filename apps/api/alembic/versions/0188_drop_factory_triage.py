@@ -59,9 +59,10 @@ The downgrade restores the 0186 shape exactly (every table, column, default,
 foreign key, unique constraint, CHECK and index, written out here) and
 restores no rows. It refuses nothing: ``completion_contract`` comes back NOT
 NULL with its ``implementation`` default, which every kept row satisfies, and
-every other restored column is nullable or belongs to an empty table. The
-threads step 3 recorded stay; the 0186 worker never roots them, so after a
-downgrade a later request on such a WorkItem gets no Slack thread.
+every other restored column is nullable or belongs to an empty table. It
+deletes the threads step 3 recorded that were never rooted, because the 0186
+worker roots a thread only when it discovers one, so it discovers those
+WorkItems again.
 
 Revision ID: 0188
 Revises: 0186
@@ -267,6 +268,16 @@ QUIET_UNDISCOVERED = f"""
            SELECT 1 FROM {S}.{THREADS} e WHERE e.work_item_id = w.id
        )
     ON CONFLICT (work_item_id) DO NOTHING
+"""
+# The downgrade's inverse of step 3: a configured thread with no root and no
+# post of its WorkItem at all, which only step 3 creates.
+DORMANT_THREADS = f"""
+    DELETE FROM {S}.{THREADS} t
+     WHERE t.origin = 'configured'
+       AND t.root_ts IS NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM {S}.{POSTS} p WHERE p.work_item_id = t.work_item_id
+       )
 """
 QUIET_CARDS = f"""
     UPDATE {S}.{THREADS} t
@@ -733,6 +744,7 @@ def _restore_delegations_and_handoffs() -> None:
 
 def downgrade() -> None:
     op.execute(sa.text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))
+    op.execute(sa.text(DORMANT_THREADS))
     _restore_agent_versions()
     _restore_execution_requests()
     _restore_grants()

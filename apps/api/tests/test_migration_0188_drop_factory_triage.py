@@ -990,10 +990,14 @@ def test_an_undiscovered_triage_work_item_stays_quiet_until_its_next_request(
     """Correction 14 through first discovery. Seeded at 0186 with the agent's
     Slack destination configured and no thread row yet: a completed triage
     request whose findings were delivered, and one that ended
-    ``tracker_result_undelivered`` with its findings still owed. Without the
-    upgrade's third step this pass discovers both WorkItems and posts their
-    roots, a card for each and a needs a person reply. With it the pass is
-    silent, and a new request on one WorkItem gets its root and its card.
+    ``tracker_result_undelivered`` with its findings still owed (and a third
+    completed one). Without the upgrade's third step this pass discovers them
+    and posts their roots, a card for each and a needs a person reply. With it
+    the pass is silent, and a new request on one WorkItem gets its root and its
+    card. A request that ended while the destination was cleared is behind the
+    restarted cutoff, so it does not root a recorded thread, and the next
+    eligible request does. The downgrade deletes a recorded thread that was
+    never rooted, so the 0186 worker can discover its WorkItem again.
     """
 
     isolated_migration_db.at(BELOW)
@@ -1018,6 +1022,7 @@ def test_an_undiscovered_triage_work_item_stays_quiet_until_its_next_request(
     for issue, status, cause, state in (
         (711, "completed", "completed", "delivered"),
         (712, "failed", "tracker_result_undelivered", "owed"),
+        (713, "completed", "completed", "delivered"),
     ):
         item = _work_item(agent["id"], issue)
         request = _tracker_result(
@@ -1073,3 +1078,58 @@ def test_an_undiscovered_triage_work_item_stays_quiet_until_its_next_request(
         delivery_id_for(woken["id"], "card"),
     ], slack.calls
     assert all(route.adapter == IDENTITY for _, route in slack.calls)
+
+    # A request that ended while the destination was cleared is before the
+    # restarted cutoff: it does not root the recorded thread, as it would not
+    # make an ordinary WorkItem's thread.
+    late = items[1]
+    _batch(
+        (
+            "UPDATE curie.agents SET factory_slack_channel = NULL, factory_slack_since = NULL "
+            "WHERE id = :id",
+            {"id": agent["id"]},
+        ),
+    )
+    _batch(
+        _insert(
+            "execution_requests",
+            _ended(
+                late["id"],
+                2,
+                status="completed",
+                cause="completed",
+                terminal_at=datetime.now(UTC) - timedelta(seconds=1),
+            ),
+        ),
+        ("UPDATE curie.work_items SET next_sequence = 3 WHERE id = :id", {"id": late["id"]}),
+    )
+    _batch(
+        (
+            "UPDATE curie.agents SET factory_slack_channel = :channel, "
+            "factory_slack_since = now() WHERE id = :id",
+            {"id": agent["id"], "channel": CHANNEL},
+        ),
+    )
+    before = len(slack.calls)
+    _progress_pass(slack)
+    assert slack.calls[before:] == []
+
+    # The next eligible request roots it, from that request.
+    _batch(
+        _insert("execution_requests", _queued(late["id"], 3)),
+        ("UPDATE curie.work_items SET next_sequence = 4 WHERE id = :id", {"id": late["id"]}),
+    )
+    _progress_pass(slack)
+    later = [event for event, _ in slack.calls[before:] if isinstance(event, ReplyPost)]
+    assert [post.delivery_id for post in later] == [
+        delivery_id_for(late["id"], "root"),
+        delivery_id_for(late["id"], "card"),
+    ], slack.calls[before:]
+    assert sql_rows(
+        "SELECT first_sequence FROM curie.factory_slack_threads WHERE work_item_id = :id",
+        {"id": late["id"]},
+    ) == [(3,)]
+
+    command.downgrade(alembic_config(), BELOW)
+    kept = {row[0] for row in sql_rows("SELECT work_item_id FROM curie.factory_slack_threads")}
+    assert kept == {items[0]["id"], items[1]["id"]}
