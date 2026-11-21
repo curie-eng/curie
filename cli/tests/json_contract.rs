@@ -2800,6 +2800,7 @@ fn cluster_status_output_validates_both_variants() {
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials: Vec::new(),
+        factory_model_auth_mode: None,
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());
@@ -2838,6 +2839,7 @@ fn cluster_status_output_validates_both_variants() {
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials: Vec::new(),
+        factory_model_auth_mode: None,
     };
     let with_mail = ClusterStatusOutput::Status(Box::new(with_mail)).to_json();
     assert_eq!(
@@ -2850,6 +2852,58 @@ fn cluster_status_output_validates_both_variants() {
         lines: vec!["helm status".to_string()],
     });
     assert_valid("cluster-status.schema.json", &dry.to_json());
+}
+
+#[test]
+fn cluster_status_model_auth_mode_validates_against_the_schema() {
+    for mode in [Some("service"), Some("personal"), None] {
+        let status = ClusterStatus {
+            namespace: "curie".to_string(),
+            revision: "3".to_string(),
+            release_state: "deployed".to_string(),
+            release_found: true,
+            release_missing_note: None,
+            pods: vec![],
+            ready: 0,
+            total: 0,
+            unhealthy: vec![],
+            warnings: vec![],
+            pods_listed: true,
+            urls: vec![],
+            upgrade: curie::ops::UpgradeStatusView::idle(None),
+            delivery: curie::completion_outbox::Report::unknown(),
+            credentials: Vec::new(),
+            factory_model_auth_mode: mode.map(str::to_string),
+        };
+        let json = ClusterStatusOutput::Status(Box::new(status)).to_json();
+        assert_eq!(json["factory_model_auth_mode"], serde_json::json!(mode));
+        assert_valid("cluster-status.schema.json", &json);
+    }
+    let mut invalid = ClusterStatusOutput::Status(Box::new(ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![],
+        ready: 0,
+        total: 0,
+        unhealthy: vec![],
+        warnings: vec![],
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(None),
+        delivery: curie::completion_outbox::Report::unknown(),
+        credentials: Vec::new(),
+        factory_model_auth_mode: None,
+    }))
+    .to_json();
+    invalid["factory_model_auth_mode"] = serde_json::json!("shared");
+    let schema = load_schema("cluster-status.schema.json");
+    assert!(
+        !validator(&schema).is_valid(&invalid),
+        "an unknown mode must not validate: {invalid}"
+    );
 }
 
 // #4397 AC 7: each configured forge credential is listed in status JSON with
@@ -2884,6 +2938,7 @@ fn cluster_status_lists_forge_credentials_in_the_schema() {
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials,
+        factory_model_auth_mode: None,
     };
     let value = ClusterStatusOutput::Status(Box::new(status)).to_json();
     assert_valid("cluster-status.schema.json", &value);
@@ -2983,6 +3038,7 @@ fn cluster_status_credential_authentication_is_in_the_schema() {
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials,
+        factory_model_auth_mode: None,
     };
     let value = ClusterStatusOutput::Status(Box::new(status)).to_json();
     assert_valid("cluster-status.schema.json", &value);

@@ -11,23 +11,6 @@ cd "$repo_root"
 
 generated_docs=(docs/interfaces.md docs/interfaces docs/adr/README.md)
 
-# ADR numbers must be unique (#521). Two branches each adding "the next ADR
-# number" merge clean in git -- git sees two unrelated new files, not a conflict
-# -- yet collide in the tree, making "ADR-00NN" ambiguous in every citation and
-# breaking the supersession chain. Only a live check catches it, so gate it here.
-echo "== checking ADR numbers are unique =="
-dupes="$(
-  for f in docs/adr/[0-9][0-9][0-9][0-9]-*.md; do
-    basename "$f" | grep -oE '^[0-9]{4}'
-  done | sort | uniq -d
-)"
-if [ -n "$dupes" ]; then
-  echo "ERROR: duplicate ADR number(s) in docs/adr/:" >&2
-  echo "$dupes" | sed 's/^/  /' >&2
-  echo "Renumber the newer colliding ADR and fix inbound citations (#521)." >&2
-  exit 1
-fi
-
 echo "== regenerating the seam table, the ADR index, and per-doc headers =="
 uv run python -m curie_doclint --repo-root "$repo_root" --write
 
@@ -38,11 +21,14 @@ if ! git diff --exit-code -- "${generated_docs[@]}"; then
   exit 1
 fi
 
-# The single curie_doclint invocation that follows runs four phases in this
-# order -- generate, counts, commands, lint -- so a failure in any of them
-# surfaces here (#1041). Each finding names its own phase, so this script does
-# not enumerate them.
-echo "== verifying generated counts, the verification contract, and every citation =="
-uv run python -m curie_doclint --repo-root "$repo_root"
+# The single curie_doclint invocation that follows runs generate, counts,
+# commands, lint, and ADR number uniqueness across the working tree,
+# origin/main, origin/next, and open PR additions (#541, #1957). A failure in
+# any of them surfaces here. Each finding names its own phase, so this script
+# does not enumerate them. --require-remote-adr-scan fails on collisions this
+# candidate adds or renames into; other remote collisions print as warnings.
+# Scan errors fail closed only when this candidate claims a new ADR file.
+echo "== verifying generated counts, the verification contract, citations, and ADR numbers =="
+uv run python -m curie_doclint --repo-root "$repo_root" --require-remote-adr-scan
 
-echo "OK: the interface catalog is generated and drift-free, every citation resolves, and every command the verification contract names is real."
+echo "OK: the interface catalog is generated and drift-free, every citation resolves, every command the verification contract names is real, and ADR numbers are unique for this candidate across trains and open PRs."

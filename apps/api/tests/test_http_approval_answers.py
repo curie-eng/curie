@@ -58,12 +58,14 @@ def approver_role(case: SimpleNamespace, group: str = GROUP) -> None:
         async with factory() as session, session.begin():
             result = await agent_role_policy.apply_role_change(session, change=change(
                 uuid.UUID(case.scope["tenant"]), uuid.UUID(case.scope["agent"]),
-                version=case.scope["role_version"], target="approver", operation="migrate_role",
+                version=case.scope["role_version"], target="approver",
+                operation="set_filter" if case.scope.get("approver_migrated") else "migrate_role",
                 filter={"entries": [
                     {"kind": "issuer_group", "group": {"issuer": ISSUER, "id": group}},
                 ]},
             ))
             case.scope["role_version"] = result.version
+            case.scope["approver_migrated"] = True
 
     run(migrate)
 
@@ -223,6 +225,42 @@ def test_answer_without_receiver_proof_keeps_the_card_live(answer_case: SimpleNa
     assert response.status_code == 403, response.text
     assert response.json() == {"detail": "unsupported_approval"}
     unchanged(case, before)
+
+
+def test_answer_rejects_mismatched_proof_then_rechecks_the_same_authenticated_bytes(
+    answer_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+) -> None:
+    case = answer_case
+    stream = valkey.xrange(runs_stream)
+    lookups = len(case.provider.requests)
+    for changes in (
+        {"signed_body": b'{"decision":"rejected"}'},
+        {"attestation_sha256": "0" * 64},
+        {"approval_id": str(uuid.uuid4())},
+        {"operation": "recover", "body": b'{"decision":"approved"}'},
+        {"receiver": (case.scope["receiver_id"], b"x" * 32)},
+        {"receiver": (str(uuid.uuid4()), b"u" * 32)},
+        {"channel_identity_id": str(uuid.uuid4())},
+        {"provider_installation_id": str(uuid.uuid4())},
+        {"native_channel_id": "C0EXAMPLEOTHER"},
+        {"apr_evidence": slack_evidence(interaction_user_team_id="T0EXAMPLEOTHER")},
+    ):
+        response = resolve(case, *answer(case, **changes))
+        assert response.status_code == 401, response.text
+        assert response.json() == {"detail": "missing or invalid approval principal"}
+        unchanged(case, lookups)
+        assert valkey.xrange(runs_stream) == stream
+
+    payload, headers = answer(case)
+    approver_role(case, group="SyntheticApproverOnlyGroup")
+    response = resolve(case, payload, headers)
+    assert (response.status_code, response.json()) == (403, {"detail": "caller_not_allowed"})
+    unchanged(case, lookups + 2)
+    assert valkey.xrange(runs_stream) == stream
+    approver_role(case)
+    response = resolve(case, payload, headers)
+    assert (response.status_code, response.json()["status"]) == (200, "approved")
+    assert len(valkey.xrange(runs_stream)) == len(stream) + 1
 
 
 def test_selected_recovery_records_the_authenticated_actor_and_reseals(

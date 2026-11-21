@@ -846,12 +846,18 @@ pub fn install_curie_skills(
         (
             "review",
             "review-pr",
-            &["4c13897920b1ab2deeeda90a6cb00b2b465b0c3a8576eeb552185322fb6efbc8"][..],
+            &[
+                "4c13897920b1ab2deeeda90a6cb00b2b465b0c3a8576eeb552185322fb6efbc8",
+                "a99e46d6434fb4b25f2aeb48fc43b7bd43a6ad25cb7e57ca7b0cf52fc2b61a00",
+            ][..],
         ),
         (
             "environment",
             "factory-environment-setup",
-            &["a828913e1486f3dd8d7409f4a6f551c5e7d386230c3f8198b8f447ca3f753d6e"][..],
+            &[
+                "a828913e1486f3dd8d7409f4a6f551c5e7d386230c3f8198b8f447ca3f753d6e",
+                "8ac17b7cd4b4e680da68e5c991a704a9b93b7c843f551d4ed6193d632cb762f0",
+            ][..],
         ),
         (
             "environment",

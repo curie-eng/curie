@@ -296,6 +296,62 @@ def test_running_sends_the_wake_and_preserves_persisted_execution_facts(
     assert found.lease_held_to_deadline is lease_held_to_deadline
 
 
+# An API older than the single-path dispatch body may still send a completion
+# field. The worker reads none: every grant is an implementation or a
+# publication recovery run by its execution kind alone, and a stale value, of
+# any spelling, neither fails the body nor changes the run.
+_STALE_COMPLETION_VALUES = ["implementation", "an-unknown-contract", 7]
+
+
+@pytest.mark.parametrize("stale", _STALE_COMPLETION_VALUES)
+def test_a_stale_completion_field_in_the_dispatch_body_is_ignored(stale: object) -> None:
+    stale_body = {"completion_contract": stale}
+    acquired = _acquire({**BASE, **stale_body})
+    assert acquired == _acquire(BASE)
+    assert {field.name for field in dataclasses.fields(acquired)} == {
+        "generation",
+        "work_item_id",
+        "conversation_id",
+        "wait_deadline",
+        "repository_path",
+        "context",
+        "execution_kind",
+        "recovery_candidate_id",
+        "resource_gate",
+        "predecessor_claim_name",
+    }
+
+    found = _run(
+        lambda _request: httpx.Response(200, json={**_running_body(), **stale_body}),
+        lambda client: client.running_for_conversation("thread", wake=WAKE),
+    )
+    assert isinstance(found, WorkItemRunning)
+    assert found == _run(
+        lambda _request: httpx.Response(200, json=_running_body()),
+        lambda client: client.running_for_conversation("thread", wake=WAKE),
+    )
+
+    start_body = {
+        "runtime_epoch": 1,
+        "execution_deadline": "2099-01-01T00:00:00+00:00",
+        "remaining_s": 600,
+        "heartbeat_interval_s": 1000,
+    }
+    started = _run(
+        lambda _request: httpx.Response(200, json={**start_body, **stale_body}),
+        lambda client: client.start(
+            REQUEST_ID,
+            owner="worker-1",
+            generation=1,
+            claim_name="acme-claim",
+            sandbox_name="acme-sandbox",
+            context=CONTEXT,
+            delivered_limits=UNOBSERVED_LIMITS,
+        ),
+    )
+    assert {field.name for field in dataclasses.fields(started)} == set(start_body)
+
+
 @pytest.mark.parametrize("field", list(_running_body()))
 def test_running_refuses_missing_required_facts(field: str) -> None:
     body = _running_body()

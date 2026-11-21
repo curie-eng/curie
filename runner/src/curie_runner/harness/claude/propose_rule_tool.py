@@ -11,6 +11,7 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
+from ...completion_contract import ResultHandler
 from ...propose_rule import (
     CHANNEL_PROPOSE_RULE_DESCRIPTION,
     CHANNEL_PROPOSE_RULE_SCHEMA,
@@ -18,7 +19,6 @@ from ...propose_rule import (
     PROPOSE_RULE_SCHEMA,
 )
 from ...tool_names import PROPOSE_RULE_TOOL
-from ...tracker_result import ResultHandler
 
 
 def wrap_propose_rule_handler(handler: ResultHandler) -> SdkMcpTool[Any]:

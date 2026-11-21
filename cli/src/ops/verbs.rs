@@ -103,7 +103,7 @@ fn pods_cmd(o: &CommonOpts) -> OpsCommand {
 /// `{{ include "curie.fullname" . }}-<component>`, which equals
 /// `<release>-<component>` only when the release name happens to contain the
 /// chart name (#1533).
-fn svc_cmd(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> OpsCommand {
+pub(super) fn svc_cmd(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -959,6 +959,53 @@ pub struct ClusterStatus {
     /// Each recorded forge credential's expiry (#4397), from the computed
     /// values; a warning is also in `warnings`.
     pub credentials: Vec<crate::forge_expiry::ExpiryLine>,
+    /// The installation's model auth mode read from the computed release
+    /// values by [`factory_model_auth_mode`]; `None` when it cannot be read.
+    pub factory_model_auth_mode: Option<String>,
+}
+
+/// The installation's model auth mode as the computed release values (`helm
+/// get values --all`) show it. `factory.modelAuthMode` when present. A release
+/// upgraded with `--reuse-values` from a chart that predates the key lacks it:
+/// then a raw `FACTORY_MODEL_AUTH_MODE` literal in the computed `api.extraEnv`
+/// or `worker.extraEnv` is what that release runs, and otherwise the chart
+/// renders `service`. The raw name matches in any case, as the API reads it.
+/// `None` when the computed values are unavailable, when the API's and the
+/// worker's retained literals disagree, or when a retained literal is other
+/// than `service` or `personal` (a value the services refuse at startup).
+pub fn factory_model_auth_mode(computed: Option<&serde_json::Value>) -> Option<String> {
+    let computed = computed?;
+    if let Some(mode) = computed
+        .pointer("/factory/modelAuthMode")
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(mode.to_string());
+    }
+    // The API's settings reader ignores case, so a retained entry counts
+    // under any case of the name. Each workload contributes its own literal.
+    let raw: Vec<Option<&str>> = ["/api/extraEnv", "/worker/extraEnv"]
+        .iter()
+        .filter_map(|pointer| {
+            computed
+                .pointer(pointer)?
+                .as_array()?
+                .iter()
+                .find(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("FACTORY_MODEL_AUTH_MODE"))
+                })
+                .map(|entry| entry.get("value").and_then(serde_json::Value::as_str))
+        })
+        .collect();
+    match raw.as_slice() {
+        [] => Some("service".to_string()),
+        // The API and the worker disagree: no single mode runs.
+        [first, rest @ ..] if rest.iter().any(|other| other != first) => None,
+        [Some(mode @ ("service" | "personal")), ..] => Some((*mode).to_string()),
+        _ => None,
+    }
 }
 
 impl crate::ui::CliOutput for ClusterStatusOutput {
@@ -987,6 +1034,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     "healthy": healthy,
                     "upgrade": s.upgrade.to_json(),
                     "credentials": serde_json::to_value(&s.credentials).expect("credentials serialize"),
+                    "factory_model_auth_mode": s.factory_model_auth_mode,
                 })
             }
         }
@@ -1016,6 +1064,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 for line in &s.credentials {
                     ui.payload(&line.status_line());
                 }
+                ui.payload(&factory_model_auth_mode_line(
+                    s.factory_model_auth_mode.as_deref(),
+                ));
                 ui.payload(&format!(
                     "upgrade {} · phase {} · known-good {}",
                     s.upgrade.status,
@@ -1040,6 +1091,14 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
             }
         }
     }
+}
+
+/// The human status line for the installation's model auth mode.
+pub fn factory_model_auth_mode_line(mode: Option<&str>) -> String {
+    format!(
+        "factory model auth mode: {}",
+        mode.unwrap_or("unknown (not readable from the computed release values)")
+    )
 }
 
 pub(crate) enum MailVerdict {
@@ -1331,6 +1390,8 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         _ => Vec::new(),
     };
     let read_health = !credentials.is_empty() && helm_ok;
+    let factory_model_auth_mode =
+        factory_model_auth_mode(computed.as_ref().ok().and_then(Option::as_ref));
 
     let (ui_url, langfuse_url, worker_claims, delivery, health) = tokio::join!(
         resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
@@ -1436,6 +1497,7 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         delivery,
         upgrade,
         credentials,
+        factory_model_auth_mode,
     }));
     let json = crate::ui::CliOutput::to_json(&output);
     if let Some(error) = context_error {
@@ -4327,7 +4389,7 @@ pub(crate) fn release_fullname_from_values(release: &str, values: &serde_json::V
 /// discovered and [`chart_fullname`]'s no-override rule is the honest best
 /// guess. Every dry-run branch owes the reader the same caveat, so the note
 /// lives with the value rather than being restated at each verb.
-fn dry_run_fullname(release: &str) -> ReleaseFullname {
+pub(super) fn dry_run_fullname(release: &str) -> ReleaseFullname {
     let fullname = chart_fullname(release);
     crate::ui::ui().note(&format!(
         "dry run: service names assume the chart's default naming ({}); an install \
@@ -5588,7 +5650,7 @@ async fn resolve_service_url(
 }
 
 /// From `kubectl get svc -o json`, return (type, first nodePort, first port).
-fn parse_service(svc_json: &str) -> Option<(String, Option<u16>, u16)> {
+pub(super) fn parse_service(svc_json: &str) -> Option<(String, Option<u16>, u16)> {
     let v: serde_json::Value = serde_json::from_str(svc_json).ok()?;
     let spec = v.get("spec")?;
     let svc_type = spec.get("type").and_then(|t| t.as_str())?.to_string();
@@ -5630,8 +5692,19 @@ pub enum ServiceEndpoint {
     Unreadable,
 }
 
+/// The non-privileged local port a service port is forwarded to: ports below
+/// 1024 are offset by 18000, and an absent service port falls back to 8080.
+/// `cluster status` hints and `cluster access` forward to the same port.
+pub(super) fn forward_local_port(port: u16) -> u16 {
+    match port {
+        0 => 8080,
+        1..=1023 => port + 18000,
+        _ => port,
+    }
+}
+
 /// The path suffix that selects the console's API-backed view.
-fn api_suffix_path(api: bool) -> &'static str {
+pub(super) fn api_suffix_path(api: bool) -> &'static str {
     if api {
         "/?api=1"
     } else {
@@ -5650,11 +5723,7 @@ fn resolve_service_endpoint(svc_json: &str, host: &str, api: bool) -> ServiceEnd
             None => ServiceEndpoint::UnassignedNodePort,
         },
         Some((_, _, port)) => ServiceEndpoint::PortForwardHint {
-            local: match port {
-                0 => 8080,
-                1..=1023 => port + 18000,
-                _ => port,
-            },
+            local: forward_local_port(port),
             port,
         },
         None => ServiceEndpoint::Unreadable,
@@ -5786,7 +5855,11 @@ fn service_surface(
 }
 
 /// Fetch one release service's JSON, or None when kubectl cannot read it.
-async fn fetch_service(o: &CommonOpts, fullname: &ReleaseFullname, suffix: &str) -> Option<String> {
+pub(super) async fn fetch_service(
+    o: &CommonOpts,
+    fullname: &ReleaseFullname,
+    suffix: &str,
+) -> Option<String> {
     match run_capture(&svc_cmd(o, fullname, suffix)).await {
         Ok((true, out, _)) => Some(out),
         _ => None,
@@ -7163,6 +7236,7 @@ mod tests {
             },
             upgrade: crate::ops::upgrade::UpgradeStatusView::idle(None),
             credentials: Vec::new(),
+            factory_model_auth_mode: None,
         }));
         crate::ui::CliOutput::to_json(&output)["healthy"].clone()
     }
@@ -7845,5 +7919,156 @@ mod tests {
                 .any(|l| l.contains("get svc curie-langfuse-web")),
             "{lines:?}"
         );
+    }
+
+    fn model_auth_mode_status(mode: Option<String>) -> ClusterStatusOutput {
+        ClusterStatusOutput::Status(Box::new(ClusterStatus {
+            namespace: "acme".to_string(),
+            revision: "1".to_string(),
+            release_state: "deployed".to_string(),
+            release_found: true,
+            release_missing_note: None,
+            pods: Vec::new(),
+            ready: 0,
+            total: 0,
+            unhealthy: Vec::new(),
+            warnings: Vec::new(),
+            pods_listed: true,
+            urls: Vec::new(),
+            delivery: crate::completion_outbox::Report::unknown(),
+            upgrade: crate::ops::upgrade::UpgradeStatusView::idle(None),
+            credentials: Vec::new(),
+            factory_model_auth_mode: mode,
+        }))
+    }
+
+    #[test]
+    fn model_auth_mode_status_reads_the_computed_chart_value() {
+        for mode in ["service", "personal"] {
+            let computed = serde_json::json!({"factory": {"modelAuthMode": mode}});
+            let read = factory_model_auth_mode(Some(&computed));
+            assert_eq!(read.as_deref(), Some(mode));
+            let json = crate::ui::CliOutput::to_json(&model_auth_mode_status(read.clone()));
+            assert_eq!(json["factory_model_auth_mode"], mode, "{json}");
+            assert_eq!(
+                factory_model_auth_mode_line(read.as_deref()),
+                format!("factory model auth mode: {mode}")
+            );
+        }
+    }
+
+    #[test]
+    fn model_auth_mode_status_is_null_without_computed_values() {
+        let read = factory_model_auth_mode(None);
+        assert_eq!(read, None);
+        let json = crate::ui::CliOutput::to_json(&model_auth_mode_status(read.clone()));
+        assert!(
+            json.get("factory_model_auth_mode")
+                .is_some_and(serde_json::Value::is_null),
+            "{json}"
+        );
+        assert_eq!(
+            factory_model_auth_mode_line(read.as_deref()),
+            "factory model auth mode: unknown (not readable from the computed release values)"
+        );
+    }
+
+    /// A release upgraded with --reuse-values from a chart without the key
+    /// still runs whatever its retained raw extraEnv entry says.
+    #[test]
+    fn model_auth_mode_status_reads_a_retained_raw_entry_without_the_key() {
+        for (pointer, mode) in [
+            ("api", "personal"),
+            ("worker", "personal"),
+            ("worker", "service"),
+        ] {
+            let computed = serde_json::json!({
+                "factory": {"enabled": true},
+                pointer: {"extraEnv": [
+                    {"name": "ACME_EXTENSION", "value": "1"},
+                    {"name": "FACTORY_MODEL_AUTH_MODE", "value": mode},
+                ]},
+            });
+            let read = factory_model_auth_mode(Some(&computed));
+            assert_eq!(read.as_deref(), Some(mode), "{computed}");
+            let json = crate::ui::CliOutput::to_json(&model_auth_mode_status(read.clone()));
+            assert_eq!(json["factory_model_auth_mode"], mode, "{json}");
+            assert_eq!(
+                factory_model_auth_mode_line(read.as_deref()),
+                format!("factory model auth mode: {mode}")
+            );
+        }
+    }
+
+    /// Without the key or a raw entry, the chart template renders service.
+    #[test]
+    fn model_auth_mode_status_defaults_to_service_without_the_key() {
+        for computed in [
+            serde_json::json!({}),
+            serde_json::json!({"factory": {}}),
+            serde_json::json!({"api": {"extraEnv": [{"name": "ACME_EXTENSION", "value": "1"}]}}),
+        ] {
+            let read = factory_model_auth_mode(Some(&computed));
+            assert_eq!(read.as_deref(), Some("service"), "{computed}");
+            let json = crate::ui::CliOutput::to_json(&model_auth_mode_status(read.clone()));
+            assert_eq!(json["factory_model_auth_mode"], "service", "{json}");
+            assert_eq!(
+                factory_model_auth_mode_line(read.as_deref()),
+                "factory model auth mode: service"
+            );
+        }
+    }
+
+    /// The API reads its settings case-insensitively, so a retained entry
+    /// counts under any case of the name.
+    #[test]
+    fn model_auth_mode_status_reads_a_case_variant_raw_entry() {
+        let lower_case = serde_json::json!({
+            "api": {"extraEnv": [{"name": "factory_model_auth_mode", "value": "personal"}]},
+        });
+        assert_eq!(
+            factory_model_auth_mode(Some(&lower_case)).as_deref(),
+            Some("personal")
+        );
+        let agree = serde_json::json!({
+            "api": {"extraEnv": [{"name": "Factory_Model_Auth_Mode", "value": "personal"}]},
+            "worker": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "personal"}]},
+        });
+        assert_eq!(
+            factory_model_auth_mode(Some(&agree)).as_deref(),
+            Some("personal")
+        );
+    }
+
+    /// Retained API and worker literals that disagree mean no single mode runs.
+    #[test]
+    fn model_auth_mode_status_is_null_when_raw_entries_disagree() {
+        let disagree = serde_json::json!({
+            "api": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "personal"}]},
+            "worker": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "service"}]},
+        });
+        assert_eq!(factory_model_auth_mode(Some(&disagree)), None);
+        let reversed = serde_json::json!({
+            "api": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "service"}]},
+            "worker": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "personal"}]},
+        });
+        assert_eq!(factory_model_auth_mode(Some(&reversed)), None);
+    }
+
+    /// The chart value wins over a retained raw entry once both exist.
+    #[test]
+    fn model_auth_mode_status_prefers_the_chart_value_over_a_raw_entry() {
+        let computed = serde_json::json!({
+            "factory": {"modelAuthMode": "personal"},
+            "worker": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "service"}]},
+        });
+        assert_eq!(
+            factory_model_auth_mode(Some(&computed)).as_deref(),
+            Some("personal")
+        );
+        let unreadable = serde_json::json!({
+            "worker": {"extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": "Personal"}]},
+        });
+        assert_eq!(factory_model_auth_mode(Some(&unreadable)), None);
     }
 }

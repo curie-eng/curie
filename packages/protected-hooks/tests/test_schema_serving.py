@@ -128,7 +128,8 @@ def graph_payload() -> dict[str, Any]:
         ("0184", False),
         ("0185", False),
         ("0186", False),
-        ("0187", True),
+        ("0188", False),
+        ("0189", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -158,18 +159,15 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     answers require the 0156 answer gate. The factory Slack progress loop reads
     the 0157 tables, and the code host link route writes the github_host kind
     0158 allows. Execution owner reads require 0159, personal custody reads
-    and enrollment fences require 0160, and agent version reads select the
-    0162 result policy columns. Factory CI observations require the 0163
-    table. Cached facts and request delivery require the 0164 tables, which
+    and enrollment fences require 0160. Factory CI observations require the
+    0163 table. Cached facts and request delivery require the 0164 tables, which
     stay below this floor. Owner coding profiles and tenant policies require
     0165, which stays below this floor. Slack kickoff thread origin reads
-    require 0166, which stays below this floor. Execution request reads select
-    the 0167 completion contract columns. Intake notice storage requires 0168,
+    require 0166, which stays below this floor. Intake notice storage requires 0168,
     which stays below this floor. Requester selection columns require 0169,
     which stays below this floor. Refusal posts require 0170, which stays
-    below this floor. Triage handoff storage requires 0171, which stays below
-    this floor. Factory retry allowance columns require 0172, which stays below
-    this floor. Publication candidate retention requires 0173, which stays below
+    below this floor. Factory retry allowance columns require 0172, which stays
+    below this floor. Publication candidate retention requires 0173, which stays below
     this floor. Factory resource gate columns require 0174, which stays below
     this floor. Publication recovery requests require 0175, which stays below
     this floor. Operator retry records require 0176.
@@ -182,11 +180,11 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     Factory question rounds require 0184.
     Learned memory rules require 0185.
     The plain feedback cap requires 0186.
-    Run handoffs require 0187.
+    The 0188 triage contract precedes the 0189 run-handoff schema floor.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0187"
-    assert window.schema_head == "0187"
+    assert window.schema_min == "0189"
+    assert window.schema_head == "0189"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

@@ -246,6 +246,13 @@ if program == "kubectl":
             images = [{"names": names[:2]}, {"names": names[2:]}]
         if scenario == "alias-ambiguous":
             images.append({"names": [names[0], "example.com/imported-api@sha256:" + "e" * 64]})
+        if scenario == "alias-reimported-same-digest":
+            # Observed on kind/containerd 1.7: ctr import --digests names a
+            # digest import-<UTC date>@<digest>, so a reload after midnight
+            # adds a second digest name for the same image to the one entry.
+            images = [{"names": names + ["docker.io/library/import-2026-11-20@sha256:" + "d" * 64]}]
+        if scenario == "alias-same-entry-two-digests":
+            images = [{"names": names + ["example.com/imported-api@sha256:" + "e" * 64]}]
         if scenario == "alias-missing-entry":
             images = []
         if scenario == "alias-no-reported-alias":

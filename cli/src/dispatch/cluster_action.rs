@@ -262,6 +262,28 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             )
             .await?,
         ),
+        ClusterAction::Access {
+            namespace,
+            release,
+            ui_port,
+            langfuse_port,
+            dry_run,
+        } => {
+            let opts = ops::AccessOpts {
+                common: CommonOpts {
+                    namespace,
+                    release,
+                    dry_run,
+                },
+                ui_port,
+                langfuse_port,
+            };
+            if dry_run {
+                emit(ops::access_plan(&opts)?)
+            } else {
+                ops::access(opts).await
+            }
+        }
         ClusterAction::Observability {
             query,
             namespace,
@@ -401,6 +423,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         }
         ClusterAction::Factory {
             intake,
+            model_auth_mode,
             repos,
             all_installed_repos,
             label,
@@ -426,11 +449,6 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .as_deref()
                 .map(parse_runner_image_binding)
                 .transpose()?;
-            let webhook_secret = if disable || !repo_runners.is_empty() || !repo_docker.is_empty() {
-                None
-            } else {
-                curie::factory_intake::resolve_webhook_secret(webhook_secret_file.as_deref())?
-            };
             let resolved = artifacts::resolve_chart(
                 chart.as_deref(),
                 artifacts::Channel::current(),
@@ -439,34 +457,45 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 std::path::Path::new("charts/curie").is_dir(),
             )?;
             let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-            emit_boxed(
-                curie::factory_intake::factory_intake(curie::factory_intake::FactoryIntakeOpts {
-                    common: CommonOpts {
-                        namespace,
-                        release,
-                        dry_run,
-                    },
-                    chart,
-                    repos,
-                    all_installed_repos,
-                    label,
-                    mention,
-                    card_base_url,
-                    webhook_secret,
-                    forge_egress,
-                    disable,
-                    timeout_seconds: timeout,
-                    app_id,
-                    private_key_file,
-                    org,
-                    intake,
-                    runner_binding,
-                    repo_runners,
-                    registry,
-                    repo_docker,
-                })
-                .await?,
-            )
+            let mut opts = curie::factory_intake::FactoryIntakeOpts {
+                common: CommonOpts {
+                    namespace,
+                    release,
+                    dry_run,
+                },
+                chart,
+                repos,
+                all_installed_repos,
+                label,
+                mention,
+                card_base_url,
+                webhook_secret: None,
+                forge_egress,
+                disable,
+                timeout_seconds: timeout,
+                app_id,
+                private_key_file,
+                org,
+                intake,
+                model_auth_mode,
+                runner_binding,
+                repo_runners,
+                registry,
+                repo_docker,
+            };
+            // Decide mode-only first: an exported webhook secret must not turn
+            // `--model-auth-mode` alone into an intake run.
+            let mode_only = webhook_secret_file.is_none()
+                && curie::factory_intake::model_auth_mode_only(&opts).is_some();
+            if !(mode_only
+                || opts.disable
+                || !opts.repo_runners.is_empty()
+                || !opts.repo_docker.is_empty())
+            {
+                opts.webhook_secret =
+                    curie::factory_intake::resolve_webhook_secret(webhook_secret_file.as_deref())?;
+            }
+            emit_boxed(curie::factory_intake::factory_intake(opts).await?)
         }
         ClusterAction::Message {
             text,

@@ -48,11 +48,11 @@ from aiohttp.test_utils import TestServer
 from channel_protocol.work_item_events import execute_event_id
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from curie_runner import RunTracer, SideEffectClassifier, workspace_snapshot
+from curie_runner.completion_contract import BoundContract, bind_completion_contract
 from curie_runner.fake import FakeModelSession
 from curie_runner.server import bind_status_attestation
 from curie_runner.server import create_app as create_runner_app
 from curie_runner.session import SessionRunner
-from curie_runner.tracker_result import BoundContract, bind_completion_contract
 from curie_worker.approvals import ApprovalClient
 from curie_worker.binding import FactoryWake
 from curie_worker.kernel.publication_recovery import RECOVERY_REFUSED_CAUSE

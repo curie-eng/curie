@@ -194,8 +194,8 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0044");
-    assert_eq!(target.schema_min, "0187");
-    assert_eq!(target.schema_head, "0187");
+    assert_eq!(target.schema_min, "0189");
+    assert_eq!(target.schema_head, "0189");
     let workspace_recovery = target
         .revisions
         .iter()
@@ -269,13 +269,13 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         .expect("the personal custody revision is packaged");
     assert_eq!(custody.parents, vec![String::from("0159")]);
     assert_eq!(custody.kind, "expand");
-    let tracker_results = target
+    let revision_0162 = target
         .revisions
         .iter()
         .find(|node| node.revision == "0162")
-        .expect("the factory tracker result revision is packaged");
-    assert_eq!(tracker_results.parents, vec![String::from("0160")]);
-    assert_eq!(tracker_results.kind, "expand");
+        .expect("revision 0162 is packaged");
+    assert_eq!(revision_0162.parents, vec![String::from("0160")]);
+    assert_eq!(revision_0162.kind, "expand");
     let ci_observation = target
         .revisions
         .iter()
@@ -304,13 +304,13 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         .expect("the factory Slack thread origin revision is packaged");
     assert_eq!(origin.parents, vec![String::from("0165")]);
     assert_eq!(origin.kind, "expand");
-    let triage_activation = target
+    let revision_0167 = target
         .revisions
         .iter()
         .find(|node| node.revision == "0167")
-        .expect("the factory triage activation revision is packaged");
-    assert_eq!(triage_activation.parents, vec![String::from("0166")]);
-    assert_eq!(triage_activation.kind, "expand");
+        .expect("revision 0167 is packaged");
+    assert_eq!(revision_0167.parents, vec![String::from("0166")]);
+    assert_eq!(revision_0167.kind, "expand");
     let intake_notices = target
         .revisions
         .iter()
@@ -325,13 +325,13 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         .expect("the requester instruction revision is packaged");
     assert_eq!(requester_selection.parents, vec![String::from("0168")]);
     assert_eq!(requester_selection.kind, "expand");
-    let triage_handoff = target
+    let revision_0171 = target
         .revisions
         .iter()
         .find(|node| node.revision == "0171")
-        .expect("the triage handoff revision is packaged");
-    assert_eq!(triage_handoff.parents, vec![String::from("0170")]);
-    assert_eq!(triage_handoff.kind, "expand");
+        .expect("revision 0171 is packaged");
+    assert_eq!(revision_0171.parents, vec![String::from("0170")]);
+    assert_eq!(revision_0171.kind, "expand");
     let retry_allowance = target
         .revisions
         .iter()
@@ -430,12 +430,19 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         .expect("the plain feedback cap revision is packaged");
     assert_eq!(plain_feedback_cap.parents, vec![String::from("0185")]);
     assert_eq!(plain_feedback_cap.kind, "expand");
+    let triage_removal = target
+        .revisions
+        .iter()
+        .find(|node| node.revision == "0188")
+        .expect("the triage schema removal revision is packaged");
+    assert_eq!(triage_removal.parents, vec![String::from("0186")]);
+    assert_eq!(triage_removal.kind, "contract");
     let run_handoff = target
         .revisions
         .iter()
-        .find(|node| node.revision == "0187")
+        .find(|node| node.revision == "0189")
         .expect("the factory run handoff revision is packaged");
-    assert_eq!(run_handoff.parents, vec![String::from("0186")]);
+    assert_eq!(run_handoff.parents, vec![String::from("0188")]);
     assert_eq!(run_handoff.kind, "expand");
 
     let pending =
@@ -462,7 +469,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             "0139", "0141", "0143", "0144", "0145", "0146", "0147", "0148", "0149", "0151", "0152",
             "0153", "0154", "0156", "0157", "0158", "0159", "0160", "0162", "0163", "0164", "0165",
             "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0173", "0174", "0175", "0176",
-            "0177", "0178", "0179", "0180", "0182", "0183", "0184", "0185", "0186", "0187"
+            "0177", "0178", "0179", "0180", "0182", "0183", "0184", "0185", "0186", "0188", "0189"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -470,7 +477,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         .filter(|step| step.kind == "contract")
         .map(|step| step.revision.as_str())
         .collect();
-    assert_eq!(contracts, ["0060", "0063", "0070", "0103"]);
+    assert_eq!(contracts, ["0060", "0063", "0070", "0103", "0188"]);
     assert!(pending
         .iter()
         .all(|step| step.kind == "expand" || contracts.contains(&step.revision.as_str())));
@@ -493,7 +500,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
     );
     assert_eq!(decision.action, "apply");
     assert_eq!(decision.source_head.as_deref(), Some("0044"));
-    assert_eq!(decision.target_min, "0187");
+    assert_eq!(decision.target_min, "0189");
 }
 
 // @spec PROTECTED-HOOK-SOURCE-10
@@ -511,8 +518,8 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_min, "0187");
-    assert_eq!(target.schema_head, "0187");
+    assert_eq!(target.schema_min, "0189");
+    assert_eq!(target.schema_head, "0189");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     assert_eq!(
@@ -536,11 +543,11 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             "0145", "0146", "0147", "0148", "0149", "0151", "0152", "0153", "0154", "0156", "0157",
             "0158", "0159", "0160", "0162", "0163", "0164", "0165", "0166", "0167", "0168", "0169",
             "0170", "0171", "0172", "0173", "0174", "0175", "0176", "0177", "0178", "0179", "0180",
-            "0182", "0183", "0184", "0185", "0186", "0187"
+            "0182", "0183", "0184", "0185", "0186", "0188", "0189"
         ]
     );
 
-    // Contracts 0060, 0063, 0070 and 0090 are pending, so 0.10.1 needs the forward flag.
+    // Contracts 0060, 0063, 0070, 0090 and 0188 are pending, so 0.10.1 needs the forward flag.
     let refused = plan_upgrade(
         Some(&source.schema_head),
         &target,
@@ -557,7 +564,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
         Some(&source.schema_head),
     );
     assert_eq!(decision.action, "apply");
-    assert_eq!(decision.target_min, "0187");
+    assert_eq!(decision.target_min, "0189");
 }
 
 /// @spec PROTECTED-HOOK-SOURCE-1
@@ -586,8 +593,8 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0062");
-    assert_eq!(target.schema_min, "0187");
-    assert_eq!(target.schema_head, "0187");
+    assert_eq!(target.schema_min, "0189");
+    assert_eq!(target.schema_head, "0189");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     assert_eq!(
@@ -611,7 +618,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             "0149", "0151", "0152", "0153", "0154", "0156", "0157", "0158", "0159", "0160", "0162",
             "0163", "0164", "0165", "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0173",
             "0174", "0175", "0176", "0177", "0178", "0179", "0180", "0182", "0183", "0184", "0185",
-            "0186", "0187"
+            "0186", "0188", "0189"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -619,7 +626,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
         .filter(|step| step.kind == "contract")
         .map(|step| step.revision.as_str())
         .collect();
-    assert_eq!(contracts, ["0063", "0070", "0103"]);
+    assert_eq!(contracts, ["0063", "0070", "0103", "0188"]);
 
     let refused = plan_upgrade(
         Some(&source.schema_head),
@@ -663,8 +670,8 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0063");
-    assert_eq!(target.schema_min, "0187");
-    assert_eq!(target.schema_head, "0187");
+    assert_eq!(target.schema_min, "0189");
+    assert_eq!(target.schema_head, "0189");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.3 reaches the new head");
     assert_eq!(
@@ -688,7 +695,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             "0151", "0152", "0153", "0154", "0156", "0157", "0158", "0159", "0160", "0162", "0163",
             "0164", "0165", "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0173", "0174",
             "0175", "0176", "0177", "0178", "0179", "0180", "0182", "0183", "0184", "0185", "0186",
-            "0187"
+            "0188", "0189"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -696,7 +703,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
         .filter(|step| step.kind == "contract")
         .map(|step| step.revision.as_str())
         .collect();
-    assert_eq!(contracts, ["0070", "0103"]);
+    assert_eq!(contracts, ["0070", "0103", "0188"]);
 
     let refused = plan_upgrade(
         Some(&source.schema_head),

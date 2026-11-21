@@ -1,7 +1,7 @@
 """Store the optional bounded run handoff on the existing status row (#5771).
 
-Revision ID: 0187
-Revises: 0186
+Revision ID: 0189
+Revises: 0188
 """
 
 from collections.abc import Sequence
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
-revision: str = "0187"
-down_revision: str = "0186"
+revision: str = "0189"
+down_revision: str = "0188"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

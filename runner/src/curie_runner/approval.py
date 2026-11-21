@@ -47,6 +47,7 @@ from typing import Any, NamedTuple
 
 import yaml
 from aci_protocol import PublicationContext
+from curie_internal.approver_ticket import TicketError, unverified_claims
 from plugin_format import (
     PLATFORM_PUBLISH_TOOL_NAME,
     TOOL_POLICY_ENFORCEMENT,
@@ -73,13 +74,13 @@ from .approval_wording import describe_approval, presentation_text
 from .caller_feedback import action_label
 from .memory_facts import MEMORY_TOOL_NAMES
 from .publication_precheck import PublicationPrecheck
+from .ticket_carry import TICKET_ARGUMENT, TicketCarry, damaged_copy_of, live_pair
 from .tool_names import (
     PROGRESS_TOOL,
     PROPOSE_RULE_TOOL,
     QUESTION_TOOL,
     RUN_HANDOFF_TOOL,
     STATE_TOOL_NAMES,
-    TRACKER_RESULT_TOOL,
     TURN_PROGRESS_TOOL,
 )
 
@@ -247,10 +248,6 @@ TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
 # The GitHub factory's platform issue read (ADR 0187), mounted on the same
 # server only when the worker injected the issue read route and capability.
 ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
-# The tracker result submission (ADR 0277, #5586), mounted on the same server
-# only for an execution whose API contract is tracker_result. It writes, so it
-# is never in ``side_effects.PLATFORM_IDEMPOTENT_TOOLS``.
-TRACKER_RESULT_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TRACKER_RESULT_TOOL}"
 # The factory question tool (#5785), mounted on the same server only for an
 # execution whose API contract is implementation and that holds the issue read
 # capability. It writes a ticket comment, so it is never idempotent (see
@@ -290,9 +287,6 @@ PROPOSE_RULE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{PROPOSE_RULE_TOOL}"
 # execution: it reports a phase and never acts, so it is never gated.
 # This also covers ``progress`` (ADR 0130), mounted only for eligible human
 # turns, and ``get_issue`` (ADR 0187), which reads only the execution's own issue.
-# ``submit_tracker_result`` (ADR 0277) is the run's one platform result: the
-# API, not toolPolicy, decides whether it is accepted, from the request bound
-# capability, and only the platform's own ``curie`` server publishes the name.
 # ``ask_questions`` (#5785) is exempt for the same reason: the API, not
 # toolPolicy, decides from the request bound capability whether the questions
 # are accepted, and only the platform's own ``curie`` server publishes the name.
@@ -307,7 +301,6 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
         RUN_HANDOFF_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
-        TRACKER_RESULT_TOOL_NAME,
         QUESTION_TOOL_NAME,
         PROPOSE_RULE_TOOL_NAME,
     }
@@ -659,6 +652,11 @@ class ApprovalGate:
     # ``SessionRunner`` knows the runner itself requested that stop. It is
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
+    # Set by ``halt_for_questions`` once ``ask_questions`` has posted this
+    # turn's round (ADR 0286 decisions 2 and 11, #5785). From then on every
+    # tool call of the turn is refused with the same turn-stopping flags a
+    # blocked call carries. Runner-internal, per turn, never serialized.
+    questions_posted: bool = False
     # The metric observer must attribute a hold to the exact SDK call. A tool
     # name is insufficient when a granted call and a held sibling share it.
     held_call_ids: set[str] = field(default_factory=set)
@@ -692,6 +690,11 @@ class ApprovalGate:
     # (#1461). Same fact-not-default reasoning as ``state_server_mounted``:
     # ``__main__`` sets it from the expression that decides the mount.
     memory_tools_mounted: bool = False
+    # The connector-issued approval tickets this conversation has seen (ADR
+    # 0288). Deliberately NOT cleared by ``reset()``: a ticket prepared in
+    # one turn may be used in the next. It holds no authority; see
+    # ``carried_input``.
+    ticket_carry: TicketCarry = field(default_factory=TicketCarry, repr=False)
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -745,6 +748,7 @@ class ApprovalGate:
         # than with the boot-turn grant below: a halt that leaked forward would
         # make every later errored turn finalize as awaiting-approval (#1852).
         self.pending_halt = False
+        self.questions_posted = False
         self.held_call_ids.clear()
         self.refused_call_ids.clear()
         # Boot-turn-only grant: keep it on the first reset (the boot turn),
@@ -828,6 +832,96 @@ class ApprovalGate:
         self.grant_tool = None
         self.grant_arguments = None
         return True
+
+    def halt_for_questions(self) -> None:
+        """End this turn because its questions are posted (ADR 0286, #5785).
+
+        The request ends when the factory asks (decision 2) and the platform,
+        not the model, enforces it (decision 11). This reuses the approval
+        hook: its PostToolUse callback ends the turn right after the ask, and
+        ``_decide_gate`` refuses with the turn-stopping flags a blocked call
+        carries any call sent beside it, so the model runs nothing after its
+        ask. No approval is recorded, so ``pending_halt`` stays unset: the
+        turn is not paused for a human.
+        """
+
+        self.questions_posted = True
+
+    def observe_tool_result(self, tool_name: str, response: Any) -> int:
+        """Remember the approval tickets a hosted connector tool returned (ADR 0288).
+
+        Only a reply from a server in ``proxied_connector_servers`` is read, at
+        call time, so a session with no hosted connector remembers nothing.
+        Returns how many new tickets were remembered.
+        """
+
+        return self.ticket_carry.observe(
+            tool_name, response, servers=self.proxied_connector_servers
+        )
+
+    def carried_input(self, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+        """The arguments to record for a held call: the model's, or the carried ticket's.
+
+        ADR 0288 decision 1. For a hosted connector's gated tool, the one
+        remembered ticket issued for exactly these other arguments replaces the
+        model's copy of it. In every other case the model's arguments are
+        returned unchanged, which is the behavior before this rule existed. The
+        API verifies whatever ticket it receives, so this choice grants nothing.
+        """
+
+        pair = live_pair(tool_name)
+        if pair is None or pair[0] not in self.proxied_connector_servers:
+            return tool_input
+        restored = self.ticket_carry.restore(tool_name, tool_input)
+        return tool_input if restored is None else restored
+
+    def granted_with_ticket(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """The approved arguments when this call differs from them only in its ticket.
+
+        ADR 0288 decision 2. The grant's stored arguments are the trusted
+        resume boot input (#3255) and carry the exact ticket the API verified.
+        When the model's call names the granted tool, carries a damaged copy of
+        the granted ticket (``ticket_carry.damaged_copy_of``) and is canonically
+        equal to the grant in every other argument, the approved call runs with
+        the stored arguments instead of the model's copy. None in every other
+        case, so a call with different details still meets the grant-mismatch
+        refusal (#3174). Like ``carried_input``, it applies only to a hosted
+        connector's tool: an ordinary tool argument that happens to be named
+        ``approval_ticket`` is compared like any other argument.
+        """
+
+        granted = self.grant_arguments
+        if self.grant_tool is None or tool_name != self.grant_tool or granted is None:
+            return None
+        pair = live_pair(tool_name)
+        if pair is None or pair[0] not in self.proxied_connector_servers:
+            return None
+        ticket = granted.get(TICKET_ARGUMENT)
+        if not isinstance(ticket, str):
+            return None
+        try:
+            claims = unverified_claims(ticket)
+        except TicketError:
+            return None
+        if (claims.connector, claims.tool) != pair:
+            return None
+        # The same evidence rule as creation: only a damaged copy of the
+        # granted ticket itself is repaired; a different or missing ticket
+        # keeps the grant-mismatch refusal. No runner memory is read: the
+        # stored arguments are the only trust anchor, and the repaired call is
+        # the approved call byte for byte, whatever else the runner has seen.
+        if not damaged_copy_of(tool_input.get(TICKET_ARGUMENT), ticket):
+            return None
+        others = {key: value for key, value in tool_input.items() if key != TICKET_ARGUMENT}
+        approved = {key: value for key, value in granted.items() if key != TICKET_ARGUMENT}
+        try:
+            if _canonical_arguments(others) != _canonical_arguments(approved):
+                return None
+            return deepcopy(granted)
+        except (TypeError, ValueError, RecursionError):
+            return None
 
     def block(self, tool_name: str, tool_input: dict[str, Any]) -> None:
         # Outside the first-block guard on purpose (#1852): the FIRST blocked
@@ -927,6 +1021,10 @@ class _GateDecision(NamedTuple):
     ungated: bool
     refusal: str | None = None
     continue_turn: bool = False
+    # The arguments an allowed call must run with instead of the model's (ADR
+    # 0288 decision 2): the grant's stored arguments when the model's copy
+    # differed only in its approval ticket. None leaves the call as written.
+    updated_input: dict[str, Any] | None = None
 
 
 def is_mcp_tool(live_tool_name: str) -> bool:
@@ -1101,6 +1199,12 @@ def _canonical_arguments(arguments: dict[str, Any]) -> str:
     return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+_QUESTIONS_POSTED_REFUSAL = (
+    "The questions are posted on the ticket, so this session has ended. This "
+    "call was not run. Make no further changes."
+)
+
+
 def _grant_mismatch_refusal(tool_name: str) -> str:
     return (
         f"The approval for {action_label(tool_name)} covers only the approved details, "
@@ -1126,6 +1230,12 @@ async def _decide_gate(
     flag) -- this function decides, it does not render.
     """
 
+    if gate.questions_posted:
+        # ADR 0286 decision 11: nothing runs after the questions are posted,
+        # and the refusal stops the turn (``continue_turn`` stays False).
+        if tool_use_id is not None:
+            gate.refused_call_ids.add(tool_use_id)
+        return _GateDecision(blocked=False, ungated=False, refusal=_QUESTIONS_POSTED_REFUSAL)
     if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
         refusal = await gate.check_publication(tool_use_id, tool_input)
         if refusal is not None:
@@ -1146,6 +1256,11 @@ async def _decide_gate(
     # Policy gates are additive to legacy/operator gates. A policy allow never
     # removes a legacy gate, while approvalRequired joins the same one-shot path.
     if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
+        # ADR 0288 decision 2: a copy that differs from the grant only in
+        # its ticket runs with the grant's stored arguments.
+        granted = gate.granted_with_ticket(tool_name, tool_input)
+        if granted is not None:
+            tool_input = granted
         if gate.grant_argument_mismatch(tool_name, tool_input):
             if tool_use_id is not None:
                 gate.refused_call_ids.add(tool_use_id)
@@ -1156,8 +1271,9 @@ async def _decide_gate(
                 continue_turn=True,
             )
         if gate.consume_grant(tool_name, tool_input):
-            return _GateDecision(blocked=False, ungated=False)
-        gate.block(tool_name, tool_input)
+            return _GateDecision(blocked=False, ungated=False, updated_input=granted)
+        # ADR 0288 decision 1: record the connector's own ticket, not the copy.
+        gate.block(tool_name, gate.carried_input(tool_name, tool_input))
         if tool_use_id is not None:
             gate.held_call_ids.add(tool_use_id)
         return _GateDecision(blocked=True, ungated=False)
@@ -1165,6 +1281,13 @@ async def _decide_gate(
         return _GateDecision(blocked=False, ungated=True)
     # Publication is completed outside the sandbox after approval, so an
     # injected or stale grant must never let the in-sandbox tool execute.
+    granted = (
+        gate.granted_with_ticket(tool_name, tool_input)
+        if tool_name != PLATFORM_PUBLISH_TOOL_NAME
+        else None
+    )
+    if granted is not None:
+        tool_input = granted
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.grant_argument_mismatch(
         tool_name, tool_input
     ):
@@ -1177,8 +1300,8 @@ async def _decide_gate(
             continue_turn=True,
         )
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name, tool_input):
-        return _GateDecision(blocked=False, ungated=False)
-    gate.block(tool_name, tool_input)
+        return _GateDecision(blocked=False, ungated=False, updated_input=granted)
+    gate.block(tool_name, gate.carried_input(tool_name, tool_input))
     if tool_use_id is not None:
         gate.held_call_ids.add(tool_use_id)
     if (

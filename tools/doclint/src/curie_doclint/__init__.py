@@ -16,9 +16,17 @@ Four phases run over the linted root (``docs/`` excluding ``docs/adr/``):
    every Python symbol resolves, and every cited ADR number has a file in
    ``docs/adr/`` (#3844, see ``adr_citations.py``).
 
+ADR number uniqueness (#541, #1957) runs as part of generation: the working
+tree must not duplicate a prefix, and a real git checkout also fetches
+``origin/main`` / ``origin/next`` and open PR additions so a number cannot be
+claimed twice across trains. A failed remote scan fails closed
+(``adr_uniqueness.py``).
+
 ``main`` is a pure check by default (drift is a finding, nothing is written);
 ``main --write`` rewrites the generated regions so ``scripts/check-docs.sh`` can
-diff them, mirroring ``scripts/check-contracts.sh``.
+diff them, mirroring ``scripts/check-contracts.sh``. Write mode checks only
+the working-tree prefixes so catalog regeneration stays offline-safe; the
+following non-write invocation performs the remote scan.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ import subprocess
 from pathlib import Path
 
 from .adr_citations import scan_adr_citations
+from .adr_uniqueness import check_adr_uniqueness, repo_has_git_metadata
 from .citation import (
     SOURCE_EXTENSIONS,
     Classification,
@@ -97,17 +106,25 @@ def _git_top_level() -> Path:
     return Path(result.stdout.strip())
 
 
-def lint(repo_root: Path) -> list[Finding]:
+def lint(
+    repo_root: Path, *, require_remote_adr_scan: bool | None = None
+) -> list[Finding]:
     """Run the generate + lint phases in memory and return the findings."""
-    findings, _ = _lint_and_count(repo_root)
+    findings, _ = _lint_and_count(
+        repo_root, require_remote_adr_scan=require_remote_adr_scan
+    )
     return findings
 
 
-def _lint_and_count(repo_root: Path) -> tuple[list[Finding], int]:
+def _lint_and_count(
+    repo_root: Path, *, require_remote_adr_scan: bool | None = None
+) -> tuple[list[Finding], int]:
     """Return the findings plus the count of lines silenced by the escape hatch."""
     cache = SymbolCache()
     findings: list[Finding] = []
-    findings.extend(_check_generation(repo_root))
+    findings.extend(
+        _check_generation(repo_root, require_remote_adr_scan=require_remote_adr_scan)
+    )
     # Prose counts the catalog states about the tree (#938). Not a generated
     # region: the numbers sit mid-sentence, so they are asserted against source
     # rather than rewritten, and `--write` leaves them alone.
@@ -168,7 +185,23 @@ def _render_table_or_finding(
         return None, Finding(INDEX_REL, "seam-table", f"order tie: {exc}")
 
 
-def _check_generation(repo_root: Path) -> list[Finding]:
+def _resolve_remote_adr_scan(
+    repo_root: Path, require_remote_adr_scan: bool | None
+) -> bool:
+    """Whether to fetch trains and open PRs for ADR allocation (#1957).
+
+    Explicit CLI choice wins. Otherwise a real git checkout requires the
+    remote scan; fixture trees without ``.git`` stay local-only so the unit
+    suite remains hermetic.
+    """
+    if require_remote_adr_scan is not None:
+        return require_remote_adr_scan
+    return repo_has_git_metadata(repo_root)
+
+
+def _check_generation(
+    repo_root: Path, *, require_remote_adr_scan: bool | None = None
+) -> list[Finding]:
     seam_docs, findings = _collect_seam_rows(repo_root)
     rows: list[tuple[str, SeamMeta]] = []
 
@@ -181,48 +214,18 @@ def _check_generation(repo_root: Path) -> list[Finding]:
 
     findings.extend(_check_index_region(repo_root, rows))
 
-    collisions = _check_adr_uniqueness(repo_root)
+    collisions = check_adr_uniqueness(
+        repo_root,
+        require_remote=_resolve_remote_adr_scan(repo_root, require_remote_adr_scan),
+    )
     findings.extend(collisions)
     # A collided dir cannot produce a meaningful index -- two rows would claim
     # one number -- and reporting drift on top of the collision buries the one
     # finding that has a remedy. Fix the numbers, then the index follows.
-    if not collisions:
+    # Warnings about remote collisions this PR does not participate in must not
+    # suppress the index check.
+    if not any(f.severity == "error" for f in collisions):
         findings.extend(_check_adr_index_region(repo_root))
-    return findings
-
-
-def _adr_collisions(repo_root: Path) -> dict[str, list[str]]:
-    """Group ADR filenames by their number prefix, keeping only the collisions."""
-    by_number: dict[str, list[str]] = {}
-    for doc in iter_adr_docs(repo_root):
-        number = adr_number(doc)
-        if number is not None:
-            by_number.setdefault(number, []).append(doc.name)
-    return {number: names for number, names in by_number.items() if len(names) > 1}
-
-
-def _check_adr_uniqueness(repo_root: Path) -> list[Finding]:
-    """No two ADRs may claim the same number prefix (#541, AC A).
-
-    Reads **filenames**, deliberately: ``docs/adr/`` is excluded from the
-    citation walk because an Accepted ADR is immutable and its citations are
-    allowed to rot with the code they described. So this is the one check that
-    looks at a directory whose contents the linter otherwise refuses to read.
-
-    Both colliding names are reported. The whole remedy is deciding which file
-    moves, and "0029 is duplicated" does not tell you that.
-    """
-    findings: list[Finding] = []
-    for number, names in sorted(_adr_collisions(repo_root).items()):
-        findings.append(
-            Finding(
-                _ADR_REL,
-                number,
-                f"ADR number {number} is claimed by {len(names)} files: "
-                f"{', '.join(sorted(names))}; renumber all but one to the next "
-                "free number and update every inbound reference",
-            )
-        )
     return findings
 
 
@@ -646,7 +649,10 @@ def _write_adr_index(repo_root: Path) -> list[Finding]:
     if not index_path.is_file():
         return [_missing_adr_index()]
 
-    collisions = _check_adr_uniqueness(repo_root)
+    # Write stays offline: only the working-tree prefixes must be unique before
+    # regenerating the index. Cross-train allocation runs on the subsequent
+    # check invocation from scripts/check-docs.sh.
+    collisions = check_adr_uniqueness(repo_root, require_remote=False)
     if collisions:
         return collisions
 
@@ -672,15 +678,45 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Rewrite the generated regions in place instead of checking drift.",
     )
+    remote = parser.add_mutually_exclusive_group()
+    remote.add_argument(
+        "--require-remote-adr-scan",
+        action="store_true",
+        help=(
+            "Fetch origin/main and origin/next and list open PR ADR additions "
+            "before accepting ADR numbers (#1957). Collisions this candidate "
+            "adds or renames into fail the gate; other remote collisions are "
+            "warnings. Fails closed on scan errors when this candidate claims "
+            "a new ADR file. Default for a git checkout when neither flag is set."
+        ),
+    )
+    remote.add_argument(
+        "--skip-remote-adr-scan",
+        action="store_true",
+        help=(
+            "Check only working-tree ADR prefixes. Used by the hermetic unit "
+            "suite and by --write; the scripts/check-docs.sh check pass does "
+            "not pass this flag."
+        ),
+    )
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else _git_top_level()
+
+    if args.require_remote_adr_scan:
+        require_remote: bool | None = True
+    elif args.skip_remote_adr_scan:
+        require_remote = False
+    else:
+        require_remote = None
 
     if args.write:
         findings = _write_generated(repo_root)
         ignored = 0
     else:
-        findings, ignored = _lint_and_count(repo_root)
+        findings, ignored = _lint_and_count(
+            repo_root, require_remote_adr_scan=require_remote
+        )
 
     for finding in findings:
         print(finding.render())
@@ -688,4 +724,6 @@ def main(argv: list[str]) -> int:
     if ignored:
         print(f"doclint: {ignored} line(s) suppressed by the ignore-line escape hatch")
 
-    return 0 if not findings else 1
+    # Warnings (e.g. ADR collisions this PR does not claim) stay in the log
+    # but do not fail the gate (#1957 review).
+    return 0 if not any(f.severity == "error" for f in findings) else 1

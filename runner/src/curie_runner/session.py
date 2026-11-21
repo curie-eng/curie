@@ -422,6 +422,7 @@ class SessionRunner:
         memory_store: MemoryStore | None = None,
         history_store: TranscriptStore | None = None,
         approval_gate: ApprovalGate | None = None,
+        question_gate: ApprovalGate | None = None,
         approval_resumed_kind: str | None = None,
         approval_decision: str | None = None,
         false_completion_check: bool = False,
@@ -529,6 +530,9 @@ class SessionRunner:
         # blocked approval-required call here, and the turn's final is flipped
         # to awaiting-approval on the same override the policy gate uses.
         self._approval_gate = approval_gate
+        # The gate that carries the question halt (ADR 0286, #5785): the
+        # approval gate, or a factory boot's gate that gates nothing.
+        self._question_gate = question_gate if question_gate is not None else approval_gate
         # The SDK's init catalog is the evidence a CLI unknown-tool result
         # needs before it can be separated from a connector's own error text.
         # None means no trustworthy catalog has arrived; fail closed to error.
@@ -1515,6 +1519,8 @@ class SessionRunner:
                 # grant for the next turn that may spend it.
                 self._approval_gate.reset(grant_eligible=event.tool_access is None)
                 self._approval_gate.bind_publication_context(event.publication_context)
+            if self._question_gate is not None and self._question_gate is not self._approval_gate:
+                self._question_gate.reset()
             tracker = BudgetTracker(ceiling=self._ceiling)
             metric_outcome = "interrupted"
             metric_attributes = {
@@ -2516,8 +2522,16 @@ class SessionRunner:
                     tool,
                 )
 
+    def _questions_posted(self) -> bool:
+        gate = self._question_gate
+        return gate is not None and gate.questions_posted
+
     def _has_unhandled_publication(self, state: TurnState) -> bool:
         gate = self._approval_gate
+        if self._questions_posted():
+            # ADR 0286 decision 2 (#5785): a posted question round ends the
+            # request, so a publication call beside the ask is not one to record.
+            return False
         return any(
             gate is None or not gate.publication_refused(tool_use_id)
             for tool_use_id, _ in state.publication_calls
@@ -2797,6 +2811,17 @@ class SessionRunner:
         gate = self._approval_gate
         if gate is None:
             return
+        if self._questions_posted():
+            # ADR 0286 decisions 2 and 11 (#5785): the turn ended because its
+            # question round was posted, so it is the question ending and never
+            # an approval pause, even for a call the model sent beside the ask.
+            state.approval_summary = None
+            state.approval_display = None
+            state.approval_route = None
+            state.approval_gate_kind = None
+            state.approval_granted_tool = None
+            state.approval_granted_arguments = None
+            return
 
         permission_is_actionable_tool = (
             gate.pending_summary is not None
@@ -2973,6 +2998,11 @@ class SessionRunner:
             return Final(text="run interrupted", status=final.status), False
         if final.status is not SessionStatus.DONE:
             return final, False
+        if self._questions_posted():
+            # ADR 0286 decision 2 (#5785): the posted question round is this
+            # turn's answer, and the halt ended the turn before any final text,
+            # so there is no candidate to validate and the turn is not a failure.
+            return final, False
         accepted = validation.accepts(final.text)
         if accepted:
             # Preserve the outbound security boundary. A candidate needing
@@ -2983,9 +3013,7 @@ class SessionRunner:
             accepted = isinstance(clean, Final) and clean.text == final.text
         if accepted:
             return final.model_copy(update={"text_mode": "verbatim"}), False
-        return Final(
-            text=FINAL_ANSWER_DIAGNOSTIC, status=SessionStatus.CLASSIFIED_FAILURE
-        ), True
+        return Final(text=FINAL_ANSWER_DIAGNOSTIC, status=SessionStatus.CLASSIFIED_FAILURE), True
 
     def _with_connector_notice(self, final: Final) -> Final:
         """Lead a DONE final's text with this turn's one-line connector notice.

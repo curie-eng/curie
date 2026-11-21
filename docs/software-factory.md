@@ -127,13 +127,13 @@ below. The skill does not deploy a factory or guarantee that a task can finish.
 
 ## Read a factory pull request
 
-After a factory run, `curie factory explain` reads that issue's factory pull requests with your own GitHub login. Pass `owner/repo#number` or a github.com issue URL:
+After a factory run, `curie factory explain` reads that issue's factory pull requests with your own GitHub login. Pass `owner/repo#number` or a github.com issue URL. The reference must be an issue, not a pull request; a pull request reference exits 2 with a usage error:
 
 ```bash
-curie factory explain curie-eng/curie#120 --json
+curie factory explain curie-eng/curie#5239 --json
 ```
 
-The command checks `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. It never reads the Curie platform key. Each match prints the pull request summary, the parsed Decisions entries, verification counts, review text, forge review states, and head-commit checks. The pull request summary and the Decisions entries are the plan record. Zero matches print `no factory pull request`. A pull request that never wrote `## Decisions` reports `not recorded`.
+The command checks `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. It never reads the Curie platform key. Each match prints the pull request summary, the parsed Decisions entries, verification counts, review text, forge review states, and head-commit checks. The pull request summary and the Decisions entries are the plan record. Zero matches print `no factory pull request`. A pull request that never wrote `## Decisions` reports `not recorded`. A Decisions section ends at the next `## ` heading or at a line that is exactly `---`; the platform writes that line before the closing reference, issue marker and ask line it adds after the agent's text, so a section the agent left last still parses. A section that is malformed reports `unparsed`.
 
 ## Delegate, inspect, and refine
 
@@ -183,8 +183,16 @@ provide the equivalent provider-specific steps.
    (its body and all its inline comments together). An approving review starts
    none unless a comment mentions the factory. Each
    pull request allows 10 plain-comment revisions; the factory then posts one
-   notice and a mention, such as `@<app-slug>`, is required. A mention always
-   works and is not counted. GitLab and Bitbucket still require the mention.
+   notice and a mention, such as `@<app-slug>`, is required. A mention is not
+   counted against that cap, but it is not a bypass. On GitHub it starts a
+   revision only when its author currently has write or admin access, the pull
+   request is open and bound to the factory's lineage, and the comment or
+   review is against the pull request's current head. GitLab and Bitbucket
+   still require the mention and read it by polling: the lineage must be open,
+   the code host must confirm the comment is current, and its author must be
+   allowed (GitLab asks the host for write access; Bitbucket Cloud and Data
+   Center cannot report it, so Bitbucket requires the binding's
+   `reviewFeedbackAllowlist`). That path compares no head.
    To teach the factory a rule it keeps, turn on learned-rule proposals
    (`curie cluster overrides <agent> --memory-rule-proposals on`), give
    reusable feedback on an open factory pull request, and merge the revised

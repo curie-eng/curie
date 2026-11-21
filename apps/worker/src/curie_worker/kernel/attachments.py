@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
@@ -53,6 +54,7 @@ async def _route_attachment_and_start(
     agent_id: uuid.UUID | None,
     packs: BehaviorPacks | None = None,
     *,
+    record_handoff: Callable[[], None],
     workspace_deployment_id: uuid.UUID | None = None,
     agent_name: str | None = None,
     runner_resources: dict[str, Any] | None = None,
@@ -291,6 +293,7 @@ async def _route_attachment_and_start(
                         raise handoff_error
                     if handle is None:
                         raise RuntimeError("attachment handoff returned no handle")
+                    record_handoff()
                     prepared_installed = True
                     self._log_claim_latency(thread_key, claim_started)
                     if agent_id is not None:

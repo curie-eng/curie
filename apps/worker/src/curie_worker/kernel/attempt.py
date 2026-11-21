@@ -315,6 +315,11 @@ async def _attempt_turn(
     )
     aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(attachment_turn)
     attachment_intent = not lazy and self._attachments is not None and bool(qevent.attachments)
+    attachment_handed_off = False
+
+    def record_attachment_handoff() -> None:
+        nonlocal attachment_handed_off
+        attachment_handed_off = True
 
     # Critical section: decide steer-vs-new-turn and, if new, open the turn so
     # it is active before we release the Valkey lock (rule 1: no two live
@@ -430,6 +435,7 @@ async def _attempt_turn(
                     boot_env,
                     agent_id,
                     packs,
+                    record_handoff=record_attachment_handoff,
                     workspace_deployment_id=workspace_deployment_id,
                     agent_name=agent_name,
                     runner_resources=runner_resources,
@@ -771,9 +777,8 @@ async def _attempt_turn(
         return failures.TurnOutcome(
             terminal_ok=False,
             classification="runner-error",
-            runner_unreachable=isinstance(
-                exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError)
-            ),
+            runner_unreachable=not attachment_handed_off
+            and isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError)),
         )
     assert routed is not None
     record_reclaimed_retry()
@@ -923,13 +928,6 @@ async def _attempt_turn(
             and publication._is_publish_provenance(
                 outcome.approval_gate_kind,
                 outcome.approval_granted_tool,
-            )
-            # ADR 0277 (#5586): a tracker_result run's publish request is
-            # refused unread; no snapshot of its workspace is taken.
-            and not (
-                owned_run is not None
-                and owned_run.event_id == qevent.event_id
-                and owned_run.is_tracker_result
             )
         ):
             snapshot = None
@@ -1434,6 +1432,10 @@ async def _apply_frame(
             acc.tools_called.add(frame.tool)
     elif isinstance(frame, SideEffectFlag):
         acc.saw_side_effect = True
+        if frame.tool == constants._QUESTION_TOOL_NAME and frame.failed is False:
+            # The closing frame of an ask whose result was not an error. The
+            # opening frame carries ``failed`` None and says nothing yet.
+            acc.questions_ask_succeeded = True
         # Persist immediately so a crash before done still blocks auto-retry.
         # Unchanged by ADR-0117: this latches on the FIRST frame and the rule
         # reads presence, so a stream carrying one frame per call rather than
@@ -1566,6 +1568,7 @@ async def _finish(
             text=text,
             status=acc.status,
             tools_called=frozenset(acc.tools_called),
+            questions_ask_succeeded=acc.questions_ask_succeeded,
             assistant_text=acc.rendered(),
             runner_ended=True,
             retry_condition=acc.retry_condition,
@@ -1586,6 +1589,7 @@ async def _finish(
             approval_granted_arguments=acc.approval_granted_arguments,
             approval_display=acc.approval_display,
             tools_called=frozenset(acc.tools_called),
+            questions_ask_succeeded=acc.questions_ask_succeeded,
             assistant_text=acc.rendered(),
             runner_ended=True,
             retry_condition=acc.retry_condition,

@@ -47,7 +47,11 @@ def run_lint(capsys: pytest.CaptureFixture[str]) -> RunLint:
     """
 
     def _run(root: Path) -> tuple[int, str]:
-        code = main(["--repo-root", str(root)])
+        # Hermetic: fixture trees and the unit suite must not hit the network.
+        # Cross-train allocation is covered in test_adr_uniqueness.py against
+        # injected runners; scripts/check-docs.sh passes
+        # --require-remote-adr-scan on the real checkout.
+        code = main(["--repo-root", str(root), "--skip-remote-adr-scan"])
         captured = capsys.readouterr()
         return code, captured.out + captured.err
 

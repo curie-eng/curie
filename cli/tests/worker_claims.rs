@@ -565,6 +565,7 @@ fn assert_existing_cluster_status_shape(value: &serde_json::Value) {
         BTreeSet::from([
             "credentials",
             "delivery",
+            "factory_model_auth_mode",
             "healthy",
             "namespace",
             "pods",

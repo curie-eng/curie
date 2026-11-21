@@ -14,26 +14,31 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+import mcp.types as mcp_types
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_runner.__main__ import build_runner
 from curie_runner.approval import QUESTION_TOOL_NAME, is_platform_owned_tool
-from curie_runner.issue_read import CAPABILITY_HEADER
+from curie_runner.completion_contract import bind_completion_contract, sibling_urls
+from curie_runner.issue_read import CAPABILITY_HEADER, ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
 from curie_runner.question_tool import question_input_issues, questions_handler
 from curie_runner.side_effects import (
     PLATFORM_IDEMPOTENT_TOOLS,
     PLATFORM_SIDE_EFFECTING_TOOLS,
     SideEffectClassifier,
 )
-from curie_runner.tracker_result import bind_completion_contract, sibling_urls
-from test_tracker_result import (
+from runner_boot_session import initialized_session
+from test_completion_contract import (
     CAPABILITY,
     IMPLEMENTATION,
+    ISSUE_READ_PATH,
+    PROBE,
     RECOVERY,
-    TRACKER,
     _Api,
     _boot,  # noqa: F401 - the autouse boot fixture of the sibling tests
     _boot_session,
+    _config,
     _curie_tools,
     _ModelSession,
     _text,
@@ -130,19 +135,14 @@ def test_an_implementation_contract_with_the_capability_mounts_the_tool(
     assert isinstance(session, _ModelSession)
     tools = _curie_tools(session.options)
     assert "ask_questions" in tools
-    assert "submit_tracker_result" not in tools
 
 
-@pytest.mark.parametrize("contract", [TRACKER, RECOVERY])
-def test_other_contracts_do_not_mount_the_tool(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contract: dict[str, Any]
+def test_a_publication_recovery_contract_does_not_mount_the_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    session = _boot_session(monkeypatch, tmp_path, _QuestionsApi([(200, contract)]))
-    if isinstance(session, _ModelSession):
-        assert "ask_questions" not in _curie_tools(session.options)
-    else:
-        # A publication recovery constructs no model session at all.
-        assert not isinstance(session, _ModelSession)
+    session = _boot_session(monkeypatch, tmp_path, _QuestionsApi([(200, RECOVERY)]))
+    # A publication recovery constructs no model session at all.
+    assert not isinstance(session, _ModelSession)
 
 
 def test_without_the_capability_the_tool_is_not_mounted_and_nothing_is_called(
@@ -165,10 +165,6 @@ def test_the_binding_sets_the_handler_only_for_an_implementation_contract() -> N
 
     implementation = anyio.run(bind, IMPLEMENTATION)
     assert implementation.question_handler is not None
-    assert implementation.result_handler is None
-    tracker = anyio.run(bind, TRACKER)
-    assert tracker.question_handler is None
-    assert tracker.result_handler is not None
     assert anyio.run(bind, RECOVERY).question_handler is None
     assert anyio.run(bind_completion_contract, None).question_handler is None
 
@@ -327,6 +323,127 @@ def test_a_transport_failure_asks_for_a_retry_and_never_names_the_endpoint() -> 
     assert "127.0.0.1" not in text
     assert CAPABILITY not in text
     json.dumps(result)
+
+
+# --- The halt a posted round sets (ADR 0286 decision 11) ---------------------------
+
+
+async def _bash_decisions(options: Any) -> list[dict[str, Any]]:
+    """Every PreToolUse answer the booted session gives one Bash call."""
+
+    decisions: list[dict[str, Any]] = []
+    for matcher in options.hooks["PreToolUse"]:
+        for callback in matcher.hooks:
+            decisions.append(
+                await callback(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "git commit -am more"},
+                    },
+                    "toolu_after_ask",
+                    {"signal": None},
+                )
+            )
+    return decisions
+
+
+async def _after_ask_decisions(options: Any) -> list[dict[str, Any]]:
+    """Every PostToolUse answer the booted session gives the ask itself."""
+
+    decisions: list[dict[str, Any]] = []
+    for matcher in options.hooks.get("PostToolUse", []):
+        for callback in matcher.hooks:
+            decisions.append(
+                await callback(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "tool_name": "mcp__curie__ask_questions",
+                        "tool_input": _valid(),
+                        "tool_response": {},
+                    },
+                    "toolu_ask",
+                    {"signal": None},
+                )
+            )
+    return decisions
+
+
+def _ends(decision: dict[str, Any]) -> bool:
+    return decision.get("continue_") is False
+
+
+def _stops(decision: dict[str, Any]) -> bool:
+    output = decision.get("hookSpecificOutput") or {}
+    return output.get("permissionDecision") == "deny" and decision.get("continue_") is False
+
+
+@pytest.mark.parametrize(
+    ("answer", "halts", "managed"),
+    [
+        ((200, {"round": 1, "rounds_limit": 3}), True, True),
+        ((200, {"round": 1, "rounds_limit": 3}), True, False),
+        ((409, {"code": "already_asked"}), False, True),
+        ((503, {}), False, True),
+    ],
+    ids=["200", "200-no-workspace", "409", "503"],
+)
+def test_the_booted_session_stops_the_turn_after_a_posted_round(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    answer: tuple[int, Any],
+    halts: bool,
+    managed: bool,
+) -> None:
+    """``__main__`` hands the tool the gate's halt: after a 200 the next call stops the turn.
+
+    A factory boot (an issue read capability and a managed workspace) mounts
+    ``ask_questions``; the mounted tool is called the way the CLI calls it, then
+    the session's own PreToolUse hooks decide a Bash call. Red without the
+    halt: no hook refuses. A refusal or a 503 posts nothing and stops nothing.
+    A factory boot with no managed workspace, approval tools or tool policy has
+    no policy gate and must still stop.
+    """
+
+    workspace = tmp_path / "workspace"
+    if managed:
+        (workspace / ".git").mkdir(parents=True)
+    api = _QuestionsApi([(200, IMPLEMENTATION)], answer=answer)
+
+    async def go() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        async with TestServer(api.app()) as server:
+            monkeypatch.setenv(ISSUE_READ_URL_ENV, str(server.make_url(ISSUE_READ_PATH)))
+            monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, CAPABILITY)
+            runner = build_runner(
+                _config(tmp_path),
+                mcp_capability=PROBE,
+                workspace_path=workspace if managed else None,
+            )
+            session = await initialized_session(runner)
+            assert isinstance(session, _ModelSession)
+            before = await _bash_decisions(session.options)
+            entry = session.options.mcp_servers["curie"]["instance"].get_request_handler(
+                "tools/call"
+            )
+            assert entry is not None
+            called = await entry.handler(
+                None,
+                mcp_types.CallToolRequestParams(name="ask_questions", arguments=_valid()),
+            )
+            after = await _bash_decisions(session.options)
+            ended = await _after_ask_decisions(session.options)
+            return before, after + ended, called.model_dump()
+
+    before, after, called = anyio.run(go)
+
+    assert len(api.question_calls) == 1
+    assert not any(_stops(decision) for decision in before)
+    assert any(_stops(decision) for decision in after) is halts
+    # The ask's own PostToolUse ends the turn before the model is asked again.
+    assert (
+        any(_ends(decision) and "hookSpecificOutput" not in decision for decision in after) is halts
+    )
+    assert bool(called.get("isError") or called.get("is_error")) is not halts
 
 
 # --- Classification --------------------------------------------------------------

@@ -15,12 +15,17 @@ import re
 import sys
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
+from uuid import uuid4
 
-from aci_protocol import Final, SessionStatus, TurnSource
+from aci_protocol import Attachment, Final, SessionStatus, TurnSource
 from aiohttp import web
+from channel_protocol.reply import ReplyUpdate
+from curie_worker.kernel import clock as kernel_clock
 from curie_worker.kernel import routing as kernel_routing
 from curie_worker.kernel.failures import failure_class_from_reply
 
@@ -146,6 +151,86 @@ def _counted_attempts(text: str | None) -> int:
     found = re.search(r"\(runner-error\) after (\d+) attempt\(s\)", text)
     assert found is not None, text
     return int(found.group(1))
+
+
+def test_eager_handoff_attempt_opens_no_window(make_harness, monkeypatch) -> None:
+    from .test_attachment_claim import _FakeAttachmentLane, _HistoryBinding, _WorkspaceProbe
+
+    max_attempts = 3
+    window_attempts = 5
+
+    async def go() -> None:
+        binding = _HistoryBinding(uuid4(), workspace_enabled=False)
+        async with (
+            make_harness(
+                binding=binding,
+                attachment_enabled=True,
+                attachment_mode="eager",
+                max_attempts=max_attempts,
+                claim_timeout_seconds=float(window_attempts),
+            ) as h,
+            AsyncExitStack() as stack,
+        ):
+            h.kernel._attachments = _FakeAttachmentLane()
+            h.kernel._workspace = _WorkspaceProbe(h.substrate, selected_repo=None)
+            runners = []
+            for _ in range(1 + window_attempts + max_attempts):
+                runner = _ReopenableRunner(make_harness)
+                stack.push_async_callback(runner.cleanup)
+                await runner.start()
+                runners.append(runner)
+            h.fake_k8s.runner_ports = [runner.port for runner in runners]
+            for runner in runners[1:]:
+                await runner.close()
+
+            thread = "tEagerHandoff"
+            await h.kernel.process_event(qevent("first", thread=thread))
+            assert runners[0].runner.opened == ["first"]
+
+            attempts = 0
+            emit = h.sink.emit
+
+            async def emit_with_runner_boot(reply, **kwargs):
+                nonlocal attempts
+                if isinstance(reply, ReplyUpdate) and reply.text == h.config.booting_text:
+                    # The replacement starts listening before it becomes the next
+                    # attempt's retained runner. The next replacement is still closed.
+                    if attempts:
+                        await runners[attempts].open()
+                    attempts += 1
+                return await emit(reply, **kwargs)
+
+            monkeypatch.setattr(h.sink, "emit", emit_with_runner_boot)
+            # Advance one second per attempt so the old loop can make five
+            # window attempts without depending on CI wall time.
+            monkeypatch.setattr(
+                kernel_clock, "time", SimpleNamespace(monotonic=lambda: attempts, time=time.time)
+            )
+            handoff = Mock(wraps=h.substrate.handoff)
+            monkeypatch.setattr(h.substrate, "handoff", handoff)
+            event = qevent(
+                "read the file",
+                thread=thread,
+                attachments=[Attachment(id="F2", name="report.csv", mime_type="text/csv")],
+            )
+            with _recording() as records:
+                await h.kernel.process_event(event)
+
+            records.assert_connect_failures(event.event_id)
+            assert handoff.call_count == max_attempts
+            assert len(records.failures(event.event_id)) == max_attempts
+            assert records.windows(event.event_id) == []
+            for runner in runners[1:max_attempts]:
+                assert len(runner.runner.status_headers) == 2
+                assert all(
+                    headers.get("Authorization") == "Bearer workspace-test-token"
+                    for headers in runner.runner.status_headers
+                )
+            assert _completion(h, event.event_id) == ["escalated"]
+            assert failure_class_from_reply(h.sink.last_text) == "runner-error"
+            assert _counted_attempts(h.sink.last_text) == max_attempts
+
+    asyncio.run(go())
 
 
 def test_runner_reachable_inside_window_is_answered_in_same_delivery(make_harness) -> None:

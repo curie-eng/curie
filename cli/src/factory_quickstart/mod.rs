@@ -682,6 +682,20 @@ pub enum QuickstartOutput {
     },
 }
 
+impl QuickstartOutput {
+    /// The closing `cluster access` line for a finished install, printed by the
+    /// caller after the result is emitted: it needs the release's namespace and
+    /// name, which the result does not carry.
+    pub fn console_access_hint(&self, namespace: &str, release: &str) -> Option<String> {
+        match self {
+            Self::Ready { context, .. } | Self::AgentAdded { context, .. } => {
+                Some(console_access_hint(context, namespace, release))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl crate::ui::CliOutput for QuickstartOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
@@ -979,6 +993,24 @@ pub fn kind_context_name(kind_name: &str) -> String {
 /// the gVisor-off path, so confirmation uses it too.
 fn is_kind_context(name: &str) -> bool {
     name.starts_with("kind-")
+}
+
+/// How to reach the Console and Langfuse of the release quickstart installs
+/// or confirms. It makes no claim about the release's service type: a release
+/// that already matched the target is not reinstalled and keeps what it
+/// recorded, and `cluster access` forwards both service types. The values are
+/// shell-quoted because a kubeconfig context is any name, not only `kind-*`.
+fn console_access_hint(context: &str, namespace: &str, release: &str) -> String {
+    use crate::ops::shell_quote;
+    let mut command = format!("curie cluster access --context {}", shell_quote(context));
+    for (flag, value) in [("--namespace", namespace), ("--release", release)] {
+        if value != "curie" {
+            command.push_str(&format!(" {flag} {}", shell_quote(value)));
+        }
+    }
+    format!(
+        "To open the Console and Langfuse on localhost, run `{command}`. It forwards them while it runs."
+    )
 }
 
 fn unconfirmed_remote_context<'a>(
@@ -1329,6 +1361,11 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
         "--chart".into(),
         target.chart.to_string(),
     ];
+    // Quickstart is also how organisations stand up shared factory clusters, so
+    // every install it runs keeps the console and Langfuse ClusterIP, reached
+    // on demand with `curie cluster access`, which holds loopback
+    // port-forwards only while it runs.
+    up.push("--no-expose".into());
     if kind_target {
         up.push("--set".into());
         up.push(GVISOR_OFF_SET.into());
@@ -2786,6 +2823,8 @@ mod tests {
     use super::*;
 
     const KIND_CONTEXT: &str = "kind-curie-factory";
+    const REMOTE_CONTEXT: &str = "remote-cluster";
+    const ODD_CONTEXT: &str = "prod west; id";
     const TEST_CONTEXT: &str = "scratch-cluster";
 
     fn agent_holding(kind: &str, address: &str, label: Option<&str>) -> crate::api::Agent {
@@ -3026,6 +3065,88 @@ mod tests {
         );
         assert!(!text.contains("cluster deploy"), "{text}");
         assert!(plan_touches_forbidden_tool(&lines).is_none(), "{text}");
+    }
+
+    /// Quickstart keeps the console and Langfuse ClusterIP on every path: the
+    /// kind path it creates, an existing kind cluster, and a targeted
+    /// non-kind context. Only the kind paths also turn gVisor off.
+    #[test]
+    fn every_quickstart_path_installs_with_no_expose() {
+        let text = describe(&quickstart_plan(&base()).unwrap()).join("\n");
+        assert!(
+            text.contains("--chart charts/curie --no-expose --set security.gvisor.mode=off"),
+            "{text}"
+        );
+        let mut remote = base();
+        remote.explicit_context = Some("remote-cluster".into());
+        let text = describe(&quickstart_plan(&remote).unwrap()).join("\n");
+        assert!(text.contains("--chart charts/curie --no-expose"), "{text}");
+        assert!(!text.contains("security.gvisor.mode=off"), "{text}");
+        let mut existing_kind = base();
+        existing_kind.explicit_context = Some(KIND_CONTEXT.into());
+        let text = describe(&quickstart_plan(&existing_kind).unwrap()).join("\n");
+        assert!(
+            text.contains("--chart charts/curie --no-expose --set security.gvisor.mode=off"),
+            "{text}"
+        );
+    }
+
+    /// The GitLab and Jira installs end in `AgentAdded`, not `Ready`, and they
+    /// run the same `cluster up`, so they close with the access line too.
+    #[test]
+    fn an_agent_added_result_closes_with_the_access_hint() {
+        let added = QuickstartOutput::AgentAdded {
+            context: "remote-cluster".into(),
+            agent: DEFAULT_AGENT.into(),
+            repos: vec!["acme/widgets".into()],
+            trigger_label: None,
+            effective_label: "factory".into(),
+            bundle: "published".into(),
+            runner_image: None,
+            deadline_seconds: DEFAULT_DEADLINE_SECONDS,
+            budget_usd: DEFAULT_BUDGET_USD,
+            output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
+            credit_remaining_usd: None,
+        };
+        let hint = added.console_access_hint("curie", "curie").unwrap();
+        assert!(
+            hint.contains(&format!(
+                "`curie cluster access --context {REMOTE_CONTEXT}`"
+            )),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn the_access_hint_names_the_context_on_every_context() {
+        let hint = console_access_hint(KIND_CONTEXT, "curie", "curie");
+        assert!(
+            hint.contains(&format!("`curie cluster access --context {KIND_CONTEXT}`")),
+            "{hint}"
+        );
+        let hint = console_access_hint(REMOTE_CONTEXT, "curie", "curie");
+        assert!(
+            hint.contains(&format!(
+                "`curie cluster access --context {REMOTE_CONTEXT}`"
+            )),
+            "{hint}"
+        );
+        // A namespace or release that is not the default must be in the command,
+        // or the command it prints addresses a different release.
+        let hint = console_access_hint(KIND_CONTEXT, "factory", "acme");
+        assert!(
+            hint.contains(&format!(
+                "`curie cluster access --context {KIND_CONTEXT} --namespace factory --release acme`"
+            )),
+            "{hint}"
+        );
+        // A context is any kubeconfig name, so the copy-paste command quotes it.
+        let hint = console_access_hint(ODD_CONTEXT, "curie", "curie");
+        let quoted = format!("'{ODD_CONTEXT}'");
+        assert!(
+            hint.contains(&format!("`curie cluster access --context {quoted}`")),
+            "{hint}"
+        );
     }
 
     #[test]
@@ -3284,7 +3405,7 @@ mod tests {
             format!("Kubernetes context: {KIND_CONTEXT} because --context was passed"),
             "model credential: use CURIE_CREDENTIALS (no prompt)".to_string(),
             format!("kubectl --context {KIND_CONTEXT} -n kube-system scale deployment/coredns --replicas=1"),
-            format!("curie cluster up --context {KIND_CONTEXT} --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off"),
+            format!("curie cluster up --context {KIND_CONTEXT} --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --no-expose --set security.gvisor.mode=off"),
             "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
             "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
@@ -3316,6 +3437,11 @@ mod tests {
             output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
             credit_remaining_usd: None,
         };
+        assert!(
+            ready.console_access_hint("curie", "curie").is_some_and(
+                |hint| hint.contains("curie cluster access --context kind-curie-factory")
+            )
+        );
         let json = crate::ui::CliOutput::to_json(&ready);
         assert_eq!(json["repo"], "acme/widgets");
         assert_eq!(

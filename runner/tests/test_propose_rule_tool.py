@@ -7,7 +7,7 @@ not the fake model. The tool posts exactly ``rule`` and ``reason`` to the
 refusal into a readable ``is_error`` result that never repeats the rule.
 
 This file is the must-not-regress record decision 4 names, kept apart from
-``test_tracker_result.py`` so a rename of that module or its tests does not
+``test_completion_contract.py`` so a rename of that module or its tests does not
 move it. Its helpers are copied, not imported, for the same reason.
 
 Every HTTP case runs against a real local aiohttp server that records what it
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ import mcp.types as mcp_types
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_runner import RunnerConfig, tracker_result
+from curie_runner import RunnerConfig, completion_contract
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import (
@@ -34,6 +35,7 @@ from curie_runner.approval import (
     PROPOSE_RULE_TOOL_NAME,
     is_platform_owned_tool,
 )
+from curie_runner.completion_contract import BoundContract
 from curie_runner.fake import FakeModelSession
 from curie_runner.harness.claude.preflight_blocked import PreflightBlockedSession
 from curie_runner.issue_read import CAPABILITY_HEADER, ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
@@ -44,7 +46,6 @@ from curie_runner.side_effects import (
     PLATFORM_SIDE_EFFECTING_TOOLS,
     SideEffectClassifier,
 )
-from curie_runner.tracker_result import BoundContract
 from runner_boot_session import initialized_session
 
 CAPABILITY = "wir.example-capability.signature"
@@ -55,13 +56,7 @@ BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 
 IMPLEMENTATION: dict[str, Any] = {
     "completion_contract": "implementation",
-    "result_kinds": [],
-    "session_usd_allowance": None,
-}
-TRACKER: dict[str, Any] = {
-    "completion_contract": "tracker_result",
-    "result_kinds": ["ticket", "findings"],
-    "session_usd_allowance": 2.5,
+    "execution": None,
 }
 
 RULE = "Every CLI flag that takes a time parses it with parse_timestamp in cli/src/time.rs."
@@ -165,11 +160,17 @@ def bound(monkeypatch: pytest.MonkeyPatch) -> list[BoundContract]:
     recorded: list[BoundContract] = []
 
     async def recording(
-        issue_read: tuple[str, str] | None, *, fake_model: bool = False
+        issue_read: tuple[str, str] | None,
+        *,
+        fake_model: bool = False,
+        on_questions_posted: Callable[[], None] | None = None,
     ) -> BoundContract:
         # The contract call's retry waits are injected, never slept.
-        result = await tracker_result.bind_completion_contract(
-            issue_read, fake_model=fake_model, delay=_no_delay
+        result = await completion_contract.bind_completion_contract(
+            issue_read,
+            fake_model=fake_model,
+            delay=_no_delay,
+            on_questions_posted=on_questions_posted,
         )
         recorded.append(result)
         return result
@@ -231,7 +232,6 @@ def _curie_tools(options: Any) -> set[str]:
     ("contract", "fake_model", "mounted"),
     [
         pytest.param({**IMPLEMENTATION, "rule_proposal": True}, False, True, id="true"),
-        pytest.param({**TRACKER, "rule_proposal": True}, False, True, id="tracker-true"),
         pytest.param({**IMPLEMENTATION, "rule_proposal": False}, False, False, id="false"),
         # A runner newer than its API: the field is absent and reads false.
         pytest.param(IMPLEMENTATION, False, False, id="absent"),
@@ -261,9 +261,7 @@ def test_propose_rule_mounts_only_when_the_contract_offers_it(
         tools = _curie_tools(session.options)
         assert ("propose_rule" in tools) is mounted
         # The contract's own tool still mounts beside it.
-        tracker = contract["completion_contract"] == "tracker_result"
-        assert ("submit_tracker_result" in tools) is tracker
-        assert ("ask_questions" in tools) is not tracker
+        assert "ask_questions" in tools
     # Booting never proposes anything.
     assert api.rule_calls == []
 

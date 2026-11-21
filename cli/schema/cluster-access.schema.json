@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/cluster-access/v1.json",
+  "title": "curie cluster access --json",
+  "description": "The loopback port-forwards `curie cluster access` has open, emitted once after every forward is ready. The command then keeps running until it is stopped, and the forwards end with it.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "forwards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "local_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "remote_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        "required": [
+          "name",
+          "url",
+          "service",
+          "local_port",
+          "remote_port"
+        ]
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "forwards",
+    "skipped"
+  ]
+}

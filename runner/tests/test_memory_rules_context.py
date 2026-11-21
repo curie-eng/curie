@@ -29,6 +29,7 @@ from curie_runner import __main__ as boot
 from curie_runner import create_app
 from curie_runner import memory_rules_context as mrc
 from curie_runner.__main__ import _compose_system_prompt, build_runner
+from curie_runner.completion_contract import CONTRACT_BLOCKED_EXPLANATION
 from curie_runner.final_answer import FINAL_ANSWER_HEADER
 from curie_runner.harness.claude.requester_guard import build_learned_rules_guard
 from curie_runner.issue_read import ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
@@ -50,7 +51,6 @@ from curie_runner.memory_rules_context import (
 from curie_runner.requester_context import FRAMING as REQUESTER_FRAMING
 from curie_runner.requester_context import FRAMING_WITH_LEARNED_RULES, requester_section
 from curie_runner.session import SessionRunner
-from curie_runner.tracker_result import CONTRACT_BLOCKED_EXPLANATION
 from personal_auth_support import requires_cli
 
 from .test_requester_instruction_context import (

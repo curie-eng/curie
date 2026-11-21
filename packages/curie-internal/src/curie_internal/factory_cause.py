@@ -162,16 +162,6 @@ _CAUSE_TEXT = {
     "ci_fix_unpublished": (
         "a CI fix round ended without pushing a fix. The pull request stays open."
     ),
-    # Tracker-result (triage) runs (#5586).
-    "tracker_result": "the investigation delivered its triage result to the issue.",
-    "no_tracker_result": (
-        "the investigation ended without submitting a result, so nothing was delivered "
-        "to the issue."
-    ),
-    "tracker_result_undelivered": (
-        "the investigation submitted a result, but it was not delivered to the issue "
-        "before the run ended. Curie keeps trying until the delivery deadline."
-    ),
 }
 
 

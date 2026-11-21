@@ -266,6 +266,132 @@ fn edited_previously_shipped_skill_refuses_the_whole_set() {
     }
 }
 
+/// Install the review skill exactly as the v0.16.3 release shipped it, with no
+/// sibling skills, so only the review skill's registered digests are in play.
+fn seed_v0_16_3_review_skill(f: &Fixture) -> PathBuf {
+    let root = f.project.join(".agents/skills");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/vectors/factory-skills-v0.16.3/review-pr");
+    for (_, files) in SKILLS.iter().filter(|(name, _)| *name == "review-pr") {
+        for (name, current_bytes) in *files {
+            let released = fs::read(fixture.join(name)).unwrap();
+            if *name == "references/feedback.md" {
+                assert_ne!(released, *current_bytes, "review-pr {name} must differ");
+            }
+            let path = root.join("review-pr").join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, released).unwrap();
+        }
+    }
+    root
+}
+
+#[test]
+fn released_v0_16_3_review_skill_upgrades_through_offline_cli() {
+    let f = Fixture::new();
+    seed_v0_16_3_review_skill(&f);
+    let before = files_under(&f.project);
+    let plan = success(&f.run(&["--agent", "codex", "--dry-run"]));
+    let lines: Vec<&str> = plan["plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .collect();
+    let upgrades: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.contains("Upgrade unmodified skill"))
+        .collect();
+    assert_eq!(upgrades.len(), 1, "{lines:?}");
+    assert!(upgrades[0].contains("review-pr"), "{lines:?}");
+    assert_eq!(files_under(&f.project), before, "dry run is read only");
+
+    let result = success(&f.run(&["--agent", "codex"]));
+    let statuses: Vec<(&str, &str)> = result["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["skill"].as_str().unwrap(), r["status"].as_str().unwrap()))
+        .collect();
+    assert!(
+        statuses.contains(&("review-pr", "upgraded")),
+        "{statuses:?}"
+    );
+    installed(&f.project, ".agents/skills");
+}
+
+#[test]
+fn edited_v0_16_3_review_skill_still_refuses_the_whole_set() {
+    let f = Fixture::new();
+    let root = seed_v0_16_3_review_skill(&f);
+    fs::write(
+        root.join("review-pr/references/feedback.md"),
+        b"local customization\n",
+    )
+    .unwrap();
+    let before = files_under(&f.project);
+    for args in [
+        vec!["--agent", "codex"],
+        vec!["--agent", "codex", "--dry-run"],
+    ] {
+        let result = f.run(&args);
+        assert!(!result.status.success(), "edited skill must conflict");
+        assert_eq!(files_under(&f.project), before);
+    }
+}
+
+/// The class guard: every skill the CLI ships must either equal its v0.16.3
+/// release or have that release's digest registered, so an untouched install of
+/// any released skill upgrades. A skill edited without registering the prior
+/// digest makes the whole set refuse here, naming the conflicting skill.
+#[test]
+fn every_shipped_skill_upgrades_from_its_v0_16_3_release() {
+    let f = Fixture::new();
+    let root = f.project.join(".agents/skills");
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/vectors/factory-skills-v0.16.3");
+    let mut changed = Vec::new();
+    for (skill, files) in SKILLS {
+        for (name, current_bytes) in files {
+            let released = fs::read(fixtures.join(skill).join(name))
+                .unwrap_or_else(|_| panic!("v0.16.3 fixture is missing {skill}/{name}"));
+            if released != *current_bytes && !changed.contains(&skill) {
+                changed.push(skill);
+            }
+            let path = root.join(skill).join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, released).unwrap();
+        }
+        assert_eq!(
+            files_under(&fixtures.join(skill)).len(),
+            files.len(),
+            "{skill} fixture holds exactly the released files the CLI ships"
+        );
+    }
+    let before = files_under(&f.project);
+    let plan = success(&f.run(&["--agent", "codex", "--dry-run"]));
+    assert_eq!(files_under(&f.project), before, "dry run is read only");
+    let upgrades = plan["plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|line| line.as_str().unwrap().contains("Upgrade unmodified skill"))
+        .count();
+    assert_eq!(upgrades, changed.len(), "{changed:?}");
+
+    let result = success(&f.run(&["--agent", "codex"]));
+    for receipt in result["skills"].as_array().unwrap() {
+        let skill = receipt["skill"].as_str().unwrap();
+        let expected = if changed.contains(&skill) {
+            "upgraded"
+        } else {
+            "unchanged"
+        };
+        assert_eq!(receipt["status"], expected, "{skill}");
+    }
+    installed(&f.project, ".agents/skills");
+}
+
 #[test]
 fn conflict_in_either_skill_prevents_any_new_sibling_writes() {
     for (conflicting, _) in SKILLS {

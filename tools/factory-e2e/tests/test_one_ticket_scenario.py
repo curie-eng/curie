@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import importlib.util
 import json
+import re
 import ssl
 import sys
 from collections.abc import Iterator
@@ -73,7 +74,7 @@ def _request(
         "sequence": sequence,
         "status": status,
         "terminal_cause": cause,
-        "completion_contract": "implementation",
+        "execution_kind": "implementation",
         "created_at": created,
     }
 
@@ -568,21 +569,21 @@ def test_the_transcript_serves_the_asking_session_then_the_publishing_one(
 ) -> None:
     script, router = served
 
-    # Session 1 is the asking turn and the worker's one continuation turn, which
-    # also ends; only then does session 2 start again from ordinal 0.
-    first = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(6)]
+    # Session 1 ends on its ask: the platform stops the turn once the questions
+    # are posted and the worker does not re-prompt it (#5785), so its last
+    # exchange is the ask. Session 2 then starts again from ordinal 0.
+    first = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(4)]
     second = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(19)]
 
     assert "mcp__curie__ask_questions" in _tools(first[3])
-    assert [first[n]["message"]["stop_reason"] for n in (4, 5)] == ["end_turn", "end_turn"]
-    assert first[5]["message"]["id"] == "msg_one_ticket_done_again"
-    assert all(e["message"]["id"] != "msg_one_ticket_done_again" for e in second)
+    assert first[3]["message"]["stop_reason"] == "tool_use"
+    assert "mcp__curie__ask_questions" not in _tools(second[0])
     assert all("mcp__curie__publish_changes" not in _tools(e) for e in first)
     assert "mcp__curie__publish_changes" in _tools(second[18])
     assert all("mcp__curie__ask_questions" not in _tools(e) for e in second)
     assert router.unrouted == []
     served_ordinals = router.evidence()["one-ticket"]["served_ordinals"]
-    assert served_ordinals == [*range(6), *range(19)]
+    assert served_ordinals == [*range(4), *range(19)]
 
 
 def test_the_asked_questions_are_exactly_two_and_the_publication_closes_the_issue() -> None:
@@ -614,3 +615,15 @@ def test_the_scenario_observation_names_only_the_fixture_issue() -> None:
     sql = run.observation_sql(ots.ISSUE)
     assert f"tracker_issue_id = '{ots.ISSUE}'" in sql
     assert sql.count("tracker_issue_id") == 4
+
+
+def test_the_scenario_observation_reads_only_columns_the_head_schema_has() -> None:
+    from curie_api.models import Base
+
+    sql = run.observation_sql(ots.ISSUE)
+    columns = {table.name: set(table.columns.keys()) for table in Base.metadata.tables.values()}
+    aliases = dict((alias, table) for table, alias in re.findall(r"curie\.(\w+) (\w)\b", sql))
+    references = set(re.findall(r"\b([a-z])\.(\w+)", sql))
+    assert set(aliases) == {alias for alias, _ in references}
+    missing = sorted(f"{aliases[a]}.{c}" for a, c in references if c not in columns[aliases[a]])
+    assert missing == []

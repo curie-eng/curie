@@ -173,7 +173,11 @@ def _hook_callback(gate: ApprovalGate):
     """The single PreToolUse callback ``build_approval_hook`` contributes."""
 
     hooks = build_approval_hook(gate)
-    assert set(hooks) == {"PreToolUse"}, "the approval hook registers PreToolUse only"
+    # PreToolUse decides; PostToolUse only ends the turn after a posted
+    # question round (ADR 0286, #5785).
+    assert set(hooks) == {"PreToolUse", "PostToolUse"}
+    (stop,) = hooks["PostToolUse"]
+    assert stop.matcher is None and len(stop.hooks) == 1
     matchers = hooks["PreToolUse"]
     assert len(matchers) == 1
     matcher = matchers[0]

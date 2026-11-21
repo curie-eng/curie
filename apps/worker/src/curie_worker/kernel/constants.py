@@ -457,6 +457,12 @@ _CONTEXT_MCP_PREFIXES = ("get_", "list_", "search_", "read_")
 
 _APPROVAL_TOOL_NAME = "mcp__curie__request_approval"
 
+# The runner's ``ask_questions`` tool (#5785; canonical spelling
+# runner/src/curie_runner/tool_names.py ``QUESTION_TOOL`` on the ``curie``
+# server). A turn that called it is not re-prompted to publish unless the API
+# confirms its round was not posted.
+_QUESTION_TOOL_NAME = "mcp__curie__ask_questions"
+
 # The API's ``FinishBody.detail`` max_length.
 _FINISH_DETAIL_MAX = 4000
 

@@ -36,6 +36,7 @@ from approver_dm_support import (
     no_effect,
     register_dm_card,
     selected,
+    unauthenticated,
 )
 from approver_dm_support import dm_case as dm_case
 from approver_ticket_support import APPROVER_A
@@ -117,6 +118,9 @@ def test_group_membership_is_read_through_the_dm_identity_at_answer_and_at_resum
     row = _registered_on_other(case)
     clients = _groups(case, dm=_Group(NATIVE_A), reply=_Group(NATIVE_B))
 
+    rejected = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver="main")
+    unauthenticated(case, row["id"], rejected, card_channel=DM_CHANNEL)
+    assert not (clients.dm.calls or clients.reply.calls or clients.default.calls)
     response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver="other")
     assert response.status_code == 200, response.text
     assert (response.json()["status"], response.json()["resolved_by"]) == ("approved", NATIVE_A)

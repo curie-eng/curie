@@ -24,12 +24,14 @@ from typing import Any
 
 import pytest
 from approver_ticket_support import (
+    OTHER_ROUTE,
     approval_rows,
     carried,
     create,
     dynamic_request,
     enroll,
     exactly,
+    ingress,
 )
 from approver_ticket_support import ticket_case as ticket_case
 from curie_api import identity_fence
@@ -40,8 +42,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from apps.api.tests import test_http_invocation_membership as membership
 from apps.api.tests.test_approver_ticket_creation import receipt
-from apps.api.tests.test_http_approval_creation import rows
-from apps.api.tests.test_http_requester_projection import CHANGED_SUBJECT
+from apps.api.tests.test_http_approval_creation import accepted, rows
+from apps.api.tests.test_http_requester_projection import CHANGED_SUBJECT, admit_raw_sender
 from apps.api.tests.test_http_requester_projection import synthetic_provider as synthetic_provider
 
 PLAIN: dict[str, Any] = {"target": "acct-example-1"}
@@ -53,6 +55,33 @@ LOOKUPS: dict[str, Callable[[SimpleNamespace], None]] = {
         {membership.SENDER: CHANGED_SUBJECT},
     ),
 }
+
+
+def test_ticket_creation_requires_a_fresh_canonical_requester(
+    ticket_case: SimpleNamespace,
+) -> None:
+    case = ticket_case
+    admit_raw_sender(case.scope)
+    enroll(case)
+    agent = case.scope["agent"]
+    for change in LOOKUPS.values():
+        change(case.provider)
+        selected = dynamic_request(case, carried(case, PLAIN))
+        exactly(create(case.client, selected), 403, "caller_not_allowed")
+        assert approval_rows(agent) == []
+        case.provider.outcomes.clear()
+        case.provider.subjects.clear()
+
+    LOOKUPS["unresolved"](case.provider)
+    ordinary = dynamic_request(
+        case, {}, route=OTHER_ROUTE, tool="synthetic_read", gate_kind="permission",
+    )
+    accepted(create(case.client, ordinary), ordinary)
+    assert [row["selection_mode"] for row in approval_rows(agent)] == ["ordinary"]
+    case.provider.outcomes.clear()
+    selected = dynamic_request(ingress(case), carried(case, PLAIN))
+    receipt(create(case.client, selected), selected)
+    assert sorted(row["selection_mode"] for row in approval_rows(agent)) == ["dynamic", "ordinary"]
 
 
 def test_a_requester_disabled_before_the_writer_refuses_there(

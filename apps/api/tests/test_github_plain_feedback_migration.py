@@ -20,6 +20,7 @@ from _migration_support import (
     stamped_revision,
 )
 from alembic import command
+from alembic.script import ScriptDirectory
 from curie_api.config import get_settings
 from sqlalchemy.exc import IntegrityError
 from test_github_factory_review import _complete
@@ -35,7 +36,7 @@ from test_github_plain_feedback import (
 from test_memory_rules_migration import _agent, _lineage
 
 REVISION = "0186"
-CURRENT_APP_REVISION = "0187"
+CURRENT_APP_REVISION = "0189"
 BELOW = "0185"
 TABLE = "thread_publication_lineages"
 COUNT_CHECK = "thread_publication_lineages_plain_feedback_revisions_ck"
@@ -124,9 +125,9 @@ def test_a_pull_request_bound_before_the_upgrade_takes_plain_feedback_after_it(
     past the cap (or with a capped time) refuses this first comment.
     """
 
-    # The current API reads run handoffs from 0187. Seed the work item there,
-    # then make its publication lineage at the pre-0186 schema boundary.
-    isolated_migration_db.at(CURRENT_APP_REVISION)
+    # The app under test is the head app, so it runs on the head schema; the
+    # downgrade below passes back through 0186 to the release below it.
+    isolated_migration_db.at("head")
     github = factory_github(monkeypatch, tmp_path)
     try:
         with running_factory(github, new_agent=True) as factory:
@@ -141,11 +142,8 @@ def test_a_pull_request_bound_before_the_upgrade_takes_plain_feedback_after_it(
         lineage_id = _own_pull_request(
             first["work_item_id"], pr, branch=branch, head=head, status="open"
         )
-        command.upgrade(config, REVISION)
-        assert stamped_revision() == REVISION
-        assert _counts(lineage_id) == (0, None)
-        command.upgrade(config, CURRENT_APP_REVISION)
-        assert stamped_revision() == CURRENT_APP_REVISION
+        command.upgrade(config, "head")
+        assert stamped_revision() == ScriptDirectory.from_config(config).get_current_head()
 
         with running_factory(github, new_agent=False) as factory:
             _complete(factory.client, first["id"])

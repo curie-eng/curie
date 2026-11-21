@@ -53,11 +53,43 @@ logger = logging.getLogger(__name__)
 
 
 class ApprovalContinuityRefused(RuntimeError):
-    """@spec HTTP-APPROVAL-CONTINUITY-3."""
+    """@spec HTTP-APPROVAL-CONTINUITY-3.
 
-    def __init__(self) -> None:
+    ``code`` is the API's exact refusal detail when the refusal carried one, so
+    a caller can tell a refused ticket from a refused person (ADR 0288
+    decision 3). The message stays fixed and names no code.
+    """
+
+    def __init__(self, code: str | None = None) -> None:
         """@spec HTTP-APPROVAL-CONTINUITY-3."""
         super().__init__("identity_approval_refused")
+        self.code = code
+
+
+TICKET_RETRY_CODES = frozenset(
+    {
+        "approval_ticket_arguments_mismatch",
+        "approval_ticket_invalid_ticket",
+        "approval_ticket_preparation_expired",
+        "approval_ticket_replayed",
+    }
+)
+"""Creation refusals about the prepared ticket itself, not about any person.
+
+ADR 0288 decision 3. Each one means the ticket the model sent was damaged,
+stale, already used, or prepared for other details, and a fresh request makes a
+fresh ticket. ``approval_ticket_arguments_unstable`` is deliberately absent: the
+stored arguments changed form in the database, and asking again for the same
+details would fail the same way. None of them says anything about who asked or who may approve, so
+telling the requester does not disclose an identity refusal. Every other coded
+refusal stays silent, as HTTP-APPROVAL-CONTINUITY-3 and invocation criterion 18
+require.
+"""
+
+TICKET_RETRY_REPLY = (
+    "The approval request for this action could not be created. "
+    "Please ask again, and a new request will be prepared."
+)
 
 _PUBLICATION_REFUSAL_CODES = {
     "publication.github_unavailable",
@@ -763,7 +795,7 @@ class ApprovalClient:
                 },
             }
             if status in denials and set(body) == {"detail"} and body["detail"] in denials[status]:
-                raise ApprovalContinuityRefused()
+                raise ApprovalContinuityRefused(body["detail"])
             if status not in {200, 201}:
                 raise ValueError
             # @spec REQUEST-APPROVAL-4: exactly the version the receipt names.

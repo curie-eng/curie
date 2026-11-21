@@ -51,7 +51,11 @@ existing records, with no lifecycle hook:
    request. A request is eligible when it was live at or after
    ``factory_slack_since`` (created then or later, still open, or ended then or
    later). ``first_sequence`` is the smallest eligible sequence, set once here
-   and never advanced (a kickoff thread's is its kickoff request's);
+   and never advanced (a kickoff thread's is its kickoff request's). A
+   configured thread with no root post yet, which Alembic revision 0188
+   records ahead of a WorkItem's next request, gets its root post once an
+   eligible request at or after its ``first_sequence`` exists, and its
+   ``first_sequence`` moves to that request;
 2. the card post described above;
 3. one ``needs_person`` reply per request at or after ``first_sequence`` that
    ended ``failed`` or ``expired`` with no automatic retry admitted, and one
@@ -60,10 +64,7 @@ existing records, with no lifecycle hook:
    kickoff sender, or for a configured thread the WorkItem owner's (else
    requester's) one active Slack link in the posting identity's workspace,
    and no one when there is none. A request a pre-card ``terminal`` or
-   ``pull_request`` post already announced owes neither. A tracker-result
-   request whose result is owed or delivered gets one ``triage`` post once
-   delivered instead (``factory_slack_triage``); a delegated ticket's post
-   waits for its handoff outcome (#5588).
+   ``pull_request`` post already announced owes neither.
 
 ``phase``, ``pull_request`` and ``terminal`` rows from before the card are
 never delivered and never hold a later post back.
@@ -129,7 +130,6 @@ from .factory_slack_card import (
     render_card,
     starting_text,
 )
-from .factory_slack_triage import TRIAGE_KIND, render_triage
 from .reply_sink import ReplySink, TargetRoute
 
 logger = logging.getLogger(__name__)
@@ -217,7 +217,7 @@ _ROOT_PAYLOAD_SQL = """
 """
 # The kinds this lane delivers. Rows of the pre-card kinds stay in the table
 # and neither deliver nor hold a later post back.
-_DELIVERED_KINDS_SQL = "'root', 'card', 'needs_person', 'ready', 'triage'"
+_DELIVERED_KINDS_SQL = "'root', 'card', 'needs_person', 'ready'"
 _LIVE_SQL = "'queued', 'waiting', 'running', 'cancellation_requested'"
 _CARD_SEND_TIMEOUT: Final = 30.0
 # The latest implementation request at or after the thread's first sequence,
@@ -227,7 +227,6 @@ _SHOWN_SQL = """
       FROM {requests} s
      WHERE s.work_item_id = t.work_item_id
        AND s.sequence >= t.first_sequence
-       AND s.completion_contract = 'implementation'
      ORDER BY s.sequence DESC
      LIMIT 1
 """
@@ -318,8 +317,6 @@ def render_post(kind: str, payload: dict[str, Any]) -> str:
         return needs_person_text(_user(payload), _str(payload.get("cause")))
     if kind == "ready":
         return ready_text(_user(payload), str(payload.get("url") or ""))
-    if kind == TRIAGE_KIND:
-        return _escaped(render_triage(payload))
     raise ValueError(f"unknown factory Slack post kind {kind!r}")
 
 
@@ -550,9 +547,6 @@ class PostgresFactorySlackStore:
         self._namespaces = f'"{schema}".identity_namespaces'
         self._links = f'"{schema}".identity_links'
         self._reconnect_url = reconnect_url_for(console_origin)
-        self._deliveries = f'"{schema}".factory_tracker_result_deliveries'
-        self._receipts = f'"{schema}".factory_tracker_result_receipts'
-        self._handoffs = f'"{schema}".factory_triage_handoffs'
         self._issue_url = _ISSUE_URL_SQL.format(requests=self._requests)
         self._root_payload = _ROOT_PAYLOAD_SQL.format(issue_url=self._issue_url)
         self._shown = _SHOWN_SQL.format(requests=self._requests)
@@ -676,7 +670,11 @@ class PostgresFactorySlackStore:
 
         # Discovery roots a configured thread in the agent's destination while
         # exactly one Slack binding there names an adapter. A kickoff thread is
-        # inserted rooted by the API, so the NOT EXISTS below skips it.
+        # inserted rooted by the API, so the NOT EXISTS below skips it. A
+        # configured thread recorded with no root post (revision 0188 records
+        # one ahead of a WorkItem's next request) is rooted at its first
+        # eligible request at or after its first sequence, by the same
+        # destination cutoff, in the destination's current binding.
         discover = text(
             f"""
             WITH discovered AS (
@@ -712,12 +710,58 @@ class PostgresFactorySlackStore:
                    )
                 ON CONFLICT (work_item_id) DO NOTHING
                 RETURNING t.work_item_id, t.first_sequence
+            ),
+            dormant AS (
+                SELECT t.work_item_id, b.adapters[1] AS channel_identity,
+                       a.factory_slack_channel AS channel, e.first_sequence
+                  FROM {self._threads} t
+                  JOIN {self._agents} a ON a.id = t.agent_id
+                  CROSS JOIN LATERAL (
+                      SELECT min(q.sequence) AS first_sequence
+                        FROM {self._requests} q
+                       WHERE q.work_item_id = t.work_item_id
+                         AND q.sequence >= t.first_sequence
+                         AND (q.created_at >= a.factory_slack_since
+                              OR q.terminal_at IS NULL
+                              OR q.terminal_at >= a.factory_slack_since)
+                  ) e
+                  CROSS JOIN LATERAL (
+                      SELECT array_agg(CAST(c.adapter AS text)) AS adapters
+                        FROM {self._channels} c
+                       WHERE c.agent_id = a.id
+                         AND c.kind = 'slack'
+                         AND c.address = a.factory_slack_channel
+                         AND c.adapter IS NOT NULL
+                  ) b
+                 WHERE t.origin = 'configured'
+                   AND t.root_ts IS NULL
+                   AND a.factory_slack_channel IS NOT NULL
+                   AND a.factory_slack_since IS NOT NULL
+                   AND e.first_sequence IS NOT NULL
+                   AND cardinality(b.adapters) = 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {self._posts} r
+                        WHERE r.work_item_id = t.work_item_id AND r.post_key = 'root'
+                   )
+            ),
+            woken AS (
+                UPDATE {self._threads} AS t
+                   SET channel_identity = d.channel_identity,
+                       channel = d.channel,
+                       first_sequence = d.first_sequence
+                  FROM dormant d
+                 WHERE t.work_item_id = d.work_item_id
+                RETURNING t.work_item_id, t.first_sequence
             )
             INSERT INTO {self._posts} AS p
                    (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
             SELECT d.work_item_id, 'root', 'root', 0, 0, 0,
                    {self._root_payload}
-              FROM discovered d
+              FROM (
+                  SELECT work_item_id, first_sequence FROM discovered
+                  UNION ALL
+                  SELECT work_item_id, first_sequence FROM woken
+              ) d
               JOIN {self._work_items} w ON w.id = d.work_item_id
               JOIN {self._requests} q
                 ON q.work_item_id = d.work_item_id AND q.sequence = d.first_sequence
@@ -807,15 +851,6 @@ class PostgresFactorySlackStore:
                       AND x.post_key = 'terminal:' || q.id
                       AND x.posted_at IS NOT NULL
                )
-               AND (
-                   q.completion_contract <> 'tracker_result'
-                   OR NOT EXISTS (
-                       SELECT 1
-                         FROM {self._deliveries} d
-                        WHERE d.execution_request_id = q.id
-                          AND d.state IN ('owed', 'delivered')
-                   )
-               )
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
@@ -841,7 +876,6 @@ class PostgresFactorySlackStore:
                 ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
              WHERE l.pr_url IS NOT NULL
                AND l.status = 'open'
-               AND q.completion_contract = 'implementation'
                AND EXISTS (
                    SELECT 1
                      FROM {self._publications} b
@@ -890,49 +924,12 @@ class PostgresFactorySlackStore:
             ON CONFLICT (notice_id) DO NOTHING
             """
         )
-        # One triage post per delivered result. The kind literal matches TRIAGE_KIND.
-        # A delegated ticket's post waits for its handoff outcome (#5588), so
-        # the one line carries the ticket and the implementation disposition.
-        # The receipt transaction writes the handoff, so a ticket with none
-        # (no delegation, or findings) posts at once and never waits.
-        triages = text(
-            f"""
-            INSERT INTO {self._posts} AS p
-                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
-            SELECT t.work_item_id, 'triage:' || q.id, 'triage', q.sequence, 3, 0,
-                   jsonb_build_object(
-                       'result_kind', r.result_kind,
-                       'reason', r.reason,
-                       'revision', r.revision,
-                       'ticket_url', r.output_url,
-                       'result_comment_url', r.result_comment_url,
-                       'handoff_admitted', CASE h.outcome
-                           WHEN 'admitted' THEN true
-                           WHEN 'refused' THEN false
-                       END,
-                       'implementation_status_url',
-                           CASE WHEN h.outcome = 'admitted' THEN h.output_url END,
-                       'refusal_reason', CASE WHEN h.outcome = 'refused' THEN h.reason END
-                   )
-              FROM ({live_threads}) t
-              JOIN {self._requests} q
-                ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
-              JOIN {self._receipts} r
-                ON r.execution_request_id = q.id
-              LEFT JOIN {self._handoffs} h
-                ON h.source_execution_request_id = q.id
-             WHERE q.completion_contract = 'tracker_result'
-               AND (r.result_kind <> 'ticket' OR h.id IS NULL OR h.outcome IS NOT NULL)
-            ON CONFLICT (work_item_id, post_key) DO NOTHING
-            """
-        )
         async with self._engine.begin() as connection:
             await connection.execute(discover)
             await connection.execute(refresh_roots)
             await connection.execute(cards)
             await connection.execute(needs_person)
             await connection.execute(ready)
-            await connection.execute(triages)
             await connection.execute(refusals)
             await connection.execute(self._grant_notices(), {"reconnect_url": self._reconnect_url})
 

@@ -20,8 +20,9 @@ reviewer subagents check it on a stronger model. The skill walks ten phases:
    For a reported bug it attempts a reproduction and records the result
    whether it reproduced or not; for a feature it records the behaviour the
    change starts from. Then it continues, or calls `mcp__curie__ask_questions`
-   with a summary of its findings and 1 to 10 numbered questions and ends the
-   session.
+   with a summary of its findings and 1 to 10 numbered questions. Once the
+   questions are posted the platform ends the session: no further tool call
+   runs, and the run is not prompted to continue.
 3. `pin_criteria`: pin the acceptance criteria, or ask on the ticket when the
    request is ambiguous.
 4. `plan`: read the repository's own guidance, find its test commands, and

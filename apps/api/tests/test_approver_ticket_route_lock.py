@@ -23,13 +23,19 @@ from approver_ticket_support import (
     OTHER_ROUTE,
     approval_rows,
     carried,
+    create,
     dynamic_request,
     enroll,
+    exactly,
+    ingress,
     legacy,
     refused_with,
 )
 from approver_ticket_support import synthetic_provider as synthetic_provider
 from approver_ticket_support import ticket_case as ticket_case
+
+from apps.api.tests.test_approver_ticket_creation import receipt
+from apps.api.tests.test_http_approval_creation import accepted, rows
 
 GATE_KINDS = (None, "policy", "permission")
 PLAIN: dict[str, Any] = {"target": "acct-example-1"}
@@ -84,6 +90,29 @@ def approval_for(case: SimpleNamespace, gate_kind: str | None, changes: dict[str
     request = dynamic_request(case, None, gate_kind=gate_kind)
     request["approval"].update(changes)
     return request
+
+
+def test_protected_creation_enforces_the_pair_route_lock_before_writing(
+    ticket_case: SimpleNamespace,
+) -> None:
+    case = ticket_case
+    enroll(case)
+    for gate_kind in GATE_KINDS:
+        for name, changes, code in lock_cases(case):
+            request = approval_for(case, gate_kind, changes)
+            response = create(case.client, request)
+            assert response.status_code == 409, (gate_kind, name, response.text)
+            exactly(response, 409, code)
+    assert approval_rows(case.scope["agent"]) == []
+
+    selected = dynamic_request(case, carried(case, PLAIN))
+    receipt(create(case.client, selected), selected)
+    for tool in ("synthetic_read", f"mcp__plugin_ticket-plugin_{CONNECTOR}__execute",
+                 f"mcp__{CONNECTOR}"):
+        ordinary = dynamic_request(ingress(case), {}, route=OTHER_ROUTE, tool=tool)
+        accepted(create(case.client, ordinary), ordinary)
+        assert rows(ordinary["approval"]["dedupe_key"])[0]["route"] == OTHER_ROUTE
+    assert len(approval_rows(case.scope["agent"])) == 4
 
 
 def test_legacy_creation_applies_the_same_lock(ticket_case: SimpleNamespace) -> None:

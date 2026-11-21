@@ -31,14 +31,17 @@ from approval_answer_support import (
     NATIVE_A,
     NATIVE_B,
     NATIVE_OUTSIDER,
+    NATIVE_UNRESOLVED,
     SENDER,
     actions,
     answer_as,
     answered,
+    approval_row,
     audit_rows,
     configured,
     dynamic,
     fence_stable,
+    grant_check,
     no_wake,
     one_more_resume_refusal,
     ordinary,
@@ -67,16 +70,35 @@ from approver_ticket_support import (
     set_approver_role,
     store_routes,
     subject_entry,
+    surface_entry,
 )
 
 CONTINUE = ("continue", "current_authority")
 REFUSE = ("refuse", "caller_not_allowed")
 
 
-# --- AC1.1, AC1.2, AC1.6: the selected set decides, also on a migrated role ---------
-
-
-# --- AC1.3: selection is fixed at creation ------------------------------------------
+def test_answer_keeps_the_original_selection_after_key_and_role_changes(
+    selection_case: SimpleNamespace,
+) -> None:
+    case = selection_case
+    configured(case)
+    row = dynamic(case, (APPROVER_A,))
+    refused(case, row, NATIVE_B, code="selection_actor_not_selected")
+    set_approver_role(case.scope, {"entries": [
+        *CEILING_FILTER["entries"], subject_entry(OUTSIDER),
+        surface_entry(case.scope, NATIVE_B), surface_entry(case.scope, NATIVE_UNRESOLVED),
+    ]})
+    configured(case, key=selector_key(3), users=[APPROVER_A, APPROVER_B, OUTSIDER])
+    for native in (NATIVE_B, NATIVE_OUTSIDER):
+        evidence = refused(case, row, native, code="selection_actor_not_selected")
+        assert (evidence["mode"], evidence["route"]) == ("dynamic", ROUTE)
+    configured(case, key=selector_key(3))
+    refused(case, row, NATIVE_UNRESOLVED, code="selection_actor_not_canonical")
+    no_wake(case, row["id"])
+    assert approval_row(row["id"])["selected_approvers"] == row["selected_approvers"]
+    answered(case, row, NATIVE_A)
+    assert approval_row(row["id"])["selected_approvers"] == row["selected_approvers"]
+    published(case, row["id"])
 
 
 # --- AC1.4: current authority is revocable at answer ---------------------------------
@@ -122,6 +144,23 @@ def _revoke(case: SimpleNamespace, revocation: str) -> Callable[[], Any]:
         case.provider.roster[NATIVE_A] = person(APPROVER_A)
 
     return restore
+
+
+def test_selected_actor_must_keep_current_route_key_ceiling_and_identity(
+    selection_case: SimpleNamespace,
+) -> None:
+    case = selection_case
+    configured(case, users=BOTH)
+    row = dynamic(case)
+    for revocation, code in REVOCATION_CODES.items():
+        restore = _revoke(case, revocation)
+        try:
+            refused(case, row, NATIVE_A, code=code)
+            no_wake(case, row["id"])
+        finally:
+            restore()
+    answered(case, row, NATIVE_A)
+    published(case, row["id"])
 
 
 # --- AC1.5: widening admits nobody outside the stored set -----------------------------
@@ -186,7 +225,101 @@ def test_a_malformed_stored_snapshot_refuses_every_answer(selection_case: Simple
     answered(case, row, NATIVE_A)
 
 
-# --- AC1.9: the preserved actor must still be the same canonical person ---------------
+def test_resume_and_grant_recheck_the_preserved_selected_person(
+    selection_case: SimpleNamespace,
+) -> None:
+    case = selection_case
+    set_approver_role(case.scope, {"entries": [
+        *CEILING_FILTER["entries"], surface_entry(case.scope, NATIVE_A),
+    ]})
+    configured(case)
+    row = dynamic(case, (APPROVER_A, APPROVER_B))
+    answered(case, row, NATIVE_A)
+    entry = published(case, row["id"])
+    assert turn_check(case, entry, row["id"]) == CONTINUE
+    assert grant_check(case, entry, row["id"]) == CONTINUE
+    for observed, code in (
+        (person(APPROVER_B), "selection_actor_changed"),
+        (person(APPROVER_A, status="disabled"), ANY_CODE),
+    ):
+        case.provider.roster[NATIVE_A] = observed
+        before = len(resume_refusals(row["id"]))
+        assert turn_check(case, entry, row["id"]) == REFUSE
+        one_more_resume_refusal(row["id"], before, NATIVE_A, code=code)
+        assert grant_check(case, entry, row["id"]) == REFUSE
+        one_more_resume_refusal(row["id"], before + 1, NATIVE_A, code=code)
+        assert republish(case, row["id"]) == "caller_not_allowed"
+        one_more_resume_refusal(row["id"], before + 2, NATIVE_A, code=code)
+        assert approval_row(row["id"])["status"] == "approved"
+        assert published(case, row["id"]) == entry
+    case.provider.roster[NATIVE_A] = person(APPROVER_A)
+    assert turn_check(case, entry, row["id"]) == CONTINUE
+    assert grant_check(case, entry, row["id"]) == CONTINUE
+
+
+@pytest.mark.parametrize("revocation", ["ceiling_user", "key_id"])
+def test_approved_resume_grant_and_republish_require_current_ceiling_and_key(
+    selection_case: SimpleNamespace, revocation: str,
+) -> None:
+    """@spec REQUEST-APPROVAL-5: an approved answer still needs its ceiling and selector key."""
+    case = selection_case
+    configured(case, users=BOTH)
+    row = dynamic(case, (APPROVER_A, APPROVER_B))
+    approval_id = row["id"]
+    answered(case, row, NATIVE_A)
+    entry = published(case, approval_id)
+    approved = approval_row(approval_id)
+    assert approved["resumed_at"] is not None
+    assert turn_check(case, entry, approval_id) == CONTINUE
+    assert grant_check(case, entry, approval_id) == CONTINUE
+
+    restore = _revoke(case, revocation)
+    code = REVOCATION_CODES[revocation]
+    before = len(resume_refusals(approval_id))
+    try:
+        assert turn_check(case, entry, approval_id) == REFUSE
+        one_more_resume_refusal(approval_id, before, NATIVE_A, code=code)
+        assert grant_check(case, entry, approval_id) == REFUSE
+        one_more_resume_refusal(approval_id, before + 1, NATIVE_A, code=code)
+        assert republish(case, approval_id) == "caller_not_allowed"
+        one_more_resume_refusal(approval_id, before + 2, NATIVE_A, code=code)
+        assert approval_row(approval_id) == {**approved, "resumed_at": None}
+        assert published(case, approval_id) == entry
+    finally:
+        restore()
+
+    assert republish(case, approval_id) is None
+    assert turn_check(case, entry, approval_id) == CONTINUE
+    assert grant_check(case, entry, approval_id) == CONTINUE
+    assert len(resume_refusals(approval_id)) == before + 3
+
+
+def test_resume_and_grant_audit_an_authenticated_capture_refusal(
+    selection_case: SimpleNamespace,
+) -> None:
+    case = selection_case
+    configured(case)
+    row = dynamic(case, (APPROVER_A,))
+    answered(case, row, NATIVE_A)
+    entry = published(case, row["id"])
+    for cause, status in CAPTURE_FAILURES.items():
+        expected = ("unavailable" if status == 503 else "refuse", FIXED[status])
+        before = len(resume_refusals(row["id"]))
+        lookups = len(case.provider.requests)
+        with _capture_failure(case, cause):
+            assert turn_check(case, entry, row["id"]) == expected
+            assert grant_check(case, entry, row["id"]) == expected
+        found = resume_refusals(row["id"])[before:]
+        assert len(found) == 2
+        for refusal in found:
+            assert refusal["actor"] == NATIVE_A
+            assert (refusal["evidence"]["status"], refusal["evidence"]["stage"]) == (
+                status, "capture",
+            )
+        assert len(case.provider.requests) == lookups
+        assert published(case, row["id"]) == entry
+        assert turn_check(case, entry, row["id"]) == CONTINUE
+        assert grant_check(case, entry, row["id"]) == CONTINUE
 
 
 # --- AC1.10: every refusal on a canonical route is audited ---------------------------

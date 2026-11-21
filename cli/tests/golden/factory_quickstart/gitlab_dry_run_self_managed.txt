@@ -9,7 +9,7 @@ ensure labels curie-factory, curie-factory:queued, curie-factory:running, curie-
 kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1
 release curie in namespace curie was not read under --dry-run; a live run reads it and decides whether cluster up runs
 if the release already runs the target chart and values: skip cluster up
-otherwise: curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart <chart> --set security.gvisor.mode=off
+otherwise: curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart <chart> --no-expose --set security.gvisor.mode=off
 write Secret curie-<entry>-token key token in namespace curie from --token-file <dir>/token-7c1e (the token is never printed), unless this release's quickstart already left it holding that token
 write ConfigMap curie-code-host-trust key ca.crt in namespace curie from --ca-file <ca-file> and set codeHostTrust.caBundle.configMapRef.name=curie-code-host-trust
 write factory.enabled=true, factory.intake=poll, factory.codeHosts entry <entry> and factory.trackers entry <entry> (apiUrl http://<forge-host>/api/v4, label curie-factory, mention factory-bot, credential expiresAt <expires>T00:00:00Z) and factory.bindings entry <entry>-1234 (project_id and tracker_scope_id 1234, path factory-fixture/nested/widgets): helm upgrade --reuse-values of release curie, then roll the API
