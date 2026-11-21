@@ -2805,12 +2805,11 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
         {"name": "CURIE_OIDC_SCOPES", "value": "openid email profile"},
         {"name": "CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "value": "false"},
     ]
-    personal = {"name": "FACTORY_MODEL_AUTH_MODE", "value": PERSONAL_MODE}
     console_origin = {"name": "CURIE_CONSOLE_ORIGIN", "value": CONSOLE_ORIGIN}
     return {
         "api": {
             "image": image("curie-api"),
-            "extraEnv": [*oidc, personal],
+            "extraEnv": oidc,
             "githubAppId": plan.app_id,
             "githubAppExistingSecret": plan.app_secret,
             "githubRepoAllowlist": [plan.repo],
@@ -2819,7 +2818,7 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
             "image": image("curie-worker"),
             "maxConcurrency": 1,
             "workItemMaxTurns": plan.implementer_turns,
-            "extraEnv": [dict(personal), dict(console_origin)],
+            "extraEnv": [dict(console_origin)],
         },
         "dispatcher": {
             "deploy": True,
@@ -2862,6 +2861,8 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
         "factory": {
             "enabled": True,
             "intake": "poll",
+            # Rendered as FACTORY_MODEL_AUTH_MODE into both the api and the worker.
+            "modelAuthMode": PERSONAL_MODE,
             "codeHosts": [{**github, "credential": dict(credential)}],
             "trackers": [
                 {

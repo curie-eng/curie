@@ -1479,7 +1479,7 @@ through stdin. `testInstallation.enabled` is true with one driver whose
 `channel_id`, `bot_id` and `bot_user_id` come from the sender token's
 `auth.test`. The chart generates the API key, worker token and attester
 secret. The factory is on with the GitHub App as code host and tracker for the
-fixture repository only, `FACTORY_MODEL_AUTH_MODE=personal`, one worker slot
+fixture repository only, `factory.modelAuthMode=personal`, one worker slot
 and no warm pool. Poll intake watches an unused per-run label, so the kickoff
 is the only admission. The agent is deployed from a private copy of
 `examples/dark-factory` that adds only the reservation gate hook, gets a

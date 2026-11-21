@@ -631,6 +631,9 @@ spec:
             # factory.admission.minModelCreditUsd. A negative value fails above.
             - name: CURIE_FACTORY_MIN_MODEL_CREDIT_USD
               value: {{ $creditMin | quote }}
+            # factory.modelAuthMode; the api renders the same helper.
+            - name: FACTORY_MODEL_AUTH_MODE
+              value: {{ include "curie.factory.modelAuthMode" . | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured and the
