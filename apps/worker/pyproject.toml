@@ -6,7 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "curie-internal",
     "redis>=5.2",
-    "cronsim==2.7",
+    "cronsim==2.8",
     "pydantic-settings>=2.15.0",
     "pyyaml>=6.0",
     # PEP 508 requirement parsing and PEP 503 identities at publication validation.
