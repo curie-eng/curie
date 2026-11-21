@@ -112,15 +112,15 @@ pub(crate) struct SubscriptionSession {
 /// private session file and never the platform key.
 #[derive(Args, Debug, Default, Clone)]
 #[group(skip)]
+#[command(group(clap::ArgGroup::new("rule_surface").multiple(true)))]
 pub(crate) struct MemoryRuleArgs {
     /// List learned rules (`GET /agents/{id}/memory/rules`).
     #[arg(
         long,
         conflicts_with_all = [
-            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
-            "accept", "reject", "remove",
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
         ],
-        group = "rule_verb"
+        group = "rule_surface"
     )]
     pub(crate) rules: bool,
     /// With --rules, show only rules in this state: proposed, accepted,
@@ -128,16 +128,31 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(long, value_name = "STATE", requires = "rules")]
     pub(crate) rule_state: Option<String>,
     /// With --rules, show only rules of this exact scope key.
-    #[arg(long, value_name = "KEY", requires = "rules")]
+    #[arg(
+        long,
+        value_name = "KEY",
+        requires = "rules",
+        conflicts_with = "channel"
+    )]
     pub(crate) scope_key: Option<String>,
-    /// Accept this proposed rule. Needs --expected-version and --session-file.
+    /// With --rules, show only the agent scope rules (not a channel's or a
+    /// repository's). `--channel KIND=ADDRESS` with --rules selects one
+    /// bound channel instead.
+    #[arg(
+        long,
+        requires = "rule_surface",
+        conflicts_with_all = ["channel", "scope_key"]
+    )]
+    pub(crate) agent_scope: bool,
+    /// Accept this proposed rule. With --channel KIND=ADDRESS or --agent-scope
+    /// the rule must be in that scope or nothing is sent. Needs --expected-version and --session-file.
     #[arg(
         long,
         value_name = "RULE_ID",
-        groups = ["rule_action", "rule_verb"],
+        groups = ["rule_action", "rule_verb", "rule_surface"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
-            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
             "reject", "remove",
         ]
     )]
@@ -146,10 +161,10 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(
         long,
         value_name = "RULE_ID",
-        groups = ["rule_action", "rule_verb"],
+        groups = ["rule_action", "rule_verb", "rule_surface"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
-            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
             "accept", "remove",
         ]
     )]
@@ -158,10 +173,10 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(
         long,
         value_name = "RULE_ID",
-        groups = ["rule_action", "rule_verb"],
+        groups = ["rule_action", "rule_verb", "rule_surface"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
-            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
             "accept", "reject",
         ]
     )]
@@ -178,7 +193,7 @@ pub(crate) struct MemoryRuleArgs {
     /// Console session cookie, __Host-curie_console_session. Used by --accept,
     /// --reject and --remove, which never send the platform key. With --rules
     /// it lists with the session instead of the platform key.
-    #[arg(long, value_name = "PATH", requires = "rule_verb")]
+    #[arg(long, value_name = "PATH", requires = "rule_surface")]
     pub(crate) session_file: Option<PathBuf>,
 }
 
@@ -1162,9 +1177,11 @@ pub(crate) enum ClusterAction {
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
         /// Let the agent propose memory rules on or off
-        /// (`memory_rule_proposals`, #5796). Takes effect for the next
-        /// request's completion contract. A person still accepts any proposed
-        /// rule; the agent never activates one itself.
+        /// (`memory_rule_proposals`, #5796, #5801). A factory run reads it at
+        /// its next request's completion contract; any other agent at its next
+        /// session in a channel, where it also needs --memory-writes on. A
+        /// person still accepts any proposed rule; the agent never activates
+        /// one itself.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_rule_proposals: Option<String>,
         #[command(flatten)]
@@ -1195,6 +1212,42 @@ pub(crate) enum ClusterAction {
         /// Remove the branch prefix.
         #[arg(long)]
         clear_branch_prefix: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read or set the Slack channel one agent's factory runs post progress to
+    /// (`PATCH /agents/{id}`, `factory_slack_channel`).
+    ///
+    /// This is its own verb, not a flag on `curie cluster factory`: that
+    /// command configures release-wide Helm intake, has no API connection and
+    /// no agent argument, so a per-agent setting there would be ambiguous.
+    ///
+    /// With neither flag this inspects. The agent must already hold exactly
+    /// one Slack binding with an identity for the channel; add it first with
+    /// `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>` (when another
+    /// agent already holds the default Slack identity on that channel, add it
+    /// under a free declared identity with `--adapter <identity>`), or, when
+    /// the channel is bound under several identities, remove the extra with
+    /// `curie cluster surfaces <agent> --remove slack=<CHANNEL_ID> --adapter
+    /// <identity>`. Binding it is a separate decision because it also makes
+    /// the agent answer there.
+    ///
+    /// `--no-slack-channel` clears the configured progress channel: the
+    /// progress lane stops rooting runs there and stops replying and editing
+    /// cards in the threads it already rooted. A thread that a Slack kickoff
+    /// started keeps its own progress either way.
+    FactoryProgress {
+        /// Agent name or id.
+        agent: String,
+        /// Post progress to this Slack channel id (public C..., private G...).
+        #[arg(long, value_name = "CHANNEL_ID", conflicts_with = "no_slack_channel")]
+        slack_channel: Option<String>,
+        /// Clear the configured progress channel.
+        #[arg(long)]
+        no_slack_channel: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.

@@ -52,10 +52,6 @@ class FactoryNotice:
     label_event_id: int | None = None
     actor_refusal: str | None = None
     previously_admitted: bool = False
-    # A Bot label event GitHub attributes to this installation's own App
-    # (``performed_via_github_app``), kept only as an observation: the triage
-    # handoff's delegated output lookup reads it (#5588). It grants nothing.
-    own_app_label: bool = False
     # A created issue comment that is not a mention a human made (disposition
     # ``comment``, #5787): the code today's mention rules refuse it with. The
     # answer intake decides first; when the comment is not an answer, this is

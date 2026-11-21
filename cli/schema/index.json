@@ -301,7 +301,7 @@
       "result": "MemoryRulesOutput",
       "kind": "CliOutput",
       "schema": "memory-rules.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "MessageDryRunOutput",
@@ -385,6 +385,12 @@
       "result": "PublicationPolicyOutput",
       "kind": "CliOutput",
       "schema": "publication-policy.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "FactoryProgressOutput",
+      "kind": "CliOutput",
+      "schema": "factory-progress.schema.json",
       "version": "1.0"
     },
     {

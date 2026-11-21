@@ -145,8 +145,8 @@ def test_long_agent_message_stays_off_public_tracker(admitted: Any) -> None:  # 
     assert stored == detail
     assert "Agent's last message:" not in body
     assert "Which parser should the maintainer choose?" not in body
-    assert "No pull request was published" in body
-    assert "Next owner:" in body
+    assert "Could not complete: the run ended without publishing a pull request." in body
+    assert "Cause: no_pull_request" in body
 
 
 def test_an_oversized_handoff_is_bounded_before_rendering(admitted: Any) -> None:  # noqa: F811

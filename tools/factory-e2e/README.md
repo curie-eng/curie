@@ -1752,6 +1752,61 @@ the evidence.
    with recording stubs and substitute the Slack Web API. They prove refusals,
    ordering and the judge, not the live path.
 
+## Scripted learned rules chain (#5799)
+
+`curie dev factory-e2e scripted --scenario learned-rules --transcript
+tools/model-script/transcripts/learned-rules-chain-a.json` proves the learned
+rule chain from outside on one owned kind install, with the GitHub stub, the
+scripted model server and a disposable Dex. It reuses the scripted driver's
+install and ticket A (stub issue 3815), then a reviewer with write access
+posts a review comment that mentions the factory and states a general rule on
+ticket A's pull request. The revision calls `propose_rule`, the merge turns
+the candidate into the proposed rule R1, a principal linked to a read only
+account is refused its acceptance with `memory_rules.write_access_required`
+and the writer's principal accepts it, both through the CLI with a session
+file. Ticket B (3921) is labelled by the writer, whose requester document asks
+for the opposite; its implementer prompt carries the learned rules section
+above the requester section, no reviewer prompt carries it, its pull request
+body names R1 with the work item's digest on the line before the requester
+line, and every added `assertAlmostEqual(` uses `places=6`. After the writer
+removes R1, ticket C (3922) carries none of it. The evidence JSON records one
+step per link under `learned_rules`, and `learned_rules_scenario.assert_chain`
+judges it; the command fails when it raises.
+
+Principal sessions come from a real Dex password login (users
+`writer@example.com` and `reader@example.com`), never a login code. The
+session probe runs before ticket A is labelled and before any model request:
+both sessions must be principal sessions of two distinct principals in the
+agent's tenant. Session values stay in memory, are redacted from every log,
+and reach the CLI only through mode 0600 files in the run directory.
+
+`--transcript` names the ticket A file; the B and C files sit beside it with
+the same stem, `-b.json` and `-c.json`, and the command refuses to start when
+either is missing or malformed. Replay routes each model request to its
+ticket's lane by the raw issue identity, with no fallback, so a request no
+ticket claims fails the run:
+
+```bash
+curie dev factory-e2e scripted --scenario learned-rules --build-images \
+  --transcript tools/model-script/transcripts/learned-rules-chain-a.json
+```
+
+Recording proxies every lane through a live model under the driver's existing
+caps, with the key in `CURIE_FACTORY_RECORD_KEY`. At teardown the exchanges
+are split by ticket, scrubbed of the stub's address, and written to the three
+`learned-rules-chain-*.json` files; an exchange with no ticket fails the run:
+
+```bash
+CURIE_FACTORY_RECORD_KEY=... \
+  curie dev factory-e2e scripted --scenario learned-rules --build-images --record
+```
+
+CI runs the replay as the `learned-rules` suite of the `e2e-scripted-factory`
+job and uploads its evidence as `scripted-learned-rules-evidence-<sha>`. The
+offline tests are `tests/test_learned_rules_scenario.py` (the judge, the
+session probe through `ScriptedRun.execute`, and the revision routing on the
+real stub) and the learned rules cases of `tests/test_scripted_driver.py`.
+
 ## Live GitHub chain (#5808)
 
 `factory_e2e.py run --scenario live-github-chain` runs the whole GitHub
@@ -1812,3 +1867,51 @@ Teardown deletes Dex and the OIDC Secret, the session files, the code host
 links, the run's unbound label (read back as gone), closes the run's issues,
 moves the default branch back to its head before the merge (read back), and
 deletes the namespace. The verdict fails unless every step is verified.
+
+## Live one-ticket on Jira Cloud (#5793)
+
+`factory_e2e.py run --scenario one-ticket --forge jira_cloud --answer-file
+<file> [--issue-file <file>]` runs the one-ticket flow against a real Jira
+Cloud site with a real model on the preflight's `jira_cloud+github` install.
+The driver is `one_ticket_live.py`; `one-ticket` is a loop scenario fixed to
+the `jira_cloud` forge, so any other `--forge` is refused before anything is
+installed. `--issue-file` defaults to `fixtures/one-ticket-jira-issue.md`, a
+ticket that leaves its rounding mode and default precision open, and
+`fixtures/one-ticket-answer.md` answers it.
+
+### Inputs
+
+1. The usual App, fixture repository, actor token, kube context and layer
+   registry inputs, plus `CURIE_FACTORY_MODEL_API_KEY`.
+2. `CURIE_FACTORY_JIRA_ENV_FILE`, in the format of the docstring of
+   `forges/jira_cloud.py`.
+3. `--answer-file`: the labeller's plain answer. It is required, refused when
+   empty or when it mentions anyone, and refused for every other scenario.
+
+### What the run judges
+
+Each beat against its bound, counted from labelling or from the answer:
+`Investigating this ticket.` within 180 seconds of labelling, a question
+comment within 1800 seconds, the answer posted only after the issue carries
+`curie-factory:questions` with no live request in the same read, the second
+request and `Answer received.` each within 180 seconds of the answer, exactly
+one pull request within 3600 seconds of the answer that names the Jira key and
+has a line starting `Answered on the ticket by `, the merge, and
+`Pull request merged:` within 600 seconds of it. It also requires the Jira
+status id read before labelling to equal the one read after the merged notice
+(an id, not a category), at most two requests, a `Usage:` total of at most
+25 USD (`total cost unknown` and a missing line fail), and no Jira issue
+created by the factory account.
+
+### Evidence and check-clean
+
+Before any lock or cluster call the run loads every identity of its
+environment (fixture repository, actor, operator, App, installation, Jira
+site, cloud, project, labeller and bot accounts, kube context, registry,
+binary paths, home) and writes evidence and log lines only through
+`anonymize`, which replaces each value with its role name. The serializer
+refuses evidence that still names one. The outcome summary for the pull
+request body is logged and stored as `outcome_summary`.
+`python3 tools/factory-e2e/one_ticket_live.py check-clean <file>` reloads the
+same identities and prints `clean`, or exits 1 naming only the roles it found;
+an unreadable input exits 2. It needs only the standard library.

@@ -33,7 +33,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import test_factory_tracker_results as tr
+import factory_run_support as tr
 from curie_api import factory_questions
 from curie_api.factory_comment_text import marker_for
 from curie_api.workitem_dispatch import DispatchConflict, acquire
@@ -59,7 +59,6 @@ STATE_LABELS = {
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
-    "curie-factory:triaged",
     QUESTIONS_LABEL,
 }
 INVESTIGATING = (
@@ -67,27 +66,27 @@ INVESTIGATING = (
 )
 
 
-def _ask(triage: tr._Triage, questions: list[str] | None = None) -> Any:
-    return triage.client.post(
+def _ask(job: tr._Run, questions: list[str] | None = None) -> Any:
+    return job.client.post(
         QUESTIONS_URL,
-        headers={"X-Curie-Issue-Read": triage.capability},
+        headers={"X-Curie-Issue-Read": job.capability},
         json={"summary": SUMMARY, "questions": questions or QUESTIONS},
     )
 
 
-def _running(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
+def _running(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Run:
     _client, _github, sink = admitted
     sink.issue_labels[number] = {LABEL}
-    triage = tr._triage(admitted, monkeypatch, number, tracker_result=False)
-    tr._begin(triage)
-    return triage
+    job = tr._admit_run(admitted, monkeypatch, number)
+    tr._begin(job)
+    return job
 
 
-def _asked(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
-    triage = _running(admitted, monkeypatch, number)
-    response = _ask(triage)
+def _asked(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Run:
+    job = _running(admitted, monkeypatch, number)
+    response = _ask(job)
     assert response.status_code == 200, response.text
-    return triage
+    return job
 
 
 def _round_row(work_item_id: uuid.UUID) -> dict[str, Any] | None:
@@ -128,22 +127,22 @@ def _version(work_item_id: uuid.UUID) -> int:
     return int(row["version"])
 
 
-def _queue_revision(triage: tr._Triage) -> uuid.UUID:
+def _queue_revision(job: tr._Run) -> uuid.UUID:
     """A follow-up revision request on the same WorkItem, as an answer queues it."""
 
     (source,) = _rows(
         "SELECT requester, reply_kind, reply_address, reply_conversation_id "
         "FROM curie.execution_requests WHERE id = :id",
-        {"id": triage.request_id},
+        {"id": job.request_id},
     )
     revision_id = uuid.uuid4()
-    version = _version(triage.work_item_id)
+    version = _version(job.work_item_id)
 
     async def go() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             return await lifecycle.create_revision_request(
                 session,
-                work_item_id=triage.work_item_id,
+                work_item_id=job.work_item_id,
                 request_id=revision_id,
                 wait_deadline=datetime.now(UTC) + timedelta(hours=1),
                 expected_work_item_version=version,
@@ -156,7 +155,7 @@ def _queue_revision(triage: tr._Triage) -> uuid.UUID:
                 },
             )
 
-    created = triage.client.portal.call(go)
+    created = job.client.portal.call(go)
     assert isinstance(created, lifecycle.WorkItemOutcome), created
     return revision_id
 
@@ -171,25 +170,25 @@ def _answer(work_item_id: uuid.UUID, pending: uuid.UUID) -> None:
     )
 
 
-def _promote(triage: tr._Triage) -> None:
+def _promote(job: tr._Run) -> None:
     async def go() -> None:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             await lifecycle.admit_next_revision(
                 session,
-                work_item_id=triage.work_item_id,
+                work_item_id=job.work_item_id,
                 wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             )
 
-    triage.client.portal.call(go)
+    job.client.portal.call(go)
 
 
-def _take_over(triage: tr._Triage, request_id: uuid.UUID) -> tr._Triage:
+def _take_over(job: tr._Run, request_id: uuid.UUID) -> tr._Run:
     """Promote, acquire and start ``request_id`` and mint its capability."""
 
-    _promote(triage)
+    _promote(job)
 
     async def go() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             acquired = await acquire(
                 session,
                 request_id,
@@ -197,24 +196,24 @@ def _take_over(triage: tr._Triage, request_id: uuid.UUID) -> tr._Triage:
                 generation=1,
                 wake=await factory_wake(session, request_id),
                 context=None,
-                client=triage.client.app.state.http_client,
+                client=job.client.app.state.http_client,
             )
             assert not isinstance(acquired, DispatchConflict), acquired
             return acquired.context
 
-    context = triage.client.portal.call(go)
-    minted = triage.client.post(
+    context = job.client.portal.call(go)
+    minted = job.client.post(
         tr.MINT_URL,
         headers=tr.WORKER_HEADERS,
         json={"execution_request_id": str(request_id), "publication_recovery": False},
     )
     assert minted.status_code == 200, minted.text
-    successor = tr._Triage(
-        client=triage.client,
+    successor = tr._Run(
+        client=job.client,
         request_id=request_id,
-        work_item_id=triage.work_item_id,
-        tracker=triage.tracker,
-        issue=triage.issue,
+        work_item_id=job.work_item_id,
+        tracker=job.tracker,
+        issue=job.issue,
         capability=minted.json()["capability"],
         context=context,
     )
@@ -238,14 +237,14 @@ def _state_labels(sink: Any, number: int) -> set[str]:
 def test_an_asking_request_that_ends_without_a_pull_request_settles_questions_asked(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _asked(admitted, monkeypatch, 901)
-    tr._finish(triage, "failed", "no_pull_request")
+    job = _asked(admitted, monkeypatch, 901)
+    tr._finish(job, "failed", "no_pull_request")
 
-    assert _request(triage.request_id) == {
+    assert _request(job.request_id) == {
         "status": "completed",
         "terminal_cause": "questions_asked",
     }
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["rounds_used"], row["pending_request_id"]) == (
         "outstanding",
@@ -253,7 +252,7 @@ def test_an_asking_request_that_ends_without_a_pull_request_settles_questions_as
         None,
     )
     # A completed request admits no retry successor.
-    assert [r["id"] for r in _requests(triage.work_item_id)] == [triage.request_id]
+    assert [r["id"] for r in _requests(job.work_item_id)] == [job.request_id]
     _client, _github, sink = admitted
     _reconcile()
     assert _state_labels(sink, 901) == {QUESTIONS_LABEL}
@@ -263,9 +262,9 @@ def test_an_asking_request_that_ends_without_a_pull_request_settles_questions_as
 def test_every_unpublished_ending_of_an_asking_request_settles_questions_asked(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, cause: str
 ) -> None:
-    triage = _asked(admitted, monkeypatch, 902)
-    tr._finish(triage, "failed", cause)
-    assert _request(triage.request_id) == {
+    job = _asked(admitted, monkeypatch, 902)
+    tr._finish(job, "failed", cause)
+    assert _request(job.request_id) == {
         "status": "completed",
         "terminal_cause": "questions_asked",
     }
@@ -274,22 +273,22 @@ def test_every_unpublished_ending_of_an_asking_request_settles_questions_asked(
 def test_a_request_that_never_asked_settles_its_own_cause(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 903)
-    tr._finish(triage, "failed", "no_pull_request")
-    assert _request(triage.request_id)["terminal_cause"] == "no_pull_request"
-    assert _round_row(triage.work_item_id) is None
+    job = _running(admitted, monkeypatch, 903)
+    tr._finish(job, "failed", "no_pull_request")
+    assert _request(job.request_id)["terminal_cause"] == "no_pull_request"
+    assert _round_row(job.work_item_id) is None
 
 
 def test_a_published_failure_after_asking_keeps_its_cause_and_clears_the_round(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _asked(admitted, monkeypatch, 904)
-    tr._finish(triage, "failed", "budget_exceeded")
-    assert _request(triage.request_id) == {
+    job = _asked(admitted, monkeypatch, 904)
+    tr._finish(job, "failed", "budget_exceeded")
+    assert _request(job.request_id) == {
         "status": "failed",
         "terminal_cause": "budget_exceeded",
     }
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["rounds_used"]) == ("cleared", 1)
 
 
@@ -306,16 +305,16 @@ def test_a_published_failure_after_asking_keeps_its_cause_and_clears_the_round(
 def test_answered_before_settle_keeps_the_queued_revision(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, cause: str, settled: dict[str, str]
 ) -> None:
-    triage = _asked(admitted, monkeypatch, 911)
-    before = _round_row(triage.work_item_id)
+    job = _asked(admitted, monkeypatch, 911)
+    before = _round_row(job.work_item_id)
     assert before is not None
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
 
-    tr._finish(triage, "failed", cause)
+    tr._finish(job, "failed", cause)
 
-    assert _request(triage.request_id) == settled
-    row = _round_row(triage.work_item_id)
+    assert _request(job.request_id) == settled
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"], row["rounds_used"]) == (
         "answered",
@@ -324,9 +323,9 @@ def test_answered_before_settle_keeps_the_queued_revision(
     )
     assert row["answer_after"] == before["answer_after"]
     # No automatic successor; the follow-up waits queued for its promotion.
-    assert [r["id"] for r in _requests(triage.work_item_id)] == [triage.request_id, revision]
+    assert [r["id"] for r in _requests(job.work_item_id)] == [job.request_id, revision]
     assert _request(revision)["status"] == "queued"
-    _promote(triage)
+    _promote(job)
     assert _request(revision)["status"] == "waiting"
 
 
@@ -337,11 +336,11 @@ def test_status_comment_names_the_round_and_carries_the_questions_label(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 921)
-    tr._finish(triage, "failed", "no_pull_request")
+    job = _asked(admitted, monkeypatch, 921)
+    tr._finish(job, "failed", "no_pull_request")
     _reconcile()
 
-    body = _status_body(sink, triage.request_id)
+    body = _status_body(sink, job.request_id)
     assert "Questions asked (round 1 of 3). Answer in a plain comment on this ticket." in body
     assert "Status: NEEDS HUMAN" not in body
     assert "Could not complete" not in body
@@ -355,25 +354,14 @@ def test_investigating_line_leads_a_running_implementation_status_comment(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _client, _github, sink = admitted
-    triage = _running(admitted, monkeypatch, 931)
+    job = _running(admitted, monkeypatch, 931)
     _reconcile()
-    body = _status_body(sink, triage.request_id)
+    body = _status_body(sink, job.request_id)
     assert body.startswith(INVESTIGATING)
 
-    tr._finish(triage, "failed", "runner_escalated")
+    tr._finish(job, "failed", "runner_escalated")
     _reconcile()
-    assert INVESTIGATING not in _status_body(sink, triage.request_id)
-
-
-def test_investigating_line_is_absent_for_a_tracker_result_request(
-    admitted: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _client, _github, sink = admitted
-    sink.issue_labels[932] = {LABEL}
-    triage = tr._triage(admitted, monkeypatch, 932, tracker_result=True)
-    tr._begin(triage)
-    _reconcile()
-    assert INVESTIGATING not in _status_body(sink, triage.request_id)
+    assert INVESTIGATING not in _status_body(sink, job.request_id)
 
 
 @pytest.mark.parametrize("fragment", ["discussion_r88301", "issuecomment-88302"])
@@ -391,7 +379,7 @@ def test_investigating_line_is_absent_for_pull_request_feedback(
 
 def _asked_rounds(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int, rounds: int
-) -> tr._Triage:
+) -> tr._Run:
     """``rounds`` real rounds, each answered while its asker ran; the last
     asker is still running."""
 
@@ -407,7 +395,7 @@ def _asked_rounds(
     return current
 
 
-def _refused_fourth(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
+def _refused_fourth(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Run:
     """A running request whose fourth ask got a real 409 for the cap."""
 
     current = _asked_rounds(admitted, monkeypatch, number, 3)
@@ -428,7 +416,7 @@ def _refused_fourth(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int)
     return current
 
 
-def _versions(triage: tr._Triage, request_id: uuid.UUID) -> tuple[int, int]:
+def _versions(job: tr._Run, request_id: uuid.UUID) -> tuple[int, int]:
     (row,) = _rows(
         "SELECT w.version AS work_item_version, r.version AS request_version "
         "FROM curie.work_items w JOIN curie.execution_requests r ON r.work_item_id = w.id "
@@ -438,7 +426,7 @@ def _versions(triage: tr._Triage, request_id: uuid.UUID) -> tuple[int, int]:
     return int(row["work_item_version"]), int(row["request_version"])
 
 
-def _lose_owner(triage: tr._Triage) -> None:
+def _lose_owner(job: tr._Run) -> None:
     """The heartbeat lapses past the runtime TTL, the reconciler's owner loss
     cancellation runs, and the worker records the sandbox's termination."""
 
@@ -448,37 +436,37 @@ def _lose_owner(triage: tr._Triage) -> None:
     tr._exec(
         "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
         "clock_timestamp() - make_interval(secs => :lapse) WHERE id = :id",
-        {"lapse": ttl + 5, "id": triage.request_id},
+        {"lapse": ttl + 5, "id": job.request_id},
     )
 
-    work_item_version, request_version = _versions(triage, triage.request_id)
+    work_item_version, request_version = _versions(job, job.request_id)
 
     async def cancel() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             result = await lifecycle.request_owner_lost_cancellation(
                 session,
-                work_item_id=triage.work_item_id,
-                request_id=triage.request_id,
+                work_item_id=job.work_item_id,
+                request_id=job.request_id,
                 expected_work_item_version=work_item_version,
                 expected_request_version=request_version,
             )
             await session.commit()
             return result
 
-    assert isinstance(triage.client.portal.call(cancel), lifecycle.WorkItemOutcome)
-    assert _request(triage.request_id) == {
+    assert isinstance(job.client.portal.call(cancel), lifecycle.WorkItemOutcome)
+    assert _request(job.request_id) == {
         "status": "cancellation_requested",
         "terminal_cause": "owner_lost",
     }
 
-    work_item_version, request_version = _versions(triage, triage.request_id)
+    work_item_version, request_version = _versions(job, job.request_id)
 
     async def terminate() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             result = await lifecycle.record_runtime_termination(
                 session,
-                work_item_id=triage.work_item_id,
-                request_id=triage.request_id,
+                work_item_id=job.work_item_id,
+                request_id=job.request_id,
                 termination_observation="sandbox gone after the owner stopped heartbeating",
                 expected_work_item_version=work_item_version,
                 expected_request_version=request_version,
@@ -486,21 +474,21 @@ def _lose_owner(triage: tr._Triage) -> None:
             await session.commit()
             return result
 
-    assert isinstance(triage.client.portal.call(terminate), lifecycle.WorkItemOutcome)
+    assert isinstance(job.client.portal.call(terminate), lifecycle.WorkItemOutcome)
 
 
-def _finish_clean(triage: tr._Triage, cause: str) -> Any:
+def _finish_clean(job: tr._Run, cause: str) -> Any:
     """The worker's failed finish with proved ``no_effects``, which lets a
     retryable cause admit an automatic successor."""
 
     from curie_api.workitem_dispatch import finish
 
     async def go() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             return await finish(
                 session,
-                triage.request_id,
-                runtime_epoch=triage.epoch,
+                job.request_id,
+                runtime_epoch=job.epoch,
                 outcome="failed",
                 cause=cause,
                 detail=None,
@@ -510,7 +498,7 @@ def _finish_clean(triage: tr._Triage, cause: str) -> Any:
                 exhausted_volume=None,
             )
 
-    return triage.client.portal.call(go)
+    return job.client.portal.call(go)
 
 
 def test_cap_refuses_a_fourth_round_and_the_request_needs_a_human(
@@ -552,10 +540,10 @@ def test_cap_refuses_a_fourth_round_and_the_request_needs_a_human(
     assert len(current.tracker.marked_comments.comments(_target(current))) >= 3
 
 
-def _target(triage: tr._Triage) -> Any:
+def _target(job: tr._Run) -> Any:
     from curie_api.forges.types import ReplyTarget
 
-    return ReplyTarget.on_issue(triage.issue)
+    return ReplyTarget.on_issue(job.issue)
 
 
 def test_cap_owner_loss_after_the_refusal_settles_exhausted_without_a_successor(
@@ -593,43 +581,43 @@ def test_cap_a_retryable_failure_after_the_refusal_settles_exhausted_without_a_s
 def test_cap_owner_loss_below_the_cap_still_admits_its_successor(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _asked(admitted, monkeypatch, 945)
-    _lose_owner(triage)
-    assert _request(triage.request_id) == {"status": "failed", "terminal_cause": "owner_lost"}
-    successor = _requests(triage.work_item_id)[-1]
-    assert successor["id"] != triage.request_id
+    job = _asked(admitted, monkeypatch, 945)
+    _lose_owner(job)
+    assert _request(job.request_id) == {"status": "failed", "terminal_cause": "owner_lost"}
+    successor = _requests(job.work_item_id)[-1]
+    assert successor["id"] != job.request_id
     assert successor["status"] == "waiting"
 
 
 def test_cap_a_retryable_failure_below_the_cap_still_admits_its_successor(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _asked(admitted, monkeypatch, 946)
-    _finish_clean(triage, "sandbox_node_disrupted")
-    assert _request(triage.request_id) == {
+    job = _asked(admitted, monkeypatch, 946)
+    _finish_clean(job, "sandbox_node_disrupted")
+    assert _request(job.request_id) == {
         "status": "failed",
         "terminal_cause": "sandbox_node_disrupted",
     }
-    successor = _requests(triage.work_item_id)[-1]
-    assert successor["id"] != triage.request_id
+    successor = _requests(job.work_item_id)[-1]
+    assert successor["id"] != job.request_id
     assert successor["status"] == "waiting"
 
 
 # Criterion 12: cancellation -----------------------------------------------------------
 
 
-def _cancel(triage: tr._Triage) -> None:
-    version = _version(triage.work_item_id)
+def _cancel(job: tr._Run) -> None:
+    version = _version(job.work_item_id)
 
     async def go() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             result = await lifecycle.request_cancellation(
-                session, work_item_id=triage.work_item_id, expected_work_item_version=version
+                session, work_item_id=job.work_item_id, expected_work_item_version=version
             )
             await session.commit()
             return result
 
-    assert isinstance(triage.client.portal.call(go), lifecycle.WorkItemOutcome)
+    assert isinstance(job.client.portal.call(go), lifecycle.WorkItemOutcome)
 
 
 def test_cancel_deletes_the_question_cancels_the_queued_answer_and_keeps_the_cap(
@@ -688,15 +676,15 @@ def test_cancel_after_the_question_settled_stops_asking_on_the_ticket(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 956)
-    tr._finish(triage, "failed", "no_pull_request")
+    job = _asked(admitted, monkeypatch, 956)
+    tr._finish(job, "failed", "no_pull_request")
     _reconcile()
     assert _state_labels(sink, 956) == {QUESTIONS_LABEL}
 
-    _cancel(triage)
+    _cancel(job)
     _reconcile()
-    assert _round_row(triage.work_item_id) is None
-    assert _round_count(triage.work_item_id) == (1, triage.request_id)
+    assert _round_row(job.work_item_id) is None
+    assert _round_count(job.work_item_id) == (1, job.request_id)
     assert _state_labels(sink, 956) == set()
 
 
@@ -704,24 +692,24 @@ def test_a_question_comment_rendered_after_cancel_does_not_ask_for_an_answer(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _client, _github, sink = admitted
-    triage = _asked(admitted, monkeypatch, 957)
-    tr._finish(triage, "failed", "no_pull_request")
-    _cancel(triage)
+    job = _asked(admitted, monkeypatch, 957)
+    tr._finish(job, "failed", "no_pull_request")
+    _cancel(job)
     _reconcile()
-    body = _status_body(sink, triage.request_id)
+    body = _status_body(sink, job.request_id)
     assert "Answer in a plain comment" not in body
     assert "Questions asked (round 1 of 3). The factory label was removed" in body
     assert _state_labels(sink, 957) == set()
 
 
-async def _cancel_now(triage: tr._Triage) -> Any:
-    async with triage.client.app.state.sessionmaker() as session:
+async def _cancel_now(job: tr._Run) -> Any:
+    async with job.client.app.state.sessionmaker() as session:
         version = await session.scalar(
             text("SELECT version FROM curie.work_items WHERE id = :id"),
-            {"id": triage.work_item_id},
+            {"id": job.work_item_id},
         )
         result = await lifecycle.request_cancellation(
-            session, work_item_id=triage.work_item_id, expected_work_item_version=version
+            session, work_item_id=job.work_item_id, expected_work_item_version=version
         )
         await session.commit()
         return result
@@ -730,30 +718,30 @@ async def _cancel_now(triage: tr._Triage) -> Any:
 def test_cancel_before_the_comment_is_written_refuses_with_no_write(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 952)
+    job = _running(admitted, monkeypatch, 952)
     original = factory_questions.begin_round
 
     async def cancelled_after_posting(*args: Any, **kwargs: Any) -> Any:
         begun = await original(*args, **kwargs)
         assert isinstance(begun, factory_questions.Posting)
-        assert isinstance(await _cancel_now(triage), lifecycle.WorkItemOutcome)
+        assert isinstance(await _cancel_now(job), lifecycle.WorkItemOutcome)
         return begun
 
     monkeypatch.setattr(factory_questions, "begin_round", cancelled_after_posting)
-    refused = _ask(triage)
+    refused = _ask(job)
     assert (refused.status_code, refused.json()["detail"]["code"]) == (
         409,
         "work_item_cancelled",
     )
-    assert triage.tracker.ledger.writes == 0
-    assert _round_row(triage.work_item_id) is None
-    assert _round_count(triage.work_item_id) == (0, None)
+    assert job.tracker.ledger.writes == 0
+    assert _round_row(job.work_item_id) is None
+    assert _round_count(job.work_item_id) == (0, None)
 
 
 def test_cancel_during_the_comment_write_waits_for_the_round_then_deletes_it(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 958)
+    job = _running(admitted, monkeypatch, 958)
     original = factory_questions.post_round
     pending: list[asyncio.Task[Any]] = []
 
@@ -761,44 +749,44 @@ def test_cancel_during_the_comment_write_waits_for_the_round_then_deletes_it(
         comment_id = await original(*args, **kwargs)
         # The cancellation takes the WorkItem lock and then waits for the
         # question row, which the round being recorded holds.
-        pending.append(asyncio.create_task(_cancel_now(triage)))
+        pending.append(asyncio.create_task(_cancel_now(job)))
         finished, _ = await asyncio.wait({pending[0]}, timeout=0.5)
         assert not finished
         return comment_id
 
     monkeypatch.setattr(factory_questions, "post_round", cancelled_meanwhile)
-    posted = _ask(triage)
+    posted = _ask(job)
     assert posted.status_code == 200, posted.text
 
     async def cancelled() -> Any:
         return await asyncio.wait_for(pending[0], timeout=30)
 
-    assert isinstance(triage.client.portal.call(cancelled), lifecycle.WorkItemOutcome)
-    assert triage.tracker.ledger.writes == 1
-    assert _round_row(triage.work_item_id) is None
-    assert _round_count(triage.work_item_id) == (1, triage.request_id)
+    assert isinstance(job.client.portal.call(cancelled), lifecycle.WorkItemOutcome)
+    assert job.tracker.ledger.writes == 1
+    assert _round_row(job.work_item_id) is None
+    assert _round_count(job.work_item_id) == (1, job.request_id)
 
 
 def test_cancel_then_relabel_keeps_the_round_cap(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _client, github, _sink = admitted
-    triage = _asked(admitted, monkeypatch, 953)
+    job = _asked(admitted, monkeypatch, 953)
     # Two more rounds were posted by earlier attempts on this WorkItem.
     tr._exec(
         "UPDATE curie.factory_question_rounds SET rounds_used = 3 WHERE work_item_id = :id",
-        {"id": triage.work_item_id},
+        {"id": job.work_item_id},
     )
     tr._exec(
         "UPDATE curie.factory_question_round_counts SET rounds_used = 3 WHERE work_item_id = :id",
-        {"id": triage.work_item_id},
+        {"id": job.work_item_id},
     )
-    tr._finish(triage, "failed", "no_pull_request")
-    _cancel(triage)
-    tr._label(triage.client, github, 953)
-    relabelled = _requests(triage.work_item_id)[-1]["id"]
-    assert relabelled != triage.request_id
-    current = _take_over(triage, relabelled)
+    tr._finish(job, "failed", "no_pull_request")
+    _cancel(job)
+    tr._label(job.client, github, 953)
+    relabelled = _requests(job.work_item_id)[-1]["id"]
+    assert relabelled != job.request_id
+    current = _take_over(job, relabelled)
     refused = _ask(current)
     assert (refused.status_code, refused.json()["detail"]["code"]) == (
         409,
@@ -812,11 +800,11 @@ def test_a_relabel_that_supersedes_the_waiting_answer_clears_the_round(
     from forge_fakes.github import _issue_event, _post
 
     client, github, _sink = admitted
-    triage = _asked(admitted, monkeypatch, 954)
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
-    tr._finish(triage, "failed", "no_pull_request")
-    _promote(triage)
+    job = _asked(admitted, monkeypatch, 954)
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
+    tr._finish(job, "failed", "no_pull_request")
+    _promote(job)
     assert _request(revision)["status"] == "waiting"
 
     github.advance_label_event(954)
@@ -825,6 +813,6 @@ def test_a_relabel_that_supersedes_the_waiting_answer_clears_the_round(
     _reconcile()
 
     assert _request(revision)["status"] == "cancelled"
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["rounds_used"]) == ("cleared", 1)

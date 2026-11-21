@@ -2792,3 +2792,302 @@ def test_the_publication_scenario_installs_the_one_ticket_lane_and_the_gateway()
     lane = one_ticket_run.build_lane(model)
     assert (lane.agent, lane.issue) == (lanes.IMPLEMENTATION, ots.ISSUE)
     assert lane.exchanges, "the transcript holds both sessions"
+
+
+# The learned rules chain (#5799): its configuration, its driver and its recording.
+
+import learned_rules_lanes as lrl  # noqa: E402
+import learned_rules_run as lrr  # noqa: E402
+
+
+def _chain_transcripts(tmp_path: Path, *, skip: str | None = None) -> Path:
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    first.parent.mkdir(exist_ok=True)
+    for letter, path in lrl.transcript_paths(first).items():
+        if letter != skip:
+            path.write_text(json.dumps({"version": 1, "exchanges": []}))
+    return first
+
+
+def _chain_args(transcript: Path, *extra: str) -> Any:
+    return fe.parse_args(
+        ["scripted", "--scenario", "learned-rules", "--transcript", str(transcript), *extra]
+    )
+
+
+@pytest.mark.parametrize("missing", ["b", "c"])
+def test_learned_rules_replay_without_a_sibling_refuses_before_any_external_command(
+    missing: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    first = _chain_transcripts(tmp_path, skip=missing)
+
+    assert sk.main(_chain_args(first)) == fe.EXIT_CONFIG
+    assert f"learned-rules-chain-{missing}.json is missing" in capsys.readouterr().err
+
+
+def test_learned_rules_replay_refuses_a_malformed_sibling_and_an_unpaired_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    first = _chain_transcripts(tmp_path)
+    first.with_name("learned-rules-chain-c.json").write_text('{"version": 1, "exchanges": [')
+    assert sk.main(_chain_args(first)) == fe.EXIT_CONFIG
+    assert "learned-rules-chain-c.json is malformed" in capsys.readouterr().err
+
+    unpaired = tmp_path / "chain" / "transcript.json"
+    unpaired.write_text(json.dumps({"version": 1, "exchanges": []}))
+    assert sk.main(_chain_args(unpaired)) == fe.EXIT_CONFIG
+    assert "is not named <stem>-a.json" in capsys.readouterr().err
+
+
+def test_learned_rules_replay_with_all_three_transcripts_passes_configuration(
+    tmp_path: Path,
+) -> None:
+    sk.validate_configuration(_chain_args(_chain_transcripts(tmp_path)))
+
+
+def test_learned_rules_may_record_with_the_key_and_writes_the_chain_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    recording = fe.parse_args(["scripted", "--scenario", "learned-rules", "--record"])
+    sk.validate_configuration(recording)
+    run = lrr.LearnedRulesRun(recording)
+    assert run.transcripts["a"] == lrr.RECORD_TARGET
+    assert run.transcripts["b"].name == "learned-rules-chain-b.json"
+    # A named target must be an A file, since the B and C files sit beside it.
+    sk.validate_configuration(_chain_args(tmp_path / "x-a.json", "--record"))
+    with pytest.raises(fe.ConfigError, match="<stem>-a.json"):
+        sk.validate_configuration(_chain_args(tmp_path / "x.json", "--record"))
+
+
+def test_learned_rules_recording_without_the_key_refuses_before_any_external_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("CURIE_FACTORY_RECORD_KEY", raising=False)
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    args = fe.parse_args(["scripted", "--scenario", "learned-rules", "--record"])
+    assert sk.main(args) == fe.EXIT_CONFIG
+    assert "CURIE_FACTORY_RECORD_KEY" in capsys.readouterr().err
+
+
+def test_main_runs_the_learned_rules_scenario_in_its_own_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    ran: list[type] = []
+
+    def execute(run: sk.ScriptedRun) -> None:
+        ran.append(type(run))
+
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+    assert sk.main(_chain_args(_chain_transcripts(tmp_path))) == 0
+    assert ran == [lrr.LearnedRulesRun]
+    evidence = _evidence(tmp_path)
+    assert evidence["learned_rules"]["scenario"] == "learned-rules"
+
+
+def test_the_learned_rules_scenario_owes_no_one_ticket_verdict_and_the_others_still_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chain = lrr.LearnedRulesRun(_chain_args(_chain_transcripts(tmp_path)))
+    assert chain.one_ticket_required() is False
+    assert chain.one_ticket_verdict_error() is None
+    assert not chain.gateway_enabled() and sk.GATEWAY_IMAGE not in chain.image_refs
+    assert chain.router_fallback() is False
+    run = sk.ScriptedRun(_replay_args(tmp_path, scenario="publication"))
+    assert run.one_ticket_required() is True
+    assert run.one_ticket_verdict_error() == "the one-ticket scenario did not run"
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    recording = fe.parse_args(["scripted", "--scenario", "publication", "--record"])
+    assert sk.ScriptedRun(recording).one_ticket_required() is False
+
+
+def test_the_default_hooks_route_the_existing_scenarios_as_before(tmp_path: Path) -> None:
+    model = sk._module("factory_model_script_hooks", MODEL_SCRIPT)
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    assert run.model_options(model) == {}
+    assert run.router_fallback() is True
+    router = run.make_router(model)
+    assert router is not None and router.agent_markers == {}
+    assert [lane.name for lane in router.lanes.values()] == ["one-ticket"]
+    values: dict[str, Any] = {"api": {"extraEnv": [{"name": "X", "value": "1"}]}}
+    run.extend_install_values(values)
+    assert values == {"api": {"extraEnv": [{"name": "X", "value": "1"}]}}
+
+
+def test_learned_rules_install_values_add_the_oidc_settings_by_secret_reference(
+    tmp_path: Path,
+) -> None:
+    run = lrr.LearnedRulesRun(_chain_args(_chain_transcripts(tmp_path)))
+    values: dict[str, Any] = {
+        "api": {"extraEnv": [{"name": "KEEP", "value": "1"}, {"name": "CURIE_OIDC_ISSUER"}]}
+    }
+    run.extend_install_values(values)
+    env = {entry["name"]: entry for entry in values["api"]["extraEnv"]}
+    assert env["KEEP"] == {"name": "KEEP", "value": "1"}
+    assert env["CURIE_OIDC_ISSUER"]["value"] == run.issuer
+    assert run.issuer.endswith(".svc.cluster.local:5556/dex")
+    assert env["CURIE_OIDC_CLIENT_SECRET"] == {
+        "name": "CURIE_OIDC_CLIENT_SECRET",
+        "valueFrom": {"secretKeyRef": {"name": lrr.OIDC_SECRET, "key": lrr.OIDC_SECRET_KEY}},
+    }
+    assert env["CURIE_OIDC_REDIRECT_URI"]["value"] == run.redirect_uri
+    assert env["CURIE_OIDC_ADMIT_ALL_AUTHENTICATED"]["value"] == "true"
+    assert len([e for e in values["api"]["extraEnv"] if e["name"] == "CURIE_OIDC_ISSUER"]) == 1
+
+
+class _RecordedStub:
+    host = "192.0.2.10"
+    port = 34567
+    base_url = "https://192.0.2.10:34567"
+
+
+class _RecordedModel:
+    def __init__(self, exchanges: list[dict[str, Any]], tags: list[str | None]) -> None:
+        self._exchanges = exchanges
+        self.recorded_tags = tags
+        self._lock = threading.Lock()
+
+
+def _recorded(lane: str, text: str) -> dict[str, Any]:
+    return {
+        "lane_key": lane,
+        "ordinal": 0,
+        "message": {"type": "message", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def test_a_learned_rules_recording_is_split_by_ticket_and_scrubbed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    run = lrr.LearnedRulesRun(_chain_args(first, "--record"))
+    run.stub = _RecordedStub()
+    run.model = _RecordedModel(
+        [
+            _recorded("a0", "cloned https://192.0.2.10:34567/acme-corp/acme-bot.git"),
+            _recorded("b0", "host 192.0.2.10:34567"),
+            _recorded("a1", "pushed to 192.0.2.10"),
+            _recorded("c0", "done"),
+        ],
+        ["a", "b", "a", "c"],
+    )
+    # A committed A file from an earlier recording; ModelScript dumps elsewhere.
+    first.parent.mkdir()
+    first.write_text(json.dumps({"version": 1, "exchanges": [{"stale": True}]}))
+    run.workdir = tmp_path / "work"
+    assert run.model_transcript() == run.workdir / "recording-raw.json"
+    assert run.model_transcript() not in run.transcripts.values()
+    run.write_recording()
+
+    model = sk._module("factory_model_script_split", MODEL_SCRIPT)
+    written = {letter: model.load_transcript(path) for letter, path in run.transcripts.items()}
+    assert [e["lane_key"] for e in written["a"]] == ["a0", "a1"]
+    assert [e["lane_key"] for e in written["b"]] == ["b0"]
+    assert [e["lane_key"] for e in written["c"]] == ["c0"]
+    texts = json.dumps(written)
+    assert "192.0.2.10" not in texts
+    assert "https://stub.example.test/acme-corp/acme-bot.git" in texts
+    assert "host stub.example.test" in texts
+    assert run.evidence["recorded_exchanges"] == {"a": 2, "b": 1, "c": 1}
+
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.model = _RecordedModel([_recorded("x", "cloned 192.0.2.10:34567")], [None])
+    with pytest.raises(lanes.LaneError, match="no known ticket tag"):
+        run.write_recording()
+    # A failed split leaves every committed file as it was.
+    assert {letter: path.read_text() for letter, path in run.transcripts.items()} == committed
+
+
+@pytest.mark.parametrize(
+    ("exchanges", "tags", "passed"),
+    [
+        # A failure after ticket A's model calls: the split alone would succeed and
+        # replace B and C with empty transcripts.
+        ([_recorded("a0", "one"), _recorded("a1", "two")], ["a", "a"], False),
+        # A failure after the model was set up and before its first call.
+        ([], [], False),
+        # The control: a chain the judge passed writes all three files.
+        (
+            [_recorded("a0", "one"), _recorded("b0", "two"), _recorded("c0", "three")],
+            list("abc"),
+            True,
+        ),
+    ],
+    ids=["failed-after-a", "failed-before-first-call", "passed-chain-writes"],
+)
+def test_cleanup_replaces_the_replay_fixtures_only_after_a_passed_chain(
+    exchanges: list[dict[str, Any]],
+    tags: list[str | None],
+    passed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    # The cluster, registry and endpoint teardown is not under test here.
+    monkeypatch.setattr(sk.ScriptedRun, "cleanup", lambda _self: [])
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    first.parent.mkdir()
+    run = lrr.LearnedRulesRun(_chain_args(first, "--record"))
+    for path in run.transcripts.values():
+        path.write_text(json.dumps({"version": 1, "exchanges": [{"committed": path.name}]}))
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.stub = _RecordedStub()
+    run.model = _RecordedModel(list(exchanges), list(tags))
+    run.workdir = tmp_path / "work"
+    if passed:
+        run.chain["result"] = "passed"
+    run.cleanup()
+    after = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    assert (after != committed) is passed
+    if passed:
+        assert [e["lane_key"] for e in json.loads(after["b"])["exchanges"]] == ["b0"]
+
+
+@pytest.mark.parametrize("failure", ["teardown", "transcript-write"])
+def test_a_passed_chain_replaces_no_fixture_when_teardown_or_a_write_fails(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    monkeypatch.setattr(
+        sk.ScriptedRun,
+        "cleanup",
+        lambda _self: (
+            ["owned kind cluster remains after teardown"] if failure == "teardown" else []
+        ),
+    )
+    original_write_text = Path.write_text
+
+    def write_text(self: Path, *args: Any, **kwargs: Any) -> int:
+        if failure == "transcript-write" and "learned-rules-chain-b.json" in self.name:
+            raise OSError("disk full")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    first.parent.mkdir()
+    run = lrr.LearnedRulesRun(_chain_args(first, "--record"))
+    for path in run.transcripts.values():
+        committed_text = json.dumps({"version": 1, "exchanges": [{"committed": path.name}]})
+        original_write_text(path, committed_text)
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.stub = _RecordedStub()
+    run.model = _RecordedModel(
+        [_recorded("a0", "one"), _recorded("b0", "two"), _recorded("c0", "three")], list("abc")
+    )
+    run.workdir = tmp_path / "work"
+    run.chain["result"] = "passed"
+
+    errors = run.cleanup()
+
+    assert errors
+    assert {letter: path.read_text() for letter, path in run.transcripts.items()} == committed
+    assert not list(first.parent.glob("*.tmp"))

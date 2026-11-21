@@ -111,5 +111,5 @@ log; it is prior art, not a dependency.
 4. Pin, delivery, prompt section, reviewer exclusion and the pull request line: #5798.
 5. The scripted chain proof with a recorded real model: #5799 (scenario `learned-rules` of `curie dev factory-e2e scripted`).
 6. Console Memory page: #5800.
-7. Non-factory proposals and session start load: #5801.
+7. Non-factory proposals and session start load: #5801 (`POST` and `GET /agents/{agent_id}/state/_rules` on the state router's `rules_router`, `apps/api/src/curie_api/memory_rule_channel.py`, `binding_claim_scope_key`, the decision routes for agent and binding scopes with `applies_from` `next_session`).
 8. The live proof on a real GitHub repository with a live model: #5808 (scenario `live-github-chain` of `curie dev factory-e2e run`).

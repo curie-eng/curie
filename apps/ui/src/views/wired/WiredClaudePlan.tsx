@@ -69,7 +69,7 @@ export function describeEnrollmentError(e: unknown): string {
 }
 
 export function statusLine(e: PersonalEnrollment): string {
-  if (e.state === "active") return `Connected, generation ${e.generation ?? "unknown"}`;
+  if (e.state === "active") return "Connected";
   if (e.state === "inactive") return "Disconnected";
   return "Not connected";
 }
@@ -207,6 +207,11 @@ function ClaudePlanBody() {
       <div data-testid="claude-plan-status" data-state={current.state} style={{ fontSize: 14, color: C.text }}>
         {statusLine(current)}
       </div>
+      {current.state === "active" && current.generation != null ? (
+        <div data-testid="claude-plan-generation" style={{ ...muted, marginTop: 2 }}>
+          Generation {current.generation}
+        </div>
+      ) : null}
       {teardown ? (
         <div data-testid="claude-plan-teardown" style={{ ...muted, marginTop: 4 }}>
           {teardown}

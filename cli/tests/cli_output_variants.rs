@@ -43,9 +43,9 @@ use curie::api::{
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
-    ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, HookFireOutput,
-    HookOutput, KillOutput, MemoryChannel, MemoryOutput, MemoryRulesOutput, OverridesOutput,
-    PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
+    ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, FactoryProgressOutput,
+    HookFireOutput, HookOutput, KillOutput, MemoryChannel, MemoryOutput, MemoryRulesOutput,
+    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
     SkillApprovalsOutput, SubscriptionOutput, SubscriptionVerb, VersionsOutput, WakeKeyOutput,
     WorkItemsOutput,
 };
@@ -472,6 +472,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "FactoryProgressOutput",
+        samples![
+            "DryRun" => FactoryProgressOutput::DryRun(plan()),
+            "Done" => FactoryProgressOutput::Done {
+                agent: "acme-bot".to_string(),
+                factory_slack_channel: Some("C0EXAMPLE1".to_string()),
+                changed: false,
+            },
+        ],
+    );
+    m.insert(
         "AccessPolicyOutput",
         samples![
             "DryRun" => AccessPolicyOutput::DryRun(plan()),
@@ -631,8 +642,8 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Changed" => MemoryRulesOutput::Changed {
                 verb: curie::commands::MemoryRuleVerb::Accept,
                 change: Box::new(
-                    curie::api::parse_memory_rule_change(memory_rules_vector("accept"))
-                        .expect("the recorded accept parses"),
+                    curie::api::parse_memory_rule_change(memory_rules_vector("accept_binding"))
+                        .expect("the recorded binding accept parses"),
                 ),
             },
         ],

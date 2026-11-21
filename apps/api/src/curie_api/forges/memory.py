@@ -31,8 +31,6 @@ from curie_api.forges.capabilities import (
 )
 from curie_api.forges.errors import (
     Ambiguous,
-    ForgeError,
-    LinkedIssueUnconfirmed,
     NotFound,
     Unavailable,
     Unsupported,
@@ -55,7 +53,6 @@ from curie_api.forges.types import (
     FactoryPublication,
     FeedbackKind,
     FeedbackPage,
-    LinkedIssue,
     MarkedComment,
     MarkedNotice,
     NormalizedCheck,
@@ -77,11 +74,6 @@ from curie_api.forges.types import (
     TrackerComment,
     TrackerIssueRef,
     UpsertResult,
-    body_sha256,
-    ends_with_marker,
-    linked_issue_body,
-    linked_issue_marker,
-    valid_output_identity,
 )
 from curie_api.publication_policy import is_publication_branch
 
@@ -127,41 +119,22 @@ class PageFaults:
 class WriteFaults:
     """Injectable write failures, one shot each, keyed by `Operation`.
 
-    `InMemoryTracker` honours them for `Operation.CREATE_LINKED_ISSUE` and its
-    `InMemoryMarkedComments` for `Operation.UPSERT_MARKED`; both share the one
-    object the tracker was built with (``InMemoryTracker.write_faults``).
+    `InMemoryMarkedComments` honours them for `Operation.UPSERT_MARKED`; a
+    tracker's marked comments share the one object the tracker was built with
+    (``InMemoryTracker.write_faults``).
     """
 
     def __init__(self) -> None:
         self._lost: set[Operation] = set()
         self._aborts: dict[Operation, BaseException] = {}
-        self._refusals: dict[Operation, ForgeError] = {}
 
     def lose_next_response(self, operation: Operation) -> None:
         """A lost response.
 
         For `Operation.UPSERT_MARKED` the next call does its work, writes
-        included, then raises `Unavailable` instead of answering. For
-        `Operation.CREATE_LINKED_ISSUE` it applies to the next create write:
-        the issue is written, then the answer is lost, so the adapter relists
-        within the call as a real adapter does. It returns the issue when the
-        relist sees it (``created`` False) and raises `LinkedIssueUnconfirmed`
-        when it does not (`InMemoryTracker.hide_new_from_listing`)."""
+        included, then raises `Unavailable` instead of answering."""
 
         self._lost.add(operation)
-
-    def refuse_next_write(self, operation: Operation, error: ForgeError) -> None:
-        """The next create write of `Operation.CREATE_LINKED_ISSUE` is refused
-        definitely with ``error`` and writes nothing, as a 401 or 422 is."""
-
-        self._refusals[operation] = error
-
-    def refusal(self, operation: Operation) -> None:
-        """Called by an adapter just before the write a refusal answers."""
-
-        error = self._refusals.pop(operation, None)
-        if error is not None:
-            raise error
 
     def lost(self, operation: Operation) -> bool:
         """Consume an armed lost response for ``operation``; True when one was."""
@@ -418,16 +391,6 @@ class InMemoryTracker(_Declared):
         self.ledger = ledger or WriteLedger()
         self.faults = faults or PageFaults()
         self.write_faults = write_faults or WriteFaults()
-        # Each composed body a `create_linked_issue` create wrote, in order.
-        self.sent_issue_bodies: list[str] = []
-        # How many own-issue listings `create_linked_issue` has run.
-        self.linked_listings = 0
-        # Listing lag: issues absent from the creator listing yet readable
-        # directly, as a fresh GitHub issue is for a few seconds. While
-        # ``hide_new_from_listing`` is set every issue the port creates starts
-        # hidden.
-        self.hide_new_from_listing = False
-        self._hidden: set[TrackerIssueRef] = set()
         self._page_size = page_size
         self._issues: dict[TrackerIssueRef, _Issue] = {}
         self._timeline: list[_TimelineEvent] = []
@@ -505,22 +468,6 @@ class InMemoryTracker(_Declared):
         """A person edits the issue's title. Not a port write: no ledger entry."""
 
         self._issue(issue).title = title
-
-    def hide_from_listing(self, issue: TrackerIssueRef) -> None:
-        """Listing lag: ``issue`` is absent from the creator listing
-        `create_linked_issue` reads, yet still readable directly, so an
-        ``expected`` read still finds it."""
-
-        self._issue(issue)
-        self._hidden.add(issue)
-
-    def show_in_listing(self, issue: TrackerIssueRef | None = None) -> None:
-        """The lag ends for ``issue``, or for every hidden issue when None."""
-
-        if issue is None:
-            self._hidden.clear()
-        else:
-            self._hidden.discard(issue)
 
     def issues(self, *, author: Actor | None = None) -> list[TrackerIssueRef]:
         """Every issue in creation order, only those ``author`` created when given."""
@@ -794,110 +741,6 @@ class InMemoryTracker(_Declared):
         if own:
             return (f"Closes #{issue.issue_id}",)
         return (f"Closes {issue.scope_id}#{issue.issue_id}",)
-
-    @staticmethod
-    def embed_linked_marker(output_identity: str) -> str:
-        """How this adapter carries the linked issue marker: an HTML comment."""
-
-        return f"<!-- {linked_issue_marker(output_identity)} -->"
-
-    def _own_marked(self, embedded: str) -> list[_Issue]:
-        """Issues in this scope our own identity created whose last line is
-        ``embedded``, read page by page as a creator-filtered listing is."""
-
-        self.linked_listings += 1
-        own = [
-            found
-            for found in self._issues.values()
-            if found.ref.scope_id == self.scope_id
-            and found.author == self.identity
-            and found.ref not in self._hidden
-        ]
-        matches: list[_Issue] = []
-        for start in range(0, max(len(own), 1), self._page_size):
-            self.faults.read_page("issues")
-            matches.extend(
-                found
-                for found in own[start : start + self._page_size]
-                if ends_with_marker(found.body, embedded)
-            )
-        return matches
-
-    async def create_linked_issue(
-        self,
-        source: TrackerIssueRef,
-        *,
-        output_identity: str,
-        title: str,
-        body: str,
-        labels: Collection[str],
-        expected: TrackerIssueRef | None = None,
-        reconcile_only: bool = False,
-    ) -> LinkedIssue:
-        """The port operation over dict state; honours ``write_faults`` for
-        `Operation.CREATE_LINKED_ISSUE`. The related-source line is
-        ``Related to <issue_url(source)>.``; the marker is
-        `embed_linked_marker`. A create counts one ledger write and appends
-        the composed body to ``sent_issue_bodies``; an issue it creates while
-        ``hide_new_from_listing`` is set is hidden from the listing. With
-        ``expected`` it reads that issue directly and never lists or creates;
-        with ``reconcile_only`` it lists and never creates (see the port)."""
-
-        self._gate(Operation.CREATE_LINKED_ISSUE)
-        if expected is not None and reconcile_only:
-            raise ValueError("expected and reconcile_only are exclusive")
-        valid_output_identity(output_identity)
-        self._issue(source)
-        self.write_faults.before(Operation.CREATE_LINKED_ISSUE)
-        embedded = self.embed_linked_marker(output_identity)
-        text = linked_issue_body(
-            body, related=f"Related to {self.issue_url(source)}.", embedded=embedded
-        )
-        if expected is not None:
-            # A recorded output is read directly, never listed or recreated.
-            recorded = self._issues.get(expected)
-            if (
-                recorded is None
-                or recorded.ref.scope_id != self.scope_id
-                or recorded.author != self.identity
-                or not ends_with_marker(recorded.body, embedded)
-            ):
-                raise NotFound("linked_issue")
-            return self._linked(recorded, text, created=False)
-        matches = self._own_marked(embedded)
-        if len(matches) > 1:
-            raise Ambiguous("linked_issue")
-        if matches:
-            return self._linked(matches[0], text, created=False)
-        if reconcile_only:
-            raise NotFound("linked_issue")
-        self.write_faults.refusal(Operation.CREATE_LINKED_ISSUE)
-        ref = TrackerIssueRef(self.kind, self.host, self.scope_id, self._next_issue_id())
-        found = _Issue(ref, title, text, labels=set(labels), author=self.identity)
-        self._issues[ref] = found
-        if self.hide_new_from_listing:
-            self._hidden.add(ref)
-        self.sent_issue_bodies.append(text)
-        self.ledger.record()
-        if not self.write_faults.lost(Operation.CREATE_LINKED_ISSUE):
-            return self._linked(found, text, created=True)
-        # The answer was lost: relist within the call, as a real adapter does.
-        confirmed = self._own_marked(embedded)
-        if len(confirmed) > 1:
-            raise Ambiguous("linked_issue")
-        if not confirmed:
-            raise LinkedIssueUnconfirmed("linked_issue_unconfirmed")
-        return self._linked(confirmed[0], text, created=False)
-
-    def _linked(self, found: _Issue, sent: str, *, created: bool) -> LinkedIssue:
-        return LinkedIssue(
-            issue=found.ref,
-            url=self.issue_url(found.ref),
-            labels=frozenset(found.labels),
-            body_sha256=body_sha256(found.body),
-            sent_body_sha256=body_sha256(sent),
-            created=created,
-        )
 
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         if not self._gate(Operation.LINK_PULL_REQUEST):
