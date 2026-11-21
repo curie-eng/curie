@@ -31,6 +31,8 @@ from curie_api.forges.errors import NotFound
 from curie_api.forges.types import PullRequestRef, ReplyTarget, RepositoryRef
 from forge_fakes.jira import LABEL, JiraFake, flatten, jira_tracker
 
+_WORK_ITEM_ID = "11111111-1111-1111-1111-111111111111"
+
 GOLDENS = Path(__file__).resolve().parent / "goldens"
 REQUEST_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
 MARKER = marker_for(REQUEST_ID)
@@ -112,7 +114,13 @@ async def test_jira_comments_a_rendered_final_handoff_keeps_its_marks_and_list()
         card_url=None,
         pill_label="FAILED",
         phase_view=None,
-        result=result_section("no_pull_request", pr_url=None, detail=message),
+        result=result_section(
+            "no_pull_request",
+            pr_url=None,
+            detail=message,
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
+        ),
     )
 
     result = await tracker.marked_comments.upsert_marked(target, MARKER, body)
@@ -153,7 +161,13 @@ async def test_jira_comments_handoff_keeps_inert_prose_and_encoded_code(
         card_url=None,
         pill_label="FAILED",
         phase_view=None,
-        result=result_section("no_pull_request", pr_url=None, detail=message),
+        result=result_section(
+            "no_pull_request",
+            pr_url=None,
+            detail=message,
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
+        ),
     )
     written = await tracker.marked_comments.upsert_marked(target, MARKER, body)
     assert written.written is True
@@ -213,7 +227,13 @@ async def test_jira_comments_handoff_links_stay_inert_and_visible(url: str) -> N
         card_url=card_url,
         pill_label="FAILED",
         phase_view=None,
-        result=result_section("no_pull_request", pr_url=None, detail=f"[query]({url})"),
+        result=result_section(
+            "no_pull_request",
+            pr_url=None,
+            detail=f"[query]({url})",
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
+        ),
     )
     written = await tracker.marked_comments.upsert_marked(target, MARKER, body)
     assert written.written is True
@@ -246,7 +266,13 @@ async def test_jira_comments_handoff_uses_only_schema_valid_quote_children(
         card_url=None,
         pill_label="FAILED",
         phase_view=None,
-        result=result_section("no_pull_request", pr_url=None, detail=message),
+        result=result_section(
+            "no_pull_request",
+            pr_url=None,
+            detail=message,
+            workspace_recovery_enabled=False,
+            work_item_id=_WORK_ITEM_ID,
+        ),
     )
     written = await tracker.marked_comments.upsert_marked(target, MARKER, body)
     assert written.written is True
