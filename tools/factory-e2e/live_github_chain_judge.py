@@ -1,14 +1,15 @@
 """Pure judge and evidence sanitizer of the ``live-github-chain`` scenario (#5808).
 
-Decision 7 of #5808 lists eight beats (a to h) with bounds. Decision 8 sets
-the spend and attempt caps, decision 9 the evidence sanitizer, decision 10 the
+Decision 7 of #5808 lists eight beats (a to h) with bounds. Decision 8 sets the
+spend and attempt caps, decision 9 the evidence sanitizer, decision 10 the
 teardown verdict. This module judges all of it from already fetched records and
 returns one verdict per beat with reasons. It does no network, subprocess,
-cluster or file access: the driver (``live_github_chain.py``, a later part of
-#5808) fetches the GitHub API JSON, the CLI JSON output, the install records
-and the timings, passes them in as plain data and writes the verdicts out
-through :func:`sanitize_evidence`. The driver does the I/O and this module
-judges.
+cluster or file access beyond importing the default bundle's Decisions grammar
+(``examples/dark-factory/hooks/decisions_section.py``): the driver
+(``live_github_chain.py``, a later part of #5808) fetches the GitHub API JSON,
+the CLI JSON output, the install records and the timings, passes them in as
+plain data and writes the verdicts out through :func:`sanitize_evidence`. The
+driver does the I/O and this module judges.
 
 The one public entry point is :func:`judge_chain`. It takes one record::
 
@@ -67,6 +68,7 @@ Fields the driver part added to the record, each read as GitHub returns it:
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import re
@@ -75,6 +77,8 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 # --- Bounds of decisions 7 and 8 (seconds unless named) ---------------------
@@ -101,7 +105,29 @@ QUESTIONS_MARKER_LINE = re.compile(
     + r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) -->"
 )
 QUESTIONS_LABEL = "curie-factory:questions"
-ANSWERED_PREFIX = "Answered on the ticket by "
+
+
+def _decisions_grammar() -> ModuleType:
+    """The default bundle's Decisions grammar (``hooks/decisions_section.py``).
+
+    Its review gate refuses a publication whose Decisions section does not
+    parse, and its reproduction gate reads answer citations with the same
+    boundary, so the judge reads the section through that module instead of a
+    heading rule of its own.
+    """
+
+    path = Path(__file__).resolve().parents[2] / "examples/dark-factory/hooks/decisions_section.py"
+    spec = importlib.util.spec_from_file_location("factory_decisions_grammar", path)
+    if spec is None or spec.loader is None:  # pragma: no cover -- a source checkout has it
+        raise ImportError(f"cannot load the Decisions grammar from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+DECISIONS_GRAMMAR = _decisions_grammar()
+DECISIONS_HEADING = "## Decisions"
+ANSWERED_PREFIX: str = DECISIONS_GRAMMAR.CITATION_PREFIX
 # Mirror of curie_api.factory_questions.ANSWER_RECEIVED_LINE (a test pins equality):
 # the first line of the status comment of a request an answer started.
 ANSWER_RECEIVED_LINE = "Answer received. The factory is working on this ticket again."
@@ -642,6 +668,31 @@ def section_lines(body: str, heading: str) -> list[str]:
     return lines
 
 
+def answer_citations(body: Any) -> tuple[list[str], str | None]:
+    """The answer citations of a publication's Decisions section, and why it is
+    refused when the bundle's grammar refuses it.
+
+    The section is the one the grammar parses: the lines after the single
+    exact ``## Decisions`` line, up to the next ``## `` line or the exact
+    ``---`` line the platform writes before its own text. A citation below that
+    line is outside the section and does not count.
+    """
+
+    try:
+        DECISIONS_GRAMMAR.parse_decisions_section(body)
+    except ValueError as exc:
+        return [], str(exc)
+    lines = str(body).splitlines()
+    start = lines.index(DECISIONS_HEADING) + 1
+    citations: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("## ") or line == DECISIONS_GRAMMAR.SECTION_END:
+            break
+        if line.startswith(ANSWERED_PREFIX) and line[len(ANSWERED_PREFIX) :].strip():
+            citations.append(line)
+    return citations, None
+
+
 def _lines_starting(body: str, prefix: str) -> list[str]:
     return [line for line in (body or "").splitlines() if line.lstrip("-*• ").startswith(prefix)]
 
@@ -874,14 +925,12 @@ def _judge_beat_b(b: _Beat, rec: Mapping[str, Any]) -> None:
             "the pull request came late",
         )
         b.check(_closes(pull["body"], issue), f"the pull request lacks `Closes #{issue}`")
-        b.check(
-            bool(
-                _lines_starting(
-                    "\n".join(section_lines(pull["body"], "Decisions")), ANSWERED_PREFIX
-                )
-            ),
-            "the Decisions section lacks an `Answered on the ticket by ` line",
-        )
+        citations, refused = answer_citations(pull["body"])
+        if b.check(refused is None, f"the Decisions section does not parse: {refused}"):
+            b.check(
+                bool(citations),
+                "the Decisions section lacks an `Answered on the ticket by ` line",
+            )
     others = [i["number"] for i in beat["issues"] if _by_app(i, ids)]
     b.check(not others, f"the App opened issues: {others}")
     acks = _app_comments_since(

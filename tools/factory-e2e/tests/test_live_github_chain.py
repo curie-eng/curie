@@ -59,9 +59,17 @@ def drop_line(body: str, prefix: str) -> str:
     return "\n".join(x for x in body.splitlines() if not x.startswith(prefix)) + "\n"
 
 
-OUTSIDE_DECISIONS = (
-    "Closes #11\n\n## Decisions\n\nNone.\n\n## Notes\n\n"
-    "Answered on the ticket by fixture-writer: print 2 decimal places.\n"
+# The default bundle's sole None declaration: a Decisions section that parses
+# and cites no answer.
+NONE_DECLARATION = "None: the change follows directly from the acceptance criteria."
+CITATION = "Answered on the ticket by fixture-writer: print 2 decimal places."
+OUTSIDE_DECISIONS = f"Closes #11\n\n## Decisions\n\n{NONE_DECLARATION}\n\n## Notes\n\n{CITATION}\n"
+# The citation below the exact `---` line the platform writes before its own
+# text (#5897): the section ends there, so it is not in the section.
+BELOW_SEPARATOR = (
+    f"Closes #11\n\n## Decisions\n\n{NONE_DECLARATION}\n\n---\n\n"
+    "Ask the factory: comment on this pull request. The first 10 revisions need no "
+    f"mention; after that, mention @fixture-app.\n{CITATION}\n"
 )
 
 
@@ -211,9 +219,26 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "no-answered-line",
-        [("beat_b/open_pulls/0/body", lambda s: drop_line(s, "Answered on the ticket by "))],
+        [
+            (
+                "beat_b/open_pulls/0/body",
+                lambda s: drop_line(s, "Answered on the ticket by ") + NONE_DECLARATION + "\n",
+            )
+        ],
         "beat_b",
         "Decisions section lacks",
+    ),
+    (
+        "answered-line-below-the-platform-separator",
+        [("beat_b/open_pulls/0/body", BELOW_SEPARATOR)],
+        "beat_b",
+        "Decisions section lacks",
+    ),
+    (
+        "decisions-section-the-bundle-grammar-refuses",
+        [("beat_b/open_pulls/0/body", lambda s: s.replace("## Decisions", "## Decisions\n\n1. x"))],
+        "beat_b",
+        "the Decisions section does not parse",
     ),
     (
         "answered-line-outside-the-decisions-section",
@@ -1590,3 +1615,86 @@ def test_sanitizer_refuses_percent_encoded_leftovers() -> None:
     ):
         with pytest.raises(judge.EvidenceLeak):
             judge.refuse_leaks(leaky, IDENTIFIERS)
+
+
+# --------------------------------------------------------------------------
+# Shared Decisions fixtures: every Python consumer reads one section
+# --------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+HOOKS = REPO_ROOT / "examples" / "dark-factory" / "hooks"
+PUBLISHED_VECTORS = ("factory-decisions-published.json", "factory-decisions-published-route.json")
+
+
+def _hook(name: str) -> Any:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(f"shared_decisions_{name}", HOOKS / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _published_cases() -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for name in PUBLISHED_VECTORS:
+        cases.extend(json.loads((REPO_ROOT / "tests" / "vectors" / name).read_text())["cases"])
+    return cases
+
+
+def _cited_inside(case: dict[str, Any]) -> str:
+    body = str(case["published_body"])
+    if not case["entries"]:
+        # The sole None declaration takes no citation beside it; a citation alone is a section.
+        return body.replace(NONE_DECLARATION, CITATION, 1)
+    return body.replace("## Decisions\n", f"## Decisions\n\n{CITATION}\n", 1)
+
+
+def _cited_after_the_platform_text(case: dict[str, Any]) -> str:
+    return str(case["published_body"]).rstrip("\n") + f"\n{CITATION}\n"
+
+
+@pytest.mark.parametrize("case", _published_cases(), ids=lambda c: str(c["id"]))
+def test_shared_decisions_fixtures_read_alike_in_every_consumer(case: dict[str, Any]) -> None:
+    # The real published bodies of #5897 (the platform's `---` and "Ask the
+    # factory" line after the agent's text) through every Python consumer of a
+    # Decisions section on the integration branch: the bundle's grammar (its
+    # review gate refuses a body it rejects), the reproduction gate's citation
+    # check, and this judge. The Rust reader behind `curie factory explain`
+    # reads the same vector files in its own tests.
+    grammar, gate = _hook("decisions_section"), _hook("reproduction_gate")
+    body = str(case["published_body"])
+    citations, refused = judge.answer_citations(body)
+    if not case["valid"]:
+        with pytest.raises(ValueError):
+            grammar.parse_decisions_section(body)
+        assert refused is not None and citations == []
+        return
+    assert grammar.parse_decisions_section(body) == case["entries"]
+    assert (citations, refused) == ([], None)
+    # A citation inside the section counts for each consumer.
+    inside = _cited_inside(case)
+    assert grammar.parse_decisions_section(inside) == case["entries"]
+    assert gate.cited(inside) is True
+    assert judge.answer_citations(inside) == ([CITATION], None)
+    # Counterexample: the same citation after the platform's text is outside
+    # the section for each consumer.
+    outside = _cited_after_the_platform_text(case)
+    assert grammar.parse_decisions_section(outside) == case["entries"]
+    assert gate.cited(outside) is False
+    assert judge.answer_citations(outside) == ([], None)
+
+
+def test_shared_decisions_a_citation_alone_below_the_separator_is_no_section() -> None:
+    # The grammar's own observable: a section holding only a citation parses,
+    # and the same citation moved below the separator leaves an empty section.
+    grammar = _hook("decisions_section")
+    assert grammar.SECTION_END == _hook("reproduction_gate").DECISIONS_END
+    held = f"## Decisions\n\n{CITATION}\n\n---\n\nAsk the factory: comment here.\n"
+    below = f"## Decisions\n\n---\n\n{CITATION}\n"
+    assert grammar.parse_decisions_section(held) == []
+    assert judge.answer_citations(held) == ([CITATION], None)
+    with pytest.raises(ValueError):
+        grammar.parse_decisions_section(below)
+    assert judge.answer_citations(below)[1] is not None
