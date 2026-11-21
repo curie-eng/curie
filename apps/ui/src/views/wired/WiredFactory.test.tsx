@@ -587,4 +587,16 @@ describe("WiredFactory (#4102)", () => {
     await waitFor(() => expect(vi.mocked(getWorkItem).mock.calls.length).toBeGreaterThan(detailCalls));
     await waitFor(() => expect(getWorkItemUsage.mock.calls.length).toBeGreaterThan(usageCalls));
   });
+
+  it("keeps each lane at least 200px wide and scrolls the lane area on a narrow window (#5174)", async () => {
+    vi.mocked(listWorkItems).mockResolvedValue(list([outcome()]));
+    renderView();
+    await screen.findAllByTestId("factory-card");
+
+    // The lane sections' parent is the lane grid; its parent is the wrapper
+    // that scrolls instead of shrinking the lanes.
+    const grid = screen.getByTestId("factory-lane-queued").parentElement;
+    expect(grid).toHaveStyle({ gridTemplateColumns: "repeat(4, minmax(200px, 1fr))" });
+    expect(grid?.parentElement).toHaveStyle({ overflowX: "auto" });
+  });
 });

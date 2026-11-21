@@ -112,8 +112,8 @@ function Board({
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 420px", gap: 16, alignItems: "start" }}>
-        <div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10 }}>
+        <div style={{ overflowX: "auto" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(200px, 1fr))", gap: 10 }}>
             {LANES.map((lane) => {
               const all = lanes[lane.id];
               const shown = lane.id === "shipped" ? all.slice(0, SHIPPED_CAP) : all;
