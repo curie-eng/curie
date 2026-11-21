@@ -28,7 +28,7 @@ We welcome bug reports, documentation improvements, tests, and focused feature
 work. Before starting anything larger than a bug fix or a docs tweak, please
 open a GitHub issue describing the change so a maintainer can confirm it fits
 the project's direction. This is especially important for anything that touches
-a cross-component seam or a frozen contract (see below).
+a cross-component seam or a [frozen contract](ARCHITECTURE.md#glossary) (see below).
 
 ## Labeling issues, PRs, and discussions
 
@@ -237,7 +237,7 @@ therefore deletes `next` when the merger can bypass the deletion ruleset
 (issue #2090). Run `python3 release/preserve_next.py --repo <owner/name>`
 before enabling auto-merge: it refuses that ordinary path until the head is
 not `next` or an active deletion ruleset covers `next` with an empty bypass
-list. Then run every parity ladder rung on the resulting `main` commit:
+list. Then run every [parity ladder](ARCHITECTURE.md#glossary) rung on the resulting `main` commit:
 
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder
