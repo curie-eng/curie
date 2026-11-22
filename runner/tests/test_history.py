@@ -1157,19 +1157,24 @@ def test_state_store_load_rejects_malformed_log_entry() -> None:
 def _recording_runner(store: TranscriptStore, *, script=None, ceiling: int = 0):
     """A SessionRunner wired to the fake model and a recording transcript store."""
     from curie_runner import RunTracer, SideEffectClassifier
+    from curie_runner.approval import PolicyApprovalLedger
     from curie_runner.fake import FakeModelSession, default_turn
     from curie_runner.session import SessionRunner
 
+    ledger = PolicyApprovalLedger()
     return SessionRunner(
         max_usd_per_day=None,
         held_secrets=frozenset(),
-        session_factory=lambda: FakeModelSession(script or default_turn),
+        session_factory=lambda: FakeModelSession(
+            script or default_turn, policy_approval_ledger=ledger
+        ),
         ceiling=ceiling,
         tracer=RunTracer(None),
         classifier=SideEffectClassifier(),
         trace_name="t",
         session_id="sess-hist",
         history_store=store,
+        policy_approval_ledger=ledger,
     )
 
 

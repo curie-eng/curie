@@ -25,6 +25,7 @@ from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import RunTracer, SideEffectClassifier, build_options, create_app
 from curie_runner import session as session_module
 from curie_runner.adapter import ClaudeAgentSession, McpServerReconnector
+from curie_runner.approval import PolicyApprovalLedger
 from curie_runner.fake import FakeModelSession, approval_turn, default_turn
 from curie_runner.history import (
     HarnessReplayState,
@@ -240,7 +241,8 @@ def _runner_with_history(
     tracer: RunTracer | None = None,
     session: FakeModelSession | None = None,
 ) -> tuple[SessionRunner, FakeModelSession]:
-    fake = session or FakeModelSession(script_factory)
+    ledger = PolicyApprovalLedger()
+    fake = session or FakeModelSession(script_factory, policy_approval_ledger=ledger)
     return (
         SessionRunner(
             max_usd_per_day=None,
@@ -252,6 +254,7 @@ def _runner_with_history(
             trace_name="history-test",
             session_id="session-PLACEHOLDER",
             history_store=store,
+            policy_approval_ledger=ledger,
         ),
         fake,
     )
