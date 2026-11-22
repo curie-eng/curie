@@ -211,7 +211,10 @@ function ClaudePlanBody() {
         dispatch({ type: "toast", message: done });
       } catch (e) {
         setError(describeEnrollmentError(e));
-        if (e instanceof EnrollmentApiError && (e.status === 409 || e.status === 404)) void reload();
+        if (e instanceof EnrollmentApiError && (e.status === 409 || e.status === 404)) {
+          await queryClient.cancelQueries({ queryKey: STATUS_KEY });
+          void reload();
+        }
       } finally {
         setToken("");
         setConfirming(false);

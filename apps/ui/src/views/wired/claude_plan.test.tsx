@@ -510,6 +510,45 @@ describe("claude_plan one write at a time", () => {
     expect(screen.getByTestId("claude-plan-token")).toBeEnabled();
   });
 
+  it("claude_plan starts a fresh enrollment read when a remounted read overlaps a 409", async () => {
+    const enrollmentPath = "/api/personal-claude/enrollment";
+    const pendingRead = deferred();
+    const pendingWrite = deferred();
+    let reads = 0;
+    routes[`GET ${enrollmentPath}`] = () => {
+      reads += 1;
+      if (reads === 1) return json(200, active(1, 7));
+      if (reads === 2) return pendingRead.promise;
+      return json(200, active(2, 8));
+    };
+    routes[`PUT ${enrollmentPath}`] = () => pendingWrite.promise;
+
+    mount();
+    await status();
+    await userEvent.type(tokenBox(), SENTINEL);
+    await userEvent.click(screen.getByTestId("claude-plan-write"));
+    expect(calls("PUT", enrollmentPath)).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Workspace" }));
+    await waitFor(() => expect(queryClient.getQueryData(["personal-claude-enrollment"])).toBeUndefined());
+    await userEvent.click(screen.getByRole("button", { name: "Claude plan" }));
+    await waitFor(() => expect(reads).toBe(2));
+
+    await act(async () => {
+      pendingWrite.resolve(refusal(409, "stale_version"));
+    });
+    await waitFor(() => expect(reads).toBe(3));
+    await act(async () => {
+      pendingRead.resolve(json(200, active(1, 7)));
+    });
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 2$/));
+
+    routes[`PUT ${enrollmentPath}`] = () => json(200, active(3, 9));
+    await userEvent.type(tokenBox(), SENTINEL);
+    await userEvent.click(screen.getByTestId("claude-plan-write"));
+    const versions = calls("PUT", enrollmentPath).map((call) => JSON.parse(call.body as string).expected_version);
+    expect(versions).toEqual([7, 8]);
+  });
+
   it("claude_plan a deferred Disconnect stays one delete after Workspace and back", async () => {
     let current = active(1, 6);
     setEnrollment(() => current);
