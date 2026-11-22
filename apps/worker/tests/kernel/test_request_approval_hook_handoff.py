@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from curie_runner.approval import APPROVAL_TOOL_NAME
@@ -9,6 +10,7 @@ from curie_runner.approval import APPROVAL_TOOL_NAME
 from .test_approval_lifecycle import RecordingApprovals
 from .test_publish_hook_deny_handoff import _support
 from .test_work_item_early_stop import (
+    CHANNEL,
     ISSUE_PROMPT,
     _Binding,
     _done,
@@ -17,6 +19,14 @@ from .test_work_item_early_stop import (
     _WorkItems,
     _Workspace,
 )
+
+
+class _RoutedBinding(_Binding):
+    def _deployment(self) -> object:
+        deployment = super()._deployment()
+        assert isinstance(deployment, SimpleNamespace)
+        deployment.approval_routes = {"ops": {"resolution": {"kind": "slack", "address": CHANNEL}}}
+        return deployment
 
 
 @pytest.mark.parametrize("allow_second", [False, True], ids=["deny", "deny-then-allow"])
@@ -35,7 +45,7 @@ def test_policy_approval_handoff_uses_the_executed_request(
         approvals = RecordingApprovals()
         publications = _PublicationApi()
         async with make_harness(
-            binding=_Binding(),
+            binding=_RoutedBinding(),
             workspace_factory=_Workspace,
             approvals=approvals,
             publication_creator=publications,
