@@ -189,7 +189,13 @@ def test_github_link_oauth_identity_revoke_and_label_actor(stub: Any, github: ht
         == "bad_verification_code"
     )
     headers = {"Authorization": "Bearer " + token}
-    assert github.get("/api/v3/user", headers=headers).json()["id"] == 6601
+    # A known user token is the authenticated user and is not an auth rejection.
+    # https://docs.github.com/en/rest/users/users#get-the-authenticated-user
+    known = github.get("/api/v3/user", headers=headers)
+    assert known.status_code == 200
+    assert known.json()["id"] == 6601
+    assert stub.rejected_auth == []
+    assert stub.unknown_requests == []
     revoke_path = f"/api/v3/applications/{stub.oauth_client_id}/token"
     assert github.request("DELETE", revoke_path, json={"access_token": token}).status_code == 401
     assert (
@@ -201,7 +207,13 @@ def test_github_link_oauth_identity_revoke_and_label_actor(stub: Any, github: ht
         ).status_code
         == 204
     )
-    assert github.get("/api/v3/user", headers=headers).status_code == 401
+    # An unknown bearer is 401 and is recorded as the request, never the token.
+    # https://docs.github.com/en/rest/users/users#get-the-authenticated-user
+    rejected = github.get("/api/v3/user", headers=headers)
+    assert rejected.status_code == 401
+    assert rejected.json() == {"message": "Bad credentials"}
+    assert stub.rejected_auth == ["GET /user"]
+    assert stub.unknown_requests == []
     labelled = github.post(
         f"/repos/{REPO}/issues/3815/labels",
         json={"labels": ["github-link-fixture"]},
@@ -218,7 +230,7 @@ def test_github_link_oauth_identity_revoke_and_label_actor(stub: Any, github: ht
             connection.execute("SELECT * FROM oauth_tokens").fetchall()
         )
     for sentinel in (token, returned["code"][0], params["state"], stub.oauth_client_secret):
-        assert sentinel not in rows + str(stub.request_log)
+        assert sentinel not in rows + str(stub.request_log) + str(stub.rejected_auth)
 
 
 def test_tls_requires_the_generated_ca(stub: Any) -> None:

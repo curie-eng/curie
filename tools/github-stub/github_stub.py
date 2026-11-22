@@ -142,6 +142,15 @@ class GithubStub:
         with sqlite3.connect(self._database) as connection:
             return [row[0] for row in connection.execute("SELECT request FROM unsupported")]
 
+    @property
+    def rejected_auth(self) -> list[str]:
+        """GET /user calls refused for an unknown bearer, as ``METHOD path`` only."""
+
+        if not self._database.exists():
+            return []
+        with sqlite3.connect(self._database) as connection:
+            return [row[0] for row in connection.execute("SELECT request FROM rejected_auth")]
+
     def _run(self, *args: str, input_: bytes | None = None, **kwargs: Any) -> bytes:
         result = subprocess.run(
             args, input=input_, capture_output=True, timeout=30, check=True, **kwargs
@@ -217,6 +226,7 @@ class GithubStub:
                 "CREATE TABLE clock(seconds REAL NOT NULL); INSERT INTO clock VALUES(0);"
                 "CREATE TABLE objects(kind TEXT, id INTEGER, body TEXT NOT NULL,"
                 " PRIMARY KEY(kind,id)); CREATE TABLE unsupported(request TEXT);"
+                "CREATE TABLE rejected_auth(request TEXT);"
                 "CREATE TABLE tokens(token TEXT PRIMARY KEY, permissions TEXT);"
                 "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL);"
                 "CREATE TABLE comment_history(comment_id INTEGER NOT NULL, at TEXT NOT NULL,"
@@ -1009,11 +1019,16 @@ class GithubStub:
             return
         token = handler.headers.get("Authorization", "").removeprefix("Bearer ")
         if method == "GET" and path == "/user":
+            # https://docs.github.com/en/rest/users/users#get-the-authenticated-user
+            digest = hashlib.sha256(token.encode()).hexdigest()
             with sqlite3.connect(self._database) as connection:
                 found = connection.execute(
                     "SELECT 1 FROM oauth_tokens WHERE token_hash=?",
-                    (hashlib.sha256(token.encode()).hexdigest(),),
+                    (digest,),
                 ).fetchone()
+                if found is None:
+                    # Record the request only. The bearer is a credential.
+                    connection.execute("INSERT INTO rejected_auth VALUES(?)", (f"{method} {path}",))
             self._json(
                 handler, 200 if found else 401, HUMAN if found else {"message": "Bad credentials"}
             )
