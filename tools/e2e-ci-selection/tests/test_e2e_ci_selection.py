@@ -4968,6 +4968,9 @@ def test_runner_publication_paths_select_scripted_factory(tmp_path: Path, path: 
     outputs = _outputs_of(output)
     assert outputs["factory"] == "true", path
     assert outputs["cluster"] == "true", path
+    # The exact approval.py file stays on the approval-resume list too.
+    approval_resume = path == "runner/src/curie_runner/approval.py"
+    assert outputs["approval_resume"] == str(approval_resume).lower(), path
 
 
 @pytest.mark.parametrize("path", RUNNER_PUBLICATION_PATHS)
@@ -4992,6 +4995,32 @@ def test_unrelated_runner_siblings_do_not_select_scripted_factory(
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert _outputs_of(output)["factory"] == "false", path
+
+
+@pytest.mark.parametrize("path", [f"{path}/child.py" for path in RUNNER_PUBLICATION_PATHS])
+def test_runner_publication_slash_children_do_not_select_scripted_factory(
+    tmp_path: Path, path: str
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    outputs = _outputs_of(output)
+    assert outputs["factory"] == "false", path
+    # approval.py/child.py still matches the approval-resume prefix rule.
+    if path == "runner/src/curie_runner/approval.py/child.py":
+        assert outputs["approval_resume"] == "true", path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "runner/src/curie_runner/preflight/check.py",
+        "runner/src/curie_runner/verification.py/child.py",
+    ],
+)
+def test_existing_factory_prefixes_still_match_children(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert _outputs_of(output)["factory"] == "true", path
 
 
 @pytest.mark.parametrize("event_name", ["pull_request", "merge_group", "push", "workflow_dispatch"])

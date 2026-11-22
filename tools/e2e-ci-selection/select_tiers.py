@@ -63,19 +63,21 @@ FACTORY_PREFIXES = (
     "packages/aci-protocol/src/aci_protocol/turn.py",
     "runner/src/curie_runner/verification.py",
     "runner/src/curie_runner/preflight",
-    # Exact publication files (#5916). The .py suffix keeps a sibling such as
-    # session.py.other from matching.
-    "runner/src/curie_runner/session.py",
-    "runner/src/curie_runner/approval.py",
-    "runner/src/curie_runner/harness/claude/approval.py",
-    "runner/src/curie_runner/translate.py",
-    "runner/src/curie_runner/fake.py",
     "examples/dark-factory",
     "tools/factory-e2e",
     "tools/model-script",
     "tools/github-stub",
     "tools/jira-stub",
 )
+# Publication files are exact (#5916). A slash child such as session.py/child.py
+# must not select factory. Other factory prefixes keep _matches_scenario.
+RUNNER_PUBLICATION_FILES = frozenset({
+    "runner/src/curie_runner/session.py",
+    "runner/src/curie_runner/approval.py",
+    "runner/src/curie_runner/harness/claude/approval.py",
+    "runner/src/curie_runner/translate.py",
+    "runner/src/curie_runner/fake.py",
+})
 # The kind approval resume scenario (#4016) covers worker, approval and shared
 # setup paths. Prefixes without a .py suffix match by raw string prefix, so
 # "curie_api/approval" covers every approval*.py module.
@@ -466,7 +468,10 @@ def _matches_scenario(path: str, prefixes: tuple[str, ...]) -> bool:
 def _needs_factory(paths: list[str]) -> bool:
     if not paths:
         return True
-    return any(_matches_scenario(path, FACTORY_PREFIXES) for path in paths)
+    return any(
+        path in RUNNER_PUBLICATION_FILES or _matches_scenario(path, FACTORY_PREFIXES)
+        for path in paths
+    )
 
 
 def _needs_approval_resume(paths: list[str]) -> bool:
