@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import http.client
+import importlib.util
 import json
 import os
 import signal
@@ -55,6 +56,14 @@ OUTSIDER = ojt.OUTSIDER["account_id"]
 ASKING = uuid.UUID("00000000-0000-4000-8000-000000000001")
 SECOND = uuid.UUID("00000000-0000-4000-8000-000000000002")
 QUESTIONS = ["Which spelling of Kelvin?", "Should negative Kelvin be rejected?"]
+
+
+def _load_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _ca(workdir: Path) -> tuple[Path, Path]:
@@ -365,6 +374,36 @@ def test_the_transcript_is_rekeyed_on_the_jira_channel_only() -> None:
         run.transcript_for_jira(exchanges[1:])
     recorded = json.loads(one_ticket_run.TRANSCRIPT.read_text())["exchanges"]
     assert any("\nchannel: jira\n" in e["lane_key"] for e in run.transcript_for_jira(recorded))
+
+
+def test_the_jira_lane_publication_cites_the_answer_its_labeller_posted() -> None:
+    """On Jira the publication cites the same answer by the Jira labeller.
+
+    The Jira lane's one authorized answer is ``ANSWER_TEXT`` from the stub's
+    labeller, and a Jira ticket read names a comment's author by display
+    name, so the rekeyed transcript's body cites that name, never the GitHub
+    login, and still passes the dark factory's citation check and Decisions
+    grammar.
+    """
+
+    hooks = REPO_ROOT / "examples/dark-factory/hooks"
+    reproduction = _load_module("jira_one_ticket_reproduction_gate", hooks / "reproduction_gate.py")
+    decisions = _load_module("jira_one_ticket_decisions_section", hooks / "decisions_section.py")
+    recorded = json.loads(one_ticket_run.TRANSCRIPT.read_text())["exchanges"]
+    (body,) = one_ticket_run.publication_bodies(run.transcript_for_jira(recorded))
+
+    citation = (
+        f"Answered on the ticket by {ojt.LABELLER['display_name']}: {one_ticket_run.ANSWER_TEXT}"
+    )
+    assert [
+        line for line in body.splitlines() if line.startswith("Answered on the ticket by ")
+    ] == [citation]
+    assert one_ticket_run.ANSWER_AUTHOR not in body
+    assert reproduction.cited(body)
+    assert len(decisions.parse_decisions_section(body)) == 2
+    # The GitHub lane's transcript is untouched by the Jira rekeying.
+    (github_body,) = one_ticket_run.publication_bodies(recorded)
+    assert one_ticket_run.answer_citation(one_ticket_run.ANSWER_AUTHOR) in github_body
 
 
 def test_the_jira_tracker_values_render_a_valid_forges_config() -> None:

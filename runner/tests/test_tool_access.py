@@ -782,10 +782,10 @@ def test_translation_captures_no_request_on_a_read_only_turn() -> None:
     translate_message(message, restricted, SideEffectClassifier(), None)
     translate_message(message, ordinary, SideEffectClassifier(), None)
 
+    # The publish call is not captured here on either turn: only its tool body
+    # records a publication, and a read-only turn refuses the call before that.
     assert restricted.approval_summary is None
-    assert restricted.publication_calls == []
     assert ordinary.approval_summary == "deploy"
-    assert [call_id for call_id, _ in ordinary.publication_calls] == ["t2"]
 
 
 def test_the_final_never_flips_to_awaiting_approval_on_a_read_only_turn() -> None:

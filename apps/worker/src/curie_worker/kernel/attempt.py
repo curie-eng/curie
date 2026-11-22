@@ -1432,6 +1432,10 @@ async def _apply_frame(
             acc.tools_called.add(frame.tool)
     elif isinstance(frame, SideEffectFlag):
         acc.saw_side_effect = True
+        if frame.tool == constants._QUESTION_TOOL_NAME and frame.failed is False:
+            # The closing frame of an ask whose result was not an error. The
+            # opening frame carries ``failed`` None and says nothing yet.
+            acc.questions_ask_succeeded = True
         # Persist immediately so a crash before done still blocks auto-retry.
         # Unchanged by ADR-0117: this latches on the FIRST frame and the rule
         # reads presence, so a stream carrying one frame per call rather than
@@ -1564,6 +1568,7 @@ async def _finish(
             text=text,
             status=acc.status,
             tools_called=frozenset(acc.tools_called),
+            questions_ask_succeeded=acc.questions_ask_succeeded,
             assistant_text=acc.rendered(),
             runner_ended=True,
             retry_condition=acc.retry_condition,
@@ -1584,6 +1589,7 @@ async def _finish(
             approval_granted_arguments=acc.approval_granted_arguments,
             approval_display=acc.approval_display,
             tools_called=frozenset(acc.tools_called),
+            questions_ask_succeeded=acc.questions_ask_succeeded,
             assistant_text=acc.rendered(),
             runner_ended=True,
             retry_condition=acc.retry_condition,

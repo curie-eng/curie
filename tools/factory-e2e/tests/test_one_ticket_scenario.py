@@ -37,6 +37,8 @@ import scripted_lanes as lanes  # noqa: E402
 REPO_ROOT = TOOLS.parents[1]
 STUB = REPO_ROOT / "tools/github-stub/github_stub.py"
 MODEL_SCRIPT = REPO_ROOT / "tools/model-script/model_script.py"
+REPRODUCTION_GATE = REPO_ROOT / "examples/dark-factory/hooks/reproduction_gate.py"
+DECISIONS_SECTION = REPO_ROOT / "examples/dark-factory/hooks/decisions_section.py"
 SEED_TREE = TOOLS / "fixtures/unitconv"
 RECORDING = REPO_ROOT / "tools/github-stub/recordings/curie-pr-3400.json"
 REPOSITORY = "acme-corp/acme-bot"
@@ -569,21 +571,21 @@ def test_the_transcript_serves_the_asking_session_then_the_publishing_one(
 ) -> None:
     script, router = served
 
-    # Session 1 is the asking turn and the worker's one continuation turn, which
-    # also ends; only then does session 2 start again from ordinal 0.
-    first = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(6)]
+    # Session 1 ends on its ask: the platform stops the turn once the questions
+    # are posted and the worker does not re-prompt it (#5785), so its last
+    # exchange is the ask. Session 2 then starts again from ordinal 0.
+    first = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(4)]
     second = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(19)]
 
     assert "mcp__curie__ask_questions" in _tools(first[3])
-    assert [first[n]["message"]["stop_reason"] for n in (4, 5)] == ["end_turn", "end_turn"]
-    assert first[5]["message"]["id"] == "msg_one_ticket_done_again"
-    assert all(e["message"]["id"] != "msg_one_ticket_done_again" for e in second)
+    assert first[3]["message"]["stop_reason"] == "tool_use"
+    assert "mcp__curie__ask_questions" not in _tools(second[0])
     assert all("mcp__curie__publish_changes" not in _tools(e) for e in first)
     assert "mcp__curie__publish_changes" in _tools(second[18])
     assert all("mcp__curie__ask_questions" not in _tools(e) for e in second)
     assert router.unrouted == []
     served_ordinals = router.evidence()["one-ticket"]["served_ordinals"]
-    assert served_ordinals == [*range(6), *range(19)]
+    assert served_ordinals == [*range(4), *range(19)]
 
 
 def test_the_asked_questions_are_exactly_two_and_the_publication_closes_the_issue() -> None:
@@ -600,6 +602,34 @@ def test_the_asked_questions_are_exactly_two_and_the_publication_closes_the_issu
     (publish,) = [c for c in calls if c["name"] == "mcp__curie__publish_changes"]
     assert f"Closes #{ots.ISSUE}" in publish["input"]["body"]
     assert "3815" not in json.dumps(exchanges)
+
+
+def test_the_github_lane_publication_cites_the_answer_its_labeller_posted() -> None:
+    """Session 2's body cites the answer the GitHub lane admits, by its author.
+
+    The lane's one authorized answer is ``ANSWER_TEXT``, posted by the stub's
+    labeller, and a GitHub ticket read names a comment's author by login. The
+    body must carry that citation, which is also what the dark factory's
+    reproduction gate requires once the ticket carries the factory's questions,
+    inside a Decisions section the review gate's grammar accepts. The runner
+    honours those gates' denies, so a body either refuses would be denied in
+    the run and the model asked for an exchange the transcript does not hold.
+    """
+
+    reproduction = _load("one_ticket_reproduction_gate", REPRODUCTION_GATE)
+    decisions = _load("one_ticket_decisions_section", DECISIONS_SECTION)
+    model = _load("one_ticket_model_script_gates", MODEL_SCRIPT)
+    (body,) = run.publication_bodies(model.load_transcript(run.TRANSCRIPT))
+
+    assert run.ANSWER_AUTHOR == GITHUB.HUMAN["login"]
+    citation = f"Answered on the ticket by {GITHUB.HUMAN['login']}: {run.ANSWER_TEXT}"
+    assert run.answer_citation(GITHUB.HUMAN["login"]) == citation
+    assert body.splitlines().count(citation) == 1
+    assert [
+        line for line in body.splitlines() if line.startswith("Answered on the ticket by ")
+    ] == [citation]
+    assert reproduction.cited(body)
+    assert len(decisions.parse_decisions_section(body)) == 2
 
 
 def test_the_publication_scenario_routes_a_fixture_issue_it_never_labelled_to_the_fallback(

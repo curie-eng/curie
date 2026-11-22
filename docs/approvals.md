@@ -53,11 +53,13 @@ the call through its unscoped `PreToolUse` hook, with the SDK's `can_use_tool` c
 the second line, before it runs. The denied call never executes. Two sources name gated
 tools and they are unioned, never subtracted: the bundle manifest's `approvalPolicy`, and
 the `CURIE_APPROVAL_REQUIRED_TOOLS` operator override. For the platform's own
-`publish_changes` tool the runner additionally records every call it sees on the model
-stream (#2294): if neither SDK layer recorded the call, the in-sandbox tool body runs and
-returns its defensive error (it carries no publication authority), the stream record still
-parks the turn awaiting approval, and a publication call that left no record ends the turn
-as a `publication-unrecorded` classified failure rather than a clean `done`.
+`publish_changes` tool the in-sandbox tool body records the publication request (it
+carries no publication authority) and the runner then ends the turn awaiting approval. The
+CLI runs that body only after every PreToolUse hook allowed the call, so a call the
+runner's precheck or any bundle hook denied records nothing: the model receives the
+hook's reason and can correct the call in the same turn. A turn whose tool body ran but
+recorded nothing, for example a malformed proposal never corrected, ends as a
+`publication-unrecorded` classified failure rather than a clean `done`.
 
 ## Declaring routes in the bundle
 

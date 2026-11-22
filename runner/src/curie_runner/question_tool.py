@@ -21,6 +21,7 @@ import asyncio
 import logging
 import re
 import unicodedata
+from collections.abc import Callable
 from typing import Any
 
 import aiohttp
@@ -135,24 +136,38 @@ def question_input_issues(args: Any) -> list[str]:
     return issues
 
 
+_POSTED_ENDING = (
+    "This session ends now: stop working, make no further changes and end "
+    "the turn without opening a pull request."
+)
+
+
 def _render_posted(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return _error("The questions answer could not be read. Retry shortly.")
-    number = payload.get("round")
-    limit = payload.get("rounds_limit")
+    # A 200 means the round is posted, so even an answer whose round number
+    # cannot be read is a success: the turn ends on it (ADR 0286 decision 11),
+    # and an error result would reach the CLI as a failed call instead.
+    number = payload.get("round") if isinstance(payload, dict) else None
+    limit = payload.get("rounds_limit") if isinstance(payload, dict) else None
     if type(number) is not int or number < 1:
-        return _error("The questions answer could not be read. Retry shortly.")
+        return _ok(f"The questions are posted on the ticket. {_POSTED_ENDING}")
     if type(limit) is not int or limit < 1:
         limit = ROUNDS_LIMIT
     return _ok(
-        f"The questions are posted on the ticket as round {number} of {limit}. "
-        "This session ends now: stop working, make no further changes and end "
-        "the turn without opening a pull request."
+        f"The questions are posted on the ticket as round {number} of {limit}. {_POSTED_ENDING}"
     )
 
 
-def questions_handler(url: str, token: str) -> ResultHandler:
+def questions_handler(
+    url: str, token: str, *, on_posted: Callable[[], None] | None = None
+) -> ResultHandler:
     """The handler of ``ask_questions``, closed over the route and capability.
+
+    ``on_posted`` runs once the route answers 200, a first post or a replay of
+    the same body: the round is posted, so the session must end (ADR 0286
+    decisions 2 and 11). The runner passes the approval gate's
+    ``halt_for_questions``, which stops the turn before the model's next tool
+    call. A refusal, a 503 or a transport failure posts nothing and does not
+    halt.
 
     Calls run one at a time. The route lets a retry of a round still
     ``posting`` write again (the lost-response path), so two parallel calls
@@ -191,6 +206,8 @@ def questions_handler(url: str, token: str) -> ResultHandler:
         except ValueError:
             payload = None
         if status == 200:
+            if on_posted is not None:
+                on_posted()
             return _render_posted(payload)
         if status == 409:
             code = _code(payload)
