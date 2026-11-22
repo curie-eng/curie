@@ -1,8 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { initialState, reducer } from "./store";
+import { initialState, navForPath, reducer } from "./store";
 import type { AppState, PromotedEvalCase } from "./types";
 
 const fresh = (): AppState => initialState();
+
+describe("navForPath", () => {
+  it("opens settings only for the settings paths", () => {
+    expect(navForPath("/settings/claude-plan")).toBe("settings");
+    expect(navForPath("/settings")).toBe("settings");
+    expect(navForPath("/")).toBe("overview");
+    expect(navForPath("/agents")).toBe("overview");
+    expect(navForPath("/settings/claude-plan/extra")).toBe("overview");
+  });
+
+  it("reads that path into the first store state", () => {
+    window.history.pushState({}, "", "/settings/claude-plan");
+    expect(initialState().nav).toBe("settings");
+    window.history.pushState({}, "", "/agents");
+    expect(initialState().nav).toBe("overview");
+    window.history.pushState({}, "", "/");
+  });
+});
 
 describe("reducer state machine", () => {
   it("go navigates and clears transient sub-views", () => {

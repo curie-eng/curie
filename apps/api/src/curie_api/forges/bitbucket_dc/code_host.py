@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 
 CAPABILITIES: Mapping[Operation, Support] = {
     **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
+    Operation.CURRENT_INSTALLATION_CREDENTIAL: Support.UNSUPPORTED,
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
@@ -330,6 +331,9 @@ class BitbucketDcCodeHost:
             # An empty repository has no default branch yet.
             return None
         return _text(branch.get("displayId")) or None
+
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        raise Unsupported(Operation.CURRENT_INSTALLATION_CREDENTIAL)
 
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:
         """The Bearer credential for git on ``<api_url>/scm/<KEY>/<slug>.git``,

@@ -33,7 +33,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from curie_api.crud import agents as crud_agents
 
-from . import __version__, oidc
+from . import __version__, custody_store, oidc, rollout_hold
 from .approval_reminders import enqueue_reminder
 from .channel_identities import start_static_slack_bootstrap
 from .code_host_trust import code_host_verify
@@ -64,7 +64,8 @@ from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
-from .lineage_reconciler import start_lineage_reconciler
+from .lineage_reconciler import start_lineage_reconciler, start_rule_settlement
+from .personal_custody_reconciler import start_personal_custody_reconciler
 from .protected_reconciler import ProtectedAdmissionReconciler
 from .remediation_admission import reconcile_admissions
 from .resumequeue import ResumeQueue
@@ -82,6 +83,7 @@ from .routers import (
     channel_read,
     channels,
     cluster_message_replies,
+    coding_instructions,
     config,
     console,
     control,
@@ -89,6 +91,7 @@ from .routers import (
     deployments,
     directory,
     evals,
+    factory_facts,
     factory_slack,
     factory_status,
     forge_credential_health,
@@ -104,10 +107,15 @@ from .routers import (
     identity_approvals,
     identity_authority,
     identity_connect,
+    identity_me,
     identity_operator,
     memory,
+    memory_rules,
     observability,
+    personal_enrollments,
     provider_installations,
+    publication_candidates,
+    publication_candidates_access,
     publication_code_host,
     publication_precheck,
     publication_ui_evidence,
@@ -163,7 +171,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The shared client reaches the code host, so it trusts the operator's
     # code host CA bundle as well as the public roots (#3831).
     http_client = httpx.AsyncClient(
-        timeout=10.0, verify=code_host_verify(settings),
+        timeout=10.0,
+        verify=code_host_verify(settings),
         mounts=gateway_http_mounts(settings.channel_gateway_url),
     )
     app.state.http_client = http_client
@@ -260,6 +269,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.work_item_reconciler_enabled
         else None
     )
+    from . import factory_poll_intake
+
+    app.state.factory_poll_intake_task = (
+        asyncio.create_task(factory_poll_intake.run_forever(app.state.sessionmaker, settings))
+        if settings.work_item_reconciler_enabled
+        and settings.factory_enabled
+        and settings.factory_intake == "poll"
+        else None
+    )
     app.state.work_item_status_comments_task = (
         asyncio.create_task(work_item_reconciler.run_status_comments_forever())
         if settings.work_item_reconciler_enabled
@@ -273,9 +291,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.lineage_reconciler_task = start_lineage_reconciler(
         app.state.sessionmaker, settings, http_client
     )
+    # ADR 0287 (#5796): runs whatever the reconciler switches say.
+    app.state.rule_settlement_task = start_rule_settlement(app.state.sessionmaker, settings)
     app.state.ui_evidence_reconciler_task = start_ui_evidence_reconciler(
         app.state.sessionmaker, settings, http_client
     )
+    # Personal grant custody (#5377): the Secret store exists only when a grant
+    # namespace is configured, and its cleanup loop is independent of the factory.
+    app.state.custody_store = custody_store.build_custody_secret_store(settings)
+    app.state.personal_custody_reconciler_task = start_personal_custody_reconciler(
+        app.state.sessionmaker, settings, app.state.custody_store
+    )
+    app.state.rollout_hold = rollout_hold.build_rollout_hold(settings)
+    rollout_hold.install(app.state.rollout_hold)
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
     # resume_queue); interval <= 0 disables it (no task started).
@@ -413,6 +441,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     pass
             # These background loops use Valkey and the database, so stop them
             # before closing either resource.
+            intake_task = getattr(app.state, "factory_poll_intake_task", None)
+            if intake_task is not None:
+                intake_task.cancel()
+                try:
+                    await intake_task
+                except asyncio.CancelledError:
+                    pass
             status_task = getattr(app.state, "work_item_status_comments_task", None)
             if status_task is not None:
                 status_task.cancel()
@@ -427,6 +462,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await work_item_task
                 except asyncio.CancelledError:
                     pass
+            custody_task = getattr(app.state, "personal_custody_reconciler_task", None)
+            if custody_task is not None:
+                custody_task.cancel()
+                try:
+                    await custody_task
+                except asyncio.CancelledError:
+                    pass
+            rollout_hold.uninstall(app.state.rollout_hold)
             evidence_task = getattr(app.state, "ui_evidence_reconciler_task", None)
             if evidence_task is not None:
                 evidence_task.cancel()
@@ -434,13 +477,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await evidence_task
                 except asyncio.CancelledError:
                     pass
-            lineage_task = getattr(app.state, "lineage_reconciler_task", None)
-            if lineage_task is not None:
-                lineage_task.cancel()
-                try:
-                    await lineage_task
-                except asyncio.CancelledError:
-                    pass
+            for name in ("lineage_reconciler_task", "rule_settlement_task"):
+                lineage_task = getattr(app.state, name, None)
+                if lineage_task is not None:
+                    lineage_task.cancel()
+                    try:
+                        await lineage_task
+                    except asyncio.CancelledError:
+                        pass
             task = getattr(app.state, "resume_reconciler_task", None)
             if task is not None:
                 task.cancel()
@@ -619,7 +663,8 @@ class HttpTelemetryMiddleware:
 
 # @spec HTTP-INVOCATION-EXECUTION-15
 def create_app(
-    *, http_identity_runtime: HttpInvocationRuntime | None = None,
+    *,
+    http_identity_runtime: HttpInvocationRuntime | None = None,
     http_identity_client: HttpIdentityClient | None = None,
 ) -> FastAPI:
     if (
@@ -713,11 +758,15 @@ def create_app(
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
     app.include_router(hook_wake.admin_router)
+    # Before `state.router`, so `_rules` never reaches the key/value namespace routes (#5801).
+    app.include_router(state.rules_router)
     app.include_router(state.router)
     app.include_router(state.internal_router)
     app.include_router(state.released_router)
     app.include_router(thread_attachments.internal_router)
     app.include_router(memory.router)
+    app.include_router(memory_rules.router)
+    app.include_router(memory_rules.decision_router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
     app.include_router(approval_recovery.router)
@@ -740,6 +789,7 @@ def create_app(
     app.include_router(channel_read.router)
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
+    app.include_router(factory_facts.router)
     app.include_router(factory_status.router)
     app.include_router(forge_credential_health.router)
     app.include_router(turn_progress.router)
@@ -748,18 +798,23 @@ def create_app(
     app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspace_recovery.router)
     app.include_router(workspace_recovery_access.router)
+    app.include_router(publication_candidates.router)
+    app.include_router(publication_candidates_access.router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
     app.include_router(identity_admin.router)
     app.include_router(identity_operator.router)
+    app.include_router(personal_enrollments.router)
+    app.include_router(coding_instructions.router)
     app.include_router(identity_authority.router)
     app.include_router(identity_authority.grant_router)
     app.include_router(identity_authority.classification_router)
     app.include_router(identity_approvals.router)
     app.include_router(directory.router)
     app.include_router(identity_connect.router)
+    app.include_router(identity_me.router)
     app.include_router(identity.router)
     app.include_router(teams.router)
     app.include_router(agent_access.router)
@@ -789,7 +844,8 @@ def create_configured_app() -> FastAPI:
     if tls is None:
         return create_app(http_identity_runtime=runtime)
     return create_app(
-        http_identity_runtime=runtime, http_identity_client=HttpIdentityClient(tls_context=tls),
+        http_identity_runtime=runtime,
+        http_identity_client=HttpIdentityClient(tls_context=tls),
     )
 
 

@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 CAPABILITIES: Mapping[Operation, Support] = {
     **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
+    Operation.CURRENT_INSTALLATION_CREDENTIAL: Support.UNSUPPORTED,
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
@@ -308,6 +309,9 @@ class BitbucketCloudCodeHost:
             raise Unavailable("repository")
         default = _text(_dict(payload.get("mainbranch")).get("name")) or None
         return RepositoryRef(self.kind, self.host, uuid, full_name, default_branch=default)
+
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        raise Unsupported(Operation.CURRENT_INSTALLATION_CREDENTIAL)
 
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:
         """Git's basic ``x-token-auth`` credential for ``https://bitbucket.org``,

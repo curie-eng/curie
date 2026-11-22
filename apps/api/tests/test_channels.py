@@ -1393,6 +1393,10 @@ def _other_routes() -> list[tuple[str, str]]:
         # the state cookie and the IdP's authorization code are the credential.
         "/console/oidc/login",
         "/console/oidc/callback",
+        # The login screen reads which methods exist before a session does.
+        # The route does not consult X-API-Key, so a channel token is ignored
+        # rather than accepted.
+        "/console/sign-in-methods",
         # Logout takes no credential beyond the session cookie it revokes, and
         # always answers 204 so it is not an oracle for which tokens are live.
         "/console/logout",
@@ -1480,6 +1484,42 @@ def test_a_channel_token_is_refused_on_every_other_router(
         assert resp.json()["detail"] == "invalid or expired account connection"
     else:
         assert resp.status_code == 401, resp.text
+
+
+def test_sign_in_methods_ignores_a_channel_token(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """The login screen reads this before a session exists.
+
+    A channel token is not a credential here. The route answers the same way
+    it answers with no header, which is why the sweep excludes it instead of
+    expecting 401.
+    """
+
+    agent_id = _bind(
+        channels_client,
+        auth_headers,
+        name=f"methods-{uuid.uuid4().hex[:8]}",
+        channel=_email_channel(f"methods-{uuid.uuid4().hex[:8]}@example.test"),
+    )
+    row = _binding_row(agent_id)
+    token = mint(
+        get_settings().api_key,
+        channel_id=str(row["id"]),
+        generation=row["generation"],
+        scope=CHANNEL_ENQUEUE_SCOPE,
+        exp=FAR_FUTURE,
+    )
+
+    anonymous = channels_client.get("/console/sign-in-methods")
+    presented = channels_client.get("/console/sign-in-methods", headers={"X-API-Key": token})
+
+    assert ("GET", "/console/sign-in-methods") not in _other_routes()
+    assert anonymous.status_code == 200, anonymous.text
+    assert presented.status_code == 200, presented.text
+    assert presented.json() == anonymous.json() == {"oidc": False}
 
 
 # --- the token dies with the binding it names ---------------------------------

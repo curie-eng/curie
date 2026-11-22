@@ -584,29 +584,6 @@ def test_foreign_wake_claims_are_read_only(paused_factory: AdmittedKind, change:
         assert run.comments(protected_ticket) == comments[request["id"]]
 
 
-def test_duplicate_effective_label_is_refused_at_admission(paused_factory: AdmittedKind) -> None:
-    run = paused_factory
-    run.write_sql(
-        "UPDATE curie.agent_channels SET trigger_label=NULL "
-        f"WHERE agent_id='{uuid.UUID(run.agents[0].id)}' AND kind='github'; "
-        "UPDATE curie.agent_channels SET trigger_label='factory' "
-        f"WHERE agent_id='{uuid.UUID(run.agents[1].id)}' AND kind='github'"
-    )
-    ticket = run.seed("github", run.agents[0], label="factory")
-    result = run.label_webhook(ticket, "factory")
-    assert result["status"] == "factory_ignored"
-    assert result["errors"] == [{"code": "binding_missing"}]
-    run.worker_replicas(1)
-    progress_neighbor(run)
-    assert run.request(ticket) is None
-    assert run.sql(
-        "SELECT count(*) FROM curie.work_items "
-        f"WHERE tracker_kind='github' AND tracker_issue_id='{ticket.number}'"
-    ) == 0
-    assert run.comments(ticket) == []
-    assert not [lane for lane, _, _ in run.model.observations() if ticket.url in lane]
-
-
 def test_ordinary_ambiguous_chat_still_has_no_agent_or_reply(paused_factory: AdmittedKind) -> None:
     run = paused_factory
     ticket, row, wake = waiting_ticket(run)

@@ -1,0 +1,102 @@
+{
+  "comment": "Frozen Slack mention receipts (#5414, #5380), curie_internal.slack_mention_receipt. Each receipts entry is one native Socket Mode envelope, the identity it arrives on, the ADR 0202 driver declaration in force (null for none), and the exact bytes the dispatcher stores for it in Valkey (SlackMentionReceipt.model_dump_json). person_thread_reply is version 1, byte-identical to the receipt written before version 2 existed (driver_bot_id omitted), so released workers and APIs keep reading it. declared_driver_root is version 2; its event keys (app_id, blocks, bot_id, bot_profile, channel, event_ts, team, text, ts, type, user; no user_team, thread_ts or subtype) follow an app_mention posted by another app's bot token, observed over Socket Mode on a real test workspace, 2026-11-12; provider reference https://docs.slack.dev/reference/events/app_mention . Its user_id and evidence.user_id are the declared bot_user_id, never event.user. kickoff_request_ids are uuid5(NAMESPACE_URL, 'curie-slack://factory/kickoff/{channel_identity}/{delivery_id}'). Read by packages/curie-internal/tests/test_slack_mention_receipt.py and apps/dispatcher/tests/test_factory_slack_kickoff_receipt.py. The curie-internal test rejects unknown keys at every level it reads, so a key one reader cannot see fails there.",
+  "receipts": [
+    {
+      "name": "person_thread_reply",
+      "slack_identity": "default",
+      "declared_driver": null,
+      "envelope": {
+        "type": "event_callback",
+        "team_id": "T0EXAMPLE1",
+        "api_app_id": "A0EXAMPLE1",
+        "event": {
+          "type": "app_mention",
+          "user": "U0EXAMPLE1",
+          "user_team": "T0EXAMPLE1",
+          "team": "T0EXAMPLE1",
+          "channel": "C0EXAMPLE1",
+          "text": "  <@U0BOT>  Please rename \"helper\" to \"acme_helper\"\n> keep <@U0BOT> quoted\nand café too \n",
+          "ts": "1700000000.000200",
+          "thread_ts": "1700000000.000100",
+          "event_ts": "1700000000.000200"
+        },
+        "event_id": "Ev0EXAMPLE5380A",
+        "event_time": 1700000000,
+        "authorizations": [
+          {
+            "enterprise_id": null,
+            "team_id": "T0EXAMPLE1",
+            "user_id": "U0BOT",
+            "is_bot": true,
+            "is_enterprise_install": false
+          }
+        ],
+        "is_ext_shared_channel": false,
+        "event_context": "EC0EXAMPLE5380A"
+      },
+      "serialized": "{\"version\":1,\"delivery_id\":\"Ev0EXAMPLE5380A\",\"channel_identity\":\"default\",\"channel\":\"C0EXAMPLE1\",\"root_ts\":\"1700000000.000100\",\"message_ts\":\"1700000000.000200\",\"user_id\":\"U0EXAMPLE1\",\"body\":\"  <@U0BOT>  Please rename \\\"helper\\\" to \\\"acme_helper\\\"\\n> keep <@U0BOT> quoted\\nand café too \\n\",\"evidence\":{\"delivery\":\"app_mention\",\"user_id\":\"U0EXAMPLE1\",\"event_user_team\":\"T0EXAMPLE1\",\"event_team\":\"T0EXAMPLE1\",\"is_ext_shared_channel\":false,\"enterprise_ids\":[]}}"
+    },
+    {
+      "name": "declared_driver_root",
+      "slack_identity": "acme-factory",
+      "declared_driver": {
+        "channel_id": "C0EXAMPLE1",
+        "bot_id": "B0EXAMPLE1",
+        "bot_user_id": "U0EXAMPLE8"
+      },
+      "envelope": {
+        "type": "event_callback",
+        "team_id": "T0EXAMPLE1",
+        "api_app_id": "A0EXAMPLE1",
+        "event": {
+          "type": "app_mention",
+          "app_id": "A0EXAMPLE2",
+          "bot_id": "B0EXAMPLE1",
+          "bot_profile": {
+            "app_id": "A0EXAMPLE2",
+            "deleted": false,
+            "icons": {},
+            "id": "B0EXAMPLE1",
+            "name": "acme-test-sender",
+            "team_id": "T0EXAMPLE1",
+            "updated": 1700000000,
+            "user_id": "U0EXAMPLE8"
+          },
+          "blocks": [],
+          "channel": "C0EXAMPLE1",
+          "event_ts": "1700000000.000300",
+          "team": "T0EXAMPLE1",
+          "text": "<@U0BOT> [test action] start <https://github.com/acme-corp/acme-bot/issues/41>",
+          "ts": "1700000000.000300",
+          "user": "U0EXAMPLE8"
+        },
+        "event_id": "Ev0EXAMPLE5380B",
+        "event_time": 1700000000,
+        "authorizations": [
+          {
+            "enterprise_id": null,
+            "team_id": "T0EXAMPLE1",
+            "user_id": "U0BOT",
+            "is_bot": true,
+            "is_enterprise_install": false
+          }
+        ],
+        "is_ext_shared_channel": false,
+        "event_context": "EC0EXAMPLE5380B"
+      },
+      "serialized": "{\"version\":2,\"delivery_id\":\"Ev0EXAMPLE5380B:acme-factory\",\"channel_identity\":\"acme-factory\",\"channel\":\"C0EXAMPLE1\",\"root_ts\":\"1700000000.000300\",\"message_ts\":\"1700000000.000300\",\"user_id\":\"U0EXAMPLE8\",\"body\":\"<@U0BOT> [test action] start <https://github.com/acme-corp/acme-bot/issues/41>\",\"evidence\":{\"delivery\":\"app_mention\",\"user_id\":\"U0EXAMPLE8\",\"event_user_team\":null,\"event_team\":\"T0EXAMPLE1\",\"is_ext_shared_channel\":false,\"enterprise_ids\":[]},\"driver_bot_id\":\"B0EXAMPLE1\"}"
+    }
+  ],
+  "kickoff_request_ids": [
+    {
+      "channel_identity": "default",
+      "delivery_id": "Ev0EXAMPLE5380A",
+      "request_id": "12a8b78d-32f8-5594-b1ae-449188edc8a0"
+    },
+    {
+      "channel_identity": "acme-factory",
+      "delivery_id": "Ev0EXAMPLE5380B:acme-factory",
+      "request_id": "cb5f1279-1d76-556d-9981-51d6bfd61484"
+    }
+  ]
+}

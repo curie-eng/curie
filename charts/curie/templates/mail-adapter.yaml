@@ -1,15 +1,4 @@
-{{/*
-Validate and normalize one CIDR before it is allowed into the credential-bearing
-mail pod's NetworkPolicy. Kubernetes validates CIDR syntax only after Helm has
-already accepted the release, so this render gate keeps malformed and broad
-routes from becoming an install-time surprise or an egress escape hatch.
-
-The chart has no general IP-network parser. This deliberately accepts the two
-NetworkPolicy families Kubernetes accepts: strict dotted-quad IPv4 and IPv6
-hextets with at most one `::` compression. Prefix 0 and 1 are rejected outright;
-that also rejects the two-/1 spellings of a default route without depending on
-list order or an exact string comparison.
-*/}}
+{{/* Validate and normalize one CIDR before it enters the credential-bearing mail pod's NetworkPolicy; Kubernetes validates syntax only after Helm accepts the release. Accepts strict dotted-quad IPv4 and IPv6 hextets with at most one `::`; prefix 0 and 1 are rejected outright. */}}
 {{- define "curie.mailAdapter.narrowCidr" -}}
 {{- $key := .key -}}
 {{- $cidr := trim (printf "%v" .cidr) -}}
@@ -78,14 +67,7 @@ list order or an exact string comparison.
 {{- if and .Values.mailAdapter.egressSecretExistingSecret (not .Values.worker.adapterCredentialsExistingSecret) }}
 {{- fail "mailAdapter.egressSecretExistingSecret requires worker.adapterCredentialsExistingSecret so the adapter and worker source the paired egress credential externally. Set both configuration keys; credential values are not printed." }}
 {{- end }}
-{{- /* #2824: AgentMail is CloudFront-fronted and its edges move, so a /32
-     snapshot goes stale and cuts the adapter off. `cidrs` keeps the narrow
-     snapshot (use published provider ranges, not resolved /32s); `publicHttps`
-     is the operator's explicit trade: any public address on TCP 443, with
-     private, loopback, link-local (metadata), CGNAT, documentation, multicast
-     and reserved ranges excepted, and no pin list for the adapter. Pod,
-     Service or node ranges in public space (dual-stack IPv6, GKE PUPI) are
-     NOT excepted unless listed in publicHttpsExcept. Each mode refuses the other's key rather than ignore it. */}}
+{{- /* #2824: AgentMail edges move, so a /32 snapshot goes stale. `cidrs` is the narrow snapshot (published ranges); `publicHttps` is the explicit trade: any public address on TCP 443 except private, loopback, link-local, CGNAT, documentation, multicast and reserved ranges. Pod, Service or node ranges in public space are NOT excepted unless in publicHttpsExcept. Each mode refuses the other's key. */}}
 {{- $agentmailMode := .Values.mailAdapter.agentmail.egressMode | default "cidrs" }}
 {{- if not (has $agentmailMode (list "cidrs" "publicHttps")) }}
 {{- fail (printf "mailAdapter.agentmail.egressMode %q is not supported; use cidrs (declared provider ranges in mailAdapter.agentmail.httpsCidrs) or publicHttps (any public address on TCP 443)" $agentmailMode) }}
@@ -103,15 +85,7 @@ list order or an exact string comparison.
 {{- if not (hasPrefix "https://" .Values.mailAdapter.agentmail.baseUrl) }}
 {{- fail "mailAdapter.deploy is true: mailAdapter.agentmail.baseUrl must use https:// because the mail egress policy permits provider traffic only on TCP 443" }}
 {{- end }}
-{{- /* Chart-managed credentials must checksum the incoming values, not the
-     currently live chart Secret: on an upgrade Kubernetes has not applied the
-     next Secret yet, so hashing the old object would leave the pod template
-     unchanged and the process would keep its old environment. An externally
-     managed credential is the opposite lifecycle: its Helm value is only a
-     reference, so checksum the referenced Secret's live data when available.
-     Clusterless renders and a first install fall back to the external source
-     name/key. No credential data is emitted into the manifest: only the
-     resulting digest reaches the pod annotation. */}}
+{{- /* Chart-managed credentials checksum the incoming values, not the live Secret. External credentials checksum the referenced Secret's live data when available, else the source name/key. Only the digest is emitted. */}}
 {{- $credentialChecksumSources := dict }}
 {{- range $name, $source := dict
       "channelToken" (dict "existingSecret" .Values.mailAdapter.channelTokenExistingSecret "existingSecretKey" .Values.mailAdapter.channelTokenExistingSecretKey "value" .Values.mailAdapter.channelToken)
@@ -166,12 +140,7 @@ list order or an exact string comparison.
   {{- fail "mailAdapter.apiEgress.port must be an integer from 1 through 65535" }}
   {{- end }}
 {{- end }}
-{{- /* The adapter is the only first-party workload with an egress-restricting
-     policy, so it is the only one whose OTLP export its own rail can drop
-     while api/dispatcher/worker keep exporting from the same rendered env
-     (#2361). Resolve the endpoint it actually dials, and either select the
-     in-chart collector by pod label or require an operator-declared IP peer;
-     never both, and never neither. */}}
+{{- /* The adapter is the only first-party workload with an egress-restricting policy (#2361). Select the in-chart collector by pod label or require an operator-declared IP peer; never both, never neither. */}}
 {{- $otelCidrs := list }}
 {{- $otelExternal := include "curie.mailAdapter.otlpIsExternal" . | trim }}
 {{- $otelPort := "" }}
@@ -185,12 +154,7 @@ list order or an exact string comparison.
   {{- $otelPort = include "curie.mailAdapter.otelEgressPort" . | trim }}
 {{- else }}
   {{- if .Values.mailAdapter.otelEgress.httpsCidrs }}
-  {{- /* Not-external covers two unrelated releases, and one remedy for both
-       mis-diagnoses one of them: an empty effective endpoint (telemetry
-       disabled, or deploy=false with no endpoint) has no in-chart collector at
-       all -- curie.otel.validate forbids telemetryDisabled with deploy=true --
-       so telling that operator a pod-selector rule covers their export names a
-       rule that was never rendered. Each case gets its own true remedy. */}}
+  {{- /* Not-external covers two cases needing different remedies: an empty effective endpoint (telemetry disabled, or deploy=false with no endpoint) has no in-chart collector, so do not point that operator at a pod-selector rule. */}}
   {{- if include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim }}
   {{- fail "mailAdapter.otelEgress.httpsCidrs is set, but the key is only read when this release's effective OTLP endpoint is external. This release exports to its own in-chart collector, and egress to it is governed by the rendered pod-selector rule -- these CIDRs would be silently ignored, leaving an operator believing a peer exists. Clear mailAdapter.otelEgress.httpsCidrs, or point the release at an external collector with otelCollector.deploy=false and otelCollector.endpoint." }}
   {{- else }}
@@ -198,50 +162,7 @@ list order or an exact string comparison.
   {{- end }}
   {{- end }}
 {{- end }}
-{{/*
-The first-party email channel (#1515): the adapter polls an AgentMail inbox,
-posts each allowed message to the platform as a turn, and replies on the same
-mail thread when the worker delivers the turn's events back.
-
-Modeled on templates/dispatcher.yaml, with six deliberate divergences:
-
- 1. A Service exists. The dispatcher dials Slack outbound over a websocket and
-    has no inbound port; this adapter receives reply.update / turn.completed
-    from the worker over HTTP, so the worker needs an address to deliver to.
- 2. curie.env.api is deliberately NOT included. That helper renders a
-    CURIE_API_KEY secretKeyRef alongside the URL, and the adapter must hold no
-    platform API key: it authenticates with CURIE_CHANNEL_TOKEN, scoped to the
-    one channel binding it serves. CURIE_API_URL is therefore rendered here from
-    curie.api.url, the derivation curie.env.api itself uses, off
-    mailAdapter.apiBaseUrl. Include that helper, never a copy of its expression.
- 3. HTTP probes replace curie.heartbeatProbes, which exists only for the
-    portless services (worker, dispatcher). GET /healthz is a static liveness
-    signal; GET /readyz is withheld until SQLite opens and startup recovery
-    completes. Every POST still requires the egress secret.
- 4. replicas is hardcoded 1 and the strategy is Recreate, neither of them a
-    value. SQLite makes replacement durable, but the PVC is ReadWriteOnce and
-    the database has one serialized writer. A rolling update would briefly run
-    two writers, so any count other than 1 remains wrong. This is the one
-    recorded exception to the values-not-templates invariant in
-    charts/curie/CLAUDE.md; horizontal scale needs a separately accepted shared
-    store design, at which point the exception is removed, not extended.
- 5. A checksum/mail-adapter-credentials pod-template annotation hashes the next
-    Helm value for each chart-managed credential and the live data behind each
-    external secretKeyRef. Env is read once at boot, so without it a Helm-value
-    or external Secret rotation leaves the pod using the old credential behind
-    a green /healthz. A deterministic external source-ref fallback keeps
-    clusterless renders stable. Scoped to this adapter's own three credentials
-    so an unrelated key rotating does not restart it.
- 6. The deploy gate is a bare `.Values.mailAdapter.deploy`, deliberately NOT the
-    dispatcher's curie.dispatcher.enabled gate, which also waits for the Slack
-    identity `default` to have both tokens. mailAdapter.deploy defaults to false,
-    so an operator who sets it true has made a deliberate choice and deserves a
-    loud crash-loop naming the missing variable (the adapter's own boot gates do
-    exactly that), not a Deployment that silently fails to render and leaves
-    them hunting for a typo in their values file. The same bare check appears
-    in curie.adapterCredentials, which derives this adapter's egress entry only
-    when it is deployed.
-*/}}
+{{/* First-party email channel (#1515), modeled on dispatcher.yaml with six divergences. 1. A Service exists: the worker delivers events over HTTP. 2. curie.env.api is NOT included: the adapter holds no platform API key, only CURIE_CHANNEL_TOKEN; CURIE_API_URL renders from curie.api.url off mailAdapter.apiBaseUrl, never a copy. 3. HTTP probes replace curie.heartbeatProbes. 4. replicas is hardcoded 1 with Recreate (RWO PVC, one SQLite writer): the one recorded exception to the values-not-templates invariant in charts/curie/CLAUDE.md, removed (not extended) by an accepted shared store design. 5. A checksum/mail-adapter-credentials annotation restarts the pod on credential rotation. 6. The deploy gate is a bare .Values.mailAdapter.deploy, NOT curie.dispatcher.enabled, so opting in gets a loud crash-loop; curie.adapterCredentials uses the same check. */}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -567,13 +488,7 @@ spec:
         - { protocol: TCP, port: {{ .Values.otelCollector.service.grpcPort }} }
         - { protocol: TCP, port: {{ .Values.otelCollector.service.httpPort }} }
     {{- else }}
-    {{- /* The external peer is the ELSE of the in-chart gate, not a sibling
-         `if`: as siblings the #2317 class guard read this file as a .deploy
-         carve-out with no BYO branch and needed an exemption, so deleting the
-         rule below would have restored the silent drop with the suite still
-         green. The inner gate keeps the two peers mutually exclusive -- a
-         release that exports nowhere (empty effective endpoint) lands here and
-         correctly renders neither. */}}
+    {{- /* The external peer is the ELSE of the in-chart gate, not a sibling `if`: siblings made the #2317 class guard need an exemption. An empty effective endpoint renders neither. */}}
     {{- if $otelExternal }}
     # An external collector has no in-chart pod labels to select, and
     # NetworkPolicy cannot resolve its DNS name, so the operator declares its

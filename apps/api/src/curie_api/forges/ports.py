@@ -34,8 +34,10 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    SourceContent,
     StoredEvidence,
     TicketLabels,
+    TrackerComment,
     TrackerIssueRef,
     UpsertResult,
 )
@@ -75,6 +77,34 @@ class MarkedComments(Protocol):
         ...
 
 
+class FactsComments(MarkedComments, Protocol):
+    """Optional label-scoped comments whose request attributes change in place."""
+
+    async def find_facts(self, target: ReplyTarget, prefix: str) -> MarkedComment | None: ...
+
+    async def upsert_facts(
+        self, target: ReplyTarget, *, prefix: str, marker: str, body: str
+    ) -> UpsertResult: ...
+
+
+class TrackerFacts(Protocol):
+    """Optional tracker capability for the advisory facts exchange (ADR 0280)."""
+
+    @property
+    def repository(self) -> RepositoryRef: ...
+
+    @property
+    def marked_comments(self) -> FactsComments: ...
+
+    async def read_comment(self, comment_id: int) -> TrackerComment: ...
+
+    async def facts_issue_is_plain(self, issue: TrackerIssueRef) -> bool: ...
+
+    async def facts_writer(self, comment: TrackerComment) -> Actor | None:
+        """A current writer, or None; an unreadable permission raises Unavailable."""
+        ...
+
+
 class Tracker(Protocol):
     """Where work is marked and described (ADR 0197, "Two ports" item 1)."""
 
@@ -88,15 +118,31 @@ class Tracker(Protocol):
     def capabilities(self) -> Mapping[Operation, Support]: ...
 
     @property
+    def facts(self) -> TrackerFacts | None:
+        """Optional facts exchange; absent where FACTS_EXCHANGE is unsupported."""
+        ...
+
+    @property
     def marked_comments(self) -> MarkedComments:
         """Status comments on tracker issues (`ReplyTarget` kind ``issue``)."""
         ...
 
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         """Every marking since ``cursor``, plus a cancellation for any ``running``
         issue whose marker is gone, and the cursor to poll from next.
+
+        ``answering`` names the issues whose WorkItem has an outstanding or
+        answered factory question. On each of them every new comment by a
+        person, with or without a mention, is a `Disposition.ANSWER` notice
+        whose ``occurred_at`` is the comment's creation time and whose
+        ``event_id`` identifies the comment; it is never also a mention.
+        Elsewhere only a comment that mentions the factory is a notice.
 
         A listing that cannot be read to its end raises `Unavailable` and
         yields no cursor, so the caller's stored cursor stays where it is.
@@ -119,6 +165,15 @@ class Tracker(Protocol):
 
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         """The ticket as markdown for the sandbox. Nothing is stored."""
+        ...
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's own title and description now (ADR 0277 decision 4).
+
+        Read from the issue's fields alone, never from its comments, so the
+        content fingerprint a tracker result run holds survives any comment.
+        Gated as `Operation.READ_TICKET`. Nothing is stored.
+        """
         ...
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
@@ -198,6 +253,15 @@ class CodeHost(Protocol):
 
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:
         """A clone- or push-scoped credential with its origin and git header."""
+        ...
+
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        """Optional: a platform write credential for the currently installed App.
+
+        Rediscover the installation on every call, including when a cached
+        token is usable. Refuse missing App authority instead of using an
+        operator token. Only GitHub currently supports App installations.
+        """
         ...
 
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:

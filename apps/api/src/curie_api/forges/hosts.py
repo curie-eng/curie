@@ -75,6 +75,34 @@ def factory_credentials(registry: ForgeRegistry) -> GitHubCredentials:
     return factory_code_host_entry(registry).credentials.credentials
 
 
+async def resolve_factory_repository(
+    registry: ForgeRegistry, client: httpx.AsyncClient, path: str
+) -> RepositoryRef:
+    """Resolve a factory repository through its code host's configured credentials."""
+    code_host: CodeHost = factory_code_host(registry, client)
+    return await code_host.resolve_repository(f"{PATH_ID_PREFIX}{path}")
+
+
+async def factory_app_slug(registry: ForgeRegistry) -> str | None:
+    """The factory App login, or None when it cannot be read.
+
+    A missing slug never hides the configured mention. Callers still match that
+    mention on its own.
+    """
+
+    from starlette.concurrency import run_in_threadpool
+
+    from curie_api.github_app import GitHubAppError
+
+    try:
+        slug = await run_in_threadpool(factory_credentials(registry).app_slug)
+    except (GitHubAppError, Unavailable):
+        return None
+    if not isinstance(slug, str) or not slug.strip():
+        return None
+    return slug
+
+
 def factory_tracker(registry: ForgeRegistry) -> GitHubTrackerConnection:
     """The factory's GitHub tracker entry. Refused ``unavailable`` when none."""
 

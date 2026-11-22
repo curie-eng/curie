@@ -179,5 +179,3 @@ def relay() -> Iterator[Any]:
     finally:
         server.shutdown()
         server.server_close()
-
-

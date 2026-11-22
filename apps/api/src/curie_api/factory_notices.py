@@ -32,11 +32,13 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import httpx
+from curie_internal.factory_cause import cause_text as cause_text
+from curie_internal.factory_phase_view import PhaseView, phase_view
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -44,9 +46,25 @@ from starlette.concurrency import run_in_threadpool
 
 from .code_host_trust import code_host_verify
 from .config import Settings
-from .factory_comment_text import marker_for, redact_factory_comment, status_marker
-from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
+from .factory_comment_text import (
+    append_github_ask_line,
+    marker_for,
+    redact_factory_comment,
+    status_marker,
+)
+from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, pill_for
+from .factory_questions import (
+    ANSWER_RECEIVED_LINE,
+    QUESTIONS_ASKED,
+    QUESTIONS_LABEL,
+    QUESTIONS_UNRECORDED_LINE,
+    ROUND_LIMIT,
+    asked_round,
+    question_unrecorded,
+)
+from .factory_questions import answer_started as _answer_started
 from .factory_reply_target import stored_reply_target
+from .factory_retry_policy import condition_text
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
 from .forges.errors import ForgeError, NotFound, Unauthorized
@@ -59,17 +77,19 @@ from .forges.github.marked_comments import (
     patch_comment,
     subject_title,
 )
-from .forges.github.transport import github_headers
+from .forges.github.transport import github_headers, repository_identity_matches
 from .forges.hosts import factory_credentials, factory_tracker
 from .forges.ports import CodeHost, Tracker, comments_for
 from .forges.registry import forges_registry
 from .forges.trackers import code_host_for_repository, tracker_for_work_item
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
+from .github_review_truth import VerifiedRepository
 from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
     FactoryBaseTransition,
+    FactoryCiObservation,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -77,114 +97,13 @@ from .models import (
 )
 from .publication_truth import conversation_pr_lineage_id
 from .repo_full_name import repo_url_path
-from .workitems.lifecycle import (
-    OWNER_LOST_RETRY_LIMIT,
-    owner_lost_streak,
-    owner_lost_successor_admitted,
-)
+from .workitems.lifecycle import AUTOMATIC_RETRY_LIMIT, automatic_successor_of
 
 logger = logging.getLogger(__name__)
 
 
-# The operator-facing sentence for each terminus cause (#3073). The raw code
-# still appears on the comment, but never as its headline.
-_CAUSE_TEXT = {
-    "model_credit_exhausted": (
-        "the model provider refused the request because the account has run "
-        "out of credits. Add credits or raise the key's limit, then retry."
-    ),
-    "model_usage_limited": (
-        "the model provider's usage limit for this credential was reached; "
-        "re-add the label after the limit resets."
-    ),
-    "model_credential_rejected": (
-        "the model provider rejected the configured API key. Check the model "
-        "credential, then retry."
-    ),
-    "model_rate_limited": (
-        "the model provider kept rate limiting the request. Retry later or raise "
-        "the provider limit."
-    ),
-    "model_error": "the model provider returned an error the run could not recover from.",
-    "model_unreachable": (
-        "the model provider could not be reached. Check the runner's network path "
-        "to the model endpoint, then retry."
-    ),
-    "budget_exceeded": "the run reached a budget limit before it finished.",
-    "runner_timeout": "the run took longer than its time limit.",
-    "sandbox_terminated": (
-        "the sandbox terminated before the run finished. Check the Kubernetes "
-        "reason below, then retry after addressing the sandbox failure."
-    ),
-    "workspace_error": "the repository workspace could not be prepared for the run.",
-    "history_capacity": (
-        "conversation history capacity exceeded. Work may have happened. "
-        "Inspect the result and retry."
-    ),
-    "runner_escalated": "the run stopped on an error and was handed to a person.",
-    "pull_request_not_adopted": (
-        "an earlier pull request on this issue could not be continued. "
-        "A person should close or merge it, then re-add the label."
-    ),
-    "unclassified": (
-        "the run failed and Curie could not name a more specific cause. "
-        "Read the worker log for the provider message, then retry or hand it to a person."
-    ),
-    "max_turns": (
-        "the run used its whole turn budget. Raise worker.workItemMaxTurns "
-        "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns, then retry."
-    ),
-    "runner_failed": "the run ended without a result.",
-    "approval_create_failed": (
-        "the publication request was refused, so no pull request was opened. "
-        "Read the details for the reason, fix it, then retry."
-    ),
-    "early_stop": "the agent stopped before doing any work on the issue.",
-    "no_pull_request": "the run ended without publishing a pull request.",
-    "revision_unchanged": (
-        "the existing pull request is unchanged because this revision published nothing."
-    ),
-    "execution_deadline": "the run did not finish before its deadline.",
-    "capacity_wait_expired": "sandbox admission did not complete before the wait expired.",
-    "start_failed": "the sandbox did not start.",
-    "owner_lost": "the worker running this request stopped responding.",
-    "issue_cancelled": "the request was cancelled.",
-    "issue_deleted": "the tracker issue no longer exists.",
-    "publication_denied": "a person denied the request to open the pull request.",
-    "publication_expired": (
-        "the request to open the pull request expired before anyone approved it."
-    ),
-    "publication_failed": (
-        "publishing the pull request failed. A branch or pull request from this run may still "
-        "exist; check the repository before retrying."
-    ),
-    "publication_unrecorded": (
-        "the agent tried to publish its change, but no valid publication was recorded. "
-        "The Details line below gives the reason; the pull request, if any, is unchanged."
-    ),
-    "ci_failed": (
-        "the pull request's checks still failed after 3 rounds of fixes. The pull "
-        "request stays open for a person."
-    ),
-    "ci_timeout": (
-        "the pull request's checks did not finish before the CI wait ran out. The "
-        "pull request stays open."
-    ),
-    "ci_unverified": (
-        "the pull request's CI could not be verified, so the run did not complete. "
-        "The Reason line below says why. The pull "
-        "request stays open; check it yourself."
-    ),
-    "merge_conflict": (
-        "the pull request has merge conflicts with its base branch, so GitHub ran "
-        "no pull request checks. The pull request stays open; resolve the conflicts "
-        "to continue."
-    ),
-    "pr_closed": "a person closed the pull request without merging it during the CI wait.",
-    "ci_fix_unpublished": (
-        "a CI fix round ended without pushing a fix. The pull request stays open."
-    ),
-}
+# Cause sentences live in curie_internal.factory_cause. cause_text is
+# re-exported above so existing callers keep importing it from this module.
 
 # The detail of these causes is text returned by the model service; every other
 # cause that prints a detail labels it "Details".
@@ -198,9 +117,16 @@ _PROVIDER_MESSAGE_CAUSES = frozenset(
         "model_unreachable",
     }
 )
+# Publication refusals can quote caller-supplied paths (#3617), so their
+# detail is rendered as one inert line.
+_PUBLICATION_REFUSAL_CAUSES = frozenset(
+    {"approval_create_failed", "publication_refused", "publication_recovery_refused"}
+)
 # A run that ended without publishing carries the agent's own last message
 # (#3128). Quote each line and neutralize HTML, image syntax and mentions.
-_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request", "revision_unchanged"})
+_AGENT_MESSAGE_CAUSES = frozenset(
+    {"early_stop", "no_pull_request", "revision_unchanged", "ci_fix_unpublished"}
+)
 # Wire classification a text-only consumer reads off the status comment (#3401).
 # Same tokens as the channel reply's ``curie-turn-failure:`` line. Causes with
 # no entry stay unlabeled rather than inventing a class.
@@ -217,7 +143,15 @@ _FAILURE_CLASS_BY_CAUSE = {
     "budget_exceeded": "budget-exceeded",
     "runner_timeout": "runner-timeout",
     "sandbox_terminated": "sandbox-terminated",
+    # A diagnosed sandbox exhaustion or node disruption is still a sandbox
+    # termination by class (#5427); the cause names which.
+    "sandbox_memory_exhausted": "sandbox-terminated",
+    "sandbox_storage_exhausted": "sandbox-terminated",
+    "sandbox_scratch_exhausted": "sandbox-terminated",
+    "sandbox_node_disrupted": "sandbox-terminated",
     "workspace_error": "workspace-error",
+    "runner_error": "runner-error",
+    "authentication_required": "authentication-required",
 }
 _BACKTICK_RUN = re.compile(r"`+")
 _OUTPUT_TOKEN_BUDGET_DETAIL = re.compile(
@@ -239,10 +173,12 @@ _USD_BUDGET_DETAIL = re.compile(
 # be a plain word. The colon form stays on ``_PROVIDER_WORKSPACE``.
 
 
-def cause_text(cause: str) -> str:
-    """A plain sentence for a terminus cause; unknown codes get a generic one."""
-
-    return _CAUSE_TEXT.get(cause, "the run stopped for a reason Curie did not recognize.")
+# The ``start_failed`` sentence of a request an answer started whose pull
+# request merged or closed before it could start (#5786).
+ANSWER_PULL_REQUEST_ENDED_SENTENCE = (
+    "this ticket's pull request was merged or closed before the factory could act on "
+    "the answer, so no new run started."
+)
 
 
 def start_failed_sentence(attempts: int, reason: str) -> str:
@@ -312,7 +248,7 @@ def render_base_line(
 async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
     """Let the reconciler edit the latest status comment once more.
 
-    A selected or requested base change must reach a comment that was already
+    A base or publication change must reach a comment that was already
     finalized. A sync holding the lease is flagged so its writeback leaves the
     row due. The comment re-finalizes after the edit.
     """
@@ -342,14 +278,70 @@ async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UU
     )
 
 
-# The four state labels the pass owns (#3077, #3221). A closed set, never a
-# prefix match: human labels, including other ``curie:`` labels, are never
-# touched.
+async def mark_lineage_status_comment_stale(session: AsyncSession, lineage_id: uuid.UUID) -> None:
+    found = (
+        await session.execute(
+            select(WorkItem.id, ThreadPublicationLineage.status)
+            .join(ThreadPublicationLineage, ThreadPublicationLineage.id == lineage_id)
+            .where(WorkItem.publication_lineage_id == lineage_id)
+        )
+    ).one_or_none()
+    if found is None:
+        return
+    work_item_id, lineage_status = found
+    await mark_status_comment_stale(session, work_item_id)
+    if lineage_status == "merged":
+        await _mark_ticket_status_comment_stale(session, work_item_id)
+
+
+async def _mark_ticket_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
+    """Reopen the ticket's own status comment once its pull request merged.
+
+    A pull request revision is the newest request but answers on the pull
+    request, so the stale mark on the newest request never reaches the comment
+    on the ticket. The ticket's comment is the newest request that replies on
+    the issue; it gains the merge notice only when it completed.
+    """
+
+    ticket_request = (
+        await session.execute(
+            select(ExecutionRequest.id, ExecutionRequest.status)
+            .where(
+                ExecutionRequest.work_item_id == work_item_id,
+                ExecutionRequest.reply_target_kind == "issue",
+            )
+            .order_by(ExecutionRequest.sequence.desc())
+            .limit(1)
+        )
+    ).one_or_none()
+    if ticket_request is None or ticket_request.status != "completed":
+        return
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.execution_request_id == ticket_request.id,
+            or_(
+                FactoryStatusComment.finalized_at.is_not(None),
+                FactoryStatusComment.sync_owner.is_not(None),
+            ),
+            FactoryStatusComment.refused_at.is_(None),
+        )
+        .values(
+            finalized_at=None,
+            sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
+        )
+    )
+
+
+# The state labels the pass owns (#3077, #3221; questions since #5785). A
+# closed set, never a prefix match: human labels, including other ``curie:``
+# labels, are never touched.
 STATE_LABELS = (
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
+    QUESTIONS_LABEL,
 )
 LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
@@ -360,11 +352,23 @@ _DESIRED_LABEL = {
     "completed": "curie-factory:pr-open",
     "failed": "curie-factory:needs-human",
     "expired": "curie-factory:needs-human",
-    # Cancelled clears the current four and the legacy four; '' records that nothing is applied.
+    # Cancelled clears the current labels and the legacy four; '' records that nothing is applied.
     "cancelled": "",
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
+# The label a release without question rounds gives a question ending.
+_OLDER_QUESTIONS_LABEL = _DESIRED_LABEL["completed"]
 _WAITING_FOR_PROGRESS = "_Waiting for the agent to report progress._"
+# The first line of a live implementation run's status comment on its ticket
+# (#5785 decision 13): posted at admission, before any model progress.
+INVESTIGATING_LINE = (
+    "Investigating this ticket. The factory will open a pull request or post its questions here."
+)
+_READING_PULL_REQUEST = "Reading the pull request and its Decisions"
+# A running pull request follow-up hides its checklist until a phase other than
+# these is reported. verification_preflight is the platform's own check, not
+# the agent entering the revision pipeline.
+_EARLY_FOLLOW_UP_PHASES = frozenset({VERIFICATION_PREFLIGHT_PHASE, "read_issue"})
 _MARKDOWN_SPECIAL = set("\\`*_[]()#<>!|")
 # #3127 AC2: queued work isn't stuck, it's waiting out an upgrade.
 _PAUSED_FOR_UPGRADE_LINE = (
@@ -373,9 +377,27 @@ _PAUSED_FOR_UPGRADE_LINE = (
 )
 
 
-def desired_label(status: str) -> str:
-    """The state label for a request status; '' means none of the four."""
+def desired_label(
+    status: str,
+    *,
+    cause: str | None = None,
+    pr_state: str | None = None,
+    work_item_cancelled: bool = False,
+) -> str:
+    """The state label for a request status; '' means none of the state labels.
 
+    A request that ended with the question ending (completed, cause
+    ``questions_asked``, #5785) shows questions; every other mapping is
+    unchanged.
+    """
+
+    # A merged pull request ends the ticket's time with the factory, whatever
+    # the run's own status: the label is removed (ADR decision 15).
+    if status in {"completed", "failed", "expired"} and pr_state == "merged":
+        return ""
+    if status == "completed" and cause == QUESTIONS_ASKED:
+        # A cancelled WorkItem takes no answer, so the ticket stops asking.
+        return "" if work_item_cancelled else QUESTIONS_LABEL
     return _DESIRED_LABEL.get(status, "")
 
 
@@ -387,24 +409,34 @@ def result_section(
     detail: str | None = None,
     unchanged: bool = False,
     superseded: bool = False,
-    lost_streak: int = 0,
-    lost_retried: bool = False,
+    successor: RetrySuccessor | None = None,
+    retries_used: int = 0,
+    blocked_on: str | None = None,
     run_cost_usd: Decimal | None = None,
+    question_round: int | None = None,
+    work_item_cancelled: bool = False,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
-    For ``owner_lost``, ``lost_streak`` is the consecutive losses through
-    this request and ``lost_retried`` whether its settlement admitted a
-    successor (ADR 0206); together they choose the retry or exhausted sentence.
+    ``successor`` is the automatic retry this request's settlement admitted
+    (ADR 0269); with one, the result is a ``Retrying:`` notice naming its
+    state instead of a failure. ``retries_used`` is the WorkItem's used
+    allowance, rendered after the cause sentence when the caller passes it for
+    a failed or expired request with no successor. ``blocked_on`` is the
+    condition a ``retry_condition_expired`` request was still blocked on.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
+    ``question_round`` is the round a ``questions_asked`` request posted, and
+    ``work_item_cancelled`` replaces its answer instruction once the WorkItem
+    is cancelled, since an answer then starts nothing.
     """
+
+    if successor is not None:
+        return _retrying_section(cause, successor, feedback_url=feedback_url)
 
     if cause == "completed":
         if unchanged:
             if feedback_url is not None:
-                text = (
-                    "No changes needed: this pull request already covers the requested revision.\n"
-                )
+                text = "No changes needed: this pull request is unchanged.\n"
             elif isinstance(pr_url, str) and pr_url.strip():
                 text = (
                     "No changes needed: the open pull request already covers this request: "
@@ -425,6 +457,18 @@ def result_section(
                 text += f"Note: {detail.strip()}\n"
         else:
             raise ValueError("a completed issue notice requires its pull request URL")
+    elif cause == QUESTIONS_ASKED:
+        # The question ending (#5785): its own outcome, never a failure line.
+        of_rounds = (
+            f" (round {question_round} of {ROUND_LIMIT})" if question_round is not None else ""
+        )
+        if work_item_cancelled:
+            text = (
+                f"Questions asked{of_rounds}. The factory label was removed, "
+                "so an answer starts nothing.\n"
+            )
+        else:
+            text = f"Questions asked{of_rounds}. Answer in a plain comment on this ticket.\n"
     elif cause == "issue_cancelled" and superseded:
         text = (
             f"Stopped: the label was added again, so a new run replaced this one.\nCause: {cause}\n"
@@ -455,17 +499,11 @@ def result_section(
                 "was opened. This was an infrastructure failure, not a refusal of the change; "
                 "retry the run."
             )
-        elif cause == "owner_lost" and lost_streak == OWNER_LOST_RETRY_LIMIT:
+        elif cause == "retry_condition_expired" and blocked_on:
             sentence = (
-                "the worker running this request stopped responding "
-                f"{OWNER_LOST_RETRY_LIMIT} times."
-            )
-        elif cause == "owner_lost" and lost_retried and 1 <= lost_streak < OWNER_LOST_RETRY_LIMIT:
-            prefix = "Retrying: "
-            sentence = (
-                "the worker running this request stopped responding. Curie started "
-                "the work again as a new run "
-                f"(attempt {lost_streak + 1} of {OWNER_LOST_RETRY_LIMIT})."
+                "the automatic retry was still waiting for "
+                f"{condition_text(blocked_on)} (condition {code_span(blocked_on)}) "
+                "when its wait expired."
             )
         elif cause == "budget_exceeded":
             token_budget = _OUTPUT_TOKEN_BUDGET_DETAIL.fullmatch(detail or "")
@@ -510,9 +548,11 @@ def result_section(
             # deferral reason: one line, and no HTML comment opener.
             sentence = _inert_line(detail)
         text = f"{prefix}{sentence}\n"
+        if retries_used > 0:
+            text += f"{retries_used} of {AUTOMATIC_RETRY_LIMIT} automatic retries used.\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
-        elif cause == "approval_create_failed" and detail is not None and detail.strip():
+        elif cause in _PUBLICATION_REFUSAL_CAUSES and detail is not None and detail.strip():
             # The API refusal can quote caller-supplied paths (#3617): one line,
             # so it cannot add a ``Cause:`` line, and no HTML comment opener.
             text += f"Details: {_inert_line(detail)}\n"
@@ -532,6 +572,116 @@ def result_section(
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"
     return text
+
+
+@dataclass(frozen=True)
+class RetrySuccessor:
+    """The automatic retry a failed request's settlement admitted (ADR 0269).
+
+    ``slot`` is which of the WorkItem's automatic retries it spent, counted at
+    its own admission, so the sentence does not drift as later retries land.
+    """
+
+    owner_loss: bool
+    slot: int
+    dispatch_not_before: datetime
+    blocked_on: str | None
+    # A publication recovery (#5429) publishes the retained candidate it names
+    # with no model run.
+    publication_recovery: bool
+    candidate_id: uuid.UUID | None
+
+
+def utc_text(value: datetime) -> str:
+    """A stored timestamp as an operator reads it on a tracker comment."""
+
+    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def retry_state_line(*, dispatch_not_before: datetime, blocked_on: str | None) -> str:
+    """Whether an automatic retry is scheduled or blocked, and until when.
+
+    For a blocked retry the caller passes its waiting deadline, which
+    ``retry_state_time`` picks.
+    """
+
+    if blocked_on:
+        return (
+            f"Blocked: the automatic retry waits for {condition_text(blocked_on)} "
+            f"(condition {code_span(blocked_on)}). If that does not happen by "
+            f"{utc_text(dispatch_not_before)}, the retry expires."
+        )
+    return f"Scheduled: the automatic retry starts at or after {utc_text(dispatch_not_before)}."
+
+
+def retry_state_time(row: ExecutionRequest) -> datetime:
+    """The time a retry's state line names: its waiting deadline when blocked.
+
+    An ungated blocked retry stores that deadline as its dispatch time, but a
+    resource gated one is offered every probe interval (#5427), so its
+    dispatch time is the next probe, not when the wait ends.
+    """
+
+    if row.blocked_on is not None and row.wait_deadline is not None:
+        return row.wait_deadline
+    return row.dispatch_due
+
+
+def _retrying_section(cause: str, successor: RetrySuccessor, *, feedback_url: str | None) -> str:
+    retry = f"automatic retry {successor.slot} of {AUTOMATIC_RETRY_LIMIT}"
+    if successor.owner_loss:
+        # ADR 0206: the teardown is proven, the absence of earlier effects is not.
+        text = (
+            "Retrying: the worker running this request stopped responding. Curie observed "
+            f"the sandbox teardown and admitted {retry} as a new run. Work the lost run "
+            "already did is not ruled out.\n"
+        )
+    elif successor.publication_recovery:
+        text = (
+            "Recovering publication: this run's finished change is retained as candidate "
+            f"{code_span(str(successor.candidate_id))}, so Curie admitted publication recovery "
+            f"{successor.slot} of {AUTOMATIC_RETRY_LIMIT} to verify and publish it without "
+            "another model run.\n"
+        )
+    else:
+        text = f"Retrying: this run failed with no side effects, so Curie admitted {retry}.\n"
+    state = retry_state_line(
+        dispatch_not_before=successor.dispatch_not_before, blocked_on=successor.blocked_on
+    )
+    text += f"{state}\nCause: {cause}\n"
+    failure_class = _FAILURE_CLASS_BY_CAUSE.get(cause)
+    if failure_class is not None:
+        text += f"Failure class: {failure_class}\n"
+    if feedback_url is not None:
+        text += f"In response to {feedback_url}\n"
+    return text
+
+
+async def retry_successor(
+    session: AsyncSession, request: ExecutionRequest
+) -> RetrySuccessor | None:
+    """The automatic successor of a failed ``request``, with the slot it spent."""
+
+    if request.status != "failed":
+        return None
+    successor = await automatic_successor_of(session, request)
+    if successor is None:
+        return None
+    slot = await session.scalar(
+        select(func.count(ExecutionRequest.id)).where(
+            ExecutionRequest.work_item_id == successor.work_item_id,
+            ExecutionRequest.retry_of_request_id.is_not(None),
+            ExecutionRequest.sequence <= successor.sequence,
+        )
+    )
+    return RetrySuccessor(
+        owner_loss=successor.owner_lost_retry,
+        slot=int(slot or 0),
+        dispatch_not_before=retry_state_time(successor),
+        blocked_on=successor.blocked_on,
+        publication_recovery=successor.execution_kind == "publication_recovery",
+        candidate_id=successor.recovery_candidate_id,
+    )
 
 
 def _break_html_comments(text: str) -> str:
@@ -569,14 +719,14 @@ def _agent_message_block(message: str) -> str:
     return f"Agent's last message:\n{quoted}\n\n"
 
 
-def _escape_markdown(value: str) -> str:
+def escape_markdown(value: str) -> str:
     return "".join(f"\\{char}" if char in _MARKDOWN_SPECIAL else char for char in value)
 
 
 def _checklist(view: PhaseView, *, final: bool) -> list[str]:
     lines: list[str] = []
     for slot in view.phases:
-        label = _escape_markdown(slot.label)
+        label = escape_markdown(slot.label)
         if slot.state == "done":
             lines.append(f"- [x] {label}")
         elif slot.state == "current":
@@ -601,6 +751,8 @@ def status_body(
     paused_for_upgrade: bool = False,
     waiting_line: str | None = None,
     base_line: str | None = None,
+    progress_line: str | None = None,
+    lead_line: str | None = None,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
@@ -608,13 +760,19 @@ def status_body(
     last nonempty note as one inert line. A final result can also include the
     agent's last message as a neutralized Markdown quote. With a card, the checklist
     and waiting placeholder are left out; without one the checklist is the
-    fallback (#3125).
+    fallback (#3125). A ``progress_line`` replaces both the card and the checklist.
+    A ``lead_line`` opens a non-final body, before the card, checklist or
+    waiting placeholder; a final body carries none.
     """
 
     parts: list[str] = []
     if result is not None:
         parts.append(result.rstrip("\n"))
-    if card_url:
+    elif lead_line:
+        parts.append(lead_line)
+    if progress_line:
+        parts.append(progress_line)
+    elif card_url:
         parts.append(f"![Curie status]({card_url})")
     elif phase_view is not None and phase_view.phases:
         parts.append("\n".join(_checklist(phase_view, final=result is not None)))
@@ -633,12 +791,67 @@ def status_body(
     return redact_factory_comment("\n\n".join(parts) + "\n")
 
 
-def _digest(body: str) -> str:
+def lease_available(owner: Any, expires_at: Any) -> Any:
+    return or_(owner.is_(None), expires_at <= func.clock_timestamp())
+
+
+def body_digest(body: str) -> str:
     return hashlib.sha256(body.encode()).hexdigest()
+
+
+def completed_proof() -> Any:
+    """SQL predicate shared by status selection and item projections."""
+
+    return exists().where(
+        FactoryCiObservation.request_id == ExecutionRequest.id,
+        FactoryCiObservation.status == "completed",
+        FactoryCiObservation.lineage_id == WorkItem.publication_lineage_id,
+        FactoryCiObservation.head_sha == ThreadPublicationLineage.head_sha,
+        ThreadPublicationLineage.status == "open",
+        WorkItem.cancelled_at.is_(None),
+    )
+
+
+def _admitted_before_merge_sql() -> Any:
+    """Whether the request was admitted before its WorkItem's pull request merged.
+
+    The merge is the lineage's last write (``mark_publication_lineage_terminal``
+    stamps ``updated_at``). A run admitted after it (the label added again)
+    keeps the lineage on its WorkItem but is a fresh run of its own, so the
+    merge notice and its label removal are not its.
+    """
+
+    return ExecutionRequest.created_at <= ThreadPublicationLineage.updated_at
 
 
 def _desired_label_sql() -> Any:
     return case(
+        (
+            and_(
+                ExecutionRequest.status.in_(("completed", "failed", "expired")),
+                ThreadPublicationLineage.status == "merged",
+                _admitted_before_merge_sql(),
+                ThreadPublicationLineage.pr_number.is_not(None),
+                ThreadPublicationLineage.pr_url.is_not(None),
+            ),
+            literal(""),
+        ),
+        (
+            and_(
+                ExecutionRequest.status == "completed",
+                ExecutionRequest.terminal_cause == QUESTIONS_ASKED,
+                WorkItem.cancelled_at.is_not(None),
+            ),
+            literal(""),
+        ),
+        (
+            and_(
+                ExecutionRequest.status == "completed",
+                ExecutionRequest.terminal_cause == QUESTIONS_ASKED,
+            ),
+            literal(QUESTIONS_LABEL),
+        ),
+        (completed_proof(), literal("curie-factory:pr-open")),
         *[
             (ExecutionRequest.status == status, literal(label))
             for status, label in _DESIRED_LABEL.items()
@@ -654,11 +867,14 @@ async def sync_status_comments(
     owner: str,
     limit: int = 20,
     paused_for_upgrade: bool = False,
+    request_ids: set[uuid.UUID] | None = None,
+    verified_repository: VerifiedRepository | None = None,
 ) -> int:
     """Claim, render, release the session, call GitHub, then persist under the lease.
 
     Returns the number of GitHub writes. A crashed claimer's lease expires;
-    marker recovery finds a comment whose create response was lost.
+    marker recovery finds a comment whose create response was lost. Poll callers
+    may reuse their verified repository credential for matching claims.
     """
 
     writes = 0
@@ -676,6 +892,7 @@ async def sync_status_comments(
                         owner=owner,
                         attempted_ids=attempted_ids,
                         paused_for_upgrade=paused_for_upgrade,
+                        request_ids=request_ids,
                     )
                     await session.commit()
                 if claim is None:
@@ -685,7 +902,7 @@ async def sync_status_comments(
                 token = github_calls.set(calls)
                 started = time.monotonic()
                 try:
-                    writes += await _sync_one(client, settings, claim)
+                    writes += await _sync_one(client, settings, claim, verified_repository)
                     claim.row.attempts += 1
                     async with sessionmaker() as session:
                         await _write_back(session, claim, owner=owner)
@@ -731,10 +948,13 @@ class _StatusClaim:
     opened_pr: int | None
     work_item_id: uuid.UUID
     status: str
+    pr_state: str | None
     target: ReplyTarget
     body: str
     latest: bool
     now: datetime
+    work_item_cancelled: bool = False
+    cause: str | None = None
 
 
 async def _claim_next(
@@ -744,6 +964,7 @@ async def _claim_next(
     owner: str,
     attempted_ids: set[uuid.UUID],
     paused_for_upgrade: bool,
+    request_ids: set[uuid.UUID] | None = None,
 ) -> _StatusClaim | None:
     later = aliased(ExecutionRequest)
     is_latest = and_(
@@ -772,7 +993,10 @@ async def _claim_next(
                 ExecutionRequest,
                 ThreadPublicationLineage.pr_url,
                 ThreadPublicationLineage.pr_number,
+                ThreadPublicationLineage.status,
                 is_latest.label("is_latest"),
+                _desired_label_sql().label("desired_label"),
+                _admitted_before_merge_sql().label("admitted_before_merge"),
             )
             .join(WorkItem, WorkItem.id == FactoryStatusComment.work_item_id)
             .join(
@@ -785,11 +1009,15 @@ async def _claim_next(
             )
             .where(
                 FactoryStatusComment.refused_at.is_(None),
+                *(
+                    ()
+                    if request_ids is None
+                    else (FactoryStatusComment.execution_request_id.in_(request_ids),)
+                ),
                 ExecutionRequest.objective.is_not(None),
                 or_(FactoryStatusComment.finalized_at.is_(None), label_due),
-                or_(
-                    FactoryStatusComment.sync_owner.is_(None),
-                    FactoryStatusComment.sync_lease_expires_at <= func.clock_timestamp(),
+                lease_available(
+                    FactoryStatusComment.sync_owner, FactoryStatusComment.sync_lease_expires_at
                 ),
                 FactoryStatusComment.execution_request_id.not_in(attempted_ids),
             )
@@ -803,7 +1031,34 @@ async def _claim_next(
     ).one_or_none()
     if selected is None:
         return None
-    row, work_item, request, pr_url, pr_number, latest = selected
+    (
+        row,
+        work_item,
+        request,
+        pr_url,
+        pr_number,
+        pr_state,
+        latest,
+        label,
+        admitted_before_merge,
+    ) = selected
+    if pr_number is None or not pr_url:
+        pr_state = None
+    if pr_state == "merged" and admitted_before_merge is False:
+        # A fresh run after the merge: the merged pull request is not its own.
+        pr_state = None
+    if pr_state == "merged" and request.status in {"completed", "failed", "expired"}:
+        row.finalized_at = None
+    if (
+        request.status == "completed"
+        and request.terminal_cause == QUESTIONS_ASKED
+        and row.applied_label == _OLDER_QUESTIONS_LABEL
+    ):
+        # An API replica built before the question rounds (#5785) finalized
+        # this comment during a rolling upgrade: it renders the unknown cause
+        # as a failure and labels a completed request pr-open, which this
+        # version never applies to a question ending. Write the body again.
+        row.finalized_at = None
     now = await _clock(session)
     await session.execute(
         update(FactoryStatusComment)
@@ -842,6 +1097,7 @@ async def _claim_next(
         request,
         target,
         pr_url=pr_url,
+        pr_state=pr_state,
         paused_for_upgrade=paused_for_upgrade,
     )
     claim = _StatusClaim(
@@ -852,11 +1108,14 @@ async def _claim_next(
         tracker_issue=work_item.tracker_issue,
         opened_pr=opened_pr,
         work_item_id=work_item.id,
-        status=request.status,
+        status="completed" if label == "curie-factory:pr-open" else request.status,
+        pr_state=pr_state,
         target=target,
         body=body,
         latest=bool(latest),
         now=now,
+        work_item_cancelled=work_item.cancelled_at is not None,
+        cause=request.terminal_cause,
     )
     session.expunge(row)
     return claim
@@ -928,6 +1187,7 @@ async def _sync_one(
     client: httpx.AsyncClient,
     settings: Settings,
     claim: _StatusClaim,
+    verified_repository: VerifiedRepository | None,
 ) -> int:
     row = claim.row
     if row.terminal_cause == "issue_deleted":
@@ -940,11 +1200,24 @@ async def _sync_one(
     registry = forges_registry(settings)
     try:
         intake = factory_tracker(registry)
-        token = await run_in_threadpool(
-            factory_credentials(registry).token_for_verified_installation,
-            claim.repository_path,
-            claim.code_host_installation_id,
-        )
+        if verified_repository is None:
+            token = await run_in_threadpool(
+                factory_credentials(registry).token_for_verified_installation,
+                claim.repository_path,
+                claim.code_host_installation_id,
+            )
+        else:
+            if (
+                verified_repository.api != intake.config.api_url.rstrip("/")
+                or verified_repository.installation_id != claim.code_host_installation_id
+                or not repository_identity_matches(
+                    verified_repository.repository,
+                    repository_id=int(claim.tracker_issue.scope_id),
+                    repo_full_name=claim.repository_path,
+                )
+            ):
+                return 0
+            token = verified_repository.token
     except (ForgeError, GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
     github = GitHubCommentClient(
@@ -1012,7 +1285,7 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
     """
 
     row, target, body, now = claim.row, claim.target, claim.body, claim.now
-    digest = _digest(body)
+    digest = body_digest(body)
     pr = claim.opened_pr
     link = pr is not None and (
         tracker.capabilities.get(Operation.LINK_PULL_REQUEST) == Support.SUPPORTED
@@ -1020,6 +1293,8 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
     linked = f"{digest}:{pr}"
     stored = row.rendered_digest
     if stored == (linked if link else digest):
+        if FINAL_MARKER in body:
+            row.finalized_at = now
         return 0
     already = link and stored is not None and stored.endswith(f":{pr}")
     try:
@@ -1079,12 +1354,12 @@ async def _sync_comment(
         row.comment_list = comment_list
         row.posted_at = now
         # A comment found by its marker carries an unknown body: edit it below.
-        row.rendered_digest = _digest(body) if created else None
+        row.rendered_digest = body_digest(body) if created else None
         writes += int(created)
-    if row.rendered_digest != _digest(body):
+    if row.rendered_digest != body_digest(body):
         edited = await patch_comment(github, row, body)
         if edited == "edited":
-            row.rendered_digest = _digest(body)
+            row.rendered_digest = body_digest(body)
             writes += 1
         elif edited == "gone":
             # A person deleted the comment: re-create it next pass, marker scan first.
@@ -1129,6 +1404,23 @@ def _lineage_pr_link(
     return stored_url
 
 
+def github_status_mention(settings: Settings, tracker_kind: str) -> str | None:
+    """The GitHub tracker's mention, or None for every other tracker kind.
+
+    Status comments append the GitHub ask line only when this returns a mention.
+    """
+
+    if tracker_kind != GITHUB:
+        return None
+    tracker = forges_registry(settings).github_tracker()
+    if tracker is None:
+        return None
+    mention = tracker.config.mention
+    if not isinstance(mention, str) or not mention.strip():
+        return None
+    return mention
+
+
 async def _render(
     session: AsyncSession,
     settings: Settings,
@@ -1138,11 +1430,15 @@ async def _render(
     target: ReplyTarget,
     *,
     pr_url: str | None,
+    pr_state: str | None = None,
     paused_for_upgrade: bool = False,
 ) -> str:
+    """The status comment body."""
+
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
     retrying = False
+    unchanged = False
     if request.terminal_at is not None and cause:
         cause = cause.strip()
         if cause == "pull_request_not_adopted":
@@ -1176,16 +1472,13 @@ async def _render(
             and target.kind == "issue"
             and (not isinstance(pr_url, str) or not pr_url.strip())
         ):
-            streak = 0
-            retried = False
-            if cause == "owner_lost":
-                streak = await owner_lost_streak(
-                    session, work_item.id, through_sequence=request.sequence
-                )
-                retried = await owner_lost_successor_admitted(session, request)
-                retrying = (
-                    request.status == "failed" and retried and 1 <= streak < OWNER_LOST_RETRY_LIMIT
-                )
+            successor = await retry_successor(session, request)
+            retrying = successor is not None
+            retries_used = (
+                work_item.automatic_retries_used
+                if successor is None and request.status in {"failed", "expired"}
+                else 0
+            )
             unchanged = (
                 request.status == "completed"
                 and (
@@ -1217,16 +1510,39 @@ async def _render(
                 unchanged=unchanged,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
-                lost_streak=streak,
-                lost_retried=retrying,
+                successor=successor,
+                retries_used=retries_used,
+                blocked_on=request.blocked_on,
                 run_cost_usd=run_cost_usd,
+                question_round=(
+                    await asked_round(session, work_item.id, request.id)
+                    if cause == QUESTIONS_ASKED
+                    else None
+                ),
+                work_item_cancelled=work_item.cancelled_at is not None,
             )
+            if cause != QUESTIONS_ASKED and await question_unrecorded(
+                session, work_item.id, request.id
+            ):
+                result += QUESTIONS_UNRECORDED_LINE
+            if (
+                request.status in {"failed", "expired", "cancelled"}
+                and pr_url
+                and pr_state in {"open", "merged", "closed"}
+            ):
+                state = "closed without merging" if pr_state == "closed" else pr_state
+                result += f"Pull request: {pr_url} ({state})\n"
             # Tokens and estimated cost over every round of the work item
             # (#3223), after the Cause line so its parse is unchanged.
             line = usage_line(usage)
             if line is not None:
                 separator = "\n\n" if result.endswith("\n\n") else "\n"
                 result = result.rstrip("\n") + separator + line + "\n"
+            if request.status == "completed" and pr_url and pr_state == "merged":
+                # The factory sends no workflow status transition; this last
+                # line is how a Jira or GitLab ticket learns the pull request
+                # merged.
+                result += f"Pull request merged: {pr_url}\n"
     publishing = (
         await session.scalar(
             select(Publication.id)
@@ -1238,7 +1554,17 @@ async def _render(
         )
     ) is not None
     view: PhaseView | None = None
-    if row.declaration is not None or (result is not None and cause == "budget_exceeded"):
+    follow_up_running = (
+        result is None
+        and request.status == "running"
+        and target.kind in {"pull_request", "review_thread"}
+    )
+    reports: list[ExecutionRequestPhaseReport] = []
+    if (
+        row.declaration is not None
+        or (result is not None and cause == "budget_exceeded")
+        or follow_up_running
+    ):
         reports = list(
             await session.scalars(
                 select(ExecutionRequestPhaseReport)
@@ -1266,21 +1592,40 @@ async def _render(
                 label = labels.get(latest_note.phase, latest_note.phase)
                 progress = _inert_line(f"Last progress note: {label}: {latest_note.note}")[:300]
                 result += progress + "\n"
-    pill_label, _color, _live = pill_for(request.status, publishing, retrying=retrying)
+    # An unchanged completion answered a question: the checklist would show
+    # steps that did not run. The card image stays.
+    answered = unchanged and request.status == "completed" and cause == "completed"
+    if answered:
+        view = None
+    progress_line: str | None = None
+    if follow_up_running and not any(
+        report.phase not in _EARLY_FOLLOW_UP_PHASES for report in reports
+    ):
+        progress_line = _READING_PULL_REQUEST
+    pill_label, _color, _live = pill_for(
+        request.status, publishing, retrying=retrying, answered=answered
+    )
     pending_count = await session.scalar(
         select(func.count(ExecutionRequest.id)).where(
             ExecutionRequest.work_item_id == work_item.id,
             ExecutionRequest.status == "queued",
         )
     )
-    waiting_line: str | None = None
+    waiting_lines: list[str] = []
     if request.status == "queued":
-        waiting_line = (
+        waiting_lines.append(
             "This revision is waiting on the current run. It will start when that run finishes."
         )
-    elif request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
+    elif request.status == "waiting" and request.retry_of_request_id is not None:
+        waiting_lines.append(
+            retry_state_line(
+                dispatch_not_before=retry_state_time(request), blocked_on=request.blocked_on
+            )
+        )
+    if request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
         word = "revision" if pending_count == 1 else "revisions"
-        waiting_line = f"{pending_count} {word} waiting on this run."
+        waiting_lines.append(f"{pending_count} {word} waiting on this run.")
+    waiting_line = " ".join(waiting_lines) or None
     transition = await session.scalar(
         select(FactoryBaseTransition)
         .where(
@@ -1290,24 +1635,29 @@ async def _render(
         .limit(1)
     )
     base = forges_registry(settings).card_base_url
-    body = status_body(
-        request_id=row.execution_request_id,
-        card_url=f"{base}/v1/factory/cards/{row.card_token}.svg" if base else None,
-        pill_label=pill_label,
-        phase_view=view,
-        result=result,
-        paused_for_upgrade=paused_for_upgrade,
-        waiting_line=waiting_line,
-        base_line=render_base_line(work_item, transition),
+    card_url = (
+        None if progress_line or not base else f"{base}/v1/factory/cards/{row.card_token}.svg"
     )
-    if (
+    # A follow-up on an existing pull request cannot ask (pull_request_open),
+    # so it carries the continuing line instead of the investigating line.
+    admitted = aliased(ExecutionRequest)
+    continuing = bool(
         request.status in {"queued", "waiting", "running", "cancellation_requested"}
         and work_item.publication_lineage_id is not None
         and pr_url
         and await session.scalar(
             select(Publication.id)
             .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+            .join(ThreadPublicationLineage, ThreadPublicationLineage.id == Publication.lineage_id)
             .where(
+                # A run admitted after the pull request merged is not continuing it.
+                or_(
+                    ThreadPublicationLineage.status != "merged",
+                    ThreadPublicationLineage.updated_at
+                    >= select(admitted.created_at)
+                    .where(admitted.id == request.id)
+                    .scalar_subquery(),
+                ),
                 Publication.lineage_id == work_item.publication_lineage_id,
                 ExecutionRequest.work_item_id == work_item.id,
                 ExecutionRequest.sequence < request.sequence,
@@ -1315,10 +1665,55 @@ async def _render(
             .limit(1)
         )
         is not None
-    ):
-        body = redact_factory_comment(
-            f"Continuing on the existing pull request: {pr_url}\n\n{body}"
-        )
+    )
+    # An answer-started request says the answer was received (#5786), first,
+    # even when it continues on an existing pull request or has already
+    # settled by its first status sync.
+    answer_started = False
+    lead_line: str | None = None
+    if target.kind == "issue" and request.execution_kind != "publication_recovery":
+        answer_started = await _answer_started(session, work_item.id, request.id)
+        if request.terminal_at is None and not continuing:
+            lead_line = ANSWER_RECEIVED_LINE if answer_started else INVESTIGATING_LINE
+    body = status_body(
+        request_id=row.execution_request_id,
+        card_url=card_url,
+        pill_label=pill_label,
+        phase_view=None if progress_line else view,
+        result=result,
+        paused_for_upgrade=paused_for_upgrade,
+        waiting_line=waiting_line,
+        base_line=render_base_line(work_item, transition),
+        progress_line=progress_line,
+        lead_line=lead_line,
+    )
+    if continuing:
+        body = f"Continuing on the existing pull request: {pr_url}\n\n{body}"
+        if answer_started:
+            body = f"{ANSWER_RECEIVED_LINE}\n\n{body}"
+        body = redact_factory_comment(body)
+    elif answer_started and (lead_line is None or result is not None):
+        # A final body carries no lead line.
+        body = redact_factory_comment(f"{ANSWER_RECEIVED_LINE}\n\n{body}")
+    observation = await session.get(FactoryCiObservation, request.id)
+    if observation is not None:
+        until = observation.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if observation.status == "observing":
+            line = f"Checks are still being watched until {until}."
+        elif observation.status == "completed" and observation.observed_at is not None:
+            when = observation.observed_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+            line = (
+                f"Checks passed on head {code_span(observation.head_sha)}, "
+                f"observed at {when} after the run ended."
+            )
+        elif observation.status == "expired":
+            line = "Checks were not verified within 24 hours."
+        else:
+            line = f"Checks were not verified: {code_span(observation.reason or 'invalidated')}."
+        body += f"\n\n{line}"
+    mention = github_status_mention(settings, work_item.tracker_kind)
+    if mention is not None:
+        body = append_github_ask_line(body, mention)
     return body
 
 
@@ -1343,7 +1738,7 @@ async def _superseded(
 async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     """Add the desired state label and remove the others, on the issue.
 
-    Only the four state labels are ever written. Legacy deletes stay
+    Only the state labels are ever written. Legacy deletes stay
     unconditional: a new request starts with applied_label NULL, and the issue
     may still carry a legacy name. A refused write is logged and given up; any
     other failure is retried next pass.
@@ -1352,7 +1747,12 @@ async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     row = claim.row
     if row.applied_label == "":
         return 0
-    desired = desired_label(claim.status)
+    desired = desired_label(
+        claim.status,
+        cause=claim.cause,
+        pr_state=claim.pr_state,
+        work_item_cancelled=claim.work_item_cancelled,
+    )
     if row.applied_label == desired:
         return 0
     issue = claim.tracker_issue

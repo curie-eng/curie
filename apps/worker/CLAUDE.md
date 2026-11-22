@@ -35,7 +35,13 @@ stop -- that is scope creep on the sacred module.
    persisted to Valkey the instant it is seen so a crash mid-side-effect
    still escalates on reclaim. Flag-clean failures retry by classification
    (`rate-limit`/`runner-error`/`runner-timeout`/`sandbox-capacity`/`sandbox-terminated`/`workspace-error`/`model-unreachable` transient,
-   everything else escalates). A connect-phase turn-start failure (classified
+   everything else escalates). A started factory implementation execute turn
+   is the one exception (ADR 0269): it never retries inside a delivery, except
+   a `sandbox-capacity` refusal that opened no runner turn. Its finish reports
+   a required safety fact and the provider retry condition the runner sent, and
+   the SQL lifecycle owns the retry as a fresh request. Interactive, cron, CI
+   fix and approval resume turns keep the classification list.
+   A connect-phase turn-start failure (classified
    `runner-error`) opens one window per delivery, the sandbox claim timeout
    long (90 s by default) and never reset, in which attempts do not consume
    `max_attempts` but are counted in the escalation text; each sleep is capped

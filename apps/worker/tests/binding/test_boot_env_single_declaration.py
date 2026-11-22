@@ -148,6 +148,15 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # run._build_factory_slack_progress. Never injected into a sandbox.
         "CURIE_FACTORY_SLACK_PROGRESS_ENABLED",
         "CURIE_FACTORY_SLACK_INTERVAL_S",
+        # #5720: the console origin for the rejected-plan direct message.
+        # WorkerConfig reads it at startup; the progress lane puts it on the
+        # reconnect button. Never injected into a sandbox.
+        "CURIE_CONSOLE_ORIGIN",
+        # Issue 5581: WorkerConfig reads the minimum at worker startup, and
+        # factory_credit reads the OpenRouter credit API override from the
+        # worker process. Neither name is injected into a sandbox.
+        "CURIE_FACTORY_MIN_MODEL_CREDIT_USD",
+        "CURIE_OPENROUTER_API_URL",
         # Reclaim scan policy for the WORKER's own maintenance tick (#2433):
         # how idle a pending row whose delivery lease has expired must be before
         # the lease-expiry pass may transfer it. Read from the worker's env by
@@ -219,6 +228,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the API reads the same enable switch. Neither reaches the sandbox.
         "CURIE_WORKSPACE_RECOVERY_ENABLED",
         "CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S",
+        # The worker's publication candidate switch and collector interval
+        # (#5428); the API reads the same enable switch. Neither reaches the
+        # sandbox.
+        "CURIE_PUBLICATION_CANDIDATES_ENABLED",
+        "CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S",
         # WorkspaceClaimCoordinator injects these exact-object handoff values
         # into a claim for the workspace-init container
         # to consume. They are substrate-local delivery inputs, not fields read
@@ -455,6 +469,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the runner's personal_auth policy from its own env. #5373 decides it is
         # not a BootEnv field; worker emission of a personal boot env is #5378.
         "CURIE_MODEL_AUTH_MODE",
+        # Worker service config (#5377): the namespace the trusted worker reads
+        # personal custody Secrets from. Never written into a boot env.
+        "CURIE_PERSONAL_GRANT_NAMESPACE",
         # CLI-owned profile directory. personal_auth points it at a fresh
         # runner-owned directory for a personal launch; it is never a boot key.
         "ANTHROPIC_CONFIG_DIR",

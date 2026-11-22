@@ -13,25 +13,35 @@ const PRODUCTION_ROOT = join(process.cwd(), "src");
 const EXPECTED_COMMAND_IDS = [
   "cluster.console.login",
   "cluster.deploy",
+  "cluster.factory-progress",
+  "cluster.memory",
   "cluster.observability.metrics",
   "cluster.observability.run",
   "cluster.observability.runs",
   "cluster.reset-thread",
   "cluster.status",
+  "cluster.subscription.disconnect",
+  "cluster.subscription.enroll",
+  "cluster.subscription.reconnect",
+  "cluster.subscription.replace",
+  "cluster.surfaces",
   "cluster.work-items",
   "init",
   "local.console.login",
   "local.deploy",
+  "local.factory-progress",
   "local.observability.metrics",
   "local.observability.run",
   "local.observability.runs",
   "local.reset-thread",
   "local.status",
+  "local.surfaces",
   "local.work-items",
 ] as const;
 const EXPECTED_NO_CLI_ACTION_IDS = [
   "behavior-packs-edit",
   "eval-matrix",
+  "github-account-link",
   "memory-delete",
   "memory-edit",
 ] as const satisfies readonly WiredActionId[];
@@ -308,6 +318,22 @@ describe("console/CLI parity registry (#280)", () => {
         `${discovered.location} must map ${discovered.id} to PARITY_TRACKING_ISSUE`,
       ).toBe(PARITY_TRACKING_ISSUE);
     }
+  });
+
+  it("maps every learned rule action to the cluster memory command", () => {
+    for (const id of ["memory-rules-list", "memory-rule-accept", "memory-rule-dismiss", "memory-rule-remove"]) {
+      const action = WIRED_ACTIONS.find((candidate) => candidate.id === id);
+      expect(action, `missing wired action: ${id}`).toBeDefined();
+      expect(action && "command" in action.mapping ? action.mapping.command : undefined).toBe("cluster.memory");
+    }
+  });
+
+  it("records organization sign-in as a console gap tracked by issue 5559", () => {
+    const action = WIRED_ACTIONS.find((candidate) => candidate.id === "console-oidc-sign-in");
+    expect(action?.label).toBe("Sign in with your organization");
+    expect(action && "noCliEquivalent" in action.mapping ? action.mapping.noCliEquivalent : undefined).toBe(
+      "https://github.com/curie-eng/curie/issues/5559",
+    );
   });
 
   it("removes the issue scoped unrendered registry entries", () => {

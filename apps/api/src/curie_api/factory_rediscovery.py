@@ -34,6 +34,7 @@ match is ignored everywhere. Any `ForgeError` propagates; callers defer on it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Sequence
@@ -44,6 +45,7 @@ from typing import Literal
 import httpx
 
 from .config import Settings
+from .forges.errors import ForgeError
 from .forges.hosts import code_host_for, forge_code_host
 from .forges.ports import CodeHost, Tracker
 from .forges.types import (
@@ -111,6 +113,27 @@ def publishing_code_host(
     return forge_code_host(settings, client, repository)
 
 
+class PassPublications:
+    """Share one complete publication read, or its failure, within a pass."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._listed: Sequence[FactoryPublication] | ForgeError | None = None
+
+    async def read(
+        self, code_host: CodeHost, repository: RepositoryRef
+    ) -> Sequence[FactoryPublication]:
+        async with self._lock:
+            if self._listed is None:
+                try:
+                    self._listed = await code_host.list_factory_publications(repository)
+                except ForgeError as error:
+                    self._listed = error
+            if isinstance(self._listed, ForgeError):
+                raise self._listed
+            return self._listed
+
+
 def _bounded(reference: str, body: str) -> bool:
     pattern = rf"(?<![\w/.-]){re.escape(reference)}(?![\w-])"
     return re.search(pattern, body) is not None
@@ -139,6 +162,7 @@ async def rediscover(
     *,
     event_at: datetime | None,
     exclude_branch: str | None = None,
+    publications: PassPublications | None = None,
 ) -> Rediscovery:
     """The verdict on ``issue``'s earlier publications in ``repository``.
 
@@ -146,7 +170,11 @@ async def rediscover(
     ``exclude_branch`` drops the caller's own publication branch.
     """
 
-    listed = await code_host.list_factory_publications(repository)
+    listed = (
+        await publications.read(code_host, repository)
+        if publications is not None
+        else await code_host.list_factory_publications(repository)
+    )
     references = await tracker.publication_references(issue, repository)
     marker = issue_marker(issue)
     every_match = [

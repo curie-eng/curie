@@ -171,5 +171,3 @@ def test_grid_partner_answers_require_the_trusted_workspace_and_action_scope(
         assert response.status_code == 200, response.text
         _, capsule = sealed_actor(case, "approved")
         assert capsule.actor_scope.namespace.model_dump() == trusted.model_dump()
-
-

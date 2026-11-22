@@ -52,6 +52,7 @@ from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 
 from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 # importlib import mode does not add the tests directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -2387,6 +2388,9 @@ def test_publication_create_stops_retrying_when_its_budget_is_spent() -> None:
 class _FactoryBinding:
     """A workspace-enabled deployment for a factory execute turn."""
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "acme-bot"
+
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
     ) -> HttpIdentityBinding | None:
@@ -2455,7 +2459,7 @@ class _FactoryWorkspace:
         return SimpleNamespace(repo_full_name="acme-corp/widgets", base_sha="a1" * 20)
 
 
-class _FactoryWorkItems:
+class _FactoryWorkItems(AbsentRequesterContext):
     """The WorkItems dispatch double: an acquired execution that records each call."""
 
     def __init__(self) -> None:
@@ -2482,7 +2486,11 @@ class _FactoryWorkItems:
             conversation_id=factory_conversation(wake),
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path="acme-corp/widgets",
+            execution_kind="implementation",
+            recovery_candidate_id=None,
             context=factory_context(uuid.UUID("11111111-1111-4111-8111-111111114180"), wake),
+            resource_gate=None,
+            predecessor_claim_name=None,
         )
 
     async def start(
@@ -2504,7 +2512,9 @@ class _FactoryWorkItems:
         self.calls.append("finish")
         self.finishes.append(kwargs)
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         return "acme widgets issue 123", f"wir.capability-for-{request_id}"
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]  # noqa: ANN204
@@ -3552,6 +3562,9 @@ class GrantBinding:
     mirroring the worker's real derivation from durable approval state.
     """
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "test-agent" if event_id == self.grant_event_id else None
+
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
     ) -> HttpIdentityBinding | None:
@@ -3980,6 +3993,9 @@ def _awaiting_routed_script(summary: str, route: str) -> list:
 
 class RoutedBinding:
     """A minimal binding stand-in: one channel -> one agent with route bindings."""
+
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "test-agent"
 
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
@@ -6113,6 +6129,9 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
 class _WorkspacelessBinding:
     """A deployment with repository workspaces off, as `curie cluster message`
     installs it: a deployment id (so selection runs) and no bound repository."""
+
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return None
 
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,

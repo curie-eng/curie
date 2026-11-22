@@ -19,6 +19,11 @@ def _context(ca_file: str) -> ssl.SSLContext:
     return context
 
 
+def gateway_ca_context(ca_file: str) -> ssl.SSLContext:
+    """A verifying context that also trusts the gateway's private CA file."""
+    return _context(ca_file)
+
+
 def gateway_verify() -> ssl.SSLContext | bool:
     ca_file = os.environ.get("CURIE_CHANNEL_GATEWAY_CA_FILE", "")
     return _context(ca_file) if ca_file else True

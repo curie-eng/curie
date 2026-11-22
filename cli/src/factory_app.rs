@@ -995,7 +995,7 @@ impl crate::ui::CliOutput for FactoryAppSetupOutput {
             self.slug, self.app_id
         ));
         let mention_note = if self.mention.inferred {
-            " (the App slug)"
+            " (factory default)"
         } else {
             ""
         };

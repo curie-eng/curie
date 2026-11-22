@@ -35,15 +35,15 @@ from curie_api.workitems import lifecycle
 
 from . import (
     factory_ci,
+    factory_ci_recovery,
     factory_label_reconcile,
     factory_notices,
-    factory_poll_intake,
+    factory_provider_gate,
     factory_review_feedback,
     factory_tracker_intake,
 )
 from .code_host_trust import code_host_verify
 from .config import Settings
-from .forges.registry import forges_registry
 from .models import ExecutionRequest, WorkItem
 from .workitem_dispatch import (
     claim_due,
@@ -148,6 +148,9 @@ class WorkItemReconciler:
         for name, step in (
             ("settle_publications", self._settle_publications),
             ("expire_waiting", self._expire_waiting),
+            # After expiry, so a passed deadline wins over a verified repair, and
+            # before the execute wakes, so a released request is woken this pass.
+            ("release_provider_gates", self._release_provider_gates),
             ("request_deadline_cancellations", self._request_deadline_cancellations),
             (
                 "request_owner_lost_cancellations",
@@ -157,7 +160,11 @@ class WorkItemReconciler:
             # worker was told to tear down before the settle pass.
             ("publish_terminate_wakes", self._publish_terminate_wakes),
             ("settle_overdue_cancellations", self._settle_overdue_cancellations),
+            # A question round an older API replica settled past during a
+            # rolling upgrade (#5785), before readmission and promotion.
+            ("redrive_question_rounds", self._redrive_question_rounds),
             ("readmit_pending", self._readmit_pending),
+            ("drain_answer_retries", self._drain_answer_retries),
             ("reconcile_missed_labels", self._reconcile_missed_labels),
             ("poll_trackers", self._poll_trackers),
             ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
@@ -229,6 +236,7 @@ class WorkItemReconciler:
                         ExecutionRequest.work_item_id,
                         ExecutionRequest.version,
                         ExecutionRequest.capacity_deferrals,
+                        ExecutionRequest.blocked_on,
                         WorkItem.version.label("work_item_version"),
                     )
                     .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
@@ -247,13 +255,72 @@ class WorkItemReconciler:
                     expected_work_item_version=row.work_item_version,
                     expected_request_version=row.version,
                 )
-            if isinstance(result, lifecycle.WorkItemOutcome):
+            if not isinstance(result, lifecycle.WorkItemOutcome):
+                continue
+            if row.blocked_on is not None:
+                logger.warning(
+                    "work item request %s expired waiting for retry condition %s",
+                    row.id,
+                    row.blocked_on,
+                )
+            else:
                 logger.warning(
                     "work item request %s expired waiting for sandbox admission "
                     "after %d capacity deferrals",
                     row.id,
                     row.capacity_deferrals,
                 )
+
+    async def _release_provider_gates(self) -> None:
+        """Lift each provider block a fresh ledger read verifies (#5426).
+
+        Each candidate is read and released in its own session and transaction;
+        the release repeats the ledger read under the WorkItem lock.
+        """
+
+        async with self._sessionmaker() as session:
+            found = await factory_provider_gate.candidates(
+                session, limit=self._settings.work_item_batch_limit
+            )
+            await session.rollback()
+        for candidate in found:
+            await self._release_provider_gate(candidate)
+
+    async def _release_provider_gate(self, candidate: factory_provider_gate.GateCandidate) -> None:
+        prefix = self._settings.worker_key_prefix
+        async with self._sessionmaker() as session:
+
+            async def recheck() -> bool:
+                now = await lifecycle.database_now(session)
+                return await factory_provider_gate.cleared(
+                    self._valkey, prefix, candidate.facts, now
+                )
+
+            # A read without locks first, so an unverified block opens no lock.
+            if not await recheck():
+                await session.rollback()
+                return
+            result = await lifecycle.release_retry_condition(
+                session,
+                work_item_id=candidate.work_item_id,
+                request_id=candidate.request_id,
+                expected_work_item_version=candidate.work_item_version,
+                expected_request_version=candidate.request_version,
+                recheck=recheck,
+            )
+        if result.released:
+            logger.info(
+                "work item request %s released from retry condition %s",
+                result.request_id,
+                result.condition,
+            )
+        else:
+            logger.info(
+                "work item request %s stays blocked on retry condition %s: %s",
+                result.request_id,
+                result.condition,
+                result.refusal,
+            )
 
     async def _request_deadline_cancellations(self) -> None:
         async with self._sessionmaker() as session:
@@ -368,6 +435,16 @@ class WorkItemReconciler:
                     settle_seconds,
                 )
 
+    async def _redrive_question_rounds(self) -> None:
+        async with self._sessionmaker() as session:
+            ids = await lifecycle.question_rounds_to_redrive(
+                session, limit=self._settings.work_item_batch_limit
+            )
+        for work_item_id in ids:
+            async with self._sessionmaker() as session:
+                await lifecycle.redrive_question_round(session, work_item_id=work_item_id)
+                await session.commit()
+
     async def _readmit_pending(self) -> None:
         async with self._sessionmaker() as session:
             ids = (
@@ -457,6 +534,8 @@ class WorkItemReconciler:
                             cause=settlement.cause,
                             expected_work_item_version=settlement.work_item_version,
                             expected_request_version=settlement.request_version,
+                            retry_safety=None,
+                            retry_condition=None,
                         )
                         continue
                     # No network call under the claim's row lock.
@@ -484,6 +563,14 @@ class WorkItemReconciler:
                 )
                 if result != "waiting":
                     self._ci_observed.pop(settlement.request_id, None)
+            if client is None:
+                client = httpx.AsyncClient(
+                    timeout=self._settings.github_app_timeout_seconds,
+                    verify=code_host_verify(self._settings),
+                )
+            await factory_ci_recovery.reconcile(
+                self._sessionmaker, self._valkey, self._settings, client
+            )
         finally:
             if client is not None:
                 await client.aclose()
@@ -532,6 +619,24 @@ class WorkItemReconciler:
         # Already-enqueued counts as published: the round has its turn.
         return True
 
+    async def _drain_answer_retries(self) -> None:
+        """Read again the answers a webhook deferred (#5787), on every tick.
+
+        Not gated on ``factory_reconcile_interval_s``: GitHub never redelivers
+        the deferral, so this is the only reader in webhook mode. Poll mode's
+        pass drains them itself.
+        """
+
+        settings = self._settings
+        if not settings.factory_enabled or settings.factory_intake == "poll":
+            return
+        async with httpx.AsyncClient(
+            timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+        ) as client:
+            await factory_label_reconcile.drain_webhook_answer_retries(
+                self._sessionmaker, settings, client
+            )
+
     async def _reconcile_missed_labels(self) -> None:
         """Admit labeled issues whose delivery GitHub never retried (#3081)."""
 
@@ -539,10 +644,8 @@ class WorkItemReconciler:
         if not settings.factory_enabled:
             return
         if settings.factory_intake == "poll":
-            tracker = forges_registry(settings).github_tracker()
-            interval = tracker.config.poll_interval_s if tracker is not None else 0.0
-        else:
-            interval = settings.factory_reconcile_interval_s
+            return
+        interval = settings.factory_reconcile_interval_s
         if interval <= 0:
             return
         clock = asyncio.get_running_loop().time()
@@ -552,12 +655,9 @@ class WorkItemReconciler:
         async with httpx.AsyncClient(
             timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
         ) as client:
-            if settings.factory_intake == "poll":
-                await factory_poll_intake.poll_once(self._sessionmaker, settings, client)
-            else:
-                await factory_label_reconcile.reconcile_missed_labels(
-                    self._sessionmaker, settings, client, now=datetime.now(UTC)
-                )
+            await factory_label_reconcile.reconcile_missed_labels(
+                self._sessionmaker, settings, client, now=datetime.now(UTC)
+            )
 
     async def _poll_trackers(self) -> None:
         """Poll every non-GitHub tracker binding through the ports (#4358 plan D1),
@@ -610,6 +710,10 @@ class WorkItemReconciler:
             owner=self._owner,
             paused_for_upgrade=paused_for_upgrade,
         )
+
+        from .factory_intake_notices import sync_intake_notices
+
+        await sync_intake_notices(self._sessionmaker, self._settings, owner=self._owner)
 
     async def _publish_execute_wakes(self) -> None:
         async with self._sessionmaker() as session:

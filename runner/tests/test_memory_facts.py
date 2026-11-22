@@ -837,6 +837,46 @@ def test_save_paragraph_limits_the_remember_call_to_what_the_guidance_allows() -
     assert tied, paragraph
 
 
+# #5801: a standing way of working goes to propose_rule, when it is mounted, so a
+# person accepts it before it applies; a plain fact still goes to memory.
+PROPOSE_RULE_PARAGRAPH = (
+    "When someone states how you should always work from now on and the propose_rule "
+    "tool is available, propose it as a standing rule with propose_rule instead of "
+    "saving it to memory with remember; a person must accept it before it applies. "
+    "A plain fact still goes to memory."
+)
+
+
+def test_default_guidance_sends_a_standing_rule_to_propose_rule() -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    paragraphs = DEFAULT_GUIDANCE.split("\n\n")
+    assert paragraphs.count(PROPOSE_RULE_PARAGRAPH) == 1, DEFAULT_GUIDANCE
+    at = paragraphs.index(PROPOSE_RULE_PARAGRAPH)
+    # After the paragraph that says when to remember, before the tool summary.
+    assert paragraphs[at - 1].startswith("Nothing is kept for later unless"), paragraphs
+    assert paragraphs[at + 1].startswith("Use remember for a new fact"), paragraphs
+
+
+def test_the_propose_rule_paragraph_keeps_the_save_paragraph_unique() -> None:
+    # The new paragraph says "standing rule", never "standing instruction", so the
+    # save paragraph stays the one paragraph that sends instructions to remember.
+    assert "standing instruction" not in PROPOSE_RULE_PARAGRAPH
+    assert "channel memory" in _save_paragraph().lower()
+
+
+def test_boot_guidance_carries_the_propose_rule_paragraph_when_tools_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _options, prompt = _boot_options(monkeypatch, tmp_path, FakeStateApi(), channel=True)
+    assert prompt is not None and PROPOSE_RULE_PARAGRAPH in prompt
+    # Control: with writes off the guidance, and the paragraph, are not shown.
+    _options, off = _boot_options(
+        monkeypatch, tmp_path / "off", FakeStateApi(), channel=True, writes=False
+    )
+    assert off is not None and PROPOSE_RULE_PARAGRAPH not in off
+
+
 # --------------------------------------------------------------------------- #
 # 3. The toolPolicy exemption set
 # --------------------------------------------------------------------------- #
@@ -862,6 +902,8 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
         APPROVAL_TOOL_NAME,
         ISSUE_TOOL_NAME,
         PROGRESS_TOOL_NAME,
+        PROPOSE_RULE_TOOL_NAME,
+        QUESTION_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         platform_tool_names,
     )
@@ -870,13 +912,16 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
     published = _published(options)
     expected = platform_tool_names(state_server_mounted=False, memory_tools_mounted=True)
     # The probe boots with no potential write tool, progress URL or issue reader,
-    # so approval, progress and issue tools are absent; the three memory tools are.
+    # so approval, progress, issue and question tools are
+    # absent, as is propose_rule; the three memory tools are.
     assert MEMORY_TOOLS <= published
     assert published == expected - {
         PROGRESS_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         APPROVAL_TOOL_NAME,
         ISSUE_TOOL_NAME,
+        QUESTION_TOOL_NAME,
+        PROPOSE_RULE_TOOL_NAME,
     }
 
 

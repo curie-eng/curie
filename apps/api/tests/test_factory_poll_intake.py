@@ -1,7 +1,7 @@
 """Polling is the default factory intake (#3745).
 
-These tests drive ``WorkItemReconciler.run_once``, ``Settings``, and
-``POST /github/webhook``. They do not call the poll helper. GitHub is an
+These tests drive ``poll_once``, ``WorkItemReconciler.run_once``, ``Settings``, and
+``POST /github/webhook``. GitHub is an
 in-process fixture. List and conditional reads follow:
 
 https://docs.github.com/en/rest/issues/issues#list-repository-issues
@@ -9,6 +9,8 @@ https://docs.github.com/en/rest/issues/events#list-issue-events
 https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository
 https://docs.github.com/en/rest/pulls/comments#list-review-comments-in-a-repository
 https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request
+https://docs.github.com/en/rest/pulls/reviews#get-a-review-for-a-pull-request
+https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
 https://docs.github.com/en/rest/git/refs#get-a-reference
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
 https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
@@ -28,6 +30,7 @@ import sys
 import threading
 import uuid
 from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +41,8 @@ import httpx
 import pytest
 import redis.asyncio as aioredis
 from curie_api.config import Settings, get_settings
+from curie_api.factory_poll_intake import poll_once
+from curie_api.github_review_events import FeedbackIgnored, label_actor
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest
 from curie_api.threadkeys import route_thread_key
@@ -54,6 +59,9 @@ from forge_fakes import jira as jira_fake  # noqa: E402
 from forge_fakes.github import (  # noqa: E402
     INSTALLATION_ID,
     LABEL,
+    LABEL_ACTOR_PERMISSIONS,
+    LABEL_ACTOR_REFUSAL_IDS,
+    LABEL_ACTOR_REFUSALS,
     MENTION,
     REPO,
     REPO_ID,
@@ -113,6 +121,12 @@ def _feedback_request_id(event: str, feedback_id: int) -> uuid.UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, event_id)
 
 
+def _review_request_id(pull: int, review_id: int) -> uuid.UUID:
+    """Every piece of one submitted review admits under its review (#5794)."""
+
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"curie-review:{REPO_ID}:{pull}:{review_id}")
+
+
 def _body_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
 
@@ -143,7 +157,9 @@ class PollGitHub:
     failures: dict[str, int] = field(default_factory=dict)
     permission_failures: set[int] = field(default_factory=set)
     failed_permissions: list[int] = field(default_factory=list)
-    _permission_issue: int | None = None
+    _permission_issue: ContextVar[int | None] = field(
+        default_factory=lambda: ContextVar("permission_issue", default=None)
+    )
     issues: dict[int, _PlantedIssue] = field(default_factory=dict)
     comments: dict[int, dict[str, Any]] = field(default_factory=dict)
     review_comments: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -151,6 +167,10 @@ class PollGitHub:
     pulls: dict[int, dict[str, Any]] = field(default_factory=dict)
     listed_pulls: set[int] = field(default_factory=set)
     permission: str = "write"
+    role_name: str = "write"
+    label_actor: Any = field(default_factory=_user)
+    label_app: Any = None
+    permission_user_id: int = SENDER_ID
     default_branch: str = "main"
     branches: dict[str, str] = field(default_factory=lambda: {"main": _MAIN_SHA, "next": _NEXT_SHA})
     _comment_ids: Iterator[int] = field(default_factory=lambda: itertools.count(880000))
@@ -224,8 +244,20 @@ class PollGitHub:
         self.comments[comment_id] = comment
         return comment
 
-    def add_review_comment(self, pr: int, comment_id: int, body: str) -> dict[str, Any]:
+    def add_review_comment(
+        self, pr: int, comment_id: int, body: str, *, review_id: int | None = None
+    ) -> dict[str, Any]:
+        """An inline comment of submitted review ``review_id``.
+
+        GitHub creates every inline comment inside a review, which the reviews
+        listing then shows; an unknown review is submitted as COMMENTED with
+        no text of its own, as a single inline comment is.
+        """
+
         stamp = _iso(datetime.now(UTC))
+        review = review_id if review_id is not None else comment_id + 500000
+        if review not in self.reviews:
+            self.add_review(pr, review, "", state="COMMENTED")
         comment = {
             "id": comment_id,
             "body": body,
@@ -237,23 +269,26 @@ class PollGitHub:
             "commit_id": HEAD,
             "path": "src/acme/helper.py",
             "line": 12,
-            "pull_request_review_id": comment_id + 500000,
+            "pull_request_review_id": review,
             "html_url": f"https://github.com/{REPO}/pull/{pr}#discussion_r{comment_id}",
             "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/{pr}",
         }
         self.review_comments[comment_id] = comment
         return comment
 
-    def add_review(self, pr: int, review_id: int, body: str) -> dict[str, Any]:
+    def add_review(
+        self, pr: int, review_id: int, body: str, *, state: str = "CHANGES_REQUESTED"
+    ) -> dict[str, Any]:
         review = {
             "id": review_id,
             "pr": pr,
             "body": body,
             "user": _user(),
             "commit_id": HEAD,
-            "state": "CHANGES_REQUESTED",
+            "state": state,
             "submitted_at": _iso(datetime.now(UTC)),
             "html_url": f"https://github.com/{REPO}/pull/{pr}#pullrequestreview-{review_id}",
+            "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/{pr}",
             "author_association": "MEMBER",
             "performed_via_github_app": None,
         }
@@ -312,8 +347,8 @@ class PollGitHub:
                 "id": issue.event_id,
                 "event": "labeled",
                 "label": {"name": issue.label},
-                "actor": human,
-                "performed_via_github_app": None,
+                "actor": self.label_actor,
+                "performed_via_github_app": self.label_app,
                 "created_at": _iso(issue.labeled_at),
             }
         ]
@@ -467,10 +502,24 @@ class PollGitHub:
                     if review.get("pr") == pr
                 ]
                 return self._page(request, "reviews", owned)
-            review_id = int(review_tail.strip("/"))
+            review_text, _, comments_tail = review_tail.strip("/").partition("/")
+            review_id = int(review_text)
             review = self.reviews.get(review_id)
             if review is None or review.get("pr") != pr:
                 return httpx.Response(404, json={"message": "missing fixture"})
+            if comments_tail == "comments":
+                # https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
+                listed = sorted(
+                    (
+                        comment
+                        for comment in self.review_comments.values()
+                        if comment.get("pull_request_review_id") == review_id
+                    ),
+                    key=lambda comment: comment["id"],
+                )
+                size = int(request.url.params.get("per_page", "30"))
+                page = int(request.url.params.get("page", "1"))
+                return httpx.Response(200, json=listed[(page - 1) * size : page * size])
             return httpx.Response(200, json=_public_review(review))
         if path.startswith(f"{root}/pulls/"):
             tail = path.rsplit("/", 1)[1]
@@ -501,7 +550,7 @@ class PollGitHub:
             issue = self.issues.get(number)
             if issue is None:
                 return httpx.Response(404, json={"message": "missing fixture"})
-            self._permission_issue = number
+            self._permission_issue.set(number)
             body = self._issue_body(issue)
             etag = f'"{hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()}"'
             if request.headers.get("if-none-match") == etag:
@@ -509,14 +558,19 @@ class PollGitHub:
                 return httpx.Response(304, headers={"ETag": etag})
             return httpx.Response(200, json=body, headers={"ETag": etag})
         if path == f"{root}/collaborators/{SENDER}/permission":
-            number, self._permission_issue = self._permission_issue, None
+            number = self._permission_issue.get()
+            self._permission_issue.set(None)
             if number in self.permission_failures:
                 assert number is not None
                 self.failed_permissions.append(number)
                 return httpx.Response(500, json={"message": "Permission unavailable"})
             return httpx.Response(
                 200,
-                json={"permission": self.permission, "user": {"id": SENDER_ID, "login": SENDER}},
+                json={
+                    "permission": self.permission,
+                    "role_name": self.role_name,
+                    "user": {"id": self.permission_user_id, "login": SENDER},
+                },
             )
         return httpx.Response(404, json={"message": "missing fixture"})
 
@@ -616,6 +670,9 @@ async def _run_once_async(github: PollGitHub) -> None:
     maker = async_sessionmaker(engine, expire_on_commit=False)
     client = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
     try:
+        if get_settings().factory_intake == "poll":
+            async with httpx.AsyncClient() as http:
+                await poll_once(maker, get_settings(), http)
         await WorkItemReconciler(maker, client, get_settings()).run_once()
     finally:
         await client.aclose()
@@ -883,7 +940,13 @@ def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_aft
     )
     assert admitted["base_resolved_request_id"] is None
     assert not any("/git/ref/heads/" in request.url.path for request in github.calls)
-    assert github.comments == {}
+    [status] = _rows(
+        "SELECT comment_id, posted_at FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )
+    assert status["posted_at"] is not None
+    assert set(github.comments) == {status["comment_id"]}
 
     refused = _acquire(client, request_id)
 
@@ -894,9 +957,10 @@ def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_aft
     assert refusal["start_deferrals"] == 0
     assert refusal["last_deferral_reason"].startswith("base_")
     comments = list(github.comments.values())
-    assert len(comments) == 1
-    assert "<!-- curie-factory-base-refusal -->" in comments[0]["body"]
-    assert reason in comments[0]["body"]
+    assert len(comments) == 2
+    [base_refusal] = [comment for comment in comments if comment["id"] != status["comment_id"]]
+    assert "<!-- curie-factory-base-refusal -->" in base_refusal["body"]
+    assert reason in base_refusal["body"]
 
     github._etags["issues"] = f'"retry-refusal-{number}"'
     _run_once(github)
@@ -917,7 +981,7 @@ def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_aft
                 and request.url.path == f"/repos/{REPO}/issues/{number}/comments"
             ]
         )
-        == 1
+        == 2
     )
 
     github.issues[number].base_labels = ()
@@ -992,6 +1056,12 @@ def test_poll_uses_current_labels_at_claim_and_replaces_only_a_pinned_selection(
                 "claim_name": "claim-poll-intake",
                 "sandbox_name": "sandbox-poll-intake",
                 "context": acquired.json()["context"],
+                "delivered_limits": {
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             },
         )
         assert started.status_code == 200, started.text
@@ -1017,6 +1087,7 @@ def test_poll_uses_current_labels_at_claim_and_replaces_only_a_pinned_selection(
             headers=headers,
             json={
                 "runtime_epoch": teardown.json()["runtime_epoch"],
+                "expected_request_version": teardown.json()["request_version"],
                 "observation": "runtime stopped",
             },
         )
@@ -1104,9 +1175,7 @@ def test_poll_defers_one_unreadable_issue_and_continues_other_intake(
     assert cancelled[0]["cancelled_at"] is not None
     assert cancelled[0]["terminal_cause"] == "issue_cancelled"
     assert _mention_request_id(comment_id) in {row["id"] for row in _requests(mentioned)}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in _requests(reviewed)
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in _requests(reviewed)}
     del github.failures[path]
     github.close_issue(unavailable)
 
@@ -1198,9 +1267,7 @@ def test_poll_retries_permission_failure_after_events_and_continues_other_intake
     mentioned_rows = _requests(mentioned)
     reviewed_rows = _requests(reviewed)
     assert _mention_request_id(comment_id) in {row["id"] for row in mentioned_rows}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in reviewed_rows
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in reviewed_rows}
     github.permission_failures.remove(unavailable)
 
     _run_once(github)
@@ -1275,9 +1342,7 @@ def test_poll_prunes_persisted_etags_for_cancelled_issues_and_closed_lineages(
     healthy_rows = _requests(healthy)
     assert len(healthy_rows) == 3
     assert _mention_request_id(comment_id) in {row["id"] for row in healthy_rows}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in healthy_rows
-    }
+    assert _review_request_id(healthy_pull, review_id) in {row["id"] for row in healthy_rows}
 
 
 def test_stale_issue_conditional_read_still_cancels_after_an_issue_changes(
@@ -1365,6 +1430,151 @@ def _stored_labels(number: int) -> list[str | None]:
     return [row["trigger_label"] for row in rows]
 
 
+def test_poll_admits_the_app_slug_once_and_refuses_status_and_lookalike_comments(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    """``poll_once`` admits ``@<slug>`` and ``@<slug>[bot]`` through ``_admit_mentions``.
+
+    The same comment on the next pass is not a second request. A factory status
+    comment that carries the ask line, and a login that only starts with the
+    slug, are not admitted.
+    """
+
+    from curie_api.factory_comment_text import marker_for
+    from forge_fakes.github import APP_SLUG
+
+    client, github = poll_factory
+    number, _row = _admit_label(client, github)
+    slug_id, bot_id, status_id, lookalike_id = 73201, 73202, 73203, 73204
+    github.add_issue_comment(number, slug_id, f"@{APP_SLUG} please revise the helper")
+    github.add_issue_comment(number, bot_id, f"@{APP_SLUG}[bot] please revise the helper")
+    github.add_issue_comment(
+        number,
+        status_id,
+        (
+            f"Status: QUEUED\n{marker_for(uuid.uuid4())}\n"
+            f"Ask the factory: mention @{APP_SLUG} on this pull request."
+        ),
+    )
+    github.add_issue_comment(number, lookalike_id, f"@{APP_SLUG}-x please revise the helper")
+
+    _run_once(github)
+
+    ids = [row["id"] for row in _requests(number)]
+    assert _mention_request_id(slug_id) in ids
+    assert _mention_request_id(bot_id) in ids
+    assert _mention_request_id(status_id) not in ids
+    assert _mention_request_id(lookalike_id) not in ids
+    assert len(ids) == 3
+    assert ids.count(_mention_request_id(slug_id)) == 1
+
+    # The stored ETag would answer 304 and skip the comments. A new ETag makes
+    # the second poll return 200. The cursor's inclusive ``since`` is the newest
+    # comment, so these four keep that timestamp and are listed again.
+    newest = max(comment["updated_at"] for comment in github.comments.values())
+    for comment_id in (slug_id, bot_id, status_id, lookalike_id):
+        github.comments[comment_id]["created_at"] = newest
+        github.comments[comment_id]["updated_at"] = newest
+    github._etags["issue-comments"] = '"slug-comments-redelivered"'
+    statuses: list[int] = []
+    pages: list[list[dict[str, Any]]] = []
+    original = github._page
+
+    def _page(request: httpx.Request, family: str, items: list[Any]) -> httpx.Response:
+        response = original(request, family, items)
+        if family == "issue-comments":
+            statuses.append(response.status_code)
+            if response.status_code == 200:
+                pages.append(response.json())
+        return response
+
+    github._page = _page  # type: ignore[method-assign]
+    _run_once(github)
+
+    assert statuses == [200]
+    redelivered = {item["id"] for page in pages for item in page}
+    assert {slug_id, bot_id, status_id, lookalike_id} <= redelivered
+    assert [row["id"] for row in _requests(number)] == ids
+
+
+def test_tracker_poll_admits_the_app_slug_once_and_refuses_status_and_lookalike_comments() -> None:
+    """``GitHubTracker.poll_marked`` is the other poll, at ``_mention_notice``."""
+
+    from curie_api.factory_comment_text import marker_for
+    from curie_api.forges.github.comments import static_token
+    from curie_api.forges.github.tracker import GitHubTracker
+    from curie_api.forges.types import Disposition
+    from forge_fakes.github import APP_SLUG, REPO, REPO_ID
+
+    slug = APP_SLUG
+    comments = [
+        _poll_comment(73211, 12, f"@{slug} please revise the helper"),
+        _poll_comment(73212, 12, f"@{slug}[bot] please revise the helper"),
+        _poll_comment(
+            73213,
+            12,
+            (
+                f"Status: QUEUED\n{marker_for(uuid.uuid4())}\n"
+                f"Ask the factory: mention @{slug} on this pull request."
+            ),
+        ),
+        _poll_comment(73214, 12, f"@{slug}-x please revise the helper"),
+    ]
+
+    async def own_login() -> str:
+        return f"{slug}[bot]"
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/issues/events"):
+            return httpx.Response(200, json=[])
+        if path.endswith("/issues/comments"):
+            listed = sorted(comments, key=lambda item: int(item["id"]), reverse=True)
+            return httpx.Response(200, json=listed)
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    async def poll() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            tracker = GitHubTracker(
+                client,
+                api="https://api.github.com",
+                html_base="https://github.com",
+                repo_full_name=REPO,
+                repository_id=REPO_ID,
+                token=static_token("fixture-installation-token"),
+                label=LABEL,
+                mention=MENTION,
+                app_id="51",
+                own_login=own_login,
+                page_size=10,
+            )
+            first = await tracker.poll_marked(None, running=(), answering=())
+            admitted = [
+                notice for notice in first.notices if notice.disposition is Disposition.MENTION
+            ]
+            assert {int(notice.event_id) for notice in admitted} == {73211, 73212}
+            again = await tracker.poll_marked(first.cursor, running=(), answering=())
+            repeated = [
+                notice for notice in again.notices if notice.disposition is Disposition.MENTION
+            ]
+            assert repeated == []
+
+    asyncio.run(poll())
+
+
+def _poll_comment(comment_id: int, number: int, body: str) -> dict[str, Any]:
+    return {
+        "id": comment_id,
+        "body": body,
+        "user": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+        "created_at": "2026-11-16T12:00:00Z",
+        "updated_at": "2026-11-16T12:00:00Z",
+        "performed_via_github_app": None,
+        "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
+        "issue_url": f"https://api.github.com/repos/{REPO}/issues/{number}",
+    }
+
+
 def test_poll_admits_a_mention_once(poll_factory: tuple[TestClient, PollGitHub]) -> None:
     client, github = poll_factory
     number, _row = _admit_label(client, github)
@@ -1384,6 +1594,128 @@ def test_poll_admits_a_mention_once(poll_factory: tuple[TestClient, PollGitHub])
     _run_once(github)
 
     assert [row["id"] for row in _requests(number)] == [row["id"] for row in rows]
+
+
+@pytest.mark.parametrize("intake", ["poll", "webhook"])
+@pytest.mark.parametrize("plain_request", [False, True], ids=["quoted-marker", "request-on-pr"])
+def test_facts_marker_on_owned_pull_does_not_hide_feedback(
+    poll_factory: tuple[TestClient, PollGitHub], intake: str, plain_request: bool
+) -> None:
+    from curie_api.factory_facts_schema import REQUEST_MARKER
+    from test_factory_facts import request_body
+
+    client, github = poll_factory
+    number, first = _admit_label(client, github)
+    pull = github.plant_pull()
+    _own_pull_request(first["work_item_id"], pull)
+    _complete(client, first["id"])
+    body = (
+        request_body(
+            {"schema_version": 1, "trigger_label": LABEL, "executables": [], "services": []},
+            f"@{MENTION}",
+        )
+        if plain_request
+        else f"@{MENTION} please preserve this quoted marker: `{REQUEST_MARKER}`"
+    )
+    comment_id = 731510 + pull
+    github.add_issue_comment(pull, comment_id, body)
+    if intake == "poll":
+        _run_once(github)
+    else:
+        payload = _comment_event(pull, body, comment_id)
+        payload["issue"]["pull_request"] = {}
+        payload["comment"] = github.comments[comment_id]
+        response = _post(client, "issue_comment", payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] != "ignored"
+    assert _feedback_request_id("issue_comment", comment_id) in {
+        row["id"] for row in _requests(number)
+    }
+    assert _rows("SELECT * FROM curie.factory_facts_requests") == []
+
+
+@pytest.mark.parametrize("status", [404, 410, 503])
+def test_owed_facts_failure_does_not_block_mentions_reviews_or_cursor(
+    poll_factory: tuple[TestClient, PollGitHub], status: int
+) -> None:
+    client, github = poll_factory
+    mentioned, _ = _admit_label(client, github)
+    reviewed, first = _admit_label(client, github)
+    pull = github.plant_pull()
+    _own_pull_request(first["work_item_id"], pull)
+    _complete(client, first["id"])
+    _execute(
+        "INSERT INTO curie.factory_facts_requests "
+        "(tracker_host,repository_id,issue_number,trigger_label,"
+        "request_comment_id,digest,actor_id,state) "
+        "VALUES ('github.com',:repo,900999,:label,79999999,:digest,:actor,'owed')",
+        {
+            "repo": str(REPO_ID),
+            "label": LABEL,
+            "digest": "sha256:" + "a" * 64,
+            "actor": str(SENDER_ID),
+        },
+    )
+    github.failures[f"/repos/{REPO}/issues/900999/comments"] = status
+    mention_id, review_id = 731520 + pull, 731530 + pull
+    github.add_issue_comment(mentioned, mention_id, f"@{MENTION} please revise the helper")
+    github.add_issue_comment(pull, review_id, f"@{MENTION} please address this review")
+    github._etags["issue-comments"] = '"owed-failure-other-comments"'
+    _run_once(github)
+    assert _mention_request_id(mention_id) in {row["id"] for row in _requests(mentioned)}
+    assert _feedback_request_id("issue_comment", review_id) in {
+        row["id"] for row in _requests(reviewed)
+    }
+    [cursor] = _rows("SELECT comments_since,etags FROM curie.factory_poll_cursors")
+    assert cursor["comments_since"] is not None
+    assert cursor["etags"]["issue-comments"] == github._etags["issue-comments"]
+    owed = _rows("SELECT * FROM curie.factory_facts_requests")
+    assert len(owed) == (1 if status == 503 else 0)
+
+
+def test_failed_facts_observation_advances_applied_comments_and_retries_by_id(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    from test_factory_facts import request_body
+
+    client, github = poll_factory
+    mentioned, _ = _admit_label(client, github)
+    reviewed, first = _admit_label(client, github)
+    pull = github.plant_pull()
+    _own_pull_request(first["work_item_id"], pull)
+    _complete(client, first["id"])
+    failed = github.plant_issue(label="other-label")
+    github.permission_failures.add(failed)
+    github.add_issue_comment(
+        failed,
+        73154,
+        request_body(
+            {
+                "schema_version": 1,
+                "trigger_label": LABEL,
+                "executables": [],
+                "services": [],
+            }
+        ),
+    )
+    github.add_issue_comment(mentioned, 73155, f"@{MENTION} please revise the helper")
+    github.add_issue_comment(pull, 73156, f"@{MENTION} please address this review")
+    github._etags["issue-comments"] = '"mixed-facts-and-feedback"'
+    _run_once(github)
+    before = [_requests(mentioned), _requests(reviewed)]
+    assert len(before[0]) == len(before[1]) == 2
+    [cursor] = _rows("SELECT comments_since,etags FROM curie.factory_poll_cursors")
+    assert cursor["comments_since"] is not None
+    assert cursor["etags"]["issue-comments"] == github._etags["issue-comments"]
+    assert cursor["etags"]["facts-retry:73154"] == "pending"
+    assert _rows("SELECT * FROM curie.factory_facts_requests") == []
+    github.permission_failures.clear()
+    _run_once(github)
+    assert [_requests(mentioned), _requests(reviewed)] == before
+    [record] = _rows("SELECT state FROM curie.factory_facts_requests")
+    assert record["state"] == "answered"
+    pages = [r for r in github.calls if r.url.path.endswith("/issues/comments")]
+    assert pages[-1].headers["if-none-match"] == github._etags["issue-comments"]
 
 
 def test_poll_admits_review_feedback_once(
@@ -1406,8 +1738,9 @@ def test_poll_admits_review_feedback_once(
     rows = _requests(number)
     assert len(rows) == 3
     found = {row["id"] for row in rows}
-    assert _feedback_request_id("pull_request_review_comment", comment_id) in found
-    assert _feedback_request_id("pull_request_review", review_id) in found
+    # The inline comment's own review and the separate review: one request each.
+    assert _review_request_id(pull, comment_id + 500000) in found
+    assert _review_request_id(pull, review_id) in found
     assert _requests(pull) == []
 
     _run_once(github)
@@ -1606,9 +1939,7 @@ def test_webhook_of_a_polled_review_stays_one_request(
     review_id = 74111
     review = github.add_review(pull, review_id, f"@{MENTION} please rename the helper")
     _run_once(github)
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in _requests(number)
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in _requests(number)}
     count = len(_requests(number))
     before = _delivery_ids()
     payload = {
@@ -1839,3 +2170,176 @@ def test_configured_webhook_secret_accepts_a_valid_signature(
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "ignored"
+
+
+# Attribution shapes and provider references are shared with label_actor tests
+# in test_github_factory_ingress.py, including the observed #5510 and #4485 events.
+@pytest.mark.parametrize("app", [None, {"id": 52}])
+def test_label_actor_admission(
+    poll_factory: tuple[TestClient, PollGitHub], app: dict[str, Any] | None
+) -> None:
+    _client, github = poll_factory
+    github.label_app = app
+    number = github.plant_issue()
+    _run_once(github)
+    _run_once(github)
+    assert [r["requester"] for r in _requests(number)] == [f"github:{SENDER_ID}:{SENDER}"]
+
+
+@pytest.mark.parametrize("permission", LABEL_ACTOR_PERMISSIONS)
+def test_label_actor_permission(
+    poll_factory: tuple[TestClient, PollGitHub], permission: str
+) -> None:
+    _client, github = poll_factory
+    github.label_app = {"id": 52}
+    github.permission = "write" if permission == "maintain" else permission
+    github.role_name = permission
+    number = github.plant_issue()
+    _run_once(github)
+    assert len(_requests(number)) == int(permission in {"write", "maintain", "admin"})
+
+
+def test_label_actor_permission_retry(poll_factory: tuple[TestClient, PollGitHub]) -> None:
+    _client, github = poll_factory
+    github.label_app = {"id": 52}
+    number = github.plant_issue()
+    github.permission_failures.add(number)
+    _run_once(github)
+    assert _requests(number) == []
+    github.permission_failures.clear()
+    _run_once(github)
+    assert len(_requests(number)) == 1
+
+
+@pytest.mark.parametrize("actor,app,reason", LABEL_ACTOR_REFUSALS, ids=LABEL_ACTOR_REFUSAL_IDS)
+def test_label_actor_own_app_bot_or_unverifiable(
+    poll_factory: tuple[TestClient, PollGitHub],
+    actor: Any,
+    app: Any,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="curie_api.factory_poll_intake")
+    _client, github = poll_factory
+    github.label_actor, github.label_app = actor, app
+    number = github.plant_issue()
+    _run_once(github)
+    assert _requests(number) == []
+    assert (REPO, number, reason) in [
+        record.args for record in caplog.records if record.name == "curie_api.factory_poll_intake"
+    ]
+    github.label_actor, github.label_app = _user(), {"id": 52}
+    # A new observation with a usable person must still make progress.
+    github._etags["issues"] = '"reapplied"'
+    github.issues[number].event_id += 1
+    _run_once(github)
+    assert len(_requests(number)) == 1
+
+
+def test_label_actor_permission_identity_mismatch(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    _client, github = poll_factory
+    github.label_app, github.permission_user_id = {"id": 52}, SENDER_ID + 1
+    number = github.plant_issue()
+    _run_once(github)
+    assert _requests(number) == []
+    github.permission_user_id = SENDER_ID
+    github._etags["issues"] = '"permission-fixed"'
+    github.issues[number].event_id += 1
+    _run_once(github)
+    assert len(_requests(number)) == 1
+
+
+def test_label_actor_reader_preserves_app_review_refusal(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    client, github = poll_factory
+    number, first = _admit_label(client, github)
+    pull = github.plant_pull()
+    _own_pull_request(first["work_item_id"], pull)
+    _complete(client, first["id"])
+    comment = github.add_issue_comment(pull, 73991, f"@{MENTION} revise this")
+    comment["performed_via_github_app"] = {"id": 52}
+    _run_once(github)
+    assert len(_requests(number)) == 1
+    github.add_issue_comment(pull, 73992, f"@{MENTION} revise this")
+    github._etags["issue-comments"] = '"human-comment"'
+    _run_once(github)
+    assert len(_requests(number)) == 2
+
+
+@pytest.mark.parametrize("via", ["invalid", [], {}, {"id": "52"}, {"id": True}, {"id": 52.0}])
+def test_label_actor_reader_refuses_malformed_app(via: Any) -> None:
+    with pytest.raises(FeedbackIgnored) as refused:
+        label_actor({"actor": _user(), "performed_via_github_app": via}, app_id="51")
+    assert refused.value.code == "actor_unverifiable"
+
+
+@pytest.mark.parametrize("via", [None, {"id": 52}])
+def test_label_actor_reader_accepts_direct_or_other_app(via: Any) -> None:
+    assert label_actor({"actor": _user(), "performed_via_github_app": via}, app_id="51") == (
+        SENDER_ID,
+        SENDER,
+    )
+
+
+@pytest.mark.parametrize("write_status", [201, 403, 503])
+def test_cadence_status_answer_terminal_refusal_and_transient_retry(
+    poll_factory: tuple[TestClient, PollGitHub],
+    monkeypatch: pytest.MonkeyPatch,
+    write_status: int,
+) -> None:
+    from curie_api.factory_poll_intake import Cadence, IntakeClock
+
+    _client, github = poll_factory
+    number = github.plant_issue()
+    original = PollGitHub.handle
+
+    def handle(self: PollGitHub, request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "POST"
+            and request.url.path == f"/repos/{REPO}/issues/{number}/comments"
+            and write_status != 201
+        ):
+            return httpx.Response(write_status, json={"message": "Fixture write failure"})
+        return original(self, request)
+
+    monkeypatch.setattr(PollGitHub, "handle", handle)
+
+    async def observe() -> list[tuple[dict[str, Any], dict[str, float]]]:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        now = 10.0
+
+        async def wait(delay: float) -> None:
+            raise AssertionError("poll_once must not wait for its timer")
+
+        cadence = Cadence(IntakeClock(lambda: now, wait), 45, last_clean={REPO: 0.0})
+        snapshots = []
+        try:
+            async with httpx.AsyncClient() as http:
+                for instant in (10.0, 80.0):
+                    now = instant
+                    await poll_once(maker, get_settings(), http, cadence=cadence)
+                    async with maker() as session:
+                        etags = await session.scalar(
+                            text("SELECT etags FROM curie.factory_poll_cursors")
+                        )
+                    snapshots.append((dict(etags), dict(cadence.last_clean)))
+        finally:
+            await engine.dispose()
+        return snapshots
+
+    first, second = asyncio.run(observe())
+    [status] = _rows("SELECT posted_at,refused_at FROM curie.factory_terminal_notices")
+    assert (status["posted_at"] is not None) == (write_status == 201)
+    assert (status["refused_at"] is not None) == (write_status == 403)
+    for (etags, last_clean), instant in zip((first, second), (10.0, 80.0), strict=True):
+        if write_status == 503:
+            assert f"issues:{LABEL}" not in etags
+            assert last_clean[REPO] == 0.0
+        else:
+            assert etags[f"issues:{LABEL}"] == github._etags["issues"]
+            assert last_clean[REPO] == instant
+    assert len(_requests(number)) == 1

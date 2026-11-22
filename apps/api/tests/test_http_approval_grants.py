@@ -396,5 +396,3 @@ def test_expired_resume_cannot_authorize_its_stored_effect(resolved_case: Simple
     check = resume_check(case, token, payload)
     assert_response(post_check(case.client, check), check,
                     decision="continue", reason="current_authority")
-
-

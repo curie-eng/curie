@@ -34,8 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api import factory_notices
 from curie_api.config import get_settings
-from curie_api.factory_comment_text import marker_for
-from curie_api.factory_notices import FINAL_MARKER, result_section, sync_status_comments
+from curie_api.factory_comment_text import github_ask_line, marker_for
+from curie_api.factory_notices import (
+    FINAL_MARKER,
+    github_status_mention,
+    result_section,
+    sync_status_comments,
+)
 from curie_api.forges.types import (
     MarkedComment,
     PullRequest,
@@ -44,10 +49,14 @@ from curie_api.forges.types import (
     UpsertResult,
 )
 from curie_api.github_app import GitHubAppError
+from curie_api.github_review_truth import VerifiedRepository
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
 from forge_fakes import factory_wake
 from forge_fakes.github import (
+    INSTALLATION_ID,
     LABEL,
+    MENTION,
+    REPO_ID,
     _issue_event,
     _post,
     fake_installation_tokens,
@@ -76,6 +85,7 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     REVISION_REPLY_VALUES,
     _attach_publication,
     _attach_revision_publication,
+    _finish_unpublished,
     _insert_revision,
     _notices,
     _patches,
@@ -144,7 +154,12 @@ def _execute(statement: str, params: dict[str, Any]) -> None:
 def _finish_failed(
     client: Any, request_id: uuid.UUID, epoch: int, cause: str, detail: str | None = None
 ) -> None:
-    body: dict[str, Any] = {"runtime_epoch": epoch, "outcome": "failed", "cause": cause}
+    body: dict[str, Any] = {
+        "runtime_epoch": epoch,
+        "outcome": "failed",
+        "cause": cause,
+        "retry_safety": "uncertain",
+    }
     if detail is not None:
         body["detail"] = detail
     finished = client.post(
@@ -655,6 +670,7 @@ def _observe_termination(client: Any, request_id: uuid.UUID) -> None:
         headers=WORKER,
         json={
             "runtime_epoch": claimed.json()["runtime_epoch"],
+            "expected_request_version": claimed.json()["request_version"],
             "observation": "runtime stopped",
         },
     )
@@ -678,7 +694,7 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert WAITING in body
     assert FINAL_MARKER not in body
     assert "![Curie status]" not in body
-    assert body.rstrip().endswith(marker_for(request_id))
+    _assert_one_current_ask_line(body)
     assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # Human and admission labels are never touched.
     assert {LABEL, "bug"} <= sink.issue_labels[number]
@@ -739,7 +755,138 @@ def test_a_card_url_replaces_the_checklist_as_phases_advance(
     assert "- [" not in body
     assert "Read issue" not in body
     assert WAITING not in body
-    assert body.rstrip().endswith(marker_for(request_id))
+    assert marker_for(request_id) in body
+    _assert_one_current_ask_line(body)
+
+
+def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9929
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+
+    body = _posts(sink)[0][1] or ""
+    ask = github_ask_line(MENTION)
+    assert "Status: QUEUED" in body
+    assert WAITING in body
+    assert marker_for(request_id) in body
+    _assert_one_current_ask_line(body)
+    assert body.count(ask) == 1
+
+
+def _assert_one_current_ask_line(body: str) -> None:
+    """Exactly one ask line, the current text, one blank line after the body text.
+
+    Anything after it is a platform annotation line; none may be an ask line.
+    """
+
+    lines = body.rstrip("\n").splitlines()
+    asks = [i for i, line in enumerate(lines) if line.startswith("Ask the factory:")]
+    assert len(asks) == 1, body
+    at = asks[0]
+    assert lines[at] == github_ask_line(MENTION)
+    assert lines[at - 1] == "" and lines[at - 2].strip()
+    assert f"mention @{MENTION} on this pull request" not in body
+
+
+def test_status_comment_replaces_the_previous_ask_wording(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 9930)
+    _reconcile()
+    body = _posts(sink)[0][1] or ""
+    old = f"Ask the factory: mention @{MENTION} on this pull request."
+    seeded = body.replace(github_ask_line(MENTION), old)
+    assert old in seeded and github_ask_line(MENTION) not in seeded
+
+    # The real writer's last step, applied to a body carrying the old wording.
+    rewritten = factory_notices.append_github_ask_line(seeded, MENTION)
+
+    assert old not in rewritten
+    assert marker_for(request_id) in rewritten
+    _assert_one_current_ask_line(rewritten)
+
+
+def test_non_github_status_comments_omit_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
+    assert admitted
+    settings = get_settings()
+    for kind in ("gitlab", "bitbucket_cloud", "bitbucket_dc", "jira_cloud"):
+        assert github_status_mention(settings, kind) is None
+    assert github_status_mention(settings, "github") == MENTION
+
+
+class _RecordedComments:
+    """The port the status sync posts through, keeping each rendered body."""
+
+    def __init__(self) -> None:
+        self.bodies: list[str] = []
+
+    async def upsert_marked(self, target: Any, marker: str, body: str) -> UpsertResult:
+        self.bodies.append(body)
+        return UpsertResult(MarkedComment("1", target, body), written=True)
+
+
+class _RecordingTracker:
+    def __init__(self, posted: _RecordedComments) -> None:
+        self.marked_comments = posted
+        self.capabilities: dict[Any, Any] = {}
+
+    async def set_state_label(self, issue: Any, *, add: str | None, remove: Any) -> None:
+        return None
+
+
+def _retarget_tracker(work_item_id: uuid.UUID, kind: str) -> None:
+    """Point one admitted work item at another tracker kind.
+
+    The identity trigger guards ``tracker_kind``, so it is off for this write,
+    the same way a row an earlier admission stored is rewritten in tests.
+    """
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text("SET LOCAL session_replication_role = replica"))
+                await connection.execute(
+                    text("UPDATE curie.work_items SET tracker_kind = :kind WHERE id = :id"),
+                    {"kind": kind, "id": work_item_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["gitlab", "bitbucket_cloud", "bitbucket_dc"])
+def test_gitlab_and_bitbucket_status_comments_omit_the_ask_line(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """The reconciler renders the comment, then the port posts that body."""
+
+    client, github, sink = admitted
+    number = {"gitlab": 9941, "bitbucket_cloud": 9942, "bitbucket_dc": 9943}[kind]
+    request_id = _admit(client, github, sink, number)
+    _retarget_tracker(_request(number)["work_item_id"], kind)
+    posted = _RecordedComments()
+    monkeypatch.setattr(
+        factory_notices,
+        "tracker_for_work_item",
+        lambda *_args, **_kwargs: _RecordingTracker(posted),
+    )
+    monkeypatch.setattr(
+        factory_notices, "code_host_for_repository", lambda *_args, **_kwargs: object()
+    )
+
+    _reconcile()
+
+    assert len(posted.bodies) == 1
+    body = posted.bodies[0]
+    assert "Status: QUEUED" in body
+    assert WAITING in body
+    assert marker_for(request_id) in body
+    assert "Ask the factory" not in body
+    assert github_ask_line(MENTION) not in body
 
 
 # --- 2: edited in place as phases advance --------------------------------------------
@@ -1007,7 +1154,7 @@ def _link_through_jira(
     issue = jira.seed_issue("Ticket")
     linked: list[uuid.UUID] = []
 
-    async def sync_one(client: Any, settings: Any, claim: Any) -> int:
+    async def sync_one(client: Any, settings: Any, claim: Any, _verified_repository: Any) -> int:
         if claim.row.finalized_at is not None:
             return 0
         async with jira_client(jira) as http:
@@ -1237,10 +1384,12 @@ def _lose_owner(client: Any, request_id: uuid.UUID) -> None:
 
 
 RETRIED = (
-    "the worker running this request stopped responding. Curie started the work "
-    "again as a new run (attempt {attempt} of 3)."
+    "the worker running this request stopped responding. Curie observed the sandbox "
+    "teardown and admitted automatic retry {slot} of 2 as a new run. Work the lost run "
+    "already did is not ruled out."
 )
-EXHAUSTED = "the worker running this request stopped responding 3 times."
+LOST = "the worker running this request stopped responding."
+EXHAUSTED = "2 of 2 automatic retries used."
 
 
 def test_a_retried_owner_lost_hands_the_label_to_the_successor(
@@ -1265,10 +1414,11 @@ def test_a_retried_owner_lost_hands_the_label_to_the_successor(
     (lost,) = _marked(sink, lost_id)
     body = lost["body"]
     assert "Status: RETRYING" in body
-    assert f"Retrying: {RETRIED.format(attempt=2)}" in body
+    assert f"Retrying: {RETRIED.format(slot=1)}" in body
+    assert "Scheduled: the automatic retry starts at or after " in body
     assert "Could not complete:" not in body
     assert "NEEDS HUMAN" not in body
-    assert EXHAUSTED not in body
+    assert "automatic retries used" not in body
     assert "Cause: owner_lost" in body
     assert FINAL_MARKER in body
     (successor,) = _marked(sink, successor_id)
@@ -1279,22 +1429,22 @@ def test_a_retried_owner_lost_hands_the_label_to_the_successor(
 
 
 def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F811
-    """ADR 0206: two losses are retried; the third needs a human."""
+    """ADR 0206 and ADR 0269: two losses spend both retries; the third needs a human."""
 
     client, github, sink = admitted
     number = 9932
     current = _admit(client, github, sink, number)
     _reconcile()
     lost: list[uuid.UUID] = []
-    for attempt in (2, 3):
+    for slot in (1, 2):
         _lose_owner(client, current)
         lost.append(current)
         requests = _issue_requests(number)
-        assert len(requests) == attempt, requests
+        assert len(requests) == slot + 1, requests
         (comment,) = _marked(sink, current)
         body = comment["body"]
         assert "Status: RETRYING" in body
-        assert f"Retrying: {RETRIED.format(attempt=attempt)}" in body
+        assert f"Retrying: {RETRIED.format(slot=slot)}" in body
         assert "Could not complete:" not in body
         assert "NEEDS HUMAN" not in body
         assert "Cause: owner_lost" in body
@@ -1307,18 +1457,19 @@ def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F8
     assert [(r["status"], r["terminal_cause"]) for r in requests] == [("failed", "owner_lost")] * 3
     (comment,) = _marked(sink, current)
     body = comment["body"]
-    assert f"Could not complete: {EXHAUSTED}" in body
-    assert "Curie started the work again" not in body
+    assert f"Could not complete: {LOST}\n{EXHAUSTED}\n" in body
+    assert body.count("automatic retries used") == 1
+    assert "Retrying:" not in body
     assert "Cause: owner_lost" in body
     assert "Status: NEEDS HUMAN" in body
     assert "Status: FAILED" not in body
     assert FINAL_MARKER in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     # The earlier comments keep their retry text once the third loss lands.
-    for attempt, request_id in zip((2, 3), lost, strict=True):
+    for slot, request_id in zip((1, 2), lost, strict=True):
         (earlier,) = _marked(sink, request_id)
         assert "Status: RETRYING" in earlier["body"]
-        assert f"Retrying: {RETRIED.format(attempt=attempt)}" in earlier["body"]
+        assert f"Retrying: {RETRIED.format(slot=slot)}" in earlier["body"]
         assert "Could not complete:" not in earlier["body"]
         assert "NEEDS HUMAN" not in earlier["body"]
         assert "Cause: owner_lost" in earlier["body"]
@@ -1789,6 +1940,10 @@ def test_later_request_status_comments_continue_on_the_existing_pr_until_termina
     assert running_comment["id"] == comment_id
     assert "Status: RUNNING" in running_comment["body"]
     assert continuation in running_comment["body"]
+    # A follow-up on an existing pull request cannot ask questions (#5785), so
+    # it leads with the continuation and never claims to be investigating.
+    assert running_comment["body"].startswith(continuation)
+    assert "Investigating this ticket." not in running_comment["body"]
     assert FINAL_MARKER not in running_comment["body"]
     assert _rows(
         "SELECT status FROM curie.execution_requests WHERE id = :id", {"id": successor}
@@ -2049,3 +2204,692 @@ def test_a_request_without_an_admission_row_still_gets_exactly_one_comment(
 
 def test_declaration_fixture_matches_nine_phases() -> None:
     assert len(DECLARATION["phases"]) == 9
+
+
+def _failed_pr_status(
+    fixture: Any, *, number: int = 55830, pr: int = 77
+) -> tuple[Any, Any, Any, uuid.UUID]:
+    client, github, sink = fixture
+    request_id = _admit(client, github, sink, number)
+    epoch = _start_running(client, request_id)
+    _attach_publication(_request(number)["work_item_id"], status="succeeded", pr=pr)
+    _finish_failed(client, request_id, epoch, "runner_escalated", "The fixture cannot be repaired.")
+    _reconcile()
+    assert _notices(request_id)[0]["finalized_at"] is not None
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    return client, github, sink, request_id
+
+
+def _observe_lineage_state(client: Any, work_item_id: uuid.UUID, state: str) -> None:
+    from curie_api.forges.types import PullRequestState
+    from curie_api.lineage_reconciler import LineageReconciler
+    from curie_api.models import ThreadPublicationLineage, WorkItem
+
+    async def go() -> None:
+        maker = client.app.state.sessionmaker
+        async with maker() as session:
+            item = await session.get(WorkItem, work_item_id)
+            assert item is not None
+            lineage = await session.get(ThreadPublicationLineage, item.publication_lineage_id)
+            assert lineage is not None
+            branch, base_ref, url, head = (
+                lineage.branch,
+                lineage.base_ref,
+                lineage.pr_url,
+                lineage.head_sha,
+            )
+
+        class Host:
+            async def read_pull_request(self, ref: PullRequestRef) -> PullRequest:
+                return PullRequest(
+                    ref=ref,
+                    head_sha=head,
+                    head_ref=branch,
+                    base_ref=base_ref,
+                    state=PullRequestState(state),
+                    url=url,
+                )
+
+        reconciler = LineageReconciler(
+            maker, get_settings(), lambda _repository: Host(), interval_seconds=60
+        )
+        await reconciler.run_once()
+
+    client.portal.call(go)
+
+
+@pytest.mark.parametrize("state", ["open", "merged", "closed"])
+def test_lineage_state_refreshes_failed_comment_and_label_idempotently(
+    admitted: Any,  # noqa: F811
+    state: str,
+) -> None:
+    client, _github, sink, request_id = _failed_pr_status(admitted)
+    before = _notices(request_id)[0]
+    request = _request(55830)
+    sink.requests.clear()
+
+    _observe_lineage_state(client, request["work_item_id"], state)
+    _reconcile()
+
+    suffix = "closed without merging" if state == "closed" else state
+    (comment,) = _marked(sink, request_id)
+    assert f"Pull request: https://github.com/{REPO}/pull/77 ({suffix})" in comment["body"]
+    assert "Cause: runner_escalated" in comment["body"]
+    assert "The fixture cannot be repaired." in comment["body"]
+    assert _notices(request_id)[0]["comment_id"] == before["comment_id"]
+    assert len(_patches(sink)) == (0 if state == "open" else 1)
+    assert _posts(sink) == []
+    assert _curie_labels(sink, 55830) == (
+        set() if state == "merged" else {"curie-factory:needs-human"}
+    )
+    assert not any(method == "POST" for method, _, _ in _label_writes(sink))
+    assert _request(55830) == request
+    assert _notices(request_id)[0]["finalized_at"] is not None
+
+    sink.requests.clear()
+    _observe_lineage_state(client, request["work_item_id"], state)
+    _reconcile()
+    _reconcile()
+    assert _writes(sink) == []
+
+
+def test_lineage_state_invalidation_during_stale_sync_is_not_lost(admitted: Any) -> None:  # noqa: F811
+    client, _github, sink, request_id = _failed_pr_status(admitted)
+    work_item_id = _request(55830)["work_item_id"]
+
+    async def go() -> None:
+        async with client.app.state.sessionmaker() as session:
+            await factory_notices.mark_status_comment_stale(session, work_item_id)
+            await session.execute(
+                text(
+                    "UPDATE curie.factory_terminal_notices SET subject_title = NULL "
+                    "WHERE execution_request_id = :id"
+                ),
+                {"id": request_id},
+            )
+            await session.commit()
+        async with _blocked_status_sync(client, sink, 55830) as (_sync, released):
+            await asyncio.to_thread(_observe_lineage_state, client, work_item_id, "merged")
+            released.set()
+        async with client.app.state.sessionmaker() as session:
+            assert (
+                await session.scalar(
+                    text(
+                        "SELECT finalized_at FROM curie.factory_terminal_notices "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"id": request_id},
+                )
+                is None
+            )
+
+    client.portal.call(go)
+    _reconcile()
+    assert "(merged)" in _marked(sink, request_id)[0]["body"]
+    assert _curie_labels(sink, 55830) == set()
+    assert _notices(request_id)[0]["finalized_at"] is not None
+    sink.requests.clear()
+    _reconcile()
+    assert _writes(sink) == []
+
+
+def test_lineage_state_newer_active_request_keeps_its_status(admitted: Any) -> None:  # noqa: F811
+    client, _github, sink, first = _failed_pr_status(admitted)
+    work_item_id = _request(55830)["work_item_id"]
+    second = _second_request(client, work_item_id, 55830, "Repair the checks")
+    _reconcile()
+    assert _curie_labels(sink, 55830) == {"curie-factory:running"}
+    prior_body = _marked(sink, second)[0]["body"]
+    sink.requests.clear()
+
+    _observe_lineage_state(client, work_item_id, "merged")
+    _reconcile()
+
+    assert _curie_labels(sink, 55830) == {"curie-factory:running"}
+    assert _marked(sink, second)[0]["body"] == prior_body
+    assert _notices(first)[0]["finalized_at"] is not None
+    assert _writes(sink) == []
+
+
+@pytest.mark.parametrize("terminal", ["cancelled", "expired"])
+def test_lineage_state_preserves_cancellation_and_expiry(
+    admitted: Any,  # noqa: F811
+    terminal: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import curie_api.workitems.lifecycle as lifecycle
+    from test_factory_terminus import _observe_termination
+
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 55832)
+    _start_running(client, request_id)
+    work_item_id = _request(55832)["work_item_id"]
+    _attach_publication(work_item_id, status="succeeded", pr=77)
+    if terminal == "cancelled":
+        github.labels = []
+        removed = _post(client, "issues", _issue_event("unlabeled", 55832, label={"name": LABEL}))
+        assert removed.json()["status"] == "factory_cancellation_requested"
+    else:
+        original = lifecycle.database_now
+
+        async def later(session: AsyncSession) -> Any:
+            return await original(session) + timedelta(seconds=1900)
+
+        with monkeypatch.context() as clock:
+            clock.setattr(lifecycle, "database_now", later)
+            client.portal.call(
+                client.app.state.work_item_reconciler._request_deadline_cancellations
+            )
+    _observe_termination(client, request_id)
+    _reconcile()
+    assert _request(55832)["status"] == terminal
+    cause = "issue_cancelled" if terminal == "cancelled" else "execution_deadline"
+    before = _marked(sink, request_id)[0]["body"]
+    assert f"Cause: {cause}" in before
+    assert "Pull request:" in before and "(open)" in before
+    sink.requests.clear()
+
+    _observe_lineage_state(client, work_item_id, "merged")
+    _reconcile()
+
+    after = _marked(sink, request_id)[0]["body"]
+    assert f"Cause: {cause}" in after
+    assert before.splitlines()[0] == after.splitlines()[0]
+    assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in after
+    assert _curie_labels(sink, 55832) == set()
+    assert len(_patches(sink)) == 1
+
+
+@pytest.mark.parametrize("writer", ["link", "publication"])
+def test_lineage_state_late_adoption_refreshes_a_finalized_failure(
+    admitted: Any,  # noqa: F811
+    writer: str,
+) -> None:
+    from curie_api.crud import lineages
+    from curie_api.models import Publication, ThreadPublicationLineage
+    from curie_api.workitems import lifecycle as workitems
+    from sqlalchemy import select
+
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 55833)
+    epoch = _start_running(client, request_id)
+    work_item_id = _request(55833)["work_item_id"]
+    _attach_publication(work_item_id, status="succeeded", pr=77, bind_lineage=False)
+    lineage_id = _rows(
+        "SELECT lineage_id FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["lineage_id"]
+    _finish_failed(client, request_id, epoch, "runner_escalated")
+    _reconcile()
+    assert "Pull request:" not in _marked(sink, request_id)[0]["body"]
+    before = _notices(request_id)[0]
+    request = _request(55833)
+
+    async def link() -> None:
+        async with client.app.state.sessionmaker() as session:
+            if writer == "publication":
+                publication = await session.scalar(
+                    select(Publication).where(Publication.execution_request_id == request_id)
+                )
+                lineage = await session.get(ThreadPublicationLineage, lineage_id)
+                assert publication is not None and lineage is not None
+                await lineages._bind_running_work_item_lineage(
+                    session, publication=publication, lineage=lineage
+                )
+                await session.commit()
+                return
+            result = await workitems.link_publication_lineage(
+                session,
+                work_item_id=work_item_id,
+                request_id=request_id,
+                publication_lineage_id=lineage_id,
+                expected_work_item_version=request["work_version"],
+                expected_request_version=request["version"],
+            )
+            assert isinstance(result, workitems.WorkItemOutcome), result
+
+    client.portal.call(link)
+    assert _notices(request_id)[0]["finalized_at"] is None
+    sink.requests.clear()
+    _reconcile()
+    body = _marked(sink, request_id)[0]["body"]
+    assert f"Pull request: https://github.com/{REPO}/pull/77 (open)" in body
+    assert _notices(request_id)[0]["comment_id"] == before["comment_id"]
+    assert len(_patches(sink)) == 1
+    assert _curie_labels(sink, 55833) == {"curie-factory:needs-human"}
+
+
+def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
+    admitted: Any,  # noqa: F811
+) -> None:
+    from curie_api.lineage_reconciler import LineageReconciler
+
+    client, _github, sink, request_id = _failed_pr_status(admitted)
+    item_id = _request(55830)["work_item_id"]
+    lineage_id = _rows(
+        "SELECT publication_lineage_id FROM curie.work_items WHERE id = :id",
+        {"id": item_id},
+    )[0]["publication_lineage_id"]
+
+    async def stale() -> None:
+        maker = client.app.state.sessionmaker
+        reconciler = LineageReconciler(
+            maker,
+            get_settings(),
+            lambda _repository: pytest.fail("a stale record must not read the provider"),
+            interval_seconds=60,
+        )
+        (pending,) = await reconciler._batch()
+        async with maker() as session:
+            await session.execute(
+                text(
+                    "UPDATE curie.thread_publication_lineages SET version = version + 1 "
+                    "WHERE id = :id"
+                ),
+                {"id": lineage_id},
+            )
+            await session.commit()
+        assert not await reconciler._record(pending, "merged")
+
+    client.portal.call(stale)
+    assert _notices(request_id)[0]["finalized_at"] is not None
+    client, _github, sink, _other = _failed_pr_status(admitted, number=55834, pr=78)
+    sink.requests.clear()
+    _observe_lineage_state(client, _request(55834)["work_item_id"], "merged")
+    assert _notices(request_id)[0]["finalized_at"] is not None
+    _reconcile()
+    assert all(
+        path != f"/repos/{REPO}/issues/comments/{_notices(request_id)[0]['comment_id']}"
+        for path, _ in _patches(sink)
+    )
+    assert _curie_labels(sink, 55830) == {"curie-factory:needs-human"}
+
+
+@pytest.mark.parametrize("terminal", ["failed", "expired", "completed"])
+def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotently(
+    admitted: Any, terminal: str, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    import hashlib
+
+    import curie_api.workitems.lifecycle as lifecycle
+    from test_factory_terminus import _observe_termination
+
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 55835)
+    epoch = _start_running(client, request_id)
+    work_item_id = _request(55835)["work_item_id"]
+    _attach_publication(work_item_id, status="succeeded", pr=77)
+    if terminal == "failed":
+        _finish_failed(client, request_id, epoch, "runner_escalated")
+    elif terminal == "completed":
+        pass  # the succeeded publication above completes it on the next pass
+    else:
+        original = lifecycle.database_now
+
+        async def later(session: AsyncSession) -> Any:
+            return await original(session) + timedelta(seconds=1900)
+
+        with monkeypatch.context() as clock:
+            clock.setattr(lifecycle, "database_now", later)
+            client.portal.call(
+                client.app.state.work_item_reconciler._request_deadline_cancellations
+            )
+        _observe_termination(client, request_id)
+    _reconcile()
+    request = _request(55835)
+    assert request["status"] == terminal
+    before = _notices(request_id)[0]
+    assert before["finalized_at"] is not None
+    (comment,) = _marked(sink, request_id)
+    # The stored comment is the pre-merge text: no pull request state line.
+    comment["body"] = "\n".join(
+        line
+        for line in comment["body"].split("\n")
+        if not line.startswith(("Pull request:", "Pull request merged:"))
+    )
+    _execute(
+        "UPDATE curie.factory_terminal_notices SET rendered_digest = :digest "
+        "WHERE execution_request_id = :id",
+        {"digest": hashlib.sha256(comment["body"].encode()).hexdigest(), "id": request_id},
+    )
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = 'merged', version = version + 1 "
+        "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)",
+        {"id": work_item_id},
+    )
+    # No stale mark ran: only the fallback selection can reopen this notice.
+    assert _curie_labels(sink, 55835) == {
+        "curie-factory:pr-open" if terminal == "completed" else "curie-factory:needs-human"
+    }
+    sink.requests.clear()
+
+    _reconcile()
+
+    (updated,) = _marked(sink, request_id)
+    assert updated["id"] == comment["id"]
+    if terminal == "completed":
+        assert updated["body"].split("\n\n")[0].rstrip("\n").splitlines()[-1] == (
+            f"Pull request merged: https://github.com/{REPO}/pull/77"
+        )
+    else:
+        assert f"Cause: {request['terminal_cause']}" in updated["body"]
+        assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in updated["body"]
+    assert len(_patches(sink)) == 1
+    assert _posts(sink) == []
+    assert _curie_labels(sink, 55835) == set()
+    assert not any(method == "POST" for method, _, _ in _label_writes(sink))
+    assert _request(55835) == request
+    assert _notices(request_id)[0]["finalized_at"] is not None
+    sink.requests.clear()
+    _reconcile()
+    assert _writes(sink) == []
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotently(
+    admitted: Any,  # noqa: F811
+    state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, github, _sink = admitted
+    jira = JiraFake()
+    ticket = jira.seed_issue("Ticket")
+    linked: list[uuid.UUID] = []
+
+    async def sync_one(http: Any, settings: Any, claim: Any, _verified_repository: Any) -> int:
+        async with jira_client(jira) as jira_http:
+            tracker = jira_tracker(jira, client=jira_http)
+            code_host = _JiraLinkPorts(tracker, claim.row.execution_request_id, linked)
+            with monkeypatch.context() as adapters:
+                adapters.setattr(
+                    factory_notices, "tracker_for_work_item", lambda *_a, **_k: tracker
+                )
+                adapters.setattr(
+                    factory_notices, "code_host_for_repository", lambda *_a, **_k: code_host
+                )
+                issue = jira.ref(ticket)
+                return await factory_notices._sync_through_ports(
+                    http,
+                    settings,
+                    replace(claim, tracker_issue=issue, target=replace(claim.target, issue=issue)),
+                )
+
+    monkeypatch.setattr(factory_notices, "_sync_one", sync_one)
+    request_id = _admit(client, github, _sink, 55836)
+    _start_running(client, request_id)
+    work_item_id = _request(55836)["work_item_id"]
+    _reconcile()
+    assert _notices(request_id)[0]["finalized_at"] is None
+    _reconcile()
+    assert _notices(request_id)[0]["finalized_at"] is None
+    _attach_publication(work_item_id, status="succeeded", pr=77)
+    _reconcile()
+    before = _notices(request_id)[0]
+    assert _request(55836)["status"] == "completed"
+    assert before["finalized_at"] is not None
+    assert before["applied_label"] == "curie-factory:pr-open"
+    digest = _rows(
+        "SELECT rendered_digest FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["rendered_digest"]
+    writes = jira.writes
+
+    _observe_lineage_state(client, work_item_id, state)
+    assert _notices(request_id)[0]["finalized_at"] is None
+    _reconcile()
+
+    after = _notices(request_id)[0]
+    assert after["finalized_at"] is not None
+    redigest = _rows(
+        "SELECT rendered_digest FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["rendered_digest"]
+    assert (redigest != digest) == (state == "merged")
+    assert after["comment_id"] == before["comment_id"]
+    assert len(jira.issue(ticket.id).remote_links) == 1
+    if state == "merged":
+        # A merged pull request ends the factory's label; the body gained its
+        # merge line, so the edit is a real write (one-ticket ADR decision 15).
+        assert "curie-factory:pr-open" not in jira.issue(ticket.id).labels
+        assert jira.writes > writes
+        writes = jira.writes
+    else:
+        assert jira.writes == writes
+        assert "curie-factory:pr-open" in jira.issue(ticket.id).labels
+    _reconcile()
+    repeated = _notices(request_id)[0]
+    assert repeated["attempts"] == after["attempts"]
+    assert repeated["finalized_at"] == after["finalized_at"]
+    assert jira.writes == writes
+
+
+# --- An implementation request's label after its WorkItem is cancelled ---------------
+
+
+def _end(request_id: uuid.UUID, status: str, cause: str) -> None:
+    """The request's terminal transition, in the shape the lifecycle writes it."""
+
+    observed = status in {"expired", "cancelled"}
+    _execute(
+        "UPDATE curie.execution_requests SET status = :status, "
+        "terminal_at = clock_timestamp(), terminal_cause = :cause, "
+        "termination_observation = CASE WHEN :observed "
+        "THEN 'fixture runtime termination observed' END WHERE id = :id",
+        {"id": request_id, "status": status, "cause": cause, "observed": observed},
+    )
+
+
+def _remove_trigger_label(client: Any, github: Any, number: int) -> None:
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.status_code == 200, removed.text
+
+
+def test_a_cancelled_work_item_keeps_an_implementation_completed_label(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 58610
+    request_id = _admit(client, github, sink, number)
+    _start_running(client, request_id)
+    _end(request_id, "completed", "completed")
+    _reconcile()
+    assert _curie_labels(sink, number) == {"curie-factory:pr-open"}
+
+    _remove_trigger_label(client, github, number)
+    _reconcile()
+    assert _request(number)["status"] == "completed"
+    assert _curie_labels(sink, number) == {"curie-factory:pr-open"}
+    assert _notices(request_id)[0]["applied_label"] == "curie-factory:pr-open"
+
+
+@pytest.mark.parametrize("mismatch", ["api", "installation", "repository_id", "repository_path"])
+def test_poll_status_credential_is_scoped_to_verified_repository(
+    admitted: Any,  # noqa: F811
+    mismatch: str,
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 55850)
+    proof = VerifiedRepository(
+        get_settings().github_api_url.rstrip("/"),
+        "fixture-installation-token",
+        INSTALLATION_ID,
+        {"id": REPO_ID, "full_name": REPO},
+    )
+    if mismatch == "api":
+        proof = replace(proof, api="https://api.example.com")
+    elif mismatch == "installation":
+        proof = replace(proof, installation_id=INSTALLATION_ID + 1)
+    elif mismatch == "repository_id":
+        proof = replace(proof, repository={"id": REPO_ID + 1, "full_name": REPO})
+    else:
+        proof = replace(proof, repository={"id": REPO_ID, "full_name": "acme-corp/another-bot"})
+
+    async def go() -> None:
+        assert (
+            await sync_status_comments(
+                client.app.state.sessionmaker,
+                get_settings(),
+                owner="poll-status-proof",
+                limit=1,
+                request_ids={request_id},
+                verified_repository=proof,
+            )
+            == 0
+        )
+        assert sink.requests == []
+        assert (
+            await sync_status_comments(
+                client.app.state.sessionmaker,
+                get_settings(),
+                owner="status-retry",
+                limit=1,
+                request_ids={request_id},
+            )
+            > 0
+        )
+
+    client.portal.call(go)
+    assert len(_posts(sink)) == 1
+    assert _notices(request_id)[0]["attempts"] == 2
+
+
+# --- #5728: a question on a factory pull request -----------------------------
+
+_NINE_STEPS = (
+    "Read issue",
+    "Pin acceptance criteria",
+    "Plan",
+    "Plan review",
+    "Failing test",
+    "Implement",
+    "Review diff",
+    "Publish PR",
+    "Wait for CI",
+)
+_READING = "Reading the pull request and its Decisions"
+
+
+def _checklist_lines(body: str) -> list[str]:
+    return [line for line in body.splitlines() if line.startswith("- [")]
+
+
+def _running_revision(client: Any, github: Any, sink: Any, fragment: str) -> tuple[int, uuid.UUID]:
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
+    revision = _insert_revision(
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, fragment),
+        _revision_reply(pr, fragment),
+    )
+    _start_running(client, revision)
+    _execute(
+        "INSERT INTO curie.factory_terminal_notices (execution_request_id, work_item_id) "
+        "VALUES (:request, :item)",
+        {"request": revision, "item": first["work_item_id"]},
+    )
+    return number, revision
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    ["issuecomment-5728", "discussion_r5728"],
+    ids=["pull_request", "review_thread"],
+)
+def test_a_running_pull_request_follow_up_hides_the_checklist_until_a_later_phase(
+    admitted: Any,  # noqa: F811
+    fragment: str,
+) -> None:
+    """#5728 AC2: the nine steps stay hidden through read_issue and preflight."""
+
+    client, github, sink = admitted
+    _number, revision = _running_revision(client, github, sink, fragment)
+
+    _reconcile()
+    (comment,) = _marked(sink, revision)
+    assert _READING in comment["body"]
+    assert "Status: RUNNING" in comment["body"]
+    assert _checklist_lines(comment["body"]) == []
+
+    assert report(client, revision, "read_issue").status_code == 201
+    _execute(
+        "INSERT INTO curie.execution_request_phase_reports (execution_request_id, phase) "
+        "VALUES (:id, 'verification_preflight')",
+        {"id": revision},
+    )
+    sink.requests.clear()
+    _reconcile()
+    (comment,) = _marked(sink, revision)
+    assert _READING in comment["body"]
+    assert "Status: RUNNING" in comment["body"]
+    assert _checklist_lines(comment["body"]) == []
+    for label in _NINE_STEPS:
+        assert label not in comment["body"]
+
+    assert report(client, revision, "plan", round=1).status_code == 201
+    sink.requests.clear()
+    _reconcile()
+    (comment,) = _marked(sink, revision)
+    assert _READING not in comment["body"]
+    assert "Status: RUNNING" in comment["body"]
+    checklist = _checklist_lines(comment["body"])
+    assert checklist
+    for label in _NINE_STEPS:
+        assert any(label in line for line in checklist)
+
+
+def test_an_issue_run_still_shows_the_checklist_at_read_issue(admitted: Any) -> None:  # noqa: F811
+    """A tracker-issue run is not a pull request follow-up, so its checklist stays."""
+
+    client, github, sink = admitted
+    number = 57281
+    request_id = _admit(client, github, sink, number)
+    _start_running(client, request_id)
+    assert report(client, request_id, "read_issue").status_code == 201
+    _reconcile()
+    (comment,) = _marked(sink, request_id)
+    assert _READING not in comment["body"]
+    assert "Status: RUNNING" in comment["body"]
+    checklist = _checklist_lines(comment["body"])
+    for label in _NINE_STEPS:
+        assert any(label in line for line in checklist)
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    ["issuecomment-5729", "discussion_r5729"],
+    ids=["pull_request", "review_thread"],
+)
+def test_an_unchanged_follow_up_is_answered_without_a_checklist(
+    admitted: Any,  # noqa: F811
+    fragment: str,
+) -> None:
+    """#5728 AC1: the final pill is ANSWERED and the request row stays completed."""
+
+    client, github, sink = admitted
+    _number, revision = _running_revision(client, github, sink, fragment)
+    assert report(client, revision, "plan", round=1).status_code == 201
+    detail = "No changes needed: Decisions entry 2 already records this approach."
+    finished = _finish_unpublished(client, revision, cause="no_pull_request", detail=detail)
+    assert finished.status_code == 200, finished.text
+    sink.requests.clear()
+    _reconcile()
+
+    (comment,) = _marked(sink, revision)
+    body = comment["body"]
+    assert "Status: ANSWERED" in body
+    assert "Status: SUCCEEDED" not in body
+    assert detail in body
+    assert "Agent's last message:" in body
+    assert _checklist_lines(body) == []
+    for label in _NINE_STEPS:
+        assert label not in body
+    row = _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": revision},
+    )[0]
+    assert row == {"status": "completed", "terminal_cause": "completed"}

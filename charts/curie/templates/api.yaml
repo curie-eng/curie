@@ -248,6 +248,13 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+            {{- $personalGrantNamespace := dig "personalClaude" "grantNamespace" "" (.Values | toYaml | fromYaml) }}
+            {{- if $personalGrantNamespace }}
+            # Personal Claude enrollment custody namespace (#5377). Rendered
+            # only when set; the RBAC lives in personal-grant-custody-rbac.yaml.
+            - name: CURIE_PERSONAL_GRANT_NAMESPACE
+              value: {{ $personalGrantNamespace | quote }}
+            {{- end }}
             # The action executor switch (ACTION-EXECUTOR-1). The worker
             # renders the same value from the same helper; the two must never
             # differ.
@@ -267,6 +274,17 @@ spec:
               value: {{ include "curie.workspaceRecoveryMaxBytes" . | quote }}
             - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
               value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            {{- end }}
+            - name: CURIE_PUBLICATION_CANDIDATES_ENABLED
+              value: {{ include "curie.publicationCandidatesEnabled" . | quote }}
+            {{- if eq (include "curie.publicationCandidatesEnabled" .) "true" }}
+            {{- /* Publication candidates (#5428). Recovery may already render the archive limit. */}}
+            - name: CURIE_PUBLICATION_CANDIDATE_MAX_BYTES
+              value: {{ include "curie.publicationCandidateMaxBytes" . | quote }}
+            {{- if ne (include "curie.workspaceRecoveryEnabled" .) "true" }}
+            - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
+              value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            {{- end }}
             {{- end }}
             # The automated remediation switch (AUTOMATED-REMEDIATION-1). The
             # worker renders the same value from the same helper, which fails
@@ -311,6 +329,11 @@ spec:
             # connector object holds the password as a literal.
             - name: CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME
               value: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) | quote }}
+            # Operator-named connector ServiceAccounts, rendered into the
+            # matching connector's pod template. The API refuses to boot on a
+            # list it cannot render from; values.schema.json refuses the same.
+            - name: CURIE_CONNECTOR_SERVICE_ACCOUNTS
+              value: {{ .Values.connectorServiceAccounts | default list | toJson | quote }}
             {{- $e2e := .Values.e2eConnector }}
             {{- if and $e2e.enabled (or (not $e2e.ownerLabel.value) (not $e2e.serviceAccount) (not $e2e.serviceAccountNamespace) (not $e2e.workerClusterRole)) }}
             {{- fail "e2eConnector.enabled requires ownerLabel.value, serviceAccount, serviceAccountNamespace, and workerClusterRole" }}
@@ -386,10 +409,24 @@ spec:
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
             - name: FACTORY_ENABLED
               value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
+            - name: FACTORY_GITHUB_APP_CLIENT_ID
+              value: {{ get (.Values.factory | default dict) "githubAppClientId" | default "" | quote }}
+            {{- if get (.Values.factory | default dict) "githubAppClientSecretExistingSecret" }}
+            - name: FACTORY_GITHUB_APP_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ get (.Values.factory | default dict) "githubAppClientSecretExistingSecret" | quote }}
+                  key: {{ get (.Values.factory | default dict) "githubAppClientSecretExistingSecretKey" | default "clientSecret" | quote }}
+            {{- end }}
             - name: FACTORY_INTAKE
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
+            # factory.modelAuthMode; the worker renders the same helper.
+            - name: FACTORY_MODEL_AUTH_MODE
+              value: {{ include "curie.factory.modelAuthMode" . | quote }}
             - name: FACTORY_BASE_LABEL_SETTLE_S
               value: {{ dig "baseLabelSettleSeconds" 60 (.Values.factory | default dict) | quote }}
+            - name: CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY
+              value: {{ dig "requesterCodingInstructions" "apply" true (.Values.factory | default dict) | quote }}
             - name: FACTORY_CI_WAIT_S
               value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 3600) | quote }}
             - name: CURIE_FORGES

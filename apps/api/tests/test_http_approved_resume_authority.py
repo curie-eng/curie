@@ -118,4 +118,3 @@ def test_approved_resume_and_grant_distinguish_current_role_route_and_provider(
     assert valkey.xrange(runs_stream) == stream
     assert_grant(post_grant(case.client, grant), grant,
                  decision="refuse", reason="caller_not_allowed")
-

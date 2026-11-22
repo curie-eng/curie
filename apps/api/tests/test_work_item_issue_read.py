@@ -27,8 +27,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import factory_run_support as support  # noqa: E402
 import httpx
 import pytest
+import test_factory_publication_recovery as recovery  # noqa: E402
 from channel_protocol import scoped_conversation_id
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -38,12 +40,19 @@ from curie_api.routers import work_item_issue
 from fastapi.testclient import TestClient
 from forge_fakes import jira as jira_fake
 from forge_fakes.github import forges_document, forges_env_json
+from forge_fakes.github_comments import admitted, comments  # noqa: E402, F401  (fixtures)
+from test_factory_publication_recovery import api  # noqa: E402, F401  (fixture)
 
 from apps.api.tests.test_publications import REPO, WORKER_HEADERS, _execute, _rows
 from apps.api.tests.test_publications import publication_stack as publication_stack
 
 MINT_URL = "/v1/internal/work-items/issue-read/context"
 READ_URL = "/work-items/issue-read"
+CONTRACT_URL = "/work-items/completion-contract"
+# The runner-facing route of the separate triage path, removed with it (#5803);
+# the one place this file names it.
+RETIRED_TRIAGE_ROUTE = "/work-items/tracker-result"
+CONTRACT_KEYS = {"completion_contract", "execution", "rule_proposal"}
 CAPABILITY_HEADER = "X-Curie-Issue-Read"
 REPOSITORY_ID = 9001
 INSTALLATION_ID = 41
@@ -223,7 +232,12 @@ def issue_case(
         if request.url.path == f"{issue_path}/comments":
             page = int(request.url.params["page"])
             batch = [COMMENTS[page - 1]] if page <= len(COMMENTS) else []
-            headers = {"link": f'<{request.url}>; rel="next"'} if page < len(COMMENTS) else {}
+            last = request.url.copy_set_param("page", str(len(COMMENTS)))
+            headers = (
+                {"link": f'<{request.url}>; rel="next", <{last}>; rel="last"'}
+                if page < len(COMMENTS)
+                else {}
+            )
             return httpx.Response(200, json=batch, headers=headers)
         return httpx.Response(404, json={"message": "Not Found"})
 
@@ -336,7 +350,10 @@ def _replace_execution(case: dict[str, Any], **shape: Any) -> None:
 def _mint(case: dict[str, Any], request_id: uuid.UUID | None = None) -> dict[str, Any]:
     response = case["client"].post(
         MINT_URL,
-        json={"execution_request_id": str(request_id or case["request_id"])},
+        json={
+            "execution_request_id": str(request_id or case["request_id"]),
+            "publication_recovery": False,
+        },
         headers=WORKER_HEADERS,
     )
     assert response.status_code == 200, response.text
@@ -447,6 +464,12 @@ def test_issue_read_reports_the_stored_execution_deadline_and_configured_duratio
             "claim_name": "fixture-claim",
             "sandbox_name": "fixture-sandbox",
             "context": acquire.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text
@@ -696,10 +719,10 @@ def test_mint_requires_the_worker_credential_and_a_live_execution(
     issue_case: dict[str, Any], auth_headers: dict[str, str]
 ) -> None:
     case = issue_case
-    body = {"execution_request_id": str(case["request_id"])}
+    body = {"execution_request_id": str(case["request_id"]), "publication_recovery": False}
     assert case["client"].post(MINT_URL, json=body).status_code == 401
     assert case["client"].post(MINT_URL, json=body, headers=auth_headers).status_code == 401
-    unknown = {"execution_request_id": str(uuid.uuid4())}
+    unknown = {"execution_request_id": str(uuid.uuid4()), "publication_recovery": False}
     assert case["client"].post(MINT_URL, json=unknown, headers=WORKER_HEADERS).status_code == 409
     # Minting at sandbox boot precedes the start grant.
     _, waiting = _insert_execution(
@@ -803,3 +826,114 @@ def test_one_execution_has_a_bounded_read_budget(issue_case: dict[str, Any]) -> 
     assert refused.status_code == 429, refused.text
     assert refused.json()["detail"]["code"] == "rate_limited"
     assert len(_github_reads(case)) == reads
+
+
+# The completion contract (#5803) ---------------------------------------------------
+
+
+def _contract(client: TestClient, capability: str) -> httpx.Response:
+    return client.post(CONTRACT_URL, headers={CAPABILITY_HEADER: capability})
+
+
+def _tenant_of(work_item_id: uuid.UUID) -> uuid.UUID:
+    (row,) = _rows(
+        "SELECT a.tenant_id FROM curie.work_items w JOIN curie.agents a ON a.id = w.agent_id "
+        "WHERE w.id = :id",
+        {"id": work_item_id},
+    )
+    return uuid.UUID(str(row["tenant_id"]))
+
+
+def test_completion_contract_answers_implementation_with_its_execution_binding(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A label admitted request, minted and started as the worker does, is
+    answered exactly the three keys: implementation, its execution binding at
+    its running fence, and no rule proposal offer."""
+
+    job = support._admit_run(admitted, monkeypatch, 9611)
+    support._begin(job)
+
+    answered = _contract(job.client, job.capability)
+
+    assert answered.status_code == 200, answered.text
+    assert answered.headers["Cache-Control"] == "no-store"
+    body = answered.json()
+    assert set(body) == CONTRACT_KEYS
+    assert body == {
+        "completion_contract": "implementation",
+        "execution": {
+            "tenant_id": str(_tenant_of(job.work_item_id)),
+            "work_item_id": str(job.work_item_id),
+            "execution_request_id": str(job.request_id),
+            "execution_fence": job.epoch,
+        },
+        "rule_proposal": False,
+    }
+    assert job.epoch >= 1
+
+
+def test_completion_contract_answers_publication_recovery_without_a_binding(
+    api: TestClient,  # noqa: F811
+    auth_headers: dict[str, str],
+) -> None:
+    """A publication recovery request is answered the recovery contract with no
+    execution binding; its implementation predecessor, asked while it ran, is
+    the control on the same WorkItem."""
+
+    item = recovery._item(api, recovery._agent(api, auth_headers), 54791)
+    implementation = recovery._run(api, item.request_id, item.work_item_id)
+    ordinary = _contract(api, _mint_for(api, item.request_id, publication_recovery=False))
+    assert ordinary.status_code == 200, ordinary.text
+    assert set(ordinary.json()) == CONTRACT_KEYS
+    assert ordinary.json()["completion_contract"] == "implementation"
+    assert ordinary.json()["execution"]["execution_request_id"] == str(item.request_id)
+    recovery._capture(api, implementation)
+    recovery._settle(implementation.ref, "publication_failed")
+    successor = recovery._successor(item.request_id)
+    assert successor is not None
+    assert successor["execution_kind"] == "publication_recovery"
+    recovery._run(api, successor["id"], item.work_item_id)
+
+    answered = _contract(api, _mint_for(api, successor["id"], publication_recovery=True))
+
+    assert answered.status_code == 200, answered.text
+    body = answered.json()
+    assert set(body) == CONTRACT_KEYS
+    assert body["completion_contract"] == "publication_recovery"
+    assert body["execution"] is None
+    assert isinstance(body["rule_proposal"], bool)
+
+
+def _mint_for(client: TestClient, request_id: uuid.UUID, *, publication_recovery: bool) -> str:
+    minted = client.post(
+        MINT_URL,
+        headers=recovery.WORKER,
+        json={
+            "execution_request_id": str(request_id),
+            "publication_recovery": publication_recovery,
+        },
+    )
+    assert minted.status_code == 200, minted.text
+    return str(minted.json()["capability"])
+
+
+def test_the_retired_triage_route_is_gone(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No route serves a POST to the removed path any more: with a valid
+    capability, which the completion contract route still accepts, it reaches
+    only the WorkItem read, ``GET /work-items/{work_item_id}``, so it answers
+    405 allowing GET alone."""
+
+    job = support._admit_run(admitted, monkeypatch, 9612)
+    support._begin(job)
+    headers = {CAPABILITY_HEADER: job.capability}
+
+    gone = job.client.post(RETIRED_TRIAGE_ROUTE, headers=headers, json={"proposal": {}})
+
+    assert gone.status_code == 405, gone.text
+    assert gone.headers["allow"] == "GET"
+    assert _contract(job.client, job.capability).status_code == 200

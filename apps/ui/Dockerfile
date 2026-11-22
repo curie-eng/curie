@@ -24,10 +24,11 @@ RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 COPY apps/ui/package.json apps/ui/pnpm-lock.yaml ./apps/ui/
 WORKDIR /app/apps/ui
 RUN pnpm install --frozen-lockfile
-# The shared wording vector, then the UI sources. Both land at their
-# repo-relative paths so `../../tests/...` resolves from apps/ui.
+# The shared wording and enrollment token vectors, then the UI sources. All
+# land at their repo-relative paths so `../../tests/...` resolves from apps/ui.
 WORKDIR /app
 COPY tests/vectors/user-action-wording.json ./tests/vectors/user-action-wording.json
+COPY tests/vectors/personal-enrollment-token.json ./tests/vectors/personal-enrollment-token.json
 COPY apps/ui ./apps/ui
 WORKDIR /app/apps/ui
 RUN pnpm build
@@ -69,9 +70,24 @@ server {
         access_log off;
         error_log /dev/null;
         add_header Cache-Control "private, no-store" always;
-        add_header Referrer-Policy "no-referrer" always;
+        # no-referrer makes the confirm POST send Origin null. strict-origin
+        # keeps that Origin and still omits the token path from Referer.
+        add_header Referrer-Policy "strict-origin" always;
+        proxy_hide_header Referrer-Policy;
         gzip off;
         proxy_pass ${CURIE_API_TARGET}/identity/connect/;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location ^~ /api/identity/me/github-link {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/identity/me/github-link;
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

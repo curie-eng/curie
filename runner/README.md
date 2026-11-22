@@ -196,6 +196,19 @@ caller proxy fronts with one `initialize` and one `tools/list`, and answers one
 of the caller token, never the token. API/worker integration
 tests and live-provider tests exercise the real progress handler instead.
 
+Two directives exhaust a runner resource offline (#5427), with no tool call and
+so no `side_effect_flag`. `[fake:hold-memory <MiB>]` allocates that many MiB in
+the runner process, touching every page, holds it a few seconds, releases it
+and answers `all done`. `[fake:fill-scratch <MiB>]` writes that many MiB of
+zeros in 1 MiB chunks to one file in the temporary directory (the sandbox's
+`/tmp` scratch volume), holds it long
+enough for a kubelet eviction pass to measure it, deletes it and answers
+`all done`. Both take 1 to 16384 MiB; anything else gets the default turn.
+Under a smaller runner limit the kernel or the kubelet ends the runner first.
+A factory turn's text is only the issue link, so the fake also reads a
+standing directive from `FAKE_MODEL_DIRECTIVE` and treats it as part of every
+turn's words; a test sets it per agent through `agentSandbox.runnerEnv`.
+
 ## Per-turn tool access
 
 The runner is the reference enforcement of TOOL-ACCESS in
@@ -447,9 +460,24 @@ resources and fake provider credentials, with no real model or approval action.
   expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
   boot and drops `NAME` from the process environment (and from
   `CURIE_CONNECTOR_SECRET_KEYS`) before the session accepts turns, so `Bash`
-  cannot read the PAT. #2635 keeps that in-memory catalog off the claude CLI
-  argv by writing `--mcp-config` JSON to a 0600 tempfile; same-uid `Bash` can
-  still cat the file, and that is accepted. The on-disk catalog keeps the
+  cannot read the PAT. #2635 keeps the CLI's MCP configuration off the claude
+  CLI argv by writing `--mcp-config` JSON to a 0600 tempfile, which same-uid
+  `Bash` can read. So no runner-materialized hosted header reaches that file
+  (#5378): every derived entry whose `Authorization` Bearer or `X-Curie-Caller`
+  the runner expanded, or that carries a resumed turn's
+  `X-Curie-Connector-Grant`, is mounted on the CLI as an in-process SDK MCP
+  server under the same name (`mcp_header_channel.py`). That relay holds the
+  headers only in the runner process, which is not dumpable, and forwards the
+  CLI's MCP messages to that one connector over the client the capability probe
+  uses (`CURIE_CONNECTOR_CA_FILE` trust, no proxy env). The file names the
+  server and nothing else. Tool names, schemas, results, approvals and
+  side-effect classification are unchanged; a dropped connector session is
+  dialed again on the next call. `CURIE_CONNECTOR_TOOL_GRANT` leaves the
+  process environment once a relay holds the grant; the turn-start re-probe
+  keeps the value for its own client. The CLI transport refuses
+  to start when its command line, configuration or environment would carry a
+  relay-held value. Bundle servers and remote connector headers the CLI expands
+  from `${VAR}` keep their existing delivery. The on-disk catalog keeps the
   placeholder. Residual:
   kubelet / `docker -e` still injects the value onto the container until the
   runner process unsets it. ADR-0009 `--secret` names that are not a hosted

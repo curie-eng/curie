@@ -224,6 +224,9 @@ def _asgi(fake: gitlab_fake.GitLabAPI, origin: str) -> Starlette:
             headers=[(k, v) for k, v in request.headers.items() if k.lower() != "host"],
             content=await request.body(),
         )
+        action = fake.take_before(forwarded)
+        if action is not None:
+            await asyncio.to_thread(action)
         answered = fake.handle(forwarded)
         headers = {
             k: v
@@ -616,6 +619,12 @@ def start_request(client: TestClient, request_id: uuid.UUID) -> int:
                 claim_name="claim-gitlab",
                 sandbox_name="sbx-gitlab",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)

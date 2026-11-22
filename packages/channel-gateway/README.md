@@ -35,7 +35,7 @@ Import ports from `curie_channel_gateway.ports`; their defining modules are:
 | `ports/admission.py` | `AdmissionClient`, `AdmissionRequest`, `AdmissionAnswer` |
 | `ports/intake.py` | `TurnSubmission[Turn, Receipt]`, `ApprovalResolution[Outcome]` |
 | `ports/groups.py` | `GroupMembershipSource[Membership]` |
-| `ports/reads.py` | `IdentitySelection[Route]`, `FileSource`, `SenderIdentities`, `AddressIdentityLookup`, `ChannelReader[Route, Window, Page, Message]`, `CanvasReader[Route, File, Page, Document]` |
+| `ports/reads.py` | `IdentitySelection[Route]`, `FileSource`, `SenderIdentities`, `AddressIdentityLookup`, `ChannelReader[Route, Window, Page, Message]`, `CanvasReader[Route, File, Page, Document]`, `UserEmailSource` |
 
 Reply events and acknowledgements remain the existing `channel_protocol.reply`
 types: `turn.status`, `reply.update`, `reply.post`, `turn.completed` and `{ref}`.
@@ -59,6 +59,71 @@ is a wrapper contract: map `evidence` to the API's existing provider evidence
 field and preserve `None` as unavailable. The lane adapter fixes `kind` as a class
 constant, never from the inbound request. `connect_url` is single-use and must
 never be cached or shared. The ports add no platform endpoint.
+
+## Slack user email lookup for identity providers
+
+An external HTTP identity provider can map a Slack sender to a directory
+account without holding a Slack token
+([spec](../../docs/superpowers/specs/2026-11-12-gateway-slack-user-email-v1.md)).
+The gateway accepts an optional third caller credential,
+`CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN`, distinct from the API and worker
+credentials. That caller may call only
+`POST /v1/gateway/{identity}/user_email` with
+`{"user_id": "U...", "workspace": "T... or E..."}`; the API and worker callers
+may not. The gateway reads Slack `users.info` fresh with the named identity's
+bot token, bounded by `CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S` (default 5
+seconds), and answers `{"user_id", "email"}`. An unknown or invisible user, a
+workspace mismatch, a deleted, bot or app user and a missing email answer 404
+`{"code": "user_email.unknown"}`. A Slack failure answers 502 and a timeout 504.
+The Slack app needs the `users:read` and `users:read.email` scopes; without the
+email scope the lookup answers 502 rather than silently unknown. Requests use the same signed,
+single-use proof as every gateway caller (`request_replay.request_headers`).
+Nothing on this path logs an email.
+
+### Lookup identities
+
+By default `{identity}` is a declared Slack identity, so that agent's app
+needs `users:read.email`. To keep directory scopes off every agent app, declare
+a lookup identity: a credential the gateway uses for directory reads alone
+(section 7 of the [spec](../../docs/superpowers/specs/2026-11-12-gateway-slack-user-email-v1.md)).
+`CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES` is a JSON list of
+`{"name", "kind", "token_env"}` entries, for example
+`[{"name": "directory", "kind": "slack", "token_env": "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__0"}]`,
+with the credential in `CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__0`. `slack` is the
+only kind: a bot-token-only app with `users:read` and `users:read.email`, no
+Socket Mode and no events. Point the provider's
+`CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` at the lookup identity's name. Do not
+declare it in `CURIE_SLACK_IDENTITIES`.
+
+Only the `user_email` read sees a lookup identity's credential. Replies, group
+membership, files, channel and canvas reads, sender identities and account
+profiles never receive it, and every other operation naming it answers as for
+an unknown identity. The gateway refuses to start on a malformed entry, a
+repeated name or `token_env`, a name that is `default`, `curie-cluster-message`
+or a declared identity, an unsupported kind (the error lists the supported
+ones), or an unset or blank credential. Each kind is one adapter in the
+`lookup_registry` of `slack/read_server.py`; adding one leaves the declaration
+unchanged. Processes that consume gateway ports refuse any
+`CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__` variable, and the worker drops that
+prefix from agent environments.
+
+A Python provider uses `curie_channel_gateway.user_email_client`:
+
+```python
+from curie_channel_gateway.user_email_client import (
+    GatewayUserEmails, GatewayUserEmailSettings, UserEmailLookupError, UserEmailUnknown,
+)
+
+async with GatewayUserEmails.from_settings(GatewayUserEmailSettings()) as emails:
+    email = await emails.email_of(sender.native_id, sender.namespace.key)
+```
+
+`GatewayUserEmailSettings` reads `CURIE_CHANNEL_GATEWAY_URL`,
+`CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN`, `CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY`
+(default `default`), `CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S` (default 8),
+`CURIE_CHANNEL_GATEWAY_CA_FILE` and `CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE`, and
+refuses to load when any Slack token is present. `UserEmailUnknown` means
+answer `unresolved`; any other `UserEmailLookupError` means `unavailable`.
 
 ## Authenticated HTTP replies
 

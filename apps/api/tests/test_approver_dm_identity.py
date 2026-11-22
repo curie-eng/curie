@@ -160,5 +160,3 @@ def test_a_dm_group_that_refuses_is_not_overridden_by_the_reply_identity(
     response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver="other")
     assert response.status_code == 200, response.text
     assert clients.reply.calls == [] and clients.default.calls == []
-
-

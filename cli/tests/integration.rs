@@ -1,6 +1,6 @@
-//! The one integration test crate root for the curie CLI. Every file
-//! cli/tests/<name>.rs is a module declared below. With `autotests = false`
-//! an undeclared file never compiles, which the guard test below catches.
+//! Shared integration test crate for the curie CLI. The subscription and
+//! requester coding instructions suites are independent Cargo test targets.
+//! With `autotests = false`, the inventory guard catches undeclared modules.
 
 mod support;
 
@@ -26,6 +26,7 @@ mod approvals_manifest_unreadable;
 mod artifacts_fetch;
 mod boot_env_contract;
 mod budget_factory_allowance;
+mod bundle_refusal_output;
 mod callers_verb;
 mod channel_token_verb;
 mod chart_check;
@@ -38,6 +39,7 @@ mod cluster_convergence;
 mod cluster_deploy_no_docker;
 mod cluster_down_failforward;
 mod cluster_down_namespace_bound;
+mod cluster_factory_model_auth_mode;
 mod cluster_kube_context;
 mod cluster_lint_values;
 mod cluster_namespace_ownership;
@@ -107,12 +109,14 @@ mod eval_falsifiability;
 mod eval_portforward_cleanup;
 mod eval_sampling;
 mod eval_thread_reset;
+mod eval_trial_records;
 mod example_builtin_coding_tools;
 mod example_dark_factory_render;
 mod example_sre_bot_install;
 mod exit_codes;
 mod factory_github_app;
 mod factory_preparation_install;
+mod factory_progress_verb;
 mod factory_quickstart_context;
 mod factory_quickstart_forges;
 mod factory_quickstart_gitlab;
@@ -150,6 +154,7 @@ mod mail_channel_health;
 mod memory_add;
 mod memory_facts;
 mod memory_guidance_clap_wiring;
+mod memory_rules;
 mod message_argv;
 mod message_ephemeral_ports;
 mod model_provider_registry;
@@ -195,19 +200,25 @@ mod upgrade_drill;
 mod valkey_required_gate;
 mod verify_fix_pin;
 mod wake_operator;
+mod work_item_retry;
 mod work_items;
 mod worker_claims;
 
 use std::fs;
 use std::path::Path;
 
-/// File names (sorted) ending in `.rs`, other than `integration.rs`, whose stem
-/// has no line in `root_source` that equals `mod <stem>;` after trimming.
+/// Module files whose stems have no matching declaration in `root_source`.
+/// Independent Cargo targets are excluded from this shared crate inventory.
 fn undeclared_test_files(file_names: &[String], root_source: &str) -> Vec<String> {
     let declared: Vec<&str> = root_source.lines().map(str::trim).collect();
     let mut missing: Vec<String> = file_names
         .iter()
-        .filter(|name| name.as_str() != "integration.rs")
+        .filter(|name| {
+            !matches!(
+                name.as_str(),
+                "integration.rs" | "subscription.rs" | "requester_coding_instructions.rs"
+            )
+        })
         .filter_map(|name| name.strip_suffix(".rs").map(|stem| (name, stem)))
         .filter(|(_, stem)| !declared.contains(&format!("mod {stem};").as_str()))
         .map(|(name, _)| name.clone())
@@ -233,7 +244,14 @@ fn every_test_file_is_declared_in_the_integration_crate() {
     }
     let root_source =
         fs::read_to_string(tests_dir.join("integration.rs")).expect("read tests/integration.rs");
-    let missing = undeclared_test_files(&names, &root_source);
+    let cargo_toml = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .expect("read cli/Cargo.toml");
+    // A file with its own [[test]] target compiles on its own. Declaring it
+    // again in this crate ran the same tests a second time, or skipped them.
+    let missing: Vec<String> = undeclared_test_files(&names, &root_source)
+        .into_iter()
+        .filter(|name| !cargo_toml.contains(&format!("path = \"tests/{name}\"")))
+        .collect();
     assert!(
         missing.is_empty(),
         "these test files are not declared, so they never compile: {}. \

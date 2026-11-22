@@ -1427,6 +1427,76 @@ def test_malformed_bundle_push_is_rejected(
     assert deployments == []
 
 
+def test_push_refuses_a_retired_result_declaration(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A dev push of a bundle that still carries `workflow/result.json` is rejected.
+
+    Liveness: the next commit, which only deletes the file, deploys.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(
+        trusted_clone_base, REPO, {**VALID_FILES, "workflow/result.json": "{}"}
+    )
+
+    refused = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+
+    assert refused.status_code == 200, refused.text
+    body = refused.json()
+    assert body["status"] == "rejected", body
+    assert "bundle.result_declaration_retired" in {e["code"] for e in body["errors"]}, body
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert deployments == []
+
+    work = trusted_clone_base / "_work" / REPO
+    (work / "workflow" / "result.json").unlink()
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "drop the retired declaration", cwd=work)
+    fixed = _git("rev-parse", "HEAD", cwd=work)
+    bare = trusted_clone_base / f"{REPO}.git"
+    _git("push", "--quiet", str(bare), "HEAD:refs/heads/dev", cwd=work)
+
+    accepted = _post(client, "push", _push_payload("refs/heads/dev", fixed, clone_url)).json()
+
+    assert accepted["status"] == "deployed", accepted
+
+
+def test_a_prod_promote_of_a_stored_retired_result_declaration_is_rejected(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """The reuse path re-checks the stored object, as `POST /deployments` does."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    _repoint_stored_bundle(
+        agent_id, dev["version_id"], {**VALID_FILES, "workflow/result.json": "{}"}
+    )
+
+    body = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert body["status"] == "rejected", body
+    assert [e["code"] for e in body["errors"]] == ["bundle.result_declaration_retired"], body
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["environment"] for d in deployments] == ["dev"], deployments
+    # Liveness: repointed at the bytes without the file, the same promote succeeds.
+    _repoint_stored_bundle(agent_id, dev["version_id"], dict(VALID_FILES))
+    promoted = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+    assert promoted["status"] == "promoted", promoted
+
+
 def test_signed_push_with_a_foreign_clone_url_is_rejected(
     client: Any,
     auth_headers: dict[str, str],
@@ -3397,9 +3467,16 @@ def _replace_stored_bundle_with(agent_id: str, version_id: str, connectors_yaml:
     the version row is repointed with SQL.
     """
 
+    files = {**VALID_FILES, "connectors.yaml": connectors_yaml}
+    _repoint_stored_bundle(agent_id, version_id, files)
+
+
+def _repoint_stored_bundle(agent_id: str, version_id: str, files: dict[str, str]) -> None:
+    """Store ``files`` as a tar.gz under a fresh key and repoint the version at it."""
+
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for rel, content in {**VALID_FILES, "connectors.yaml": connectors_yaml}.items():
+        for rel, content in files.items():
             data = content.encode()
             info = tarfile.TarInfo(f"demo-plugin/{rel}")
             info.size = len(data)
@@ -3478,3 +3555,100 @@ def test_a_prod_promote_of_a_stored_bundle_with_the_sealing_key_secret_ref_is_pr
 
     assert body["status"] == "promoted", body
     assert body["version_id"] == dev["version_id"], body
+
+
+# --------------------------------------------------------------------------- #
+# #5804: a sibling promote refuses a stored retired result declaration
+# --------------------------------------------------------------------------- #
+
+
+def _work_item_count(agent_id: str) -> int:
+    async def _run() -> int:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                value = await conn.scalar(
+                    text("SELECT count(*) FROM curie.work_items WHERE agent_id = :agent_id"),
+                    {"agent_id": uuid.UUID(agent_id)},
+                )
+        finally:
+            await engine.dispose()
+        return int(value or 0)
+
+    return asyncio.run(_run())
+
+
+def _dev_deployed_sibling(
+    client: Any, auth_headers: dict[str, str], trusted_clone_base: Path, files: dict[str, str]
+) -> tuple[str, str, str, str, str]:
+    """Deploy ``files`` to the dev agent; return (dev_id, prod_id, sha, url, dev version)."""
+
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    assert dev["agent_id"] == dev_id, dev
+    return dev_id, prod_id, sha, clone_url, str(dev["version_id"])
+
+
+def _assert_prod_untouched(client: Any, auth_headers: dict[str, str], prod_id: str) -> None:
+    assert client.get(f"/agents/{prod_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get("/deployments", params={"agent_id": prod_id}, headers=auth_headers).json()
+        == []
+    )
+    assert _work_item_count(prod_id) == 0
+
+
+def test_a_sibling_promote_of_a_stored_result_declaration_is_refused_before_any_row(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A retired declaration reports its own code, not the route join's.
+
+    The stored object also declares the `ops` route, which only the dev agent
+    binds, so a route join run first would answer `approval_routes.unbound`
+    for the prod agent and hide the refusal. No prod version, deployment or
+    work item is written.
+    """
+
+    gated = _gated_files(TWO_TARGET_FILES, "ops")
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    _bind_route(client, auth_headers, dev_id, "ops")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, gated)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    _repoint_stored_bundle(dev_id, str(dev["version_id"]), {**gated, "workflow/result.json": "{}"})
+
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert prod["status"] == "rejected", prod
+    assert [e["code"] for e in prod["errors"]] == ["bundle.result_declaration_retired"], prod
+    _assert_prod_untouched(client, auth_headers, prod_id)
+
+
+def test_a_sibling_promote_of_the_same_stored_bundle_without_the_declaration_promotes(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """The paired control: a repointed sibling object without the file still promotes."""
+
+    dev_id, prod_id, sha, clone_url, dev_version = _dev_deployed_sibling(
+        client, auth_headers, trusted_clone_base, TWO_TARGET_FILES
+    )
+    _repoint_stored_bundle(dev_id, dev_version, dict(TWO_TARGET_FILES))
+
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert prod["status"] == "promoted", prod
+    assert prod["agent_id"] == prod_id, prod
+    deployments = client.get(
+        "/deployments", params={"agent_id": prod_id}, headers=auth_headers
+    ).json()
+    assert [d["environment"] for d in deployments] == ["prod"], deployments

@@ -941,6 +941,97 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/memory/rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Rules
+         * @description The agent's proposed, accepted, rejected and removed rules, by scope and number.
+         *
+         *     The platform key and a console session bound to no principal read any
+         *     agent. A principal's console session reads only an agent of its own
+         *     tenant: another tenant's agent is the same 404 as an unknown one, for
+         *     every filter and scope, so its rules, reasons and deciders never leave it.
+         */
+        get: operations["list_rules_agents__agent_id__memory_rules_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept Rule
+         * @description Accept a proposed rule. The decision is recorded now. A repository rule takes
+         *     effect at the next ticket's admission (#5798), and a running request keeps the
+         *     rules it was admitted with; an agent or binding scope rule takes effect at the
+         *     agent's next session start (#5801).
+         */
+        post: operations["accept_rule_agents__agent_id__memory_rules__rule_id__accept_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reject Rule
+         * @description Reject a proposed rule; it never applies.
+         */
+        post: operations["reject_rule_agents__agent_id__memory_rules__rule_id__reject_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove Rule
+         * @description Remove an accepted rule. The decision is recorded now. A repository rule
+         *     stops applying at the next ticket's admission (#5798), and a running request
+         *     keeps the rules it was admitted with; an agent or binding scope rule stops
+         *     applying at the agent's next session start (#5801).
+         */
+        post: operations["remove_rule_agents__agent_id__memory_rules__rule_id__remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/memory/{index}": {
         parameters: {
             query?: never;
@@ -1091,6 +1182,58 @@ export interface paths {
         get: operations["list_namespaces_agents__agent_id__state_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Rules
+         * @description The accepted rules a non-factory session loads at its start (#5801).
+         *
+         *     A scoped sandbox state credential with memory claims (the boot read
+         *     credential or a turn's write credential) gets ``ChannelRulesOut``: the
+         *     agent's ``memory_rule_proposals`` as ``proposals_enabled`` and the
+         *     ``accepted`` rules of the agent scope, then of the binding scope the
+         *     credential's ``binding`` claim names (none for a credential with no
+         *     binding), each ordered by acceptance and at most 16 per scope. Never a
+         *     proposed, rejected or removed rule, and never another binding's.
+         *
+         *     Every other caller (the platform key, the bundle token and a legacy token)
+         *     gets what ``GET /agents/{agent_id}/state/{namespace}`` answers for the
+         *     ``_rules`` namespace: the key/value entries stored there, as a list of
+         *     ``StateEntryOut``, after the same checks. A state credential signed for
+         *     another agent is 403 here, where the key/value routes answer 401.
+         */
+        get: operations["read_rules_agents__agent_id__state__rules_get"];
+        put?: never;
+        /**
+         * Propose Rule
+         * @description Propose one learned rule for this turn (ADR 0287 decision 7, #5801).
+         *
+         *     Only the per-turn memory write credential (ADR 0188) may propose: the
+         *     platform key, the bundle token, a legacy token and a read credential are
+         *     refused 403. The body is exactly ``rule``, ``reason`` and an optional
+         *     ``scope`` (``channel``, the default, or ``agent``); everything else comes
+         *     from the credential: the scope key from its ``binding`` claim, the source
+         *     turn from ``turn`` and the proposer from ``sender``. The rule is stored
+         *     ``proposed`` with the next number of its scope and applies only after a
+         *     person accepts it, from the agent's next session. A turn the worker
+         *     reported ended is refused 403; the agent's ``memory_rule_proposals`` off
+         *     is 403 ``rule_proposal_not_eligible``; a second proposal of one turn is
+         *     409 ``rule_already_proposed``; a malformed body is 422 ``invalid_body`` and
+         *     text outside the bounds 422 ``invalid_text``, ``too_large`` or
+         *     ``reserved_text``. No refusal and no log line carries the submitted text.
+         */
+        post: operations["propose_rule_agents__agent_id__state__rules_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1910,6 +2053,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/coding-instructions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read */
+        get: operations["read_coding_instructions_get"];
+        /** Write */
+        put: operations["write_coding_instructions_put"];
+        post?: never;
+        /** Clear */
+        delete: operations["clear_coding_instructions_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/config": {
         parameters: {
             query?: never;
@@ -2103,6 +2265,29 @@ export interface paths {
          *     endpoint cannot be used to enumerate which codes exist.
          */
         post: operations["exchange_login_code_console_session_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/console/sign-in-methods": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Sign In Methods
+         * @description Report whether Console OIDC sign-in is enabled. No credential required.
+         *
+         *     A presented X-API-Key is not a credential for this route. The login screen
+         *     reads it before a session exists, and the answer does not depend on the header.
+         */
+        get: operations["sign_in_methods_console_sign_in_methods_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2430,6 +2615,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/factory/facts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Factory Facts */
+        get: operations["get_factory_facts_factory_facts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/forges/credentials/health": {
         parameters: {
             query?: never;
@@ -2644,6 +2846,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/identity/admin/{tenant_id}/coding-instructions-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Coding Instructions Policy */
+        get: operations["coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_get"];
+        /** Set Coding Instructions Policy */
+        put: operations["set_coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/identity/admin/{tenant_id}/links/{link_id}/revoke": {
         parameters: {
             query?: never;
@@ -2779,6 +2999,74 @@ export interface paths {
         /** Confirm Connection */
         post: operations["confirm_connection_identity_connect__token__confirm_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/github-link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start Github Link */
+        post: operations["start_github_link_identity_me_github_link_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/github-link/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Github Link Callback */
+        get: operations["github_link_callback_identity_me_github_link_callback_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Links */
+        get: operations["list_links_identity_me_links_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/links/{link_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Unlink */
+        delete: operations["unlink_identity_me_links__link_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2975,6 +3263,37 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/personal-claude/enrollment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Enrollment
+         * @description The caller's enrollment; ``absent`` before the first enroll.
+         */
+        get: operations["read_enrollment_personal_claude_enrollment_get"];
+        /**
+         * Write Enrollment
+         * @description Enroll (generation 1), or replace or reconnect at ``expected_version``.
+         */
+        put: operations["write_enrollment_personal_claude_enrollment_put"];
+        post?: never;
+        /**
+         * Disconnect Enrollment
+         * @description Disconnect: inactive at a new generation, runtimes fenced, Secret retired.
+         *
+         *     Repeating it at the inactive version answers 200 and changes nothing. It is
+         *     never held for a rollout, since it only reduces access.
+         */
+        delete: operations["disconnect_enrollment_personal_claude_enrollment_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3375,6 +3694,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/factory-slack/kickoff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Kickoff Factory Run
+         * @description Admit a personal factory run for the one issue a mention links, or name why not.
+         *
+         *     ``not_factory`` sends the mention down the ordinary path; every other
+         *     refusal is final for the delivery. Both answer 200. A code host that
+         *     cannot answer now is 503, so the worker keeps the delivery pending, and so
+         *     is a database failure, raised without its exception chain: the driver's
+         *     error may carry bound parameters that hold the Slack body.
+         */
+        post: operations["kickoff_factory_run_v1_internal_factory_slack_kickoff_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/factory-slack/steer": {
         parameters: {
             query?: never;
@@ -3553,6 +3898,176 @@ export interface paths {
          *     credential for the turn could still be valid (``MEMORY_TURN_CLOSED_TTL_S``).
          */
         post: operations["close_memory_turn_v1_internal_memory_closed_turns_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/acquire-reader": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acquire Reader */
+        post: operations["acquire_reader_v1_internal_publication_candidates_acquire_reader_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/claim-collection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Claim Collection */
+        post: operations["claim_collection_v1_internal_publication_candidates_claim_collection_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete */
+        post: operations["complete_v1_internal_publication_candidates_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Context */
+        post: operations["context_v1_internal_publication_candidates_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/fail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fail */
+        post: operations["fail_v1_internal_publication_candidates_fail_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/finalize-collection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Finalize Collection */
+        post: operations["finalize_collection_v1_internal_publication_candidates_finalize_collection_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Outcome */
+        post: operations["outcome_v1_internal_publication_candidates_outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Recovery */
+        post: operations["recovery_v1_internal_publication_candidates_recovery_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/release-reader": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Release Reader */
+        post: operations["release_reader_v1_internal_publication_candidates_release_reader_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/reserve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reserve */
+        post: operations["reserve_v1_internal_publication_candidates_reserve_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3766,6 +4281,11 @@ export interface paths {
         /**
          * Verify Publication Revision
          * @description Prove the marked revision and its authoritative publication parent.
+         *
+         *     The named revision is the publication's own, or for a publication recovery
+         *     one of the earlier failed revisions it may adopt (#5429). Only that one
+         *     revision's marker is accepted, so a caller proving its own push never
+         *     accepts a predecessor's commit by accident.
          */
         post: operations["verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post"];
         delete?: never;
@@ -4047,6 +4567,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Memory Rules Context
+         * @description The running request's version 1 learned rules envelope, for the current fence.
+         */
+        post: operations["read_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge Memory Rules Context
+         * @description Accept the relayed acknowledgment only for the current request and fence.
+         */
+        post: operations["acknowledge_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_acknowledgment_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/work-items/requests/{request_id}/owner-lost": {
         parameters: {
             query?: never;
@@ -4058,6 +4618,46 @@ export interface paths {
         put?: never;
         /** Declare Work Item Owner Lost */
         post: operations["declare_work_item_owner_lost_v1_internal_work_items_requests__request_id__owner_lost_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/requests/{request_id}/requester-context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Requester Context
+         * @description The running request's version 1 context envelope, for the current fence.
+         */
+        post: operations["read_requester_context_v1_internal_work_items_requests__request_id__requester_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge Requester Context
+         * @description Accept the relayed acknowledgment only for the current request and fence.
+         */
+        post: operations["acknowledge_requester_context_v1_internal_work_items_requests__request_id__requester_context_acknowledgment_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4498,6 +5098,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/completion-contract": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Completion Contract
+         * @description The execution's completion contract.
+         *
+         *     An implementation request is answered with its ADR 0278 execution
+         *     binding. A publication recovery request (#5429) passes the same fences and
+         *     is answered ``publication_recovery`` with no execution binding, so its
+         *     runner constructs no model session. A capability that does not name its
+         *     WorkItem's issue, a cancelled WorkItem, and a request that can no longer
+         *     run are 409 ``invalid_context``.
+         */
+        post: operations["read_completion_contract_work_items_completion_contract_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/issue-read": {
         parameters: {
             query?: never;
@@ -4515,6 +5142,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/questions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Post Questions
+         * @description Post this execution's numbered questions on its own ticket (#5785).
+         *
+         *     The platform composes the comment and writes it as one marked comment per
+         *     asking request through the tracker's marked-comment write. The round is
+         *     recorded ``posting`` and committed before the tracker write, and
+         *     ``outstanding`` after it, with the answer fence read from the database
+         *     clock then. A replay of the same body by the same request answers the
+         *     first result with no second write. Refusals are 409 with a fixed code and
+         *     nothing echoed; a tracker failure is 503 ``tracker_unavailable`` and
+         *     leaves the round ``posting``, which settlement treats as not asked. The
+         *     body is read only after the capability is verified, and any body that is
+         *     not a JSON object inside the bounds is 409 ``invalid_questions``.
+         */
+        post: operations["post_questions_work_items_questions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/rule-proposal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Post Rule Proposal
+         * @description Store this execution's one learned rule candidate (#5796, ADR 0287).
+         *
+         *     The capability's request and WorkItem decide everything but the text: the
+         *     agent, the repository scope, the source request, pull request lineage and
+         *     URL, and the proposer (the request's verified requester). The candidate
+         *     stays hidden until the pull request merges. A capability that does not
+         *     name its WorkItem's issue is 409 ``invalid_context``; a request that is
+         *     not an eligible revision is 403 ``rule_proposal_not_eligible``; a second
+         *     proposal of the request is 409 ``rule_already_proposed``; a body that is
+         *     not one JSON object of exactly ``rule`` and ``reason`` strings is 422
+         *     ``invalid_body``; text outside the bounds is 422 ``invalid_text``,
+         *     ``too_large`` or ``reserved_text``. No refusal and no log line carries the
+         *     submitted text.
+         */
+        post: operations["post_rule_proposal_work_items_rule_proposal_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/{work_item_id}": {
         parameters: {
             query?: never;
@@ -4524,6 +5214,23 @@ export interface paths {
         };
         /** Get Work Item */
         get: operations["get_work_item_work_items__work_item_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/{work_item_id}/publication-candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Candidates */
+        get: operations["list_candidates_work_items__work_item_id__publication_candidates_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4583,6 +5290,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/{work_item_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Work Item
+         * @description Admit one fresh request for a failed WorkItem, as automatic recovery would (#5431).
+         *
+         *     Reruns the automatic successor admission against the newest failed
+         *     request, inside the same shared allowance. ``request_id`` makes the call
+         *     idempotent; ``dry_run`` answers the exact plan and writes nothing. The
+         *     actor is the authenticated credential, never the body. Refusals are 409
+         *     with a named ``code``; a missing WorkItem is 404.
+         */
+        post: operations["retry_work_item_work_items__work_item_id__retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/{work_item_id}/usage": {
         parameters: {
             query?: never;
@@ -4607,6 +5340,20 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AcknowledgmentBody
+         * @description What the worker relays: the runner's acknowledgment, or its own failure.
+         */
+        AcknowledgmentBody: {
+            /** Acknowledgment */
+            acknowledgment?: {
+                [key: string]: unknown;
+            } | null;
+            /** Reason */
+            reason?: string | null;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+        };
         /** AcquireBody */
         AcquireBody: {
             context: components["schemas"]["FactoryContext"] | null;
@@ -4932,6 +5679,8 @@ export interface components {
             request_id: string;
             /** Requester */
             requester: string;
+            /** Requester Principal Id */
+            requester_principal_id?: string | null;
             tracker: components["schemas"]["TrackerIssueIn"];
         };
         /**
@@ -5117,6 +5866,11 @@ export interface components {
             /** Memory */
             memory: boolean;
             /**
+             * Memory Rule Proposals
+             * @default false
+             */
+            memory_rule_proposals?: boolean;
+            /**
              * Memory Writes
              * @default false
              */
@@ -5216,6 +5970,8 @@ export interface components {
             } | null;
             /** Memory */
             memory?: boolean | null;
+            /** Memory Rule Proposals */
+            memory_rule_proposals?: boolean | null;
             /** Memory Writes */
             memory_writes?: boolean | null;
             /** Model */
@@ -6339,6 +7095,16 @@ export interface components {
             schema_version: 1;
             scope: components["schemas"]["TurnAuthorityScopeV1"];
         };
+        /** BindingFact */
+        BindingFact: {
+            /** Reason */
+            reason: ("unbound" | "label_not_served" | "ambiguous") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "bound" | "unbound" | "label_not_served" | "ambiguous";
+        };
         /** Body_confirm_connection_identity_connect__token__confirm_post */
         Body_confirm_connection_identity_connect__token__confirm_post: {
             /** Csrf */
@@ -6399,6 +7165,464 @@ export interface components {
         CancelBody: {
             /** Expected Version */
             expected_version: number;
+        };
+        /** CandidateAcknowledged */
+        CandidateAcknowledged: {
+            /**
+             * Released
+             * @default true
+             */
+            released?: boolean;
+        };
+        /** CandidateAcquireReader */
+        CandidateAcquireReader: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateCaptureAuthority */
+        CandidateCaptureAuthority: {
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateCaptureContext */
+        CandidateCaptureContext: {
+            /** Base Commit */
+            base_commit: string;
+            repository: components["schemas"]["CandidateRepository"];
+            /** Target Branch */
+            target_branch: string;
+        };
+        /** CandidateCaptureFailure */
+        CandidateCaptureFailure: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /**
+             * Status
+             * @default tombstoned
+             * @constant
+             */
+            status?: "tombstoned";
+        };
+        /** CandidateClaimCollection */
+        CandidateClaimCollection: {
+            /** Collector Id */
+            collector_id: string;
+            /**
+             * Limit
+             * @default 100
+             */
+            limit?: number;
+        };
+        /** CandidateCollectionClaim */
+        CandidateCollectionClaim: {
+            /**
+             * Claim Id
+             * Format: uuid
+             */
+            claim_id: string;
+            /**
+             * Claimed Until
+             * Format: date-time
+             */
+            claimed_until: string;
+            /** Key */
+            key: string;
+            /**
+             * Object Id
+             * Format: uuid
+             */
+            object_id: string;
+            /** Version */
+            version: number;
+        };
+        /** CandidateCollectionClaims */
+        CandidateCollectionClaims: {
+            /** Claims */
+            claims: components["schemas"]["CandidateCollectionClaim"][];
+        };
+        /** CandidateComplete */
+        CandidateComplete: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /** Receipts */
+            receipts: components["schemas"]["CandidateObjectReceipt"][];
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateCompletion */
+        CandidateCompletion: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /**
+             * Status
+             * @default complete
+             * @constant
+             */
+            status?: "complete";
+        };
+        /** CandidateFail */
+        CandidateFail: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "upload_failed" | "capture_failed" | "capture_timeout";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateFinalizeCollection */
+        CandidateFinalizeCollection: {
+            /**
+             * Claim Id
+             * Format: uuid
+             */
+            claim_id: string;
+            /** Collector Id */
+            collector_id: string;
+            /**
+             * Object Id
+             * Format: uuid
+             */
+            object_id: string;
+            /** Version */
+            version: number;
+        };
+        /** CandidateFinalized */
+        CandidateFinalized: {
+            /**
+             * Finalized
+             * @default true
+             */
+            finalized?: boolean;
+        };
+        /** CandidateObjectDeclaration */
+        CandidateObjectDeclaration: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "base" | "patch";
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** CandidateObjectReceipt */
+        CandidateObjectReceipt: {
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "base" | "patch";
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** CandidateOutcome */
+        CandidateOutcome: {
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "capture_timeout" | "capture_failed" | "base_unavailable" | "base_digest_mismatch" | "base_mismatch" | "ledger_unavailable" | "upload_failed" | "patch_too_large";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateOutcomeRecorded */
+        CandidateOutcomeRecorded: {
+            /** Recorded */
+            recorded: boolean;
+        };
+        /** CandidatePublic */
+        CandidatePublic: {
+            /** Available */
+            available: boolean;
+            base: components["schemas"]["CandidatePublicBase"] | null;
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Changed Path Count */
+            changed_path_count: number;
+            /** Completed At */
+            completed_at: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Expires At */
+            expires_at: string | null;
+            /** Final Disposition At */
+            final_disposition_at: string | null;
+            /**
+             * Origin Request Id
+             * Format: uuid
+             */
+            origin_request_id: string;
+            /**
+             * Owner Request Id
+             * Format: uuid
+             */
+            owner_request_id: string;
+            /** Owner Transferred At */
+            owner_transferred_at: string | null;
+            patch: components["schemas"]["CandidatePublicPatch"] | null;
+            /** Previous Owner Request Id */
+            previous_owner_request_id: string | null;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "staging" | "complete" | "tombstoned";
+        };
+        /** CandidatePublicBase */
+        CandidatePublicBase: {
+            /** Base Commit */
+            base_commit: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** CandidatePublicList */
+        CandidatePublicList: {
+            /** Candidates */
+            candidates: components["schemas"]["CandidatePublic"][];
+            /** Capture Outcome */
+            capture_outcome: string | null;
+            /** Capture Outcome At */
+            capture_outcome_at: string | null;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidatePublicPatch */
+        CandidatePublicPatch: {
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** CandidateReader */
+        CandidateReader: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Lease Id
+             * Format: uuid
+             */
+            lease_id: string;
+            /** Objects */
+            objects: components["schemas"]["CandidateObjectReceipt"][];
+        };
+        /**
+         * CandidateRecovery
+         * @description The exact retained candidate a publication recovery request publishes (#5429).
+         */
+        CandidateRecovery: {
+            /** Base Commit */
+            base_commit: string;
+            /** Body */
+            body: string;
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Changed Paths */
+            changed_paths: string[];
+            /** Contains Workflow Files */
+            contains_workflow_files: boolean;
+            /** Content Sha256 */
+            content_sha256: string;
+            patch: components["schemas"]["CandidateObjectReceipt"];
+            repository: components["schemas"]["CandidateRepository"];
+            /** Target Branch */
+            target_branch: string;
+            /** Title */
+            title: string;
+        };
+        /** CandidateReleaseReader */
+        CandidateReleaseReader: {
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Lease Id
+             * Format: uuid
+             */
+            lease_id: string;
+        };
+        /** CandidateRepository */
+        CandidateRepository: {
+            /** Host */
+            host: string;
+            /** Path */
+            path: string;
+            /** Project Id */
+            project_id: string;
+            /** Provider */
+            provider: string;
+        };
+        /** CandidateReservation */
+        CandidateReservation: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /**
+             * Capture Deadline
+             * Format: date-time
+             */
+            capture_deadline: string;
+            /** Objects */
+            objects: components["schemas"]["CandidateObjectReceipt"][];
+            /** Replayed */
+            replayed: boolean;
+            /**
+             * Staging Expires At
+             * Format: date-time
+             */
+            staging_expires_at: string;
+        };
+        /** CandidateReserve */
+        CandidateReserve: {
+            /** Base Archive Limit Bytes */
+            base_archive_limit_bytes: number;
+            /** Base Commit */
+            base_commit: string;
+            /** Body */
+            body: string;
+            /**
+             * Capture Budget Seconds
+             * @default 60
+             */
+            capture_budget_seconds?: number;
+            /** Changed Paths */
+            changed_paths: string[];
+            /** Contains Workflow Files */
+            contains_workflow_files: boolean;
+            /** Dedupe Key */
+            dedupe_key: string;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /** Objects */
+            objects: components["schemas"]["CandidateObjectDeclaration"][];
+            /** Patch Limit Bytes */
+            patch_limit_bytes: number;
+            repository: components["schemas"]["CandidateRepository"];
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /** Target Branch */
+            target_branch: string;
+            /** Title */
+            title: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
         };
         /**
          * CanvasCell
@@ -6818,6 +8042,67 @@ export interface components {
             thread_id?: string | null;
         };
         /**
+         * ChannelRuleOut
+         * @description One accepted rule a session loads at its start.
+         */
+        ChannelRuleOut: {
+            /**
+             * Accepted At
+             * Format: date-time
+             */
+            accepted_at: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Number */
+            number: number;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding";
+            /** Scope Label */
+            scope_label: string;
+            /** Text */
+            text: string;
+        };
+        /** ChannelRuleRefusal */
+        ChannelRuleRefusal: {
+            detail: components["schemas"]["ChannelRuleRefusalDetail"];
+        };
+        /**
+         * ChannelRuleRefusalDetail
+         * @description A coded refusal of the state router's learned rule routes.
+         */
+        ChannelRuleRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Fix */
+            fix: string;
+            /** Message */
+            message: string;
+        };
+        /**
+         * ChannelRulesOut
+         * @description The accepted rules a non-factory session loads at its start (#5801).
+         */
+        ChannelRulesOut: {
+            /**
+             * Proposals Enabled
+             * @description Whether the agent may propose rules (`memory_rule_proposals`).
+             */
+            proposals_enabled: boolean;
+            /**
+             * Rules
+             * @description Accepted rules of the agent scope, then of the credential's binding scope, each ordered by acceptance, at most 16 per scope.
+             */
+            rules: components["schemas"]["ChannelRuleOut"][];
+        };
+        /**
          * ChannelSelector
          * @description A bound channel named by the agent. ``kind`` is required in practice and
          *     refused by name when absent, so the agent learns what to send.
@@ -6918,6 +8203,67 @@ export interface components {
              */
             link_id: string;
         };
+        /**
+         * CodingInstructionsMetadata
+         * @description Public selection metadata; the private snapshot text is never serialized.
+         */
+        CodingInstructionsMetadata: {
+            /** Absence Reason */
+            absence_reason?: ("no_profile" | "no_verified_requester" | "tenant_disabled" | "application_unavailable" | "historical") | null;
+            /** Format Version */
+            format_version?: 1 | null;
+            /** Revision */
+            revision?: number | null;
+            /** Sha256 */
+            sha256?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "absent" | "selected";
+        };
+        /** CodingInstructionsOut */
+        CodingInstructionsOut: {
+            /**
+             * Application
+             * @enum {string}
+             */
+            application: "available" | "unavailable";
+            /** Byte Length */
+            byte_length: number;
+            /**
+             * Format Version
+             * @constant
+             */
+            format_version: 1;
+            /** Revision */
+            revision: number;
+            /** Sha256 */
+            sha256: string | null;
+            /** Tenant Enabled */
+            tenant_enabled: boolean;
+            /** Text */
+            text: string | null;
+            /** Updated At */
+            updated_at: string | null;
+        };
+        /** CodingInstructionsPolicyOut */
+        CodingInstructionsPolicyOut: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** CodingInstructionsPolicyWrite */
+        CodingInstructionsPolicyWrite: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** CodingInstructionsWrite */
+        CodingInstructionsWrite: {
+            /** Expected Revision */
+            expected_revision: number;
+            /** Text */
+            text: string;
+        };
         /** Completed */
         Completed: {
             /** Sha256 */
@@ -6941,6 +8287,26 @@ export interface components {
              * @constant
              */
             status?: "complete";
+        };
+        /**
+         * CompletionContractOut
+         * @description How the execution completes: by a pull request (``implementation``), or
+         *     by publishing a retained publication candidate with no model run
+         *     (``publication_recovery``, #5429).
+         *
+         *     ``execution`` is the ADR 0278 binding of an ``implementation`` execution.
+         *     A ``publication_recovery`` answer carries none: that process runs no
+         *     model, so it waits for no requester context.
+         */
+        CompletionContractOut: {
+            /**
+             * Completion Contract
+             * @enum {string}
+             */
+            completion_contract: "implementation" | "publication_recovery";
+            execution: components["schemas"]["ExecutionBindingOut"] | null;
+            /** Rule Proposal */
+            rule_proposal: boolean;
         };
         /**
          * ConnectorManifests
@@ -7013,11 +8379,16 @@ export interface components {
         };
         /**
          * ConsoleSessionOut
-         * @description The result of an exchange. Deliberately carries NO token.
+         * @description The result of an exchange or a session probe. Deliberately carries NO token.
          *
          *     The session token travels only as an `HttpOnly` cookie, so page script cannot
          *     read it -- putting it in the body would hand the credential straight back to
          *     the JavaScript this design exists to keep it away from.
+         *
+         *     ``kind`` is ``operator`` for a login-code session and ``principal`` for an
+         *     OIDC session. ``principal`` is populated only for the latter. A principal
+         *     session's ``subject`` is ``principal:<id>``, the same subject
+         *     ``authenticate_administrator`` already records.
          */
         ConsoleSessionOut: {
             /**
@@ -7025,8 +8396,37 @@ export interface components {
              * Format: date-time
              */
             expires_at: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "operator" | "principal";
+            principal: components["schemas"]["ConsoleSessionPrincipal"] | null;
             /** Subject */
             subject: string | null;
+        };
+        /**
+         * ConsoleSessionPrincipal
+         * @description The person a principal console session names. No token, no issuer.
+         */
+        ConsoleSessionPrincipal: {
+            /** Display Name */
+            display_name: string | null;
+            /** Email */
+            email: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+        };
+        /**
+         * ConsoleSignInMethodsOut
+         * @description Which unauthenticated sign-in paths this install offers.
+         */
+        ConsoleSignInMethodsOut: {
+            /** Oidc */
+            oidc: boolean;
         };
         /** Context */
         Context: {
@@ -7058,6 +8458,11 @@ export interface components {
              */
             ttl_s?: number;
         };
+        /** ContextBody */
+        ContextBody: {
+            /** Runtime Epoch */
+            runtime_epoch: number;
+        };
         /**
          * CostReport
          * @description Daily spend series + total for an agent (L1 Cost view).
@@ -7077,6 +8482,18 @@ export interface components {
             /** Total Usd */
             total_usd: number;
         };
+        /** CredentialFact */
+        CredentialFact: {
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "healthy" | "unhealthy" | "unknown";
+        };
         /**
          * CredentialHeader
          * @description The header form git accepts on a forge. GitLab refuses a Bearer header.
@@ -7092,6 +8509,20 @@ export interface components {
             generation: number;
             /** Id */
             id: string;
+        };
+        /** CreditFact */
+        CreditFact: {
+            /** Expires At */
+            expires_at: string | null;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "sufficient" | "insufficient" | "unknown";
         };
         /** Declaration */
         Declaration: {
@@ -7116,6 +8547,26 @@ export interface components {
             reason: string;
             /** Start Failure Detail */
             start_failure_detail?: string | null;
+        };
+        /**
+         * DeliveredLimitsIn
+         * @description The limits the worker read from the sandbox it claimed (#5427).
+         *
+         *     Read from the created sandbox, never from desired configuration. A null or
+         *     absent volume means the substrate enforces no such limit, which can never
+         *     release a resource gate.
+         */
+        DeliveredLimitsIn: {
+            /** Ephemeral Storage Bytes */
+            ephemeral_storage_bytes: number | null;
+            /** Max Turns */
+            max_turns: number | null;
+            /** Memory Bytes */
+            memory_bytes: number | null;
+            /** Scratch Bytes */
+            scratch_bytes: {
+                [key: string]: number;
+            };
         };
         /** DeploymentCreate */
         DeploymentCreate: {
@@ -7730,6 +9181,22 @@ export interface components {
              */
             version_id: string;
         };
+        /** ExecutableFact */
+        ExecutableFact: {
+            /** Basis */
+            basis: "selected_image_probe" | null;
+            /** Name */
+            name: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "present" | "absent" | "unknown";
+        };
         /**
          * ExecutionArguments
          * @description A claimed forward execution's bound call, read by its holder only.
@@ -7747,6 +9214,32 @@ export interface components {
             };
             /** Tool */
             tool: string;
+        };
+        /**
+         * ExecutionBindingOut
+         * @description The execution a runner process is bound to (ADR 0278, #5592).
+         *
+         *     The runner checks the worker's requester context envelope against it, and
+         *     its presence tells the runner to wait for one before any model work.
+         */
+        ExecutionBindingOut: {
+            /** Execution Fence */
+            execution_fence: number;
+            /**
+             * Execution Request Id
+             * Format: uuid
+             */
+            execution_request_id: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
         };
         /**
          * ExecutionClaim
@@ -7923,6 +9416,132 @@ export interface components {
              */
             tenant_id: string;
         };
+        /** FactoryFact */
+        FactoryFact: {
+            code_host_credential: components["schemas"]["CredentialFact"];
+            /** Enabled */
+            enabled: boolean;
+            /**
+             * Kill Switch
+             * @enum {string}
+             */
+            kill_switch: "clear" | "engaged" | "unknown";
+            /**
+             * Upgrade Pause
+             * @enum {string}
+             */
+            upgrade_pause: "clear" | "paused" | "unknown";
+        };
+        /** FactoryFacts */
+        FactoryFacts: {
+            /**
+             * Admission
+             * @constant
+             */
+            admission: "not_requested";
+            binding: components["schemas"]["BindingFact"];
+            /** Context Digest */
+            context_digest: string;
+            /**
+             * Deployment Readiness
+             * @constant
+             */
+            deployment_readiness: "unvalidated";
+            /** Executables */
+            executables: components["schemas"]["ExecutableFact"][];
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            factory: components["schemas"]["FactoryFact"];
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "factory_facts";
+            label_route: components["schemas"]["LabelRoute"] | null;
+            model_credit: components["schemas"]["CreditFact"];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            request: components["schemas"]["RequestIdentity"] | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /** Services */
+            services: components["schemas"]["ServiceFact"][];
+            subject: components["schemas"]["FactsSubject"];
+        };
+        /**
+         * FactorySlackKickoffIn
+         * @description One Slack mention linking an issue, at a channel root or in a thread no
+         *     factory run owns, as the worker consumed it.
+         *
+         *     ``receipt`` is the dispatcher's verified mention receipt
+         *     (``curie_internal.slack_mention_receipt.SlackMentionReceipt``, version 1
+         *     for a person, 2 for a declared test driver), validated by the route so a
+         *     malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
+         *     the message's own at root. ``author`` is the turn's Slack user id; the
+         *     receipt must name the same delivery, route and sender.
+         *     ``placeholder_ts`` is the ts of the dispatcher's placeholder reply under
+         *     the mention, None when it posted none; an admission stores it as the
+         *     run's progress card.
+         */
+        FactorySlackKickoffIn: {
+            /** Author */
+            author: string;
+            /** Channel */
+            channel: string;
+            /** Channel Identity */
+            channel_identity: string;
+            /** Delivery Id */
+            delivery_id: string;
+            /** Placeholder Ts */
+            placeholder_ts?: string | null;
+            /** Receipt */
+            receipt: {
+                [key: string]: unknown;
+            };
+            /** Root Ts */
+            root_ts: string;
+        };
+        /**
+         * FactorySlackKickoffOut
+         * @description The kickoff decision. ``reason`` is the resolver's reason for
+         *     ``sender_unverified``, the base refusal code for ``base_refused`` and the
+         *     admission refusal code for ``admission_refused``.
+         */
+        FactorySlackKickoffOut: {
+            /** Connect Url */
+            connect_url?: string | null;
+            /** Issue Url */
+            issue_url?: string | null;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "admitted" | "not_factory" | "receipt_mismatch" | "test_driver_refused" | "binding_missing" | "binding_ambiguous" | "link_missing" | "link_multiple" | "link_malformed" | "link_host_unsupported" | "link_pull_request" | "sender_unverified" | "enrollment_inactive" | "issue_inaccessible" | "issue_closed" | "publication_exists" | "base_refused" | "thread_conflict" | "authority_changed" | "admission_refused";
+            /** Plan Url */
+            plan_url?: string | null;
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Replayed
+             * @default false
+             */
+            replayed?: boolean;
+            /** Request Id */
+            request_id?: string | null;
+            /** Request Status */
+            request_status?: string | null;
+            /** Work Item Id */
+            work_item_id?: string | null;
+        };
         /**
          * FactorySlackSteerIn
          * @description One threaded Slack mention in a factory run's root, as the worker consumed it.
@@ -7981,6 +9600,15 @@ export interface components {
             /** Kind */
             kind: string;
         };
+        /** FactsSubject */
+        FactsSubject: {
+            /** Issue Number */
+            issue_number: number | null;
+            /** Repository Id */
+            repository_id: string;
+            /** Trigger Label */
+            trigger_label: string;
+        };
         /** FileDescriptor */
         FileDescriptor: {
             /** Current */
@@ -8004,11 +9632,16 @@ export interface components {
             ci_fix_round?: number | null;
             /** Detail */
             detail?: string | null;
+            /** Exhausted Volume */
+            exhausted_volume?: string | null;
             /**
              * Outcome
              * @enum {string}
              */
             outcome: "completed" | "failed";
+            retry_condition?: components["schemas"]["RetryCondition"] | null;
+            /** Retry Safety */
+            retry_safety?: ("no_effects" | "flagged" | "uncertain") | null;
             /** Runtime Epoch */
             runtime_epoch: number;
         };
@@ -8066,6 +9699,11 @@ export interface components {
          * @enum {string}
          */
         GateKind: "permission" | "policy";
+        /** GithubLinkStartOut */
+        GithubLinkStartOut: {
+            /** Authorize Url */
+            authorize_url: string;
+        };
         /**
          * GraderOut
          * @description A deterministic grader, mirroring the frozen eval-case Grader shape
@@ -8543,6 +10181,8 @@ export interface components {
              * Format: uuid
              */
             execution_request_id: string;
+            /** Publication Recovery */
+            publication_recovery: boolean;
         };
         /**
          * IssueReadResult
@@ -8573,6 +10213,28 @@ export interface components {
         KillState: {
             /** Killed */
             killed: boolean;
+        };
+        /** LabelRoute */
+        LabelRoute: {
+            /** Actor Id */
+            actor_id: string;
+            /**
+             * Actor Kind
+             * @constant
+             */
+            actor_kind: "human";
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * Route
+             * @enum {string}
+             */
+            route: "github_user" | "github_user_via_app";
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "eligible" | "ineligible" | "unknown";
         };
         /**
          * ListedTargets
@@ -8715,6 +10377,162 @@ export interface components {
             source?: string | null;
             /** Source Trace Ids */
             source_trace_ids?: string[];
+        };
+        /**
+         * MemoryRuleAuthRefusal
+         * @description A refused credential or console origin: one plain reason string.
+         */
+        MemoryRuleAuthRefusal: {
+            /** Detail */
+            detail: string;
+        };
+        /** MemoryRuleDecider */
+        MemoryRuleDecider: {
+            /** Display Name */
+            display_name: string | null;
+            /**
+             * Principal Id
+             * Format: uuid
+             */
+            principal_id: string;
+        };
+        /**
+         * MemoryRuleDecision
+         * @description The body of an accept, reject or remove: the version the person saw.
+         */
+        MemoryRuleDecision: {
+            /** Expected Version */
+            expected_version: number;
+        };
+        /** MemoryRuleDecisionOut */
+        MemoryRuleDecisionOut: {
+            /**
+             * Applies From
+             * @description When the decision takes effect. `next_ticket` for a repository scope rule: at the next ticket's admission; a running request keeps the rules it was admitted with. `next_session` for an agent or binding scope rule: at the next session start of the agent; a running session keeps the rules it loaded (#5801).
+             * @enum {string}
+             */
+            applies_from: "next_ticket" | "next_session";
+            rule: components["schemas"]["MemoryRuleOut"];
+        };
+        /** MemoryRuleOut */
+        MemoryRuleOut: {
+            /** Accepted At */
+            accepted_at: string | null;
+            accepted_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Label */
+            label: string;
+            /** Number */
+            number: number;
+            /**
+             * Proposed At
+             * Format: date-time
+             */
+            proposed_at: string;
+            /** Proposed By */
+            proposed_by: string;
+            /** Reason */
+            reason: string;
+            /** Rejected At */
+            rejected_at: string | null;
+            rejected_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /** Removed At */
+            removed_at: string | null;
+            removed_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding" | "repository";
+            /** Scope Label */
+            scope_label: string;
+            /** Source Url */
+            source_url: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "proposed" | "accepted" | "rejected" | "removed";
+            /** Text */
+            text: string;
+            /** Version */
+            version: number;
+        };
+        /**
+         * MemoryRuleRefusal
+         * @description Every coded learned rule refusal, a malformed request's 422 included.
+         */
+        MemoryRuleRefusal: {
+            detail: components["schemas"]["MemoryRuleRefusalDetail"];
+        };
+        /**
+         * MemoryRuleRefusalDetail
+         * @description A coded refusal: ``code`` is ``memory_rules.<name>``.
+         */
+        MemoryRuleRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Current Version */
+            current_version?: number | null;
+            /** Fix */
+            fix: string;
+            /** Limit */
+            limit?: number | null;
+            /** Limit Bytes */
+            limit_bytes?: number | null;
+            /** Message */
+            message: string;
+        };
+        /** MemoryRuleScopeOut */
+        MemoryRuleScopeOut: {
+            /** In Force Count */
+            in_force_count: number;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding" | "repository";
+            /** Scope Label */
+            scope_label: string;
+        };
+        /**
+         * MemoryRulesMetadata
+         * @description The learned rules pinned at admission (#5798): numbers and digest, never the text.
+         */
+        MemoryRulesMetadata: {
+            /**
+             * Count
+             * @default 0
+             */
+            count?: number;
+            /** Format Version */
+            format_version?: 1 | null;
+            /** Rule Numbers */
+            rule_numbers?: number[];
+            /** Sha256 */
+            sha256?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "absent" | "selected";
+        };
+        /** MemoryRulesOut */
+        MemoryRulesOut: {
+            /** In Force Limit */
+            in_force_limit: number;
+            /** Rules */
+            rules: components["schemas"]["MemoryRuleOut"][];
+            /** Scopes */
+            scopes: components["schemas"]["MemoryRuleScopeOut"][];
         };
         /**
          * MemoryTraceBackOut
@@ -8908,6 +10726,30 @@ export interface components {
              */
             request_id: string;
         };
+        /** OwnedLinkOut */
+        OwnedLinkOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Display Label */
+            display_label: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Provider */
+            provider: string;
+        };
+        /** OwnedLinksOut */
+        OwnedLinksOut: {
+            /** Github Link Available */
+            github_link_available: boolean;
+            /** Links */
+            links: components["schemas"]["OwnedLinkOut"][];
+        };
         /** Owner */
         Owner: {
             /**
@@ -9027,6 +10869,50 @@ export interface components {
             status: string;
             /** Version */
             version: number;
+        };
+        /**
+         * PersonalEnrollmentOut
+         * @description The caller's own enrollment; ``generation`` and ``version`` are null when absent.
+         */
+        PersonalEnrollmentOut: {
+            /** Generation */
+            generation: number | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "absent" | "active" | "inactive";
+            teardown: components["schemas"]["PersonalEnrollmentTeardownOut"];
+            /** Version */
+            version: number | null;
+        };
+        /**
+         * PersonalEnrollmentTeardownOut
+         * @description Teardown still owed after a replace or disconnect.
+         */
+        PersonalEnrollmentTeardownOut: {
+            /** Pending Custody Cleanup */
+            pending_custody_cleanup: number;
+            /** Pending Runtimes */
+            pending_runtimes: number;
+        };
+        /**
+         * PersonalEnrollmentWrite
+         * @description ``PUT /personal-claude/enrollment``. ``expected_version`` is null only for enroll.
+         */
+        PersonalEnrollmentWrite: {
+            /** Expected Version */
+            expected_version?: number | null;
+            /**
+             * Intent
+             * @enum {string}
+             */
+            intent: "enroll" | "replace" | "reconnect";
+            /**
+             * Token
+             * Format: password
+             */
+            token: string;
         };
         /** PhaseDeclaration */
         PhaseDeclaration: {
@@ -9655,6 +11541,16 @@ export interface components {
              * Format: uuid
              */
             revision_id: string;
+        };
+        /**
+         * QuestionsOut
+         * @description The posted round: ``round`` of ``rounds_limit`` for the WorkItem.
+         */
+        QuestionsOut: {
+            /** Round */
+            round: number;
+            /** Rounds Limit */
+            rounds_limit: number;
         };
         /**
          * QueuedTurn
@@ -10680,6 +12576,13 @@ export interface components {
             /** Project Id */
             project_id: string;
         };
+        /** RequestIdentity */
+        RequestIdentity: {
+            /** Comment Id */
+            comment_id: string;
+            /** Digest */
+            digest: string;
+        };
         /**
          * ResolveTargetRequest
          * @description A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).
@@ -10717,6 +12620,89 @@ export interface components {
             /** Slack Channel */
             slack_channel?: string | null;
         };
+        /**
+         * ResourceGateOut
+         * @description The raised limit a blocked retry of a resource failure waits for (#5427).
+         *
+         *     ``failed_limit`` is the limit the failed attempt actually had; the retry
+         *     starts only when the limit delivered to its own sandbox is larger.
+         *     ``volume`` names the scratch volume for a scratch gate.
+         */
+        ResourceGateOut: {
+            /** Condition */
+            condition: string;
+            /**
+             * Dimension
+             * @enum {string}
+             */
+            dimension: "memory" | "ephemeral_storage" | "scratch" | "max_turns" | "history_capacity" | "execution_seconds";
+            /** Failed Limit */
+            failed_limit: number;
+            /** Volume */
+            volume: string | null;
+        };
+        /**
+         * RetryCondition
+         * @description Provider-derived evidence that a failed turn should wait before a retry.
+         *
+         *     Carried as ``ErrorEvent.retry_condition``. A missing or null carrier means
+         *     no trusted retry condition, and a consumer must never read that as retry
+         *     now. A present carrier is evidence for a wait. It is never authorization,
+         *     an approval, an increased limit, or permission to replay an effect: the
+         *     no-retry-after-side-effects rule and every other gate still apply.
+         *
+         *     ``reason`` is the closed ``RetryReason`` the producer derived from the
+         *     provider's own signal. Nothing infers a reset from
+         *     ``ErrorEvent.classification``; a classification token alone never creates
+         *     a retry condition.
+         *
+         *     ``retry_at`` is optional. When present it is an absolute, provider-derived
+         *     UTC instant spelled as ``RETRY_AT_PATTERN`` describes. Naive values,
+         *     numeric offsets (``+00:00`` included), unix numbers and every other
+         *     spelling are refused rather than coerced, so every lane reads the same
+         *     instant. A past instant is valid; consumers judge time themselves. The
+         *     scheduler adds its own separate 60 second reset grace; the producer reports
+         *     the provider's time without it. A Python ``datetime`` is accepted only with
+         *     a zero UTC offset and is normalized to ``UTC``, so every Python producer
+         *     writes the ``Z`` form. Python also normalizes the fraction spelling on
+         *     re-encode (``.5Z`` becomes ``.500000Z`` and a zero fraction is dropped)
+         *     while the generated Rust keeps the received string; both name the same
+         *     instant.
+         *
+         *     ``scope_key`` is optional. When present it is an opaque digest of the
+         *     credential scope the condition applies to, ``sha256:`` followed by 64
+         *     lowercase hex digits (``RETRY_SCOPE_KEY_PATTERN``). It is never a
+         *     credential value, an account name or a provider message. The grammar check
+         *     is the only guard on it and is not a secret detector, so a producer must
+         *     derive the value from a digest rather than rely on validation to catch a
+         *     leak.
+         */
+        RetryCondition: {
+            reason: components["schemas"]["RetryReason"];
+            /** Retry At */
+            retry_at?: string | null;
+            /** Scope Key */
+            scope_key?: string | null;
+        };
+        /**
+         * RetryReason
+         * @description Why a provider asked the platform to wait before another attempt.
+         *
+         *     Carried only inside ``RetryCondition``. Each value names the provider's
+         *     signal, not a platform decision: ``rate_limited`` is a request rate limit,
+         *     ``usage_reset`` is a usage allowance that resets at a provider time,
+         *     ``credit_exhausted`` is a spent credit balance, ``credential_rejected`` is
+         *     a credential the provider refused, and ``transient_service`` is a temporary
+         *     provider service failure. These are deliberately not the hyphenated
+         *     ``ErrorEvent.classification`` tokens, and neither vocabulary maps onto the
+         *     other.
+         *
+         *     A closed enum, not free text: an unknown value is refused on the wire,
+         *     never read as an absent condition. Adding a value is a breaking change
+         *     under ADR 0036.
+         * @enum {string}
+         */
+        RetryReason: "rate_limited" | "usage_reset" | "credit_exhausted" | "credential_rejected" | "transient_service";
         /**
          * RevalidationBody
          * @description The versions the caller read, compared and set in one transaction.
@@ -10964,6 +12950,18 @@ export interface components {
             repo_full_name: string;
         };
         /**
+         * RuleProposalOut
+         * @description A stored proposal: a hidden candidate, shown to a person only after the
+         *     pull request merges.
+         */
+        RuleProposalOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "candidate";
+        };
+        /**
          * RunnerPods
          * @description The runner sandbox pods in a namespace (populates the Logs pod dropdown).
          */
@@ -10993,7 +12991,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch") | null;
+            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "resource_gate_unmet" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -11101,6 +13099,20 @@ export interface components {
              * Format: uuid
              */
             id: string;
+        };
+        /** ServiceFact */
+        ServiceFact: {
+            /** Name */
+            name: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "configured" | "observed" | "unknown";
         };
         /**
          * SettingConfig
@@ -11269,6 +13281,7 @@ export interface components {
             /** Claim Name */
             claim_name: string;
             context: components["schemas"]["FactoryContext"];
+            delivered_limits: components["schemas"]["DeliveredLimitsIn"];
             /** Generation */
             generation: number;
             /** Owner */
@@ -11384,6 +13397,8 @@ export interface components {
         };
         /** TerminationBody */
         TerminationBody: {
+            /** Expected Request Version */
+            expected_request_version: number;
             /** Observation */
             observation: string;
             /** Runtime Epoch */
@@ -11393,6 +13408,16 @@ export interface components {
         TerminationClaimBody: {
             /** Owner */
             owner: string;
+        };
+        /**
+         * TerminationClaimOut
+         * @description What the claimant's termination record presents back (#5377).
+         */
+        TerminationClaimOut: {
+            /** Request Version */
+            request_version: number;
+            /** Runtime Epoch */
+            runtime_epoch: number;
         };
         /** ThreadAttachmentAppend */
         ThreadAttachmentAppend: {
@@ -11914,6 +13939,33 @@ export interface components {
             version_id?: string | null;
         };
         /**
+         * WorkItemCiObservationOut
+         * @description Item-level observation; the failed execution remains historical truth.
+         */
+        WorkItemCiObservationOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Head Sha */
+            head_sha: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "observing" | "completed" | "expired" | "invalidated";
+        };
+        /**
          * WorkItemCiOut
          * @description A live, unpersisted CI observation of the published head.
          */
@@ -11966,9 +14018,15 @@ export interface components {
              * Format: uuid
              */
             agent_id: string;
+            /** Automatic Retries Used */
+            automatic_retries_used: number;
+            /** Automatic Retry Limit */
+            automatic_retry_limit: number;
             /** Cancelled At */
             cancelled_at: string | null;
             ci: components["schemas"]["WorkItemCiOut"] | null;
+            ci_observation?: components["schemas"]["WorkItemCiObservationOut"] | null;
+            coding_instructions: components["schemas"]["CodingInstructionsMetadata"];
             correctness: components["schemas"]["WorkItemCorrectnessOut"];
             /**
              * Created At
@@ -11982,6 +14040,7 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            memory_rules: components["schemas"]["MemoryRulesMetadata"];
             /**
              * Model Auth Mode
              * @default service
@@ -12000,6 +14059,8 @@ export interface components {
             repository: components["schemas"]["WorkItemRepositoryOut"];
             /** Requester */
             requester: string | null;
+            /** Requester Principal Id */
+            requester_principal_id?: string | null;
             /** Requests */
             requests: components["schemas"]["WorkItemRequestOut"][];
             /**
@@ -12029,7 +14090,7 @@ export interface components {
         };
         /**
          * WorkItemProgressOut
-         * @description The latest execution's progress, derived by ``factory_progress.phase_view``.
+         * @description The latest execution's progress, derived by ``factory_phase_view.phase_view``.
          */
         WorkItemProgressOut: {
             /** Current */
@@ -12068,13 +14129,28 @@ export interface components {
          *     allowlist dict, never from an ORM row, so no runtime-owner field leaks.
          */
         WorkItemRequestOut: {
+            /** Blocked On */
+            blocked_on: string | null;
             /** Capacity Deferrals */
             capacity_deferrals: number;
+            /**
+             * Coding Instructions Evidence
+             * @default none
+             * @enum {string}
+             */
+            coding_instructions_evidence?: "none" | "pending" | "applied" | "failed";
+            /** Coding Instructions Selection Id */
+            coding_instructions_selection_id?: string | null;
             /**
              * Created At
              * Format: date-time
              */
             created_at: string;
+            /**
+             * Dispatch Not Before
+             * Format: date-time
+             */
+            dispatch_not_before: string;
             /** Enrollment Generation */
             enrollment_generation?: number | null;
             /** Execution Deadline */
@@ -12084,6 +14160,12 @@ export interface components {
             /** Last Start Failure Detail */
             last_start_failure_detail: string | null;
             /**
+             * Memory Rules Evidence
+             * @default none
+             * @enum {string}
+             */
+            memory_rules_evidence?: "none" | "pending" | "applied" | "failed";
+            /**
              * Model Auth Mode
              * @default service
              * @enum {string}
@@ -12091,6 +14173,13 @@ export interface components {
             model_auth_mode?: "service" | "personal";
             /** Owner Principal Id */
             owner_principal_id?: string | null;
+            resource_gate: components["schemas"]["ResourceGateOut"] | null;
+            /** Retry Kind */
+            retry_kind: ("owner_loss" | "failure") | null;
+            /** Retry Of Request Id */
+            retry_of_request_id: string | null;
+            /** Retry Safety */
+            retry_safety: ("no_effects" | "flagged" | "uncertain") | null;
             /** Sequence */
             sequence: number;
             /** Started At */
@@ -12107,6 +14196,89 @@ export interface components {
             termination_observation: string | null;
             /** Wait Deadline */
             wait_deadline: string | null;
+        };
+        /**
+         * WorkItemRetryIn
+         * @description An operator's request to admit one fresh request for a failed WorkItem (#5431).
+         *
+         *     ``request_id`` is the operator's idempotency key. ``expected_version`` is
+         *     the WorkItem version the operator read. ``dry_run`` answers the exact plan
+         *     and writes nothing, reserving neither the key nor a retry slot.
+         */
+        WorkItemRetryIn: {
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run?: boolean;
+            /** Expected Version */
+            expected_version: number;
+            /** Reason */
+            reason: string;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+        };
+        /**
+         * WorkItemRetryOut
+         * @description The admission an operator retry made, would make (dry run) or made before (replay).
+         *
+         *     ``disposition`` is the successor's kind: ``implementation`` reruns the
+         *     work, ``publication_recovery`` publishes the retained candidate without a
+         *     model run. ``retries_used`` counts the slot this admission spends.
+         *     ``successor_request_id`` and ``recorded_at`` are null in a dry run.
+         */
+        WorkItemRetryOut: {
+            /**
+             * Actor Kind
+             * @enum {string}
+             */
+            actor_kind: "platform_key" | "console_session";
+            /**
+             * Disposition
+             * @enum {string}
+             */
+            disposition: "implementation" | "publication_recovery";
+            /** Dry Run */
+            dry_run: boolean;
+            /** Predecessor Cause */
+            predecessor_cause: string;
+            /**
+             * Predecessor Request Id
+             * Format: uuid
+             */
+            predecessor_request_id: string;
+            /** Recorded At */
+            recorded_at: string | null;
+            /** Replayed */
+            replayed: boolean;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Retries Used */
+            retries_used: number;
+            /** Retry Limit */
+            retry_limit: number;
+            /** Successor Blocked On */
+            successor_blocked_on: string | null;
+            /**
+             * Successor Dispatch Not Before
+             * Format: date-time
+             */
+            successor_dispatch_not_before: string;
+            /** Successor Request Id */
+            successor_request_id: string | null;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+            /** Work Item Version */
+            work_item_version: number;
         };
         /**
          * WorkItemStageOut
@@ -14564,6 +16736,328 @@ export interface operations {
             };
         };
     };
+    list_rules_agents__agent_id__memory_rules_get: {
+        parameters: {
+            query?: {
+                state?: ("proposed" | "accepted" | "rejected" | "removed") | null;
+                scope_kind?: ("agent" | "binding" | "repository") | null;
+                scope_key?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRulesOut"];
+                };
+            };
+            /** @description No platform key or live console session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description Console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found`: no such agent, or a principal session of another tenant */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    accept_rule_agents__agent_id__memory_rules__rule_id__accept_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    reject_rule_agents__agent_id__memory_rules__rule_id__reject_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    remove_rule_agents__agent_id__memory_rules__rule_id__remove_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
     edit_memory_agents__agent_id__memory__index__put: {
         parameters: {
             query?: never;
@@ -14889,6 +17383,175 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_rules_agents__agent_id__state__rules_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `ChannelRulesOut` for a scoped sandbox credential with memory claims; for every other caller the `_rules` key/value namespace listing, as `GET /agents/{agent_id}/state/{namespace}` answers it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRulesOut"] | components["schemas"]["StateEntryOut"][];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description Another agent's credential, a released credential, or one naming no valid channel */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `agent_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description `rules_unavailable`, or the credential could not be checked (a plain string) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+        };
+    };
+    propose_rule_agents__agent_id__state__rules_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Reason
+                     * @description Why it should always apply, at most 240 UTF-8 bytes.
+                     */
+                    reason: string;
+                    /**
+                     * Rule
+                     * @description The rule, one line of at most 240 UTF-8 bytes.
+                     */
+                    rule: string;
+                    /**
+                     * Scope
+                     * @description `channel`: the credential's own binding. `agent`: every channel.
+                     * @default channel
+                     * @enum {string}
+                     */
+                    scope?: "channel" | "agent";
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleOut"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description A credential that may not propose (a plain string: another agent's, not a turn credential, read-only, released, or its turn ended), or `rule_proposal_not_eligible` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `agent_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description `rule_already_proposed` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description `invalid_body`, `invalid_text`, `too_large` or `reserved_text`, or a malformed agent id */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description `rule_proposal_unavailable`, or the credential or its turn could not be checked (a plain string) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
                 };
             };
         };
@@ -16633,6 +19296,105 @@ export interface operations {
             };
         };
     };
+    read_coding_instructions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    write_coding_instructions_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodingInstructionsWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clear_coding_instructions_delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_config_config_get: {
         parameters: {
             query?: never;
@@ -16794,7 +19556,9 @@ export interface operations {
     };
     oidc_login_console_oidc_login_get: {
         parameters: {
-            query?: never;
+            query?: {
+                return_to?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -16807,6 +19571,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };
@@ -16901,6 +19674,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sign_in_methods_console_sign_in_methods_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConsoleSignInMethodsOut"];
                 };
             };
         };
@@ -17597,6 +20390,42 @@ export interface operations {
             };
         };
     };
+    get_factory_facts_factory_facts_get: {
+        parameters: {
+            query: {
+                repository: string;
+                trigger_label: string;
+                executables?: string;
+                services?: string;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactoryFacts"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_forge_credential_health_forges_credentials_health_get: {
         parameters: {
             query?: never;
@@ -17953,6 +20782,76 @@ export interface operations {
             };
         };
     };
+    coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsPolicyOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodingInstructionsPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsPolicyOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     revoke_link_identity_admin__tenant_id__links__link_id__revoke_post: {
         parameters: {
             query?: never;
@@ -18271,6 +21170,131 @@ export interface operations {
                 };
                 content: {
                     "text/html": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    start_github_link_identity_me_github_link_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubLinkStartOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    github_link_callback_identity_me_github_link_callback_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+                "__Host-curie_github_link_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            307: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_links_identity_me_links_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnedLinksOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    unlink_identity_me_links__link_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                link_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityLinkRevokedOut"];
                 };
             };
             /** @description Validation Error */
@@ -18716,6 +21740,169 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    read_enrollment_personal_claude_enrollment_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalEnrollmentOut"];
+                };
+            };
+            /** @description No live principal session, or another credential was presented */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `invalid_enrollment_request`; the input is never echoed */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    write_enrollment_personal_claude_enrollment_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalEnrollmentWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalEnrollmentOut"];
+                };
+            };
+            /** @description No live principal session, or another credential was presented */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Version or intent conflict: `detail.code` names it */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `invalid_enrollment_request`; the input is never echoed */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `custody_unconfigured`, `custody_unavailable`, `enrollment_busy` or `personal_rollout_in_progress` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    disconnect_enrollment_personal_claude_enrollment_delete: {
+        parameters: {
+            query: {
+                expected_version: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalEnrollmentOut"];
+                };
+            };
+            /** @description No live principal session, or another credential was presented */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `enrollment_absent` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Version or intent conflict: `detail.code` names it */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `invalid_enrollment_request`; the input is never echoed */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `custody_unconfigured`, `custody_unavailable`, `enrollment_busy` or `personal_rollout_in_progress` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -19590,6 +22777,41 @@ export interface operations {
             };
         };
     };
+    kickoff_factory_run_v1_internal_factory_slack_kickoff_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorySlackKickoffIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactorySlackKickoffOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     steer_factory_run_v1_internal_factory_slack_steer_post: {
         parameters: {
             query?: never;
@@ -19897,6 +23119,356 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    acquire_reader_v1_internal_publication_candidates_acquire_reader_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateAcquireReader"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateReader"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    claim_collection_v1_internal_publication_candidates_claim_collection_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateClaimCollection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateCollectionClaims"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    complete_v1_internal_publication_candidates_complete_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateComplete"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateCompletion"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    context_v1_internal_publication_candidates_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateCaptureAuthority"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateCaptureContext"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    fail_v1_internal_publication_candidates_fail_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateFail"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateCaptureFailure"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    finalize_collection_v1_internal_publication_candidates_finalize_collection_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateFinalizeCollection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateFinalized"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    outcome_v1_internal_publication_candidates_outcome_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateOutcome"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateOutcomeRecorded"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recovery_v1_internal_publication_candidates_recovery_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateCaptureAuthority"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateRecovery"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    release_reader_v1_internal_publication_candidates_release_reader_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateReleaseReader"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateAcknowledged"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reserve_v1_internal_publication_candidates_reserve_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateReserve"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateReservation"];
+                };
             };
             /** @description Validation Error */
             422: {
@@ -20911,6 +24483,84 @@ export interface operations {
             };
         };
     };
+    read_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContextBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    acknowledge_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_acknowledgment_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcknowledgmentBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     declare_work_item_owner_lost_v1_internal_work_items_requests__request_id__owner_lost_post: {
         parameters: {
             query?: never;
@@ -20925,6 +24575,84 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["OwnerLostBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_requester_context_v1_internal_work_items_requests__request_id__requester_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContextBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    acknowledge_requester_context_v1_internal_work_items_requests__request_id__requester_context_acknowledgment_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcknowledgmentBody"];
             };
         };
         responses: {
@@ -21051,9 +24779,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["TerminationClaimOut"];
                 };
             };
             /** @description Validation Error */
@@ -21823,6 +25549,37 @@ export interface operations {
             };
         };
     };
+    read_completion_contract_work_items_completion_contract_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CompletionContractOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     read_work_item_issue_work_items_issue_read_post: {
         parameters: {
             query?: never;
@@ -21841,6 +25598,98 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["IssueReadResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_questions_work_items_questions_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Questions
+                     * @description 1 to 10 questions, each 1 to 1,000 characters with no blank line.
+                     */
+                    questions?: unknown;
+                    /**
+                     * Summary
+                     * @description What the investigation found, 1 to 4,000 characters, including a reproduction result when there is one.
+                     */
+                    summary?: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QuestionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_rule_proposal_work_items_rule_proposal_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Reason
+                     * @description Why the feedback states a general rule, at most 240 UTF-8 bytes.
+                     */
+                    reason: string;
+                    /**
+                     * Rule
+                     * @description The rule, one sentence of at most 240 UTF-8 bytes.
+                     */
+                    rule: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleProposalOut"];
                 };
             };
             /** @description Validation Error */
@@ -21876,6 +25725,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkItemOutcomeOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_candidates_work_items__work_item_id__publication_candidates_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidatePublicList"];
                 };
             };
             /** @description Validation Error */
@@ -21978,6 +25860,43 @@ export interface operations {
                 };
                 content: {
                     "application/octet-stream": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_work_item_work_items__work_item_id__retry_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkItemRetryIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkItemRetryOut"];
                 };
             };
             /** @description Validation Error */

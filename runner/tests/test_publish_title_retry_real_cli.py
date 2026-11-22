@@ -47,6 +47,7 @@ _TITLELESS_CALL_ID = "toolu_acme_titleless1"
 _RETRY_CALL_ID = "toolu_acme_retry1"
 _RETRY_TITLE = "Ship the documentation update (#4460)"
 _BODY = "Explain the requested documentation changes.\n"
+_BLANK_TITLE = "   "
 _SESSION_ID = "session-PLACEHOLDER-publish-retry"
 _SYSTEM_PROMPT = "You publish the requested changes."
 _TURN_TIMEOUT_S = 120
@@ -182,7 +183,10 @@ async def _messages(request: web.Request) -> web.StreamResponse:
         request.app[_EMITTED].append((_RETRY_CALL_ID, arguments))
         retry = _tool_block(_RETRY_CALL_ID, PLATFORM_PUBLISH_TOOL_NAME, arguments)
         return await _stream(request, body, [retry], "tool_use")
-    arguments = {"body": _BODY}
+    # A blank title: the tool schema accepts it, so the CLI runs the tool body
+    # and the runner's own validation refuses it. A missing title never gets
+    # that far: the CLI's schema check answers it first.
+    arguments = {"title": _BLANK_TITLE, "body": _BODY}
     request.app[_EMITTED].append((_TITLELESS_CALL_ID, arguments))
     titleless = _tool_block(_TITLELESS_CALL_ID, PLATFORM_PUBLISH_TOOL_NAME, arguments)
     return await _stream(request, body, [titleless], "tool_use")
@@ -290,7 +294,7 @@ def test_a_titleless_publish_denies_and_the_retry_records_the_publication(
     # deny came back to it, the corrected one. Red before #4460: the first deny
     # stopped the turn, so the corrected call was never requested.
     assert emitted == [
-        (_TITLELESS_CALL_ID, {"body": _BODY}),
+        (_TITLELESS_CALL_ID, {"title": _BLANK_TITLE, "body": _BODY}),
         (_RETRY_CALL_ID, {"title": _RETRY_TITLE, "body": _BODY}),
     ], emitted
 

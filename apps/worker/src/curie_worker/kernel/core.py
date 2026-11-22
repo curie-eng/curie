@@ -60,6 +60,7 @@ from . import (
     lifecycle,
     memory,
     publication,
+    publication_recovery,
     route_tokens,
     routing,
     sweep_slices,
@@ -70,6 +71,9 @@ from .work_items import _SettlingWorkItem
 
 if TYPE_CHECKING:
     from ..factory_steering import FactorySteeringClient
+    from ..personal_execution import PersonalExecution
+    from ..publication_candidate_capture import PublicationCandidateCapture
+    from ..publication_candidate_storage import CandidateReader
 
 
 class Kernel:
@@ -110,7 +114,10 @@ class Kernel:
         progress: ProgressStore | None = None,
         bundles: BundleReader | None = None,
         recovery: WorkspaceRecoveryCapture | None = None,
+        publication_candidates: PublicationCandidateCapture | None = None,
+        publication_candidate_reader: CandidateReader | None = None,
         factory_steering: FactorySteeringClient | None = None,
+        personal_execution: PersonalExecution | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -149,6 +156,14 @@ class Kernel:
         # The terminal recovery capture (ADR 0251, #5143). None, the default and
         # the disabled configuration, keeps every release on the plain path.
         self._recovery = recovery
+        # The publication candidate capture (#5428). None, the default and the
+        # disabled configuration, validates every publication snapshot exactly
+        # as before; wired, a started WorkItem run's snapshot is retained first.
+        self._publication_candidates = publication_candidates
+        # The candidate reader a publication recovery run reads its one
+        # retained candidate through (#5429). None refuses every recovery run
+        # ``recovery_unavailable``; no other run reads it.
+        self._publication_candidate_reader = publication_candidate_reader
         # The inbound-attachment lane (#2567), optional on exactly the same
         # terms as the workspace lane above: a deployment that has not wired it
         # runs every turn unchanged rather than discovering a missing attribute.
@@ -198,6 +213,10 @@ class Kernel:
         # ordinary path; wired, a mention in a factory run's Slack root is
         # answered by the API's steering decision and never claims a sandbox.
         self._factory_steering = factory_steering
+        # The personal execution authority (#5378, ADR 0268). Every production
+        # entry point wires it; a WorkItem request is then launched only as the
+        # owner its own snapshot names. None (a unit harness) enforces nothing.
+        self._personal_execution = personal_execution
         # ADR 0100: where a turn's channel read grant is read from (the stored
         # bundle's manifest). None means the grant is never known locally.
         self._bundles = bundles
@@ -293,6 +312,7 @@ class Kernel:
     _attempt = attempt._attempt
     _attempt_turn = attempt._attempt_turn
     _require_tool_access = attempt._require_tool_access
+    _retain_and_validate_publication_snapshot = attempt._retain_and_validate_publication_snapshot
     _consume = attempt._consume
     _start_progress_pump = attempt._start_progress_pump
     _apply_frame = attempt._apply_frame
@@ -365,7 +385,9 @@ class Kernel:
     _require_channel_read = channel_read._require_channel_read
     _bind_publication_context = publication._bind_publication_context
     _request_not_running = publication._request_not_running
+    _continuation_refused = publication._continuation_refused
     _continue_unpublished = publication._continue_unpublished
+    _recover_publication = publication_recovery._recover_publication
     _target_for = routing._kernel_target_for
     _adopt_ref = routing._adopt_ref
     _reply_for = routing._reply_for
@@ -386,6 +408,7 @@ class Kernel:
     _evict_expired_held_work_items = work_items._evict_expired_held_work_items
     _forget_held_work_items = work_items._forget_held_work_items
     _run_for_event = work_items._run_for_event
+    _started_execute_run = work_items._started_execute_run
     _is_factory_work_item_turn = work_items._is_factory_work_item_turn
     _work_item_repository = work_items._work_item_repository
     _execution_deadline_for = work_items._execution_deadline_for

@@ -719,6 +719,7 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
         runner_api_base_url="http://crash-api:8000",
         api_key="crash-proof-platform-key",
         workspace_enabled=False,
+        publication_candidates_enabled=False,
     )
     storage = build_s3_client(
         endpoint_url=config.s3_endpoint_url,

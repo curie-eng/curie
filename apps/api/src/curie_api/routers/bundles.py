@@ -125,6 +125,10 @@ async def upload_bundle(
             {"detail": "bundle failed validation", "errors": exc.errors},
         ) from exc
 
+    agent = await crud_agents.get_agent(session, agent_id)
+    if agent is None:  # pragma: no cover -- the version lookup above proves it
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+
     # The declared/bound approval-route join, CONDITIONAL on this version already
     # being live (#2436). `DeploymentCreate` carries no bundle and
     # `revalidate_stored_bundle` no-ops on a null `bundle_ref`, so a version can
@@ -145,9 +149,6 @@ async def upload_bundle(
     # leaves `bundle_ref` null -- `crud.versions.attach_bundle` commits immediately, so a
     # check placed after it would already be live.
     if await crud_deployments.version_has_active_deployment(session, version_id):
-        agent = await crud_agents.get_agent(session, agent_id)
-        if agent is None:  # pragma: no cover -- the version lookup above proves it
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
         try:
             await deploy.check_routes_from_bytes(
                 data, agent.approval_routes, version_id, get_settings()

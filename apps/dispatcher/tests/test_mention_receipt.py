@@ -7,8 +7,10 @@ it. The receipt carries the complete event text exactly as Slack delivered it,
 mention markup and boundary whitespace included, before the self-mention strip
 and before the thread-context rewrite quotes a bot-rooted thread's root into
 the turn text. The queued turn keeps the normalized text. A root mention
-(thread_ts equal to ts), a direct message, a bot author, a marked test action,
-a refused caller, and an HTTP-selected mention write none.
+without an issue link (thread_ts absent or equal to ts), a direct message (even
+one linking an issue), a bot author, a refused caller, and an HTTP-selected
+mention write none. Root issue-link mentions and declared test drivers (#5380)
+are covered in test_factory_slack_kickoff_receipt.py.
 
 Driven through Bolt's real SocketModeHandler.handle and the real Valkey. Only
 the Slack Web API (a recording stand-in) and the platform API
@@ -31,7 +33,6 @@ from curie_channel_gateway.slack.app import build_app
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.identities import SlackIdentityCredentials, delivery_key
 from curie_channel_gateway.slack.identity import slack_evidence
-from curie_internal.driver_declaration import DeclaredDriver
 from curie_internal.turn_queue import from_stream_fields
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -49,10 +50,12 @@ PLACEHOLDER_TS = "1700000000.000300"
 # CURIE_MENTION_RECEIPT_TTL_SECONDS default.
 RECEIPT_TTL_S = 604800
 ROOT_TEXT = "Factory run for acme-corp/acme-bot issue 41"
+# Slack delivers a linked URL as <URL> (observed over Socket Mode on a real test
+# workspace, 2026-11-12; https://docs.slack.dev/messaging/formatting-message-text).
+ISSUE_LINK = "<https://github.com/acme-corp/acme-bot/issues/41>"
 NAMED = SlackIdentityCredentials(
     name="acme-factory", app_token="xapp-named", bot_token="xoxb-named"
 )
-MARKED_DRIVER = DeclaredDriver(CHANNEL, "B0EXAMPLE1", "U0EXAMPLE8")
 
 
 def _steering() -> tuple[str, type]:
@@ -164,8 +167,13 @@ def _deliver(
     identity: SlackIdentityCredentials | None = None,
     identity_bots: dict[str, str] | None = None,
     require_clean: bool = True,
+    payload: dict[str, Any] | None = None,
 ) -> tuple[MagicMock, list[BaseException]]:
-    """One envelope through a freshly built app, drained before returning."""
+    """One envelope through a freshly built app, drained before returning.
+
+    ``payload`` replaces the minimal envelope ``_body`` builds, for a test that
+    delivers a complete recorded envelope.
+    """
 
     web_client = WebClient(token="xoxb-test")
     post = MagicMock(return_value={"ok": True, "ts": PLACEHOLDER_TS})
@@ -195,7 +203,7 @@ def _deliver(
     request = SocketModeRequest(
         type="events_api",
         envelope_id=f"env-{uuid.uuid4().hex[:8]}",
-        payload=_body(event_id, event),
+        payload=payload if payload is not None else _body(event_id, event),
     )
     try:
         handler.handle(FakeSocketClient(), request)
@@ -342,7 +350,13 @@ def test_a_human_thread_mention_writes_one_receipt_with_its_turn(
 
 @pytest.mark.parametrize(
     "case",
-    ["root_mention", "direct_message", "bot_thread_mention", "marked_action", "refused_caller"],
+    [
+        "root_mention_without_link",
+        "direct_message",
+        "bot_thread_mention",
+        "refused_caller",
+        "refused_root_link_caller",
+    ],
 )
 def test_lanes_that_cannot_steer_write_no_receipt(
     redis_client: redis.Redis,
@@ -355,13 +369,13 @@ def test_lanes_that_cannot_steer_write_no_receipt(
     delivery_id = delivery_key(event_id, "default")
     delivered.append(delivery_id)
     identity_bots: dict[str, str] | None = None
-    cfg = config
-    if case == "root_mention":
+    if case == "root_mention_without_link":
         # Slack echoes thread_ts equal to ts for the root message.
         event = _mention("<@U0BOT> start something", thread_ts=REPLY_TS)
         expected_turns = 1
     elif case == "direct_message":
-        event = _direct_message("please revise the pull request")
+        # A direct message is never a kickoff, even when it links an issue.
+        event = _direct_message(f"please start {ISSUE_LINK}")
         expected_turns = 1
     elif case == "bot_thread_mention":
         # A sibling identity's bot is admitted in a thread, so the turn exists.
@@ -369,25 +383,19 @@ def test_lanes_that_cannot_steer_write_no_receipt(
         event = _mention("<@U0BOT> continue", user=None, bot_id="B0EXAMPLE1")
         identity_bots = {"B0EXAMPLE1": "U0EXAMPLE9"}
         expected_turns = 1
-    elif case == "marked_action":
-        cfg = config.model_copy(
-            update={
-                "test_installation_enabled": True,
-                "test_installation_drivers": (MARKED_DRIVER,),
-            }
-        )
-        event = _mention(
-            "<@U0BOT> [test action] act", user="U0EXAMPLE9", bot_id=MARKED_DRIVER.bot_id
-        )
-        expected_turns = 1
-    else:
+    elif case == "refused_caller":
         admission_api.lists[(CHANNEL, "default")] = {"U0EXAMPLE2"}
         event = _mention("<@U0BOT> revise it")
         expected_turns = 0
+    else:
+        # Admission is asked before any receipt, at root as in a thread.
+        admission_api.lists[(CHANNEL, "default")] = {"U0EXAMPLE2"}
+        event = _mention(f"<@U0BOT> start {ISSUE_LINK}", thread_ts=None)
+        expected_turns = 0
 
-    _deliver(cfg, redis_client, event_id, event, identity_bots=identity_bots)
+    _deliver(config, redis_client, event_id, event, identity_bots=identity_bots)
 
-    queued = _queued(redis_client, cfg)
+    queued = _queued(redis_client, config)
     assert len(queued) == expected_turns
     if expected_turns:
         assert queued[0].event_id == delivery_id

@@ -729,6 +729,12 @@ class Install:
                     "claim_name": f"curie-thread-{request_id.hex[:12]}",
                     "sandbox_name": f"sbx-{request_id.hex[:12]}",
                     "context": work["context"],
+                    "delivered_limits": {
+                        "memory_bytes": None,
+                        "ephemeral_storage_bytes": None,
+                        "scratch_bytes": {},
+                        "max_turns": None,
+                    },
                 },
             )
             assert started.status_code == 200, started.text

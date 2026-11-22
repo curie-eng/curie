@@ -19,6 +19,7 @@ from curie_channel_gateway.reply_errors import (
     DeletedReplyTargetError,
     ProviderEgressRefusedError,
 )
+from curie_telemetry import agent_metric_label
 
 from .. import sweep
 from ..behaviorpacks import (
@@ -49,7 +50,7 @@ from ..workitem_dispatch import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import claim, clock, constants, failures, log, routing
+from . import claim, clock, constants, failures, log, routing, work_items
 from .log import logger
 
 
@@ -132,6 +133,17 @@ async def _complete(
     if run is not None and run.request_id in self._settling_work_items:
         run = None
     if run is not None and run.started and not run.finished:
+        # The two retry facts every finishing branch below reports. Approval
+        # is not a finish, so it reads no marker.
+        finishing = outcome != "awaiting-approval"
+        retry_safety = failures.retry_safety(
+            turn,
+            marker_flagged=finishing and await self._markers.saw_side_effect(qevent.event_id),
+            own_execute_turn=(
+                parsed is not None and parsed.kind == "execute" and run.event_id == qevent.event_id
+            ),
+        )
+        retry_condition = turn.retry_condition if turn is not None else None
         try:
             if outcome == "awaiting-approval":
                 # Approval is not a terminus. Stop the short lease refresh
@@ -175,10 +187,13 @@ async def _complete(
                         cause=cause,
                         detail=(
                             None
-                            if ci_fix or turn is None
+                            if turn is None or (ci_fix and cause != "ci_fix_unpublished")
                             else failures._finish_detail(turn.assistant_text)
                         ),
                         ci_fix_round=ci_fix_round,
+                        retry_safety=retry_safety,
+                        retry_condition=retry_condition,
+                        exhausted_volume=None,
                     )
                 except WorkItemConflict as exc:
                     if exc.code != "publication_pending":
@@ -194,6 +209,9 @@ async def _complete(
                     cause=failures._escalation_cause(turn),
                     detail=turn.error_message if turn is not None else None,
                     ci_fix_round=None,
+                    retry_safety=retry_safety,
+                    retry_condition=retry_condition,
+                    exhausted_volume=failures._exhausted_volume(turn),
                 )
             else:
                 await self._finish_or_settle(
@@ -202,6 +220,9 @@ async def _complete(
                     cause="runner_failed",
                     detail=None,
                     ci_fix_round=None,
+                    retry_safety=retry_safety,
+                    retry_condition=retry_condition,
+                    exhausted_volume=None,
                 )
         except WorkItemConflict as exc:
             logger.warning(
@@ -230,6 +251,9 @@ async def _complete(
             else None
         )
         try:
+            if constants._PERSONAL_LAUNCH.get() is not None:
+                # #5378: a failure after the claim and before the API start.
+                await work_items._release_unstarted_personal_claim(self, run)
             await run.defer(
                 (
                     "workspace_timeout"
@@ -404,7 +428,7 @@ async def _complete(
         "outcome": telemetry_outcome,
     }
     log.record_metric("curie.turn.completed", attributes=attributes)
-    self._record_agent_turn(telemetry_outcome)
+    agent_label = self._record_agent_turn(telemetry_outcome)
     try:
         received = datetime.fromisoformat(qevent.received_at)
         if received.tzinfo is None:
@@ -415,7 +439,9 @@ async def _complete(
         )
     except ValueError:
         duration = 0.0
-    log.record_metric("curie.turn.duration", duration, attributes=attributes)
+    log.record_metric(
+        "curie.turn.duration", duration, attributes={**attributes, "agent": agent_label}
+    )
 
 
 async def _settle_and_publish(
@@ -521,22 +547,10 @@ async def _settle_targetless(
     self._record_agent_turn(telemetry_outcome)
 
 
-def _record_agent_turn(self: Kernel, telemetry_outcome: str) -> None:
-    """Count the terminal turn under the resolved agent, or ``unbound``.
+def _record_agent_turn(self: Kernel, telemetry_outcome: str) -> str:
+    """Count the terminal turn and return its shared agent metric label."""
 
-    The fleet counter stays unlabeled. This series is the one a per-agent
-    silence alarm can group on, and the label is capped in ``record_metric``.
-    """
-
-    raw = constants._TURN_AGENT.get()
-    # Only a missing agent is ``unbound``. A real agent whose name is a
-    # reserved label shares ``other`` so it cannot inflate the unresolved series.
-    if not raw:
-        label = "unbound"
-    elif raw in {"other", "unbound"}:
-        label = "other"
-    else:
-        label = raw
+    label = agent_metric_label(constants._TURN_AGENT.get())
     log.record_metric(
         "curie.agent.turn.completed",
         attributes={
@@ -546,6 +560,7 @@ def _record_agent_turn(self: Kernel, telemetry_outcome: str) -> None:
             "agent": label,
         },
     )
+    return label
 
 
 async def _deliver_completion(self: Kernel, record: CompletionRecord, *, generation: str) -> bool:

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
     QueuedTurn,
+    RetryCondition,
     SessionStatus,
     ToolAccess,
 )
@@ -17,8 +18,10 @@ from ..runner_client import (
     RunnerWorkspaceSnapshot,
 )
 from ..sandbox.types import (
+    ResourceExhaustion,
     SandboxTermination,
 )
+from ..workitem_dispatch import RetrySafety
 
 if TYPE_CHECKING:
     from ..ui_evidence import UiEvidenceCapture
@@ -46,10 +49,51 @@ def map_error_classification(raw: str | None) -> str:
     return constants.UNCLASSIFIED_ERROR_CLASSIFICATION
 
 
+# ADR 0269 (#5427): a sandbox termination the substrate positively identified.
+# Only the pod observation sets ``sandbox_exhaustion``, so a runner error
+# frame, whatever its text, can never produce one of these causes.
+_EXHAUSTION_CAUSES = {
+    "memory": "sandbox_memory_exhausted",
+    "ephemeral_storage": "sandbox_storage_exhausted",
+    "scratch": "sandbox_scratch_exhausted",
+    "node_disruption": "sandbox_node_disrupted",
+}
+
+
 def _escalation_cause(failure: TurnOutcome | None) -> str:
     if failure is None or failure.classification is None:
         return "runner_escalated"
+    if failure.classification == "sandbox-terminated" and failure.sandbox_exhaustion is not None:
+        return _EXHAUSTION_CAUSES[failure.sandbox_exhaustion.kind]
     return constants._ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
+
+
+def _exhausted_volume(failure: TurnOutcome | None) -> str | None:
+    """The scratch volume a ``sandbox_scratch_exhausted`` finish names, else None."""
+
+    exhaustion = failure.sandbox_exhaustion if failure is not None else None
+    if exhaustion is None or _escalation_cause(failure) != "sandbox_scratch_exhausted":
+        return None
+    return exhaustion.volume
+
+
+def retry_safety(
+    turn: TurnOutcome | None, *, marker_flagged: bool, own_execute_turn: bool
+) -> RetrySafety:
+    """The safety fact a finish reports about the turn it ends.
+
+    ``no_effects`` is a positive observation: the kernel saw the run's own
+    execute turn end with no side effect flag, no durable marker and no
+    execution uncertainty. Anything short of that is never reported as clean.
+    """
+
+    if turn is not None and turn.execution_uncertain:
+        return "uncertain"
+    if marker_flagged or (turn is not None and turn.saw_side_effect):
+        return "flagged"
+    if turn is None or not turn.runner_ended or not own_execute_turn:
+        return "uncertain"
+    return "no_effects"
 
 
 def _sandbox_termination_detail(termination: SandboxTermination) -> str:
@@ -227,6 +271,9 @@ class TurnOutcome:
     approval_display: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    # The snapshot error is a publication policy refusal, not a fault (#5429):
+    # the run finishes ``publication_refused``, which admits no recovery.
+    publication_snapshot_refused: bool = False
     ui_evidence: UiEvidenceCapture | None = None
     review_origin_key: str | None = None
     # The repository this turn attached because its own message named it
@@ -236,8 +283,20 @@ class TurnOutcome:
     # Every tool the turn called, the model's reply without the receipt, and
     # whether this outcome already includes the one factory continuation (#3128).
     tools_called: frozenset[str] = frozenset()
+    # An ``ask_questions`` call in this turn completed without failing (#5785).
+    questions_ask_succeeded: bool = False
     assistant_text: str = ""
     continued: bool = False
+    # The kernel observed this turn end: the runner's final frame was applied,
+    # or, on a stream that carried no error frame, the runner accepted the
+    # timeout stop or the pod termination was observed.
+    runner_ended: bool = False
+    # The provider retry condition the runner put on an error frame, reported
+    # unchanged at finish. None when the stream carried none.
+    retry_condition: RetryCondition | None = None
+    # What the substrate positively identified as ending a ``sandbox-terminated``
+    # turn (ADR 0269, #5427). None when it identified nothing.
+    sandbox_exhaustion: ResourceExhaustion | None = None
 
 
 class _FactoryExecutionEnded(Exception):

@@ -269,17 +269,26 @@ def test_scripted_parser_refuses_removed_external_cluster_flags(flag: str) -> No
     import factory_e2e as fe
 
     with pytest.raises(SystemExit):
-        fe.parse_args(["scripted", flag, "example"])
+        fe.parse_args(["scripted", "--scenario", "publication", flag, "example"])
 
 
 def test_scripted_parser_owns_its_cluster_and_supports_recording_and_image_builds() -> None:
     import factory_e2e as fe
 
-    args = fe.parse_args(["scripted", "--build-images", "--record"])
+    args = fe.parse_args(["scripted", "--scenario", "publication", "--build-images", "--record"])
     assert args.build_images is True
     assert args.record is True
     assert not hasattr(args, "context")
     assert not hasattr(args, "model_base_url")
+
+
+def test_scripted_parser_requires_a_scenario(capsys: pytest.CaptureFixture[str]) -> None:
+    import factory_e2e as fe
+
+    with pytest.raises(SystemExit) as refusal:
+        fe.parse_args(["scripted"])
+    assert refusal.value.code == 2
+    assert "--scenario" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -345,7 +354,8 @@ def test_failed_diagnostics_preserve_scenario_error_and_owned_cleanup(
         monkeypatch.setattr(kind.ScriptedRun, "capture_failure_diagnostics", broken_collector)
     monkeypatch.setattr(kind.subprocess, "run", _with_curie_version_probe(command, candidate_curie))
 
-    assert kind.main(kind.fe.parse_args(["scripted"])) == kind.fe.EXIT_FAILED
+    args = kind.fe.parse_args(["scripted", "--scenario", "publication"])
+    assert kind.main(args) == kind.fe.EXIT_FAILED
     (evidence_file,) = (tmp_path / "target/factory-e2e").glob("scripted-*.json")
     evidence = json.loads(evidence_file.read_text())
     assert evidence["error"] == "publication clone exited 124"
@@ -412,7 +422,8 @@ def test_interrupted_scenario_skips_diagnostics_preserves_failure_and_owned_clea
     monkeypatch.setattr(kind.ScriptedRun, "capture_failure_diagnostics", diagnostics)
     monkeypatch.setattr(kind.subprocess, "run", _with_curie_version_probe(command, candidate_curie))
 
-    assert kind.main(kind.fe.parse_args(["scripted"])) == kind.fe.EXIT_FAILED
+    args = kind.fe.parse_args(["scripted", "--scenario", "publication"])
+    assert kind.main(args) == kind.fe.EXIT_FAILED
     (evidence_file,) = (tmp_path / "target/factory-e2e").glob("scripted-*.json")
     evidence = json.loads(evidence_file.read_text())
     assert evidence["result"] == "failed"
@@ -458,7 +469,8 @@ def test_configuration_failure_before_cluster_skips_diagnostics(
     monkeypatch.setattr(kind.ScriptedRun, "capture_failure_diagnostics", diagnostics)
     monkeypatch.setattr(kind.subprocess, "run", _with_curie_version_probe(command, candidate_curie))
 
-    assert kind.main(kind.fe.parse_args(["scripted"])) == kind.fe.EXIT_CONFIG
+    args = kind.fe.parse_args(["scripted", "--scenario", "publication"])
+    assert kind.main(args) == kind.fe.EXIT_CONFIG
     (evidence_file,) = (tmp_path / "target/factory-e2e").glob("scripted-*.json")
     evidence = json.loads(evidence_file.read_text())
     assert evidence["result"] == "failed"
@@ -494,9 +506,11 @@ def test_successful_scenario_skips_pod_diagnostics(
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(kind.ScriptedRun, "execute", execute)
+    # This test is about diagnostics; its stubbed install has no scenario to run.
+    monkeypatch.setattr(kind.ScriptedRun, "runs_one_ticket", False)
     monkeypatch.setattr(kind.subprocess, "run", _with_curie_version_probe(command, candidate_curie))
 
-    assert kind.main(kind.fe.parse_args(["scripted"])) == 0
+    assert kind.main(kind.fe.parse_args(["scripted", "--scenario", "publication"])) == 0
     (evidence_file,) = (tmp_path / "target/factory-e2e").glob("scripted-*.json")
     evidence = json.loads(evidence_file.read_text())
     assert evidence["result"] == "passed"
@@ -601,7 +615,8 @@ def test_failure_pod_diagnostics_are_bounded_redacted_and_stderr_only(
     monkeypatch.setattr(kind.ScriptedRun, "execute", execute)
     monkeypatch.setattr(kind.subprocess, "run", _with_curie_version_probe(command, candidate_curie))
 
-    assert kind.main(kind.fe.parse_args(["scripted"])) == kind.fe.EXIT_FAILED
+    args = kind.fe.parse_args(["scripted", "--scenario", "publication"])
+    assert kind.main(args) == kind.fe.EXIT_FAILED
     captured = capsys.readouterr()
     (evidence_file,) = (tmp_path / "target/factory-e2e").glob("scripted-*.json")
     evidence = json.loads(evidence_file.read_text())
@@ -670,7 +685,7 @@ def test_failure_diagnostics_stop_at_budget_and_restore_scenario_deadline(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     kind = _load_kind()
-    run = kind.ScriptedRun(kind.fe.parse_args(["scripted"]))
+    run = kind.ScriptedRun(kind.fe.parse_args(["scripted", "--scenario", "publication"]))
     run.deadline = -1
     evidence_before = run.evidence.copy()
     calls: list[tuple[str, ...]] = []

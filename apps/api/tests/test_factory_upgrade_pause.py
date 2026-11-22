@@ -7,16 +7,15 @@ the reconciler decides from the marker itself (fail-open on a read error).
 
 from __future__ import annotations
 
-import contextlib
 import importlib
 import uuid
-from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 from curie_api import factory_notices, workitem_reconciler
 from curie_api.config import Settings, get_settings
 from curie_api.workitem_reconciler import WorkItemReconciler
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 PAUSED_LINE = (
     "Paused: this Curie installation is paused for an upgrade. "
@@ -100,14 +99,6 @@ class _Valkey:
         return sum(1 for key in keys if key in self.present)
 
 
-def _sessionmaker() -> Any:
-    @contextlib.asynccontextmanager
-    async def session() -> AsyncIterator[object]:
-        yield object()
-
-    return session
-
-
 async def _flag_passed(
     monkeypatch: pytest.MonkeyPatch, valkey: _Valkey, settings: Settings
 ) -> Any:
@@ -121,8 +112,14 @@ async def _flag_passed(
     monkeypatch.setattr(
         workitem_reconciler.factory_notices, "sync_status_comments", fake_sync
     )
-    reconciler = WorkItemReconciler(_sessionmaker(), valkey, settings)  # type: ignore[arg-type]
-    await reconciler._sync_status_comments()
+    engine = create_async_engine(settings.database_url)
+    try:
+        reconciler = WorkItemReconciler(
+            async_sessionmaker(engine, expire_on_commit=False), valkey, settings
+        )  # type: ignore[arg-type]
+        await reconciler._sync_status_comments()
+    finally:
+        await engine.dispose()
     assert len(captured) == 1
     return captured[0].get("paused_for_upgrade")
 
@@ -133,7 +130,7 @@ async def _flag_passed(
     [(True, False, True), (False, False, False), (True, True, False)],
 )
 async def test_reconciler_passes_the_pause_flag_from_the_marker(
-    fresh_settings: Any, present: bool, fail: bool, expected: bool
+    fresh_settings: Any, clean_db: None, present: bool, fail: bool, expected: bool
 ) -> None:
     fresh_settings.setenv("CURIE_INSTALLATION_ID", "install-a")
     settings = Settings()

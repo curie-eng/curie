@@ -455,6 +455,9 @@ services:
       # reads the same interpolation. It requires the executor switch above; the
       # API and the worker refuse to boot with it on and the executor off.
       CURIE_REMEDIATION_ENABLED: ${CURIE_REMEDIATION_ENABLED:-false}
+      # One API replica, no pod template to compare: the personal rollout hold
+      # (#5377) would otherwise hold personal enrollment and admission forever.
+      CURIE_PERSONAL_ROLLOUT_HOLD: "false"
       # Shared with curie-worker. The budget defaults to the process value.
       # The lease passes the host value through: unset stays null, empty stays
       # empty, and a set value is that value. An empty default would boot-fail.

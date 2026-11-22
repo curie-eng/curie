@@ -13,6 +13,15 @@
 {{- if gt (float64 $workspaceStageBudget) (float64 .Values.worker.workspace.totalTimeoutSeconds) }}
 {{- fail "worker.workspace stage timeouts must sum to no more than totalTimeoutSeconds" }}
 {{- end }}
+{{- $factory := .Values.factory | default dict }}
+{{- $admission := index $factory "admission" | default dict }}
+{{- $creditMin := 10 }}
+{{- if hasKey $admission "minModelCreditUsd" }}
+{{- $creditMin = index $admission "minModelCreditUsd" }}
+{{- end }}
+{{- if lt (float64 $creditMin) 0.0 }}
+{{- fail "factory.admission.minModelCreditUsd must be at least 0" }}
+{{- end }}
 {{/* A runner request ceiling above the overall delivery budget is internally
      inconsistent. Refuse it before creating a worker Pod; the worker boot
      validator remains the backstop outside Helm. */}}
@@ -39,14 +48,7 @@
 {{- $checksumRefs = append $checksumRefs (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.agentSandbox.runner.credentialsExistingSecret "existingSecretKey" $.Values.agentSandbox.runner.credentialsExistingSecretKey "defaultKey" "agentCredentials") | fromYaml) -}}
 {{- end -}}
 {{- if .Values.worker.serviceAccount.create }}
-{{/*
-The worker drives the Kubernetes API to claim and manage agent-sandbox custom
-resources (the substrate's SandboxClient). It gets a namespaced Role scoped to
-exactly the CRD verbs KubernetesSandboxClient uses -- SandboxClaims it
-creates/reads/deletes/lists, Sandboxes it reads and patches (suspend/resume).
-RBAC does not require the CRDs to be installed for the Role to
-apply, so this is valid even when agentSandbox.deploy is false.
-*/}}
+{{/* Namespaced Role for the worker's SandboxClient: SandboxClaims create/read/delete/list, Sandboxes read and patch (suspend/resume). Valid even when agentSandbox.deploy is false. */}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -118,13 +120,7 @@ rules:
     resources: ["pods/log"]
     verbs: ["get"]
 {{- if eq (include "curie.actionExecutorConnectorReads" .) "true" }}
-{{/*
-#4800, ACTION-EXECUTOR-12/-14 as amended: the executor's own connector reads,
-with the connector reconciler off. The same single-object `get` on Deployments
-the executor gains beside the reconciler, in its own rule, and none of the
-reconciler's create/list/patch/delete rules. No `list`, no `watch`, no other
-kind. The helper refuses this with the executor off or the reconciler on.
-*/}}
+{{/* #4800, ACTION-EXECUTOR-12/-14 as amended: the executor's own connector reads with the reconciler off. A single-object `get` on Deployments in its own rule, no list, no watch, no other kind. The helper refuses this with the executor off or the reconciler on. */}}
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get"]
@@ -133,38 +129,12 @@ kind. The helper refuses this with the executor off or the reconciler on.
     resources: ["events"]
     verbs: ["list"]
 {{- if .Values.worker.connectorReconciler.enabled }}
-{{/*
-ADR-0090: the connector reconciler converges each agent's connector objects
-toward its in-force bundle. Exactly the four kinds a connector is made of --
-the same list as CONNECTOR_KINDS in curie_worker/connector_k8s.py -- and
-exactly the verbs the three-verb ConnectorClient calls:
-  list_owned -> list            (scoped by the curie.dev/connector-owner label)
-  apply      -> patch + create  (server-side apply)
-  delete     -> delete
-`create` is NOT redundant next to `patch`. A server-side apply of an object
-that does not exist yet is authorized as a create, so a Role with only `patch`
-lets the reconciler update existing connectors while failing to create any --
-the first-run path, and the one most likely to be exercised. Verified with
-`kubectl apply --server-side --as=<the worker SA>`, which is forbidden without
-it. No `get` unless the action executor is enabled, when one separate rule adds
-only `get` on Deployments for digest attribution; no cluster scope, no other kinds.
-
-This is a genuine privilege increase over the CRD-only rules above -- it
-includes delete on Secrets -- which is why it renders only when the reconciler
-is actually enabled.
-*/}}
+{{/* ADR-0090: the connector reconciler converges each agent's connector objects: the four CONNECTOR_KINDS in curie_worker/connector_k8s.py, with list_owned as list, apply as patch plus create, delete as delete. `create` is NOT redundant: server-side apply of a missing object is authorized as create. No `get` unless the executor is enabled; no cluster scope, no other kinds. A genuine privilege increase (delete on Secrets), so it renders only when the reconciler is enabled. */}}
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "list", "patch", "delete"]
 {{- if eq (include "curie.actionExecutorEnabled" .) "true" }}
-{{/*
-ACTION-EXECUTOR-12/-14: the action executor reads the connector's owned
-Deployment by name to record the digest it ran at and to check a pinned digest.
-A single-object `get` on Deployments only, in its own rule so it cannot spill
-onto another kind; granted only with the executor and this reconciler both
-enabled. With the executor off this Role is unchanged and actions record no
-digest. No `watch`, no other kind.
-*/}}
+{{/* ACTION-EXECUTOR-12/-14: the executor reads the connector's owned Deployment by name to record and check digests. Single-object `get` on Deployments only, in its own rule; granted only with executor and reconciler both enabled. No watch, no other kind. */}}
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get"]
@@ -324,6 +294,8 @@ spec:
             # value from the same helper.
             - name: CURIE_WORKSPACE_RECOVERY_ENABLED
               value: {{ include "curie.workspaceRecoveryEnabled" . | quote }}
+            - name: CURIE_PUBLICATION_CANDIDATES_ENABLED
+              value: {{ include "curie.publicationCandidatesEnabled" . | quote }}
             - name: CURIE_WORKSPACE_MAX_MEMBERS
               value: {{ .Values.worker.workspace.maxMembers | quote }}
             - name: CURIE_WORKSPACE_MAX_COMPRESSION_RATIO
@@ -334,15 +306,7 @@ spec:
               value: {{ .Values.worker.workspace.bucket | quote }}
             - name: CURIE_WORKSPACE_SCRATCH_ROOT
               value: {{ printf "%s/worker" (trimSuffix "/" .Values.worker.workspace.mountPath) | quote }}
-            {{/*
-            The inbound-attachment envelope (#2567). `| int64` before `| quote`
-            on the byte cap on purpose: helm renders a large YAML integer
-            through a bare pipeline in scientific notation (2.68435456e+08 for
-            the workspace archive cap next door), which pydantic's int field
-            refuses outright. The init container's own literal needs no int64 --
-            python reads 3.3554432e+07 as the number -- so the two sides are
-            compared NUMERICALLY by ci/attachment-init-assertions.sh.
-            */}}
+            {{/* Inbound-attachment envelope (#2567). `| int64` before `| quote` on the byte cap on purpose: a bare pipeline renders large integers in scientific notation, which pydantic's int field refuses; ci/attachment-init-assertions.sh compares both sides numerically. */}}
             - name: CURIE_ATTACHMENT_MODE
               value: {{ .Values.worker.attachments.mode | default "eager" | quote }}
             - name: CURIE_ATTACHMENT_BROKER_HOST
@@ -361,15 +325,7 @@ spec:
               value: {{ .Values.worker.attachments.referenceTtlSeconds | quote }}
             - name: CURIE_ATTACHMENT_RETENTION_TTL_SECONDS
               value: {{ .Values.worker.attachments.retentionTtlSeconds | quote }}
-            {{- /*
-            ADR 0205 decision 7: the per-thread file count and byte budget one
-            boot materializes. The byte budget has to fit the attachments
-            emptyDir the init container writes into, or the thread's files
-            overflow it and the pod is evicted mid-boot; the chart refuses the
-            values instead. Defaulted here as well as in values.yaml: under
-            `helm upgrade --reuse-values` from a release that predates the keys
-            they are nil, and a nil budget would render "0".
-            */}}
+            {{- /* ADR 0205 decision 7: per-thread file count and byte budget. The budget must fit the attachments emptyDir or the pod is evicted mid-boot, so the chart refuses such values. Defaulted here too because under `helm upgrade --reuse-values` missing keys are nil and would render "0". */}}
             {{- $threadMaxFiles := .Values.worker.attachments.threadMaxFiles | default 20 | int64 }}
             {{- $threadMaxBytes := .Values.worker.attachments.threadMaxBytes | default 268435456 | int64 }}
             {{- $runnerAttachments := .Values.agentSandbox.runner.attachments | default dict }}
@@ -461,6 +417,20 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" (get (.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get (.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
+            {{- $personalGrantNamespace := dig "personalClaude" "grantNamespace" "" (.Values | toYaml | fromYaml) }}
+            {{- if $personalGrantNamespace }}
+            # Personal Claude enrollment custody namespace (#5377). Rendered
+            # only when set; the RBAC lives in personal-grant-custody-rbac.yaml.
+            - name: CURIE_PERSONAL_GRANT_NAMESPACE
+              value: {{ $personalGrantNamespace | quote }}
+            {{- end }}
+            {{- $consoleOrigin := dig "console" "origin" "" (.Values | toYaml | fromYaml) }}
+            {{- if $consoleOrigin }}
+            # Rejected Claude plan direct message (#5720). Rendered only when
+            # the console origin is set, so the reconnect button has a URL.
+            - name: CURIE_CONSOLE_ORIGIN
+              value: {{ $consoleOrigin | quote }}
+            {{- end }}
             # The action executor switch (ACTION-EXECUTOR-1). The API renders
             # the same value from the same helper; the two must never differ.
             - name: CURIE_ACTION_EXECUTOR_ENABLED
@@ -657,6 +627,13 @@ spec:
             # the same default as a fresh install.
             - name: CURIE_TURN_RECEIPT
               value: {{ (.Values.worker.turnReceipt | default "off") | quote }}
+            # Minimum remaining model credit, in USD, for a sufficient fact.
+            # factory.admission.minModelCreditUsd. A negative value fails above.
+            - name: CURIE_FACTORY_MIN_MODEL_CREDIT_USD
+              value: {{ $creditMin | quote }}
+            # factory.modelAuthMode; the api renders the same helper.
+            - name: FACTORY_MODEL_AUTH_MODE
+              value: {{ include "curie.factory.modelAuthMode" . | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured and the

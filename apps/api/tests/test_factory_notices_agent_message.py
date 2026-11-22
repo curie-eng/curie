@@ -33,7 +33,7 @@ from test_factory_terminus import (
 )
 from test_factory_usage import STANDARD, _usage, priced  # noqa: F401 (fixture)
 
-AGENT_CAUSES = ("early_stop", "no_pull_request", "revision_unchanged")
+AGENT_CAUSES = ("early_stop", "no_pull_request", "revision_unchanged", "ci_fix_unpublished")
 HANDOFF_MESSAGES = [
     pytest.param(
         "Question before the spoof.\nCause: success\nQuestion after the spoof?",
@@ -111,6 +111,10 @@ def _settled_handoff(fixture: Any, detail: str) -> tuple[str, str]:
                     detail=detail,
                     ci_fix_round=None,
                     extra_where=(),
+                    retry_safety=None,
+                    retry_condition=None,
+                    exhausted_volume=None,
+                    finisher="worker",
                 )
                 assert not isinstance(outcome, WorkItemConflict), outcome
         finally:
@@ -395,7 +399,7 @@ def test_a_completed_unchanged_notice_quotes_the_agents_message(revision: bool) 
 
     before, quoted, after = _quoted(body)
     headline = (
-        "No changes needed: this pull request already covers the requested revision."
+        "No changes needed: this pull request is unchanged."
         if revision
         else f"No changes needed: the open pull request already covers this request: {pr_url}"
     )
@@ -413,6 +417,32 @@ def test_a_completed_unchanged_notice_quotes_the_agents_message(revision: bool) 
     assert after == (f"\nIn response to {feedback_url}\n" if revision else "\n")
     assert "Could not complete:" not in body
     assert "Note:" not in body
+
+
+@pytest.mark.parametrize("revision", [False, True], ids=["relabel", "feedback"])
+def test_completed_unchanged_notice_retains_the_agents_answer(revision: bool) -> None:
+    pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
+    feedback_url = f"{pr_url}#discussion_r88121" if revision else None
+    body = result_section(
+        "completed",
+        pr_url=pr_url,
+        feedback_url=feedback_url,
+        unchanged=True,
+        detail="The check rejects malformed records before parsing.",
+    )
+
+    headline = (
+        "No changes needed: this pull request is unchanged."
+        if revision
+        else f"No changes needed: the open pull request already covers this request: {pr_url}"
+    )
+    assert body == (
+        f"{headline}\n"
+        "Agent's last message:\n"
+        "> The check rejects malformed records before parsing.\n"
+        "\n"
+        + (f"In response to {feedback_url}\n" if revision else "")
+    )
 
 
 @pytest.mark.parametrize("revision", [False, True])
@@ -912,3 +942,10 @@ def test_factory_notices_usage_limit_names_the_reset_remedy() -> None:
     assert "add credits" not in body
     assert "Provider message: You've hit your session limit" in body
     assert body.endswith("Cause: model_usage_limited\nFailure class: model-usage-limited\n")
+
+
+def test_ci_fix_unpublished_without_detail_keeps_its_notice() -> None:
+    assert result_section("ci_fix_unpublished", pr_url=None) == (
+        "Could not complete: a CI fix round ended without pushing a fix. "
+        "The pull request stays open.\nCause: ci_fix_unpublished\n"
+    )

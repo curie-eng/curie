@@ -584,6 +584,12 @@ def test_start_records_attempt_epoch_deadline_and_runtime_names(
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         row = await _request_row(session, facts.request_id)
         assert row.status == "running"
@@ -626,6 +632,12 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         before = await _request_row(session, facts.request_id)
         stale_heartbeat = await heartbeat(session, facts.request_id, runtime_epoch=2)
@@ -638,6 +650,9 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
             cause="completed",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert _code(stale_finish) == "stale_owner"
         after = await _request_row(session, facts.request_id)
@@ -813,6 +828,12 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         cancelled = await cancel(
             session,
@@ -856,6 +877,12 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         await session.execute(
             text(
@@ -889,6 +916,7 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
             session,
             owner_lost_facts.request_id,
             runtime_epoch=termination.runtime_epoch,
+            expected_request_version=termination.request_version,
             observation=TERMINATION_OBSERVATION,
         )
         row = await _request_row(session, owner_lost_facts.request_id)
@@ -947,6 +975,12 @@ def _auth_routes() -> list[tuple[str, str, dict[str, Any] | None]]:
                     "address": ADDRESS,
                     "adapter": "default",
                 },
+                "delivered_limits": {
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             },
         ),
         (
@@ -961,6 +995,7 @@ def _auth_routes() -> list[tuple[str, str, dict[str, Any] | None]]:
                 "runtime_epoch": 1,
                 "outcome": "completed",
                 "cause": "completed",
+                "retry_safety": "uncertain",
             },
         ),
         (
@@ -973,6 +1008,7 @@ def _auth_routes() -> list[tuple[str, str, dict[str, Any] | None]]:
             f"{INTERNAL_PREFIX}/requests/{request_id}/termination",
             {
                 "runtime_epoch": 1,
+                "expected_request_version": 1,
                 "observation": TERMINATION_OBSERVATION,
             },
         ),
@@ -1053,6 +1089,12 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
             "claim_name": CLAIM_NAME,
             "sandbox_name": SANDBOX_NAME,
             "context": acquired.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
         headers=WORKER_HEADERS,
     )
@@ -1106,6 +1148,7 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
             "runtime_epoch": 9,
             "outcome": "completed",
             "cause": "completed",
+            "retry_safety": "uncertain",
         },
         headers=WORKER_HEADERS,
     )
@@ -1152,6 +1195,12 @@ async def _running(session: AsyncSession, agent_id: uuid.UUID, *, issue: int = 2
         claim_name=CLAIM_NAME,
         sandbox_name=SANDBOX_NAME,
         context=acquired.context,
+        delivered_limits={
+            "memory_bytes": None,
+            "ephemeral_storage_bytes": None,
+            "scratch_bytes": {},
+            "max_turns": None,
+        },
     )
     return facts
 
@@ -1202,6 +1251,7 @@ def test_declare_owner_lost_drives_the_terminate_chain_to_failed(
             session,
             facts.request_id,
             runtime_epoch=claimed.runtime_epoch,
+            expected_request_version=claimed.request_version,
             observation=TERMINATION_OBSERVATION,
         )
         final = await _request_row(session, facts.request_id)
@@ -1400,6 +1450,12 @@ def test_http_runtime_owners_and_owner_lost(
             "claim_name": CLAIM_NAME,
             "sandbox_name": SANDBOX_NAME,
             "context": acquired.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
         headers=WORKER_HEADERS,
     )
@@ -2343,6 +2399,12 @@ def test_factory_refusal_defer_preserves_the_start_failure_detail(
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         assert _code(refused) == "factory_binding_changed"
         row = await _request_row(session, facts.request_id)
@@ -2434,6 +2496,12 @@ def test_successful_start_clears_the_start_failure_detail(
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         assert getattr(started, "code", None) is None, started
         row = await _request_row(session, facts.request_id)
@@ -2465,6 +2533,12 @@ def test_refused_start_keeps_the_start_failure_detail(clean_db: None, allowliste
                 claim_name=CLAIM_NAME,
                 sandbox_name=SANDBOX_NAME,
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
 
         # Another owner holds no acquisition of this generation.
@@ -2522,6 +2596,12 @@ async def _assert_factory_neighbor_starts(session: AsyncSession) -> None:
         claim_name="claim-neighbor",
         sandbox_name="sandbox-neighbor",
         context=acquired.context,
+        delivered_limits={
+            "memory_bytes": None,
+            "ephemeral_storage_bytes": None,
+            "scratch_bytes": {},
+            "max_turns": None,
+        },
     )
     assert isinstance(started, workitem_dispatch.StartResult)
     row = await _request_row(session, facts.request_id)
@@ -2576,6 +2656,12 @@ def test_factory_wake_mismatch_leaves_authority_untouched_and_valid_delivery_sta
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         assert isinstance(started, workitem_dispatch.StartResult)
         row = await _request_row(session, facts.request_id)
@@ -2688,6 +2774,12 @@ def test_invalid_factory_authority_defers_without_starting_while_neighbor_progre
                 claim_name=CLAIM_NAME,
                 sandbox_name=SANDBOX_NAME,
                 context=context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
         else:
             async with no_external_calls() as http_client:
@@ -2769,6 +2861,12 @@ def test_factory_revalidation_rejects_foreign_context_and_preserves_neighbor(
                 claim_name=CLAIM_NAME,
                 sandbox_name=SANDBOX_NAME,
                 context=context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
         assert _code(refused) == code
         row = await _request_row(session, facts.request_id)
@@ -2824,6 +2922,12 @@ def test_replacing_current_binding_invalidates_the_acquired_context(
                 claim_name=CLAIM_NAME,
                 sandbox_name=SANDBOX_NAME,
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
         assert _code(refused) == "factory_binding_changed"
         row = await _request_row(session, facts.request_id)
@@ -3109,7 +3213,11 @@ async def _assert_successor_terminates(
     stale_beat = await heartbeat(session, request_id, runtime_epoch=prior_epoch)
     assert _code(stale_beat) == "stale_owner"
     stale_record = await record_termination(
-        session, request_id, runtime_epoch=prior_epoch, observation=TERMINATION_OBSERVATION
+        session,
+        request_id,
+        runtime_epoch=prior_epoch,
+        expected_request_version=claimed.request_version,
+        observation=TERMINATION_OBSERVATION,
     )
     assert _code(stale_record) == "stale_owner"
     assert await _full_request(session, request_id) == claimed_row
@@ -3118,6 +3226,7 @@ async def _assert_successor_terminates(
         session,
         request_id,
         runtime_epoch=claimed.runtime_epoch,
+        expected_request_version=claimed.request_version,
         observation=TERMINATION_OBSERVATION,
     )
     assert not hasattr(settled, "code"), settled

@@ -8,6 +8,9 @@ incomplete evidence, the SQLite budget ledger, native transcript parsing, the
 in-pod harvester program against a recorded-shape tree, secret scanning, and
 the finalizer's behavior on failure, refusal and interruption.
 
+The two-owner scenario (#5379) command-path refusals and their authorized
+controls are in the section at the end of this file.
+
 Nothing here touches a cluster, GitHub, Docker or a network beyond a loopback
 registry fixture, and no value is a real credential or identifier.
 """
@@ -35,7 +38,10 @@ from typing import Any
 
 import personal_profile as pp
 import personal_profile_support as pps
+import personal_two_owner as pt
+import personal_two_owner_support as pto
 import pytest
+import two_owner_shared as tos
 
 SCRIPT = Path(pp.__file__).resolve()
 REPO_ROOT = pp.REPO_ROOT
@@ -286,6 +292,152 @@ def test_registry_image_reads_the_revision_through_a_buildkit_index() -> None:
     get_children = {("curie-api", digest): body for digest, body in children.items()}
     with _registry({("curie-api", tag): (index, config)}, get_children) as port:
         assert pps.registry_image(pps.loopback_get("127.0.0.1", port), "curie-api", tag) is None
+
+
+@pytest.mark.parametrize("drop_labels", [False, True])
+def test_image_builder_keeps_same_head_runs_distinct_in_the_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drop_labels: bool
+) -> None:
+    # Docker labels change image config: https://docs.docker.com/reference/cli/docker/buildx/build/#label
+    # Observed in #5379: CRI reused an older index ID when two indexes shared a config.
+    candidate = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+    ).strip()
+    manifests: dict[tuple[str, str], bytes] = {}
+    blobs: dict[str, bytes] = {}
+    configs: dict[str, str] = {}
+    runtime: dict[str, str] = {}
+
+    def get(path: str, _headers: Mapping[str, str]) -> tuple[int, dict[str, str], bytes]:
+        _, _, repository, kind, reference = path.split("/", 4)
+        raw = (
+            manifests.get((repository, reference)) if kind == "manifests" else blobs.get(reference)
+        )
+        if raw is None:
+            return 404, {}, b""
+        return 200, {"docker-content-digest": "sha256:" + hashlib.sha256(raw).hexdigest()}, raw
+
+    monkeypatch.setattr(pps, "loopback_get", lambda *_a, **_kw: get)
+
+    class Docker(pp.Shell):
+        def run(self, argv: list[str], **kwargs: Any) -> pp.Completed:
+            if argv[:2] == ["docker", "build"]:
+                ref = argv[argv.index("-t") + 1]
+                repository, tag = pps.split_image_ref(ref)
+                labels = dict(
+                    argv[i + 1].split("=", 1) for i, a in enumerate(argv) if a == "--label"
+                )
+                index_raw, config_raw, children = _index_image(candidate)
+                config = json.loads(config_raw)
+                config["config"]["Labels"] = (
+                    {pps.REVISION_LABEL: labels[pps.REVISION_LABEL]} if drop_labels else labels
+                )
+                config["config"]["Cmd"] = [repository]
+                config_raw = json.dumps(config, sort_keys=True).encode()
+                config_id = "sha256:" + hashlib.sha256(config_raw).hexdigest()
+                blobs[config_id] = config_raw
+                index = json.loads(index_raw)
+                image = index["manifests"][0]
+                manifest = json.loads(children[image["digest"]])
+                manifest["config"].update(digest=config_id, size=len(config_raw))
+                manifest_raw = json.dumps(manifest, sort_keys=True).encode()
+                image["digest"] = "sha256:" + hashlib.sha256(manifest_raw).hexdigest()
+                image["size"] = len(manifest_raw)
+                manifests[repository, image["digest"]] = manifest_raw
+                index["annotations"] = {"org.opencontainers.image.ref.name": ref}
+                manifests[repository, tag] = json.dumps(index, sort_keys=True).encode()
+                configs[ref] = config_id
+                return pp.Completed(0, b"", b"")
+            if argv[:3] == ["docker", "image", "inspect"]:
+                label = re.fullmatch(r'{{ index \.Config.Labels "(.*?)" }}', argv[4])
+                assert label is not None
+                labels = json.loads(blobs[configs[argv[5]]])["config"]["Labels"]
+                return pp.Completed(0, labels.get(label[1], "").encode(), b"")
+            if argv[0] == "git":
+                result = subprocess.run(argv, capture_output=True, check=False)
+                return pp.Completed(result.returncode, result.stdout, result.stderr)
+            if argv[:3] == ["kubectl", "--context", inputs.context]:
+                return pp.Completed(
+                    0, b'{"items":[{"status":{"nodeInfo":{"architecture":"amd64"}}}]}', b""
+                )
+            if argv[:2] == ["docker", "push"] or argv[:3] == ["docker", "image", "ls"]:
+                return pp.Completed(0, b"", b"")
+            raise AssertionError(argv)
+
+    class BaseImages(pp.ImageBuilder):
+        def build_layer(
+            self, bundle: Path, platform: str, tag: str, pushed: Any, tags: Any
+        ) -> pps.RegistryImage:
+            return pps.RegistryImage("fixture-runner", tag, "sha256:" + "4" * 64, candidate)
+
+    previous: dict[str, str] = {}
+    for run_id in ("acme-image-first", "acme-image-second"):
+        ledger = pps.Ledger.open(_private(tmp_path / run_id), run_id)
+        ledger.ensure_run(candidate, phase="images")
+        scrubber = pps.Scrubber()
+        scan = pps.TokenScan(scrubber)
+        inputs = pp.Inputs(
+            candidate,
+            run_id,
+            tmp_path / run_id,
+            context="fixture",
+            registry="localhost:5999",
+            registry_port=5999,
+        )
+        shell = Docker(env={}, scrubber=scrubber, scan=scan, cwd=REPO_ROOT)
+        finalizer = pp.Finalizer(None)
+        try:
+            builder = BaseImages(
+                inputs=inputs,
+                shell=shell,
+                ledger=ledger,
+                finalizer=finalizer,
+                out=pp.Output(scrubber, scan),
+                curie_bin="fixture-curie",
+            )
+            if drop_labels:
+                with pytest.raises(pps.Refusal, match="candidate_image_mismatch"):
+                    builder.build()
+                assert pp.recorded_pushed(ledger) == []
+                continue
+            builder.build()
+            for image in pp.recorded_pushed(ledger):
+                tag = "localhost:5999/" + image.repository + ":" + image.reference
+                actual = runtime.setdefault(configs[tag], image.digest)
+                spec = "localhost:5999/" + image.repository + "@" + image.digest
+                pod = {
+                    "spec": {"containers": [{"name": "app", "image": spec}]},
+                    "status": {
+                        "containerStatuses": [
+                            {
+                                "name": "app",
+                                "imageID": "docker-pullable://"
+                                + spec.rsplit("@", 1)[0]
+                                + "@"
+                                + actual,
+                            }
+                        ]
+                    },
+                }
+                failures = pps.running_image_failures(
+                    {"items": [pod]},
+                    {image.name: image.digest},
+                    registry="localhost:5999",
+                    required=(image.name,),
+                )
+                assert failures == [], (run_id, image.name, failures)
+                if image.name in previous:
+                    pod["status"]["containerStatuses"][0]["imageID"] = previous[image.name]
+                    assert pps.running_image_failures(
+                        {"items": [pod]},
+                        {image.name: image.digest},
+                        registry="localhost:5999",
+                        required=(image.name,),
+                    )
+                previous[image.name] = image.digest
+        finally:
+            finalizer.run()
+            ledger.close()
 
 
 def test_docker_listed_tags_keep_tagged_rows_only() -> None:
@@ -1334,6 +1486,47 @@ def test_harvester_program_streams_recorded_shapes(tmp_path: Path) -> None:
     assert {s.role for s in facts.sessions} == {pps.IMPLEMENTER, *pps.REVIEWER_ROLES}
 
 
+def test_harvester_reports_sizes_between_its_slow_scans(tmp_path: Path) -> None:
+    """A size report every ``sync_interval``; git and /proc scans only every ``interval``.
+
+    A parked runner's pod can be deleted within a second of the park, and a
+    capture is terminal only on a size report taken after the park, so the
+    reports cannot wait on the slow scans' interval.
+    """
+
+    nonce = "0f0f1e1e2d2d3c3c"
+    _fake_pod(tmp_path, nonce)
+    calls = tmp_path / "git-calls"
+    counted = tmp_path / "gitbin" / "counted-git"
+    counted.write_text(f'#!/bin/sh\necho x >> {calls}\nexec {tmp_path / "gitbin" / "git"} "$@"\n')
+    counted.chmod(0o755)
+    config = pps.harvest_config(
+        nonce=nonce,
+        tmp_root=str(tmp_path / "tmp"),
+        review_dir=str(tmp_path / "tmp" / "dark-factory-review"),
+        workspace=str(tmp_path / "workspace"),
+        proc_root=str(tmp_path / "proc"),
+        git=str(counted),
+        interval=60.0,
+        sync_interval=0.01,
+        max_seconds=0.3,
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", pps.HARVEST_PROGRAM, config],
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    kinds = [json.loads(line)["kind"] for line in result.stdout.splitlines()]
+    assert kinds[-1] == "end"
+    assert kinds.count("sync") >= 5
+    # One slow round in the whole run: rev-parse and status, once each.
+    assert calls.read_text().count("x") == 2
+    assert pps.HARVEST_SYNC_SECONDS <= 0.1
+    assert json.loads(pps.harvest_config(nonce=nonce))["sync_interval"] == pps.HARVEST_SYNC_SECONDS
+
+
 def _file_record(path: str, offset: int, data: bytes) -> bytes:
     return json.dumps(
         {"kind": "file", "path": path, "offset": offset, "data": base64.b64encode(data).decode()}
@@ -1412,7 +1605,8 @@ def _gate(tmp_path: Path, event: Mapping[str, Any]) -> subprocess.CompletedProce
     script = tmp_path / pps.RESERVATION_GATE_FILE
     script.write_text(pps.RESERVATION_GATE_PROGRAM)
     # The gate resolves reviewers with the bundle's own review_gate.py beside it.
-    shutil.copy(REPO_ROOT / "examples/dark-factory/hooks/review_gate.py", tmp_path)
+    for name in ("review_gate.py", "decisions_section.py"):
+        shutil.copy(REPO_ROOT / "examples/dark-factory/hooks" / name, tmp_path)
     limits = json.dumps(pps.RESERVATION_LIMITS)
     return subprocess.run(
         [sys.executable, "-I", str(script), limits],
@@ -1728,6 +1922,17 @@ def _values() -> dict[str, Any]:
         model_addresses=["192.0.2.10", "192.0.2.10", "192.0.2.11"],
         slack_bot_secret="ppa-acme-slack-bot",
     )
+
+
+def test_install_values_select_personal_mode_through_the_chart_value() -> None:
+    values = _values()
+    assert values["factory"]["modelAuthMode"] == pps.PERSONAL_MODE
+    # The rest of the factory block is still there beside it.
+    assert values["factory"]["intake"] == "poll"
+    assert values["factory"]["codeHosts"] and values["factory"]["trackers"]
+    for workload in ("api", "worker"):
+        env = values[workload].get("extraEnv", [])
+        assert "FACTORY_MODEL_AUTH_MODE" not in json.dumps(env), (workload, env)
 
 
 def test_factory_values_pass_the_api_forge_model() -> None:
@@ -3195,6 +3400,77 @@ def test_forge_probe_never_deletes_a_branch_it_did_not_create(
     assert not any(method == "PATCH" for method, _path in _ProbeForge.writes)
 
 
+class _OwnedProbeForge(_ProbeForge):
+    """The probe creates its own branch; the ref listing lags the delete by ``lag`` reads."""
+
+    lag = 0
+    reads_after_delete = 0
+    deleted = False
+
+    def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        if "/git/ref/heads/ppa-probe-" in path and method == "GET":
+            if not type(self).deleted:
+                return 200, {"object": {"sha": OWN_SHA}}
+            type(self).reads_after_delete += 1
+            if type(self).reads_after_delete > type(self).lag:
+                return 404, {}
+            return 200, {"object": {"sha": OWN_SHA}}
+        if method == "DELETE":
+            type(self).deleted = True
+            _ProbeForge.writes.append((method, path))
+            return 204, {}
+        if method == "POST" and path.endswith("/git/refs"):
+            return 201, {}
+        if method == "POST" and path.endswith("/pulls"):
+            return 201, {"number": 7}
+        if method == "GET" and path.endswith("/pulls/7"):
+            closed = any(m == "PATCH" for m, _p in _ProbeForge.writes)
+            return 200, {"head": {"sha": OWN_SHA}, "state": "closed" if closed else "open"}
+        return super().request(method, path, body)
+
+
+def _run_owned_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: type[_OwnedProbeForge], lag: int
+) -> int:
+    forge.lag = lag
+    forge.reads_after_delete = 0
+    forge.deleted = False
+    monkeypatch.setattr(pp, "Forge", forge)
+    return pp.main(
+        [
+            "forge-probe",
+            "--candidate",
+            CANDIDATE,
+            "--state-dir",
+            str(_private(tmp_path / "state")),
+            "--run-id",
+            "probe-lag",
+            "--app-dir",
+            str(_app_dir(_private(tmp_path / "apps"))),
+        ],
+        environ={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        clock=_FakeClock(T0),
+    )
+
+
+def test_forge_probe_waits_for_the_ref_listing_to_catch_up_with_the_delete(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = _run_owned_probe(tmp_path, monkeypatch, _OwnedProbeForge, lag=2)
+    assert code == 0, capsys.readouterr()
+    assert _OwnedProbeForge.reads_after_delete == 3
+
+
+def test_forge_probe_fails_when_the_branch_never_disappears(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = _run_owned_probe(tmp_path, monkeypatch, _OwnedProbeForge, lag=10_000)
+    capsys.readouterr()
+    assert code == 1
+    # Bounded: about 30 s at one read per 2 s, not unbounded.
+    assert _OwnedProbeForge.reads_after_delete <= 17
+
+
 # --------------------------------------------------------------------------
 # A cut final record, the runner image, and retained volumes
 # --------------------------------------------------------------------------
@@ -3401,3 +3677,354 @@ def test_the_item_total_stops_paid_work_at_its_approved_limit(tmp_path: Path) ->
     second.reservations = under.ledger.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0)
     second.harvest = harvest
     under.check_allowance(second)  # 21,831 + 8,000 stays inside the item total
+
+
+# --------------------------------------------------------------------------
+# Two-owner scenario (#5379): command-path refusals, each with its control
+#
+# ``personal_profile.py --scenario two-owner`` refuses before paid admission.
+# Every case drives the real ``main`` and ends with an authorized positive
+# control; the driver-level cases live in test_personal_two_owner.py.
+# --------------------------------------------------------------------------
+
+
+def test_preflight_passes_with_candidate_images_and_the_mirrored_dex(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    images = tos._candidate_registry()
+    dex_digest = next(ref for (repo, ref) in images if repo == pt.DEX_REPOSITORY)
+    with tos._registry(images) as port:
+        state = tos._private(tmp_path / "state")
+        tos._record_dex(state, digest=dex_digest)
+        inputs = tos._inputs_file(tmp_path, tos._kit(tmp_path, registry=f"localhost:{port}"))
+        code, result = tos._main(tos._argv("preflight", inputs, state, *tos.APPROVE), capsys)
+    assert code == 0, result
+    assert result["verdict"] == "pass" and result["scenario"] == "two-owner"
+    assert all(result["checks"].values())
+    assert {row["owner"] for row in result["schedule"]["groups"]} == {"a", "b"}
+    ledger = pto.TwoOwnerLedger.open_existing(state, tos.RUN_ID)
+    try:
+        dex_ref = f"localhost:{port}/{pt.DEX_REPOSITORY}@{dex_digest}"
+        assert ledger.observations("images")["preflight_dex"] == dex_ref
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("served", "dex", "detail"),
+    [("other", "served", "curie-"), ("candidate", "missing", "dex")],
+)
+def test_preflight_refuses_a_candidate_or_dex_image_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], served: str, dex: str, detail: str
+) -> None:
+    images = tos._candidate_registry(tos.OTHER_SHA if served == "other" else tos.CANDIDATE)
+    dex_digest = next(ref for (repo, ref) in images if repo == pt.DEX_REPOSITORY)
+    with tos._registry(images) as port:
+        state = tos._private(tmp_path / "state")
+        tos._record_dex(state, digest=dex_digest if dex == "served" else "sha256:" + "e" * 64)
+        inputs = tos._inputs_file(tmp_path, tos._kit(tmp_path, registry=f"localhost:{port}"))
+        code, result = tos._main(tos._argv("preflight", inputs, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "candidate_image_mismatch", result
+    assert detail in result["fix"]
+
+
+@pytest.mark.parametrize("command", ["preflight", "run"])
+def test_live_commands_refuse_a_setup_descriptor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    setup = tos._inputs_file(tmp_path / "setup", tos._setup_document(tmp_path / "setup"))
+    code, result = tos._main(tos._argv(command, setup, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "independence_unasserted"
+    # Control: the live descriptor gets past every input refusal.
+    with tos._registry({}) as port:
+        live = tos._inputs_file(
+            tmp_path / "live", tos._kit(tmp_path / "live", registry=f"localhost:{port}")
+        )
+        code, result = tos._main(tos._argv(command, live, state, *tos.APPROVE), capsys)
+    assert result.get("error") != "independence_unasserted"
+    if command == "run":
+        assert code == 1 and result["phase"] == "refusals" and result["error"] == "step_failed"
+        ledger = pto.TwoOwnerLedger.open_existing(state, tos.RUN_ID)
+        try:
+            assert ledger.observations("budget")["schedule_check_passed"] is True
+            assert not ledger.is_rehearsal()
+        finally:
+            ledger.close()
+
+
+@pytest.mark.parametrize("command", ["images", "forge-probe", "rehearse"])
+def test_setup_commands_refuse_a_live_descriptor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    live = tos._inputs_file(tmp_path / "live", tos._kit(tmp_path / "live"))
+    code, result = tos._main(tos._argv(command, live, state), capsys)
+    assert code == 2 and result["error"] == "setup_inputs_carry_grants"
+    # Control: a setup descriptor is accepted and the command reaches its first
+    # child, which this PATH lacks (git, openssl or kubectl): a step failure.
+    setup = tos._inputs_file(tmp_path / "setup", tos._setup_document(tmp_path / "setup"))
+    code, result = tos._main(tos._argv(command, setup, state), capsys)
+    assert code == 1 and result.get("error", "step_failed") == "step_failed", result
+    if command == "rehearse":
+        ledger = pto.TwoOwnerLedger.open_existing(state, tos.RUN_ID)
+        try:
+            assert ledger.is_rehearsal()
+            assert ledger.observations("rehearsal")["schedule_check_passed"] is True
+        finally:
+            ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("command", "flag", "value"),
+    [
+        ("images", "--context", tos.CONTEXT),
+        ("forge-probe", "--app-dir", "app"),
+        ("rehearse", "--resolution-channel", tos.CHANNEL),
+        ("rehearse", "--grant-file", "grant"),
+        ("preflight", "--output-token-ceiling", "32768"),
+        ("run", "--item-output-tokens-spent", "0"),
+        # Equal to its default, still a single-profile flag.
+        ("run", "--grant-probe-cli", pp.DEFAULT_PROBE_CLI),
+    ],
+)
+def test_single_profile_flags_are_refused_with_the_scenario(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, flag: str, value: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    live = command in {"preflight", "run"}
+    approve = tos.APPROVE if live else ()
+    with tos._registry({}) as port:
+        build = tos._kit if live else tos._setup_document
+        inputs = tos._inputs_file(tmp_path, build(tmp_path, registry=f"localhost:{port}"))
+        code, result = tos._main(tos._argv(command, inputs, state, *approve, flag, value), capsys)
+        assert code == 2 and result["error"] == "arguments_invalid" and flag in result["fix"]
+        code, result = tos._main(tos._argv(command, inputs, state, *approve), capsys)
+    assert result.get("error") != "arguments_invalid", result
+
+
+def test_inputs_file_is_a_two_owner_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    inputs = tos._inputs_file(tmp_path, tos._setup_document(tmp_path))
+    argv = ["judge", "--inputs-file", str(inputs), "--candidate", tos.CANDIDATE]
+    argv += ["--state-dir", str(state), "--run-id", tos.RUN_ID, "--criterion", "roles"]
+    code, result = tos._main(argv, capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+    # Control: without it the single-profile judge runs as before (no ledger yet).
+    code, result = tos._main([argv[0], *argv[3:]], capsys)
+    assert result["error"] != "arguments_invalid"
+
+
+@pytest.mark.parametrize("command", ["preflight", "run"])
+@pytest.mark.parametrize("approval", [None, "approve everything"])
+def test_live_commands_need_the_exact_live_approval(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, approval: str | None
+) -> None:
+    state = tos._private(tmp_path / "state")
+    extra = () if approval is None else ("--approve-live", approval)
+    with tos._registry({}) as port:
+        inputs = tos._inputs_file(tmp_path, tos._kit(tmp_path, registry=f"localhost:{port}"))
+        code, result = tos._main(tos._argv(command, inputs, state, *extra), capsys)
+        assert code == 2 and result["error"] == "live_not_approved"
+        code, result = tos._main(tos._argv(command, inputs, state, *tos.APPROVE), capsys)
+    assert result.get("error") != "live_not_approved"
+
+
+def test_rehearse_refuses_a_live_approval(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    inputs = tos._inputs_file(tmp_path, tos._setup_document(tmp_path))
+    code, result = tos._main(tos._argv("rehearse", inputs, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+
+
+@pytest.mark.parametrize("command", ["preflight", "run", "rehearse"])
+def test_an_impossible_schedule_is_refused_before_any_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    build = tos._setup_document if command == "rehearse" else tos._kit
+    approve = () if command == "rehearse" else tos.APPROVE
+    inputs = tos._inputs_file(tmp_path / "high", build(tmp_path / "high", prior=12_000))
+    code, result = tos._main(tos._argv(command, inputs, state, *approve), capsys)
+    assert code == 2 and result["error"] == "session_plan_impossible"
+    assert not (state / f"{tos.RUN_ID}.work").exists()
+    with tos._registry({}) as port:
+        low = build(tmp_path / "low", prior=4_000, registry=f"localhost:{port}")
+        code, result = tos._main(
+            tos._argv(command, tos._inputs_file(tmp_path / "low", low), state, *approve), capsys
+        )
+    assert result.get("error") != "session_plan_impossible"
+
+
+@pytest.mark.parametrize("command", ["images", "preflight", "rehearse", "run", "judge"])
+@pytest.mark.parametrize(
+    ("variable", "code"),
+    [("ANTHROPIC_API_KEY", "service_credentials"), (pps.FAKE_MODEL_NAME, "fake_mode")],
+)
+def test_ambient_credentials_and_fake_mode_are_refused_first(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    variable: str,
+    code: str,
+) -> None:
+    state = tos._private(tmp_path / "state")
+    live = command in {"preflight", "run"}
+    with tos._registry({}) as port:
+        build = tos._kit if live else tos._setup_document
+        inputs = tos._inputs_file(tmp_path, build(tmp_path, registry=f"localhost:{port}"))
+        argv = tos._argv(command, None if command == "judge" else inputs, state)
+        argv += [*tos.APPROVE] if live else []
+        if command == "judge":
+            argv += ["--criterion", "rehearsal"]
+        exit_code, result = tos._main(argv, capsys, {**tos.PATH_ONLY, variable: "marker-value-1"})
+        assert exit_code == 2 and result["error"] == code
+        assert "marker-value-1" not in json.dumps(result)
+        _exit, control = tos._main(argv, capsys)
+    assert control.get("error") not in {"service_credentials", "fake_mode"}
+
+
+def test_grant_probe_is_refused_for_the_scenario(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    code, result = tos._main(tos._argv("grant-probe", None, state), capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+
+
+def test_judge_reads_a_complete_rehearsal_ledger_and_nothing_else(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    tos._rehearsal_ledger(state)
+    # No inputs file, no tools on PATH, no credential: receipts only.
+    code, result = tos._main(tos._judge_argv(state, "rehearsal"), capsys)
+    assert code == 0 and result["verdict"] == "pass" and result["scenario"] == "two-owner"
+    assert result["checks"]["no_native_sessions"] is True
+    code, result = tos._main(tos._judge_argv(state, "owners"), capsys)
+    assert code == 1 and result["checks"] == {"live_ledger": False}
+    code, result = tos._main(tos._judge_argv(state, "rehearsal", tos.OTHER_SHA), capsys)
+    assert code == 2 and result["error"] == "candidate_mismatch"
+
+
+def test_judge_fails_a_rehearsal_ledger_missing_one_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    tos._rehearsal_ledger(state, drop="admission_controls_refused")
+    code, result = tos._main(tos._judge_argv(state, "rehearsal"), capsys)
+    assert code == 1 and result["checks"]["admission_controls_refused"] is False
+
+
+def test_judge_refuses_a_single_profile_ledger_and_inputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    ledger = pps.Ledger.open(state, tos.RUN_ID)
+    ledger.ensure_run(tos.CANDIDATE, phase="run")
+    ledger.close()
+    code, result = tos._main(tos._judge_argv(state, "rehearsal"), capsys)
+    assert code == 2 and result["error"] == "ledger_missing"
+    inputs = tos._inputs_file(tmp_path, tos._setup_document(tmp_path))
+    argv = [*tos._judge_argv(state, "rehearsal"), "--inputs-file", str(inputs)]
+    code, result = tos._main(argv, capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+    # A two-owner criterion is not a single-profile one.
+    single = [
+        arg for arg in tos._judge_argv(state, "owners") if arg not in {"--scenario", "two-owner"}
+    ]
+    code, result = tos._main(single, capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+
+
+def test_parser_criteria_cover_every_two_owner_criterion() -> None:
+    choices = {*pps.CRITERIA, *pp.TWO_OWNER_CRITERIA}
+    assert {*pto.CRITERIA, "rehearsal"} <= choices
+
+
+@pytest.mark.parametrize("command", ["preflight", "run"])
+@pytest.mark.parametrize("duplicate", ["same_path", "same_content", "hard_link"])
+def test_two_owner_duplicate_grants_are_refused_by_the_real_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, duplicate: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    document = tos._kit(tmp_path)
+    grant_a = Path(document["owners"]["a"]["grant_file"])
+    grant_b = Path(document["owners"]["b"]["grant_file"])
+    if duplicate == "same_path":
+        document["owners"]["b"]["grant_file"] = str(grant_a)
+    elif duplicate == "same_content":
+        grant_b.write_bytes(grant_a.read_bytes())
+    else:
+        grant_b.unlink()
+        os.link(grant_a, grant_b)
+    inputs = tos._inputs_file(tmp_path, document)
+    code, result = tos._main(tos._argv(command, inputs, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "duplicate_owner_grant", result
+    # Control: two distinct grant files pass the duplicate check.
+    with tos._registry({}) as port:
+        control = tos._inputs_file(
+            tmp_path / "ok", tos._kit(tmp_path / "ok", registry=f"localhost:{port}")
+        )
+        code, result = tos._main(tos._argv(command, control, state, *tos.APPROVE), capsys)
+    assert result.get("error") != "duplicate_owner_grant", result
+
+
+@pytest.mark.parametrize("command", ["images", "forge-probe", "rehearse", "preflight", "run"])
+@pytest.mark.parametrize("unsafe", ["mode", "symlink", "inline_grant"])
+def test_two_owner_unsafe_inputs_files_are_refused_by_the_real_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, unsafe: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    live = command in {"preflight", "run"}
+    approve = tos.APPROVE if live else ()
+    build = tos._kit if live else tos._setup_document
+    document = build(tmp_path)
+    if unsafe == "inline_grant":
+        document["target"]["grant"] = "synthetic-inline-marker-not-a-token"
+    inputs = tos._inputs_file(tmp_path, document)
+    if unsafe == "mode":
+        os.chmod(inputs, 0o644)
+    elif unsafe == "symlink":
+        link = inputs.with_name("link.json")
+        link.symlink_to(inputs)
+        inputs = link
+    code, result = tos._main(tos._argv(command, inputs, state, *approve), capsys)
+    expected = {
+        "mode": "inputs_unsafe",
+        "symlink": "inputs_unsafe",
+        "inline_grant": "inline_grant_refused",
+    }[unsafe]
+    assert code == 2 and result["error"] == expected, result
+    assert "synthetic-inline-marker" not in json.dumps(result)
+    # Control: the same document in a safe file is not refused for its file.
+    with tos._registry({}) as port:
+        good = build(tmp_path / "ok", registry=f"localhost:{port}")
+        safe = tos._inputs_file(tmp_path / "ok", good)
+        code, result = tos._main(tos._argv(command, safe, state, *approve), capsys)
+    assert result.get("error") not in {"inputs_unsafe", "inline_grant_refused"}, result
+
+
+@pytest.mark.parametrize("command", ["preflight", "run"])
+@pytest.mark.parametrize("owner", ["a", "b"])
+def test_two_owner_insufficient_lifetime_is_refused_by_the_real_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, owner: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    document = tos._kit(tmp_path)
+    document["owners"][owner]["usable_until"] = int(tos.T0 + 60)
+    inputs = tos._inputs_file(tmp_path, document)
+    code, result = tos._main(tos._argv(command, inputs, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "lifetime_insufficient", result
+    assert f"owners.{owner}.usable_until" in json.dumps(result)
+    # Control: a window covering the live and cleanup seconds is not refused.
+    with tos._registry({}) as port:
+        ok = tos._kit(tmp_path / "ok", registry=f"localhost:{port}")
+        code, result = tos._main(
+            tos._argv(command, tos._inputs_file(tmp_path / "ok", ok), state, *tos.APPROVE), capsys
+        )
+    assert result.get("error") != "lifetime_insufficient", result

@@ -35,6 +35,7 @@ from curie_worker.reply_sink import build_reply_sink as production_reply_sink
 from curie_worker.workitem_dispatch import WorkItemRunning
 
 from apps.worker.tests.queue_fixtures import factory_context
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 _gateways = []
 
@@ -296,7 +297,7 @@ def test_a_turn_on_an_identity_this_worker_cannot_speak_as_is_dropped_before_it_
     asyncio.run(go())
 
 
-class _CiWorkItems:
+class _CiWorkItems(AbsentRequesterContext):
     """Names one already-running request, like a CI continuation's dispatch."""
 
     def __init__(self, running: uuid.UUID, *, agent_id: uuid.UUID) -> None:
@@ -330,7 +331,9 @@ class _CiWorkItems:
     async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
         self.finishes.append((request_id, kwargs))
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         return "acme widgets issue 7", f"wir.capability-for-{request_id}"
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]

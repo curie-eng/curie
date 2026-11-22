@@ -94,6 +94,7 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
         private_key_file: input.private_key_file.as_ref().map(PathBuf::from),
         org: input.org.clone(),
         intake: Some(POLL_INTAKE.into()),
+        model_auth_mode: None,
         repo_runners: Vec::new(),
         registry: None,
         repo_docker: Vec::new(),
@@ -700,7 +701,7 @@ async fn execute(
     let mut credit_remaining_usd = None;
     for action in &planned.actions {
         if matches!(action, Action::Deploy { .. }) {
-            credit_remaining_usd = check_credit(release_has_real_model).await;
+            credit_remaining_usd = check_credit(opts, release_has_real_model).await;
         }
         if matches!(action, Action::Cluster { .. }) && !prompted {
             prompted = true;
@@ -915,6 +916,20 @@ async fn execute(
                 let kept_jira: Option<Option<String>> = jira_binding
                     .as_deref()
                     .and_then(|binding| surface_to_keep(&held, "jira", binding, label.as_deref()));
+                // A new agent is `approve`. The bundle upload refuses a tracker
+                // result until publication policy is `auto`, so the settings
+                // land before that upload.
+                for (args, step) in agent_settings(
+                    agent,
+                    context,
+                    namespace,
+                    release,
+                    *deadline_seconds,
+                    *budget_usd,
+                    *output_tokens,
+                ) {
+                    run_self(&args, step, None, None).await?;
+                }
                 // `deploy_args` puts the deploy first, then the Jira binding or
                 // one GitHub binding per repository.
                 for (index, args) in deploy_args(
@@ -953,17 +968,6 @@ async fn execute(
                 }
                 for repo in bound {
                     crate::ui::ui().note(&skip_bound_line(agent, repo));
-                }
-                for (args, step) in agent_settings(
-                    agent,
-                    context,
-                    namespace,
-                    release,
-                    *deadline_seconds,
-                    *budget_usd,
-                    *output_tokens,
-                ) {
-                    run_self(&args, step, None, None).await?;
                 }
                 if planned.path == QuickstartPath::AddAgent {
                     return Ok(QuickstartOutput::AgentAdded {

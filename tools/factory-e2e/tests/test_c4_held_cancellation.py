@@ -357,6 +357,11 @@ def _ready(pod: dict[str, Any]) -> bool:
 class HeldRun(sk.ScriptedRun):
     """ScriptedRun on private images, an optional tool gate and a scenario."""
 
+    # Its scenarios hold and cancel a run; the one-ticket flow is not theirs.
+    runs_one_ticket = False
+    # Nor is the Slack progress card: its install runs no channel gateway.
+    SLACK_PROGRESS = False
+
     def __init__(self, args: argparse.Namespace, candidate: Candidate) -> None:
         super().__init__(args)
         self.curie = str(candidate.binary)

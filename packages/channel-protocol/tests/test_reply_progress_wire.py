@@ -98,11 +98,12 @@ def _refused_by_rule(body: dict[str, Any], error_type: str, fragment: str = "") 
 # --- versions -------------------------------------------------------------------
 
 
-def test_the_wire_has_three_versions_and_1_0_stays_the_default() -> None:
-    assert get_args(reply_wire.ReplyWireVersion) == ("1.0", "1.1", "1.2")
+def test_the_wire_has_four_versions_and_1_0_stays_the_default() -> None:
+    assert get_args(reply_wire.ReplyWireVersion) == ("1.0", "1.1", "1.2", "1.3")
     assert REPLY_WIRE_VERSION == "1.0"
     assert reply_wire.PROGRESS_REPLY_WIRE_VERSION == "1.1"
     assert reply_wire.VERBATIM_REPLY_WIRE_VERSION == "1.2"
+    assert reply_wire.SCOPED_REPLY_WIRE_VERSION == "1.3"
 
 
 @pytest.mark.parametrize(
@@ -135,7 +136,7 @@ def test_the_schema_says_which_events_have_a_1_1_form() -> None:
     for name in ("TurnStatus", "TurnCompleted"):
         assert defs[name]["properties"]["version"]["const"] == "1.0", name
     for name in ("ReplyUpdate", "ReplyPost"):
-        versions = ["1.0", "1.1", "1.2"] if name == "ReplyUpdate" else ["1.0", "1.1"]
+        versions = ["1.0", "1.1", "1.2", "1.3"] if name == "ReplyUpdate" else ["1.0", "1.1", "1.3"]
         assert defs[name]["properties"]["version"]["enum"] == versions, name
         assert {"delivery_id", "progress"} <= set(defs[name]["properties"]), name
         assert "delivery_id" not in defs[name].get("required", []), name

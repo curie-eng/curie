@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import signal
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -64,8 +65,10 @@ from .delivery_lease import DeliveryLeaseStore
 from .deploy_notice import DeployNoticeConsumer
 from .e2e_reaper import E2EReaperLoop
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
+from .factory_credit import FactoryCreditLoop
 from .factory_slack_progress import FactorySlackProgressLoop, PostgresFactorySlackStore
 from .factory_steering import FactorySteeringClient
+from .factory_tool_observer import FactoryToolObserver
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
@@ -76,7 +79,26 @@ from .kernel.memory import drain_pending_memory_closes
 from .killswitch import KillSwitch
 from .ledger_client import ThreadAttachmentLedgerClient
 from .markers import Markers
+from .personal_custody import (
+    CustodySecret,
+    PersonalCustodyReader,
+    SecretReader,
+    build_secret_reader,
+)
+from .personal_execution import PersonalExecution, owner_lease_ttl_ms
 from .progress import ProgressStore
+from .provider_probe import ProviderProbeLoop
+from .publication_candidate_capture import PublicationCandidateCapture
+from .publication_candidate_storage import (
+    PATCH_LIMIT_BYTES as PUBLICATION_CANDIDATE_PATCH_LIMIT_BYTES,
+)
+from .publication_candidate_storage import (
+    CandidateObjectStore,
+    CandidateReader,
+    CandidateWriter,
+    build_candidate_collector,
+)
+from .publication_candidates import PublicationCandidateClient
 from .publication_clients import (
     PublicationCodeHostClient,
     PublicationCredentialClient,
@@ -169,6 +191,7 @@ class Runtime:
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
     connector_loop: ConnectorReconcileLoop | None = None
+    factory_tool_observer: FactoryToolObserver | None = None
     # The cron scheduler (#268). Always built by ``build``; optional only so a
     # Runtime constructed elsewhere need not name it.
     cron_loop: CronSchedulerLoop | None = None
@@ -185,6 +208,14 @@ class Runtime:
     # run's owed progress to its agent's Slack destination, outside the
     # consumer, the thread lock and the markers.
     factory_slack_progress: FactorySlackProgressLoop | None = None
+    # Always built. Records model_credit facts from this worker's own model
+    # credential (issue 5581). Optional only so a Runtime constructed in tests
+    # need not name it.
+    factory_credit: FactoryCreditLoop | None = None
+    # Always built. Registers this worker's provider scope and probes its
+    # allowance while a provider gate waits on it (#5426). Optional only so a
+    # Runtime constructed in tests need not name it.
+    provider_probe: ProviderProbeLoop | None = None
     # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
     # beside the connector reconcile loop, never inside the consumer.
     action_executor: ActionExecutorLoop | None = None
@@ -195,6 +226,8 @@ class Runtime:
     e2e_reaper: E2EReaperLoop | None = None
     # None unless workspace recovery is on with the internal token (ADR 0251).
     workspace_recovery_gc: RecoveryCollector | None = None
+    # None unless publication candidates are on with the internal token (#5428).
+    publication_candidates_gc: RecoveryCollector | None = None
     deploy_notice_consumer: DeployNoticeConsumer | None = None
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
     # only so a Runtime constructed elsewhere need not name it.
@@ -596,11 +629,89 @@ def _attachment_coordinator(
     )
 
 
+def refuse_personal_without_kubernetes(config: WorkerConfig, env: Mapping[str, str]) -> None:
+    """A personal installation needs the Kubernetes substrate (#5378, ADR 0268).
+
+    Docker and static runners have no per-claim grant Secret or owner labels,
+    so worker start refuses before any substrate or container exists.
+    """
+
+    if config.factory_model_auth_mode == "personal" and sandbox_substrate(env) != "kubernetes":
+        raise ValueError(
+            "personal_mode_requires_kubernetes: FACTORY_MODEL_AUTH_MODE=personal needs "
+            "CURIE_SANDBOX_SUBSTRATE=kubernetes"
+        )
+
+
+class _LazySecretReader:
+    """The custody Secret reader, built on the first personal grant read.
+
+    A worker that never launches a personal execution (a laptop on Docker)
+    never loads cluster credentials. A failed build is a failed read, which
+    the custody reader refuses ``custody_unreadable``.
+    """
+
+    def __init__(self) -> None:
+        self._reader: SecretReader | None = None
+        self._guard = threading.Lock()
+
+    def read_secret(self, namespace: str, name: str) -> CustodySecret | None:
+        with self._guard:
+            if self._reader is None:
+                self._reader = build_secret_reader()
+            reader = self._reader
+        return reader.read_secret(namespace, name)
+
+
+def build_personal_execution(
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    *,
+    engine: AsyncEngine,
+    binding: BindingResolver,
+    async_redis: AsyncRedis,
+    claim_timeout_seconds: float,
+) -> PersonalExecution:
+    """The Kernel's personal execution authority (#5378), in both modes.
+
+    A service installation still meets personal requests only through their
+    own snapshot, so it carries the same authority and refuses what it
+    cannot run (``personal_mode_requires_kubernetes`` off Kubernetes).
+    """
+
+    return PersonalExecution(
+        authority=binding,
+        custody=PersonalCustodyReader(
+            engine,
+            schema=config.db_schema,
+            namespace=config.personal_grant_namespace,
+            secrets=_LazySecretReader(),
+        ),
+        owner_lock=ThreadLock(
+            async_redis,
+            ttl_ms=owner_lease_ttl_ms(
+                thread_lock_ttl_ms=config.lock_ttl_ms,
+                claim_timeout_seconds=claim_timeout_seconds,
+            ),
+            # One attempt: a held owner lease answers OwnerBusy at once.
+            acquire_timeout_s=0.0,
+            poll_interval_s=config.lock_poll_interval_s,
+            owner=config.consumer_name,
+        ),
+        owner_key=lambda provenance: (
+            f"{config.key_prefix}:personal-owner:"
+            f"{provenance.owner_tenant_id}:{provenance.owner_principal_id}"
+        ),
+        kubernetes=sandbox_substrate(env) == "kubernetes",
+    )
+
+
 def build(
     config: WorkerConfig, env: Mapping[str, str], *, resources: WorkerResources | None = None
 ) -> Runtime:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     refuse_slack_tokens(env)
+    refuse_personal_without_kubernetes(config, env)
     owner = resources if resources is not None else WorkerResources()
     owner.register_close("memory-drain", drain_pending_memory_closes, order=0)
     # Channel read revocations likewise (ADR 0100): one not finished leaves the
@@ -743,10 +854,12 @@ def build(
     # current checks and the binding owner's per-identity classification.
     identity_authority = (
         HttpTurnAuthorityClient(
-            api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
             client=eval_http,
         )
-        if config.internal_worker_token else None
+        if config.internal_worker_token
+        else None
     )
     binding = BindingResolver(engine, config, identity_classifier=identity_authority)
     recovery_gc: RecoveryCollector | None = None
@@ -785,6 +898,58 @@ def build(
                 ),
                 runner=runner,
                 coordinator=workspace,
+            )
+    candidates_gc: RecoveryCollector | None = None
+    candidate_capture: PublicationCandidateCapture | None = None
+    candidate_reader: CandidateReader | None = None
+    if config.publication_candidates_enabled and config.internal_worker_token:
+        candidates_s3 = build_recovery_s3_client(
+            endpoint_url=config.s3_endpoint_url,
+            access_key=config.s3_access_key,
+            secret_key=config.s3_secret_key,
+            region=config.s3_region,
+        )
+        owner.register_close(
+            "publication-candidates-s3", lambda: _close_sync(candidates_s3.close), order=70
+        )
+        candidate_ledger = PublicationCandidateClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        candidate_store = CandidateObjectStore(client=candidates_s3, bucket=config.workspace_bucket)
+        candidates_gc = build_candidate_collector(
+            ledger=candidate_ledger, store=candidate_store, collector_id=config.consumer_name
+        )
+        # The pre-validation capture (#5428). The config refuses candidates
+        # without managed workspaces, so the coordinator is always built here.
+        if workspace is not None:
+            candidate_capture = PublicationCandidateCapture(
+                ledger=candidate_ledger,
+                writer=CandidateWriter(
+                    ledger=candidate_ledger,
+                    store=candidate_store,
+                    scratch_root=Path(config.workspace_scratch_root) / "candidates",
+                    base_archive_limit_bytes=config.workspace_max_archive_bytes,
+                    patch_limit_bytes=min(
+                        PUBLICATION_CANDIDATE_PATCH_LIMIT_BYTES,
+                        config.publication_patch_max_bytes,
+                    ),
+                ),
+                coordinator=workspace,
+            )
+            # The reader a publication recovery run reads its candidate
+            # through (#5429). Signed reads go to a bare transport, never an
+            # httpx client, whose logger would record the signed URL.
+            candidate_read_transport = httpx.AsyncHTTPTransport()
+            owner.register_close(
+                "publication-candidates-read", candidate_read_transport.aclose, order=30
+            )
+            candidate_reader = CandidateReader(
+                ledger=candidate_ledger,
+                store=candidate_store,
+                transport=candidate_read_transport,
+                reference_ttl_seconds=config.workspace_reference_ttl_seconds,
             )
     attachment_access_client = None
     broker_server = None
@@ -903,6 +1068,8 @@ def build(
         identity_authority=identity_authority,
         workspace=workspace,
         recovery=recovery_capture,
+        publication_candidates=candidate_capture,
+        publication_candidate_reader=candidate_reader,
         attachments=attachments,
         attachment_access=attachment_access_client,
         # ADR 0205: the thread attachment ledger, behind the internal worker
@@ -947,7 +1114,18 @@ def build(
         bundles=BundleStore(config),
         # Factory run steering (#5414): always built, so a factory run's Slack
         # root never starts ordinary chat on any worker.
-        factory_steering=_build_factory_steering(config, engine, async_redis, client=eval_http),
+        factory_steering=_build_factory_steering(
+            config, engine, async_redis, client=eval_http, sink=sink
+        ),
+        # #5378: a WorkItem request runs only as the owner its snapshot names.
+        personal_execution=build_personal_execution(
+            config,
+            env,
+            engine=engine,
+            binding=binding,
+            async_redis=async_redis,
+            claim_timeout_seconds=sub_config.claim_timeout_seconds,
+        ),
     )
     owner.register_close("work-item-settlement", kernel.close, order=5)
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
@@ -1055,6 +1233,10 @@ def build(
             else None
         ),
         connector_loop=_build_connector_loop(config, engine, client=eval_http),
+        factory_tool_observer=(
+            FactoryToolObserver(engine=engine, substrate=substrate, db_schema=config.db_schema)
+            if isinstance(sandbox_client, KubernetesSandboxClient) else None
+        ),
         action_executor=_build_action_executor(
             config,
             engine,
@@ -1067,6 +1249,7 @@ def build(
         ),
         e2e_reaper=_build_e2e_reaper(config, work_items),
         workspace_recovery_gc=recovery_gc,
+        publication_candidates_gc=candidates_gc,
         cron_loop=CronSchedulerLoop(
             source_guard=CronHookSourceGuard(source_gate, engine),
             engine=engine,
@@ -1085,6 +1268,8 @@ def build(
         remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
         remediation_receipts=_build_remediation_receipts(config, engine, sink),
         factory_slack_progress=_build_factory_slack_progress(config, engine, sink),
+        factory_credit=FactoryCreditLoop(engine, config),
+        provider_probe=ProviderProbeLoop(engine, config, async_redis),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -1100,6 +1285,9 @@ _SUPERVISED_OPERATIONS = frozenset(
         "publications",
         "e2e-reaper",
         "workspace-recovery-gc",
+        "publication-candidates-gc",
+        "factory-credit",
+        "provider-probe",
     }
 )
 
@@ -1344,8 +1532,7 @@ def _build_action_executor(
 
         if not config.connector_reconcile_enabled:
             logger.info(
-                "action executor reads connector Deployments by name; "
-                "connector reconcile loop off"
+                "action executor reads connector Deployments by name; connector reconcile loop off"
             )
         deployments = connector_deployments_api()
         manifests = HttpManifestSource(
@@ -1590,6 +1777,7 @@ def _build_factory_steering(
     redis_client: AsyncRedis,
     *,
     client: httpx.AsyncClient,
+    sink: ReplySinkRouter,
 ) -> FactorySteeringClient:
     """The kernel's factory run steering client (#5414), always built.
 
@@ -1606,6 +1794,8 @@ def _build_factory_steering(
         api_base_url=config.api_base_url,
         worker_token=config.internal_worker_token or None,
         client=client,
+        intent_key=config.steering_sent_key,
+        replies=ObservedReplySink(sink),
     )
 
 
@@ -1621,7 +1811,10 @@ def _build_factory_slack_progress(
         return None
     return FactorySlackProgressLoop(
         store=PostgresFactorySlackStore(
-            engine, schema=config.db_schema, lease_owner=config.consumer_name
+            engine,
+            schema=config.db_schema,
+            lease_owner=config.consumer_name,
+            console_origin=config.console_origin,
         ),
         replies=ObservedReplySink(sink),
         interval_seconds=config.factory_slack_interval_s,
@@ -1638,9 +1831,7 @@ def _build_publication_loop(
 ) -> PublicationReconcileLoop | None:
     """Build the worker-owned Kubernetes publication lane, never a local twin."""
 
-    if (
-        not config.publication_enabled or sandbox_substrate(env) != "kubernetes"
-    ):
+    if not config.publication_enabled or sandbox_substrate(env) != "kubernetes":
         return None
     namespace = config.publication_namespace
     cluster = KubernetesPublicationCluster(namespace)
@@ -1845,6 +2036,9 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         tasks.append(launch("deploy-notices", rt.deploy_notice_consumer.run))
     if rt.connector_loop is not None:
         tasks.append(launch("connectors", lambda: rt.connector_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    tool_observer = rt.factory_tool_observer
+    if tool_observer is not None:
+        tasks.append(launch("factory-tools", lambda: tool_observer.run_forever(shutdown)))
     if getattr(rt, "action_executor", None) is not None:
         tasks.append(launch("action-executor", lambda: rt.action_executor.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "e2e_reaper", None) is not None:
@@ -1856,6 +2050,15 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             launch(
                 "workspace-recovery-gc",
                 lambda: recovery_gc.run_forever(shutdown, interval_s=interval_s),
+            )
+        )
+    candidates_gc = getattr(rt, "publication_candidates_gc", None)
+    if candidates_gc is not None:
+        candidates_interval_s = config.publication_candidates_collect_interval_s
+        tasks.append(
+            launch(
+                "publication-candidates-gc",
+                lambda: candidates_gc.run_forever(shutdown, interval_s=candidates_interval_s),
             )
         )
     if rt.cron_loop is not None:
@@ -1875,6 +2078,20 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             launch(
                 "factory-slack-progress",
                 lambda: rt.factory_slack_progress.run_forever(shutdown),  # type: ignore[union-attr]
+            )
+        )
+    if getattr(rt, "factory_credit", None) is not None:
+        tasks.append(
+            launch(
+                "factory-credit",
+                lambda: rt.factory_credit.run_forever(shutdown),  # type: ignore[union-attr]
+            )
+        )
+    if getattr(rt, "provider_probe", None) is not None:
+        tasks.append(
+            launch(
+                "provider-probe",
+                lambda: rt.provider_probe.run_forever(shutdown),  # type: ignore[union-attr]
             )
         )
     if sweeper is not None:

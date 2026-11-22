@@ -219,6 +219,14 @@ jobs:
       - name: helm render assertions (factory forges)
         run: bash charts/curie/ci/factory-forges-assertions.sh
 
+      # Prove factory.modelAuthMode renders one FACTORY_MODEL_AUTH_MODE into
+      # both the api and the worker, and that extraEnv cannot set it.
+      - name: helm render assertions (factory model auth mode)
+        run: bash charts/curie/ci/factory-model-auth-mode-assertions.sh
+
+      - name: helm render assertions (GitHub account linking)
+        run: bash charts/curie/ci/factory-github-link-assertions.sh
+
       # Prove worker.streamRetention.minAgeSeconds reaches the worker, is
       # bounded by the schema, and defaults on a release with no such block.
       - name: helm render assertions (stream retention window)
@@ -249,6 +257,11 @@ jobs:
       # and worker when enabled with a positive cap, and refuses a bad cap.
       - name: helm render assertions (workspace recovery)
         run: bash charts/curie/ci/workspace-recovery-assertions.sh
+
+      # Prove publication candidates default on, render off when workspaces are
+      # off, and still refuse a bad byte cap while workspaces are on.
+      - name: helm render assertions (publication candidates)
+        run: bash charts/curie/ci/publication-candidates-assertions.sh
 
       # Prove the retired BYO-model LiteLLM sidecar (issue #253) is absent by
       # default and that enabling its values flag is refused by the chart
@@ -645,6 +658,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-caller-key-assertions.sh
 
+      # Prove an operator-named connector ServiceAccount reaches the API alone,
+      # that the schema refuses a name the API would refuse at boot, and that
+      # naming one grants the worker nothing.
+      - name: helm render assertions (connector ServiceAccounts)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/connector-service-accounts-assertions.sh
+
       # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
       # reconciler is off, and when on, exactly {create,list,patch,delete} on
       # exactly the four kinds the client handles. `create` is load-bearing --
@@ -654,6 +675,17 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
+
+      # Prove personal Claude enrollment custody RBAC (#5377): nothing renders
+      # while `personalClaude.grantNamespace` is empty; when set, the API Role
+      # (secrets create/get/list/delete) and worker Role (secrets get) live in
+      # the grant namespace bound to this release's ServiceAccounts, both
+      # Deployments carry the env, and a value equal to the release namespace
+      # fails the render.
+      - name: helm render assertions (personal grant custody RBAC)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/personal-grant-custody-rbac-assertions.sh
 
       # Prove the action executor switch (ACTION-EXECUTOR-1, -12, -14): one
       # value renders CURIE_ACTION_EXECUTOR_ENABLED identically into the API and

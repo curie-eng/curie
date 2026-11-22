@@ -268,6 +268,27 @@ async def test_revision_commit_is_verified_by_the_api_with_the_revision_marker(
     ]
 
 
+async def test_an_adopted_revision_is_named_to_the_api_for_its_own_marker() -> None:
+    """A recovery proves the predecessor's marker, never its own, on that commit (#5429)."""
+
+    adopted = uuid.UUID("99999999-9999-4999-8999-999999999999")
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"commit_sha": REVISION_HEAD, "parent_sha": PRIOR_HEAD})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        verified = await _code_host(handler, client).verify_revision_commit(
+            PUBLICATION_ID, REVISION_HEAD, revision_id=adopted, expected_parent=PRIOR_HEAD
+        )
+
+    assert verified == PublicationRevisionCommit(commit_sha=REVISION_HEAD, parent_sha=PRIOR_HEAD)
+    assert bodies == [
+        {"commit_sha": REVISION_HEAD, "revision_id": str(adopted), "expected_parent": PRIOR_HEAD}
+    ]
+
+
 async def test_a_refused_revision_commit_carries_the_api_reason() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(

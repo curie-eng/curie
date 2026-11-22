@@ -30,6 +30,7 @@ _PLATFORM = (
     "max-turns",
     "model-unreachable",
     "final-answer-validation",
+    "authentication-required",
 )
 
 

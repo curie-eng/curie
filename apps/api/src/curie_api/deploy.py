@@ -78,7 +78,7 @@ class SealingKeyCustody(Exception):
     stored before it did can still be deployed, promoted or rolled back to,
     and at the cluster tier the deploy path would then resolve a plain name
     into the per-agent connector Secret. Raised by
-    ``check_stored_sealing_key_custody``; the message is the intake refusal's
+    ``check_stored_bundle_intake``; the message is the intake refusal's
     own custody reason, and ``code`` is the intake issue's code, so a git push
     rejection and a 422 detail say the same thing.
     """
@@ -185,13 +185,12 @@ def _bound_clause(bound: Iterable[str]) -> str:
     return f"bound routes are {_quoted(names)}" if names else "this agent binds no approval routes"
 
 
-def validate_archive(
-    data: bytes, settings: Settings | None = None
-) -> tuple[str, str]:
+def validate_archive(data: bytes, settings: Settings | None = None) -> tuple[str, str]:
     """Validate an archive's bytes. Returns (extension, content_type).
 
     Raises ``bundles.UnsupportedArchive`` if the bytes are not a zip/tar(.gz),
-    ``BundleInvalid`` if the plugin bundle fails validation, and (via
+    ``BundleInvalid`` if the plugin bundle fails validation (including one that
+    still carries the retired ``workflow/result.json``), and (via
     ``safe_extract``) ``bundles.UnsupportedArchive`` again if the archive
     exceeds the configured uncompressed-size or compression-ratio cap.
     """
@@ -242,8 +241,14 @@ async def revalidate_stored_bundle(
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
 
 
-def _stored_custody_reasons(data: bytes, settings: Settings) -> list[str]:
-    """Blocking half of ``check_stored_sealing_key_custody``; run in a threadpool."""
+def _stored_intake_refusals(
+    data: bytes, settings: Settings
+) -> tuple[list[str], list[plugin_format.ValidationIssue]]:
+    """Blocking half of ``check_stored_bundle_intake``; run in a threadpool.
+
+    One extraction answers both stored-bundle intake checks: the sealing key
+    custody reasons, and the retired result declaration's issue.
+    """
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp)
@@ -254,20 +259,25 @@ def _stored_custody_reasons(data: bytes, settings: Settings) -> list[str]:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        issues = bundles.sealing_key_custody_issues(plugin_format.bundle_root(dest))
-        return [issue.message for issue in issues]
+        root = plugin_format.bundle_root(dest)
+        reasons = [issue.message for issue in bundles.sealing_key_custody_issues(root)]
+        return reasons, bundles.retired_result_declaration_issues(root)
 
 
-async def check_stored_sealing_key_custody(
+async def check_stored_bundle_intake(
     store: ObjectStore, version: AgentVersion, settings: Settings | None = None
 ) -> None:
-    """Refuse a stored bundle that intake would now refuse for sealing key custody.
+    """Refuse a stored bundle that intake would now refuse.
 
     @spec ACTION-EXECUTOR-16: custody holds on every path that makes a version
-    the one that boots, not only on first upload. A no-op when the version
-    carries no bundle yet, like ``revalidate_stored_bundle``. Stored bytes the
-    current caps refuse report ``BundleTooLarge``, the settled answer for them
-    (ADR-0059 decision 3).
+    the one that boots, not only on first upload. So does the retired result
+    declaration: a stored object that still carries ``workflow/result.json``
+    (stored by an earlier build) is refused rather than deployed as an
+    implementation agent. A no-op when the version carries no bundle yet, like
+    ``revalidate_stored_bundle``. Raises, in this order: ``BundleTooLarge`` for
+    stored bytes the current caps refuse (ADR-0059 decision 3),
+    ``SealingKeyCustody``, and ``BundleInvalid`` carrying the
+    ``bundle.result_declaration_retired`` issue.
     """
 
     if version.bundle_ref is None:
@@ -275,11 +285,13 @@ async def check_stored_sealing_key_custody(
     settings = settings or get_settings()
     data = await store.get(version.bundle_ref)
     try:
-        reasons = await run_in_threadpool(_stored_custody_reasons, data, settings)
+        reasons, retired = await run_in_threadpool(_stored_intake_refusals, data, settings)
     except plugin_format.UnsupportedArchive as exc:
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
     if reasons:
         raise SealingKeyCustody("; ".join(reasons))
+    if retired:
+        raise BundleInvalid([issue.model_dump() for issue in retired])
 
 
 def _declared_route_map(data: bytes, settings: Settings) -> dict[str, str] | None:

@@ -419,6 +419,90 @@ export async function updateAgent(
   return jsonOrThrow<AgentOut>(resp);
 }
 
+// A Slack channel id the API accepts for `factory_slack_channel`: a public (C) or
+// private (G) channel id. Mirrors the server pattern; the console checks it first
+// so a typo never costs a round trip.
+export const SLACK_PROGRESS_CHANNEL_RE = /^[CG][A-Z0-9]{6,}$/;
+
+export const SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE =
+  "Not a Slack channel id: use a public or private channel id such as C0EXAMPLE1 " +
+  "(uppercase letters and digits, at least 7 characters, starting with C or G).";
+
+/**
+ * A failed `factory_slack_channel` write, classified so the console can say what
+ * to do next: `unbound` (409, the agent does not have exactly one Slack binding for that channel),
+ * `invalid` (422 pattern failure), or `other`.
+ */
+export class FactorySlackChannelError extends ApiError {
+  code: "unbound" | "invalid" | "other";
+  constructor(status: number, code: "unbound" | "invalid" | "other", message: string) {
+    super(status, message);
+    this.name = "FactorySlackChannelError";
+    this.code = code;
+  }
+}
+
+// 409 body: { detail: { code: "factory_slack_channel_unbound" } }.
+function isUnboundBody(body: unknown): boolean {
+  if (!body || typeof body !== "object" || !("detail" in body)) return false;
+  const detail = (body as { detail: unknown }).detail;
+  return (
+    !!detail &&
+    typeof detail === "object" &&
+    (detail as { code?: unknown }).code === "factory_slack_channel_unbound"
+  );
+}
+
+// 422 body: FastAPI's array detail, with a string_pattern_mismatch on the
+// factory_slack_channel field.
+function isPatternFailureBody(body: unknown): boolean {
+  if (!body || typeof body !== "object" || !("detail" in body)) return false;
+  const detail = (body as { detail: unknown }).detail;
+  if (!Array.isArray(detail)) return false;
+  return detail.some((item) => {
+    if (!item || typeof item !== "object") return false;
+    const { loc, type } = item as { loc?: unknown; type?: unknown };
+    return (
+      type === "string_pattern_mismatch" &&
+      Array.isArray(loc) &&
+      loc[loc.length - 1] === "factory_slack_channel"
+    );
+  });
+}
+
+// Set (a channel id) or clear (null) the Slack channel an agent's factory runs
+// post progress to. Only the one key is sent: an explicit null clears it, which
+// is the same three-way rule as `model` above. The API refuses a channel the
+// agent has no Slack binding for with a coded 409; that and the 422 pattern
+// failure surface as FactorySlackChannelError, everything else as ApiError.
+export async function setFactorySlackChannel(
+  agentId: string,
+  channel: string | null,
+): Promise<AgentOut> {
+  const resp = await request(`/agents/${agentId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ factory_slack_channel: channel }),
+  });
+  if (resp.ok) return (await resp.json()) as AgentOut;
+  const body = await resp.json().catch(() => null);
+  if (resp.status === 409 && isUnboundBody(body)) {
+    throw new FactorySlackChannelError(
+      resp.status,
+      "unbound",
+      `This agent needs exactly one Slack binding for ${channel ?? "that channel"}, and it has none or more than one identity there. Add the channel as a surface if it has none, or remove the extra identity if it has several.`,
+    );
+  }
+  if (resp.status === 422 && isPatternFailureBody(body)) {
+    throw new FactorySlackChannelError(resp.status, "invalid", SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE);
+  }
+  throw new FactorySlackChannelError(
+    resp.status,
+    "other",
+    describeError(body) || resp.statusText || `HTTP ${resp.status}`,
+  );
+}
+
 // Move one surface binding to a new kind/address (ADR-0118). The pair being
 // moved is named by `selector` (its CURRENT kind/address) and rides in the
 // query string, never the body, so it can never be confused with `next`, the
@@ -618,6 +702,143 @@ export async function deleteMemory(
   throw new ApiError(resp.status, describeError(body) ?? resp.statusText);
 }
 
+// ---- Learned rules: list, accept, reject and remove (#5800) ----
+
+export type MemoryRule = Schemas["MemoryRuleOut"];
+export type MemoryRules = Schemas["MemoryRulesOut"];
+export type MemoryRuleChange = Schemas["MemoryRuleDecisionOut"];
+
+/**
+ * A coded refusal of a learned rule route: `detail` is `{code, message, fix}`
+ * with `code` of the form `memory_rules.<name>`. `message` is the API's own
+ * sentence; the page maps the codes it knows to its own wording.
+ */
+export class MemoryRuleRefusal extends ApiError {
+  code: string;
+  limit: number | null;
+  constructor(status: number, code: string, message: string, limit: number | null) {
+    super(status, message);
+    this.name = "MemoryRuleRefusal";
+    this.code = code;
+    this.limit = limit;
+  }
+}
+
+/** The answer did not have the shape the API documents (a skewed release). */
+export class MemoryRuleShapeError extends Error {
+  constructor(operation: string, field: string) {
+    super(`${operation} answered with a body that is not a learned rule (at \`${field}\`)`);
+    this.name = "MemoryRuleShapeError";
+  }
+}
+
+const RULE_STATES = ["proposed", "accepted", "rejected", "removed"];
+const RULE_SCOPE_KINDS = ["agent", "binding", "repository"];
+const RULE_STRINGS = [
+  "id", "label", "scope_key", "scope_label", "text", "reason", "proposed_by", "proposed_at",
+] as const;
+const RULE_NULLABLE_STRINGS = [
+  "source_url", "accepted_at", "rejected_at", "removed_at",
+] as const;
+const RULE_DECIDERS = ["accepted_by", "rejected_by", "removed_by"] as const;
+
+// The API always sends every field (null when it has no value). A rule missing
+// one, such as `version`, is refused here rather than acted on: an action would
+// send `expected_version: undefined` and the person would see a bare 422.
+function checkRule(operation: string, at: string, value: unknown): MemoryRule {
+  const rule = (value ?? {}) as Record<string, unknown>;
+  const bad = (field: string): never => {
+    throw new MemoryRuleShapeError(operation, `${at}.${field}`);
+  };
+  if (typeof value !== "object" || value === null) return bad("");
+  for (const field of RULE_STRINGS) if (typeof rule[field] !== "string") bad(field);
+  for (const field of RULE_NULLABLE_STRINGS) {
+    if (typeof rule[field] !== "string" && rule[field] !== null) bad(field);
+  }
+  for (const field of RULE_DECIDERS) {
+    const d = rule[field];
+    if (d === null) continue;
+    const decider = (d ?? {}) as Record<string, unknown>;
+    if (
+      typeof d !== "object" ||
+      typeof decider.principal_id !== "string" ||
+      (typeof decider.display_name !== "string" && decider.display_name !== null)
+    ) {
+      bad(field);
+    }
+  }
+  if (!Number.isInteger(rule.number)) bad("number");
+  if (!Number.isInteger(rule.version)) bad("version");
+  if (!RULE_STATES.includes(rule.state as string)) bad("state");
+  if (!RULE_SCOPE_KINDS.includes(rule.scope_kind as string)) bad("scope_kind");
+  return rule as unknown as MemoryRule;
+}
+
+function checkRules(body: unknown): MemoryRules {
+  const op = "GET /agents/{id}/memory/rules";
+  const list = (body ?? {}) as Record<string, unknown>;
+  if (!Array.isArray(list.rules)) throw new MemoryRuleShapeError(op, "rules");
+  list.rules.forEach((r, i) => checkRule(op, `rules[${i}]`, r));
+  if (!Number.isInteger(list.in_force_limit)) throw new MemoryRuleShapeError(op, "in_force_limit");
+  return list as unknown as MemoryRules;
+}
+
+function checkChange(body: unknown): MemoryRuleChange {
+  const op = "POST /agents/{id}/memory/rules/{rule_id}/<action>";
+  const change = (body ?? {}) as Record<string, unknown>;
+  checkRule(op, "rule", change.rule);
+  if (change.applies_from !== "next_ticket") throw new MemoryRuleShapeError(op, "applies_from");
+  return change as unknown as MemoryRuleChange;
+}
+
+async function ruleJsonOrThrow<T>(resp: Response, check: (body: unknown) => T): Promise<T> {
+  if (resp.ok) return check(await resp.json());
+  const body = await resp.json().catch(() => null);
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (detail && typeof detail === "object" && typeof (detail as { code?: unknown }).code === "string") {
+    const d = detail as { code: string; message?: unknown; limit?: unknown };
+    throw new MemoryRuleRefusal(
+      resp.status,
+      d.code,
+      typeof d.message === "string" ? d.message : resp.statusText,
+      typeof d.limit === "number" ? d.limit : null,
+    );
+  }
+  // An error body that carries a message but no code is still the API's sentence.
+  const said = detail && typeof detail === "object" ? (detail as { message?: unknown }).message : null;
+  throw new ApiError(
+    resp.status,
+    describeError(body) ?? (typeof said === "string" ? said : null) ?? (resp.statusText || `HTTP ${resp.status}`),
+  );
+}
+
+// Every learned rule of an agent in every state; the page picks what to show.
+export async function listMemoryRules(agentId: string): Promise<MemoryRules> {
+  const resp = await request(`/agents/${agentId}/memory/rules`);
+  return ruleJsonOrThrow(resp, checkRules);
+}
+
+async function decideMemoryRule(
+  agentId: string,
+  ruleId: string,
+  action: "accept" | "reject" | "remove",
+  expectedVersion: number,
+): Promise<MemoryRuleChange> {
+  const resp = await request(`/agents/${agentId}/memory/rules/${ruleId}/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_version: expectedVersion }),
+  });
+  return ruleJsonOrThrow(resp, checkChange);
+}
+
+export const acceptMemoryRule = (agentId: string, ruleId: string, expectedVersion: number) =>
+  decideMemoryRule(agentId, ruleId, "accept", expectedVersion);
+export const rejectMemoryRule = (agentId: string, ruleId: string, expectedVersion: number) =>
+  decideMemoryRule(agentId, ruleId, "reject", expectedVersion);
+export const removeMemoryRule = (agentId: string, ruleId: string, expectedVersion: number) =>
+  decideMemoryRule(agentId, ruleId, "remove", expectedVersion);
+
 // ---- Durable state store: operator read/inspect surface (#250) ----
 
 // One namespace in an agent's durable state store, summarized for the inspector:
@@ -729,6 +950,21 @@ export async function getApprovalAudit(approvalId: string): Promise<ApprovalAudi
 export type ApprovalResolveInput = Schemas["ApprovalResolve"];
 
 export type ConsoleSession = Schemas["ConsoleSessionOut"];
+export type ConsoleSignInMethods = Schemas["ConsoleSignInMethodsOut"];
+
+export type OwnedLink = Schemas["OwnedLinkOut"];
+
+export async function getOwnedLinks(): Promise<Schemas["OwnedLinksOut"]> {
+  return jsonOrThrow(await request("/identity/me/links", { cache: "no-store" }));
+}
+
+export async function startGithubLink(): Promise<Schemas["GithubLinkStartOut"]> {
+  return jsonOrThrow(await request("/identity/me/github-link", { method: "POST" }));
+}
+
+export async function unlinkOwnedAccount(id: string): Promise<void> {
+  await jsonOrThrow(await request(`/identity/me/links/${encodeURIComponent(id)}`, { method: "DELETE" }));
+}
 
 // Inspect the HttpOnly same-origin console session. No platform key is sent:
 // the ambient cookie is the only credential on this identity boundary.
@@ -753,6 +989,86 @@ export async function exchangeConsoleLoginCode(code: string): Promise<ConsoleSes
     body: JSON.stringify({ code }),
   });
   return jsonOrThrow<ConsoleSession>(resp);
+}
+
+// Which sign-in paths this install offers. Unauthenticated, and a failure means
+// the login screen hides the organization link rather than guessing it is on.
+// Bypasses request() so a 401 does not look like an expired console session.
+export async function getConsoleSignInMethods(): Promise<ConsoleSignInMethods> {
+  const resp = await fetch(url("/console/sign-in-methods"), { credentials: "same-origin" });
+  return jsonOrThrow<ConsoleSignInMethods>(resp);
+}
+
+// End the cookie session. Direct fetch, same as the probe: a 401 here is the
+// answer, not a signal to re-probe. True only when the API clears the cookie.
+export async function logoutConsoleSession(): Promise<boolean> {
+  const resp = await fetch(url("/console/logout"), {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  return resp.status === 204;
+}
+
+export type PersonalEnrollment = Schemas["PersonalEnrollmentOut"];
+export type EnrollmentIntent = Schemas["PersonalEnrollmentWrite"]["intent"];
+
+/**
+ * A refused enrollment call. Only the HTTP status and the API's machine code
+ * survive: the message is a fixed string, so nothing the API or the person sent
+ * (the token above all) can reach a log line, a toast or the DOM through it.
+ */
+export class EnrollmentApiError extends Error {
+  status: number;
+  code: string | null;
+  constructor(status: number, code: string | null) {
+    super("personal enrollment request refused");
+    this.name = "EnrollmentApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+async function enrollmentOrThrow(resp: Response): Promise<PersonalEnrollment> {
+  if (resp.ok) return (await resp.json()) as PersonalEnrollment;
+  const body: unknown = await resp.json().catch(() => null);
+  let code: string | null = null;
+  if (body && typeof body === "object" && "detail" in body) {
+    const detail = (body as { detail: unknown }).detail;
+    if (detail && typeof detail === "object" && "code" in detail) {
+      const raw = (detail as { code: unknown }).code;
+      if (typeof raw === "string") code = raw;
+    }
+  }
+  throw new EnrollmentApiError(resp.status, code);
+}
+
+// The owner's own enrollment, read with the principal console session cookie.
+export async function getPersonalEnrollment(): Promise<PersonalEnrollment> {
+  return enrollmentOrThrow(await request("/personal-claude/enrollment", { cache: "no-store" }));
+}
+
+// Enroll (`expectedVersion` null), replace or reconnect. The token travels only
+// in this request body; callers must not keep it in a cache or any storage.
+export async function writePersonalEnrollment(
+  intent: EnrollmentIntent,
+  expectedVersion: number | null,
+  token: string,
+): Promise<PersonalEnrollment> {
+  const resp = await request("/personal-claude/enrollment", {
+    method: "PUT",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ intent, expected_version: expectedVersion, token }),
+  });
+  return enrollmentOrThrow(resp);
+}
+
+export async function disconnectPersonalEnrollment(expectedVersion: number): Promise<PersonalEnrollment> {
+  const resp = await request(
+    `/personal-claude/enrollment?expected_version=${encodeURIComponent(String(expectedVersion))}`,
+    { method: "DELETE", cache: "no-store" },
+  );
+  return enrollmentOrThrow(resp);
 }
 
 // Resolve an approval (resolve-once compare-and-set) as the immutable subject

@@ -9,6 +9,7 @@ from aci_protocol import ApprovalRequest
 from aci_protocol.turn import route_identity
 from curie_internal.approval_reminder import ApprovalReminderV1
 from sqlalchemy import (
+    and_,
     case,
     func,
     literal,
@@ -505,17 +506,22 @@ async def list_approvals(
 
 async def pending_approval_inventory(
     session: AsyncSession,
-) -> tuple[int, datetime | None]:
-    """Fleet-wide pending count and oldest creation time, without pagination."""
+) -> list[tuple[str | None, int, datetime | None]]:
+    """Pending count and oldest creation per agent, including empty agents."""
 
-    count, oldest = (
-        await session.execute(
-            select(func.count(Approval.id), func.min(Approval.created_at)).where(
-                Approval.status == ApprovalStatus.pending
-            )
+    per_agent = (
+        select(Agent.name.label("agent"), func.count(Approval.id), func.min(Approval.created_at))
+        .outerjoin(
+            Approval,
+            and_(Approval.agent_id == Agent.id, Approval.status == ApprovalStatus.pending),
         )
-    ).one()
-    return int(count), oldest
+        .group_by(Agent.name)
+    )
+    unbound = select(
+        literal(None).label("agent"), func.count(Approval.id), func.min(Approval.created_at)
+    ).where(Approval.agent_id.is_(None), Approval.status == ApprovalStatus.pending)
+    rows = await session.execute(per_agent.union_all(unbound).order_by("agent"))
+    return [(name, int(count), oldest) for name, count, oldest in rows]
 
 
 async def claim_approval_resolution(

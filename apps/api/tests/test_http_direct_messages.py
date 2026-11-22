@@ -89,5 +89,3 @@ def test_grid_direct_message_queues_one_organisation_context(
             grid_direct(is_ext_shared_channel=True),
             grid_direct(channel_type="mpim"),
         )
-
-

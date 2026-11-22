@@ -13,10 +13,14 @@ import json
 import logging
 import uuid
 from collections.abc import Callable, Coroutine
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api import factory_ci
 from curie_api.config import Settings
 from curie_api.forges import types
@@ -28,7 +32,10 @@ from curie_api.forges.capabilities import (
 )
 from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailable
 from curie_api.forges.github import code_host as code_host_module
-from curie_api.forges.github.code_host import GitHubCodeHost
+from curie_api.forges.github.code_host import (
+    PLAN_GATED_BRANCH_RULES_MESSAGE,
+    GitHubCodeHost,
+)
 from curie_api.forges.hosts import github_host, repository_ref, resolve_stored
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import (
@@ -359,7 +366,10 @@ def test_lost_response_adopts_only_the_marked_revision_with_expected_parent(
     commit = _with_host(handler, lambda host: host.read_commit(_repository(), REVISION_HEAD))
 
     refusal = revision_refusal(
-        commit, commit_sha=REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+        commit,
+        commit_sha=REVISION_HEAD,
+        revision_ids=frozenset({REVISION_ID}),
+        expected_parent=PRIOR_HEAD,
     )
     assert refusal is not None and error in refusal
 
@@ -380,10 +390,58 @@ def test_lost_response_adopts_the_exact_marked_revision_commit() -> None:
     assert commit.sha == REVISION_HEAD
     assert (
         revision_refusal(
-            commit, commit_sha=REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+            commit,
+            commit_sha=REVISION_HEAD,
+            revision_ids=frozenset({REVISION_ID}),
+            expected_parent=PRIOR_HEAD,
         )
         is None
     )
+
+
+_PREDECESSOR_REVISION = uuid.UUID("99999999-9999-4999-8999-999999999999")
+_UNRELATED_REVISION = uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+
+
+@pytest.mark.parametrize(
+    ("revision_ids", "parents", "refused"),
+    [
+        (frozenset({REVISION_ID, _PREDECESSOR_REVISION}), [PRIOR_HEAD], None),
+        (frozenset({REVISION_ID}), [PRIOR_HEAD], "revision marker"),
+        (frozenset({REVISION_ID, _UNRELATED_REVISION}), [PRIOR_HEAD], "revision marker"),
+        (frozenset({REVISION_ID, _PREDECESSOR_REVISION}), ["c" * 40], "expected parent"),
+        (
+            frozenset({REVISION_ID, _PREDECESSOR_REVISION}),
+            [PRIOR_HEAD, "c" * 40],
+            "expected parent",
+        ),
+    ],
+    ids=("adoptable", "own-only", "outside-set", "wrong-parent", "two-parents"),
+)
+def test_recovery_accepts_an_adoptable_marker_only_on_the_expected_parent(
+    revision_ids: frozenset[uuid.UUID], parents: list[str], refused: str | None
+) -> None:
+    """A predecessor's pushed commit stands for a recovery only by its marker (#5429)."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "sha": REVISION_HEAD,
+                "message": f"Approved revision\n\nCurie-Revision: {_PREDECESSOR_REVISION}",
+                "parents": [{"sha": parent} for parent in parents],
+            },
+        )
+
+    commit = _with_host(handler, lambda host: host.read_commit(_repository(), REVISION_HEAD))
+
+    refusal = revision_refusal(
+        commit, commit_sha=REVISION_HEAD, revision_ids=revision_ids, expected_parent=PRIOR_HEAD
+    )
+    if refused is None:
+        assert refusal is None
+    else:
+        assert refusal is not None and refused in refusal
 
 
 def test_missing_job_recovery_reads_the_exact_lineage_branch_head() -> None:
@@ -918,6 +976,116 @@ def test_the_credential_renders_the_same_git_header_for_both_scopes() -> None:
         assert "fixture-installation-token" not in repr(credential)
 
 
+@pytest.fixture(scope="module")
+def installation_key() -> str:
+    return (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+
+
+def test_current_installation_credential_revalidates_a_cached_token(
+    monkeypatch: pytest.MonkeyPatch, installation_key: str
+) -> None:
+    # App installation discovery and mint responses follow GitHub REST:
+    # https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
+    # https://docs.github.com/en/rest/apps/installations#create-an-installation-access-token
+    installation = 5501
+    discovery_status = 200
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == f"/repos/{REPO}/installation":
+            return httpx.Response(discovery_status, json={"id": installation})
+        if request.url.path == f"/app/installations/{installation}/access_tokens":
+            return httpx.Response(
+                201,
+                json={
+                    "token": f"fixture-installation-{installation}",
+                    "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                },
+            )
+        return httpx.Response(404)
+
+    class AppClient(httpx.Client):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", AppClient)
+    credentials = GitHubCredentials(
+        GitHubAuth(
+            app_id="51",
+            private_key=installation_key,
+            token="fixture-operator-token",
+            api_url="https://api.github.com",
+            timeout_s=1,
+            ca_bundle="",
+        )
+    )
+
+    async def run() -> None:
+        nonlocal installation, discovery_status
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            host: CodeHost = _code_host(client, credentials=credentials)
+            first = await host.current_installation_credential(_repository())
+            assert first.secret == "fixture-installation-5501"
+            installation = 5502
+            second = await host.current_installation_credential(_repository())
+            assert second.secret == "fixture-installation-5502"
+            assert second.scope is CredentialScope.PUSH
+            discovery_status = 503
+            with pytest.raises(Unavailable, match="installation_credential_unavailable"):
+                await host.current_installation_credential(_repository())
+            before = len(calls)
+            with pytest.raises(NotFound):
+                await host.current_installation_credential(
+                    replace(_repository(), host="other.example.com")
+                )
+            assert len(calls) == before
+
+    asyncio.run(run())
+    assert [request.url.path for request in calls] == [
+        f"/repos/{REPO}/installation",
+        "/app/installations/5501/access_tokens",
+        f"/repos/{REPO}/installation",
+        "/app/installations/5502/access_tokens",
+        f"/repos/{REPO}/installation",
+    ]
+
+
+def test_current_installation_credential_refuses_an_operator_token() -> None:
+    credentials = GitHubCredentials(
+        GitHubAuth(
+            app_id="",
+            private_key="",
+            token="fixture-operator-token",
+            api_url="https://api.github.com",
+            timeout_s=1,
+            ca_bundle="",
+        )
+    )
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(500)
+
+    with pytest.raises(Unauthorized, match="installation_credential_refused"):
+        _with_host(
+            handler,
+            lambda host: host.current_installation_credential(_repository()),
+            credentials=credentials,
+        )
+    assert calls == []
+
+
 # --- CI ------------------------------------------------------------------------------
 
 
@@ -945,7 +1113,14 @@ def _ci_handler(
         if path.endswith("/check-runs"):
             return httpx.Response(200, json={"total_count": len(runs), "check_runs": runs})
         if path.endswith("/status"):
-            return httpx.Response(200, json={"state": "success", "statuses": statuses or []})
+            return httpx.Response(
+                200,
+                json={
+                    "state": "success",
+                    "statuses": statuses or [],
+                    "total_count": len(statuses or []),
+                },
+            )
         if path.endswith("/annotations"):
             return httpx.Response(
                 200, json=[{"path": "src/app.py", "start_line": 7, "message": "assert 1 == 2"}]
@@ -1614,6 +1789,224 @@ def test_required_checks_rules_forbidden_names_the_rules_read_and_returns_no_nam
             body,
         )
     assert str(refused.value) == "github_forbidden_get_branch_rules"
+    assert refused.value.provider_message == "Resource not accessible by integration"
+
+
+def _visibility_handler(
+    rules_status: int,
+    rules_body: Any,
+    *,
+    private: bool | str | None = False,
+    repo_status: int = 200,
+    branch_status: int = 200,
+    branch_body: Any | None = None,
+    rules_headers: dict[str, str] | None = None,
+) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/rules/branches/main"):
+            return httpx.Response(rules_status, json=rules_body, headers=rules_headers)
+        if path.endswith("/branches/main"):
+            payload = {"name": "main"} if branch_body is None else branch_body
+            return httpx.Response(branch_status, json=payload)
+        if path == f"/repos/{REPO}":
+            if repo_status != 200:
+                return httpx.Response(repo_status, json={"message": "unavailable"})
+            body: dict[str, Any] = {"id": REPO_ID, "full_name": REPO}
+            if private is not None:
+                body["private"] = private
+            return httpx.Response(200, json=body)
+        return httpx.Response(404, json={"message": "missing"})
+
+    return handler
+
+
+def test_plan_gated_rules_on_a_private_repo_keep_protection_contexts() -> None:
+    """A private plan-upgrade 403 contributes no ruleset names.
+
+    https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+    https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
+    https://docs.github.com/en/rest/repos/repos#get-a-repository
+    """
+
+    branch = {"name": "main", "protection": {"required_status_checks": {"contexts": ["lint"]}}}
+
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    found = _with_host(
+        _visibility_handler(
+            403,
+            {"message": PLAN_GATED_BRANCH_RULES_MESSAGE},
+            private=True,
+            branch_body=branch,
+        ),
+        body,
+    )
+    assert found == frozenset({"lint"})
+
+
+def test_plan_gated_rules_message_with_a_trailing_period_is_the_same_refusal() -> None:
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    found = _with_host(
+        _visibility_handler(
+            403,
+            {"message": PLAN_GATED_BRANCH_RULES_MESSAGE + "."},
+            private=True,
+            branch_body={"name": "main"},
+        ),
+        body,
+    )
+    assert found == frozenset()
+
+
+def test_plan_gated_rules_message_on_a_public_repo_stays_refused() -> None:
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with pytest.raises(Unauthorized) as refused:
+        _with_host(
+            _visibility_handler(
+                403,
+                {"message": PLAN_GATED_BRANCH_RULES_MESSAGE},
+                private=False,
+                branch_body={
+                    "name": "main",
+                    "protection": {"required_status_checks": {"contexts": ["lint"]}},
+                },
+            ),
+            body,
+        )
+    assert str(refused.value) == "github_forbidden_get_branch_rules"
+    assert refused.value.provider_message == PLAN_GATED_BRANCH_RULES_MESSAGE
+
+
+def test_another_rules_403_on_a_private_repo_stays_refused() -> None:
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with pytest.raises(Unauthorized) as refused:
+        _with_host(
+            _visibility_handler(
+                403,
+                {"message": "Resource not accessible by integration"},
+                private=True,
+            ),
+            body,
+        )
+    assert str(refused.value) == "github_forbidden_get_branch_rules"
+    assert refused.value.provider_message == "Resource not accessible by integration"
+
+
+def test_plan_gated_rules_with_unreadable_visibility_stay_refused() -> None:
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    for repo_status, private in ((500, True), (200, "true"), (200, None)):
+        with pytest.raises(Unauthorized) as refused:
+            _with_host(
+                _visibility_handler(
+                    403,
+                    {"message": PLAN_GATED_BRANCH_RULES_MESSAGE},
+                    private=private,
+                    repo_status=repo_status,
+                ),
+                body,
+            )
+        assert str(refused.value) == "github_forbidden_get_branch_rules"
+        assert refused.value.provider_message == PLAN_GATED_BRANCH_RULES_MESSAGE
+
+
+def test_rate_limited_branch_rules_403_never_takes_the_plan_gated_fallback() -> None:
+    """An exhausted budget stays a transient rate limit, even with the plan message.
+
+    https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit
+    A private repository and the plan-upgrade text do not turn this 403 into an
+    empty rules list. The wait keeps retrying and ends ``ci_timeout``.
+    """
+
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with pytest.raises(Unavailable) as refused:
+        _with_host(
+            _visibility_handler(
+                403,
+                {"message": PLAN_GATED_BRANCH_RULES_MESSAGE},
+                private=True,
+                rules_headers={"x-ratelimit-remaining": "0"},
+                branch_body={
+                    "name": "main",
+                    "protection": {"required_status_checks": {"contexts": ["lint"]}},
+                },
+            ),
+            body,
+        )
+    assert str(refused.value) == "github_rate_limited"
+
+
+def test_a_near_miss_of_the_plan_message_stays_refused() -> None:
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with pytest.raises(Unauthorized) as refused:
+        _with_host(
+            _visibility_handler(
+                403,
+                {"message": PLAN_GATED_BRANCH_RULES_MESSAGE + " today"},
+                private=True,
+            ),
+            body,
+        )
+    assert str(refused.value) == "github_forbidden_get_branch_rules"
+
+
+def test_plan_gated_private_rules_still_refuse_a_later_branch_403() -> None:
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with pytest.raises(Unauthorized) as refused:
+        _with_host(
+            _visibility_handler(
+                403,
+                {"message": PLAN_GATED_BRANCH_RULES_MESSAGE},
+                private=True,
+                branch_status=403,
+                branch_body={"message": "Resource not accessible by integration"},
+            ),
+            body,
+        )
+    assert str(refused.value) == "github_forbidden_get_branch"
+    assert refused.value.provider_message == "Resource not accessible by integration"
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "reason"),
+    [
+        (401, Unauthorized, "github_unauthorized"),
+        (500, Unavailable, "github_error"),
+        (404, None, "empty"),
+    ],
+)
+def test_rules_401_404_and_5xx_are_unchanged(
+    status: int, error: type[Exception] | None, reason: str
+) -> None:
+    """404 still contributes no names. 401 and 5xx stay unreadable."""
+
+    branch = {"name": "main", "protection": {"required_status_checks": {"contexts": ["lint"]}}}
+
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    handler = _required_handler(status, {"message": "unchanged"}, branch_body=branch)
+    if error is None:
+        assert _with_host(handler, body) == frozenset({"lint"})
+        return
+    with pytest.raises(error) as refused:
+        _with_host(handler, body)
+    assert str(refused.value) == reason
 
 
 def test_required_checks_branch_forbidden_names_the_branch_read() -> None:

@@ -304,6 +304,13 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   `sandbox-terminated`, `workspace-error` and `model-unreachable` are transient (bounded exponential
   backoff);
   `budget-exceeded` and everything else escalate.
+  A started factory implementation execute turn is the one exception (ADR
+  0269): it never retries inside a delivery, except a `sandbox-capacity`
+  refusal that opened no runner turn. Its finish reports a required safety fact
+  (`no_effects`, `flagged` or `uncertain`) and the provider retry condition the
+  runner sent, and the SQL lifecycle owns the retry as a fresh request.
+  Interactive, cron, CI fix and approval resume turns keep the classification
+  list.
   A `runner-error` whose turn start failed in the connect phase (no connection
   was made, as when a recreated sandbox pod is not yet listening) opens one
   retry window per delivery, as long as the sandbox claim timeout (90 s by
@@ -801,6 +808,8 @@ raises, so the delivery remains retryable under the same key.
 | `SlackReplyAdapter`, approval card (`reply.post` with a `ConfirmIntent`) | For a 1.0 body, `chat.postMessage` keeps the approval UUID as `client_msg_id`. For a 1.1 body, `client_msg_id` is the wire operation's `delivery_id`; the approval UUID remains in the structured Approve button value, where `cli/src/chat.rs::approval_card_id` reads it. | Slack deduplicates by whichever stable key the body form supplies. | One visible card per approval UUID on 1.0, or per `delivery_id` on 1.1. |
 | `SlackReplyAdapter`, progress post (`reply.post` carrying `progress`: a card's first revision or a milestone) | `chat.postMessage` with `client_msg_id` set to the `delivery_id`, which the coordinator derives and never re-mints for a retry. | Slack deduplicates by `client_msg_id`; the measured duplicate returned the original `ts` (above). | One visible card or milestone per `delivery_id`; the adapter adopts the original `ts`. |
 | `SlackReplyAdapter`, progress edit (`reply.update` carrying `progress`) | `chat.update` on the card's own ts, the `ref` acknowledged for its first post, never the placeholder's. Never the answer path, and never the approval card's settle path. | Yes, by **stable target**. The `delivery_id` has no Slack expression on an edit. | One visible card whatever the retry count. Which revision shows last is the coordinator's order, because Slack keeps the last edit it received. |
+| `SlackReplyAdapter` replace edit (`reply.update` version 1.3, `message_mode` replace) | `chat.update` of the generic message blocks on `(target.address, target.reply_ref)`, never the placeholder and never an approval card. | Yes, by **stable target**. | One visible message. |
+| `SlackReplyAdapter` audience post (`reply.post` version 1.3, `audience_user`) | `chat.postEphemeral` to that user with `thread_ts` from `conversation_id`. Only that user sees it. Ack is `message_ts`. | No. `chat.postEphemeral` takes no idempotency key. | Only that user sees it. Ack is `message_ts`. |
 | `HttpReplyAdapter` (`reply_sink.py`) | Whatever the binding's operator-controlled endpoint does with one POST. `turn.completed` carries `event_id` in the body, so the key is on the wire, but this repo cannot verify what the receiver does with it. | Unknown — receiver-owned, unverifiable from here. | **Explicitly at-least-once.** May not advertise exactly-once terminal effect. |
 | Eval report (`eval/stream.py` `_report` → `POST /evals/report`) | The platform API's report endpoint. `EvalReport` carries `repo_full_name`, `sha`, and counts — no idempotency key. | No. | **Explicitly at-least-once.** The pre-send lease check closes most of the window, not the send-then-lose-the-ack window; closing it needs eval-report idempotency at the platform API (follow-up F2). |
 

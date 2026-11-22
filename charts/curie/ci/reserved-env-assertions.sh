@@ -79,6 +79,7 @@ with tempfile.TemporaryDirectory() as tmp:
         ("worker", "SLACK_API_BASE_URL", "worker.slackApiBaseUrl"),
         ("worker", "CURIE_CONNECTOR_RECONCILE", "worker.connectorReconciler.enabled"),
         ("worker", "CURIE_REPO_RUNNER_POOLS", "factory.bindings"),
+        ("api", "FACTORY_GITHUB_APP_CLIENT_SECRET", "factory.githubAppClientSecretExistingSecret"),
         ("agentSandbox.runner", "ANTHROPIC_BASE_URL", "inference.service.port"),
         # The runner fails closed without a bearer (#3821): the chart owns its
         # token and a cluster runner may never opt out of it, so neither name is

@@ -68,6 +68,7 @@ VALID_SKILLS=(
   "examples/dark-factory/preparation/skills/prepare-factory-ticket"
   "examples/dark-factory/review/skills/review-pr"
   "examples/dark-factory/skills/implement-issue"
+  "examples/factory-selector/skills/factory-selector"
   "examples/github-activity/skills/github-activity"
   "examples/github-issues/skills/github-issues"
   "examples/mean-tester/skills/mean-tester"

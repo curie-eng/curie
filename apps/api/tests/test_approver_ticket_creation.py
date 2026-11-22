@@ -762,5 +762,3 @@ def test_legacy_creation_refuses_tickets_and_ordinary_legacy_is_unchanged(
 
 
 # --- answer authority (decision 5) replaces the 0271a interlock -------------------
-
-

@@ -1,0 +1,553 @@
+{
+  "$defs": {
+    "BindingFact": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": [
+            "bound",
+            "unbound",
+            "label_not_served",
+            "ambiguous"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "unbound",
+                "label_not_served",
+                "ambiguous"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        }
+      },
+      "required": [
+        "state",
+        "reason"
+      ],
+      "title": "BindingFact",
+      "type": "object"
+    },
+    "CredentialFact": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": [
+            "healthy",
+            "unhealthy",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "observation_missing",
+                "observation_expired",
+                "outside_catalog",
+                "runner_unavailable",
+                "provider_unsupported",
+                "credential_rejected",
+                "not_probed",
+                "unreadable",
+                "personal_owner_required"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observed At"
+        }
+      },
+      "required": [
+        "state",
+        "reason",
+        "observed_at"
+      ],
+      "title": "CredentialFact",
+      "type": "object"
+    },
+    "CreditFact": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": [
+            "sufficient",
+            "insufficient",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "observation_missing",
+                "observation_expired",
+                "outside_catalog",
+                "runner_unavailable",
+                "provider_unsupported",
+                "credential_rejected",
+                "not_probed",
+                "unreadable",
+                "personal_owner_required"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observed At"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        }
+      },
+      "required": [
+        "state",
+        "reason",
+        "observed_at",
+        "expires_at"
+      ],
+      "title": "CreditFact",
+      "type": "object"
+    },
+    "ExecutableFact": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "present",
+            "absent",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "basis": {
+          "anyOf": [
+            {
+              "const": "selected_image_probe",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Basis"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "observation_missing",
+                "observation_expired",
+                "outside_catalog",
+                "runner_unavailable",
+                "provider_unsupported",
+                "credential_rejected",
+                "not_probed",
+                "unreadable",
+                "personal_owner_required"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observed At"
+        }
+      },
+      "required": [
+        "name",
+        "state",
+        "basis",
+        "reason",
+        "observed_at"
+      ],
+      "title": "ExecutableFact",
+      "type": "object"
+    },
+    "FactoryFact": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "kill_switch": {
+          "enum": [
+            "clear",
+            "engaged",
+            "unknown"
+          ],
+          "title": "Kill Switch",
+          "type": "string"
+        },
+        "upgrade_pause": {
+          "enum": [
+            "clear",
+            "paused",
+            "unknown"
+          ],
+          "title": "Upgrade Pause",
+          "type": "string"
+        },
+        "code_host_credential": {
+          "$ref": "#/$defs/CredentialFact"
+        }
+      },
+      "required": [
+        "enabled",
+        "kill_switch",
+        "upgrade_pause",
+        "code_host_credential"
+      ],
+      "title": "FactoryFact",
+      "type": "object"
+    },
+    "FactsSubject": {
+      "additionalProperties": false,
+      "properties": {
+        "repository_id": {
+          "title": "Repository Id",
+          "type": "string"
+        },
+        "issue_number": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Issue Number"
+        },
+        "trigger_label": {
+          "title": "Trigger Label",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository_id",
+        "issue_number",
+        "trigger_label"
+      ],
+      "title": "FactsSubject",
+      "type": "object"
+    },
+    "LabelRoute": {
+      "additionalProperties": false,
+      "properties": {
+        "actor_id": {
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "actor_kind": {
+          "const": "human",
+          "title": "Actor Kind",
+          "type": "string"
+        },
+        "route": {
+          "enum": [
+            "github_user",
+            "github_user_via_app"
+          ],
+          "title": "Route",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "eligible",
+            "ineligible",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "observation_missing",
+                "observation_expired",
+                "outside_catalog",
+                "runner_unavailable",
+                "provider_unsupported",
+                "credential_rejected",
+                "not_probed",
+                "unreadable",
+                "personal_owner_required"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        }
+      },
+      "required": [
+        "actor_id",
+        "actor_kind",
+        "route",
+        "state",
+        "reason"
+      ],
+      "title": "LabelRoute",
+      "type": "object"
+    },
+    "RequestIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "comment_id": {
+          "title": "Comment Id",
+          "type": "string"
+        },
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "comment_id",
+        "digest"
+      ],
+      "title": "RequestIdentity",
+      "type": "object"
+    },
+    "ServiceFact": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "configured",
+            "observed",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "observation_missing",
+                "observation_expired",
+                "outside_catalog",
+                "runner_unavailable",
+                "provider_unsupported",
+                "credential_rejected",
+                "not_probed",
+                "unreadable",
+                "personal_owner_required"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observed At"
+        }
+      },
+      "required": [
+        "name",
+        "state",
+        "reason",
+        "observed_at"
+      ],
+      "title": "ServiceFact",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "kind": {
+      "const": "factory_facts",
+      "title": "Kind",
+      "type": "string"
+    },
+    "request": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RequestIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "subject": {
+      "$ref": "#/$defs/FactsSubject"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "title": "Observed At",
+      "type": "string"
+    },
+    "expires_at": {
+      "format": "date-time",
+      "title": "Expires At",
+      "type": "string"
+    },
+    "context_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Context Digest",
+      "type": "string"
+    },
+    "binding": {
+      "$ref": "#/$defs/BindingFact"
+    },
+    "label_route": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LabelRoute"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "executables": {
+      "items": {
+        "$ref": "#/$defs/ExecutableFact"
+      },
+      "title": "Executables",
+      "type": "array"
+    },
+    "services": {
+      "items": {
+        "$ref": "#/$defs/ServiceFact"
+      },
+      "title": "Services",
+      "type": "array"
+    },
+    "model_credit": {
+      "$ref": "#/$defs/CreditFact"
+    },
+    "factory": {
+      "$ref": "#/$defs/FactoryFact"
+    },
+    "admission": {
+      "const": "not_requested",
+      "title": "Admission",
+      "type": "string"
+    },
+    "deployment_readiness": {
+      "const": "unvalidated",
+      "title": "Deployment Readiness",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "request",
+    "subject",
+    "observed_at",
+    "expires_at",
+    "context_digest",
+    "binding",
+    "label_route",
+    "executables",
+    "services",
+    "model_credit",
+    "factory",
+    "admission",
+    "deployment_readiness"
+  ],
+  "title": "FactoryFacts",
+  "type": "object"
+}

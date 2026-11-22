@@ -139,6 +139,17 @@ STACK_TIER_ENV = "CURIE_CI_STACK_TIER"
 PYTEST_IMPACT = Path(__file__).resolve().parent / "tools" / "e2e-ci-selection" / "pytest_impact.py"
 
 
+@pytest.fixture
+def fresh_agent_metric_labels() -> Generator[None]:
+    from curie_telemetry.metrics import reset_bounded_labels
+
+    reset_bounded_labels()
+    try:
+        yield
+    finally:
+        reset_bounded_labels()
+
+
 def _service_pattern(*names: str) -> re.Pattern[str]:
     # Word-ish: no letter or digit may touch either end, so "s3" never matches
     # inside another word, while plurals and snake_case or kebab-case spellings

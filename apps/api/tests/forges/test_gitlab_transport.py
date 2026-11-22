@@ -68,8 +68,8 @@ async def _exercise(fake: GitLabAPI) -> None:
     sha = fake.push("factory/one")
     fake.add_merge_request("factory/one")
     fake.report_job(sha, "unit", "success")
-    page = await tracker.poll_marked(None, running=())
-    await tracker.poll_marked(page.cursor, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
+    await tracker.poll_marked(page.cursor, running=(), answering=())
     await tracker.read_ticket(fake.issue_ref(iid))
     repository = await code_host.resolve_repository(str(PROJECT_ID))
     await code_host.find_pull_request(repository, head_ref="factory/one")
@@ -120,7 +120,7 @@ async def test_a_listing_follows_x_next_page_to_the_end() -> None:
     fake = _fake(page_size=2)
     issues = _labelled(fake, 5)
 
-    page = await gitlab_tracker(fake).poll_marked(None, running=())
+    page = await gitlab_tracker(fake).poll_marked(None, running=(), answering=())
 
     listed = fake.calls("GET", f"{PROJECT}/issues")
     assert [fake.params(r).get("page", "1") for r in listed] == ["1", "2", "3"]
@@ -135,10 +135,10 @@ async def test_a_failed_later_page_raises_unavailable_and_yields_no_cursor() -> 
     fake.fail_page(f"{PROJECT}/issues", 3)
 
     with pytest.raises(Unavailable):
-        await tracker.poll_marked(None, running=())
+        await tracker.poll_marked(None, running=(), answering=())
 
     # Liveness: the same listing read to its end is a complete poll.
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
     assert {int(n.issue.issue_id) for n in page.notices} == set(issues)
 
 
@@ -146,15 +146,15 @@ async def test_a_failed_later_page_raises_unavailable_and_yields_no_cursor() -> 
 async def test_a_failed_later_page_of_an_issues_label_events_is_unavailable() -> None:
     fake = _fake(page_size=2)
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     iid = fake.add_issue("Ticket", "Do the thing.", author=WRITER)
     for add in (True, False, True):
         fake.label(iid, LABEL, WRITER, add=add)
     fake.fail_page(f"{PROJECT}/issues/{iid}/resource_label_events", 2)
 
     with pytest.raises(Unavailable):
-        await tracker.poll_marked(start.cursor, running=())
-    page = await tracker.poll_marked(start.cursor, running=())
+        await tracker.poll_marked(start.cursor, running=(), answering=())
+    page = await tracker.poll_marked(start.cursor, running=(), answering=())
     assert page.notices
 
 
@@ -243,7 +243,7 @@ async def test_a_server_below_17_is_refused_on_every_call_after_one_version_read
 
     for _ in range(2):
         with pytest.raises(Unavailable) as refused:
-            await tracker.poll_marked(None, running=())
+            await tracker.poll_marked(None, running=(), answering=())
         assert str(refused.value) == "server_version_unsupported"
     with pytest.raises(Unavailable, match="server_version_unsupported"):
         await tracker.read_ticket(fake.issue_ref(1))
@@ -268,7 +268,7 @@ async def test_a_server_at_or_above_17_is_served(version: str) -> None:
     fake = _fake(version=version)
     _labelled(fake, 1)
 
-    page = await gitlab_tracker(fake).poll_marked(None, running=())
+    page = await gitlab_tracker(fake).poll_marked(None, running=(), answering=())
 
     assert len(page.notices) == 1
     assert len(fake.calls("GET", "/version")) == 1
@@ -282,16 +282,16 @@ async def test_after_a_429_the_next_call_sends_nothing_before_retry_after() -> N
     fake = _fake()
     _labelled(fake, 1)
     tracker = gitlab_tracker(fake)
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
 
     fake.throttle(retry_after=30)
     with pytest.raises(Unavailable) as limited:
-        await tracker.poll_marked(page.cursor, running=())
+        await tracker.poll_marked(page.cursor, running=(), answering=())
     assert str(limited.value) == "rate_limited"
     sent = len(fake.requests)
 
     with pytest.raises(Unavailable, match="rate_limited"):
-        await tracker.poll_marked(page.cursor, running=())
+        await tracker.poll_marked(page.cursor, running=(), answering=())
     with pytest.raises(Unavailable, match="rate_limited"):
         await tracker.read_ticket(page.notices[0].issue)
     assert len(fake.requests) == sent

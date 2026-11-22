@@ -42,10 +42,8 @@ from curie_runner.server import create_app
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.startup_diagnostics import StderrTail
-from curie_runner.subprocess_env import proc_dumpable_library
 from curie_telemetry.redact import RedactingLogFilter, register_held_secrets
 from personal_auth_support import (
-    BUNDLED_CLI,
     IMPLEMENTER_MODEL,
     OWNER_GRANT,
     REVIEWER_MODEL,
@@ -64,23 +62,13 @@ from personal_token_support import (
     CONNECTOR_VALUE,
     PUBLIC_MARKER,
     ContainmentResponder,
+    require_native_prerequisites,
 )
 
 
 @pytest.fixture
 def native_prerequisites() -> str:
-    if not BUNDLED_CLI.is_file():
-        raise RuntimeError("the required bundled native CLI is missing")
-    library = proc_dumpable_library(os.environ)
-    if not Path(library).is_file():
-        raise RuntimeError("the required process-lock library is missing")
-    if Path("/app/runner").is_dir():
-        configured = os.environ.get("CURIE_PROC_DUMPABLE_PRELOAD", "")
-        if configured != "/usr/local/lib/curie/libproc_dumpable.so":
-            raise RuntimeError("candidate image must use its installed process-lock library")
-        if Path(configured).stat().st_uid != 0:
-            raise RuntimeError("candidate process-lock library is not root owned")
-    return library
+    return require_native_prerequisites()
 
 
 _STDIO_SERVER = """\

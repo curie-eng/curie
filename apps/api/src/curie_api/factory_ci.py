@@ -28,13 +28,22 @@ pure ``decide``:
   check with no matching run or status on the head stays pending and, at the
   CI deadline, ends ``ci_unverified``. The notice names each check that never
   started and says it may need a trigger the factory does not apply (for
-  example a label). Publication applies only operator-configured labels. A rules
-  HTTP 404 or an empty rules list adds no names. A transient required-check read stays
+  example a label). The configured Python aggregate is the exception while a
+  shard matching its pending prefix is queued or in progress, whether or not
+  the change includes a Python path: the verdict stays pending with reason
+  ``required_python_aggregate_waiting_on_shards`` and, at the same deadline,
+  is ``timed_out`` (``ci_timeout``). The notice names those shards and does
+  not say the aggregate never started.
+  Publication applies only operator-configured labels. A rules
+  HTTP 404, an empty rules list, or a plan-gated rules 403 on a private
+  repository (GitHub's plan-upgrade message and ``private: true``) adds no
+  names from that source. A transient required-check read stays
   pending until the deadline and then ends ``ci_timeout``. Any other unreadable
-  read ends ``ci_unverified`` immediately, and a 403 names the read it refused
+  read ends ``ci_unverified`` immediately. A 403 names the read it refused
   (``github_forbidden_list_check_runs``, ``github_forbidden_get_combined_status``,
   ``github_forbidden_get_branch_rules`` or ``github_forbidden_get_branch``)
-  rather than claiming a missing App permission (#5222);
+  and, when GitHub sent one, the notice quotes that message instead of
+  claiming a missing App permission (#5222);
 - a failing check run or commit status whose ``name`` or ``context`` is also
   failing on the commit the PR's base branch points to now is pre-existing,
   not caused by the change (#4105). Only caused failures fail the gate or
@@ -113,6 +122,7 @@ CI_CLAIM_SECONDS = 60
 # by the worker and stays bounded by the deadline. ``workitems`` keeps an equal
 # literal set (importing this one there would be circular).
 CI_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict", "pr_closed"})
+PYTHON_AGGREGATE_WAITING_ON_SHARDS = "required_python_aggregate_waiting_on_shards"
 
 # Reason codes that can never become readable by waiting.
 PERMANENT_UNREADABLE = frozenset(
@@ -132,7 +142,9 @@ PERMANENT_UNREADABLE = frozenset(
     }
 )
 # Reason codes that count as pending until the CI deadline.
-TRANSIENT = frozenset({"timeout", "observation_busy", "github_rate_limited", "github_error"})
+TRANSIENT = frozenset(
+    {"timeout", "observation_busy", "github_rate_limited", "github_error", "listing_incomplete"}
+)
 
 # Which GitHub read each attributed 403 refused (#5222). The notice names the
 # operation GitHub refused; it does not infer a missing App permission from the
@@ -190,16 +202,20 @@ class CiView:
     ``conflicted`` also when the pull request's head is not ``head_sha``. ``reason`` is
     set, with nothing observed, when the code host could not answer; it is a
     fixed reason code and never carries a response body, header, URL or token.
+    ``provider_message`` is GitHub's clipped ``message`` for a refused read the
+    notice quotes. It is empty for every other reason.
     """
 
     head_sha: str | None
     checks: tuple[NormalizedCheck, ...] = ()
     diagnostics: tuple[CiDiagnostic, ...] = ()
     reason: str | None = None
+    provider_message: str | None = None
     base_failing: frozenset[str] = frozenset()
     conflicted: bool | None = None
     merged: bool | None = None
     closed_unmerged: bool | None = None
+    pull_head_sha: str | None = None
 
     @property
     def runs(self) -> list[NormalizedCheck]:
@@ -272,6 +288,7 @@ async def observe(
         return view
     return replace(
         view,
+        pull_head_sha=pull.head_sha,
         conflicted=pull.conflicted if pull.head_sha == head_sha else None,
         merged=pull.state is PullRequestState.MERGED,
         closed_unmerged=pull.state is PullRequestState.CLOSED,
@@ -580,6 +597,25 @@ def _metadata_revision_detail(
     )
 
 
+def _aggregate_waiting_on_shards(
+    check_runs: Sequence[NormalizedCheck], python_ci: PythonCiPolicy | None
+) -> bool:
+    """True when a matching shard is queued or in progress.
+
+    Completed shards share the key prefix and are not dependency evidence.
+    """
+
+    prefix = None if python_ci is None else python_ci.pending_check_prefix
+    if not prefix:
+        return False
+    return any(
+        run.key.startswith(prefix)
+        and run.state is CheckState.PENDING
+        and run.reported_state in {"queued", "in_progress"}
+        for run in check_runs
+    )
+
+
 def decide(
     view: CiView,
     *,
@@ -643,7 +679,8 @@ def decide(
             if expired:
                 return Verdict(kind="timed_out", reason=reason)
             return Verdict(kind="pending", reason=reason)
-        return Verdict(kind="unverified", reason=reason)
+        quote = view.provider_message if reason in GITHUB_FORBIDDEN_OPERATIONS else None
+        return Verdict(kind="unverified", reason=reason, note=quote)
     if view.conflicted is True and view.merged is not True:
         if now < published_at + timedelta(seconds=CI_GRACE_SECONDS):
             return Verdict(kind="pending", reason="merge_conflict_grace")
@@ -763,10 +800,20 @@ def decide(
             for name in dict.fromkeys(host_required_checks)
             if name not in present and status_key(name) not in present
         )
+        if (
+            python_ci is not None
+            and missing == [python_ci.check]
+            and not required_python_runs
+            and _aggregate_waiting_on_shards(check_runs, python_ci)
+        ):
+            # Running shards are dependency evidence with or without a Python path.
+            return Verdict(
+                kind="timed_out" if expired else "pending",
+                pending=pending,
+                reason=PYTHON_AGGREGATE_WAITING_ON_SHARDS,
+            )
         if missing:
-            # Before the Python-CI missing return. A required check that never
-            # started stays pending until the CI deadline even when that name
-            # is also the repository's Python check.
+            # Any other missing required check keeps the absent-trigger ending.
             return Verdict(
                 kind="unverified" if expired else "pending",
                 pending=pending,
@@ -779,6 +826,12 @@ def decide(
         # Shard jobs stay in the list after they complete, and the aggregate
         # check is created only then. Their presence means that check can
         # still appear, so keep waiting until the CI deadline.
+        if _aggregate_waiting_on_shards(check_runs, python_ci):
+            return Verdict(
+                kind="timed_out" if expired else "pending",
+                pending=pending,
+                reason=PYTHON_AGGREGATE_WAITING_ON_SHARDS,
+            )
         shard_prefix = python_ci.pending_check_prefix if python_ci is not None else None
         shards_expect_aggregate = shard_prefix is not None and any(
             run.key.startswith(shard_prefix) for run in check_runs
@@ -1032,18 +1085,23 @@ def tried_summary(
         lines.append(f"Pending checks: {_check_list(verdict.pending)}")
     if verdict.reason:
         lines.append(f"Reason: {verdict.reason}")
-    if verdict.note:
-        lines.append(verdict.note)
     operation = GITHUB_FORBIDDEN_OPERATIONS.get(verdict.reason or "")
-    if operation is not None:
-        # The attributed 403 names the read GitHub refused (#5222); it still
-        # does not say which App permission is missing, so no grant is claimed.
-        lines.append(
-            f"GitHub refused {operation}. That names the read the CI wait could "
-            "not complete, not which App permission is missing: the checks stay "
-            "unread until the GitHub side can serve the read."
-        )
-    elif verdict.reason == "github_forbidden":
+    if operation is not None and verdict.note:
+        # Quote GitHub's message. Do not infer a missing App permission from
+        # the status (#5222).
+        lines.append(f'GitHub refused {operation}. GitHub said: "{verdict.note}".')
+    else:
+        if verdict.note:
+            lines.append(verdict.note)
+        if operation is not None:
+            # No message was captured. Still name the read and do not infer a
+            # missing App permission from the status alone (#5222).
+            lines.append(
+                f"GitHub refused {operation}. That names the read the CI wait could "
+                "not complete, not which App permission is missing: the checks stay "
+                "unread until the GitHub side can serve the read."
+            )
+    if operation is None and verdict.reason == "github_forbidden":
         lines.append(
             "GitHub returned 403 to a CI read. The refusal does not say which "
             "read or which App permission, so the checks cannot be read."
@@ -1057,7 +1115,7 @@ def tried_summary(
 
 
 @dataclass(frozen=True)
-class _Facts:
+class CiFacts:
     request: ExecutionRequest
     work_item: WorkItem
     lineage: ThreadPublicationLineage
@@ -1067,9 +1125,9 @@ class _Facts:
     published_at: datetime
 
 
-async def _load(
-    session: AsyncSession, settlement: lifecycle.PublicationSettlement
-) -> _Facts | None:
+async def load_ci_facts(
+    session: AsyncSession, settlement: lifecycle.PublicationSettlement, *, recovery: bool = False
+) -> CiFacts | None:
     request = await session.get(ExecutionRequest, settlement.request_id)
     work_item = await session.get(WorkItem, settlement.work_item_id)
     if (
@@ -1078,7 +1136,7 @@ async def _load(
         or request.work_item_id != work_item.id
         or request.version != settlement.request_version
         or work_item.version != settlement.work_item_version
-        or request.status != "running"
+        or request.status not in (("failed",) if recovery else ("running",))
         or request.execution_deadline is None
         or work_item.publication_lineage_id is None
     ):
@@ -1138,7 +1196,12 @@ async def _load(
             or base_transition is None
             or base_transition.id != subject.id
             or base_transition.version != subject.version
-            or not await session.scalar(select(lifecycle.ready_base_transition_exists(request.id)))
+            or (
+                not recovery
+                and not await session.scalar(
+                    select(lifecycle.ready_base_transition_exists(request.id))
+                )
+            )
         ):
             return None
         published_at = base_transition.ci_pushed_at
@@ -1146,7 +1209,9 @@ async def _load(
     if published_at is None:
         return None
     subject = replace(subject, changed_paths=changed_paths, published_at=published_at)
-    return _Facts(request, work_item, lineage, subject, publications, base_transition, published_at)
+    return CiFacts(
+        request, work_item, lineage, subject, publications, base_transition, published_at
+    )
 
 
 _RELEASE_CLAIM = """
@@ -1181,74 +1246,24 @@ def enqueue_marker(request_id: uuid.UUID, round_: int) -> str:
 Dispatch = Callable[[ExecutionRequest, int, str], Awaitable[bool]]
 
 
-async def gate(
+async def inspect_ci(
     sessionmaker: async_sessionmaker[AsyncSession],
     valkey: redis.Redis,
     settings: Settings,
-    client: httpx.AsyncClient,
-    settlement: lifecycle.PublicationSettlement,
+    code_host: CodeHost,
+    repository: RepositoryRef,
+    facts: CiFacts,
+    now: datetime,
     *,
-    owner: str,
-    next_poll: dict[uuid.UUID, datetime],
-    dispatch: Dispatch,
-    may_observe: Callable[[uuid.UUID], bool],
-) -> GateResult:
-    """Observe one published request's CI and act on the verdict.
+    may_observe: Callable[[], bool],
+) -> tuple[Verdict | None, CiView | None, datetime | None, MetadataCiPolicy | None, datetime]:
+    """Read current CI policy and evidence without execution or publication effects."""
 
-    ``dispatch`` enqueues the continuation turn; it runs only after the round's
-    claim and the fenced lease hold, and a failure releases the claim.
-    ``may_observe`` spends the caller's per-pass observation budget; it is asked
-    only when a CI read is actually due, so a request that is not due never
-    takes a later request's slot.
-    """
-
-    async with sessionmaker() as session:
-        facts = await _load(session, settlement)
-        now = await lifecycle.database_now(session)
-        # Keep the loaded snapshots; nothing is locked or written here.
-        session.expunge_all()
-        await session.rollback()
-    if facts is None:
-        return "waiting"
     request, work_item, lineage = facts.request, facts.work_item, facts.lineage
-    registry = forges_registry(settings)
-    # The code host entry the lineage recorded, or its WorkItem's when the
-    # lineage carries no code host identity (it is all set or all unset),
-    # never the install's GitHub accessor (#4358 plan D14).
-    if lineage.code_host_kind is not None:
-        repository = stored_repository(
-            settings,
-            kind=lineage.code_host_kind,
-            host=lineage.code_host_host,
-            path=lineage.repo_full_name or work_item.repository_path,
-            project_id=lineage.repository_project_id,
-        )
-    else:
-        repository = stored_repository(
-            settings,
-            kind=work_item.code_host_kind,
-            host=work_item.code_host_host,
-            path=work_item.repository_path,
-            project_id=work_item.repository_project_id,
-        )
-    try:
-        code_host = code_host_for_repository(
-            registry, client, repository, installations=stored_installation(lineage, work_item)
-        )
-    except ForgeError:
-        # An entry this install no longer configures is never read elsewhere.
-        return "waiting"
-    capabilities = ci_capabilities(code_host.capabilities)
     assert request.execution_deadline is not None
-    baseline_rounds = int(facts.base_transition is not None)
-    round_ = baseline_rounds + len(facts.publications)
-    if await valkey.exists(ci_key(request.id, round_ + 1)):
-        return "fixing"
-    async with sessionmaker() as session:
-        await factory_progress.record_wait_ci(session, request.id)
-    due = next_poll.get(request.id)
-    if due is not None and now < due:
-        return "waiting"
+    registry = forges_registry(settings)
+    capabilities = ci_capabilities(code_host.capabilities)
+    round_ = int(facts.base_transition is not None) + len(facts.publications)
     subject = facts.subject
     observed_sha = subject.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
@@ -1312,10 +1327,9 @@ async def gate(
     fresh_after: datetime | None = None
     if preflight_verdict is not None:
         verdict = preflight_verdict
-        head_sha = observed_sha or ""
     else:
-        if not may_observe(request.id):
-            return "waiting"
+        if not may_observe():
+            return None, None, None, metadata_ci, now
         view = await observe(
             code_host,
             repository,
@@ -1343,7 +1357,6 @@ async def gate(
         async with sessionmaker() as session:
             now = await lifecycle.database_now(session)
             await session.rollback()
-        head_sha = view.head_sha or observed_sha or ""
         host_required: frozenset[str] | None = None
         if (
             supports(code_host.capabilities, Operation.REQUIRED_CHECKS)
@@ -1359,7 +1372,16 @@ async def gate(
                 if view.reason is None or (
                     view.reason in TRANSIENT and reason not in TRANSIENT
                 ):
-                    view = replace(view, reason=reason)
+                    quote = getattr(failure, "provider_message", None)
+                    view = replace(
+                        view,
+                        reason=reason,
+                        provider_message=(
+                            quote
+                            if reason in GITHUB_FORBIDDEN_OPERATIONS and isinstance(quote, str)
+                            else None
+                        ),
+                    )
         if metadata_only and fresh_after is None:
             verdict = Verdict(kind="unverified", reason="metadata_update_unverified")
         else:
@@ -1386,6 +1408,91 @@ async def gate(
                     ),
                     reason="base_transition_checks_missing",
                 )
+    return verdict, view, fresh_after, metadata_ci, now
+
+
+async def gate(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    valkey: redis.Redis,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    settlement: lifecycle.PublicationSettlement,
+    *,
+    owner: str,
+    next_poll: dict[uuid.UUID, datetime],
+    dispatch: Dispatch,
+    may_observe: Callable[[uuid.UUID], bool],
+) -> GateResult:
+    """Observe one published request's CI and act on the verdict.
+
+    ``dispatch`` enqueues the continuation turn; it runs only after the round's
+    claim and the fenced lease hold, and a failure releases the claim.
+    ``may_observe`` spends the caller's per-pass observation budget; it is asked
+    only when a CI read is actually due, so a request that is not due never
+    takes a later request's slot.
+    """
+
+    async with sessionmaker() as session:
+        facts = await load_ci_facts(session, settlement)
+        now = await lifecycle.database_now(session)
+        # Keep the loaded snapshots; nothing is locked or written here.
+        session.expunge_all()
+        await session.rollback()
+    if facts is None:
+        return "waiting"
+    request, work_item, lineage = facts.request, facts.work_item, facts.lineage
+    registry = forges_registry(settings)
+    # The code host entry the lineage recorded, or its WorkItem's when the
+    # lineage carries no code host identity (it is all set or all unset),
+    # never the install's GitHub accessor (#4358 plan D14).
+    if lineage.code_host_kind is not None:
+        repository = stored_repository(
+            settings,
+            kind=lineage.code_host_kind,
+            host=lineage.code_host_host,
+            path=lineage.repo_full_name or work_item.repository_path,
+            project_id=lineage.repository_project_id,
+        )
+    else:
+        repository = stored_repository(
+            settings,
+            kind=work_item.code_host_kind,
+            host=work_item.code_host_host,
+            path=work_item.repository_path,
+            project_id=work_item.repository_project_id,
+        )
+    try:
+        code_host = code_host_for_repository(
+            registry, client, repository, installations=stored_installation(lineage, work_item)
+        )
+    except ForgeError:
+        # An entry this install no longer configures is never read elsewhere.
+        return "waiting"
+    capabilities = ci_capabilities(code_host.capabilities)
+    assert request.execution_deadline is not None
+    baseline_rounds = int(facts.base_transition is not None)
+    round_ = baseline_rounds + len(facts.publications)
+    if await valkey.exists(ci_key(request.id, round_ + 1)):
+        return "fixing"
+    async with sessionmaker() as session:
+        await factory_progress.record_wait_ci(session, request.id)
+    due = next_poll.get(request.id)
+    if due is not None and now < due:
+        return "waiting"
+    subject = facts.subject
+    verdict, view, fresh_after, metadata_ci, now = await inspect_ci(
+        sessionmaker,
+        valkey,
+        settings,
+        code_host,
+        repository,
+        facts,
+        now,
+        may_observe=lambda: may_observe(request.id),
+    )
+    if verdict is None:
+        return "waiting"
+    head_sha = (view.head_sha if view is not None else subject.head_sha) or ""
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
         return "waiting"

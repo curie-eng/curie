@@ -84,11 +84,12 @@ from forge_fakes.github import (
     SENDER,
     SENDER_ID,
     GitHubRepositoryFake,
-    _post,
+    WebhookDelivery,
     _sender,
     fake_installation_tokens,
     forges_document,
     forges_env_json,
+    post_delivery,
 )
 from forge_fakes.github_comments import _rows
 from starlette.applications import Starlette
@@ -106,7 +107,6 @@ STARTER_ID = "5b10a0000000000000000a11"
 OUTSIDER_ID = "5b10a0000000000000000a22"
 WORKER = {"X-Curie-Worker-Token": "jira-lifecycle-worker"}
 REVIEW_BODY = f"@{MENTION} please rename the helper before merge"
-FEEDBACK_ID = 88131
 STATE_LABELS = {
     "curie-factory:queued",
     "curie-factory:running",
@@ -190,28 +190,24 @@ class _GitHub(GitHubRepositoryFake):
             )
         return super().handle(request)
 
-    def add_feedback(self, number: int, body: str) -> dict[str, Any]:
-        """A writer's review comment on pull request ``number``, as GitHub shows it."""
+    def add_feedback(self, number: int, body: str) -> WebhookDelivery:
+        """A writer submits a review with one inline comment ``body`` on pull
+        request ``number``; returns the inline comment's signed delivery.
 
-        head = self.branches[self.pulls[number]["head"]]
-        comment = {
-            "id": FEEDBACK_ID,
-            "body": body,
-            "user": _sender(),
-            "created_at": "2026-09-20T10:00:00Z",
-            "updated_at": "2026-09-20T10:00:00Z",
-            "performed_via_github_app": None,
-            "author_association": "MEMBER",
-            "html_url": f"{self.html_base}/{REPO}/pull/{number}#discussion_r{FEEDBACK_ID}",
-            "commit_id": head,
-            "path": "src/widget.txt",
-            "line": 12,
-            "pull_request_review_id": FEEDBACK_ID + 500000,
-            "pull_request_url": f"{self.html_base}/repos/{REPO}/pulls/{number}",
-            "_number": number,
-        }
-        self.review_comments.append(comment)
-        return comment
+        GitHub creates an inline comment inside a review, which the factory
+        reads whole once it is submitted (#5794).
+        https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request
+        """
+
+        posted = self.create_review(
+            number,
+            _sender(),
+            event="COMMENT",
+            comments=[{"path": "src/widget.txt", "line": 12, "body": body}],
+        )
+        self.drain_deliveries()
+        (inline,) = [d for d in posted.deliveries if d.event == "pull_request_review_comment"]
+        return inline
 
 
 def _asgi(handler: Any) -> Starlette:
@@ -314,6 +310,7 @@ def install(
     served_jira = _serve(jira.app)
     served_github = _serve(_asgi(github.handle))
     github.html_base = served_github.url
+    github.api_url = served_github.url
     jira_host = served_jira.url.removeprefix("http://")
     # The fake answers tenant_info only on its site host, which is this address.
     monkeypatch.setattr(jira_fake, "SITE_HOST", "127.0.0.1")
@@ -473,6 +470,12 @@ def _start(client: TestClient, request_id: uuid.UUID) -> int:
                 claim_name="claim-jira",
                 sandbox_name="sbx-jira",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)
@@ -580,7 +583,11 @@ def _record_pull_request(
     from curie_api.crud import lineages as crud_lineages
     from curie_api.crud import publication_queries
     from curie_api.factory_rediscovery import publishing_code_host
-    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+    from curie_api.publication_verification import (
+        publication_base_ref,
+        publication_revision_ids,
+        verify_publication_commit,
+    )
     from curie_api.repository_access import lineage_repository
     from test_factory_ci_wait import _execute
 
@@ -608,7 +615,12 @@ def _record_pull_request(
             )
             base_branch = await publication_base_ref(session, code_host, stored, repository)
             proof = await verify_publication_commit(
-                code_host, repository, stored, commit_sha=pull["head_sha"], base_branch=base_branch
+                code_host,
+                repository,
+                stored,
+                commit_sha=pull["head_sha"],
+                base_branch=base_branch,
+                revision_ids=publication_revision_ids(stored),
             )
             await crud_lineages.advance_publication_lineage(
                 session,
@@ -642,18 +654,7 @@ def _record_pull_request(
 
 
 def _review(install: Install, pr: int) -> httpx.Response:
-    github = install.github
-    comment = github.add_feedback(pr, REVIEW_BODY)
-    pull = github._pull_payload(pr)
-    payload = {
-        "action": "created",
-        "installation": {"id": INSTALLATION_ID},
-        "repository": {"id": REPO_ID, "full_name": REPO},
-        "sender": _sender(),
-        "pull_request": pull,
-        "comment": {k: v for k, v in comment.items() if not k.startswith("_")},
-    }
-    return _post(install.client, "pull_request_review_comment", payload)
+    return post_delivery(install.client, install.github.add_feedback(pr, REVIEW_BODY))
 
 
 # --- the test -------------------------------------------------------------------------------
@@ -820,7 +821,8 @@ def test_jira_github_lifecycle(install: Install, initial_label: bool) -> None:
     assert len(rows) == 2
     revision = rows[1]
     assert (revision["reply_kind"], revision["reply_address"]) == ("jira", BINDING)
-    assert revision["reply_target_kind"] == "review_thread"
+    # A submitted review is answered in the pull request conversation (#5794).
+    assert revision["reply_target_kind"] == "pull_request"
     assert revision["status"] == "waiting"
     # The sweep replays the admitted label event: no second WorkItem, no new run.
     _reconcile()

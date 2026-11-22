@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
@@ -29,7 +29,12 @@ from curie_api.forges.capabilities import (
     Support,
     validate_declaration,
 )
-from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
+from curie_api.forges.errors import (
+    Ambiguous,
+    NotFound,
+    Unavailable,
+    Unsupported,
+)
 from curie_api.forges.ports import CodeHost, MarkedComments, Tracker
 from curie_api.forges.retarget import require_retargetable
 from curie_api.forges.types import (
@@ -63,14 +68,19 @@ from curie_api.forges.types import (
     RerunOutcome,
     RerunRecord,
     ReviewFeedback,
+    SourceContent,
     StoredEvidence,
     TicketLabels,
+    TrackerComment,
     TrackerIssueRef,
     UpsertResult,
 )
 from curie_api.publication_policy import is_publication_branch
 
 BOT = Actor(id="1000", login="curie-bot")
+# Who created a seeded issue unless the test names someone: a person, never
+# the adapter's own identity.
+REPORTER = Actor(id="2001", login="issue-reporter")
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 
 
@@ -104,6 +114,55 @@ class PageFaults:
             self._countdown = None
             raise Unavailable(what)
         self._countdown -= 1
+
+
+class WriteFaults:
+    """Injectable write failures, one shot each, keyed by `Operation`.
+
+    `InMemoryMarkedComments` honours them for `Operation.UPSERT_MARKED`; a
+    tracker's marked comments share the one object the tracker was built with
+    (``InMemoryTracker.write_faults``).
+    """
+
+    def __init__(self) -> None:
+        self._lost: set[Operation] = set()
+        self._aborts: dict[Operation, BaseException] = {}
+
+    def lose_next_response(self, operation: Operation) -> None:
+        """A lost response.
+
+        For `Operation.UPSERT_MARKED` the next call does its work, writes
+        included, then raises `Unavailable` instead of answering."""
+
+        self._lost.add(operation)
+
+    def lost(self, operation: Operation) -> bool:
+        """Consume an armed lost response for ``operation``; True when one was."""
+
+        if operation in self._lost:
+            self._lost.discard(operation)
+            return True
+        return False
+
+    def abort_before_next(self, operation: Operation, error: BaseException) -> None:
+        """The next call of ``operation`` that passes its argument checks
+        raises ``error`` before it lists or writes anything. A `BaseException`
+        subclass models a process dying."""
+
+        self._aborts[operation] = error
+
+    def before(self, operation: Operation) -> None:
+        """Called by an adapter at the start of ``operation``, after its gate."""
+
+        error = self._aborts.pop(operation, None)
+        if error is not None:
+            raise error
+
+    def after(self, operation: Operation) -> None:
+        """Called by an adapter once ``operation`` has done its work."""
+
+        if self.lost(operation):
+            raise Unavailable(f"{operation.value} response lost")
 
 
 def _declared(
@@ -141,6 +200,8 @@ class _Comment:
     id: str
     author: Actor
     body: str
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryMarkedComments(_Declared):
@@ -157,17 +218,23 @@ class InMemoryMarkedComments(_Declared):
         faults: PageFaults,
         page_size: int,
         capabilities: Mapping[Operation, Support] | None = None,
+        write_faults: WriteFaults | None = None,
     ) -> None:
         self.kind = kind
         self.host = host
         self.identity = identity
         self.capabilities = _declared(capabilities, MARKED_COMMENT_OPERATIONS)
+        self.write_faults = write_faults or WriteFaults()
         self._accepts = frozenset(accepts)
         self._ledger = ledger
         self._faults = faults
         self._page_size = page_size
         self._threads: dict[ReplyTarget, list[_Comment]] = {}
         self._ids = itertools.count(1)
+        # The tracker's own clock, which stamps each comment's creation time,
+        # and the shape of its comment ids (numeric by default).
+        self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self.comment_id: Callable[[int], str] = str
 
     @staticmethod
     def embed(marker: str, body: str) -> str:
@@ -183,12 +250,15 @@ class InMemoryMarkedComments(_Declared):
     def seed_comment(self, target: ReplyTarget, author: Actor, body: str) -> str:
         """A comment someone else (or a past run) left; returns its id."""
 
-        comment = _Comment(str(next(self._ids)), author, body)
+        comment = _Comment(self.comment_id(next(self._ids)), author, body, created_at=self.clock())
         self._accept(target).append(comment)
         return comment.id
 
     def comments(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         return [(comment.author, comment.body) for comment in self._accept(target)]
+
+    def _find(self, target: ReplyTarget, comment_id: str) -> _Comment | None:
+        return next((item for item in self._accept(target) if item.id == comment_id), None)
 
     async def find_marked(self, target: ReplyTarget, marker: str) -> MarkedComment | None:
         self._gate(Operation.FIND_MARKED)
@@ -199,11 +269,48 @@ class InMemoryMarkedComments(_Declared):
             for comment in thread[start : start + self._page_size]:
                 # Only our own identity's comments count; a pasted marker does not.
                 if comment.author == self.identity and embedded in comment.body:
+                    return MarkedComment(comment.id, target, comment.body, comment.created_at)
+        return None
+
+    async def find_facts(self, target: ReplyTarget, prefix: str) -> MarkedComment | None:
+        self._gate(Operation.FIND_MARKED)
+        thread = self._accept(target)
+        for start in range(0, max(len(thread), 1), self._page_size):
+            self._faults.read_page("comments")
+            for comment in thread[start : start + self._page_size]:
+                if comment.author == self.identity and prefix in comment.body:
                     return MarkedComment(comment.id, target, comment.body)
         return None
 
-    async def upsert_marked(self, target: ReplyTarget, marker: str, body: str) -> UpsertResult:
+    async def upsert_facts(
+        self, target: ReplyTarget, *, prefix: str, marker: str, body: str
+    ) -> UpsertResult:
         self._gate(Operation.UPSERT_MARKED)
+        self.write_faults.before(Operation.UPSERT_MARKED)
+        encoded = self.embed(marker, body)
+        found = await self.find_facts(target, prefix)
+        if found is None:
+            comment_id = self.seed_comment(target, self.identity, encoded)
+        else:
+            comment_id = found.id
+            if found.body == encoded:
+                return UpsertResult(found, written=False)
+            stored = next(comment for comment in self._accept(target) if comment.id == comment_id)
+            stored.body, stored.updated_at = encoded, datetime.now(UTC)
+        self._ledger.record()
+        self.write_faults.after(Operation.UPSERT_MARKED)
+        return UpsertResult(MarkedComment(comment_id, target, encoded), written=True)
+
+    async def upsert_marked(self, target: ReplyTarget, marker: str, body: str) -> UpsertResult:
+        """Honours ``write_faults`` for `Operation.UPSERT_MARKED`."""
+
+        self._gate(Operation.UPSERT_MARKED)
+        self.write_faults.before(Operation.UPSERT_MARKED)
+        result = await self._upsert(target, marker, body)
+        self.write_faults.after(Operation.UPSERT_MARKED)
+        return result
+
+    async def _upsert(self, target: ReplyTarget, marker: str, body: str) -> UpsertResult:
         text = self.embed(marker, body)
         found = await self.find_marked(target, marker)
         thread = self._accept(target)
@@ -213,10 +320,15 @@ class InMemoryMarkedComments(_Declared):
                 return UpsertResult(found, written=False)
             comment.body = text
             self._ledger.record()
-            return UpsertResult(MarkedComment(comment.id, target, text), written=True)
+            return UpsertResult(
+                MarkedComment(comment.id, target, text, comment.created_at), written=True
+            )
         comment_id = self.seed_comment(target, self.identity, text)
         self._ledger.record()
-        return UpsertResult(MarkedComment(comment_id, target, text), written=True)
+        created = next(item for item in thread if item.id == comment_id)
+        return UpsertResult(
+            MarkedComment(comment_id, target, text, created.created_at), written=True
+        )
 
 
 @dataclass
@@ -227,6 +339,8 @@ class _Issue:
     labels: set[str] = field(default_factory=set)
     dependencies: tuple[TrackerIssueRef, ...] = ()
     linked: list[PullRequestRef] = field(default_factory=list)
+    author: Actor = REPORTER
+    closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -238,6 +352,9 @@ class _TimelineEvent:
     marker: str
     actor: Actor
     at: datetime
+    # A plain comment's body; None for a label event or `mention_in_comment`.
+    # A comment's notice kind is decided at poll time (`InMemoryTracker.comment`).
+    body: str | None = None
 
 
 class InMemoryTracker(_Declared):
@@ -262,6 +379,7 @@ class InMemoryTracker(_Declared):
         comment_capabilities: Mapping[Operation, Support] | None = None,
         ledger: WriteLedger | None = None,
         faults: PageFaults | None = None,
+        write_faults: WriteFaults | None = None,
     ) -> None:
         self.kind = kind
         self.host = host
@@ -272,6 +390,7 @@ class InMemoryTracker(_Declared):
         self.capabilities = _declared(capabilities, TRACKER_OPERATIONS)
         self.ledger = ledger or WriteLedger()
         self.faults = faults or PageFaults()
+        self.write_faults = write_faults or WriteFaults()
         self._page_size = page_size
         self._issues: dict[TrackerIssueRef, _Issue] = {}
         self._timeline: list[_TimelineEvent] = []
@@ -287,6 +406,16 @@ class InMemoryTracker(_Declared):
             faults=self.faults,
             page_size=page_size,
             capabilities=comment_capabilities,
+            write_faults=self.write_faults,
+        )
+        self._facts = InMemoryTrackerFacts(self)
+
+    @property
+    def facts(self) -> InMemoryTrackerFacts | None:
+        return (
+            self._facts
+            if self.capabilities[Operation.FACTS_EXCHANGE] is Support.SUPPORTED
+            else None
         )
 
     @property
@@ -295,14 +424,57 @@ class InMemoryTracker(_Declared):
 
     # Seeding --------------------------------------------------------------
 
+    def _next_issue_id(self) -> str:
+        number = len(self._issues) + 1
+        while TrackerIssueRef(self.kind, self.host, self.scope_id, str(number)) in self._issues:
+            number += 1
+        return str(number)
+
     def seed_issue(
-        self, title: str, body: str, *, display_key: str | None = None
+        self,
+        title: str,
+        body: str,
+        *,
+        display_key: str | None = None,
+        issue_id: str | None = None,
+        author: Actor | None = None,
+        labels: Collection[str] = (),
     ) -> TrackerIssueRef:
+        """An issue created from outside the port, by ``author`` (a person,
+        `REPORTER`, by default; pass ``self.identity`` for one a past run of
+        the adapter created). ``issue_id`` names the id, so a test can seed the
+        issue a real WorkItem names; ValueError when it is already taken.
+        ``labels`` are set without timeline events."""
+
         ref = TrackerIssueRef(
-            self.kind, self.host, self.scope_id, str(len(self._issues) + 1), display_key
+            self.kind, self.host, self.scope_id, issue_id or self._next_issue_id(), display_key
         )
-        self._issues[ref] = _Issue(ref, title, body)
+        if ref in self._issues:
+            raise ValueError(f"issue {ref.issue_id} is already seeded")
+        self._issues[ref] = _Issue(ref, title, body, labels=set(labels), author=author or REPORTER)
         return ref
+
+    def issue_body(self, issue: TrackerIssueRef) -> str:
+        """The issue's stored body now; `NotFound` outside this tracker."""
+
+        return self._issue(issue).body
+
+    def edit_issue_body(self, issue: TrackerIssueRef, body: str) -> None:
+        """A person edits the issue's body. Not a port write: no ledger entry."""
+
+        self._issue(issue).body = body
+
+    def edit_issue_title(self, issue: TrackerIssueRef, title: str) -> None:
+        """A person edits the issue's title. Not a port write: no ledger entry."""
+
+        self._issue(issue).title = title
+
+    def issues(self, *, author: Actor | None = None) -> list[TrackerIssueRef]:
+        """Every issue in creation order, only those ``author`` created when given."""
+
+        return [
+            found.ref for found in self._issues.values() if author is None or found.author == author
+        ]
 
     def seed_dependencies(self, issue: TrackerIssueRef, *depends_on: TrackerIssueRef) -> None:
         self._issue(issue).dependencies = depends_on
@@ -340,6 +512,43 @@ class InMemoryTracker(_Declared):
         self._issue(issue)
         return self._record(issue, Disposition.MENTION, f"@{self.mention}", actor)
 
+    def comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        """``actor`` comments ``body`` on ``issue`` from outside the port; returns
+        the comment id.
+
+        The comment takes its id from the same counter as the adapter's own
+        marked comments and its creation time from their ``clock``, so it
+        orders against a factory question as on a real tracker. A poll
+        delivers it as `Disposition.ANSWER` when ``issue`` is ``answering``,
+        as `Disposition.MENTION` when ``body`` mentions ``@<mention>``, and not
+        at all otherwise; never when ``actor`` is the adapter's own identity.
+        Not a port write: no ledger entry.
+        """
+
+        self._issue(issue)
+        target = ReplyTarget.on_issue(issue)
+        comment_id = self._comments.seed_comment(target, actor, body)
+        created = self._comments._find(target, comment_id)
+        assert created is not None
+        self._timeline.append(
+            _TimelineEvent(
+                position=len(self._timeline) + 1,
+                event_id=comment_id,
+                issue=issue,
+                disposition=Disposition.ANSWER,
+                marker=self.label,
+                actor=actor,
+                at=created.created_at,
+                body=body,
+            )
+        )
+        return comment_id
+
+    def close_issue(self, issue: TrackerIssueRef) -> None:
+        """A person closes ``issue``. Not a port write: no ledger entry."""
+
+        self._issue(issue).closed = True
+
     def labels(self, issue: TrackerIssueRef) -> frozenset[str]:
         return frozenset(self._issue(issue).labels)
 
@@ -372,21 +581,44 @@ class InMemoryTracker(_Declared):
             return True
         return event.marker == self.label
 
+    def _mentions(self, body: str) -> bool:
+        pattern = rf"(?<![\w.@-])@{re.escape(self.mention)}(?![\w.-])"
+        return re.search(pattern, body, re.IGNORECASE) is not None
+
+    def _event_notice(
+        self, event: _TimelineEvent, answering: Collection[TrackerIssueRef]
+    ) -> MarkedNotice | None:
+        if event.body is None:
+            return self._notice(event) if self._marks(event) else None
+        if event.actor == self.identity:
+            return None
+        if event.issue in answering:
+            return self._notice(event)
+        if self._mentions(event.body):
+            return self._notice(
+                replace(event, disposition=Disposition.MENTION, marker=f"@{self.mention}")
+            )
+        return None
+
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         self._gate(Operation.POLL_MARKED)
         start = _cursor_position(cursor)
         unread = self._timeline[start:]
+        answers = frozenset(answering)
         notices: list[MarkedNotice] = []
         for offset in range(0, len(unread), self._page_size):
             # Read every page before returning any notice or cursor.
             self.faults.read_page("timeline")
-            notices.extend(
-                self._notice(event)
-                for event in unread[offset : offset + self._page_size]
-                if self._marks(event)
-            )
+            for event in unread[offset : offset + self._page_size]:
+                notice = self._event_notice(event, answers)
+                if notice is not None:
+                    notices.append(notice)
         if not unread:
             self.faults.read_page("timeline")
         seen = {(notice.issue, notice.event_id) for notice in notices}
@@ -419,6 +651,15 @@ class InMemoryTracker(_Declared):
             return False
         if notice.disposition is Disposition.MENTION:
             return any(event.event_id == notice.event_id for event in self._timeline)
+        if notice.disposition is Disposition.ANSWER:
+            # Open and labelled now, and the comment still stands (#5789 decision 3).
+            comment = self._comments._find(ReplyTarget.on_issue(notice.issue), notice.event_id)
+            return (
+                self.label in issue.labels
+                and not issue.closed
+                and comment is not None
+                and comment.author == notice.actor
+            )
         if notice.disposition is Disposition.CANCEL:
             return self.label not in issue.labels
         latest = self._last(notice.issue, Disposition.ADMIT)
@@ -448,6 +689,11 @@ class InMemoryTracker(_Declared):
         self._gate(Operation.READ_TICKET)
         found = self._issue(issue)
         return f"# {found.title}\n\n{found.body}"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        self._gate(Operation.READ_TICKET)
+        found = self._issue(issue)
+        return SourceContent(title=found.title, body=found.body)
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         self._gate(Operation.TICKET_LABELS)
@@ -534,6 +780,62 @@ class _PullRequest:
 class _Feedback:
     position: int
     feedback: ReviewFeedback
+
+
+class InMemoryTrackerFacts:
+    """Facts capability over the memory tracker's public seeding and grant state."""
+
+    def __init__(self, tracker: InMemoryTracker) -> None:
+        self._tracker = tracker
+        self._via_app: set[int] = set()
+
+    @property
+    def repository(self) -> RepositoryRef:
+        tracker = self._tracker
+        return RepositoryRef(tracker.kind, tracker.host, tracker.scope_id, tracker.scope_id)
+
+    @property
+    def marked_comments(self) -> InMemoryMarkedComments:
+        return self._tracker.marked_comments
+
+    def seed_comment(
+        self, issue: TrackerIssueRef, actor: Actor, body: str, *, via_app: bool = False
+    ) -> int:
+        self._tracker._issue(issue)
+        identifier = int(
+            self.marked_comments.seed_comment(ReplyTarget.on_issue(issue), actor, body)
+        )
+        if via_app:
+            self._via_app.add(identifier)
+        return identifier
+
+    async def read_comment(self, comment_id: int) -> TrackerComment:
+        self._tracker._gate(Operation.FACTS_EXCHANGE)
+        for target, comments in self.marked_comments._threads.items():
+            for comment in comments:
+                if comment.id == str(comment_id) and target.issue is not None:
+                    return TrackerComment(
+                        comment_id,
+                        target.issue,
+                        comment.body,
+                        None if comment.author == self._tracker.identity else comment.author,
+                        comment_id in self._via_app,
+                        comment.updated_at,
+                    )
+        raise NotFound("comment")
+
+    async def facts_issue_is_plain(self, issue: TrackerIssueRef) -> bool:
+        self._tracker._gate(Operation.FACTS_EXCHANGE)
+        self._tracker._issue(issue)
+        return True
+
+    async def facts_writer(self, comment: TrackerComment) -> Actor | None:
+        self._tracker._gate(Operation.FACTS_EXCHANGE)
+        self._tracker._issue(comment.issue)
+        actor = comment.actor
+        if actor is None or actor == self._tracker.identity:
+            return None
+        return actor if actor.id in self._tracker._authorized else None
 
 
 class InMemoryCodeHost(_Declared):
@@ -732,6 +1034,10 @@ class InMemoryCodeHost(_Declared):
         if found is None:
             raise NotFound("repository")
         return found
+
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        self._gate(Operation.CURRENT_INSTALLATION_CREDENTIAL)
+        return await self.credential(repository, CredentialScope.PUSH)
 
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:
         self._gate(Operation.CREDENTIAL)

@@ -5106,6 +5106,37 @@ def test_static_token_rotation_inputs_select_the_factory_runtime(tmp_path: Path,
     assert _outputs_of(output)["factory"] == "true"
 
 
+JIRA_ONE_TICKET_INPUTS = (
+    "tools/jira-stub/jira_stub.py",
+    "tools/jira-stub/tests/test_jira_stub.py",
+    "apps/api/tests/forge_fakes/jira.py",
+)
+
+
+@pytest.mark.parametrize("path", JIRA_ONE_TICKET_INPUTS)
+def test_jira_one_ticket_inputs_select_the_factory_runtime(tmp_path: Path, path: str) -> None:
+    """An edit confined to the Jira stub or its fake must run the jira-one-ticket leg."""
+
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["factory"] == "true"
+
+
+@pytest.mark.parametrize("path", JIRA_ONE_TICKET_INPUTS)
+def test_jira_one_ticket_inputs_select_nothing_without_their_prefixes(path: str) -> None:
+    """Negative control: with the entries removed these paths select no factory leg."""
+
+    selector = _load_selector_module()
+    kept = tuple(
+        prefix
+        for prefix in selector.FACTORY_PREFIXES
+        if prefix not in {"tools/jira-stub", "apps/api/tests/forge_fakes/jira.py"}
+    )
+    assert len(kept) == len(selector.FACTORY_PREFIXES) - 2
+    assert not selector._matches_scenario(path, kept)
+    assert selector._matches_scenario(path, selector.FACTORY_PREFIXES)
+
+
 @pytest.mark.parametrize(
     "path",
     (
@@ -5122,8 +5153,19 @@ def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, pat
 
 
 FRESH_INSTALL_TEST = "test_fresh_cluster_up_converges_without_rerun"
+SCRIPTED_PUBLICATION_COMMAND = (
+    "python3 tools/factory-e2e/factory_e2e.py scripted --scenario publication"
+)
+SCRIPTED_JIRA_COMMAND = (
+    "python3 tools/factory-e2e/factory_e2e.py scripted --scenario jira-one-ticket"
+)
+SCRIPTED_LEARNED_RULES_COMMAND = (
+    "python3 tools/factory-e2e/factory_e2e.py scripted --scenario learned-rules"
+    " --transcript tools/model-script/transcripts/learned-rules-chain-a.json"
+)
 SCRIPTED_FACTORY_LEGS = (
-    ("scenario", lambda run: run == "python3 tools/factory-e2e/factory_e2e.py scripted"),
+    ("scenario", lambda run: run == SCRIPTED_PUBLICATION_COMMAND),
+    ("jira-one-ticket", lambda run: run == SCRIPTED_JIRA_COMMAND),
     *(
         (f"initial-binding-{index}",
          lambda run, index=index: (
@@ -5141,8 +5183,16 @@ SCRIPTED_FACTORY_LEGS = (
         "fresh-install",
         lambda run: run == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
     ),
+    ("learned-rules", lambda run: run == SCRIPTED_LEARNED_RULES_COMMAND),
 )
 SCRIPTED_FACTORY_EVIDENCE_STEP = "Upload scripted factory evidence"
+SCRIPTED_JIRA_EVIDENCE_STEP = "Upload scripted Jira one-ticket evidence"
+# Each evidence upload runs in its own leg only, even when that leg failed.
+SCRIPTED_FACTORY_EVIDENCE = {
+    SCRIPTED_FACTORY_EVIDENCE_STEP: "always() && matrix.suite == 'scenario'",
+    SCRIPTED_JIRA_EVIDENCE_STEP: "always() && matrix.suite == 'jira-one-ticket'",
+    "Upload scripted learned rules evidence": "always() && matrix.suite == 'learned-rules'",
+}
 
 
 def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
@@ -5167,14 +5217,12 @@ def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
     for step in steps:
         if "matrix.suite" not in json.dumps(step) or any(step is owner for owner in claimed):
             continue
-        if not (
-            step.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP
-            and step.get("if") == "always() && matrix.suite == 'scenario'"
-        ):
+        if SCRIPTED_FACTORY_EVIDENCE.get(step.get("name", "")) != step.get("if"):
             raise AssertionError(f"unexpected matrix.suite use in step {step.get('name')!r}")
-    evidence = [s for s in steps if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP]
-    if len(evidence) != 1 or evidence[0].get("if") != "always() && matrix.suite == 'scenario'":
-        raise AssertionError("evidence upload must run only in the scenario leg")
+    for name, condition in SCRIPTED_FACTORY_EVIDENCE.items():
+        evidence = [s for s in steps if s.get("name") == name]
+        if len(evidence) != 1 or evidence[0].get("if") != condition:
+            raise AssertionError(f"{name!r} must run only under {condition!r}")
 
 
 def _scripted_factory_step(job: dict[str, Any], leg: str) -> dict[str, Any]:
@@ -5193,13 +5241,54 @@ def _misdirect_step_if(job: dict[str, Any]) -> None:
     _scripted_factory_step(job, "scenario")["if"] = "matrix.suite == 'initial-binding'"
 
 
+def _select_facts_in_factory_ci(job: dict[str, Any]) -> None:
+    step = _scripted_factory_step(job, "scenario")
+    step["run"] = step["run"].replace("--scenario publication", "--scenario facts")
+
+
 def _enable_fail_fast(job: dict[str, Any]) -> None:
     job["strategy"]["fail-fast"] = True
 
 
 def _unguard_evidence(job: dict[str, Any]) -> None:
-    evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP)
+    evidence = next(s for s in job["steps"] if s.get("name") == "Upload scripted factory evidence")
     evidence["if"] = "always()"
+
+
+def _drop_jira_leg(job: dict[str, Any]) -> None:
+    job["strategy"]["matrix"]["suite"].remove("jira-one-ticket")
+
+
+def _run_publication_in_jira_leg(job: dict[str, Any]) -> None:
+    _scripted_factory_step(job, "jira-one-ticket")["run"] = SCRIPTED_PUBLICATION_COMMAND
+
+
+def _upload_jira_evidence_only_on_success(job: dict[str, Any]) -> None:
+    evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_JIRA_EVIDENCE_STEP)
+    evidence["if"] = "matrix.suite == 'jira-one-ticket'"
+
+
+def _drop_learned_rules_leg(job: dict[str, Any]) -> None:
+    job["strategy"]["matrix"]["suite"].remove("learned-rules")
+
+
+def _unguard_learned_rules_evidence(job: dict[str, Any]) -> None:
+    evidence = next(
+        s for s in job["steps"] if s.get("name") == "Upload scripted learned rules evidence"
+    )
+    evidence["if"] = "always()"
+
+
+def _misdirect_learned_rules_evidence(job: dict[str, Any]) -> None:
+    evidence = next(
+        s for s in job["steps"] if s.get("name") == "Upload scripted learned rules evidence"
+    )
+    evidence["if"] = "always() && matrix.suite == 'scenario'"
+
+
+def _select_publication_in_learned_rules(job: dict[str, Any]) -> None:
+    step = _scripted_factory_step(job, "learned-rules")
+    step["run"] = step["run"].replace("--scenario learned-rules", "--scenario publication")
 
 
 def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
@@ -5209,7 +5298,21 @@ def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
 
 @pytest.mark.parametrize(
     "mutate",
-    (_drop_leg, _drop_step_if, _misdirect_step_if, _enable_fail_fast, _unguard_evidence),
+    (
+        _drop_leg,
+        _drop_step_if,
+        _misdirect_step_if,
+        _select_facts_in_factory_ci,
+        _enable_fail_fast,
+        _unguard_evidence,
+        _drop_jira_leg,
+        _run_publication_in_jira_leg,
+        _upload_jira_evidence_only_on_success,
+        _drop_learned_rules_leg,
+        _unguard_learned_rules_evidence,
+        _misdirect_learned_rules_evidence,
+        _select_publication_in_learned_rules,
+    ),
 )
 def test_scripted_factory_leg_mapping_rejects_skippable_shapes(
     mutate: Callable[[dict[str, Any]], None],
@@ -5232,17 +5335,14 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
     assert job["needs"] == ["rust-build", "changes", "ci-images"]
     assert SCRIPTED_FACTORY_JOB in jobs["e2e-required"]["needs"]
 
-    scenario = [
-        step
-        for step in job["steps"]
-        if step.get("run") == "python3 tools/factory-e2e/factory_e2e.py scripted"
-    ]
-    assert len(scenario) == 1
-    assert scenario[0]["env"] == {
-        "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
-        "BUILDX_BUILDER": "default",
-    }
-    assert "continue-on-error" not in scenario[0]
+    for command in (SCRIPTED_PUBLICATION_COMMAND, SCRIPTED_JIRA_COMMAND):
+        scenario = [step for step in job["steps"] if step.get("run") == command]
+        assert len(scenario) == 1
+        assert scenario[0]["env"] == {
+            "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
+            "BUILDX_BUILDER": "default",
+        }
+        assert "continue-on-error" not in scenario[0]
 
     steps = job["steps"]
     registrations = [step for step in steps if INITIAL_BINDING_MODULE in step.get("run", "")]

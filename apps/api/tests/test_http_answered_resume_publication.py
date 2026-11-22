@@ -82,5 +82,3 @@ def test_a_recovered_answer_publishes_its_rejected_notification(
     entries = resumes(case, valkey, runs_stream)
     assert len(entries) == 1
     assert resume_context(case, entries[0][CONTEXT_FIELD]).status == "rejected"
-
-

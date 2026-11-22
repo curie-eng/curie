@@ -396,7 +396,9 @@ def _main_env(
     monkeypatch.setattr(fe, "_resolve_candidate", forbidden)
     monkeypatch.setattr(fe, "_images_published", forbidden)
     monkeypatch.setattr(
-        fe, "resolve_curie_binary", lambda _binary: ("/opt/curie/bin/curie", "curie 0.0.0-test")
+        fe,
+        "resolve_curie_binary",
+        lambda _binary, *, show_path: ("/opt/curie/bin/curie", "curie 0.0.0-test"),
     )
 
     def head(argv: Any) -> str:

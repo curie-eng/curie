@@ -29,6 +29,7 @@ from channel_protocol.reply import (
     SettledOutcome,
 )
 from curie_internal.identity_approval import ApprovalCreationIdentityV1
+from curie_telemetry import agent_metric_label
 from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
@@ -1156,6 +1157,7 @@ async def _pause_for_approval(
         attributes={
             "service.name": "curie-worker",
             "operation": "request",
+            "agent": agent_metric_label(constants._TURN_AGENT.get()),
             "outcome": "requested",
         },
     )
@@ -1186,6 +1188,7 @@ async def _pause_for_approval(
         attributes={
             "service.name": "curie-worker",
             "operation": "suspend",
+            "agent": agent_metric_label(constants._TURN_AGENT.get()),
             "outcome": "failure" if suspend_error is not None else "suspended",
         },
     )
@@ -1460,6 +1463,7 @@ def _approver_dm_failed(approval_id: str, step: str, reason: str) -> None:
         attributes={
             "service.name": "curie-worker",
             "operation": "dm_delivery",
+            "agent": agent_metric_label(constants._TURN_AGENT.get()),
             "outcome": "failure",
         },
     )

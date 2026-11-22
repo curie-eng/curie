@@ -838,17 +838,26 @@ pub fn install_curie_skills(
         (
             "preparation",
             "prepare-factory-ticket",
-            &["b4c5b268d73dad0a010ccc51c04e9049fdb1b0516af1634f60d0834c962b3d85"][..],
+            &[
+                "b4c5b268d73dad0a010ccc51c04e9049fdb1b0516af1634f60d0834c962b3d85",
+                "123752a5668200fae36335d9488412fe96a29824121e539ae44935a40a86f800",
+            ][..],
         ),
         (
             "review",
             "review-pr",
-            &["4c13897920b1ab2deeeda90a6cb00b2b465b0c3a8576eeb552185322fb6efbc8"][..],
+            &[
+                "4c13897920b1ab2deeeda90a6cb00b2b465b0c3a8576eeb552185322fb6efbc8",
+                "a99e46d6434fb4b25f2aeb48fc43b7bd43a6ad25cb7e57ca7b0cf52fc2b61a00",
+            ][..],
         ),
         (
             "environment",
             "factory-environment-setup",
-            &["a828913e1486f3dd8d7409f4a6f551c5e7d386230c3f8198b8f447ca3f753d6e"][..],
+            &[
+                "a828913e1486f3dd8d7409f4a6f551c5e7d386230c3f8198b8f447ca3f753d6e",
+                "8ac17b7cd4b4e680da68e5c991a704a9b93b7c843f551d4ed6193d632cb762f0",
+            ][..],
         ),
         (
             "environment",
@@ -924,12 +933,28 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/hooks/hooks.json"),
     ),
     (
+        "hooks/decisions_section.py",
+        include_bytes!("../../examples/dark-factory/hooks/decisions_section.py"),
+    ),
+    (
         "hooks/review_gate.py",
         include_bytes!("../../examples/dark-factory/hooks/review_gate.py"),
     ),
     (
+        "hooks/reproduction_gate.py",
+        include_bytes!("../../examples/dark-factory/hooks/reproduction_gate.py"),
+    ),
+    (
         "evals/cases.json",
         include_bytes!("../../examples/dark-factory/evals/cases.json"),
+    ),
+    (
+        "evals/investigation-cases.json",
+        include_bytes!("../../examples/dark-factory/evals/investigation-cases.json"),
+    ),
+    (
+        "evals/question-format.md",
+        include_bytes!("../../examples/dark-factory/evals/question-format.md"),
     ),
     (
         "skills/implement-issue/SKILL.md",
@@ -990,7 +1015,8 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
 ];
 
 /// Files rendered with the executable bit, matching their tracked mode.
-const DARK_FACTORY_EXECUTABLE_FILES: &[&str] = &["hooks/review_gate.py"];
+const DARK_FACTORY_EXECUTABLE_FILES: &[&str] =
+    &["hooks/review_gate.py", "hooks/reproduction_gate.py"];
 
 pub struct DarkFactoryRenderOpts {
     pub out: PathBuf,
@@ -4984,15 +5010,17 @@ mod dark_factory_render_tests {
                 .unwrap_or_else(|e| panic!("{name} was not written: {e}"));
             assert_eq!(written.as_slice(), *bytes, "{name} bytes differ");
         }
-        let mode = std::fs::metadata(out.join("hooks/review_gate.py"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o111,
-            0o111,
-            "review_gate.py mode {mode:o} is not executable"
-        );
+        for hook in ["hooks/review_gate.py", "hooks/reproduction_gate.py"] {
+            let mode = std::fs::metadata(out.join(hook))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "{hook} mode {mode:o} is not executable"
+            );
+        }
         let readme_mode = std::fs::metadata(out.join("README.md"))
             .unwrap()
             .permissions()

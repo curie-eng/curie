@@ -47,6 +47,25 @@ def resource_vector(values: Mapping[str, str]) -> dict[str, str]:
     return result
 
 
+def quantity_bytes(raw: object) -> int | None:
+    """A Kubernetes quantity as a whole positive count, or None.
+
+    The same exact parse admission uses, so ``8Mi``, ``8388608`` and ``8M``
+    compare as the kubelet compares them. A fractional, zero, negative or
+    unparseable value is None: it is never a limit anything can be raised over.
+    """
+
+    try:
+        with localcontext() as context:
+            _configure_quantity_context(context)
+            value = _parse_quantity(raw)
+            if value is None or value < 1 or value != value.to_integral_value():
+                return None
+            return int(value)
+    except (ValueError, ArithmeticError):
+        return None
+
+
 def parse_admission_config(raw: str | None) -> AdmissionConfig | None:
     if raw is None:
         return None

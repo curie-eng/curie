@@ -1338,3 +1338,38 @@ def test_worker_mint_requires_its_own_credential_and_matching_deployment(
         assert 400 <= response.status_code < 500, response.text
         assert "capability" not in response.text
     assert _pull_reads(case) == []
+
+
+def test_an_implementation_request_mints_the_precheck_and_publishes(
+    precheck_case: dict[str, Any],
+) -> None:
+    """Both publication boundaries accept an implementation request: the
+    precheck mint answers 200 and the publication is created."""
+
+    case = precheck_case
+    _execute(
+        "UPDATE curie.publications SET outcome_history_ready_at = now() WHERE id = :id",
+        {"id": uuid.UUID(case["publication_id"])},
+    )
+    minted = case["client"].post(MINT_URL, json=_mint_body(case), headers=WORKER_HEADERS)
+    payload = _publication_payload(
+        case["deployment"]["id"],
+        patch=b"",
+        base_sha=FIRST_REVISION_SHA,
+        conversation_id=case["lineage"]["conversation_id"],
+    )
+    payload.update(
+        changed_paths=[],
+        reply_conversation_id=case["reply_conversation_id"],
+        title=OBSERVED_TITLE,
+        body="Corrected body for the pull request check.\n",
+        work_item_request_id=str(case["request_id"]),
+        work_item_runtime_epoch=7,
+        observed_title=OBSERVED_TITLE,
+        observed_body_sha256=_digest(OBSERVED_BODY),
+        observed_lineage_id=case["lineage_id"],
+        observed_lineage_version=case["lineage"]["version"],
+    )
+    created = case["client"].post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+    assert minted.status_code == 200, minted.text
+    assert created.status_code == 201, created.text

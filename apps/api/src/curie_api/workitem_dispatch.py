@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -18,9 +19,10 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from curie_api.crud import channels as crud_channels
-from curie_api.workitems import lifecycle
+from curie_api.workitems import lifecycle, resource_gate
 from curie_api.workitems.lifecycle import (
     ExecutionRequestSnapshot,
+    RetryConditionFact,
     WorkItemConflict,
     WorkItemOutcome,
     WorkItemSnapshot,
@@ -37,8 +39,9 @@ from curie_api.workitems.lifecycle import (
 )
 
 from .config import Settings, get_settings
-from .factory_notices import start_failed_sentence
+from .factory_notices import ANSWER_PULL_REQUEST_ENDED_SENTENCE, start_failed_sentence
 from .factory_reply_target import reply_columns
+from .factory_retry_policy import RetrySafety
 from .forges import surfaces, types
 from .forges.errors import NotFound
 from .forges.registry import forges_registry
@@ -49,6 +52,7 @@ from .models import (
     AgentChannel,
     ExecutionRequest,
     FactoryBaseTransition,
+    PersonalClaudeEnrollment,
     WorkItem,
 )
 from .personal_execution import (
@@ -59,6 +63,7 @@ from .personal_execution import (
     existing_work_item_refusal,
     new_work_item_owner,
 )
+from .requester_instruction_admission import requester_is_active
 from .threadkeys import (
     legacy_route_adapter_of,
     pre_identity_key_of,
@@ -78,6 +83,14 @@ logger = logging.getLogger(__name__)
 # example the kernel's ``thread_busy`` while another turn holds the thread: it
 # keeps the flat base backoff, is not counted, and never ends the request.
 START_DEFERRAL_REASON_PREFIX = "not_started:"
+# A gated retry's current limit is not yet strictly larger than the one that
+# failed (#5427). The worker defers with it before any sandbox claim, or after
+# a start refused on the gate; it is never counted and waits one probe.
+RESOURCE_GATE_UNMET = "resource_gate_unmet"
+# A fenced successor's predecessor sandbox claim is still present (#5427). The
+# worker defers with it before any claim of its own; it is never counted and
+# waits one probe.
+PREDECESSOR_RUNTIME_PRESENT = "predecessor_runtime_present"
 
 # #4930: the stored bound on a pre-start workspace diagnostic. Redaction runs
 # before the clip, so a clip can never cut a credential into a shape the
@@ -94,6 +107,7 @@ def _start_failure_detail(detail: str | None) -> str | None:
 
 RefusalCode = Literal[
     "not_found",
+    "requester_principal_invalid",
     "identity_mismatch",
     "active_request",
     "work_item_cancelled",
@@ -115,6 +129,12 @@ RefusalCode = Literal[
     "factory_binding_changed",
     "factory_surface_mismatch",
     "factory_start_failed",
+    # A termination record whose request version moved since its claim, or
+    # whose observation is blank (#5377).
+    "stale_version",
+    "termination_observation_required",
+    # A gated retry's start did not deliver a strictly larger limit (#5427).
+    "resource_gate_unmet",
     # Execution owner admission refusals (#5376).
     OwnerRefusalCode,
 ]
@@ -155,12 +175,11 @@ class Admission:
     # the WorkItem at admission and readmission. None for an admission no label
     # started (a revision, review feedback, the work-items API).
     trigger_label: str | None = None
-    # Who the execution runs as (#5376, ADR 0268). Only the internal worker
-    # admission route names an owner; tracker ingress passes the installation
-    # mode and never an owner. On an existing WorkItem these never change its
-    # owner tuple (``personal_execution``).
+    # Trusted internal admissions and verified GitHub label actors name owners.
+    # Existing WorkItems keep their owner tuple (personal_execution).
     model_auth_mode: ModelAuthMode = "service"
     owner: OwnerContext | None = None
+    requester_principal_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +198,16 @@ class AcquireGrant:
     wait_deadline: datetime
     repository_path: str
     context: FactoryContext
+    # What the request runs, and the retained candidate a publication recovery
+    # publishes (#5429), read from the request row.
+    execution_kind: ExecutionKindName
+    recovery_candidate_id: uuid.UUID | None
+    # The resource gate a retry waits on, with the current limit of an API
+    # owned dimension; None for an ungated request (#5427).
+    resource_gate: dict[str, Any] | None
+    # The predecessor's sandbox claim a fenced automatic successor must see
+    # gone before it claims its own; None when no fence applies (#5427).
+    predecessor_claim_name: str | None
 
 
 class FactoryWake(BaseModel):
@@ -241,7 +270,10 @@ class HeartbeatResult:
 
 @dataclass(frozen=True)
 class TerminationClaim:
+    """The epoch and request version a termination record must present (#5377)."""
+
     runtime_epoch: int
+    request_version: int
 
 
 @dataclass(frozen=True)
@@ -311,11 +343,22 @@ def _snapshot_values(facts: Any) -> dict[str, str | None]:
     }
 
 
+ExecutionKindName = Literal["implementation", "publication_recovery"]
+
+
+def _execution_kind(row: ExecutionRequest) -> ExecutionKindName:
+    """The request's stored execution kind (the column CHECK admits two)."""
+
+    kind = row.execution_kind
+    assert kind in ("implementation", "publication_recovery"), kind
+    return cast(ExecutionKindName, kind)
+
+
 def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
     return all(getattr(row, column) == value for column, value in _snapshot_values(facts).items())
 
 
-def _work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
+def work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
     return (
         item.agent_id == facts.agent_id
         and item.tracker_issue == facts.issue
@@ -334,6 +377,12 @@ def _work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
 async def _write_snapshot(
     session: AsyncSession, request_id: uuid.UUID, facts: Any
 ) -> ExecutionRequest | DispatchConflict:
+    """Write the admission snapshot that makes a request dispatchable.
+
+    ``claim_due`` skips a request whose objective is NULL, so a request is
+    dispatched only once this statement has written its snapshot.
+    """
+
     await session.execute(
         update(ExecutionRequest)
         .where(
@@ -360,7 +409,7 @@ async def _replay_existing(
     locked = await lock_request(session, work_item_id=work_item.id, request_id=request.id)
     if locked is None:
         return await _refuse(session, "not_found", work_item_id=work_item.id, request_id=request.id)
-    if not _work_item_matches(work_item, facts, adapter):
+    if not work_item_matches(work_item, facts, adapter):
         return await _refuse(
             session,
             "identity_mismatch",
@@ -464,7 +513,7 @@ async def admit_revision(
     )
     if work_item is None:
         return await _refuse(session, "not_found")
-    if not _work_item_matches(work_item, facts, resolved.adapter):
+    if not work_item_matches(work_item, facts, resolved.adapter):
         return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
     refused = await existing_work_item_refusal(session, work_item, facts)
     if refused is not None:
@@ -484,6 +533,55 @@ async def admit_revision(
     if requested.request.status == "queued":
         return requested
     written = await _write_snapshot(session, facts.request_id, facts)
+    if isinstance(written, DispatchConflict):
+        return written
+    reloaded = await reload_work_item(session, work_item.id)
+    return await outcome(session, reloaded, written, replayed=requested.replayed)
+
+
+@dataclass(frozen=True)
+class TicketRevision:
+    """The snapshot of a revision that answers on the WorkItem's own ticket."""
+
+    objective: str
+    requester: str
+    kind: str
+    address: str
+    reply_conversation_id: str
+
+
+async def create_answer_request(
+    session: AsyncSession,
+    *,
+    work_item: WorkItem,
+    request_id: uuid.UUID,
+    revision: TicketRevision,
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    """Create the implementation request an answer starts (#5786).
+
+    ``work_item`` is the caller's locked row, so its version is the expected
+    one. The request is created exactly as `admit_revision` creates a
+    mention's: waiting when nothing is live on the WorkItem, else queued
+    behind it. A waiting request gets its admission snapshot under the
+    implementation contract, which makes it dispatchable. Commits like the
+    lifecycle functions it calls.
+    """
+
+    now = await database_now(session)
+    requested = await lifecycle.create_revision_request(
+        session,
+        work_item_id=work_item.id,
+        request_id=request_id,
+        wait_deadline=now + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        expected_work_item_version=work_item.version,
+        snapshot=_snapshot_values(revision),
+    )
+    if isinstance(requested, WorkItemConflict):
+        return requested
+    assert requested.request is not None
+    if requested.request.status == "queued":
+        return requested
+    written = await _write_snapshot(session, request_id, revision)
     if isinstance(written, DispatchConflict):
         return written
     reloaded = await reload_work_item(session, work_item.id)
@@ -512,7 +610,7 @@ async def readmit(
     )
     if work_item is None:
         return await _admit_new(session, facts, resolved.adapter)
-    if not _work_item_matches(work_item, facts, resolved.adapter):
+    if not work_item_matches(work_item, facts, resolved.adapter):
         return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
     refused = await existing_work_item_refusal(session, work_item, facts)
     if refused is not None:
@@ -548,6 +646,22 @@ async def readmit(
 async def _admit_new(
     session: AsyncSession, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    async with session.begin_nested() as atomic:
+        async with AsyncSession(
+            bind=await session.connection(),
+            join_transaction_mode="create_savepoint",
+            expire_on_commit=False,
+        ) as transaction:
+            result = await _admit_new_transaction(transaction, facts, adapter)
+        if not isinstance(result, WorkItemOutcome):
+            await atomic.rollback()
+    await session.commit()
+    return result
+
+
+async def _admit_new_transaction(
+    session: AsyncSession, facts: Any, adapter: str | None
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
     # The owner is settled before any row is written, in the transaction that
     # inserts the WorkItem (#5376): a refusal leaves no WorkItem or request. An
     # existing WorkItem stays locked so it keeps the tuple it is compared to.
@@ -566,6 +680,16 @@ async def _admit_new(
         return await _refuse(
             session, owner.code, work_item_id=existing.id if existing is not None else None
         )
+    requester = getattr(facts, "requester_principal_id", None)
+    if existing is None:
+        if owner is not None and owner.is_personal:
+            if requester is not None and requester != owner.owner_principal_id:
+                return await _refuse(session, "requester_principal_invalid")
+            requester = owner.owner_principal_id
+        if requester is not None and not await requester_is_active(
+            session, agent_id=facts.agent_id, principal_id=requester
+        ):
+            return await _refuse(session, "requester_principal_invalid")
     created = await lifecycle.create_or_get_work_item(
         session,
         issue=facts.issue,
@@ -576,6 +700,7 @@ async def _admit_new(
         base=getattr(facts, "base", None),
         trigger_label=facts.trigger_label,
         owner=owner,
+        requester_principal_id=requester,
     )
     if isinstance(created, WorkItemConflict):
         return created
@@ -617,7 +742,26 @@ async def claim_due(
         .where(
             ExecutionRequest.status == "waiting",
             ExecutionRequest.wait_deadline > func.clock_timestamp(),
-            ExecutionRequest.dispatch_not_before <= func.clock_timestamp(),
+            # A guarded request's own dispatch time; its dispatch_not_before
+            # holds the waiting deadline so an older claim never matches it.
+            # Spelled per column so each partial due index serves its rows.
+            or_(
+                and_(
+                    ExecutionRequest.guarded_dispatch_not_before.is_(None),
+                    ExecutionRequest.dispatch_not_before <= func.clock_timestamp(),
+                ),
+                ExecutionRequest.guarded_dispatch_not_before <= func.clock_timestamp(),
+            ),
+            # A successor blocked on a typed condition is never dispatched
+            # (ADR 0269), except a resource gate, which is offered every probe
+            # so the worker can check the current limit (#5427).
+            or_(
+                ExecutionRequest.blocked_on.is_(None),
+                and_(
+                    ExecutionRequest.resource_gate.is_not(None),
+                    ExecutionRequest.blocked_on.in_(sorted(resource_gate.GATE_CONDITIONS)),
+                ),
+            ),
             ExecutionRequest.objective.is_not(None),
             ~exists().where(
                 WorkItem.id == ExecutionRequest.work_item_id,
@@ -645,7 +789,7 @@ async def claim_due(
                 ExecutionRequest.dispatch_lease_expires_at <= func.clock_timestamp(),
             ),
         )
-        .order_by(ExecutionRequest.dispatch_not_before)
+        .order_by(ExecutionRequest.dispatch_due)
         .limit(limit)
         .with_for_update(skip_locked=True)
     )
@@ -1202,6 +1346,18 @@ async def acquire(
                 generation=generation,
                 refusal="not_dispatchable",
             )
+    gate = (
+        None
+        if request.resource_gate is None
+        else resource_gate.grant_view(
+            request.resource_gate,
+            history_capacity_bytes=get_settings().transcript_max_thread_bytes,
+            # Exactly the value a start now would set its deadline from.
+            execution_seconds=await lifecycle.execution_deadline_seconds(
+                session, work_item.agent_id
+            ),
+        )
+    )
     grant = AcquireGrant(
         generation=generation,
         work_item_id=work_item.id,
@@ -1209,9 +1365,34 @@ async def acquire(
         wait_deadline=deadline,
         repository_path=work_item.repository_path,
         context=current,
+        execution_kind=_execution_kind(request),
+        recovery_candidate_id=request.recovery_candidate_id,
+        resource_gate=gate,
+        predecessor_claim_name=await _fenced_predecessor_claim(session, request),
     )
     await session.commit()
     return grant
+
+
+async def _fenced_predecessor_claim(session: AsyncSession, request: ExecutionRequest) -> str | None:
+    """The predecessor claim a resource or node disruption successor fences on.
+
+    The failed attempt's pod and runner must be confirmed absent before the
+    new attempt claims a sandbox (#5427), so the grant names the claim the
+    predecessor recorded at its start.
+    """
+
+    if request.retry_of_request_id is None:
+        return None
+    predecessor = await session.get(ExecutionRequest, request.retry_of_request_id)
+    if predecessor is None:
+        return None
+    if (
+        request.resource_gate is None
+        and predecessor.terminal_cause not in resource_gate.FENCED_PREDECESSOR_CAUSES
+    ):
+        return None
+    return predecessor.runtime_claim_name
 
 
 def _backoff_seconds(settings: Settings, count: int) -> int:
@@ -1267,6 +1448,13 @@ async def defer(
         or request.acquire_expires_at <= now
     ):
         return await _refuse(session, "not_dispatchable", request_id=request.id)
+    if reason == RESOURCE_GATE_UNMET and (capacity or request.resource_gate is None):
+        # Only a gated retry may wait on its gate; anything else would be an
+        # uncounted wait a worker could hold a request in forever.
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
+    if reason == PREDECESSOR_RUNTIME_PRESENT and (capacity or request.retry_of_request_id is None):
+        # Only an automatic successor has a predecessor to fence on.
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
     return await _apply_deferral(
         session,
         work_item,
@@ -1278,6 +1466,93 @@ async def defer(
         start_failure_detail=start_failure_detail,
         now=now,
     )
+
+
+async def _answer_on_terminal_lineage(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+) -> bool:
+    """Whether ``request`` was started by an answer (#5786 decision 5) on a
+    WorkItem whose pull request is merged or closed.
+
+    Such a request can never start: the worker refuses a turn on a terminal
+    pull request before any sandbox starts (one ticket ADR, decision 10).
+    """
+
+    from . import factory_questions
+    from .models import ThreadPublicationLineage
+
+    if work_item.publication_lineage_id is None:
+        return False
+    lineage_status = await session.scalar(
+        select(ThreadPublicationLineage.status).where(
+            ThreadPublicationLineage.id == work_item.publication_lineage_id
+        )
+    )
+    if lineage_status in (None, "open"):
+        return False
+    return await factory_questions.answer_started(session, work_item.id, request.id)
+
+
+async def _end_answer_on_terminal_lineage(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    owner: str,
+    generation: int,
+    reason: str,
+    now: datetime,
+) -> DeferResult | DispatchConflict:
+    """End an answer's request whose pull request merged or closed before it
+    started (#5786) at its first start deferral, instead of retrying a start
+    the worker always refuses until the start limit fails it.
+
+    The request fails ``start_failed`` (the one ending an unstarted waiting
+    request has) with a sentence that says why. Its settlement clears the
+    question round and posts the request's status comment, and the state
+    label that asked for an answer is replaced.
+    """
+
+    changed_id = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.status == "waiting",
+            ExecutionRequest.acquire_owner == owner,
+            ExecutionRequest.acquired_generation == generation,
+        )
+        .values(
+            status="failed",
+            terminal_at=now,
+            terminal_cause="start_failed",
+            dispatch_generation=ExecutionRequest.dispatch_generation + 1,
+            acquired_generation=None,
+            acquire_owner=None,
+            acquire_expires_at=None,
+            last_deferral_reason=reason,
+            last_start_failure_detail=ANSWER_PULL_REQUEST_ENDED_SENTENCE,
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
+    request = await reload_request(session, request.id)
+    await lifecycle.settle_terminal(
+        session, work_item, request, detail=ANSWER_PULL_REQUEST_ENDED_SENTENCE
+    )
+    result = DeferResult(
+        dispatch_generation=request.dispatch_generation,
+        not_before=None,
+        terminal_cause="start_failed",
+    )
+    await session.commit()
+    logger.info(
+        "work item request %s ended start_failed: its pull request is no longer open",
+        request.id,
+    )
+    return result
 
 
 async def _apply_deferral(
@@ -1293,6 +1568,14 @@ async def _apply_deferral(
     now: datetime,
 ) -> DeferResult | DispatchConflict:
     counts_as_start = not capacity and reason.startswith(START_DEFERRAL_REASON_PREFIX)
+    if (
+        counts_as_start
+        and work_item is not None
+        and await _answer_on_terminal_lineage(session, work_item, request)
+    ):
+        return await _end_answer_on_terminal_lineage(
+            session, work_item, request, owner=owner, generation=generation, reason=reason, now=now
+        )
     settings = get_settings()
     # Failed starts and structural workspace timeout waits retain supplied diagnostics.
     detail = (
@@ -1304,6 +1587,8 @@ async def _apply_deferral(
     if capacity:
         delay = _backoff_seconds(settings, request.capacity_deferrals)
         values["capacity_deferrals"] = ExecutionRequest.capacity_deferrals + 1
+    elif reason in (RESOURCE_GATE_UNMET, PREDECESSOR_RUNTIME_PRESENT):
+        delay = settings.work_item_resource_gate_probe_seconds
     elif not counts_as_start:
         delay = settings.work_item_backoff_base_seconds
     else:
@@ -1350,7 +1635,7 @@ async def _apply_deferral(
     if not fails_start:
         result = DeferResult(
             dispatch_generation=request.dispatch_generation,
-            not_before=request.dispatch_not_before,
+            not_before=request.dispatch_due,
         )
         await session.commit()
         return result
@@ -1386,6 +1671,7 @@ async def start(
     claim_name: str,
     sandbox_name: str,
     context: FactoryContext,
+    delivered_limits: Mapping[str, Any],
 ) -> StartResult | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -1426,6 +1712,13 @@ async def start(
         return await _defer_factory_refusal(
             session, work_item, request, owner=owner, generation=generation, refusal=refusal
         )
+    enrollment_refusal = await _personal_enrollment_refusal(session, request)
+    if enrollment_refusal is not None:
+        # #5378: the request stays waiting with its acquire held, so the worker
+        # releases the claim it made and defers; revalidation can rebind it.
+        return await _refuse(
+            session, enrollment_refusal, work_item_id=work_item.id, request_id=request.id
+        )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
     result = await start_execution_where(
@@ -1450,6 +1743,7 @@ async def start(
             "acquire_owner": None,
             "acquire_expires_at": None,
         },
+        delivered_limits=delivered_limits,
     )
     if isinstance(result, WorkItemConflict):
         mapped = _map_start_conflict(result)
@@ -1470,11 +1764,46 @@ async def start(
     )
 
 
+async def _personal_enrollment_refusal(
+    session: AsyncSession, request: ExecutionRequest
+) -> Literal["enrollment_inactive", "enrollment_generation_mismatch"] | None:
+    """Whether a personal request's owner is still enrolled at its generation (#5378).
+
+    Read ``FOR SHARE`` after the WorkItem and request locks, the order an
+    enrollment publish takes, so a disconnect or replacement cannot commit
+    between this check and the start below. A service request passes.
+    """
+
+    if request.model_auth_mode != "personal":
+        return None
+    enrollment = (
+        await session.execute(
+            select(PersonalClaudeEnrollment.generation, PersonalClaudeEnrollment.active)
+            .where(
+                PersonalClaudeEnrollment.tenant_id == request.tenant_id,
+                PersonalClaudeEnrollment.principal_id == request.owner_principal_id,
+            )
+            .with_for_update(read=True)
+        )
+    ).one_or_none()
+    if enrollment is None or not enrollment.active:
+        return "enrollment_inactive"
+    if enrollment.generation != request.enrollment_generation:
+        return "enrollment_generation_mismatch"
+    return None
+
+
 def _map_start_conflict(result: WorkItemConflict) -> RefusalCode:
     if result.code in {
         "not_found",
         "work_item_cancelled",
         "waiting_deadline_elapsed",
+        # #5378: the worker keeps a personal request waiting on these.
+        "enrollment_inactive",
+        "enrollment_generation_mismatch",
+        # #5427: the request stays waiting with its acquire held, so the worker
+        # releases its claim and defers ``resource_gate_unmet``.
+        "resource_gate_unmet",
     }:
         return cast(RefusalCode, result.code)
     return "not_dispatchable"
@@ -1745,6 +2074,8 @@ def _map_finish_conflict(result: WorkItemConflict, request: ExecutionRequest | N
         return "stale_owner"
     if result.code == "publication_pending":
         return "publication_pending"
+    if result.code == "termination_observation_required":
+        return "termination_observation_required"
     if request is not None and request.status == "cancellation_requested":
         if request.terminal_cause in ("issue_cancelled", "issue_deleted"):
             return "work_item_cancelled"
@@ -1761,6 +2092,9 @@ async def finish(
     cause: str,
     detail: str | None,
     ci_fix_round: int | None,
+    retry_safety: RetrySafety | None,
+    retry_condition: RetryConditionFact | None,
+    exhausted_volume: str | None,
 ) -> WorkItemOutcome | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -1797,6 +2131,10 @@ async def finish(
         detail=detail,
         ci_fix_round=ci_fix_round,
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
+        retry_safety=retry_safety,
+        retry_condition=retry_condition,
+        exhausted_volume=exhausted_volume,
+        finisher="worker",
     )
     if isinstance(result, WorkItemConflict):
         # The conflict path commits and expires this row.
@@ -1834,16 +2172,69 @@ def _unconfirmed_settle_teardown() -> ColumnElement[bool]:
     )
 
 
+def _unconfirmed_terminal_teardown() -> ColumnElement[bool]:
+    """A started terminal request whose runtime teardown is still owed.
+
+    A started personal request's own completed or failed write marks it
+    (#5840); the enrollment fence (#5377) marks one that ended without that
+    mark, for example a row settled before it.
+
+    The sibling rule is narrower than a settled cancellation's: only a request
+    that may own the thread's sandbox blocks the teardown, that is a running or
+    stopping one, or a waiting one under a live acquire lease (a worker is
+    starting it). A waiting request nobody is acquiring owns no sandbox, and
+    revalidation must still be able to rebind it once the teardown is
+    confirmed.
+    """
+
+    sibling = aliased(ExecutionRequest)
+    return and_(
+        ExecutionRequest.status.in_(lifecycle.TEARDOWN_TERMINAL_STATUSES),
+        ExecutionRequest.started_at.is_not(None),
+        ExecutionRequest.teardown_unconfirmed_at.is_not(None),
+        ~exists().where(
+            sibling.work_item_id == ExecutionRequest.work_item_id,
+            sibling.id != ExecutionRequest.id,
+            or_(
+                sibling.status.in_(("running", "cancellation_requested")),
+                and_(
+                    sibling.status == "waiting",
+                    sibling.acquire_expires_at > func.clock_timestamp(),
+                ),
+            ),
+        ),
+    )
+
+
 async def claim_termination(
     session: AsyncSession, request_id: uuid.UUID, *, owner: str
 ) -> TerminationClaim | DispatchConflict:
+    """Lease the termination of a stopping request, or of a terminal one owing teardown.
+
+    The claimant holds the runtime lease until it lapses; another owner is
+    refused ``duplicate`` meanwhile. Claiming a stopping request or a settled
+    cancellation advances the runtime epoch only when the claim takes the
+    runtime over: from a different owner, from a lapsed heartbeat, or from no
+    owner. The live owner's own claim renews its lease and keeps the epoch, so
+    the turn it is stopping still finishes with the epoch it started with and
+    is answered ``not_running`` rather than ``stale_owner``; a superseded
+    previous owner still presents an older epoch. Claiming a completed, failed
+    or expired request leaves the epoch alone, since an ADR 0251 recovery
+    capture of that run is bound to it, and advances the request version
+    instead, so only the latest claimant's record is accepted (#5377). The
+    claim returns the request's epoch and version as they stand after it.
+    """
+
     request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
     settled_teardown = request.status == "cancelled" and request.teardown_unconfirmed_at is not None
-    # A settled teardown is re-checked against active siblings in the
-    # guarded update below.
-    if not settled_teardown and request.status != "cancellation_requested":
+    terminal_teardown = (
+        request.status in lifecycle.TEARDOWN_TERMINAL_STATUSES
+        and request.teardown_unconfirmed_at is not None
+    )
+    # A teardown claim is re-checked against siblings in the guarded update below.
+    if not (settled_teardown or terminal_teardown) and request.status != "cancellation_requested":
         return await _refuse(
             session,
             "not_running",
@@ -1855,29 +2246,36 @@ async def claim_termination(
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at > now
     )
-    allowed = request.runtime_owner is None or not heartbeat_live or request.runtime_owner == owner
+    live_owner = heartbeat_live and request.runtime_owner == owner
+    allowed = request.runtime_owner is None or not heartbeat_live or live_owner
     if not allowed:
         return await _refuse(session, "duplicate", request_id=request.id)
+    if terminal_teardown:
+        eligible = _unconfirmed_terminal_teardown()
+        fence: dict[str, Any] = {"version": ExecutionRequest.version + 1}
+    else:
+        eligible = (
+            _unconfirmed_settle_teardown()
+            if settled_teardown
+            else ExecutionRequest.status == "cancellation_requested"
+        )
+        # A renewal by the live owner keeps the epoch its running turn holds.
+        fence = {} if live_owner else {"runtime_epoch": ExecutionRequest.runtime_epoch + 1}
     settings = get_settings()
     changed_id = await session.scalar(
         update(ExecutionRequest)
-        .where(
-            ExecutionRequest.id == request.id,
-            _unconfirmed_settle_teardown()
-            if settled_teardown
-            else ExecutionRequest.status == "cancellation_requested",
-        )
+        .where(ExecutionRequest.id == request.id, eligible)
         .values(
             runtime_owner=owner,
-            runtime_epoch=ExecutionRequest.runtime_epoch + 1,
             runtime_heartbeat_expires_at=func.clock_timestamp()
             + timedelta(seconds=settings.work_item_runtime_ttl_seconds),
             updated_at=func.clock_timestamp(),
+            **fence,
         )
         .returning(ExecutionRequest.id)
     )
     if changed_id is None:
-        if settled_teardown:
+        if settled_teardown or terminal_teardown:
             # A newer request on the thread owns the sandbox lifecycle.
             return await _refuse(
                 session,
@@ -1887,7 +2285,7 @@ async def claim_termination(
             )
         return await _refuse(session, "duplicate", request_id=request.id)
     request = await reload_request(session, request.id)
-    claimed = TerminationClaim(runtime_epoch=request.runtime_epoch)
+    claimed = TerminationClaim(runtime_epoch=request.runtime_epoch, request_version=request.version)
     await session.commit()
     return claimed
 
@@ -1897,8 +2295,18 @@ async def record_termination(
     request_id: uuid.UUID,
     *,
     runtime_epoch: int,
+    expected_request_version: int,
     observation: str,
 ) -> WorkItemOutcome | DispatchConflict:
+    """Record a claimed termination's observation.
+
+    The epoch and request version are the ones the claim returned: another
+    epoch is ``stale_owner``, another version ``stale_version`` (a later claim
+    or write superseded this one), and a blank observation
+    ``termination_observation_required``. A terminal request keeps its
+    status, cause and ``terminal_at`` (#5377).
+    """
+
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
         return locked
@@ -1911,13 +2319,21 @@ async def record_termination(
             request_id=request.id,
             status=request.status,
         )
+    if request.version != expected_request_version:
+        return await _refuse(
+            session,
+            "stale_version",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
     result = await record_runtime_termination_where(
         session,
         work_item_id=work_item.id,
         request_id=request.id,
         termination_observation=observation,
         expected_work_item_version=work_item.version,
-        expected_request_version=request.version,
+        expected_request_version=expected_request_version,
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
     )
     if isinstance(result, WorkItemConflict):
@@ -2059,6 +2475,14 @@ async def redispatch_lapsed_acquisitions(session: AsyncSession) -> int:
 async def claim_terminate_publishes(
     session: AsyncSession, *, retry_seconds: int, limit: int
 ) -> list[TerminatePublish]:
+    """Claim the terminate wakes that are due and stamp each as published.
+
+    A wake is due for a stopping request, for a settled cancellation still
+    owing its sandbox teardown, and for a started terminal request owing its
+    runtime teardown once that request's runtime lease has lapsed (#5840).
+    A published wake is republished after ``retry_seconds``.
+    """
+
     due = (
         select(ExecutionRequest.id)
         .where(
@@ -2067,15 +2491,34 @@ async def claim_terminate_publishes(
                 and_(
                     ExecutionRequest.status == "cancellation_requested",
                     or_(
-                        # An issue cancellation stops a live runtime too.
-                        ExecutionRequest.terminal_cause.in_(("issue_cancelled", "issue_deleted")),
+                        # An issue cancellation or an enrollment fence stops a
+                        # live runtime too.
+                        ExecutionRequest.terminal_cause.in_(
+                            ("issue_cancelled", "issue_deleted", "enrollment_fenced")
+                        ),
                         ExecutionRequest.runtime_owner.is_(None),
                         ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
                         ExecutionRequest.runtime_heartbeat_expires_at <= func.clock_timestamp(),
                     ),
                 ),
-                # A forced settle still owes the sandbox a teardown.
+                # A forced settle still owes the sandbox a teardown, and so
+                # does a started terminal request its own terminal write or
+                # an enrollment fence marked.
                 _unconfirmed_settle_teardown(),
+                and_(
+                    _unconfirmed_terminal_teardown(),
+                    # Wait out a live runtime lease. A worker's own finish
+                    # leaves its short lease live, and that worker may still
+                    # claim the termination; a wake taking the thread lock
+                    # first would delete the claim before its ADR 0251
+                    # recovery capture runs (#5840). The heartbeat refuses
+                    # terminal rows, so the lease lapses within its TTL.
+                    or_(
+                        ExecutionRequest.runtime_owner.is_(None),
+                        ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
+                        ExecutionRequest.runtime_heartbeat_expires_at <= func.clock_timestamp(),
+                    ),
+                ),
             ),
             or_(
                 ExecutionRequest.terminate_published_at.is_(None),
@@ -2197,7 +2640,7 @@ def request_view(row: ExecutionRequest) -> dict[str, Any]:
         "version": row.version,
         "dispatch_generation": row.dispatch_generation,
         "published_generation": row.published_generation,
-        "dispatch_not_before": row.dispatch_not_before,
+        "dispatch_not_before": row.dispatch_due,
         "capacity_deferrals": row.capacity_deferrals,
         "last_deferral_reason": row.last_deferral_reason,
         "last_start_failure_detail": row.last_start_failure_detail,
@@ -2247,6 +2690,9 @@ def work_item_view(row: WorkItemSnapshot) -> dict[str, Any]:
         "version": row.version,
         "next_sequence": row.next_sequence,
         **_owner_view(row),
+        "requester_principal_id": row.requester_principal_id,
+        "coding_instructions": row.coding_instructions.model_dump(),
+        "memory_rules": row.memory_rules.model_dump(),
     }
 
 
@@ -2275,4 +2721,7 @@ def request_snapshot_view(row: ExecutionRequestSnapshot) -> dict[str, Any]:
         "termination_observation": row.termination_observation,
         "version": row.version,
         **_owner_view(row),
+        "coding_instructions_selection_id": row.coding_instructions_selection_id,
+        "coding_instructions_evidence": row.coding_instructions_evidence,
+        "memory_rules_evidence": row.memory_rules_evidence,
     }

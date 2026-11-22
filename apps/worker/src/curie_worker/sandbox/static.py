@@ -100,12 +100,13 @@ from ..binding import (
 from ..bundle_store import BundleReader
 from ..connector_uploads import mint_claim_upload_tokens
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV, WorkspaceLimits
-from .claim_tokens import executor_claim_env, executor_withheld_names
+from .claim_tokens import MODEL_AUTH_MODE_ENV, executor_claim_env, executor_withheld_names
 from .staging import WORKER_OWNED_ENV, ClaimInputStaging, NoAttachments
 from .types import (
     BUNDLE_REF_LABEL,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    MODEL_AUTH_MODE_LABEL,
     AdmissionRejection,
     AdmissionUnavailableError,
     CapacityExhaustedError,
@@ -115,12 +116,15 @@ from .types import (
     ClaimView,
     DaemonObjectKind,
     DaemonObjectView,
+    DeliveredLimits,
     KubeTransientError,
     ListableDaemonKind,
     MissingAgentPoolError,
     OperatingMode,
+    PersonalModeUnsupported,
     QuotaRejection,
     QuotaStatus,
+    RecordedPod,
     SandboxError,
     SandboxTermination,
     SandboxView,
@@ -643,6 +647,12 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         which frees the slot only once the shell proves it clean.
         """
 
+        if (env or {}).get(MODEL_AUTH_MODE_ENV) == "personal" or (labels or {}).get(
+            MODEL_AUTH_MODE_LABEL
+        ) == "personal":
+            # ADR 0268 decision 2: a personal grant runs only on Kubernetes.
+            # Refused before any lease, staging or shell call.
+            raise PersonalModeUnsupported()
         if tool_daemon is not None:
             raise SandboxError(_NO_TOOL_DAEMON)
         if not protocol.valid_claim_name(name):
@@ -1015,7 +1025,12 @@ class StaticPoolSandboxClient(ClaimInputStaging):
             timeout=max(request_timeout_seconds, self._retire_timeout_s),
         )
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self,
+        *,
+        label_selector: str,
+        request_timeout_seconds: float | None = None,  # noqa: ARG002 - Valkey reads only
+    ) -> list[ClaimView]:
         """Every recorded claim matching ``label_selector``, from Valkey alone.
 
         No shell is contacted, so one unreachable shell cannot hide the rest
@@ -1202,10 +1217,32 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         return None
 
     def pod_termination(
-        self, name: str, *, since: datetime, request_timeout_seconds: float
+        self,
+        name: str,
+        *,
+        since: datetime,
+        request_timeout_seconds: float,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
-        del name, since, request_timeout_seconds
+        del name, since, request_timeout_seconds, recorded
         return None
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        # A shell enforces no per-claim limit this worker can observe.
+        del name, request_timeout_seconds
+        return None
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        del pool, runner_resources, agent_name
+        return DeliveredLimits(
+            memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
 
     def create_daemon_object(
         self, namespace: str, manifest: Mapping[str, Any], *, request_timeout_seconds: float

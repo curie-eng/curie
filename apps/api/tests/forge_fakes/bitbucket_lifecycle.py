@@ -373,6 +373,12 @@ def _start(client: TestClient, request_id: uuid.UUID) -> int:
                 claim_name="claim-factory",
                 sandbox_name="sbx-factory",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)
@@ -480,10 +486,12 @@ class BitbucketPair:
         """The real sink, which writes a Jira WorkItem's replies through the
         ports; remembers the request each write is for."""
 
-        async def sync_one(client: httpx.AsyncClient, settings: Any, claim: Any) -> int:
+        async def sync_one(
+            client: httpx.AsyncClient, settings: Any, claim: Any, verified_repository: Any
+        ) -> int:
             self._syncing = claim.row.execution_request_id
             try:
-                return int(await original(client, settings, claim))
+                return int(await original(client, settings, claim, verified_repository))
             finally:
                 self._syncing = None
 
@@ -547,7 +555,7 @@ class BitbucketPair:
         agent_id = _agent_id()
 
         async def go() -> uuid.UUID | None:
-            page = await self.tracker.poll_marked(self.cursor, running=())
+            page = await self.tracker.poll_marked(self.cursor, running=(), answering=())
             notices = [n for n in page.notices if n.disposition is Disposition.ADMIT]
             assert len(notices) == 1, page
             notice = notices[0]
@@ -585,7 +593,7 @@ class BitbucketPair:
         self.tracker.remove_label(self.issue, self.tracker.label, actor)
 
         async def go() -> list[Any]:
-            page = await self.tracker.poll_marked(self.cursor, running=running)
+            page = await self.tracker.poll_marked(self.cursor, running=running, answering=())
             self.cursor = page.cursor
             cancels = [n for n in page.notices if n.disposition is Disposition.CANCEL]
             for notice in cancels:

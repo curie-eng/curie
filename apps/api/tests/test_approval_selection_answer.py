@@ -525,5 +525,3 @@ def test_a_provider_outage_at_resume_leaves_resume_refused_rows(
 
 
 # --- AC1.10: administrative recovery on a canonical route records its judgment ---------
-
-

@@ -25,6 +25,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -344,21 +345,32 @@ class ChannelScan:
 
 
 class TokenScan:
-    """Counts per channel; records booleans and counts only."""
+    """Counts per channel; records booleans and counts only.
+
+    Scans run on several threads at once (one per followed container log), so
+    every update holds ``_lock``, and a hit only ever sets
+    ``token_bytes_found``: a concurrent miss never writes it back to False.
+    """
 
     def __init__(self, scrubber: Scrubber, channels: Sequence[str] = ()) -> None:
         self.scrubber = scrubber
         self.channels: dict[str, ChannelScan] = {name: ChannelScan() for name in channels}
         self._tails: dict[tuple[str, str], bytes] = {}
+        self._lock = threading.Lock()
 
     def __repr__(self) -> str:
         return "<token scan>"
 
+    def _count(self, channel: str, size: int, hit: bool) -> None:
+        with self._lock:
+            entry = self.channels.setdefault(channel, ChannelScan())
+            entry.scanned_bytes += size
+            if hit:
+                entry.token_bytes_found = True
+
     def scan(self, channel: str, data: bytes) -> bool:
-        entry = self.channels.setdefault(channel, ChannelScan())
-        entry.scanned_bytes += len(data)
         hit = self.scrubber.found(data)
-        entry.token_bytes_found |= hit
+        self._count(channel, len(data), hit)
         return hit
 
     def scan_stream(self, channel: str, key: str, data: bytes) -> bool:
@@ -368,13 +380,13 @@ class TokenScan:
         is scanned again with this chunk; only new bytes are counted.
         """
 
-        entry = self.channels.setdefault(channel, ChannelScan())
-        entry.scanned_bytes += len(data)
-        joined = self._tails.get((channel, key), b"") + data
-        hit = self.scrubber.found(joined)
-        entry.token_bytes_found |= hit
         keep = max(0, self.scrubber.longest() - 1)
-        self._tails[(channel, key)] = joined[-keep:] if keep else b""
+        with self._lock:
+            # One swap: the tail this chunk joins and the tail it leaves.
+            joined = self._tails.get((channel, key), b"") + data
+            self._tails[(channel, key)] = joined[-keep:] if keep else b""
+        hit = self.scrubber.found(joined)
+        self._count(channel, len(data), hit)
         return hit
 
     def as_json(self) -> dict[str, Any]:
@@ -1122,9 +1134,14 @@ class Ledger:
             raise Refusal("arguments_invalid", "--run-id already has a live start")
         self.record("rehearsal", "marker", True)
 
+    def _live_refused(self, db: sqlite3.Connection) -> bool:
+        """A live start is refused on a rehearsal ledger."""
+
+        return self._rehearsal(db)
+
     def begin_live(self, *, now: float, grant_expires_at: float) -> None:
         with self.transaction() as db:
-            if self._rehearsal(db):
+            if self._live_refused(db):
                 raise Refusal("rehearsal_run_id", "--run-id")
             row = db.execute(
                 "SELECT live_starts, live_started_at FROM runs WHERE run_id=?", (self.run_id,)
@@ -1568,21 +1585,39 @@ def error_class(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _assistant_key(path: str, message_id: Any, ordinal: int) -> str:
+    """The guard key of one assistant record.
+
+    A non-empty string id is the key. A record without one gets a synthetic key
+    from the file and its index among assistant records, so an append-only
+    re-parse keeps every earlier key and two sessions never share one.
+    """
+
+    if isinstance(message_id, str) and message_id:
+        return message_id
+    digest = hashlib.sha256(f"{path}\0{ordinal}".encode()).hexdigest()[:16]
+    return f"noid:{digest}"
+
+
 def _session_facts(
     path: str, role: str, parent: str, records: Sequence[Mapping[str, Any]]
 ) -> SessionFacts:
     by_id: dict[str, int | None] = {}
+    responses: set[str] = set()
     models: set[str] = set()
     synthetic = 0
     aci = 0
     errors: list[dict[str, Any]] = []
     stamps: list[float] = []
+    assistant_ordinal = 0
     for record in records:
         stamp = _timestamp(record.get("timestamp"))
         if stamp is not None:
             stamps.append(stamp)
         if record.get("type") != "assistant":
             continue
+        ordinal = assistant_ordinal
+        assistant_ordinal += 1
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         assert isinstance(message, dict)
         model = message.get("model")
@@ -1595,17 +1630,21 @@ def _session_facts(
             continue
         if isinstance(model, str):
             models.add(model)
-        message_id = message.get("id")
-        if not isinstance(message_id, str):
-            message_id = f"<no id {len(by_id)}>"
-            by_id[message_id] = None
+        raw_id = message.get("id")
+        key = _assistant_key(path, raw_id, ordinal)
+        identified = isinstance(raw_id, str) and bool(raw_id)
         usage = message.get("usage")
         tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
-        previous = by_id.get(message_id)
-        if type(tokens) is int and tokens >= 0:
-            by_id[message_id] = tokens if previous is None else max(previous, tokens)
+        previous = by_id.get(key)
+        carries_usage = type(tokens) is int and tokens >= 0
+        if carries_usage:
+            by_id[key] = tokens if previous is None else max(previous, tokens)
         else:
-            by_id.setdefault(message_id, None)
+            by_id.setdefault(key, None)
+        # Every usage-bearing record is a response, id or not. An identified
+        # record with no usage stays one too, so a later usage line can join it.
+        if carries_usage or identified:
+            responses.add(key)
         aci += sum(
             1
             for item in _content(record)
@@ -1628,7 +1667,7 @@ def _session_facts(
         aci_tool_calls=aci,
         # A session with no assistant usage at all (only user records) is not known.
         usage_known=bool(by_id) and all(value is not None for value in by_id.values()),
-        message_ids=frozenset(key for key in by_id if not key.startswith("<no id")),
+        message_ids=frozenset(responses),
         errors=tuple(errors),
     )
 
@@ -1891,6 +1930,9 @@ def settle_attempt(
 # /proc/<pid>/environ; the value never leaves the program. It reads no other
 # variable and no credential file, and the git children get a fresh minimal
 # environment.
+#: Seconds between the harvester's size reports (``harvest_config``).
+HARVEST_SYNC_SECONDS = 0.05
+
 HARVEST_PROGRAM = r"""
 import base64, glob, hashlib, json, os, subprocess, sys, time
 cfg = json.loads(sys.argv[1])
@@ -2062,22 +2104,25 @@ def processes():
             continue
     return {"kind": "process", "count": len(found), "processes": found}
 deadline = time.monotonic() + float(cfg["max_seconds"])
+slow_due = 0.0
 emit(container_credential())
 while True:
     scan_files()
     emit({"kind": "sync", "sizes": dict(offsets), "at": round(time.time(), 3)})
-    scan_reviews()
-    record = workspace()
-    if record != state["workspace"]:
-        state["workspace"] = record
-        emit(record)
-    record = processes()
-    if record != state["process"]:
-        state["process"] = record
-        emit(record)
+    if cfg.get("once") or time.monotonic() >= slow_due:
+        scan_reviews()
+        record = workspace()
+        if record != state["workspace"]:
+            state["workspace"] = record
+            emit(record)
+        record = processes()
+        if record != state["process"]:
+            state["process"] = record
+            emit(record)
+        slow_due = time.monotonic() + float(cfg["interval"])
     if cfg.get("once") or time.monotonic() >= deadline:
         break
-    time.sleep(float(cfg["interval"]))
+    time.sleep(float(cfg["sync_interval"]))
 emit({"kind": "end"})
 """
 
@@ -2091,9 +2136,20 @@ def harvest_config(
     proc_root: str = "/proc",
     git: str = "git",
     interval: float = 0.5,
+    sync_interval: float = HARVEST_SYNC_SECONDS,
     max_seconds: float = LIVE_SECONDS,
     once: bool = False,
 ) -> str:
+    """The harvester's config: transcripts and a size report every ``sync_interval``.
+
+    The workspace, review and process scans (git subprocesses and a /proc walk)
+    run only every ``interval``. The size report is what proves a capture
+    complete after a moment (``HarvestState.terminal_after``), and the product
+    can delete a parked runner's pod within a second of the park, so it is
+    taken often enough that the last one before the container dies follows
+    the park.
+    """
+
     return json.dumps(
         {
             "credential_name": PERSONAL_GRANT_ENV,
@@ -2103,6 +2159,7 @@ def harvest_config(
             "proc_root": proc_root,
             "git": git,
             "interval": interval,
+            "sync_interval": sync_interval,
             "max_seconds": max_seconds,
             "once": once,
             "nonce": nonce,
@@ -3100,7 +3157,6 @@ def install_values(
     return {
         "api": {
             "image": image("curie-api"),
-            "extraEnv": [{"name": "FACTORY_MODEL_AUTH_MODE", "value": PERSONAL_MODE}],
             "githubAppId": app_id,
             "githubAppExistingSecret": app_secret,
             "githubRepoAllowlist": [repo],
@@ -3147,6 +3203,9 @@ def install_values(
         "factory": {
             "enabled": True,
             "intake": "poll",
+            # The chart renders FACTORY_MODEL_AUTH_MODE into the api and the
+            # worker from this one value.
+            "modelAuthMode": PERSONAL_MODE,
             "codeHosts": [{**github, "credential": dict(credential)}],
             # Intake stays dormant: the label and the mention are this run's unused
             # value, and the one admission is the driver's trusted machine admission.

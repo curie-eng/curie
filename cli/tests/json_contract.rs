@@ -7,7 +7,9 @@
 use std::collections::BTreeSet;
 
 use curie::commands::DirectoryOutput;
-use curie::commands::{eval_json, status_json};
+use curie::commands::{
+    eval_json, eval_json_with_details, status_json, EvalBundleRevision, EvalReport, EvalTrial,
+};
 use curie::evals::CaseOutcome;
 use curie::exit;
 use curie::message::{message_dry_run_json, MessageOutcomeOutput};
@@ -194,6 +196,85 @@ fn eval_json_carries_the_bundle_digest_and_emits_null_when_none_applies() {
         without["bundle_digest"].is_null(),
         "no digest applies, so it is null -- never a borrowed one: {without}"
     );
+}
+
+/// Y9 raw results: a local/cluster run carries one record per trial and the
+/// deployed revision it was routed to. Those tiers cannot see tool frames, so
+/// `tool_calls` is null, and the schema must still accept that payload. A run
+/// whose trials the CLI never observed omits `trials` rather than claiming an
+/// empty list, and `bundle_revision` is always emitted, null when unknown.
+#[test]
+fn eval_json_carries_trial_records_and_the_bundle_revision() {
+    let v = validator(&load_schema("eval.schema.json"));
+    let rows = vec![(
+        "forecast".to_string(),
+        CaseOutcome::Pass,
+        3.0_f64,
+        "sunny".to_string(),
+    )];
+    let mut report = EvalReport::with_details(rows.clone(), Default::default());
+    report.trials.insert(
+        "forecast".to_string(),
+        vec![EvalTrial {
+            index: 0,
+            outcome: CaseOutcome::Pass,
+            seconds: 3.0,
+            reply: "sunny".into(),
+            tool_calls: None,
+            status: Some("replied".into()),
+            detail: None,
+            error: None,
+        }],
+    );
+    report.bundle_revision = Some(EvalBundleRevision {
+        agent_id: "agent-1".into(),
+        deployment_id: "dep-1".into(),
+        environment: "prod".into(),
+        version_id: "ver-1".into(),
+        version_label: "1.0.0".into(),
+        commit_sha: Some("0123abc".into()),
+        bundle_sha256: Some("9f86d081".into()),
+    });
+    let value = eval_json_with_details(&report, None);
+    assert!(v.is_valid(&value), "{value}");
+    assert_eq!(
+        value["bundle_revision"]["version_label"], "1.0.0",
+        "{value}"
+    );
+    assert_eq!(
+        value["bundle_revision"]["bundle_sha256"], "9f86d081",
+        "{value}"
+    );
+    let trial = &value["cases"][0]["trials"][0];
+    assert_eq!(trial["reply"], "sunny", "{value}");
+    assert_eq!(trial["passed"], true, "{value}");
+    assert!(
+        trial.get("tool_calls").is_some() && trial["tool_calls"].is_null(),
+        "not observable is null, never omitted and never an empty list: {value}"
+    );
+    assert!(trial.get("detail").is_none(), "{value}");
+
+    let unobserved = eval_json(&rows, None);
+    assert!(v.is_valid(&unobserved), "{unobserved}");
+    assert!(
+        unobserved["cases"][0].get("trials").is_none(),
+        "trials the CLI never saw are absent, not an empty list: {unobserved}"
+    );
+    assert!(
+        unobserved.get("bundle_revision").is_some() && unobserved["bundle_revision"].is_null(),
+        "the key is always emitted, null when no revision is known: {unobserved}"
+    );
+
+    // Teeth: a trial without `tool_calls` (or with a bare string tool) is refused.
+    let mut missing = value.clone();
+    missing["cases"][0]["trials"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_calls");
+    assert!(!v.is_valid(&missing), "{missing}");
+    let mut bare = value.clone();
+    bare["cases"][0]["trials"][0]["tool_calls"] = serde_json::json!(["WebFetch"]);
+    assert!(!v.is_valid(&bare), "{bare}");
 }
 
 /// The non-graded row is the new contract surface (ADR-0055, #612/#606): it must
@@ -2719,6 +2800,7 @@ fn cluster_status_output_validates_both_variants() {
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials: Vec::new(),
+        factory_model_auth_mode: None,
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());
@@ -2757,6 +2839,7 @@ fn cluster_status_output_validates_both_variants() {
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials: Vec::new(),
+        factory_model_auth_mode: None,
     };
     let with_mail = ClusterStatusOutput::Status(Box::new(with_mail)).to_json();
     assert_eq!(
@@ -2769,6 +2852,58 @@ fn cluster_status_output_validates_both_variants() {
         lines: vec!["helm status".to_string()],
     });
     assert_valid("cluster-status.schema.json", &dry.to_json());
+}
+
+#[test]
+fn cluster_status_model_auth_mode_validates_against_the_schema() {
+    for mode in [Some("service"), Some("personal"), None] {
+        let status = ClusterStatus {
+            namespace: "curie".to_string(),
+            revision: "3".to_string(),
+            release_state: "deployed".to_string(),
+            release_found: true,
+            release_missing_note: None,
+            pods: vec![],
+            ready: 0,
+            total: 0,
+            unhealthy: vec![],
+            warnings: vec![],
+            pods_listed: true,
+            urls: vec![],
+            upgrade: curie::ops::UpgradeStatusView::idle(None),
+            delivery: curie::completion_outbox::Report::unknown(),
+            credentials: Vec::new(),
+            factory_model_auth_mode: mode.map(str::to_string),
+        };
+        let json = ClusterStatusOutput::Status(Box::new(status)).to_json();
+        assert_eq!(json["factory_model_auth_mode"], serde_json::json!(mode));
+        assert_valid("cluster-status.schema.json", &json);
+    }
+    let mut invalid = ClusterStatusOutput::Status(Box::new(ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![],
+        ready: 0,
+        total: 0,
+        unhealthy: vec![],
+        warnings: vec![],
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(None),
+        delivery: curie::completion_outbox::Report::unknown(),
+        credentials: Vec::new(),
+        factory_model_auth_mode: None,
+    }))
+    .to_json();
+    invalid["factory_model_auth_mode"] = serde_json::json!("shared");
+    let schema = load_schema("cluster-status.schema.json");
+    assert!(
+        !validator(&schema).is_valid(&invalid),
+        "an unknown mode must not validate: {invalid}"
+    );
 }
 
 // #4397 AC 7: each configured forge credential is listed in status JSON with
@@ -2803,6 +2938,7 @@ fn cluster_status_lists_forge_credentials_in_the_schema() {
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials,
+        factory_model_auth_mode: None,
     };
     let value = ClusterStatusOutput::Status(Box::new(status)).to_json();
     assert_valid("cluster-status.schema.json", &value);
@@ -2902,6 +3038,7 @@ fn cluster_status_credential_authentication_is_in_the_schema() {
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials,
+        factory_model_auth_mode: None,
     };
     let value = ClusterStatusOutput::Status(Box::new(status)).to_json();
     assert_valid("cluster-status.schema.json", &value);

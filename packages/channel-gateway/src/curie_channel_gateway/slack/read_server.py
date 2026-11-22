@@ -6,14 +6,23 @@ from importlib.metadata import version
 from pathlib import Path
 
 import httpx
+from aci_protocol.slack_identities import declared_slack_identity_names
 from aiohttp import web
 from curie_telemetry import bootstrap_service_telemetry
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ..lookup_identities import (
+    LOOKUP_IDENTITIES_ENV,
+    DirectoryEmails,
+    LookupIdentities,
+    LookupSourceFactory,
+    lookup_email_sources,
+)
 from ..read_transport import GatewayProviders, gateway_application
 from ..reply_delivery import ReplyDeliveryStore
 from ..request_replay import RequestReplayStore
+from .account_profiles import SlackAccountProfiles
 from .canvas import SlackCanvasReader
 from .files import SlackFileClient
 from .groups import SlackUserGroupClient
@@ -21,6 +30,7 @@ from .reads import SlackChannelReader
 from .senders import SlackSenderIdentities
 from .slack_sink import SlackReplyAdapter
 from .tokens import SlackProviderConfig, slack_bot_tokens
+from .user_emails import SlackUserEmails
 
 
 class GatewayConfig(BaseSettings):
@@ -31,6 +41,16 @@ class GatewayConfig(BaseSettings):
     worker_token: str = Field(
         default="", validation_alias="CURIE_CHANNEL_GATEWAY_WORKER_TOKEN", repr=False
     )
+    # Optional third caller: an external HTTP identity provider that may only
+    # ask which email belongs to a Slack user (@spec GATEWAY-USER-EMAIL-1).
+    identity_token: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN", repr=False
+    )
+    user_email_timeout_s: float = Field(
+        default=5.0, gt=0, validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S"
+    )
+    # Credentials for directory reads alone (@spec GATEWAY-USER-EMAIL-7).
+    lookup_identities: LookupIdentities = Field(default=(), validation_alias=LOOKUP_IDENTITIES_ENV)
     host: str = Field(default="0.0.0.0", validation_alias="CURIE_CHANNEL_GATEWAY_HOST")
     port: int = Field(default=8081, validation_alias="CURIE_CHANNEL_GATEWAY_PORT")
     allow_insecure_http: bool = Field(
@@ -50,9 +70,43 @@ class GatewayConfig(BaseSettings):
     slack_trusted_origins: str = Field(default="", validation_alias="CURIE_SLACK_TRUSTED_ORIGINS")
 
 
+def gateway_callers(config: GatewayConfig) -> dict[str, str]:
+    """The caller credentials; the identity caller exists only when configured."""
+    callers = {"api": config.api_token, "worker": config.worker_token}
+    if config.identity_token:
+        callers["identity"] = config.identity_token
+    return callers
+
+
+def lookup_registry(
+    config: GatewayConfig, http: httpx.AsyncClient
+) -> dict[str, LookupSourceFactory]:
+    """Each lookup identity kind's directory adapter (@spec GATEWAY-USER-EMAIL-7)."""
+
+    def slack(name: str, token: str) -> SlackUserEmails:
+        return SlackUserEmails(
+            http,
+            {name: token},
+            base_url=config.slack_api_base_url or None,
+            timeout_s=config.user_email_timeout_s,
+        )
+
+    return {"slack": slack}
+
+
 async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.Application:
     tokens = slack_bot_tokens(slack)
     http = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    try:
+        # @spec GATEWAY-USER-EMAIL-8, -9: only the user email read sees these.
+        lookups = lookup_email_sources(
+            config.lookup_identities,
+            registry=lookup_registry(config, http),
+            declared=declared_slack_identity_names(slack.slack_identities),
+        )
+    except Exception:
+        await http.aclose()
+        raise
     sink = SlackReplyAdapter(
         tokens.get("default", ""),
         identity_tokens=tokens,
@@ -63,12 +117,14 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
     )
     try:
         app = gateway_application(
-            tokens={"api": config.api_token, "worker": config.worker_token},
+            tokens=gateway_callers(config),
             replay=RequestReplayStore(config.replay_db),
             max_file_bytes=config.max_file_bytes,
             groups={
                 name: SlackUserGroupClient(
-                    http, token=token, ttl_s=config.group_cache_ttl_s,
+                    http,
+                    token=token,
+                    ttl_s=config.group_cache_ttl_s,
                     base_url=config.slack_api_base_url or "https://slack.com/api/",
                 )
                 for name, token in tokens.items()
@@ -79,6 +135,18 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
                 channel=SlackChannelReader(http, tokens),
                 canvas=SlackCanvasReader(http, tokens),
                 senders=SlackSenderIdentities(tokens, base_url=config.slack_api_base_url or None),
+                emails=DirectoryEmails(
+                    SlackUserEmails(
+                        http,
+                        tokens,
+                        base_url=config.slack_api_base_url or None,
+                        timeout_s=config.user_email_timeout_s,
+                    ),
+                    lookups,
+                ),
+                profiles=SlackAccountProfiles(
+                    http, tokens, base_url=config.slack_api_base_url or None
+                ),
             ),
             reply=sink,
             reply_state=ReplyDeliveryStore(Path(config.replay_db)),

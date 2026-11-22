@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -82,20 +83,24 @@ from ..workspace import (
     WORKSPACE_SHA256_ENV,
     WorkspaceLimits,
 )
-from .claim_tokens import executor_claim_env
+from .claim_tokens import MODEL_AUTH_MODE_ENV, executor_claim_env
 from .staging import WORKER_OWNED_ENV, ClaimInputStaging, NoAttachments
 from .types import (
     BUNDLE_REF_LABEL,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    MODEL_AUTH_MODE_LABEL,
     CapacityInventory,
     ClaimView,
     DaemonObjectKind,
     DaemonObjectView,
+    DeliveredLimits,
     ListableDaemonKind,
     OperatingMode,
+    PersonalModeUnsupported,
     QuotaRejection,
     QuotaStatus,
+    RecordedPod,
     SandboxError,
     SandboxTermination,
     SandboxView,
@@ -104,6 +109,20 @@ from .types import (
 )
 
 _NO_TOOL_DAEMON = "the Docker substrate runs no per-claim tool daemon (ADR 0217)"
+# docker's RAMInBytes: binary multipliers, an optional ``i`` and ``b``.
+_DOCKER_MEMORY = re.compile(r"([0-9]+) ?([kmgtp])?i?b?", re.IGNORECASE)
+_DOCKER_MEMORY_POWERS = {None: 0, "k": 1, "m": 2, "g": 3, "t": 4, "p": 5}
+
+
+def _docker_memory_bytes(text: str | None) -> int | None:
+    """A ``--memory`` value in bytes; None when absent, fractional or zero."""
+
+    match = _DOCKER_MEMORY.fullmatch(text or "")
+    if match is None:
+        return None
+    count, unit = match.groups()
+    value = int(count) * 1024 ** _DOCKER_MEMORY_POWERS[unit.lower() if unit else None]
+    return value or None
 
 
 logger = logging.getLogger(__name__)
@@ -377,6 +396,13 @@ class DockerSandboxClient(ClaimInputStaging):
         executor_secret_names: frozenset[str] | None = None,
         tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        if (env or {}).get(MODEL_AUTH_MODE_ENV) == "personal" or (labels or {}).get(
+            MODEL_AUTH_MODE_LABEL
+        ) == "personal":
+            # ADR 0268 decision 2: a personal grant runs only on Kubernetes,
+            # whose per-claim Secret keeps it out of the runner's plain env.
+            # Refused before any docker call, so nothing is created or staged.
+            raise PersonalModeUnsupported()
         if tool_daemon is not None:
             raise SandboxError(_NO_TOOL_DAEMON)
         env = filter_agent_child_env(env)
@@ -398,16 +424,7 @@ class DockerSandboxClient(ClaimInputStaging):
         # reach; the data tier is denied by the runner's dedicated network (see
         # CURIE_DOCKER_NETWORK). This is local trusted-bundle defense-in-depth,
         # not the K8s security boundary.
-        args += self._hardening.run_args()
-        if runner_resources is not None:
-            from .resources import docker_limit_args
-
-            args = _without_flags(args, ("--memory", "--cpus"))
-            args += docker_limit_args(
-                runner_resources,
-                self._hardening.memory_limit,
-                self._hardening.cpu_limit,
-            )
+        args += self._isolation_args(runner_resources)
         for key, value in (labels or {}).items():
             args += ["--label", f"{key}={value}"]
         args += [
@@ -603,7 +620,12 @@ class DockerSandboxClient(ClaimInputStaging):
             name, request_timeout_seconds=request_timeout_seconds, include_runner=True
         )
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self,
+        *,
+        label_selector: str,
+        request_timeout_seconds: float | None = None,  # noqa: ARG002 - each call bounds itself
+    ) -> list[ClaimView]:
         out = self._docker(
             [
                 "ps",
@@ -826,11 +848,70 @@ class DockerSandboxClient(ClaimInputStaging):
         return None
 
     def pod_termination(
-        self, name: str, *, since: datetime, request_timeout_seconds: float
+        self,
+        name: str,
+        *,
+        since: datetime,
+        request_timeout_seconds: float,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
         # Docker has no Kubernetes pod status or events.
-        del name, since, request_timeout_seconds
+        del name, since, request_timeout_seconds, recorded
         return None
+
+    def _isolation_args(self, runner_resources: dict[str, Any] | None) -> list[str]:
+        """The hardening flags, with an override's memory and cpu in place of the defaults."""
+
+        args = self._hardening.run_args()
+        if runner_resources is None:
+            return args
+        from .resources import docker_limit_args
+
+        return _without_flags(args, ("--memory", "--cpus")) + docker_limit_args(
+            runner_resources,
+            self._hardening.memory_limit,
+            self._hardening.cpu_limit,
+        )
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        # Docker forwards memory and cpu only; it enforces no storage limit.
+        del pool, agent_name
+        args = self._isolation_args(runner_resources)
+        memory = (
+            _docker_memory_bytes(args[args.index("--memory") + 1]) if "--memory" in args else None
+        )
+        return DeliveredLimits(
+            memory_bytes=memory, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        """The memory limit the runner container actually runs with."""
+
+        deadline = time.monotonic() + request_timeout_seconds
+        try:
+            inspected = self._inspect(name, deadline=deadline)
+            if inspected is None or not self._owns_resource(
+                inspected[1], name=name, component="claim-runner"
+            ):
+                return None
+            raw = self._docker(
+                ["inspect", "--format", "{{.HostConfig.Memory}}", inspected[3]],
+                request_timeout_seconds=self._remaining_seconds(deadline),
+                check=False,
+            ).strip()
+        except (DockerError, ValueError):
+            return None
+        # HostConfig.Memory is a byte count; 0 is unlimited, never a limit.
+        memory = int(raw) if raw.isdigit() and int(raw) > 0 else None
+        return DeliveredLimits(
+            memory_bytes=memory, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
         # Docker has no cold suspend; pause freezes the process while keeping the

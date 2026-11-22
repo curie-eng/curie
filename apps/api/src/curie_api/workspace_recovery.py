@@ -60,6 +60,8 @@ def _failed_source(source: ExecutionRequest) -> None:
         in {
             None,
             "owner_lost",
+            # An enrollment fence is a teardown path (ADR 0251 section 7, #5377).
+            "enrollment_fenced",
             "start_failed",
             "execution_deadline",
             "issue_cancelled",

@@ -14,11 +14,14 @@ import anyio
 
 
 async def initialized_session(runner: Any) -> Any:
-    """Run the runner's boot initializer, then build the session it would connect."""
+    """Run both startup phases, then build the session it would connect."""
 
     initializer = runner._initializer  # noqa: SLF001 -- the boot wiring is the subject
     if initializer is not None:
         await initializer()
+    session_initializer = runner._session_initializer  # noqa: SLF001 -- the session wiring
+    if session_initializer is not None:
+        await session_initializer()
     return runner._factory()  # noqa: SLF001 -- the boot wiring is the subject
 
 

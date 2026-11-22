@@ -61,5 +61,3 @@ def test_grid_answer_binds_the_workspace_and_organization(
         namespace = seal.actor_scope.namespace.model_dump()
         assert namespace == case.scope["namespace"].model_dump()
         assert (namespace["kind"], namespace["key"]) == ("slack_enterprise", GRID_ORG)
-
-

@@ -6,12 +6,13 @@ ExecutionRequest snapshots it at insertion.
 
 1. The tuple is fixed when the WorkItem is created, from validated admission
    facts. A service tuple names the agent's tenant and no owner. A personal
-   tuple names an owner the trusted internal admission supplied, verified in
+   tuple names an owner the trusted admission supplied, verified in
    the inserting transaction: the owner's tenant is the agent's and active,
    the principal is active in it, and its ``personal_claude_enrollments`` row
    is active at exactly the named generation. Personal mode is never inferred
-   from an enrollment, and no requester text, issue text or event author is
-   read to choose an owner.
+   from an enrollment, and no requester text or issue text is read to choose
+   an owner. GitHub label admission resolves the verified label actor through
+   an existing account link before supplying this context.
 2. Every request copies the locked WorkItem's tuple (``snapshot_columns``).
 3. Facts arriving for an existing WorkItem never change its tuple. Service
    facts reuse it; personal facts without an owner reuse it only when it is
@@ -35,6 +36,7 @@ from typing import Any, Literal, cast
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import rollout_hold
 from .models import Agent, ExecutionRequest, PersonalClaudeEnrollment, Principal, Tenant, WorkItem
 
 # Declared beside the operator read schemas that serialize it.
@@ -50,6 +52,7 @@ OwnerRefusalCode = Literal[
     "enrollment_inactive",
     "enrollment_generation_mismatch",
     "owner_mismatch",
+    "personal_rollout_in_progress",
 ]
 
 # What an explicit owner that passed validation can still conflict on.
@@ -223,6 +226,10 @@ async def new_work_item_owner(
         return None
     if owner is None:
         return OwnerRefusal("personal_owner_required")
+    # #5377: no new personal WorkItem while API replicas run mixed templates;
+    # an older replica would expire the transcript a fenced run keeps.
+    if await rollout_hold.personal_rollout_held():
+        return OwnerRefusal("personal_rollout_in_progress")
     refused = await _verify(session, owner, agent_id=facts.agent_id)
     if refused is not None:
         return OwnerRefusal(refused)
@@ -404,8 +411,13 @@ def _runtime_proven_gone(row: ExecutionRequest) -> bool:
 
     A normal finish, a failed finish and an expired heartbeat are not evidence:
     worker sandbox cleanup after a finish is best effort, so the sandbox may
-    outlive it. An explicit epoch-bound termination confirmation for normally
-    finished runs is tracked in issue #5378.
+    outlive it. A normally finished run gets that evidence through its own
+    terminal write, which marks it ``teardown_unconfirmed_at`` (#5840), or,
+    for a run that ended without that mark, through the enrollment fence
+    (#5377, ``lifecycle.fence_enrollment_generation``). Terminate wakes follow,
+    and ``workitem_dispatch.record_termination`` records the observation under
+    the claim's runtime epoch and request version, preserving the run's status
+    and cause and clearing the flag.
     """
 
     return (

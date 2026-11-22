@@ -45,6 +45,7 @@ the first route guarded by ``require_principal_session``.
 
 import hmac
 import logging
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
@@ -56,23 +57,32 @@ from curie_api.schemas.console import (
     ConsoleLoginCodeOut,
     ConsoleSessionExchange,
     ConsoleSessionOut,
+    ConsoleSessionPrincipal,
+    ConsoleSignInMethodsOut,
     PrincipalOut,
 )
 
 from .. import oidc
 from ..approval_auth import enforce_console_cookie_origin, set_console_session_cookie
-from ..auth import CONSOLE_SESSION_COOKIE, require_platform_key, require_principal_session
+from ..auth import (
+    CONSOLE_SESSION_COOKIE,
+    authorized_console_principal,
+    require_platform_key,
+    require_principal_session,
+)
 from ..config import get_settings
 from ..deps import SessionDep
 from ..identity import connect as identity_connect
-from ..models import Principal
+from ..models import Principal, TenantIdentityProvider
 from ..principal_authority import PrincipalAuthorityRefusal
 from ..rate_limit import require_rate_limit
 from .identity_connect import (
     CONNECT_COOKIE,
     clear_connect_cookies,
     connect_path,
+    refusal_page,
     set_browser_proof_cookie,
+    wants_html,
 )
 
 logger = logging.getLogger(__name__)
@@ -154,7 +164,7 @@ async def exchange_login_code(
     # the credential back to the JavaScript this whole design keeps it from.
     assert row.session_expires_at is not None  # set by the exchange above
     response.headers["Cache-Control"] = "no-store"
-    return ConsoleSessionOut(subject=row.subject, expires_at=row.session_expires_at)
+    return _operator_session(row.subject, row.session_expires_at)
 
 
 @router.get(
@@ -174,18 +184,65 @@ async def current_session(
             detail="missing, invalid, or expired console session",
             headers={"Cache-Control": "no-store"},
         )
-    subject = row.subject
     expires_at = row.session_expires_at
-    if subject is None or not subject.strip() or expires_at is None:
+    if expires_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing, invalid, or expired console session",
+            headers={"Cache-Control": "no-store"},
+        )
+    if row.principal_id is not None:
+        principal = await authorized_console_principal(session, console_session or "", live_row=row)
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="missing, invalid, or expired console session",
+                headers={"Cache-Control": "no-store"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return ConsoleSessionOut(
+            subject=f"principal:{principal.id}",
+            expires_at=expires_at,
+            kind="principal",
+            principal=ConsoleSessionPrincipal(
+                id=principal.id,
+                display_name=principal.display_name,
+                email=principal.email,
+            ),
+        )
+    subject = row.subject
+    if subject is None or not subject.strip():
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing, invalid, or expired console session",
             headers={"Cache-Control": "no-store"},
         )
     response.headers["Cache-Control"] = "no-store"
+    return _operator_session(subject, expires_at)
+
+
+@router.get(
+    "/sign-in-methods",
+    response_model=ConsoleSignInMethodsOut,
+    dependencies=[Depends(limit_current_session)],
+)
+async def sign_in_methods(response: Response) -> ConsoleSignInMethodsOut:
+    """Report whether Console OIDC sign-in is enabled. No credential required.
+
+    A presented X-API-Key is not a credential for this route. The login screen
+    reads it before a session exists, and the answer does not depend on the header.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+    return ConsoleSignInMethodsOut(oidc=bool(get_settings().oidc_enabled))
+
+
+def _operator_session(subject: str | None, expires_at: datetime) -> ConsoleSessionOut:
     return ConsoleSessionOut(
         subject=subject,
         expires_at=expires_at,
+        kind="operator",
+        principal=None,
     )
 
 
@@ -239,7 +296,14 @@ async def logout(
 #: Path=/ is also what the prefix requires, and it keeps the cookie reaching
 #: the callback when the API sits behind a path prefix such as ``/api``.
 OIDC_STATE_COOKIE = "__Host-curie_oidc_state"
+#: Where a completed OIDC login returns. Same flags and scope as the state
+#: cookie, and only ever one of the two paths the console is allowed to open.
+OIDC_RETURN_COOKIE = "__Host-curie_oidc_return"
 _OIDC_COOKIE_PATH = "/"
+# Fixed console paths. The cookie and the redirect use these constants, never
+# the string the request supplied, even when that string compares equal.
+_RETURN_ROOT = "/"
+_RETURN_CLAUDE_PLAN = "/settings/claude-plan"
 _NO_STORE = {"Cache-Control": "no-store"}
 #: The one body every refused callback gets. Never the IdP's `error` or
 #: `error_description`: those are attacker-influenced strings, and echoing
@@ -254,12 +318,31 @@ def _require_oidc_enabled() -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, headers=_NO_STORE)
 
 
+def _accepted_return_to(value: str | None) -> str | None:
+    """The allowlisted console path, or none.
+
+    The result is ``_RETURN_ROOT`` or ``_RETURN_CLAUDE_PLAN``, never
+    ``value``. An absolute URL, a protocol-relative path, and a path that
+    contains a backslash do not match either constant.
+    """
+
+    if value == _RETURN_CLAUDE_PLAN:
+        return _RETURN_CLAUDE_PLAN
+    if value == _RETURN_ROOT:
+        return _RETURN_ROOT
+    return None
+
+
 def _clear_state_cookie(response: Response) -> None:
     # Same name, path and flags as the set: a browser only replaces (and so
     # only deletes) the cookie those match, and it refuses a __Host- cookie
-    # that is not Secure with Path=/.
+    # that is not Secure with Path=/. Every terminal callback response clears
+    # the return cookie in the same breath, including a login that never set one.
     response.delete_cookie(
         OIDC_STATE_COOKIE, path=_OIDC_COOKIE_PATH, secure=True, httponly=True, samesite="lax"
+    )
+    response.delete_cookie(
+        OIDC_RETURN_COOKIE, path=_OIDC_COOKIE_PATH, secure=True, httponly=True, samesite="lax"
     )
 
 
@@ -276,8 +359,27 @@ def _refuse_callback(reason: str) -> JSONResponse:
     return response
 
 
+def _refuse_callback_for(request: Request, reason: str) -> Response:
+    """The callback refusal; a browser mid account-connect gets the refusal page.
+
+    Same status, generic JSON detail and cookie handling as `_refuse_callback`.
+    When the browser carries a live connect cookie (it came from a connect link)
+    and Accept names text/html, the body is the link-refusal page instead of raw
+    JSON, whatever stopped the sign-in: a cancelled consent, a lapsed link or a
+    refused identity. The reason still goes to logs only.
+    """
+    if not (request.cookies.get(CONNECT_COOKIE) and wants_html(request)):
+        return _refuse_callback(reason)
+    logger.warning("oidc callback refused: %s", reason)
+    response = refusal_page(status.HTTP_401_UNAUTHORIZED, _NO_STORE, page=400)
+    _clear_state_cookie(response)
+    return response
+
+
 @router.get("/oidc/login", status_code=status.HTTP_302_FOUND, response_class=RedirectResponse)
-async def oidc_login(request: Request, session: SessionDep) -> RedirectResponse:
+async def oidc_login(
+    request: Request, session: SessionDep, return_to: str | None = None
+) -> RedirectResponse:
     """Start an OIDC login: persist an attempt and redirect to the IdP.
 
     Discovery runs first so a misconfigured or mixed-up IdP fails here, before
@@ -323,6 +425,34 @@ async def oidc_login(request: Request, session: SessionDep) -> RedirectResponse:
         secure=True,
         samesite="lax",
     )
+    accepted = _accepted_return_to(return_to)
+    if accepted == _RETURN_CLAUDE_PLAN:
+        return_cookie = _RETURN_CLAUDE_PLAN
+    elif accepted == _RETURN_ROOT:
+        return_cookie = _RETURN_ROOT
+    else:
+        return_cookie = None
+    if return_cookie is not None:
+        response.set_cookie(
+            OIDC_RETURN_COOKIE,
+            return_cookie,
+            max_age=int(crud_console.OIDC_LOGIN_TTL.total_seconds()),
+            path=_OIDC_COOKIE_PATH,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+        )
+    else:
+        # A missing or rejected return_to must not keep a path from an earlier
+        # login. Only this response's browser is still in the flow; 429 and the
+        # attempt cap return before any cookie is written.
+        response.delete_cookie(
+            OIDC_RETURN_COOKIE,
+            path=_OIDC_COOKIE_PATH,
+            secure=True,
+            httponly=True,
+            samesite="lax",
+        )
     return response
 
 
@@ -367,19 +497,19 @@ async def oidc_callback(
         or not state_cookie
         or not hmac.compare_digest(state.encode("utf-8"), state_cookie.encode("utf-8"))
     ):
-        return _refuse_callback("state does not match the state cookie")
+        return _refuse_callback_for(request, "state does not match the state cookie")
     attempt = await crud_console.consume_oidc_login_attempt(session, state)
     if attempt is None:
-        return _refuse_callback("unknown, consumed or expired login attempt")
+        return _refuse_callback_for(request, "unknown, consumed or expired login attempt")
     if error is not None:
-        return _refuse_callback("the IdP returned an error")
+        return _refuse_callback_for(request, "the IdP returned an error")
     if not code:
-        return _refuse_callback("no authorization code")
+        return _refuse_callback_for(request, "no authorization code")
     try:
         id_token = await oidc.exchange_code(code, attempt.code_verifier)
         claims = await oidc.validate_id_token(id_token, nonce=attempt.nonce)
     except oidc.OidcError as exc:
-        return _refuse_callback(str(exc))
+        return _refuse_callback_for(request, str(exc))
     response: Response
     connect_token = request.cookies.get(CONNECT_COOKIE)
     connect_row = None
@@ -387,19 +517,23 @@ async def oidc_callback(
         try:
             connect_row = await identity_connect.live_token(session, connect_token, lock=True)
         except identity_connect.ConnectRefused:
-            response = _refuse_callback("invalid account connection")
+            response = _refuse_callback_for(request, "invalid account connection")
             clear_connect_cookies(response)
             return response
         if claims.issuer != connect_row.idp_issuer:
-            response = _refuse_callback("account connection issuer mismatch")
+            response = _refuse_callback_for(request, "account connection issuer mismatch")
             clear_connect_cookies(response)
             return response
-    # Ordinary account connection authenticates a person, never an admin.
-    # Console sign-in retains its existing administrator admission policy.
-    if not connect_token and not oidc.meets_required_claims(
-        claims, get_settings().oidc_required_claims
-    ):
-        return _refuse_callback("ID token lacks a required claim")
+    # live_token locks the tenant and only accepts the fallback when there is
+    # no directory configuration. Both paths can use the same issuer URL.
+    if (
+        connect_row is None
+        or await session.get(TenantIdentityProvider, connect_row.tenant_id) is None
+    ) and not oidc.meets_required_claims(claims, get_settings().oidc_required_claims):
+        response = _refuse_callback_for(request, "ID token lacks a required claim")
+        if connect_row is not None:
+            clear_connect_cookies(response)
+        return response
     # @spec HTTP-PRINCIPAL-ADOPTION-V1-10, HTTP-PRINCIPAL-ADOPTION-V1-11.
     try:
         principal = await crud_console.resolve_principal(
@@ -407,14 +541,14 @@ async def oidc_callback(
         )
     except PrincipalAuthorityRefusal:
         await session.rollback()
-        response = _refuse_callback("principal authority refused login")
+        response = _refuse_callback_for(request, "principal authority refused login")
         if connect_token:
             clear_connect_cookies(response)
         return response
     if not await crud_console.principal_is_active(session, principal):
         # Undo the attribute refresh: a refused login changes nothing.
         await session.rollback()
-        response = _refuse_callback("principal or tenant is not active")
+        response = _refuse_callback_for(request, "principal or tenant is not active")
         if connect_token:
             clear_connect_cookies(response)
         return response
@@ -425,7 +559,7 @@ async def oidc_callback(
             )
         except identity_connect.ConnectRefused:
             await session.rollback()
-            response = _refuse_callback("account connection no longer valid")
+            response = _refuse_callback_for(request, "account connection no longer valid")
             clear_connect_cookies(response)
             return response
     if connect_token:
@@ -442,8 +576,15 @@ async def oidc_callback(
             token, _ = await crud_console.create_principal_console_session(session, principal)
         except PrincipalAuthorityRefusal:
             await session.rollback()
-            return _refuse_callback("principal authority refused login")
-        response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE)
+            return _refuse_callback_for(request, "principal authority refused login")
+        returned = _accepted_return_to(request.cookies.get(OIDC_RETURN_COOKIE))
+        if returned == _RETURN_CLAUDE_PLAN:
+            destination = _RETURN_CLAUDE_PLAN
+        else:
+            destination = _RETURN_ROOT
+        response = RedirectResponse(
+            destination, status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE
+        )
         set_console_session_cookie(response, token)
     _clear_state_cookie(response)
     return response

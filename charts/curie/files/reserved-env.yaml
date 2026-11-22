@@ -40,6 +40,7 @@ worker:
   CURIE_E2E_REGISTRY_INSECURE: e2eConnector.registryInsecure
   CURIE_E2E_REGISTRY_TOKEN_HOSTS: e2eConnector.registryTokenHosts
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
+  CURIE_FACTORY_MIN_MODEL_CREDIT_USD: factory.admission.minModelCreditUsd
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
   CURIE_HOOK_CLAIM_LEASE_S: worker.hookClaimLeaseSeconds
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
@@ -106,12 +107,14 @@ worker:
   CURIE_WORKSPACE_MAX_CONCURRENT_CLONES: worker.workspace.maxConcurrentClones
   CURIE_WORKSPACE_MAX_MEMBERS: worker.workspace.maxMembers
   CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
+  CURIE_PUBLICATION_CANDIDATES_ENABLED: worker.workspace.publicationCandidates.enabled
   CURIE_WORKSPACE_REFERENCE_TTL_SECONDS: worker.workspace.referenceTtlSeconds
   CURIE_WORKSPACE_SCRATCH_ROOT: worker.workspace.mountPath
   CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS: worker.workspace.totalTimeoutSeconds
   CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS: worker.workspace.uploadTimeoutSeconds
   DATABASE_URL: postgres.host / postgres.port / postgres.auth / postgres.sslMode
   DB_SCHEMA: the chart-managed database schema (remove this override)
+  FACTORY_MODEL_AUTH_MODE: factory.modelAuthMode
   LANGFUSE_HOST: langfuse.host / langfuse.web.service.port
   LANGFUSE_PUBLIC_KEY: langfuse.init.projectPublicKey
   LANGFUSE_SECRET_KEY: langfuse.existingSecret
@@ -144,6 +147,7 @@ api:
   CURIE_CONNECTOR_PROXY_IMAGE: worker.image
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY: worker.image.pullPolicy
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS: worker.imagePullSecrets
+  CURIE_CONNECTOR_SERVICE_ACCOUNTS: connectorServiceAccounts
   CURIE_DELIVERY_BUDGET_S: worker.deliveryBudgetSeconds
   CURIE_E2E_BUILDER_IMAGE: e2eConnector.builderImage
   CURIE_E2E_BUILD_CACHE_REPO: e2eConnector.buildCacheRepo
@@ -177,6 +181,8 @@ api:
   CURIE_WORKSPACE_MAX_ARCHIVE_BYTES: worker.workspace.maxArchiveBytes
   CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
   CURIE_WORKSPACE_RECOVERY_MAX_BYTES: worker.workspace.recovery.maxBytes
+  CURIE_PUBLICATION_CANDIDATES_ENABLED: worker.workspace.publicationCandidates.enabled
+  CURIE_PUBLICATION_CANDIDATE_MAX_BYTES: worker.workspace.publicationCandidates.maxBytes
   CURIE_SANDBOX_QUOTA_LIMITS_CPU: resourceQuota.hard.limitsCpu
   CURIE_SANDBOX_QUOTA_LIMITS_MEMORY: resourceQuota.hard.limitsMemory
   CURIE_SANDBOX_QUOTA_REQUESTS_CPU: resourceQuota.hard.requestsCpu
@@ -193,8 +199,12 @@ api:
   ENVIRONMENT: api.environment
   FACTORY_CI_WAIT_S: factory.ciWaitSeconds
   FACTORY_ENABLED: factory.enabled
+  FACTORY_GITHUB_APP_CLIENT_ID: factory.githubAppClientId
+  FACTORY_GITHUB_APP_CLIENT_SECRET: factory.githubAppClientSecretExistingSecret
   FACTORY_INTAKE: factory.intake
+  FACTORY_MODEL_AUTH_MODE: factory.modelAuthMode
   FACTORY_BASE_LABEL_SETTLE_S: factory.baseLabelSettleSeconds
+  CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY: factory.requesterCodingInstructions.apply
   GITHUB_API_URL: api.githubApiUrl
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret

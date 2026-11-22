@@ -1774,11 +1774,18 @@ class WorkspaceClaimCoordinator:
         publication_visible_outcome_revision: int = 0,
         fresh_only: bool = False,
         caller_run: str | None = None,
+        personal: Any | None = None,
     ) -> WorkspaceClaimResult:
         """Prepare once, then cold-claim or resume a suspended route.
 
         ``fresh_only`` forwards to the substrate claim so an attachment turn
         never adopts a live runner that did not boot with its env (#2739).
+
+        ``personal`` is a personal owner's create (#5378,
+        ``sandbox.types.PersonalCreate``), forwarded to the substrate claim,
+        resume or handoff. The substrate runs its final authority check and
+        grant read inside the create, after all preparation here and after
+        ``revalidate_before_claim``; the grant env reaches only that create.
 
         ``revalidate_before_handoff`` is the late-replacement linearization
         guard. It runs after the archive is verified and durably staged,
@@ -1832,6 +1839,9 @@ class WorkspaceClaimCoordinator:
             previous_ownership = self._stage_ownership(thread_key, prepared)
             ownership_staged = True
             claim_env = {**(env or {}), **prepared.claim_env()}
+            # Forwarded only for a personal create, so a substrate double that
+            # predates the keyword keeps serving service claims unchanged.
+            personal_kwargs: dict[str, Any] = {} if personal is None else {"personal": personal}
             if replace_handle is not None:
                 if repo_full_name is None:
                     raise WorkspacePreparationError(
@@ -1858,6 +1868,7 @@ class WorkspaceClaimCoordinator:
                     runner_resources=runner_resources,
                     caller_run=caller_run,
                     **candidate_guard,
+                    **personal_kwargs,
                 )
             else:
                 try:
@@ -1873,6 +1884,7 @@ class WorkspaceClaimCoordinator:
                         publication_visible_outcome_revision=(publication_visible_outcome_revision),
                         fresh_only=fresh_only,
                         caller_run=caller_run,
+                        **personal_kwargs,
                     )
                 except Exception as exc:
                     # The substrate signal is injected to keep this worker-local
@@ -1890,6 +1902,7 @@ class WorkspaceClaimCoordinator:
                         workspace_materialized_head=prepared.materialized_head,
                         publication_visible_outcome_revision=(publication_visible_outcome_revision),
                         caller_run=caller_run,
+                        **personal_kwargs,
                     )
             sandbox_exposed = True
             self._commit_ownership(thread_key, prepared)

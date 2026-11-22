@@ -80,8 +80,10 @@ from curie_runner.session import SessionRunner
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import RUNNER_TOKEN_ENV, FactoryWake
 from curie_worker.runner_client import RunnerClient
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
+    WorkItemConflict,
     WorkItemDispatchClient,
     WorkItemRun,
 )
@@ -131,6 +133,11 @@ from apps.worker.tests.test_workspace_recovery_storage import (
     _served_api,
     _settings_env,
 )
+
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
+
 
 RUNNER_TOKEN = "recovery-runner-token-claim"
 SUCCESSOR_TOKEN = "successor-holds-this-thread"
@@ -583,6 +590,7 @@ class _Stage:
             claim_name=claim,
             sandbox_name=f"sbx-{claim}",
             context=grant.context,
+            delivered_limits=UNOBSERVED_LIMITS,
         )
         await self.dispatch.finish(
             request_id,
@@ -591,6 +599,9 @@ class _Stage:
             cause="runner_failed",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert self.work_item_id is not None
         return _Source(self.work_item_id, request_id, started.runtime_epoch, grant.generation)
@@ -705,7 +716,11 @@ class _Stage:
             on_stop=self.h.kernel._stop_owned_work_item,
             on_stale=self.h.kernel._abandon_stale_work_item,
         )
-        await run.start(claim_name=self.handle.claim_name, sandbox_name=self.handle.sandbox_name)
+        await run.start(
+            claim_name=self.handle.claim_name,
+            sandbox_name=self.handle.sandbox_name,
+            delivered_limits=UNOBSERVED_LIMITS,
+        )
         assert run.runtime_epoch is not None
         assert run.recovery_eligible is False
         self.run = run
@@ -741,7 +756,14 @@ class _Stage:
         run = self.run
         assert run is not None
         await self.h.kernel._finish_or_settle(
-            run, outcome="failed", cause="runner_failed", detail=None, ci_fix_round=None
+            run,
+            outcome="failed",
+            cause="runner_failed",
+            detail=None,
+            ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert run.finished
         self.request_after_finish = await self.request_row(run.request_id)
@@ -1513,6 +1535,97 @@ def test_recovery_release_races(
     async def go() -> None:
         async with _stage(services, make_harness, sync_redis, tmp_path) as stage:
             await _RACES[case](stage)
+
+    asyncio.run(go())
+    _assert_valkey_clean(sync_redis, names)
+
+
+@pytest.mark.parametrize("order", ["beat_answers_first", "finish_answers_first"])
+def test_a_beat_crossing_the_failed_finish_still_captures(
+    services: _Services,
+    make_harness: Any,
+    names: dict[str, str],
+    sync_redis: redis.Redis,
+    tmp_path: Path,
+    order: str,
+) -> None:
+    """A heartbeat refused ``stale_owner`` by this run's own failed finish (#5840).
+
+    The served API refuses a heartbeat for a row that is no longer running, so
+    a beat in flight when the failed finish commits comes back ``stale_owner``.
+    Before #5840 the heartbeat loop then abandoned the run and the release skipped
+    its capture; for a personal request the teardown wake that follows the
+    finish then deleted the workspace. The beat's answer is driven both before
+    and after the finish's, through the real heartbeat loop and the real routes.
+    The only seams are two pass-throughs on the dispatch client that order the
+    two calls, and a short heartbeat interval in place of the granted 15 s.
+    """
+
+    async def go() -> None:
+        async with _stage(services, make_harness, sync_redis, tmp_path) as stage:
+            run = await stage.start_run()
+            await stage.fail_turn()
+
+            committed = asyncio.Event()
+            beat_answered = asyncio.Event()
+            finish_returned = asyncio.Event()
+            beat_sent = asyncio.Event()
+            beats: list[str] = []
+            real_beat = stage.dispatch.heartbeat
+            real_finish = stage.dispatch.finish
+
+            async def beat(request_id: uuid.UUID, *, runtime_epoch: int) -> Any:
+                beats.append("sent")
+                beat_sent.set()
+                await (finish_returned if order == "finish_answers_first" else committed).wait()
+                try:
+                    return await real_beat(request_id, runtime_epoch=runtime_epoch)
+                except WorkItemConflict as exc:
+                    beats.append(exc.code)
+                    raise
+                finally:
+                    beat_answered.set()
+
+            async def finish(request_id: uuid.UUID, **kwargs: Any) -> None:
+                await real_finish(request_id, **kwargs)
+                committed.set()
+                if order == "beat_answers_first":
+                    await beat_answered.wait()
+                    # The heartbeat task acts on its answer before this one lands.
+                    for _ in range(50):
+                        await asyncio.sleep(0)
+
+            stage.dispatch.heartbeat = beat  # type: ignore[method-assign]
+            stage.dispatch.finish = finish  # type: ignore[method-assign]
+            granted = run._heartbeat_task
+            assert granted is not None
+            granted.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await granted
+            loop = asyncio.create_task(run._heartbeat_loop(0.01))
+            run._heartbeat_task = loop
+            await asyncio.wait_for(beat_sent.wait(), 10)
+
+            await stage.finish_failed()
+            finish_returned.set()
+            await asyncio.wait_for(asyncio.shield(loop), 10)
+            assert beats == ["sent", "stale_owner"]
+            assert run.abandoned is False
+            assert run.recovery_eligible is True
+
+            await stage.release()
+            _assert_release_bounded(stage)
+            assert stage.observer is not None
+            assert [(c.claim_name, c.released) for c in stage.observer.calls] == [
+                (stage.handle.claim_name, True)
+            ]
+            at_release = stage.observer.calls[0].at_call
+            checkpoint_id = at_release["last_good"]
+            assert checkpoint_id is not None
+            assert at_release["checkpoints"][checkpoint_id] == ("complete", run.request_id)
+            assert len(stage.checkpoint_calls) == 1
+            await stage.assert_request_unchanged()
+            _assert_released(stage)
 
     asyncio.run(go())
     _assert_valkey_clean(sync_redis, names)

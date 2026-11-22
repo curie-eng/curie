@@ -26,6 +26,38 @@ def test_existing_http_transport_preserves_the_shared_wire(body: dict[str, Any])
     _round_trip(_EVENTS.validate_python(body))
 
 
+def test_wire_13_http_transport_posts_replace_and_audience_unchanged() -> None:
+    target = _CASES[0]["body"]["target"]
+    message = {
+        "version": "1.0",
+        "text": "replacement body",
+        "header": "Replacement heading",
+    }
+    _round_trip(
+        _EVENTS.validate_python(
+            {
+                "version": "1.3",
+                "event": "reply.update",
+                "target": target,
+                "message": message,
+                "message_mode": "replace",
+            }
+        )
+    )
+    _round_trip(
+        _EVENTS.validate_python(
+            {
+                "version": "1.3",
+                "event": "reply.post",
+                "target": {**target, "reply_ref": None},
+                "message": {"version": "1.0", "text": "only you can see this"},
+                "requested_by": "U0EXAMPLE1",
+                "audience_user": "U0EXAMPLE1",
+            }
+        )
+    )
+
+
 def test_existing_http_transport_preserves_verbatim_text() -> None:
     _round_trip(
         ReplyUpdate(

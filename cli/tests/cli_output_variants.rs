@@ -10,9 +10,8 @@
 //! This file closes that by discovering the population instead of naming it, in
 //! the shape `support/schema_inventory.rs` already uses:
 //!
-//! 1. `schema_inventory::cli_output_impls` finds every `impl CliOutput for T` in
-//!    `cli/src`.
-//! 2. `enum_variants::variant_names` reports T's variants; a T with none is a
+//! 1. A source walk finds every `impl CliOutput for T` in `cli/src`.
+//! 2. `enum_variants::variant_names_in_file` reports T's variants; a T with none is a
 //!    struct, not an enum, and is out of scope here (its single `to_json()` is
 //!    covered by the per-result tests in `json_contract.rs`).
 //! 3. `SAMPLES` below carries one constructed instance per variant. The two
@@ -33,17 +32,21 @@
 //! `Deserialize` impls rather than by exposing fields.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use curie::api::{
-    AgentAccessPolicy, ApprovalRecord, ChannelBinding, HookFireRecord, HookWakeRotation,
-    HookWakeSecret, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, ScheduleList, Version,
+    AgentAccessPolicy, ApprovalRecord, ChannelBinding, CodingInstructionsApplication,
+    CodingInstructionsStatus, EnrollmentState, HookFireRecord, HookWakeRotation, HookWakeSecret,
+    MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, PersonalEnrollmentStatus,
+    PersonalEnrollmentTeardown, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
-    ChannelsOutput, DeleteOutput, DirectoryOutput, HookFireOutput, HookOutput, KillOutput,
-    MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput,
-    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WakeKeyOutput,
+    ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, FactoryProgressOutput,
+    HookFireOutput, HookOutput, KillOutput, MemoryChannel, MemoryOutput, MemoryRulesOutput,
+    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
+    SkillApprovalsOutput, SubscriptionOutput, SubscriptionVerb, VersionsOutput, WakeKeyOutput,
     WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
@@ -62,9 +65,9 @@ use curie::ops::{
     ClusterUpgradeOutput,
 };
 use curie::ui::{CliOutput, DryRunPlan};
+use syn::visit::Visit;
 
 use crate::support::enum_variants;
-use crate::support::schema_inventory;
 
 // ---------------------------------------------------------------------------
 // Discovery: the expectation side, derived from the source AST.
@@ -103,25 +106,62 @@ fn collect_rs_paths(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// Every `impl CliOutput for T` where T is declared as an `enum`, mapped to its
 /// variant names. Purely syntactic, so it cannot drift from the source.
 fn discovered_enums() -> BTreeMap<String, BTreeSet<String>> {
-    let srcs = cli_srcs();
-    let borrowed: Vec<(&str, &str)> = srcs.iter().map(|(n, s)| (n.as_str(), s.as_str())).collect();
-    let impls = schema_inventory::cli_output_impls(&borrowed);
+    static DISCOVERED: OnceLock<BTreeMap<String, BTreeSet<String>>> = OnceLock::new();
+    DISCOVERED.get_or_init(discover_enums).clone()
+}
+
+#[derive(Default)]
+struct OutputDeclarations {
+    impls: BTreeSet<String>,
+    enums: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for OutputDeclarations {
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if node
+            .trait_
+            .as_ref()
+            .and_then(|(path, _)| path.segments.last())
+            .is_some_and(|segment| segment.ident == "CliOutput")
+        {
+            if let syn::Type::Path(path) = node.self_ty.as_ref() {
+                if let Some(segment) = path.path.segments.last() {
+                    self.impls.insert(segment.ident.to_string());
+                }
+            }
+        }
+        syn::visit::visit_item_impl(self, node);
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        self.enums.insert(node.ident.to_string());
+        syn::visit::visit_item_enum(self, node);
+    }
+}
+
+fn discover_enums() -> BTreeMap<String, BTreeSet<String>> {
+    let mut parsed = Vec::new();
+    let mut impls = BTreeSet::new();
+    for (name, src) in cli_srcs() {
+        let file = syn::parse_file(&src).unwrap_or_else(|error| {
+            panic!("cannot enumerate CliOutput variants in {name}: {error}")
+        });
+        let mut declarations = OutputDeclarations::default();
+        declarations.visit_file(&file);
+        impls.extend(declarations.impls);
+        parsed.push((file, declarations.enums));
+    }
     assert!(
         !impls.is_empty(),
         "no `impl CliOutput for T` found in cli/src: discovery is broken, so every \
          assertion below would pass vacuously"
     );
 
-    let mut found = BTreeMap::new();
-    for name in impls {
-        // An impl target with no `enum <name>` declaration is a struct; the
-        // per-variant question does not apply to it.
-        let mut variants = BTreeSet::new();
-        for (_, src) in &srcs {
-            variants.extend(enum_variants::variant_names(src, &name));
-        }
-        if !variants.is_empty() {
-            found.insert(name, variants);
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (file, enums) in parsed {
+        for name in enums.intersection(&impls) {
+            let variants = enum_variants::variant_names_in_file(&file, name);
+            found.entry(name.clone()).or_default().extend(variants);
         }
     }
     assert!(
@@ -152,6 +192,18 @@ macro_rules! samples {
 fn plan() -> DryRunPlan {
     DryRunPlan {
         lines: vec!["a planned step".to_string()],
+    }
+}
+
+fn personal_enrollment(state: EnrollmentState, version: Option<i64>) -> PersonalEnrollmentStatus {
+    PersonalEnrollmentStatus {
+        state,
+        generation: version,
+        version,
+        teardown: PersonalEnrollmentTeardown {
+            pending_runtimes: 1,
+            pending_custody_cleanup: 0,
+        },
     }
 }
 
@@ -220,6 +272,14 @@ fn work_item_outcome() -> Box<curie::api::WorkItemOutcome> {
             "publication": {"status": "published", "revision_number": 1, "approval_status": "approved"},
             "correctness": {"asserted": false, "owner": "bundle"},
             "ci": {"state": "passing", "reason": null, "head_sha": "abc1234", "observed_at": "2026-01-01T00:04:00Z"},
+            "ci_observation": {
+                "status": "observing",
+                "head_sha": "abc1234",
+                "reason": null,
+                "created_at": "2026-01-01T00:03:00Z",
+                "expires_at": "2026-01-02T00:03:00Z",
+                "observed_at": null
+            },
             "requests": [
                 {
                     "tenant_id": "55555555-5555-4555-8555-555555555555",
@@ -348,6 +408,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         upgrade: curie::ops::UpgradeStatusView::idle(None),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials: Vec::new(),
+        factory_model_auth_mode: None,
     })
 }
 
@@ -392,6 +453,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 execution_deadline_seconds: Some(90),
                 runner_resources: None,
                 memory_writes: true,
+                memory_rule_proposals: true,
                 changed: true,
             },
         ],
@@ -406,6 +468,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                changed: false,
+            },
+        ],
+    );
+    m.insert(
+        "FactoryProgressOutput",
+        samples![
+            "DryRun" => FactoryProgressOutput::DryRun(plan()),
+            "Done" => FactoryProgressOutput::Done {
+                agent: "acme-bot".to_string(),
+                factory_slack_channel: Some("C0EXAMPLE1".to_string()),
                 changed: false,
             },
         ],
@@ -560,6 +633,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "MemoryRulesOutput",
+        samples![
+            "DryRun" => MemoryRulesOutput::DryRun(plan()),
+            "Rules" => MemoryRulesOutput::Rules(
+                curie::api::parse_memory_rules(memory_rules_vector("list"))
+                    .expect("the recorded rule list parses"),
+            ),
+            "Changed" => MemoryRulesOutput::Changed {
+                verb: curie::commands::MemoryRuleVerb::Accept,
+                change: Box::new(
+                    curie::api::parse_memory_rule_change(memory_rules_vector("accept_binding"))
+                        .expect("the recorded binding accept parses"),
+                ),
+            },
+        ],
+    );
+    m.insert(
         "ApprovalsOutput",
         samples![
             "DryRun" => ApprovalsOutput::DryRun(plan()),
@@ -691,6 +781,44 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 hook: "queue-ready".to_string(),
                 generation: 2,
             }),
+        ],
+    );
+    m.insert(
+        "CodingInstructionsOutput",
+        samples![
+            "DryRun" => CodingInstructionsOutput::DryRun(plan()),
+            "Document" => CodingInstructionsOutput::Document(CodingInstructionsStatus {
+                revision: 1,
+                sha256: Some("a".repeat(64)),
+                format_version: 1,
+                byte_length: 4,
+                text: Some("text".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                tenant_enabled: true,
+                application: CodingInstructionsApplication::Available,
+            }),
+            "Document" => CodingInstructionsOutput::Document(CodingInstructionsStatus {
+                revision: 0,
+                sha256: None,
+                format_version: 1,
+                byte_length: 0,
+                text: None,
+                updated_at: None,
+                tenant_enabled: false,
+                application: CodingInstructionsApplication::Unavailable,
+            }),
+        ],
+    );
+    m.insert(
+        "SubscriptionOutput",
+        samples![
+            "DryRun" => SubscriptionOutput::DryRun(plan()),
+            "Status" => SubscriptionOutput::Status(personal_enrollment(EnrollmentState::Absent, None)),
+            "Changed" => SubscriptionOutput::Changed {
+                action: SubscriptionVerb::Replace,
+                previous_version: Some(3),
+                enrollment: personal_enrollment(EnrollmentState::Active, Some(4)),
+            },
         ],
     );
     m.insert(
@@ -860,6 +988,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "DryRun" => FactoryIntakeOutput::DryRun(plan()),
             "Done" => FactoryIntakeOutput::Done { enabled: true },
             "RepositoriesUpdated" => FactoryIntakeOutput::RepositoriesUpdated { enabled: false, repos: vec!["acme/bot".into()] },
+            "ModelAuthModeSet" => FactoryIntakeOutput::ModelAuthModeSet { mode: "personal".into() },
         ],
     );
     m.insert(
@@ -1078,6 +1207,37 @@ fn every_cli_output_enum_has_samples() {
 }
 
 #[test]
+fn coding_instructions_schema_reports_both_application_states() {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/coding-instructions.schema.json"))
+            .expect("coding instructions schema parses");
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let registry = registry();
+    let samples = registry
+        .get("CodingInstructionsOutput")
+        .expect("coding instructions samples");
+    for (variant, value) in samples {
+        assert!(validator.is_valid(value), "{variant}: {value}");
+        if value.get("dry_run").is_some() {
+            assert!(value.get("application").is_none(), "{value}");
+            continue;
+        }
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("application");
+        assert!(!validator.is_valid(&missing), "{variant}: {missing}");
+        let mut other = value.clone();
+        other["application"] = serde_json::json!("not-a-state");
+        assert!(!validator.is_valid(&other), "{variant}: {other}");
+    }
+    let states: Vec<_> = samples
+        .iter()
+        .filter_map(|(_, value)| value.get("application").and_then(|item| item.as_str()))
+        .collect();
+    assert!(states.contains(&"available"), "{states:?}");
+    assert!(states.contains(&"unavailable"), "{states:?}");
+}
+
+#[test]
 fn every_variant_of_every_cli_output_enum_has_a_sample() {
     let discovered = discovered_enums();
     let registry = registry();
@@ -1189,4 +1349,13 @@ fn every_variant_sample_validates_against_its_mapped_schema() {
         "only {checked} variant samples validated; the registry has shrunk unexpectedly \
          and the gate would pass vacuously"
     );
+}
+
+/// One recorded API response from `tests/vectors/memory-rules-responses.json`.
+fn memory_rules_vector(key: &str) -> serde_json::Value {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/memory-rules-responses.json"
+    ))
+    .expect("the memory rules vector is JSON");
+    vector[key].clone()
 }

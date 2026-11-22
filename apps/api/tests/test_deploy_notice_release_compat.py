@@ -60,8 +60,30 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # Approval ORM reads require the 0153 dynamic approval selection columns,
     # and dynamic approval answers require the 0156 answer gate. The factory
     # Slack progress loop reads the 0157 tables, and the code host link route
-    # writes the github_host kind 0158 allows. Owner tuple reads require 0159.
-    candidate = {"schema_min": "0159", "schema_head": "0159"}
+    # writes the github_host kind 0158 allows. Owner tuple reads require 0159,
+    # personal custody reads and enrollment fences require 0160, factory CI
+    # observations require the 0163 table, cached facts and request
+    # delivery require the 0164 tables, and Slack kickoff thread origin
+    # reads require 0166.
+    # Owner coding profiles and tenant policies require 0165, which stays below
+    # this floor. Intake notice storage requires 0168, which stays below this floor.
+    # Requester selection columns require 0169, which stays below this floor.
+    # Refusal posts require 0170, which stays below this floor.
+    # Factory retry allowance columns require 0172, which stays below this floor.
+    # Factory resource gate columns require 0174, which stays below this floor.
+    # Publication recovery requests require 0175, which stays below this floor.
+    # Operator retry records require 0176.
+    # Enrollment inactive intake notices require 0177.
+    # The factory Slack progress card requires 0178.
+    # GitHub account link states and display labels require 0179.
+    # Slack account display labels require 0180.
+    # Guarded automatic retry dispatch times require 0182.
+    # Grant notices require 0183.
+    # Factory question rounds require 0184.
+    # Learned memory rules require 0185.
+    # The plain feedback cap requires 0186.
+    # The triage schema removal, a contract revision, requires 0188, the floor.
+    candidate = {"schema_min": "0188", "schema_head": "0188"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -69,7 +91,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-41:] == [
+    assert catalog["revisions"][-67:] == [
         "0095",
         "0096",
         "0097",
@@ -111,6 +133,32 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0157",
         "0158",
         "0159",
+        "0160",
+        "0162",
+        "0163",
+        "0164",
+        "0165",
+        "0166",
+        "0167",
+        "0168",
+        "0169",
+        "0170",
+        "0171",
+        "0172",
+        "0173",
+        "0174",
+        "0175",
+        "0176",
+        "0177",
+        "0178",
+        "0179",
+        "0180",
+        "0182",
+        "0183",
+        "0184",
+        "0185",
+        "0186",
+        "0188",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

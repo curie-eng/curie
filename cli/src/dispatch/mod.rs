@@ -22,6 +22,7 @@ use crate::args::*;
 
 mod cluster_action;
 mod cluster_target;
+mod coding_instructions;
 mod dev_action;
 mod local_action;
 mod skill_action;
@@ -680,6 +681,9 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Skill { action }) => skill_action::run(action).await,
         Some(Command::Local { action }) => local_action::run(action).await,
         Some(Command::Factory { action }) => match action {
+            FactoryAction::Explain { reference, api_url } => {
+                emit(commands::explain(reference, api_url).await?)
+            }
             FactoryAction::Skills {
                 action:
                     AgentSkillsAction::Install {

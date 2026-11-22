@@ -3,7 +3,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { StoreProvider } from "./store";
-import { ConsoleSessionGate, useConsoleSession } from "./session";
+import { ConsoleSessionGate, useConsoleSession, useConsoleSignOut } from "./session";
 import { getAgents } from "../api/client";
 
 // The gate is exercised through the real client over a stubbed `fetch`, so the
@@ -285,5 +285,86 @@ describe("ConsoleSessionGate: a 401 mid-session (#1047)", () => {
 
     await expect(getAgents()).rejects.toMatchObject({ status: 401 });
     expect(sessionProbes()).toBe(1);
+  });
+});
+
+const PRINCIPAL_ID = "11111111-1111-1111-1111-111111111111";
+const principalSession = () =>
+  json(200, {
+    subject: `principal:${PRINCIPAL_ID}`,
+    expires_at: EXPIRES_AT,
+    kind: "principal",
+    principal: {
+      id: PRINCIPAL_ID,
+      display_name: "Alice Example",
+      email: "alice@example.com",
+    },
+  });
+
+function PrincipalProbe() {
+  const session = useConsoleSession();
+  const signOut = useConsoleSignOut();
+  return (
+    <div data-testid="console-child">
+      <span data-testid="whoami">{session.subject}</span>
+      <button type="button" onClick={() => void signOut?.()}>
+        Sign out
+      </button>
+    </div>
+  );
+}
+
+describe("ConsoleSessionGate: principal session", () => {
+  it("renders the console for a principal session", async () => {
+    routes["GET /api/console/session"] = principalSession;
+    render(
+      <StoreProvider>
+        <ConsoleSessionGate>
+          <PrincipalProbe />
+        </ConsoleSessionGate>
+      </StoreProvider>,
+    );
+    expect(await screen.findByTestId("whoami")).toHaveTextContent(`principal:${PRINCIPAL_ID}`);
+    expect(screen.queryByTestId("console-login")).not.toBeInTheDocument();
+  });
+
+  it("uses the principal expiry sentence after a mid-session 401", async () => {
+    routes["GET /api/console/session"] = principalSession;
+    render(
+      <StoreProvider>
+        <ConsoleSessionGate>
+          <Console />
+        </ConsoleSessionGate>
+      </StoreProvider>,
+    );
+    expect(await screen.findByTestId("whoami")).toBeInTheDocument();
+    routes["GET /api/agents"] = () => json(401, { detail: "missing or invalid API key" });
+    routes["GET /api/console/session"] = () => json(401, SESSION_401);
+
+    await userEvent.click(screen.getByRole("button", { name: "load agents" }));
+
+    expect(await screen.findByTestId("console-login-notice")).toHaveTextContent("Your session expired. Sign in again.");
+    expect(screen.getByTestId("console-login-notice")).not.toHaveTextContent("Mint a new login code");
+  });
+
+  it("sign-out returns to the login screen only after a 204", async () => {
+    routes["GET /api/console/session"] = principalSession;
+    routes["POST /api/console/logout"] = () => json(500, { detail: "boom" });
+    render(
+      <StoreProvider>
+        <ConsoleSessionGate>
+          <PrincipalProbe />
+        </ConsoleSessionGate>
+      </StoreProvider>,
+    );
+    expect(await screen.findByTestId("whoami")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => u === "/api/console/logout")).toBe(true));
+    expect(screen.getByTestId("whoami")).toBeInTheDocument();
+
+    routes["POST /api/console/logout"] = () => new Response(null, { status: 204 });
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByTestId("console-login")).toBeInTheDocument();
+    expect(screen.queryByTestId("console-login-notice")).not.toBeInTheDocument();
   });
 });

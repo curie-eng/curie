@@ -125,10 +125,16 @@ its unpublished factory runner image.
 ## Create the repository
 
 In the GitHub website, create a repository with one commit (an initial README
-is enough). On GitHub Free, use a public trial repository with no sensitive
-content. GitHub's branch-rules API returns 403 for private repositories on
-that plan, which prevents the factory from verifying the final CI result. A
-private trial needs a plan that supports private repository rulesets. Install
+is enough). A public repository is the simplest trial and should hold no
+sensitive content. A private repository on GitHub Free is also fine when a
+successful repository read returns `private: true`. GitHub
+answers the branch-rules read with its plan-upgrade message, and the factory
+treats that one refusal as no rules from the rules API. It still reads classic
+branch protection and the checks on the pull request head. If that read fails,
+or `private` is not boolean true, the request stays unverified and the status
+comment quotes GitHub. Any other 403,
+including that same message on a public repository, still stops CI
+verification, and the status comment quotes GitHub's message. Install
 the GitHub App on the repository as shown in
 [Rerun with the App](#rerun-with-the-app). The factory branches from the
 default branch, so the repository needs that commit. It does not need CI. Note
@@ -775,8 +781,8 @@ Before changing the cluster, quickstart:
 ### Labels
 
 Quickstart creates the trigger label `curie-factory` and the state labels
-`curie-factory:queued`, `curie-factory:running`, `curie-factory:pr-open` and
-`curie-factory:needs-human` on the project, and leaves any that already exist.
+`curie-factory:queued`, `curie-factory:running`, `curie-factory:pr-open`
+and `curie-factory:needs-human` on the project, and leaves any that already exist.
 These are plain labels. GitLab scoped labels are not used.
 
 ### Surface
@@ -994,10 +1000,10 @@ State labels Curie manages, one at a time:
 |---|---|
 | `curie-factory:queued` | Admitted, waiting for a sandbox |
 | `curie-factory:running` | Running or stopping |
-| `curie-factory:pr-open` | Finished with a pull request |
+| `curie-factory:pr-open` | Finished with a pull request; removed when that pull request merges (it stays if the pull request closes without merging) |
 | `curie-factory:needs-human` | Failed or expired; the status comment says why |
 
-A cancelled run removes all four. Curie never changes your `curie-factory` label.
+A cancelled run removes every state label. When the pull request merges, the label is removed and the status comment ends with `Pull request merged: <url>`. The factory itself sends no status transition on any tracker, so Jira and GitLab status stays with your own automation; a closing keyword in the pull request (`Closes #<id>`) is the code host's own automation and may still close the issue. Curie never changes your `curie-factory` label.
 
 ## Local kind capacity and recovery
 
@@ -1106,7 +1112,7 @@ then bind the agent with
 | Pending work pod reports `Insufficient memory` | Its resource request exceeds the node's remaining allocatable memory | Follow [local kind capacity and recovery](#local-kind-capacity-and-recovery); waiting alone will not schedule it |
 | Status comment ends with `Could not complete:` | The run stopped. The comment's cause lines say why | Fix the cause, then relabel |
 | CI wait ends `github_forbidden_get_*` after opening a PR | A GitHub CI read returned 403; the reason names the read that was refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_status`, `github_forbidden_get_branch_rules` or `github_forbidden_get_branch`) | Check the installed App's effective permissions and the PR checks. The reason does not claim which grant is missing, and a bare `github_forbidden` names no read; do not assume a missing grant or call the run complete, and record the refusal for [#5222](https://github.com/curie-eng/curie/issues/5222) |
-| CI wait ends `github_forbidden_get_branch_rules` (or bare `github_forbidden` on an older release) on a private GitHub Free repository | GitHub does not provide private repository rulesets on that plan, so its branch-rules read returns 403 even with Metadata: read | Use a public disposable repository without sensitive content, or a private repository on a plan that supports private rulesets. Relabel only after the repository can be read. |
+| CI wait ends `github_forbidden_get_branch_rules` and the comment quotes GitHub | The branch-rules read returned 403, and the empty-list fallback did not apply. That fallback requires a successful repository metadata read that returns `private: true`, together with GitHub's plan-upgrade message. A failed metadata read, a `private` value other than boolean true, that message on a public repository, and any other message stay on this path | Read the quoted GitHub message. The request stays `ci_unverified` and the comment quotes GitHub. |
 | `Could not resolve host: github.com` on kind | CoreDNS replica race | Rerun. The command scales CoreDNS to one replica |
 | Nothing happens after the label | The labelling user lacks write access, the label name differs, or the agent has no `github=<owner>/<name>` surface | Fix that and relabel. Polling notices the label on its interval |
 | Installation reports a pre-existing agent-sandbox controller | Another release owns it, or an unowned controller is already installed | Curie reuses a controller owned by another Helm release, or a healthy unowned controller with the matching chart image, by inferring `agentSandbox.controller.deploy=false`. An unhealthy or different unowned controller stops setup with a specific repair command. Have its owner make that repair, then rerun; release status cannot repair it. See [controller inference](../operations.md#curie-cluster-up) |

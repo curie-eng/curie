@@ -5,6 +5,14 @@ from typing import Literal, Protocol
 
 from channel_protocol import ChannelCapability
 
+from ..read_models import AccountProfile
+
+
+class AccountProfiles(Protocol):
+    async def profile_of(
+        self, *, identity: str, user_id: str, workspace: str
+    ) -> AccountProfile: ...
+
 
 class IdentitySelection[Route](Protocol):
     """Select a configured credential from authorized binding routes only."""
@@ -27,6 +35,17 @@ class FileSource(Protocol):
 class SenderIdentities(Protocol):
     async def identity_of(self, author: str) -> str | None:
         """None means unresolved; preserve the current nonblocking lookup."""
+        ...
+
+
+class UserEmailSource(Protocol):
+    async def email_of(self, *, identity: str, user_id: str, workspace: str) -> str:
+        """The user's email, read fresh with the named identity's credential.
+
+        Raises ``UserEmailUnknown`` when the provider has no usable email for
+        that user in that workspace and ``UserEmailLookupError`` on any other
+        failure; never returns an empty or default value.
+        """
         ...
 
 

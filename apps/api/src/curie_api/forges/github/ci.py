@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import threading
@@ -110,7 +111,7 @@ def _verdict(payload: Any) -> str:
     runs = payload.get("check_runs")
     if not isinstance(total, int) or isinstance(total, bool) or not isinstance(runs, list):
         return "malformed_response"
-    if total > CHECK_RUNS_PAGE or total > len(runs):
+    if total > len(runs):
         return "too_many_check_runs"
     if not runs:
         return "none"
@@ -438,7 +439,7 @@ async def read_ci_detail(
         except ValueError:
             return _detail_unavailable("github_error", head_sha)
 
-        async def get(
+        async def get_page(
             path: str, params: dict[str, Any], *, operation: str | None = None
         ) -> tuple[Any, str | None]:
             try:
@@ -474,9 +475,58 @@ async def read_ci_detail(
             except ValueError:
                 return None, "malformed_response"
 
+        async def get(
+            path: str, params: dict[str, Any], *, operation: str | None = None
+        ) -> tuple[Any, str | None]:
+            field = (
+                "check_runs"
+                if path.endswith("/check-runs")
+                else "statuses"
+                if path.endswith("/status")
+                else None
+            )
+            if field is None:
+                return await get_page(path, params, operation=operation)
+            rows: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            total: int | None = None
+            for page in range(1, 101):
+                payload, reason = await get_page(
+                    path, {**params, "page": page}, operation=operation
+                )
+                if reason is not None:
+                    return None, reason
+                if not isinstance(payload, dict):
+                    return None, "malformed_response"
+                count, batch = payload.get("total_count"), payload.get(field)
+                if (
+                    type(count) is not int
+                    or count < 0
+                    or not isinstance(batch, list)
+                    or not all(isinstance(row, dict) for row in batch)
+                ):
+                    return None, "malformed_response"
+                if total is not None and count != total:
+                    return None, "listing_incomplete"
+                total = count
+                for row in batch:
+                    identity = json.dumps(
+                        ("id", row["id"]) if type(row.get("id")) is int else row,
+                        sort_keys=True,
+                    )
+                    if page > 1 and identity in seen:
+                        return None, "too_many_check_runs"
+                    seen.add(identity)
+                rows.extend(batch)
+                if len(rows) == total:
+                    return {**payload, field: rows}, None
+                if not batch or len(rows) > total or len(batch) < CHECK_RUNS_PAGE:
+                    return None, "too_many_check_runs"
+            return None, "too_many_check_runs"
+
         runs_payload, reason = await get(
             f"/commits/{head_sha}/check-runs",
-            {"per_page": CHECK_RUNS_PAGE, "filter": "latest"},
+            {"per_page": CHECK_RUNS_PAGE, "filter": "all"},
             operation="list_check_runs",
         )
         if reason is None:

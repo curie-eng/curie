@@ -220,7 +220,27 @@ as a whole; remembered only):
   No approval creation or proxy wiring is implied by this pure contract.
   [vector: `tests/vectors/approver-ticket.json`]
   [vector: `tests/vectors/action-canonical-arguments.json`]
-31. runner vs API progress round caps (#5203) -- the runner's `report_progress`
+31. API vs worker factory Slack outcome codes (#5380) -- the API's outcome
+  literals for Slack kickoff and steering (`FactorySlackKickoffOutcome` and
+  `FactorySlackSteerOutcome` in `apps/api/src/curie_api/schemas/workitems.py`)
+  and the worker's in-thread reply headlines for them (`_KICKOFF_HEADLINES` and
+  `_HEADLINES` in `apps/worker/src/curie_worker/factory_steering.py`) ship in
+  different images, so an outcome added on the API side without a headline
+  would reach the thread as a bare code. The worker test reads the API literals
+  and requires a headline for each.
+  [gate: `apps/worker/tests/test_factory_steering.py::test_every_api_outcome_has_a_worker_headline`]
+32. dispatcher vs worker vs API mention receipt (#5380) -- the dispatcher writes
+  the Slack mention receipt
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py`), the
+  worker reads it to decide whether a turn is a steering or kickoff candidate
+  (`apps/worker/src/curie_worker/factory_steering.py`), and the API checks it
+  against the delivery and reads the issue link from its body
+  (`apps/api/src/curie_api/factory_slack.py`,
+  `apps/api/src/curie_api/factory_slack_kickoff.py`). All three use one receipt
+  codec and key and one issue-link parser, so they cannot disagree about which
+  message, sender or issue a receipt names.
+  [by construction: `curie_internal.slack_mention_receipt` and `curie_internal.issue_links`]
+33. runner vs API progress round caps (#5203) -- the runner's `report_progress`
   tool (`runner/src/curie_runner/progress.py::build_progress_tool`) and the API's
   `ProgressReport` validation (`apps/api/src/curie_api/factory_progress.py::Declaration.round_cap_for`)
   ship in different images and bound a reported round independently, so when two

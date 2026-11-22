@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import subprocess
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 from curie_worker.run import _substrate_config
+from curie_worker.sandbox.quota import admission_quota_headroom, resource_vector
+from curie_worker.sandbox.resources import pod_resources
+from curie_worker.sandbox.types import AdmissionConfig, QuotaStatus
 
 CHART = Path(__file__).resolve().parents[1]
 ENV = "CURIE_SANDBOX_ADMISSION"
@@ -150,6 +154,53 @@ def bound_worker_roles(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         assert len(referenced) == 1, "worker RoleBinding must resolve to one rendered role"
         roles.extend(referenced)
     return roles
+
+
+def assert_worker_cluster_reads(
+    docs: list[dict[str, Any]], *, runtime_class: str | None = None
+) -> None:
+    worker = next(
+        doc
+        for doc in docs
+        if doc.get("kind") == "Deployment"
+        and doc["metadata"]["labels"].get("app.kubernetes.io/component") == "worker"
+    )
+    account = worker["spec"]["template"]["spec"]["serviceAccountName"]
+    roles = []
+    for binding in docs:
+        if binding.get("kind") != "ClusterRoleBinding" or not any(
+            subject.get("kind") == "ServiceAccount" and subject.get("name") == account
+            for subject in binding.get("subjects", [])
+        ):
+            continue
+        assert binding["subjects"] == [
+            {"kind": "ServiceAccount", "name": account, "namespace": "acme-admission"}
+        ]
+        reference = binding["roleRef"]
+        assert reference["kind"] == "ClusterRole"
+        assert reference["apiGroup"] == "rbac.authorization.k8s.io"
+        referenced = [
+            doc
+            for doc in docs
+            if doc.get("kind") == "ClusterRole" and doc["metadata"]["name"] == reference["name"]
+        ]
+        assert len(referenced) == 1, "worker cluster binding must resolve to one role"
+        roles.append(referenced[0]["rules"])
+    expected = []
+    if runtime_class is not None:
+        expected.append(
+            [
+                {
+                    "apiGroups": ["node.k8s.io"],
+                    "resources": ["runtimeclasses"],
+                    "resourceNames": [runtime_class],
+                    "verbs": ["get"],
+                }
+            ]
+        )
+    assert sorted(json.dumps(rules, sort_keys=True) for rules in roles) == sorted(
+        json.dumps(rules, sort_keys=True) for rules in expected
+    ), "worker cluster reads must match only the selected RuntimeClass grant"
 
 
 @pytest.mark.parametrize(
@@ -336,13 +387,7 @@ def test_worker_admission_adds_only_namespaced_inventory_reads(tmp_path: Path) -
         ("", "pods"): {"get", "list"},
         ("agents.x-k8s.io", "sandboxes"): {"get", "patch", "list"},
     }
-    assert not any(
-        doc.get("kind") == "ClusterRoleBinding"
-        and any(
-            subject.get("name") == "acme-admission-worker" for subject in doc.get("subjects", [])
-        )
-        for doc in docs
-    )
+    assert_worker_cluster_reads(docs)
 
 
 @pytest.mark.parametrize(
@@ -380,13 +425,7 @@ def test_disabled_admission_omits_inventory_grants(
     ]:
         assert permissions[("", "pods")] == {"get"}
         assert permissions[("agents.x-k8s.io", "sandboxes")] == {"get", "patch"}
-    assert not any(
-        doc.get("kind") == "ClusterRoleBinding"
-        and any(
-            subject.get("name") == "acme-admission-worker" for subject in doc.get("subjects", [])
-        )
-        for doc in docs
-    )
+    assert_worker_cluster_reads(docs)
 
 
 def test_worker_reads_only_the_selected_runtime_class(tmp_path: Path) -> None:
@@ -399,43 +438,126 @@ def test_worker_reads_only_the_selected_runtime_class(tmp_path: Path) -> None:
             }
         },
     )
-    worker = next(
-        doc
-        for doc in docs
-        if doc.get("kind") == "Deployment"
-        and doc["metadata"]["labels"].get("app.kubernetes.io/component") == "worker"
+    assert_worker_cluster_reads(docs, runtime_class="acme-runtime")
+
+
+def _default_templates(tmp_path: Path) -> list[dict[str, Any]]:
+    """Chart defaults, plus one agent opted into the factory profile.
+
+    The opt-in does not change resourceQuota.hard. It only renders a second
+    SandboxTemplate so the test can read both envelopes.
+    """
+
+    completed = subprocess.run(
+        [
+            "helm",
+            "template",
+            "curie",
+            str(CHART),
+            "--namespace",
+            "curie",
+            "--kube-version",
+            "1.31.0",
+            "--output-dir",
+            str(tmp_path),
+            "--set",
+            "agentSandbox.agentResourceProfiles.acme-factory=factory",
+            "--set",
+            "resourceQuota.capacityReport=false",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
     )
-    account = worker["spec"]["template"]["spec"]["serviceAccountName"]
-    bindings = [
+    assert completed.returncode == 0, completed.stderr
+    return [
         doc
-        for doc in docs
-        if doc.get("kind") == "ClusterRoleBinding"
-        and any(
-            subject.get("kind") == "ServiceAccount" and subject.get("name") == account
-            for subject in doc.get("subjects", [])
+        for path in sorted(tmp_path.rglob("*.yaml"))
+        for doc in yaml.safe_load_all(path.read_text())
+        if isinstance(doc, dict)
+    ]
+
+
+def _sandbox_pod(docs: list[dict[str, Any]], agent: str | None) -> dict[str, Any]:
+    matched: list[dict[str, Any]] = []
+    for doc in docs:
+        if doc.get("kind") != "SandboxTemplate":
+            continue
+        labels = doc["spec"]["podTemplate"]["metadata"].get("labels") or {}
+        found = labels.get("curietech.ai/agent")
+        if (agent is None and found is None) or found == agent:
+            matched.append(doc["spec"]["podTemplate"]["spec"])
+    assert len(matched) == 1, f"expected one sandbox pod for agent {agent!r}"
+    return matched[0]
+
+
+def test_default_quota_admits_one_factory_sandbox_beside_a_standard_sandbox(
+    tmp_path: Path,
+) -> None:
+    docs = _default_templates(tmp_path)
+    entries = [entry for entry in worker_env(docs) if entry["name"] == ENV]
+    assert len(entries) == 1
+    quota = next(doc for doc in docs if doc.get("kind") == "ResourceQuota")
+    contract = json.loads(entries[0]["value"])
+    assert contract["hard"] == quota["spec"]["hard"]
+    assert contract["hard"]["requests.memory"] == "10Gi"
+    assert contract["hard"]["limits.memory"] == "16Gi"
+    assert contract["hard"]["limits.cpu"] == "8"
+    standard = pod_resources(_sandbox_pod(docs, None))
+    factory = pod_resources(_sandbox_pod(docs, "acme-factory"))
+    assert set(standard) == set(factory) == set(contract["hard"])
+    config = AdmissionConfig(
+        quota_name=contract["quota_name"],
+        priority_class=contract["priority_class"],
+        ceiling=contract["ceiling"],
+        hard=contract["hard"],
+    )
+    namespace = quota["metadata"].get("namespace", "curie")
+
+    def counted(used: dict[str, str]) -> QuotaStatus:
+        return QuotaStatus(
+            name=contract["quota_name"],
+            namespace=namespace,
+            spec_hard=contract["hard"],
+            status_hard=contract["hard"],
+            status_used=used,
         )
-    ]
-    assert len(bindings) == 1, "worker needs one narrowly scoped RuntimeClass grant"
-    assert bindings[0]["subjects"] == [
-        {
-            "kind": "ServiceAccount",
-            "name": account,
-            "namespace": "acme-admission",
-        }
-    ]
-    reference = bindings[0]["roleRef"]
-    assert reference["kind"] == "ClusterRole"
-    assert reference["apiGroup"] == "rbac.authorization.k8s.io"
-    role = next(
-        doc
-        for doc in docs
-        if doc.get("kind") == "ClusterRole" and doc["metadata"]["name"] == reference["name"]
+
+    assert admission_quota_headroom(config, namespace, factory, counted(standard))
+    assert not admission_quota_headroom(config, namespace, factory, counted(factory))
+
+    # limits.cpu is 8. One factory sandbox limits CPU at 2 and each standard
+    # sandbox limits CPU at 1, so six standard sandboxes beside that factory
+    # sandbox fit and the seventh is refused on limits.cpu.
+    sixth = _plus(factory, _times(standard, 5))
+    seventh_used = _plus(factory, _times(standard, 6))
+    assert admission_quota_headroom(config, namespace, standard, counted(sixth))
+    assert not admission_quota_headroom(
+        config, namespace, standard, counted(seventh_used)
     )
-    assert role["rules"] == [
-        {
-            "apiGroups": ["node.k8s.io"],
-            "resources": ["runtimeclasses"],
-            "resourceNames": ["acme-runtime"],
-            "verbs": ["get"],
-        }
+    assert _refused_by(contract["hard"], seventh_used, standard) == ["limits.cpu"]
+
+
+def _times(resources: dict[str, str], count: int) -> dict[str, str]:
+    return {key: format(Decimal(value) * count, "f") for key, value in resources.items()}
+
+
+def _plus(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
+    return {
+        key: format(Decimal(left.get(key, "0")) + Decimal(right.get(key, "0")), "f")
+        for key in set(left) | set(right)
+    }
+
+
+def _refused_by(
+    hard: dict[str, str], used: dict[str, str], requested: dict[str, str]
+) -> list[str]:
+    hard_n = resource_vector(hard)
+    used_n = resource_vector(used)
+    requested_n = resource_vector(requested)
+    return [
+        key
+        for key in sorted(hard_n)
+        if Decimal(used_n[key]) + Decimal(requested_n.get(key, "0")) > Decimal(hard_n[key])
     ]

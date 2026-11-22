@@ -242,6 +242,12 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
                 claim_name=CLAIM_NAME,
                 sandbox_name=SANDBOX_NAME,
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
 
             # The restarted process: same name, a fresh kernel holding nothing.
@@ -404,6 +410,18 @@ def test_restarted_worker_recovers_its_orphaned_run(
     )
     [(retry,)] = [tuple(r) for r in retry_rows]
     assert retry is True
+    # ADR 0269: the successor spent one slot of the WorkItem's shared allowance,
+    # and records the lost request it replaces.
+    lineage_rows = asyncio.run(
+        _db(
+            "SELECT s.retry_of_request_id, s.retry_origin_request_id, w.automatic_retries_used "
+            "FROM curie.execution_requests s JOIN curie.work_items w ON w.id = s.work_item_id "
+            "WHERE s.id = :id",
+            successor_id,
+        )
+    )
+    [(retry_of, retry_origin, used)] = [tuple(r) for r in lineage_rows]
+    assert (retry_of, retry_origin, used) == (request_id, request_id, 1)
     # The reconciler published the successor's execute wake and nothing else.
     redispatched = result["redispatched"]
     assert [w.event_id for w in redispatched] == [execute_event_id(successor_id, generation)]

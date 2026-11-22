@@ -449,6 +449,10 @@ impl Fixture {
     }
 
     fn with_bot_lookup(account_left: f64, bot_status: u16, bot_body: &'static str) -> Self {
+        Self::open(account_left, bot_status, bot_body)
+    }
+
+    fn open(account_left: f64, bot_status: u16, bot_body: &'static str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
         for tool in ["helm", "kubectl", "kind", "docker"] {
@@ -576,6 +580,7 @@ impl Fixture {
             .env_remove("XDG_CACHE_HOME")
             .env("TMPDIR", self.dir.path())
             .env("CURIE_CREDENTIALS", "sk-or-fixture")
+            .env_remove("CURIE_MODEL_BASE_URL")
             .env("CURIE_GITHUB_API_URL", &self.github.base_url)
             .env("CURIE_OPENROUTER_API_URL", &self.openrouter.base_url)
             .env("CURIE_API_URL", &self.platform.base_url)
@@ -2630,6 +2635,162 @@ fn ample_openrouter_credit_prints_no_credit_line() {
         !fixture.openrouter.recorded().is_empty(),
         "the credit check never reached OpenRouter"
     );
+}
+
+fn shown_output(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// An explicit OpenRouter model endpoint still probes. The probe goes to
+/// `CURIE_OPENROUTER_API_URL` (the local stub), which is not itself the
+/// model endpoint.
+#[test]
+fn an_explicit_openrouter_base_url_still_checks_credit() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .env("CURIE_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = shown_output(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(!shown.contains("OpenRouter credit not checked"), "{shown}");
+    assert!(
+        !fixture.openrouter.recorded().is_empty(),
+        "an OpenRouter model endpoint must still reach the credit probe"
+    );
+}
+
+fn assert_credit_not_sent(fixture: &Fixture, shown: &str, secret: &str) {
+    assert!(shown.contains("OpenRouter credit not checked"), "{shown}");
+    assert!(
+        !shown.contains(secret),
+        "the skip reason must not repeat the endpoint or credential: {shown}"
+    );
+    assert!(
+        fixture.openrouter.recorded().is_empty(),
+        "credit was requested from the OpenRouter stub: {:?}",
+        fixture.openrouter.recorded()
+    );
+}
+
+/// A model base URL on any other host must not be offered to the OpenRouter
+/// credit API, including a host that only looks related.
+#[test]
+fn an_explicit_non_openrouter_base_url_makes_no_credit_request() {
+    for url in [
+        "https://models.example.test/v1",
+        "https://api.openrouter.ai/api/v1",
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture
+            .command(true, &["--color", "never"])
+            .env("CURIE_MODEL_BASE_URL", url)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let shown = shown_output(&output);
+        assert!(output.status.success(), "{url}: {shown}");
+        assert!(
+            shown.contains("OpenRouter credit not checked: the model endpoint is not OpenRouter"),
+            "{url}: {shown}"
+        );
+        assert_credit_not_sent(&fixture, &shown, url);
+    }
+}
+
+fn record_release_model_base(fixture: &Fixture, path: &[&str], value: Option<&str>) {
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    let mut cursor = &mut values;
+    for key in &path[..path.len() - 1] {
+        if !cursor.get(*key).map(Value::is_object).unwrap_or(false) {
+            cursor[*key] = json!({});
+        }
+        cursor = cursor.get_mut(*key).unwrap();
+    }
+    let entry = match value {
+        Some(url) => json!({"name": "CURIE_MODEL_BASE_URL", "value": url}),
+        None => json!({
+            "name": "CURIE_MODEL_BASE_URL",
+            "valueFrom": {"secretKeyRef": {"name": "model", "key": "url"}}
+        }),
+    };
+    cursor[path[path.len() - 1]] = json!([entry]);
+    fixture.record_values(values);
+}
+
+#[test]
+fn a_release_model_base_url_on_another_host_makes_no_credit_request() {
+    let url = "https://models.example.test/v1";
+    for path in [
+        ["worker", "extraEnv"].as_slice(),
+        ["agentSandbox", "runner", "extraEnv"].as_slice(),
+    ] {
+        let fixture = Fixture::new();
+        record_release_model_base(&fixture, path, Some(url));
+        let output = fixture
+            .command(true, &["--color", "never"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let shown = shown_output(&output);
+        assert!(output.status.success(), "{path:?}: {shown}");
+        assert!(
+            shown.contains("OpenRouter credit not checked: the model endpoint is not OpenRouter"),
+            "{path:?}: {shown}"
+        );
+        assert_credit_not_sent(&fixture, &shown, url);
+    }
+}
+
+#[test]
+fn an_unreadable_release_model_base_url_makes_no_credit_request() {
+    let fixture = Fixture::new();
+    record_release_model_base(&fixture, &["worker", "extraEnv"], None);
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = shown_output(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(
+        shown.contains(
+            "OpenRouter credit not checked: the model endpoint is set but its host could not be read"
+        ),
+        "{shown}"
+    );
+    assert!(fixture.openrouter.recorded().is_empty(), "{shown}");
+}
+
+/// An Anthropic OAuth token stays off the credit probe even when the model
+/// base URL names OpenRouter. The runner refuses to forward that credential
+/// to a third-party endpoint.
+#[test]
+fn an_anthropic_oauth_credential_with_an_openrouter_base_url_makes_no_credit_request() {
+    let key = "sk-ant-oat01-PLACEHOLDER";
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .env("CURIE_CREDENTIALS", key)
+        .env("CURIE_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = shown_output(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(
+        shown.contains("OpenRouter credit not checked: the credential is for Anthropic"),
+        "{shown}"
+    );
+    assert_credit_not_sent(&fixture, &shown, key);
 }
 
 #[test]

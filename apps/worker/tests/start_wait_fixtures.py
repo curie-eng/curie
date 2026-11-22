@@ -59,6 +59,8 @@ ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "acme-corp/acme-bot"
 ADDRESS = "C0EXAMPLE1"
 WORKER_TOKEN = "start-wait-example-worker-token"
+# The placeholder operator key the API app boots with in these fixtures.
+OPERATOR_KEY = "example-api-key"
 QUOTA = "acme-start-wait-quota"
 HARD = {
     "pods": "2",
@@ -191,6 +193,10 @@ class StartWaitCase:
 
     async def db_now(self, _session: Any) -> datetime:
         return self.now
+
+    def harness_options(self) -> dict[str, Any]:
+        """Kernel config overrides for this case; a subclass replaces them."""
+        return {"max_attempts": 1}
 
     async def setup(self) -> None:
         self.engine = create_async_engine(self.database_url)
@@ -390,7 +396,7 @@ class StartWaitCase:
                     worker_token=WORKER_TOKEN,
                     read_timeout_s=5,
                 ),
-                max_attempts=1,
+                **self.harness_options(),
                 substrate_env={} if self.fault == "disabled" else admission,
                 api_key="example-api-key",
                 api_base_url=self.api_url,
@@ -533,7 +539,7 @@ def start_wait(
             raise RuntimeError(f"required executable unavailable: {executable}")
     for key, value in {
         "INTERNAL_WORKER_TOKEN": WORKER_TOKEN,
-        "API_KEY": "example-api-key",
+        "API_KEY": OPERATOR_KEY,
         "RESUME_RECONCILER_ENABLED": "false",
         "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
         "CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED": "false",

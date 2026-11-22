@@ -358,5 +358,3 @@ def test_resolve_after_a_concurrent_expiry_keeps_the_existing_410(
     )
     assert response.status_code == 410, response.text
     assert rows(row["dedupe_key"]) == [expired]
-
-

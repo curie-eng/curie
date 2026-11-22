@@ -1,0 +1,127 @@
+{
+  "_comment": "Real answers of the learned rule decision routes, recorded by apps/api/tests/test_memory_rule_routes.py::test_console_responses_match_the_console_vector, which fails when they drift. Ids and clocks are placeholders. Refresh: CURIE_WRITE_MEMORY_RULES_VECTOR=1 uv run pytest apps/api/tests/test_memory_rule_routes.py -k console_vector",
+  "accept": {
+    "status": 200,
+    "body": {
+      "rule": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "number": 1,
+        "label": "R1",
+        "scope_kind": "repository",
+        "scope_key": "github:github.com:4401",
+        "scope_label": "acme-corp/acme-bot",
+        "state": "accepted",
+        "text": "Keep rule 01 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "Reviewers asked for it twice.",
+        "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+        "proposed_by": "github:6601:octocat",
+        "proposed_at": "2026-11-19T12:00:00Z",
+        "accepted_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000002",
+          "display_name": "Acme Owner"
+        },
+        "accepted_at": "2026-11-19T12:01:00.000000Z",
+        "rejected_by": null,
+        "rejected_at": null,
+        "removed_by": null,
+        "removed_at": null,
+        "version": 2
+      },
+      "applies_from": "next_ticket"
+    }
+  },
+  "reject": {
+    "status": 200,
+    "body": {
+      "rule": {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "number": 2,
+        "label": "R2",
+        "scope_kind": "repository",
+        "scope_key": "github:github.com:4401",
+        "scope_label": "acme-corp/acme-bot",
+        "state": "rejected",
+        "text": "Keep rule 02 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "Reviewers asked for it twice.",
+        "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+        "proposed_by": "github:6601:octocat",
+        "proposed_at": "2026-11-19T12:00:00Z",
+        "accepted_by": null,
+        "accepted_at": null,
+        "rejected_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000002",
+          "display_name": "Acme Owner"
+        },
+        "rejected_at": "2026-11-19T12:02:00.000000Z",
+        "removed_by": null,
+        "removed_at": null,
+        "version": 2
+      },
+      "applies_from": "next_ticket"
+    }
+  },
+  "remove": {
+    "status": 200,
+    "body": {
+      "rule": {
+        "id": "00000000-0000-4000-8000-000000000004",
+        "number": 3,
+        "label": "R3",
+        "scope_kind": "repository",
+        "scope_key": "github:github.com:4401",
+        "scope_label": "acme-corp/acme-bot",
+        "state": "removed",
+        "text": "Keep rule 03 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "Reviewers asked for it twice.",
+        "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+        "proposed_by": "github:6601:octocat",
+        "proposed_at": "2026-11-19T12:00:00Z",
+        "accepted_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000005",
+          "display_name": "Acme Owner"
+        },
+        "accepted_at": "2026-11-19T12:03:00Z",
+        "rejected_by": null,
+        "rejected_at": null,
+        "removed_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000002",
+          "display_name": "Acme Owner"
+        },
+        "removed_at": "2026-11-19T12:04:00.000000Z",
+        "version": 2
+      },
+      "applies_from": "next_ticket"
+    }
+  },
+  "refusal_stale_version": {
+    "status": 409,
+    "body": {
+      "detail": {
+        "code": "memory_rules.stale_version",
+        "message": "The rule changed since you read it.",
+        "fix": "Read the rule again and retry with its current version.",
+        "current_version": 1
+      }
+    }
+  },
+  "refusal_write_access_required": {
+    "status": 403,
+    "body": {
+      "detail": {
+        "code": "memory_rules.write_access_required",
+        "message": "No code host account on this repository's host is linked to you.",
+        "fix": "Link your code host account first: an operator links it with POST /identity/admin/{tenant_id}/code-host-links."
+      }
+    }
+  },
+  "refusal_code_host_unavailable": {
+    "status": 503,
+    "body": {
+      "detail": {
+        "code": "memory_rules.code_host_unavailable",
+        "message": "The code host could not be reached to check write access.",
+        "fix": "Retry in a moment; nothing was changed."
+      }
+    }
+  }
+}

@@ -90,7 +90,9 @@ def test_superseded_cancellation_completes_without_a_repair_or_metadata_revision
     assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
 
 
-@pytest.mark.parametrize("failure", ["newest-cancelled", "older-failure"])
+@pytest.mark.parametrize(
+    "failure", ["newest-cancelled", "independent-app-failure", "independent-workflow-failure"]
+)
 def test_an_unsuperseded_failure_still_dispatches_a_repair(admitted: Any, failure: str) -> None:
     client, github, sink = admitted
     number = 9811
@@ -101,10 +103,18 @@ def test_an_unsuperseded_failure_still_dispatches_a_repair(admitted: Any, failur
         ]
         if failure == "newest-cancelled"
         else [
-            _run("failure", run_id=9, started_at=EARLIER, suite_id=101),
-            _run("success", run_id=10, started_at=LATER, suite_id=202),
+            {
+                **_run("failure", run_id=9, started_at=EARLIER, suite_id=101),
+                "app": {"id": 1, "slug": "external-ci"},
+            },
+            {
+                **_run("success", run_id=10, started_at=LATER, suite_id=202),
+                "app": {"id": 2, "slug": "github-actions"},
+            },
         ]
     )
+    if failure == "independent-workflow-failure":
+        runs[0]["app"] = runs[1]["app"] = {"id": 1, "slug": "github-actions"}
     sink.ci_script = [ci_entry(*runs, check_run("lint"))]
     _require_checks(sink)
     published = _published(client, github, sink, number)
@@ -117,6 +127,29 @@ def test_an_unsuperseded_failure_still_dispatches_a_repair(admitted: Any, failur
     assert [turn["event_id"] for turn in turns] == [f"work-item-{published['id']}-ci-2"]
     assert CHECK in turns[0]["text"]
     assert len(_publications(published["id"])) == 1
+
+
+def test_an_independent_running_workflow_waits_for_its_own_success(admitted: Any) -> None:
+    client, github, sink = admitted
+    earlier = _run("success", run_id=9, started_at=EARLIER, suite_id=101)
+    earlier.update(status="in_progress", conclusion=None)
+    later = _run("success", run_id=10, started_at=LATER, suite_id=202)
+    sink.ci_script = [ci_entry(earlier, later, check_run("lint"))]
+    _require_checks(sink)
+    published = _published(client, github, sink, 9811)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(9811) == ("running", None)
+    assert _ci_turns(published["id"]) == []
+    sink.ci_script = [
+        ci_entry(
+            {**earlier, "status": "completed", "conclusion": "success"}, later, check_run("lint")
+        )
+    ]
+    _reconcile_later(60)
+    assert _terminal(9811) == ("completed", "completed")
 
 
 @pytest.mark.parametrize("fresh", [False, True], ids=["not-rerun", "fresh-success"])

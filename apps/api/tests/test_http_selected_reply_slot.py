@@ -338,5 +338,3 @@ def test_malformed_reply_ref_refuses_without_delivery_state(
         response = membership._post(rig.client, rig.credential, body, proof)
         assert response.status_code == 401, response.text
         assert valkey.xrange(runs_stream) == []
-
-

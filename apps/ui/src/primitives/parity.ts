@@ -30,6 +30,7 @@ export interface WiredAction {
   readonly label: string;
   /** Its CLI mapping: a real command, or an explicit no-equivalent marker. */
   readonly mapping: CliMapping;
+  readonly operatorRoute?: string;
 }
 
 // The wired actions, grouped by surface in comments. `deploy`/`status`/`message`
@@ -73,6 +74,24 @@ export const WIRED_ACTIONS = [
   { id: "console-login-local", label: "Mint a console login code (dev)", mapping: { command: "local.console.login" } },
   { id: "console-login-cluster", label: "Mint a console login code (prod)", mapping: { command: "cluster.console.login" } },
 
+  // Organization sign-in (#5682) is a browser navigation to the API, not a
+  // CliHint. The CLI that drops the cookie copy is #5559, so the gap cites
+  // that issue rather than the parity epic.
+  {
+    id: "console-oidc-sign-in",
+    label: "Sign in with your organization",
+    mapping: { noCliEquivalent: "https://github.com/curie-eng/curie/issues/5559" },
+  },
+
+  // WiredClaudePlan (#5716): each button maps to the CLI verb that does the same
+  // write with the same session. The CLI reads the token from a private file.
+  { id: "claude-plan-enroll", label: "Connect a personal Claude plan", mapping: { command: "cluster.subscription.enroll" } },
+  { id: "claude-plan-replace", label: "Replace the personal Claude plan token", mapping: { command: "cluster.subscription.replace" } },
+  { id: "claude-plan-reconnect", label: "Reconnect a personal Claude plan", mapping: { command: "cluster.subscription.reconnect" } },
+  { id: "claude-plan-disconnect", label: "Disconnect a personal Claude plan", mapping: { command: "cluster.subscription.disconnect" } },
+  { id: "github-account-link", label: "Link your GitHub account", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
+  { id: "account-unlink", label: "Unlink your own account", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE }, operatorRoute: "POST /identity/admin/{tenant_id}/links/{link_id}/revoke" },
+
   // Genuinely-unmapped actions: no dedicated CLI verb exists yet. These render
   // the honest amber glyph linking to the parity epic instead of a command.
   { id: "rollback", label: "Roll back to an earlier version", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
@@ -83,6 +102,13 @@ export const WIRED_ACTIONS = [
   { id: "memory-edit", label: "Edit a learned memory entry", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
   { id: "memory-delete", label: "Delete a learned memory entry", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
 
+  // WiredMemoryPage (#5800) — learned rules. Every action is a flag of the one
+  // `cluster memory` command: --rules lists; --accept, --reject, --remove act.
+  { id: "memory-rules-list", label: "List learned rules", mapping: { command: "cluster.memory" } },
+  { id: "memory-rule-accept", label: "Accept a learned rule", mapping: { command: "cluster.memory" } },
+  { id: "memory-rule-dismiss", label: "Dismiss a proposed learned rule", mapping: { command: "cluster.memory" } },
+  { id: "memory-rule-remove", label: "Remove an accepted learned rule", mapping: { command: "cluster.memory" } },
+
   // WiredEvals (#868) — the eval matrix is read from GET /evals/matrix. There is
   // no top-level `curie` verb that just reads the matrix (the CLI polls it
   // internally during a model sweep), so the view renders the honest amber gap.
@@ -91,6 +117,14 @@ export const WIRED_ACTIONS = [
   // WiredWorkItems (#2577) — factory outcomes console, env-scoped like status.
   { id: "work-items-cluster", label: "List factory work items (prod)", mapping: { command: "cluster.work-items" } },
   { id: "work-items-local", label: "List factory work items (dev)", mapping: { command: "local.work-items" } },
+
+  // WiredAgentFactoryProgress — set or clear the Slack channel a factory agent
+  // posts progress to. Env-scoped like deploy. The unbound-channel hint points at
+  // the surfaces verb, which is where the binding is added.
+  { id: "factory-progress-cluster", label: "Set the factory progress channel (prod)", mapping: { command: "cluster.factory-progress" } },
+  { id: "factory-progress-local", label: "Set the factory progress channel (dev)", mapping: { command: "local.factory-progress" } },
+  { id: "surfaces-cluster", label: "Add an agent surface (prod)", mapping: { command: "cluster.surfaces" } },
+  { id: "surfaces-local", label: "Add an agent surface (dev)", mapping: { command: "local.surfaces" } },
 
   // WiredAgentBehaviorPacks (#870) — view/edit the agent's opt-in behavior packs.
   // No CLI path reads or writes behavior_packs (see cli/api-mirrors.json), so the

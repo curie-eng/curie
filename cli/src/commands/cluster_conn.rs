@@ -57,3 +57,52 @@ pub async fn resolve_cluster_conn(
     };
     Ok((api_url, api_key, port_forward))
 }
+
+/// Resolve a cluster verb's API URL and optional loopback tunnel WITHOUT the
+/// platform key, for verbs that authenticate a person rather than the release
+/// (#5377). Nothing here reads the release Secret: an omitted URL self-plumbs
+/// the same loopback port-forward [`resolve_cluster_conn`] opens, and an
+/// explicit URL is refused when it would carry the caller's credential over
+/// cleartext HTTP to a non-loopback host. The refusal also applies to a dry
+/// run, which otherwise touches nothing.
+pub async fn resolve_cluster_api(
+    api_url: Option<String>,
+    namespace: &str,
+    release: &str,
+    dry_run: bool,
+) -> Result<(String, Option<tokio::process::Child>)> {
+    if let Some(url) = api_url.as_deref() {
+        if crate::api::is_insecure_endpoint(url) {
+            return Err(crate::exit::CliError::usage(format!(
+                "refusing to send a session credential to {url}: it is not an https:// URL \
+                 or a loopback http:// URL, so the credential would cross the network in \
+                 cleartext; use an https:// URL, or omit --api-url to reach the release over \
+                 the loopback port-forward"
+            ))
+            .with_fix(
+                "use an https:// URL, or omit --api-url to reach the release over the \
+                 loopback port-forward",
+            )
+            .into());
+        }
+    }
+    let local_port = 0;
+    match api_url {
+        Some(url) => Ok((url, None)),
+        None if dry_run => Ok((format!("http://localhost:{local_port}"), None)),
+        None => {
+            let (_fullname, pf_cmd) = super::deploy_api_tunnel(
+                None,
+                namespace,
+                release,
+                local_port,
+                crate::message::API_REMOTE_PORT,
+            )
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the release API tunnel could not be planned"))?;
+            let (child, effective_port) =
+                crate::message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
+            Ok((format!("http://127.0.0.1:{effective_port}"), Some(child)))
+        }
+    }
+}

@@ -4,6 +4,8 @@ Date: 2026-10-15
 
 Status: Accepted
 
+**Partially amended by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md)** (back-link added under ADR 0045): a plain answer on the ticket admits the next attempt while a question is outstanding, and on GitHub the feedback batch is one submitted review with a limit of 10 plain-comment revisions per pull request, resolved-thread verification deferred and the other hosts deferred.
+
 ## Context
 
 On GitLab, Bitbucket Cloud and Bitbucket Data Center, the factory polls an

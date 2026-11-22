@@ -1,7 +1,9 @@
 """Typed failures every Tracker and CodeHost adapter raises (ADR 0197).
 
-Callers decide on the class alone. No error carries response text, headers or
-tokens from the forge.
+Callers decide on the class and the reason string. No error carries headers
+or tokens from the forge. A refused read may carry the forge's clipped
+``message`` on ``Unauthorized.provider_message`` so a status comment can quote
+it. Logs that opt out of diagnostics still omit the body.
 """
 
 from __future__ import annotations
@@ -32,7 +34,15 @@ class CredentialUnreadable(Unavailable):
 
 
 class Unauthorized(ForgeError):
-    """The configured credential was refused."""
+    """The configured credential was refused.
+
+    ``provider_message`` is the forge's clipped ``message`` when a status
+    comment must quote it. It is empty when the forge sent none.
+    """
+
+    def __init__(self, reason: str = "", *, provider_message: str | None = None) -> None:
+        self.provider_message = provider_message or None
+        super().__init__(reason)
 
 
 class NotFound(ForgeError):

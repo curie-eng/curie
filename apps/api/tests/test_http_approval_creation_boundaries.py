@@ -48,5 +48,3 @@ def test_resume_claim_rejects_the_receiver_that_lost_its_binding(
                     decision="continue", reason="current_authority")
     assert len(case.provider.requests) == before + 1
     assert delivery_state(valkey, runs_stream, case.scope["binding"]) == stream
-
-

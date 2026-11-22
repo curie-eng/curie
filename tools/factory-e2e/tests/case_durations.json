@@ -1,6 +1,5 @@
 {
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_adapter_bearing_shared_location_keeps_the_admitted_agent": 83.13,
-  "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_duplicate_effective_label_is_refused_at_admission": 112.21,
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_foreign_wake_claims_are_read_only[adapter]": 118.96,
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_foreign_wake_claims_are_read_only[address]": 118.27,
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_foreign_wake_claims_are_read_only[conversation]": 118.47,

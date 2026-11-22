@@ -53,7 +53,7 @@ services:
     network_mode: "service:curie-api"
     depends_on: [curie-api]
     volumes:
-      - ${OIDC_E2E_DEX_CONFIG}:/etc/dex/config.yaml:ro
+      - dex-config:/etc/dex
 
   postgres:
     ports: !reset []
@@ -61,3 +61,6 @@ services:
     ports: !reset []
   rustfs:
     ports: !reset []
+
+volumes:
+  dex-config:

@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 import httpx
+from aci_protocol import RetryCondition
 from channel_protocol.work_item_events import (
     parse_work_item_event_id as _parse_shared_event_id,
 )
@@ -46,6 +47,50 @@ class WorkItemStartRefused(WorkItemConflict):
 
 class WorkItemTransportError(Exception):
     """5xx or unreachable API; the wake must stay pending for retry."""
+
+
+# What an execute wake does (ADR 0269, #5429): an implementation request opens
+# model turns; a publication_recovery request boots the validation runtime and
+# publishes its one retained candidate without any model turn.
+ExecutionKind = Literal["implementation", "publication_recovery"]
+EXECUTION_IMPLEMENTATION: ExecutionKind = "implementation"
+EXECUTION_PUBLICATION_RECOVERY: ExecutionKind = "publication_recovery"
+
+# What the worker observed about a finished turn's effects. The API admits an
+# automatic successor only for ``no_effects``.
+RetrySafety = Literal["no_effects", "flagged", "uncertain"]
+
+# ADR 0269 (#5427): the uncounted defers of a resource successor. The first
+# leaves it waiting for a strictly larger limit, the second for its failed
+# predecessor's runtime to be gone.
+RESOURCE_GATE_UNMET = "resource_gate_unmet"
+PREDECESSOR_RUNTIME_PRESENT = "predecessor_runtime_present"
+
+ResourceDimension = Literal[
+    "memory", "ephemeral_storage", "scratch", "max_turns", "history_capacity", "execution_seconds"
+]
+_RESOURCE_DIMENSIONS: frozenset[str] = frozenset(
+    {"memory", "ephemeral_storage", "scratch", "max_turns", "history_capacity", "execution_seconds"}
+)
+_RESOURCE_GATE_KEYS = frozenset(
+    {"condition", "dimension", "volume", "failed_limit", "current_limit"}
+)
+
+
+@dataclass(frozen=True)
+class ResourceGate:
+    """What a resource successor waits on before it may claim a sandbox.
+
+    ``failed_limit`` is the limit the failed predecessor was actually given.
+    ``current_limit`` is the API's own value for the dimensions it owns
+    (history capacity, execution seconds) and None for the worker's.
+    """
+
+    condition: str
+    dimension: ResourceDimension
+    volume: str | None
+    failed_limit: int
+    current_limit: int | None
 
 
 @dataclass(frozen=True)
@@ -78,7 +123,15 @@ class WorkItemAcquireGrant:
     wait_deadline: datetime
     repository_path: str
     context: FactoryContext
-
+    # Fixed at admission (#5429). A publication_recovery request names the one
+    # retained candidate it publishes; an implementation request names none.
+    execution_kind: ExecutionKind
+    recovery_candidate_id: uuid.UUID | None
+    # ADR 0269 (#5427): the gate a resource successor waits on, and the
+    # recorded claim of the failed predecessor whose runtime must be gone
+    # before this request claims. None on every other request.
+    resource_gate: ResourceGate | None
+    predecessor_claim_name: str | None
     @property
     def agent_id(self) -> uuid.UUID:
         return self.context.agent_id
@@ -121,6 +174,9 @@ class WorkItemRequestView:
     runtime_epoch: int
     runtime_claim_name: str | None
     runtime_sandbox_name: str | None
+    # Whether the API recorded this request's question round as posted (ADR
+    # 0286, #5785). None when the answer did not say: an older API omits it.
+    questions_posted: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +184,19 @@ class WorkItemRuntimeOwner:
     request_id: uuid.UUID
     runtime_owner: str
     runtime_epoch: int
+
+
+@dataclass(frozen=True)
+class TerminationClaim:
+    """A held teardown lease: the epoch and request version a record must name.
+
+    ``request_version`` is the row version the claim left; ``record_termination``
+    sends it as ``expected_request_version``, so a claimant whose lease another
+    worker took over and settled is refused instead of recording (#5377).
+    """
+
+    runtime_epoch: int
+    request_version: int
 
 
 @dataclass(frozen=True)
@@ -208,6 +277,53 @@ def _required_positive_int(value: object) -> int:
     return value
 
 
+def _resource_gate(value: object) -> ResourceGate | None:
+    """The acquire grant's ``resource_gate``; any malformed gate is refused."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != _RESOURCE_GATE_KEYS:
+        raise ValueError("resource gate has the wrong fields")
+    dimension = value["dimension"]
+    if dimension not in _RESOURCE_DIMENSIONS:
+        raise ValueError("resource gate names an unknown dimension")
+    volume = value["volume"]
+    if dimension == "scratch":
+        volume = _required_string(volume)
+    elif volume is not None:
+        raise ValueError("only a scratch gate names a volume")
+    current = value["current_limit"]
+    return ResourceGate(
+        condition=_required_string(value["condition"]),
+        dimension=dimension,
+        volume=volume,
+        failed_limit=_required_positive_int(value["failed_limit"]),
+        current_limit=None if current is None else _required_positive_int(current),
+    )
+
+
+def _optional_name(value: object) -> str | None:
+    return None if value is None else _required_string(value)
+
+
+def _execution_kind(body: dict[str, Any]) -> tuple[ExecutionKind, uuid.UUID | None]:
+    """The request's execution kind and recovery candidate, read strictly.
+
+    Both are required. An unknown kind, a recovery without a candidate, or an
+    implementation that names one is an unusable body: a recovery run must
+    never be read as an implementation that opens a model turn.
+    """
+
+    kind = body["execution_kind"]
+    raw_candidate = body["recovery_candidate_id"]
+    candidate = None if raw_candidate is None else uuid.UUID(str(raw_candidate))
+    if kind == EXECUTION_IMPLEMENTATION and candidate is None:
+        return EXECUTION_IMPLEMENTATION, None
+    if kind == EXECUTION_PUBLICATION_RECOVERY and candidate is not None:
+        return EXECUTION_PUBLICATION_RECOVERY, candidate
+    raise ValueError("unknown execution kind or recovery candidate")
+
+
 def _parse_datetime(value: object) -> datetime:
     if not isinstance(value, str) or not value:
         raise WorkItemTransportError("work-item dispatch returned an unusable timestamp")
@@ -252,6 +368,7 @@ class WorkItemDispatchClient:
             },
         )
         try:
+            execution_kind, recovery_candidate_id = _execution_kind(body)
             return WorkItemAcquireGrant(
                 generation=_required_positive_int(body["generation"]),
                 work_item_id=uuid.UUID(str(body["work_item_id"])),
@@ -259,6 +376,10 @@ class WorkItemDispatchClient:
                 wait_deadline=_parse_datetime(body["wait_deadline"]),
                 repository_path=_required_string(body["repository_path"]),
                 context=FactoryContext.model_validate(body["context"]),
+                execution_kind=execution_kind,
+                recovery_candidate_id=recovery_candidate_id,
+                resource_gate=_resource_gate(body["resource_gate"]),
+                predecessor_claim_name=_optional_name(body["predecessor_claim_name"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -312,6 +433,7 @@ class WorkItemDispatchClient:
         claim_name: str,
         sandbox_name: str,
         context: FactoryContext,
+        delivered_limits: dict[str, Any],
     ) -> WorkItemStartGrant:
         try:
             body = await self._post(
@@ -322,6 +444,7 @@ class WorkItemDispatchClient:
                     "claim_name": claim_name,
                     "sandbox_name": sandbox_name,
                     "context": context.model_dump(mode="json"),
+                    "delivered_limits": delivered_limits,
                 },
             )
         except WorkItemConflict as exc:
@@ -439,6 +562,9 @@ class WorkItemDispatchClient:
         cause: str,
         detail: str | None,
         ci_fix_round: int | None,
+        retry_safety: RetrySafety,
+        retry_condition: RetryCondition | None,
+        exhausted_volume: str | None,
         budget_s: float = DEFAULT_BUDGET_S,
     ) -> None:
         await self._post_settlement(
@@ -449,6 +575,13 @@ class WorkItemDispatchClient:
                 "cause": cause,
                 "detail": detail,
                 "ci_fix_round": ci_fix_round,
+                "retry_safety": retry_safety,
+                "retry_condition": (
+                    retry_condition.model_dump(mode="json")
+                    if retry_condition is not None
+                    else None
+                ),
+                "exhausted_volume": exhausted_volume,
             },
             budget_s=budget_s,
         )
@@ -458,13 +591,18 @@ class WorkItemDispatchClient:
         request_id: uuid.UUID,
         *,
         owner: str,
-    ) -> int:
+    ) -> TerminationClaim:
+        """Claim, or as the same owner renew, the request's teardown lease."""
+
         body = await self._post(
             f"/v1/internal/work-items/requests/{request_id}/termination/claim",
             {"owner": owner},
         )
         try:
-            return int(body["runtime_epoch"])
+            return TerminationClaim(
+                runtime_epoch=_required_positive_int(body["runtime_epoch"]),
+                request_version=_required_positive_int(body["request_version"]),
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
                 "work-item termination claim returned an unusable body"
@@ -475,11 +613,16 @@ class WorkItemDispatchClient:
         request_id: uuid.UUID,
         *,
         runtime_epoch: int,
+        expected_request_version: int,
         observation: str,
     ) -> None:
         await self._post(
             f"/v1/internal/work-items/requests/{request_id}/termination",
-            {"runtime_epoch": runtime_epoch, "observation": observation},
+            {
+                "runtime_epoch": runtime_epoch,
+                "expected_request_version": expected_request_version,
+                "observation": observation,
+            },
         )
 
     async def runtime_owners(
@@ -554,23 +697,36 @@ class WorkItemDispatchClient:
                 runtime_epoch=int(epoch) if epoch is not None else 0,
                 runtime_claim_name=_optional_str(body.get("runtime_claim_name")),
                 runtime_sandbox_name=_optional_str(body.get("runtime_sandbox_name")),
+                questions_posted=(
+                    body["questions_posted"]
+                    if isinstance(body.get("questions_posted"), bool)
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
                 "work-item request view returned an unusable body"
             ) from exc
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         """The execution scoped issue read capability (ADR 0187).
 
         Returns the issue the capability names, as its tracker's display
         reference (``owner/repo#number`` on GitHub, ``PROJ-12`` on Jira), and
         the capability itself. The worker never reads the issue.
+        ``publication_recovery`` is true only for a publication recovery
+        request's own execute delivery, whose runner then constructs no model
+        session (#5429); any later turn on that request mints false.
         """
 
         body = await self._post(
             "/v1/internal/work-items/issue-read/context",
-            {"execution_request_id": str(request_id)},
+            {
+                "execution_request_id": str(request_id),
+                "publication_recovery": publication_recovery,
+            },
         )
         try:
             if uuid.UUID(str(body["execution_request_id"])) != request_id:
@@ -587,6 +743,64 @@ class WorkItemDispatchClient:
             raise WorkItemTransportError(
                 "work-item issue read context returned an unusable body"
             ) from None
+
+    async def requester_context(
+        self, request_id: uuid.UUID, *, runtime_epoch: int
+    ) -> dict[str, Any]:
+        """The running request's version 1 context envelope (ADR 0278)."""
+
+        return await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/requester-context",
+            {"runtime_epoch": runtime_epoch},
+        )
+
+    async def acknowledge_requester_context(
+        self,
+        request_id: uuid.UUID,
+        *,
+        runtime_epoch: int,
+        acknowledgment: dict[str, Any] | None,
+        reason: str | None,
+    ) -> str:
+        """Relay the runner's acknowledgment, or the worker's own failure; the evidence."""
+
+        body = await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
+            {"runtime_epoch": runtime_epoch, "acknowledgment": acknowledgment, "reason": reason},
+        )
+        evidence = body.get("evidence")
+        if evidence not in ("none", "applied", "failed"):
+            raise WorkItemTransportError("requester context acknowledgment was unusable")
+        return str(evidence)
+
+    async def memory_rules_context(
+        self, request_id: uuid.UUID, *, runtime_epoch: int
+    ) -> dict[str, Any]:
+        """The running request's learned rules envelope (#5798)."""
+
+        return await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/memory-rules-context",
+            {"runtime_epoch": runtime_epoch},
+        )
+
+    async def acknowledge_memory_rules_context(
+        self,
+        request_id: uuid.UUID,
+        *,
+        runtime_epoch: int,
+        acknowledgment: dict[str, Any] | None,
+        reason: str | None,
+    ) -> str:
+        """Relay the runner's learned rules acknowledgment, or the worker's failure."""
+
+        body = await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
+            {"runtime_epoch": runtime_epoch, "acknowledgment": acknowledgment, "reason": reason},
+        )
+        evidence = body.get("evidence")
+        if evidence not in ("none", "applied", "failed"):
+            raise WorkItemTransportError("learned rules acknowledgment was unusable")
+        return str(evidence)
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -673,6 +887,22 @@ class WorkItemRun:
         self.conversation_id = grant.conversation_id
         self.wait_deadline = grant.wait_deadline
         self.context = grant.context
+        # Fixed at admission and learned only at acquire (#5429). A run adopted
+        # from its running row is a continuation (an approval resume or a CI
+        # round), never the execute wake a recovery runs on, so it has none.
+        self.execution_kind: ExecutionKind | None = (
+            grant.execution_kind if isinstance(grant, WorkItemAcquireGrant) else None
+        )
+        self.recovery_candidate_id: uuid.UUID | None = (
+            grant.recovery_candidate_id if isinstance(grant, WorkItemAcquireGrant) else None
+        )
+        # Only a waiting request is gated or fenced; an adopted running one is
+        # already past its start.
+        self.resource_gate: ResourceGate | None = None
+        self.predecessor_claim_name: str | None = None
+        if isinstance(grant, WorkItemAcquireGrant):
+            self.resource_gate = grant.resource_gate
+            self.predecessor_claim_name = grant.predecessor_claim_name
         self.event_id = event_id
         self.thread_key = thread_key
         self.started = False
@@ -687,6 +917,10 @@ class WorkItemRun:
         # Cancellation, termination, deadline and owner loss never set it.
         self.recovery_eligible = False
         self.held = False
+        # Set while this run's own finish call is in flight and after it ends,
+        # so a heartbeat refused because that finish committed is not read as
+        # a lost epoch (#5840).
+        self._finish_done: asyncio.Event | None = None
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None
         self.sandbox_name: str | None = None
@@ -731,7 +965,9 @@ class WorkItemRun:
         if not self.started and self._acquire_refusal is not None:
             raise WorkItemStartRefused(self._acquire_refusal)
 
-    async def start(self, *, claim_name: str, sandbox_name: str) -> WorkItemStartGrant:
+    async def start(
+        self, *, claim_name: str, sandbox_name: str, delivered_limits: dict[str, Any]
+    ) -> WorkItemStartGrant:
         # Recorded before the API call so a start refused on a terminal code
         # (#3208) still knows the claim it made, and its release stays fenced
         # to that claim (#4331). runtime_epoch stays the started-ness signal.
@@ -748,6 +984,7 @@ class WorkItemRun:
                 claim_name=claim_name,
                 sandbox_name=sandbox_name,
                 context=self.context,
+                delivered_limits=delivered_limits,
             )
             self.started = True
             self.runtime_epoch = grant.runtime_epoch
@@ -758,6 +995,12 @@ class WorkItemRun:
             name=f"work-item-heartbeat-{self.request_id}",
         )
         return grant
+
+    @property
+    def is_publication_recovery(self) -> bool:
+        """Publish the one retained candidate with no model turn (ADR 0269, #5429)."""
+
+        return self.execution_kind == EXECUTION_PUBLICATION_RECOVERY
 
     def bound_remaining_s(self, remaining_s: float | None) -> float | None:
         if self.execution_deadline is None:
@@ -788,20 +1031,36 @@ class WorkItemRun:
         )
 
     async def finish(
-        self, *, outcome: str, cause: str, detail: str | None, ci_fix_round: int | None
+        self,
+        *,
+        outcome: str,
+        cause: str,
+        detail: str | None,
+        ci_fix_round: int | None,
+        retry_safety: RetrySafety,
+        retry_condition: RetryCondition | None,
+        exhausted_volume: str | None,
     ) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
-        await self._client.finish(
-            self.request_id,
-            runtime_epoch=self.runtime_epoch,
-            outcome=outcome,
-            cause=cause,
-            detail=detail,
-            ci_fix_round=ci_fix_round,
-            budget_s=self._write_budget_s(),
-        )
-        self.finished = True
+        done = asyncio.Event()
+        self._finish_done = done
+        try:
+            await self._client.finish(
+                self.request_id,
+                runtime_epoch=self.runtime_epoch,
+                outcome=outcome,
+                cause=cause,
+                detail=detail,
+                ci_fix_round=ci_fix_round,
+                retry_safety=retry_safety,
+                retry_condition=retry_condition,
+                exhausted_volume=exhausted_volume,
+                budget_s=self._write_budget_s(),
+            )
+            self.finished = True
+        finally:
+            done.set()
 
     async def close(self) -> None:
         """Drop renewal and heartbeat. A stop in flight is allowed to finish."""
@@ -887,6 +1146,8 @@ class WorkItemRun:
                     )
                 except WorkItemConflict as exc:
                     if exc.code == "stale_owner":
+                        if await self._own_finish_committed():
+                            return
                         await self._invoke_stop(self._on_stale)
                         return
                     logger.warning(
@@ -913,6 +1174,27 @@ class WorkItemRun:
                     return
         except asyncio.CancelledError:
             raise
+
+    async def _own_finish_committed(self) -> bool:
+        """True when a ``stale_owner`` heartbeat answer is this run's own finish.
+
+        The API refuses a heartbeat for any row that is no longer running, so a
+        beat already in flight when this run's finish commits comes back
+        ``stale_owner`` too, and its answer can arrive before or after the
+        finish answer. Reading it as a lost epoch would abandon the run, and an
+        abandoned run releases nothing, so a failed run would skip its ADR 0251
+        recovery capture and the personal teardown wake would delete the
+        workspace (#5840). Wait for a finish in flight to end, then trust only
+        a committed finish. ``_finish_or_settle`` marks a ``not_running`` answer
+        finished in the same step the finish raises, before this wait resumes.
+        A finish refused or lost on the wire leaves ``finished`` false, and the
+        stale answer keeps abandoning as before.
+        """
+
+        done = self._finish_done
+        if done is not None:
+            await done.wait()
+        return self.finished
 
     async def _invoke_stop(self, callback: StopCallback) -> None:
         self._stopping = True

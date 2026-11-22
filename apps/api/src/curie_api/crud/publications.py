@@ -25,6 +25,7 @@ from ..models import (
     ExecutionRequest,
     FactoryBaseTransition,
     Publication,
+    PublicationCandidate,
     PublicationReviewReservation,
     ThreadPublicationLineage,
     ThreadWorkspace,
@@ -337,6 +338,52 @@ async def _refuse_fenced_work_item(
         )
     await _require_new_publication_runtime(session, active)
     return active
+
+
+async def adoptable_revision_ids(
+    session: AsyncSession, request: ExecutionRequest | None, lineage_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """The earlier failed revisions a new publication of ``request`` may adopt (#5429).
+
+    Only a publication recovery request has any. Its candidate's ownership
+    chain is the request that captured it and every recovery request admitted
+    for it, since ownership moves only to a recovery successor. A failed
+    publication those requests created on the same lineage may have pushed its
+    commit before it failed; the recovery's Job adopts that commit only with
+    proof that it is this patch on an expected parent, and the API accepts its
+    marker. Denied, expired and succeeded revisions are never adoptable.
+    """
+
+    if request is None or request.execution_kind != "publication_recovery":
+        return []
+    origin_request_id = await session.scalar(
+        select(PublicationCandidate.origin_request_id).where(
+            PublicationCandidate.id == request.recovery_candidate_id,
+            PublicationCandidate.work_item_id == request.work_item_id,
+        )
+    )
+    if origin_request_id is None:
+        raise PublicationLineageConflict(
+            "publication.recovery_candidate_unavailable",
+            "the publication recovery request names no retained candidate",
+        )
+    owners = select(ExecutionRequest.id).where(
+        ExecutionRequest.work_item_id == request.work_item_id,
+        or_(
+            ExecutionRequest.id == origin_request_id,
+            ExecutionRequest.recovery_candidate_id == request.recovery_candidate_id,
+        ),
+    )
+    rows = await session.scalars(
+        select(Publication.id)
+        .where(
+            Publication.lineage_id == lineage_id,
+            Publication.execution_request_id.in_(owners),
+            Publication.status == "failed",
+        )
+        .order_by(Publication.revision_number, Publication.id)
+    )
+    return list(rows)
 
 
 async def create_publication(
@@ -659,6 +706,7 @@ async def create_publication(
         policy_version=agent.publication_policy_version if auto else None,
     )
     session.add(approval)
+    adoptable = await adoptable_revision_ids(session, owned_request, lineage.id)
     publication = Publication(
         id=reservation.id if reservation is not None else uuid.uuid4(),
         approval=approval,
@@ -667,6 +715,7 @@ async def create_publication(
         lineage=lineage,
         revision_number=revision_number,
         expected_prior_head=expected_prior_head,
+        adoptable_revision_ids=adoptable,
         repo_full_name=thread_workspace.repo_full_name,
         status="approved" if auto else "pending",
         open_as_draft=bool(auto and agent.publication_draft),

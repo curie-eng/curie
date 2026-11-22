@@ -64,5 +64,3 @@ REVOCATION_WINDOWS = [
     for status in ("disabled", "revoked")
     for role in ("invocation", "approver")
 ] + [("none", "active", "approver")]
-
-

@@ -33,6 +33,8 @@ function consoleSession(subject = "U0AUTHENTICATED") {
   return {
     subject,
     expires_at: "2026-07-24T12:00:00+00:00",
+    kind: "operator" as const,
+    principal: null,
   };
 }
 

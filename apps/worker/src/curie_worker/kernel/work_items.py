@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import traceback
 import uuid
@@ -10,14 +11,17 @@ from typing import TYPE_CHECKING
 
 from aci_protocol import (
     QueuedTurn,
+    RetryCondition,
 )
 
 from ..binding import FactoryWake
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
-from ..sandbox.types import SandboxHandle
+from ..sandbox.types import SandboxHandle, WorkItemRouteOwner
 from ..threadlock import LockLeaseLost
 from ..workitem_dispatch import (
+    RetrySafety,
+    TerminationClaim,
     TerminationObservation,
     WorkItemConflict,
     WorkItemRun,
@@ -45,6 +49,9 @@ class _SettlingWorkItem:
     cause: str
     detail: str | None
     ci_fix_round: int | None
+    retry_safety: RetrySafety
+    retry_condition: RetryCondition | None
+    exhausted_volume: str | None
     task: asyncio.Task[None] | None = None
     cleaned: bool = False
 
@@ -76,13 +83,23 @@ def _begin_settling(
     cause: str,
     detail: str | None,
     ci_fix_round: int | None,
+    retry_safety: RetrySafety,
+    retry_condition: RetryCondition | None,
+    exhausted_volume: str | None,
 ) -> None:
     """Hand off only the report, synchronously retaining ownership (#4174)."""
 
     if run.request_id in self._settling_work_items:
         return
     pending = _SettlingWorkItem(
-        run=run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+        run=run,
+        outcome=outcome,
+        cause=cause,
+        detail=detail,
+        ci_fix_round=ci_fix_round,
+        retry_safety=retry_safety,
+        retry_condition=retry_condition,
+        exhausted_volume=exhausted_volume,
     )
     self._settling_work_items[run.request_id] = pending
     if self._work_item_runs.get(run.request_id) is run:
@@ -100,9 +117,20 @@ async def _finish_or_settle(
     cause: str,
     detail: str | None,
     ci_fix_round: int | None,
+    retry_safety: RetrySafety,
+    retry_condition: RetryCondition | None,
+    exhausted_volume: str | None,
 ) -> None:
     try:
-        await run.finish(outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round)
+        await run.finish(
+            outcome=outcome,
+            cause=cause,
+            detail=detail,
+            ci_fix_round=ci_fix_round,
+            retry_safety=retry_safety,
+            retry_condition=retry_condition,
+            exhausted_volume=exhausted_volume,
+        )
     except WorkItemConflict as exc:
         if exc.code != "not_running":
             raise
@@ -114,7 +142,14 @@ async def _finish_or_settle(
         _mark_recovery_eligible(run, outcome)
     except WorkItemTransportError:
         self._begin_settling(
-            run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+            run,
+            outcome=outcome,
+            cause=cause,
+            detail=detail,
+            ci_fix_round=ci_fix_round,
+            retry_safety=retry_safety,
+            retry_condition=retry_condition,
+            exhausted_volume=exhausted_volume,
         )
     else:
         _mark_recovery_eligible(run, outcome)
@@ -142,6 +177,9 @@ async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
                     cause=pending.cause,
                     detail=pending.detail,
                     ci_fix_round=pending.ci_fix_round,
+                    retry_safety=pending.retry_safety,
+                    retry_condition=pending.retry_condition,
+                    exhausted_volume=pending.exhausted_volume,
                 )
             except WorkItemConflict as exc:
                 if exc.code in {"not_running", "publication_pending"}:
@@ -274,6 +312,27 @@ def _run_for_event(self: Kernel, event_id: str) -> WorkItemRun | None:
     return None
 
 
+def _started_execute_run(
+    self: Kernel, owned_work_item_id: uuid.UUID | None, event_id: str
+) -> WorkItemRun | None:
+    """This delivery's own started run when the turn is its execute wake.
+
+    The SQL lifecycle owns the retry of such a turn, so the in-delivery retry
+    refusal and the undecodable frame conversion ask this one question and
+    cannot drift apart. CI fix and approval resume turns are other event ids.
+    """
+
+    if owned_work_item_id is None:
+        return None
+    run = self._work_item_runs.get(owned_work_item_id)
+    if run is None or run.event_id != event_id or not run.started or run.finished:
+        return None
+    parsed = parse_work_item_event_id(event_id)
+    if parsed is None or parsed.kind != "execute":
+        return None
+    return run
+
+
 def _is_factory_work_item_turn(self: Kernel, event_id: str) -> bool:
     """Whether this turn's requesting chat belongs to a factory execution.
 
@@ -404,6 +463,9 @@ async def _adopt_resumed_work_item(
                 cause="runner_escalated",
                 detail="Factory execution authority is no longer valid.",
                 ci_fix_round=None,
+                retry_safety="uncertain",
+                retry_condition=None,
+                exhausted_volume=None,
             )
         except WorkItemConflict as exc:
             logger.info("refused factory continuation finish for %s: %s", event_id, exc.code)
@@ -751,8 +813,38 @@ async def _release_work_item_sandbox(self: Kernel, run: WorkItemRun) -> None:
     await _release_claim_locked(self, thread_key, claim_name)
 
 
-async def _release_claim_locked(self: Kernel, thread_key: str, claim_name: str) -> None:
-    """The plain release: lock the thread, release the recorded claim, unlock."""
+async def _release_unstarted_personal_claim(self: Kernel, run: WorkItemRun) -> None:
+    """Free the owner's one native process before a personal request waits (#5378).
+
+    A waiting request otherwise keeps its claim for the next acquire of the
+    thread to adopt, but a personal claim is the owner's only slot, and a
+    request cancelled while it waits gets no terminate wake to release it.
+    Fenced to the claim this run recorded, and observed gone.
+    """
+
+    if not run.started and run.claim_name is not None:
+        await _release_claim_locked(
+            self,
+            run.thread_key,
+            run.claim_name,
+            wait_gone=True,
+            expected_owner=WorkItemRouteOwner(str(run.request_id), run.generation, run.owner),
+        )
+
+
+async def _release_claim_locked(
+    self: Kernel,
+    thread_key: str,
+    claim_name: str,
+    *,
+    wait_gone: bool = False,
+    expected_owner: WorkItemRouteOwner | None = None,
+) -> None:
+    """The plain release: lock the thread, release the recorded claim, unlock.
+
+    ``wait_gone`` also waits, bounded, for the claim and its sandbox to be
+    absent (#5378: a refused personal start leaves the owner's slot free).
+    """
 
     try:
         token = await asyncio.wait_for(
@@ -767,19 +859,35 @@ async def _release_claim_locked(self: Kernel, thread_key: str, claim_name: str) 
         )
         return
     try:
-        await _release_claim(self, thread_key, claim_name)
+        if expected_owner is not None and not await asyncio.to_thread(
+            self._substrate.owns_work_item_claim, thread_key, claim_name, expected_owner
+        ):
+            return
+        await _release_claim(self, thread_key, claim_name, wait_gone=wait_gone)
     finally:
         await self._lock.release(self._config.lock_key(thread_key), token)
 
 
-async def _release_claim(self: Kernel, thread_key: str, claim_name: str) -> None:
+async def _release_claim(
+    self: Kernel, thread_key: str, claim_name: str, *, wait_gone: bool = False
+) -> None:
     """Release ``claim_name`` if the route still names it. Caller holds the lock."""
 
     try:
-        released = await asyncio.wait_for(
-            asyncio.to_thread(self._substrate.release_if_claim, thread_key, claim_name),
-            constants._RESET_RELEASE_TIMEOUT_S,
-        )
+        if wait_gone:
+            released = await asyncio.wait_for(
+                asyncio.to_thread(
+                    functools.partial(
+                        self._substrate.release_if_claim, thread_key, claim_name, wait_gone=True
+                    )
+                ),
+                constants._ENROLLMENT_REFUSAL_RELEASE_TIMEOUT_S,
+            )
+        else:
+            released = await asyncio.wait_for(
+                asyncio.to_thread(self._substrate.release_if_claim, thread_key, claim_name),
+                constants._RESET_RELEASE_TIMEOUT_S,
+            )
         if released and self._workspace is not None:
             await asyncio.to_thread(self._workspace.release, thread_key)
     except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
@@ -873,7 +981,9 @@ async def _terminate_work_item(self: Kernel, qevent: QueuedTurn, request_id: uui
         return
     thread_key = routing._thread_key_for(qevent)
     try:
-        epoch = await self._work_items.claim_termination(
+        # Gates the local cleanup below; the record names the re-claim taken
+        # under the thread lock in _halt_work_item_runtime (#5377).
+        await self._work_items.claim_termination(
             request_id,
             owner=self._config.consumer_name,
         )
@@ -901,21 +1011,24 @@ async def _terminate_work_item(self: Kernel, qevent: QueuedTurn, request_id: uui
     else:
         claim_name = view.runtime_claim_name
         sandbox_name = view.runtime_sandbox_name
-    observation = await self._halt_work_item_runtime(
+    halted = await self._halt_work_item_runtime(
         thread_key,
+        request_id,
         claim_name=claim_name,
         sandbox_name=sandbox_name,
     )
-    if observation is None:
+    if halted is None:
         logger.warning(
             "work-item terminate for %s did not observe absence; reconciler retries",
             request_id,
         )
         return
+    observation, claimed = halted
     try:
         await self._work_items.record_termination(
             request_id,
-            runtime_epoch=epoch,
+            runtime_epoch=claimed.runtime_epoch,
+            expected_request_version=claimed.request_version,
             observation=observation.render(),
         )
     except WorkItemConflict as exc:
@@ -933,21 +1046,24 @@ async def _stop_owned_work_item(self: Kernel, thread_key: str, run: WorkItemRun)
     await self._cancel_settling_work_items(request_id=run.request_id)
     if self._work_items is None or run.runtime_epoch is None:
         return
-    observation = await self._halt_work_item_runtime(
+    halted = await self._halt_work_item_runtime(
         thread_key,
+        run.request_id,
         claim_name=run.claim_name,
         sandbox_name=run.sandbox_name,
     )
-    if observation is None:
+    if halted is None:
         logger.warning(
             "work-item owner stop for %s did not observe absence",
             run.request_id,
         )
         return
+    observation, claimed = halted
     try:
         await self._work_items.record_termination(
             run.request_id,
-            runtime_epoch=run.runtime_epoch,
+            runtime_epoch=claimed.runtime_epoch,
+            expected_request_version=claimed.request_version,
             observation=observation.render(),
         )
         run.finished = True
@@ -983,31 +1099,75 @@ def _forget_held_run(self: Kernel, thread_key: str, run: WorkItemRun, *, reason:
 async def _halt_work_item_runtime(
     self: Kernel,
     thread_key: str,
+    request_id: uuid.UUID,
     *,
     claim_name: str | None,
     sandbox_name: str | None,
-) -> TerminationObservation | None:
-    """Interrupt, then poll until stored claim and sandbox names are gone."""
+) -> tuple[TerminationObservation, TerminationClaim] | None:
+    """Re-claim under the thread lock, interrupt, then poll until the runtime is gone.
 
+    The re-claim is the last check before anything is stopped (#5377). It runs
+    while the thread lock is held, so no route decision moves the thread between
+    it and the teardown, and the API refuses it once another worker has recorded
+    this request's termination. A claimant that stalled past its lease while a
+    peer tore the runtime down and a successor took the thread is refused here:
+    it interrupts nothing, deletes nothing and records nothing. The record names
+    the re-claim's epoch and request version.
+
+    The thread lock's renewer only marks a lost lease, so the lease is fenced
+    after the re-claim answers and again after the interrupt, before
+    ``terminate_thread`` deletes anything. A lease that expired while the
+    re-claim or the interrupt was in flight may already belong to a peer that
+    started a successor runtime on the thread; on ``LockLeaseLost`` nothing more
+    is interrupted, nothing is deleted and None is returned, so nothing is
+    recorded. None also when the re-claim is refused or absence was not observed.
+    """
+
+    assert self._work_items is not None
     try:
-        await asyncio.wait_for(
-            self.interrupt_thread(thread_key, "work-item termination"),
-            constants._RESET_INTERRUPT_TIMEOUT_S,
-        )
-    except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
+        async with self._lock.hold(self._config.lock_key(thread_key)) as lease:
+            try:
+                claimed = await self._work_items.claim_termination(
+                    request_id, owner=self._config.consumer_name
+                )
+            except (WorkItemConflict, WorkItemTransportError) as exc:
+                logger.info(
+                    "work-item %s teardown re-claim refused (%s); leaving thread %s",
+                    request_id,
+                    exc.code if isinstance(exc, WorkItemConflict) else type(exc).__name__,
+                    thread_key,
+                )
+                return None
+            # Both fences stay outside the interrupt's broad catch: LockLeaseLost
+            # is a TimeoutError, and that handler would swallow it.
+            await lease.ensure_owned()
+            try:
+                await asyncio.wait_for(
+                    self.interrupt_thread(thread_key, "work-item termination"),
+                    constants._RESET_INTERRUPT_TIMEOUT_S,
+                )
+            except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
+                logger.warning(
+                    "work-item interrupt did not land for thread %s; terminating anyway",
+                    thread_key,
+                    exc_info=True,
+                )
+            await lease.ensure_owned()
+            observation = await asyncio.to_thread(
+                self._substrate.terminate_thread,
+                thread_key,
+                claim_name=claim_name,
+                sandbox_name=sandbox_name,
+                observer=self._config.consumer_name,
+            )
+    except LockLeaseLost:
         logger.warning(
-            "work-item interrupt did not land for thread %s; terminating anyway",
+            "work-item %s teardown lost thread %s's lock; deleting and recording nothing",
+            request_id,
             thread_key,
-            exc_info=True,
         )
-    async with self._lock.hold(self._config.lock_key(thread_key)):
-        return await asyncio.to_thread(
-            self._substrate.terminate_thread,
-            thread_key,
-            claim_name=claim_name,
-            sandbox_name=sandbox_name,
-            observer=self._config.consumer_name,
-        )
+        return None
+    return None if observation is None else (observation, claimed)
 
 
 def attach_killswitch(self: Kernel, killswitch: KillSwitch) -> None:

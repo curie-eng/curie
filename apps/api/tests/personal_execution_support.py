@@ -76,6 +76,7 @@ _TRUNCATED = (
     "curie.github_review_deliveries",
     "curie.factory_poll_cursors",
     "curie.personal_claude_enrollments",
+    "curie.personal_claude_custody",
 )
 _TUPLE = "tenant_id, model_auth_mode, owner_principal_id, enrollment_generation"
 
@@ -533,6 +534,7 @@ def start_request(request_id: UUID, *, owner: str = RUNTIME_OWNER) -> int:
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits=lifecycle.NO_DELIVERED_LIMITS,
         )
         assert isinstance(started, StartResult), started
         return started.runtime_epoch
@@ -552,6 +554,9 @@ def finish_failed(request_id: UUID, runtime_epoch: int, *, cause: str = "deadlin
             cause=cause,
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+            exhausted_volume=None,
         )
         assert isinstance(finished, WorkItemOutcome), finished
         assert finished.request is not None and finished.request.status == "failed"
@@ -593,12 +598,13 @@ def record_termination(request_id: UUID, *, owner: str = RUNTIME_OWNER) -> Execu
         lambda session: workitem_dispatch.claim_termination(session, request_id, owner=owner)
     )
     assert isinstance(claimed, TerminationClaim), claimed
-    runtime_epoch = claimed.runtime_epoch
+    runtime_epoch, request_version = claimed.runtime_epoch, claimed.request_version
     ended = with_session(
         lambda session: workitem_dispatch.record_termination(
             session,
             request_id,
             runtime_epoch=runtime_epoch,
+            expected_request_version=request_version,
             observation=TERMINATION_OBSERVATION,
         )
     )

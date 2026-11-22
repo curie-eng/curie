@@ -57,7 +57,7 @@ def test_the_loop_is_not_built_with_the_executor_off() -> None:
 def test_the_loop_is_not_built_without_a_worker_token() -> None:
     """Pins existing behaviour."""
 
-    assert _build(_config(internal_worker_token="")) is None
+    assert _build(_config(internal_worker_token="", publication_candidates_enabled=False)) is None
 
 
 def test_the_local_tier_loop_reads_no_deployment() -> None:
@@ -97,6 +97,9 @@ class _Stoppable:
 
 
 class _CardStore:
+    async def run_retention(self, reader: Any, shutdown: asyncio.Event) -> None:
+        await shutdown.wait()
+
     async def migrate_legacy_thread_keyed_refs(self) -> None:
         return None
 
@@ -134,9 +137,11 @@ def _runtime(executor: _Executor | None) -> Any:
         eval_consumer=_Stoppable(),
         deploy_notice_consumer=None,
         card_store=_CardStore(),
+        approval_reference_reader=object(),
         orphan_sweeper=None,
         stream_retention=None,
         connector_loop=None,
+        factory_tool_observer=None,
         e2e_reaper=None,
         cron_loop=None,
         publication_loop=None,

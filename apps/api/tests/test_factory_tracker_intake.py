@@ -894,6 +894,12 @@ def test_base_poll_reads_active_selection_without_reopening_or_reading_finished_
             "claim_name": "claim-active-poll",
             "sandbox_name": "sandbox-active-poll",
             "context": grants[1]["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text
@@ -1586,6 +1592,12 @@ def _start_polled_request(intake: Intake, request_id: uuid.UUID) -> int:
             "claim_name": "claim-completed-poll",
             "sandbox_name": "sandbox-completed-poll",
             "context": grant["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text
@@ -1751,6 +1763,7 @@ def _completed_open_polled_authority(
                 "runtime_epoch": epoch,
                 "outcome": "failed",
                 "cause": "no_pull_request",
+                "retry_safety": "uncertain",
                 "detail": "No changes needed: verification passed on the moved head.",
             },
         )
@@ -1797,6 +1810,7 @@ def _complete_polled_unchanged_follow_up(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "no_pull_request",
+            "retry_safety": "uncertain",
             "detail": "No changes needed: the existing pull request satisfies this follow-up.",
         },
     )
@@ -2054,6 +2068,12 @@ def test_deleted_jira_issue_cancels_running_work_item(intake: Intake) -> None:
             "claim_name": "claim-deleted-issue",
             "sandbox_name": "sandbox-deleted-issue",
             "context": grant["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text
@@ -2085,10 +2105,17 @@ def test_deleted_jira_issue_cancels_running_work_item(intake: Intake) -> None:
             assert [wake.request_id for wake in wakes] == [request["id"]]
 
     intake.client.portal.call(teardown_wake)
+    [stopping] = _rows(
+        "SELECT version FROM curie.execution_requests WHERE id = :id", {"id": request["id"]}
+    )
     recorded = intake.client.post(
         f"/v1/internal/work-items/requests/{request['id']}/termination",
         headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
-        json={"runtime_epoch": started.json()["runtime_epoch"], "observation": "sandbox deleted"},
+        json={
+            "runtime_epoch": started.json()["runtime_epoch"],
+            "expected_request_version": stopping["version"],
+            "observation": "sandbox deleted",
+        },
     )
     assert recorded.status_code == 200, recorded.text
     assert _rows(

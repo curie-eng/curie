@@ -15,7 +15,8 @@ decides which cookies it carries. Checks run in phases, one API restart each:
    without its state cookie and then completed with it, a replay refused,
    logout refusing a foreign or missing Origin and revoking with a matching
    one, the retired cookie name refused, and a console session refused on a
-   platform-key route.
+   platform-key route. The built owner CLI then stores, reads and clears coding
+   instructions with that session and proves a second Dex principal is isolated.
 2. Required claims {"groups": "authors"} with the groups scope: Dex's mock
    connector (groups: authors) is admitted, and the password user (no groups)
    is refused without a principal being written.
@@ -42,15 +43,31 @@ Inputs, all optional:
   CURIE_OIDC_E2E_UI_IMAGE        console UI image (default
                                  ghcr.io/curie-eng/curie-ui:<tag>)
 Images missing locally are built from this checkout; `--build` always builds.
+
+Two optional first-argument modes provision a person's console session on an
+isolated `curie local up` stack instead (tools/oidc-e2e/compose.local-oidc.yaml):
+  local-env --out FILE [--project NAME]
+      writes a mode 0600 env file: the compose project, every isolation
+      variable `curie local up` requires, free loopback ports, a per-run Dex
+      client secret and the Dex config with one user, approver@example.com.
+  local-session --env FILE --email EMAIL --out FILE
+      signs EMAIL in through that Dex, writes only the session cookie value to
+      a mode 0600 file and prints {"kind", "principal_id", "tenant_id"}.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import html
+import http.client
 import json
 import os
+import random
 import re
+import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -61,6 +78,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from email.message import Message
 from http.cookies import SimpleCookie
@@ -264,7 +282,6 @@ class Stack:
                 "OIDC_E2E_UI_PORT": str(self.s.ui_port),
                 "OIDC_E2E_DEX_PORT": str(self.s.dex_port),
                 "OIDC_E2E_DEX_IMAGE": DEX_IMAGE,
-                "OIDC_E2E_DEX_CONFIG": str(self.s.dex_config),
                 # The worker is off; keep compose from resolving an endpoint
                 # that only the full profile would serve.
                 "OTEL_EXPORTER_OTLP_ENDPOINT": "",
@@ -299,11 +316,46 @@ class Stack:
         )
 
     def up(self, oidc: dict[str, str], *services: str) -> None:
-        self.compose("up", "-d", "--wait", *services, oidc=oidc)
+        application_services = tuple(service for service in services if service != "dex") or (
+            "postgres",
+            "valkey",
+            "rustfs",
+            "curie-api",
+            "curie-channel-gateway",
+            "curie-ui",
+        )
+        self.compose("up", "-d", "--wait", *application_services, oidc=oidc)
+        self.compose("create", "dex", oidc=oidc)
+        container = self.compose(
+            "ps", "--all", "--quiet", "dex", oidc=oidc, capture=True
+        ).stdout.strip()
+        if not container or "\n" in container:
+            raise CheckFailed("expected one Dex fixture container")
+        subprocess.run(
+            ["docker", "cp", str(self.s.dex_config), f"{container}:/etc/dex/config.yaml"],
+            check=True,
+        )
+        self.compose("start", "dex", oidc=oidc)
         wait_for(f"{self.s.api}/health", 200, timeout=120)
+        wait_for(f"{self.s.issuer}/.well-known/openid-configuration", 200, timeout=120)
 
     def down(self) -> None:
         self.compose("down", "-v", "--remove-orphans", oidc=oidc_off(self.s))
+        remaining = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                f"label=com.docker.compose.project={self.s.project}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if remaining:
+            raise CheckFailed("OIDC fixture containers remain after cleanup")
 
     def sql(self, query: str) -> str:
         out = self.compose(
@@ -575,6 +627,97 @@ def phase_default(s: Settings, stack: Stack, ev: Evidence) -> str:
     return token
 
 
+def phase_coding_instructions(s: Settings, ev: Evidence, token: str) -> None:
+    """Drive the owner CLI with two independently authenticated Dex principals."""
+
+    ev.check("coding instructions has a built CLI", s.curie_bin is not None)
+    assert s.curie_bin is not None
+    session_file = s.workdir / "coding-owner-session"
+    content_file = s.workdir / "coding-instructions.txt"
+    with os.fdopen(os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as out:
+        out.write(token)
+    content = b"Use explicit names.  \r\nPreserve the repository style.\r\n"
+    content_file.write_bytes(content)
+    normalized = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    ev.check("coding session file is private", session_file.stat().st_mode & 0o777 == 0o600)
+
+    def cli(*arguments: str, expected_exit: int = 0) -> dict[str, Any]:
+        proc = subprocess.run(
+            [
+                s.curie_bin,
+                "--json",
+                "cluster",
+                "coding-instructions",
+                *arguments,
+                "--session-file",
+                str(session_file),
+                "--api-url",
+                s.api,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        ev.check(
+            f"coding instructions {arguments[0]} exits {expected_exit}",
+            proc.returncode == expected_exit,
+            {"exit": proc.returncode},
+        )
+        try:
+            result = json.loads(proc.stdout)
+        except (ValueError, UnicodeError):
+            raise CheckFailed("coding instructions CLI did not emit one JSON object") from None
+        ev.check("coding instructions CLI emits one JSON object", isinstance(result, dict))
+        return result
+
+    empty = cli("get")
+    ev.check(
+        "new owner has no coding instructions", empty["revision"] == 0 and empty["text"] is None
+    )
+    written = cli("set", "--file", str(content_file), "--expected-revision", "0")
+    ev.check(
+        "coding instructions set normalizes line endings and preserves whitespace",
+        written["text"] == normalized
+        and written["revision"] == 1
+        and written["sha256"] == digest
+        and written["byte_length"] == len(normalized.encode("utf-8"))
+        and written["format_version"] == 1
+        and written["application"] == "available",
+    )
+    found = cli("get")
+    ev.check("coding instructions get returns the stored revision and digest", found == written)
+
+    other_token = session_token(finish(begin_login(s, "mock")))
+    other = request(
+        "GET", f"{s.api}/coding-instructions", headers=cookie(SESSION_COOKIE, other_token)
+    )
+    ev.check(
+        "a second Dex principal cannot read the owner's coding instructions",
+        other.status == 200
+        and other.json()["revision"] == 0
+        and other.json()["text"] is None
+        and other.json()["sha256"] is None,
+    )
+    stale = cli("set", "--file", str(content_file), "--expected-revision", "0", expected_exit=1)
+    ev.check(
+        "stale coding instructions revision is a structured conflict",
+        bool(stale.get("error")) and bool(stale.get("fix")),
+    )
+    ev.check("a stale coding instructions write changes nothing", cli("get") == written)
+    cleared = cli("clear", "--expected-revision", "1")
+    ev.check(
+        "coding instructions clear retains the advanced revision without text",
+        cleared["revision"] == 2
+        and cleared["text"] is None
+        and cleared["sha256"] is None
+        and cleared["byte_length"] == 0
+        and cleared["application"] == "available",
+    )
+    ev.check("cleared coding instructions remain cleared", cli("get") == cleared)
+
+
 def phase_required_claims(s: Settings, stack: Stack, ev: Evidence) -> None:
     stack.up(
         oidc_on(
@@ -796,7 +939,305 @@ def candidate() -> str:
     return out.stdout.strip() or "unknown"
 
 
+# --- local modes: a person's console session on an isolated local stack --------
+
+LOCAL_OVERLAY = TOOL_DIR / "compose.local-oidc.yaml"
+LOCAL_PROJECT = "curie-local-oidc"
+LOCAL_USER = "approver@example.com"
+LOCAL_HOST = "127.0.0.1"
+# Below the Linux ephemeral range (32768+) and the macOS one (49152+), and
+# outside the shared stack's 2xxxx block.
+LOCAL_PORTS = range(30000, 32768)
+_PROJECT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+#: Every published host port, by its env file variable.
+LOCAL_PORT_VARIABLES = (
+    "CURIE_LOCAL_OIDC_API_PORT",
+    "CURIE_LOCAL_POSTGRES_PORT",
+    "VALKEY_PORT",
+    "CURIE_LOCAL_OIDC_S3_PORT",
+    "CURIE_LOCAL_OIDC_DEX_PORT",
+)
+
+LocalOpener = Callable[
+    [str, str, Mapping[str, str], bytes | None], tuple[int, Sequence[tuple[str, str]], bytes]
+]
+
+
+def _two_owner_support() -> Any:
+    """tools/factory-e2e/personal_two_owner_support.py, imported by name like its siblings."""
+
+    path = str(REPO_ROOT / "tools" / "factory-e2e")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import personal_two_owner_support
+
+    return personal_two_owner_support
+
+
+def _port_unused(port: int) -> bool:
+    # Loopback only: on Linux this bind fails with EADDRINUSE while a wildcard listener holds the
+    # port, so a port Docker published on every interface is still caught.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((LOCAL_HOST, port))
+        except OSError:
+            return False
+    return True
+
+
+def free_local_ports(count: int) -> list[int]:
+    """``count`` distinct loopback ports nothing listens on right now."""
+
+    candidates = list(LOCAL_PORTS)
+    random.SystemRandom().shuffle(candidates)
+    chosen: list[int] = []
+    for port in candidates:
+        if _port_unused(port):
+            chosen.append(port)
+            if len(chosen) == count:
+                return chosen
+    raise SystemExit(f"local-env: fewer than {count} free ports in {LOCAL_PORTS}")
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` with mode 0600, never through a symlink."""
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+
+def render_env_file(values: Mapping[str, str]) -> str:
+    """``KEY=value`` lines quoted for ``set -a; . FILE; set +a`` (multi-line values too)."""
+
+    lines = [
+        "# curie dev oidc-e2e local-env: holds a Dex client secret; keep it private.",
+        "# Use: set -a; . FILE; set +a",
+    ]
+    lines += [f"{key}={shlex.quote(value)}" for key, value in values.items()]
+    return "\n".join(lines) + "\n"
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """The values of an env file ``render_env_file`` wrote, parsed as a shell would."""
+
+    values: dict[str, str] = {}
+    for word in shlex.split(path.read_text(), comments=True):
+        key, sep, value = word.partition("=")
+        if not sep or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
+            raise ValueError("env file holds a line that is not KEY=value")
+        values[key] = value
+    return values
+
+
+def local_env_values(project: str) -> dict[str, str]:
+    """Every variable the isolated stack, the overlay and ``local-session`` read."""
+
+    pto = _two_owner_support()
+    api, postgres, valkey, s3, stub, gateway, dex = free_local_ports(7)
+    api_url = f"http://{LOCAL_HOST}:{api}"
+    issuer = f"http://localhost:{dex}/dex"
+    redirect_uri = api_url + pto.CALLBACK_PATH
+    client_secret = secrets.token_urlsafe(32)
+    config = pto.dex_config(
+        issuer=issuer,
+        client_id=pto.OIDC_CLIENT_ID,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        users=[LOCAL_USER],
+        # The module's public placeholder bcrypt, base64 encoded (Dex decodes
+        # either form), so the config holds no "$" for Compose to interpolate.
+        password_hash=base64.b64encode(pto.DEX_PASSWORD_HASH.encode()).decode(),
+    )
+    # Dex shares the API's network namespace and is published on the same port,
+    # so the issuer resolves to it from the host and from inside the API alike.
+    config["web"] = {"http": f"0.0.0.0:{dex}"}
+    return {
+        "COMPOSE_PROJECT_NAME": project,
+        # For the CLI verbs that take no -f (local message, local down).
+        "COMPOSE_FILE": f"{COMPOSE_DEV}:{LOCAL_OVERLAY}",
+        "CURIE_API_URL": api_url,
+        "VALKEY_HOST": LOCAL_HOST,
+        "VALKEY_PORT": str(valkey),
+        "S3_ENDPOINT_URL": f"http://{LOCAL_HOST}:{s3}",
+        "CURIE_DOCKER_NETWORK": f"{project}_runner",
+        "CURIE_LOCAL_STUB_PORT": str(stub),
+        "CURIE_LOCAL_GATEWAY_PORT": str(gateway),
+        "CURIE_LOCAL_POSTGRES_HOST": LOCAL_HOST,
+        "CURIE_LOCAL_POSTGRES_PORT": str(postgres),
+        "CURIE_LOCAL_IMAGE_TAG": f"dev-{project}",
+        "CURIE_LOCAL_OIDC_API_PORT": str(api),
+        "CURIE_LOCAL_OIDC_S3_PORT": str(s3),
+        "CURIE_LOCAL_OIDC_DEX_PORT": str(dex),
+        "CURIE_LOCAL_OIDC_DEX_IMAGE": pto.DEX_IMAGE,
+        "CURIE_LOCAL_OIDC_ISSUER": issuer,
+        "CURIE_LOCAL_OIDC_AUDIENCE": pto.OIDC_CLIENT_ID,
+        "CURIE_LOCAL_OIDC_JWKS_URL": f"{issuer}/keys",
+        "CURIE_LOCAL_OIDC_CLIENT_SECRET": client_secret,
+        # Per-fixture bearer tokens: the gateway listens on the host network, so
+        # the public development defaults must never reach it.
+        "CURIE_CHANNEL_GATEWAY_API_TOKEN": secrets.token_urlsafe(32),
+        "CURIE_CHANNEL_GATEWAY_WORKER_TOKEN": secrets.token_urlsafe(32),
+        "CURIE_LOCAL_OIDC_REDIRECT_URI": redirect_uri,
+        "CURIE_LOCAL_OIDC_SCOPES": pto.OIDC_SCOPES,
+        "CURIE_LOCAL_OIDC_ADMIT_ALL_AUTHENTICATED": "true",
+        # JSON is YAML; Dex reads it as its config file.
+        "CURIE_LOCAL_OIDC_DEX_CONFIG": json.dumps(config, indent=2),
+    }
+
+
+def local_env(out: Path, project: str) -> int:
+    if not _PROJECT_NAME.fullmatch(project):
+        print(f"local-env: {project!r} is not a lowercase compose project name", file=sys.stderr)
+        return 2
+    values = local_env_values(project)
+    write_private(out, render_env_file(values))
+    print(
+        json.dumps(
+            {
+                "env_file": str(out),
+                "project": project,
+                "api_url": values["CURIE_API_URL"],
+                "issuer": values["CURIE_LOCAL_OIDC_ISSUER"],
+            }
+        )
+    )
+    return 0
+
+
+class LoopbackOpener:
+    """A login opener over urllib: no redirects, no proxy, plain http to loopback only."""
+
+    def __init__(self, *, timeout: float = 30.0) -> None:
+        self.timeout = timeout
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+    def __repr__(self) -> str:
+        return "<loopback opener>"
+
+    def __call__(
+        self, method: str, url: str, headers: Mapping[str, str], body: bytes | None
+    ) -> tuple[int, Sequence[tuple[str, str]], bytes]:
+        pto = _two_owner_support()
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "http" or parts.hostname not in (LOCAL_HOST, "localhost"):
+            raise pto.LoginFailed("opener_origin")
+        req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
+        try:
+            with self.opener.open(req, timeout=self.timeout) as resp:
+                return int(resp.status), list(resp.headers.items()), resp.read(1 << 20)
+        except urllib.error.HTTPError as err:
+            pairs = list(err.headers.items()) if err.headers is not None else []
+            return int(err.code), pairs, err.read(1 << 20)
+        except (OSError, http.client.HTTPException):
+            raise pto.LoginFailed("transport") from None
+
+
+def _json_object(body: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _uuid(value: Any) -> str | None:
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError:
+        return None
+
+
+def local_session(
+    env_file: Path, email: str, out: Path, *, opener: LocalOpener | None = None
+) -> int:
+    """Sign ``email`` in through the stack's Dex; exit 0 only on a principal session.
+
+    Nothing secret is printed: failures name a step or a status, and stdout
+    carries only the session kind, principal id and tenant id.
+    """
+
+    pto = _two_owner_support()
+    try:
+        env = read_env_file(env_file)
+        api = env["CURIE_API_URL"].rstrip("/")
+        issuer = env["CURIE_LOCAL_OIDC_ISSUER"]
+        redirect_uri = env["CURIE_LOCAL_OIDC_REDIRECT_URI"]
+        dex_port = int(env["CURIE_LOCAL_OIDC_DEX_PORT"])
+    except (OSError, KeyError, ValueError):
+        print("local-session: the env file is not one local-env wrote", file=sys.stderr)
+        return 2
+    open_ = opener or LoopbackOpener()
+    try:
+        held = pto.oidc_login(
+            open_,
+            api_origin=api,
+            issuer_origin=issuer,
+            dex_local_origin=f"http://{LOCAL_HOST}:{dex_port}",
+            redirect_origin=redirect_uri,
+            email=email,
+            password=pto.DEX_PASSWORD,
+        )
+    except pto.LoginFailed as failure:
+        print(f"local-session: Dex login failed at {failure.step}", file=sys.stderr)
+        return 1
+    headers = {"Cookie": f"{pto.SESSION_COOKIE}={held.reveal()}"}
+    try:
+        status, _headers, body = open_("GET", api + "/console/session", headers, None)
+        session = _json_object(body)
+        kind = session.get("kind")
+        if status != 200 or kind != "principal":
+            shown = kind if kind in ("operator", "principal") else "unknown"
+            print(
+                f"local-session: GET /console/session answered {status} with kind {shown}; "
+                "a principal session is required",
+                file=sys.stderr,
+            )
+            return 1
+        status, _headers, body = open_("GET", api + "/console/principal", headers, None)
+    except pto.LoginFailed as failure:
+        print(f"local-session: session read failed at {failure.step}", file=sys.stderr)
+        return 1
+    principal = _json_object(body)
+    principal_id = _uuid(principal.get("id"))
+    tenant_id = _uuid(principal.get("tenant_id"))
+    named = session.get("principal")
+    session_principal = _uuid(named.get("id")) if isinstance(named, dict) else None
+    if status != 200 or principal_id is None or tenant_id is None:
+        print(f"local-session: GET /console/principal answered {status}", file=sys.stderr)
+        return 1
+    if session_principal != principal_id:
+        print("local-session: the session and principal reads disagree", file=sys.stderr)
+        return 1
+    write_private(out, held.reveal())
+    print(json.dumps({"kind": "principal", "principal_id": principal_id, "tenant_id": tenant_id}))
+    return 0
+
+
+def local_main(mode: str, argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=f"curie dev oidc-e2e {mode}")
+    if mode == "local-env":
+        parser.add_argument("--out", type=Path, required=True, help="env file to write (0600)")
+        parser.add_argument("--project", default=LOCAL_PROJECT, help="compose project name")
+        args = parser.parse_args(argv)
+        return local_env(args.out, args.project)
+    parser.add_argument("--env", type=Path, required=True, help="the env file local-env wrote")
+    parser.add_argument("--email", default=LOCAL_USER, help="the Dex user to sign in")
+    parser.add_argument("--out", type=Path, required=True, help="session file to write (0600)")
+    args = parser.parse_args(argv)
+    return local_session(args.env, args.email, args.out)
+
+
+LOCAL_MODES = ("local-env", "local-session")
+
+
 def main(argv: list[str] | None = None) -> int:
+    given = sys.argv[1:] if argv is None else argv
+    if given and given[0] in LOCAL_MODES:
+        return local_main(given[0], given[1:])
     parser = argparse.ArgumentParser(
         prog="curie dev oidc-e2e",
         description="Generic OIDC console login, end to end against a real Dex.",
@@ -852,6 +1293,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         stack.up(oidc_on(s))
         token = phase_default(s, stack, ev)
+        phase_coding_instructions(s, ev, token)
         phase_required_claims(s, stack, ev)
         phase_issuer_binding(s, stack, ev, token)
         phase_rate_limit(s, ev)

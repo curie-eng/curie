@@ -287,6 +287,12 @@ def _started_case(client: TestClient, name: str) -> Case:
             "claim_name": f"fixture-{case.request_id.hex}",
             "sandbox_name": f"fixture-sandbox-{case.request_id.hex}",
             "context": acquired.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
         headers=WORKER_HEADERS,
     )
@@ -435,7 +441,12 @@ def test_expired_new_proposal(stack: TestClient) -> None:
     assert heartbeat.status_code == 409, heartbeat.text
     finish = client.post(
         f"{prefix}/finish",
-        json={"runtime_epoch": 1, "outcome": "failed", "cause": "fixture_failed"},
+        json={
+            "runtime_epoch": 1,
+            "outcome": "failed",
+            "cause": "fixture_failed",
+            "retry_safety": "uncertain",
+        },
         headers=WORKER_HEADERS,
     )
     assert finish.status_code == 409, finish.text

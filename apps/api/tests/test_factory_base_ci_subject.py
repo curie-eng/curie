@@ -268,6 +268,7 @@ def _finish(client: Any, row: dict[str, Any], *, round_: int | None = None) -> A
             "runtime_epoch": row["epoch"],
             "outcome": "failed",
             "cause": "no_pull_request" if round_ is None else "ci_fix_unpublished",
+            "retry_safety": "uncertain",
             "detail": "No changes needed: repository verification passed on the new base.",
             "ci_fix_round": round_,
         },
@@ -510,6 +511,12 @@ def test_queued_same_base_marking_acquisition_defers_until_the_prior_owner_pin_m
                     claim_name="claim-factory",
                     sandbox_name="sbx-factory",
                     context=acquired.context,
+                    delivered_limits={
+                        "memory_bytes": None,
+                        "ephemeral_storage_bytes": None,
+                        "scratch_bytes": {},
+                        "max_turns": None,
+                    },
                 )
             return acquired, started, generation
 

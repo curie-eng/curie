@@ -3,38 +3,38 @@
     "candidate/impl-advisory-progress": {
       "case": "impl-advisory-progress",
       "variant": "candidate",
-      "prompt_sha256": "fe532ebcf1a05f176a71a3a4ad5d6122043ac50c4e635cc8bf71f80e66e799bc",
-      "recorded": "2026-11-09"
+      "prompt_sha256": "50967169a7f883b3207711a0e7e341a40f94e28b40da5a4b66b6277e292f3b63",
+      "recorded": "2026-11-20"
     },
     "candidate/impl-publication": {
       "case": "impl-publication",
       "variant": "candidate",
-      "prompt_sha256": "d784e916fec28aa805e0315a9889da98df6474066440658256b99a90b7c785ce",
-      "recorded": "2026-11-09"
+      "prompt_sha256": "264ea6680a0230b68b4a6112d4059febddd5dfd7a4ba639532d5cc00ab0c9ea4",
+      "recorded": "2026-11-20"
     },
     "candidate/rev-missing-criterion": {
       "case": "rev-missing-criterion",
       "variant": "candidate",
-      "prompt_sha256": "1418f0751a323d59f699892aae9b908f7ffeabca0e648c2f2f91a1d4145a639c",
-      "recorded": "2026-10-22"
+      "prompt_sha256": "e85768dfd0135c402d22914c4570727c9b5c3d5bdd205523fc93dbb2d6aba747",
+      "recorded": "2026-11-18"
     },
     "candidate/rev-optional-notes": {
       "case": "rev-optional-notes",
       "variant": "candidate",
-      "prompt_sha256": "5eddd84f5a859ac780956e3c36dfbff26dbeaade202b94159b53bfab7bd98cf4",
-      "recorded": "2026-10-22"
+      "prompt_sha256": "2a17ef778634e4eec244a57be2a792ca1438038bfe6d9e350e83d2a273e66b4a",
+      "recorded": "2026-11-18"
     },
     "candidate/rev-security-defect": {
       "case": "rev-security-defect",
       "variant": "candidate",
-      "prompt_sha256": "7eebc487ba3c04c6ef2fa55896383d7a6fcc183ae85646c0781740578401468e",
-      "recorded": "2026-10-22"
+      "prompt_sha256": "0d7fc2dfb88282feb907e373155f60c170f57cff47db86ac2743e1f282266fda",
+      "recorded": "2026-11-18"
     },
     "removed-final-approval-control/impl-publication": {
       "case": "impl-publication",
       "variant": "removed-final-approval-control",
-      "prompt_sha256": "a4ab30a5b3961d1793ddfdcf299de06523d81c775d944aaf702eeac1057691d6",
-      "recorded": "2026-11-09"
+      "prompt_sha256": "51fec7d02f824151ff5053cc65b047c2966a468d7478b7b5cef4b2982a073a1f",
+      "recorded": "2026-11-20"
     },
     "strict-plan-control/impl-advisory-progress": {
       "case": "impl-advisory-progress",

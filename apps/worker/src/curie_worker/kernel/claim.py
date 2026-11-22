@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import math
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from aci_protocol import (
     CHANNEL_READ_STATUS_FIELD,
@@ -16,7 +17,7 @@ from aci_protocol import (
     TurnSource,
 )
 
-from .. import caller_token, sweep
+from .. import caller_token, memory_rules_context, requester_context, sweep
 from ..approvals import (
     ApprovalBackendError,
     PublicationLineage,
@@ -54,14 +55,22 @@ from ..runner_client import (
     TurnStream,
 )
 from ..sandbox.types import (
+    ClaimProvenance,
+    PersonalCreate,
+    ProvenanceMismatch,
     RouteChangedError,
     SandboxHandle,
     SuspendedThreadError,
+    WorkItemRouteOwner,
+    provenance_admits,
 )
 from ..turn_progress import (
     ELIGIBILITY_ENV,
 )
 from ..workitem_dispatch import (
+    PREDECESSOR_RUNTIME_PRESENT,
+    RESOURCE_GATE_UNMET,
+    WorkItemConflict,
     WorkItemRun,
     WorkItemStartRefused,
 )
@@ -170,6 +179,7 @@ def _boots_differently(
     caller_run: str | None = None,
     requester_enforced: bool = False,
     caller_needed: int | None = None,
+    provenance: ClaimProvenance | None = None,
 ) -> bool:
     """Whether a live runner booted with facts this delivery must not inherit.
 
@@ -181,9 +191,16 @@ def _boots_differently(
     is the expiry a requester token must reach to cover this turn; a digest
     route whose token does not reach it (or whose expiry is unknown) is
     replaced too.
+
+    ``provenance`` is the personal owner this delivery runs as (#5378, ADR
+    0268), None for a service delivery: a runner that booted with another
+    owner's or generation's grant, with unknown provenance, or in the other
+    mode boots differently.
     """
 
     env = boot_env or {}
+    if not provenance_admits(provenance, handle):
+        return True
     if handle.max_turns != env.get(MAX_TURNS_ENV):
         return True
     if (ELIGIBILITY_ENV in env) != handle.carries_turn_progress:
@@ -379,6 +396,97 @@ def _connector_tool_grant(
     )
 
 
+_SUBSTRATE_GATE_DIMENSIONS = frozenset({"memory", "ephemeral_storage", "scratch"})
+
+
+def _positive_int(raw: str | None) -> int | None:
+    if raw is None or not raw.isascii() or not raw.isdigit():
+        return None
+    value = int(raw)
+    return value if value >= 1 else None
+
+
+async def _defer_unstarted(run: WorkItemRun, reason: str) -> NoReturn:
+    """Defer an unstarted request uncounted and end this delivery without a turn."""
+
+    try:
+        await run.defer(reason, capacity=False, start_failure_detail=None)
+    except WorkItemConflict as exc:
+        logger.info("work-item %s defer refused for %s: %s", reason, run.request_id, exc.code)
+    raise failures._WorkItemDeferred()
+
+
+async def _admit_resource_successor(
+    self: Kernel,
+    run: WorkItemRun,
+    thread_key: str,
+    *,
+    boot_env: dict[str, str] | None,
+    workspace_repo: str | None,
+    agent_name: str | None,
+    runner_resources: dict[str, Any] | None,
+) -> None:
+    """ADR 0269 (#5427): what a resource successor proves before it claims anything.
+
+    First its failed predecessor's runtime is fenced: released if the thread's
+    route still names it, then confirmed gone. Then a gated request needs no
+    live route on the thread and a current limit strictly greater than the one
+    its predecessor failed under, resolved the way the next claim would
+    resolve it. Either short of that defers uncounted and creates nothing.
+    """
+
+    predecessor = run.predecessor_claim_name
+    if predecessor is not None and not await asyncio.to_thread(
+        self._substrate.predecessor_absent, thread_key, predecessor
+    ):
+        logger.info(
+            "work-item %s waits for predecessor runtime %s to be gone",
+            run.request_id,
+            predecessor,
+        )
+        await _defer_unstarted(run, PREDECESSOR_RUNTIME_PRESENT)
+    gate = run.resource_gate
+    if gate is None:
+        return
+    live = await asyncio.to_thread(self._substrate.lookup, thread_key)
+    current: int | None
+    if live is not None:
+        current = None
+    elif gate.dimension in _SUBSTRATE_GATE_DIMENSIONS:
+        current = await asyncio.to_thread(
+            functools.partial(
+                self._substrate.resource_gate_readiness,
+                gate,
+                env=boot_env,
+                workspace_repo=workspace_repo,
+                agent_name=agent_name,
+                runner_resources=runner_resources,
+            )
+        )
+    elif gate.dimension == "max_turns":
+        current = _positive_int((boot_env or {}).get(MAX_TURNS_ENV))
+    else:
+        current = gate.current_limit
+    if current is not None and current > gate.failed_limit:
+        logger.info(
+            "resource gate %s met for %s: failed limit %d, current limit %d",
+            gate.condition,
+            run.request_id,
+            gate.failed_limit,
+            current,
+        )
+        return
+    logger.info(
+        "resource gate %s unmet for %s: failed limit %d, current limit %s%s",
+        gate.condition,
+        run.request_id,
+        gate.failed_limit,
+        current,
+        "; a live route holds the thread" if live is not None else "",
+    )
+    await _defer_unstarted(run, RESOURCE_GATE_UNMET)
+
+
 async def _route_and_start(
     self: Kernel,
     thread_key: str,
@@ -425,6 +533,12 @@ async def _route_and_start(
     if owned_run is not None and owned_run.agent_id != agent_id:
         raise WorkItemStartRefused("factory_agent_mismatch")
     caller_run = str(owned_run.request_id) if owned_run is not None else None
+    # #5429: a publication recovery run never steers and never opens a turn.
+    recovery = owned_run is not None and owned_run.is_publication_recovery
+    # #5378: whose grant a runtime for this delivery boots with. None is a
+    # service delivery, which never inherits a personal runtime either.
+    launch = constants._PERSONAL_LAUNCH.get()
+    desired_provenance = None if launch is None else launch.provenance
     lineage: PublicationLineage | None = None
     if workspace_deployment_id is not None:
         # The API already bound a verified review to its persisted thread
@@ -559,6 +673,17 @@ async def _route_and_start(
         # repository record remains authority for this refusal, so an
         # approval resume cannot rebuild a workspace route as generic.
         raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
+    if owned_run is not None and not owned_run.started:
+        # Before the route snapshot, any claim and any capacity preflight.
+        await _admit_resource_successor(
+            self,
+            owned_run,
+            thread_key,
+            boot_env=boot_env,
+            workspace_repo=workspace_repo,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+        )
     existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
     # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
     # route lock, if an enabled greeting/help pack matches the message text AND
@@ -621,6 +746,7 @@ async def _route_and_start(
             caller_run=caller_run,
             requester_enforced=enforced,
             caller_needed=caller_needed_for(existing_handle),
+            provenance=desired_provenance,
         )
     ):
         # ADR-0160: a sweep continues only on the claim it already holds.
@@ -696,6 +822,7 @@ async def _route_and_start(
             caller_run=caller_run,
             requester_enforced=enforced,
             caller_needed=caller_needed_for(existing_handle),
+            provenance=desired_provenance,
         )
     )
     if (
@@ -704,6 +831,9 @@ async def _route_and_start(
         # A replacing resume never keeps the route to steer a live turn: the
         # fence below refuses a live runner, and the redelivery replaces it.
         and not resume_replaces
+        # #5378: nor does a runtime of another owner, generation or mode. Its
+        # live turn is never steered; the fence below waits it out.
+        and provenance_admits(desired_provenance, existing_handle)
         and not source.is_job
         and verified_review is None
         and await self._turn_active(existing_handle, remaining_s=remaining_s)
@@ -799,7 +929,7 @@ async def _route_and_start(
             # path asks it; it evicts exactly what that claim would evict.
             # Same condition ``_claim_or_resume`` uses to take that path.
             if workspace_repo is not None and workspace_deployment_id is not None:
-                boots = await asyncio.to_thread(self._substrate.adopt, thread_key) is None
+                boots = await _adopt(self, thread_key) is None
             else:
                 boots = await asyncio.to_thread(self._substrate.lookup, thread_key) is None
         if (
@@ -998,6 +1128,18 @@ async def _route_and_start(
     if inferred is not None:
         workspace_inference.repo = inferred
     self._log_claim_latency(thread_key, claim_started)
+    # #5378: before any steer or turn start, the runtime is this delivery's
+    # own (a continuation adopts without claiming, and a claim can adopt a
+    # route the snapshot never saw), and a personal request is authorized
+    # afresh: the owner rows, the enrollment and this worker's authority.
+    if launch is not None and owned_run is not None:
+        await asyncio.to_thread(
+            self._substrate.bind_work_item,
+            thread_key,
+            handle.claim_name,
+            WorkItemRouteOwner(str(owned_run.request_id), owned_run.generation, owned_run.owner),
+        )
+    await _authorize_turn_start(handle)
     if wait is not None:
         # A capacity wake may meet a different live turn on this thread.
         # Keep its original deadline and retry after that turn finishes;
@@ -1034,7 +1176,7 @@ async def _route_and_start(
                 or capacity_status.get("turn_active") is not False
             ):
                 raise CapacityWaitRequested()
-    elif source.is_job or verified_review is not None or event.tool_access is not None:
+    elif source.is_job or verified_review is not None or event.tool_access is not None or recovery:
         # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
         # a webhook must never fold itself into whatever a person is currently
         # saying. A verified review likewise owns a separately reserved
@@ -1203,6 +1345,7 @@ async def _route_and_start(
             caller_run=caller_run,
             requester_enforced=enforced,
             caller_needed=caller_needed_for(handle) if retained_live_route else None,
+            provenance=desired_provenance,
         ):
             raise failures.ThreadBusyError(
                 f"thread {thread_key} turn ended before its steer; "
@@ -1251,10 +1394,30 @@ async def _route_and_start(
     if run is not None and run.finished:
         raise WorkItemStartRefused("work item authority is finished")
     if run is not None and not run.started:
-        started = await run.start(
-            claim_name=handle.claim_name,
-            sandbox_name=handle.sandbox_name,
+        # ADR 0269 (#5427): what this runtime was actually given, read from
+        # the created pod. An unread pod sends nulls, which release nothing.
+        delivered = await asyncio.to_thread(
+            functools.partial(
+                self._substrate.delivered_limits,
+                handle,
+                max_turns=_positive_int(handle.max_turns),
+            )
         )
+        try:
+            started = await run.start(
+                claim_name=handle.claim_name,
+                sandbox_name=handle.sandbox_name,
+                delivered_limits=delivered.to_wire(),
+            )
+        except WorkItemStartRefused as exc:
+            if exc.code != RESOURCE_GATE_UNMET:
+                raise
+            # The limit fell back between the gate and the start. Give the
+            # unstarted claim back and wait again, uncounted.
+            from .work_items import _release_claim
+
+            await _release_claim(self, thread_key, handle.claim_name)
+            await _defer_unstarted(run, RESOURCE_GATE_UNMET)
         remaining_s = (
             started.remaining_s if remaining_s is None else min(remaining_s, started.remaining_s)
         )
@@ -1295,10 +1458,39 @@ async def _route_and_start(
         if run.event_id == queued_event_id:
             run.claim_name = handle.claim_name
             run.sandbox_name = handle.sandbox_name
+    if run is not None and run.event_id == queued_event_id and run.is_publication_recovery:
+        # #5429: the started, booted runtime is the validation runtime. No
+        # requester context, publication context or turn: the attempt reads
+        # the retained candidate instead (kernel/publication_recovery.py).
+        routing._record_route("publication-recovery")
+        return routing._RouteResult(steered=False, handle=handle)
     if agent_id is not None:
         self._register_run(agent_id, thread_key)
     turn: TurnStream | None = None
     try:
+        # ADR 0278 (#5592): the request's pinned requester context is
+        # delivered, validated and acknowledged before its first turn, on
+        # every handle this run's event starts on; a refusal fails it here.
+        work_items = getattr(self, "_work_items", None)
+        if run is not None and run.event_id == queued_event_id and work_items is not None:
+            await requester_context.deliver(
+                work_items=work_items,
+                runner=self._runner,
+                run=run,
+                base_url=handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
+            # #5798: the pinned learned rules travel beside the requester
+            # context, never inside it, and are acknowledged before the turn.
+            await memory_rules_context.deliver(
+                work_items=work_items,
+                runner=self._runner,
+                run=run,
+                base_url=handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
         event, remaining_s = await self._bind_publication_context(
             event,
             queued_event_id=queued_event_id,
@@ -1486,6 +1678,97 @@ async def _claim_or_resume(
     caller_run: str | None = None,
     resume_replacement: bool = False,
 ) -> SandboxHandle:
+    """Adopt, claim, resume or hand off the thread's runtime.
+
+    The one choke point every runtime of a personal request passes (#5378):
+    a delivery carrying a personal launch is authorized afresh at entry, and
+    any create below runs under that launch's owner lease, released here.
+    """
+
+    launch = constants._PERSONAL_LAUNCH.get()
+    guard = None if launch is None else launch.guard(asyncio.get_running_loop())
+    try:
+        return await _claim_or_resume_as(
+            self,
+            thread_key,
+            boot_env,
+            personal=guard,
+            workspace_deployment_id=workspace_deployment_id,
+            workspace_repo=workspace_repo,
+            replace_handle=replace_handle,
+            lineage_branch=lineage_branch,
+            lineage_head=lineage_head,
+            lineage_base_sha=lineage_base_sha,
+            publication_visible_outcome_revision=publication_visible_outcome_revision,
+            force_lineage_replacement=force_lineage_replacement,
+            pending_publication_approval=pending_publication_approval,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+            remaining_s=remaining_s,
+            attachment_fresh_only=attachment_fresh_only,
+            caller_run=caller_run,
+            resume_replacement=resume_replacement,
+        )
+    finally:
+        if guard is not None:
+            await guard.close()
+
+
+async def _authorize_turn_start(handle: SandboxHandle) -> None:
+    """Refuse a steer or turn start on a runtime this delivery may not use (#5378).
+
+    The runtime must have booted with this delivery's provenance (none for a
+    service delivery), and a personal request is authorized afresh. Raises
+    ``PersonalLaunchRefused``, which the delivery settles.
+    """
+
+    launch = constants._PERSONAL_LAUNCH.get()
+    if not provenance_admits(None if launch is None else launch.provenance, handle):
+        raise ProvenanceMismatch()
+    if launch is not None:
+        await launch.authorize()
+
+
+async def _adopt(self: Kernel, thread_key: str) -> SandboxHandle | None:
+    """``substrate.adopt`` with this delivery's provenance (#5378)."""
+
+    launch = constants._PERSONAL_LAUNCH.get()
+    if launch is None:
+        return await asyncio.to_thread(self._substrate.adopt, thread_key)
+    return await asyncio.to_thread(
+        functools.partial(self._substrate.adopt, thread_key, provenance=launch.provenance)
+    )
+
+
+def _personal_kwargs(personal: PersonalCreate | None) -> dict[str, Any]:
+    """Passed only for a personal create, so a substrate or workspace double
+    that predates the keyword keeps serving service claims unchanged."""
+
+    return {} if personal is None else {"personal": personal}
+
+
+async def _claim_or_resume_as(
+    self: Kernel,
+    thread_key: str,
+    boot_env: dict[str, str] | None,
+    *,
+    personal: PersonalCreate | None,
+    workspace_deployment_id: uuid.UUID | None,
+    workspace_repo: str | None,
+    replace_handle: SandboxHandle | None,
+    lineage_branch: str | None,
+    lineage_head: str | None,
+    lineage_base_sha: str | None,
+    publication_visible_outcome_revision: int,
+    force_lineage_replacement: bool,
+    pending_publication_approval: bool,
+    agent_name: str | None,
+    runner_resources: dict[str, Any] | None,
+    remaining_s: float | None,
+    attachment_fresh_only: bool,
+    caller_run: str | None,
+    resume_replacement: bool,
+) -> SandboxHandle:
     wait = current_wait()
     previous_handle: SandboxHandle | None = None
     if wait is not None:
@@ -1525,6 +1808,11 @@ async def _claim_or_resume(
     from .identity import check
 
     await check(self, "claim_or_resume")
+    # #5378: fresh SQL at every claim, adopt, resume and handoff, including
+    # the credential-capping re-claim after the API start.
+    launch = constants._PERSONAL_LAUNCH.get()
+    if launch is not None:
+        await launch.authorize()
     if workspace_deployment_id is not None:
         handoff_budget_started = clock.time.monotonic()
 
@@ -1542,7 +1830,7 @@ async def _claim_or_resume(
             )
         existing = None
         if not force_lineage_replacement:
-            existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
+            existing = await _adopt(self, thread_key)
         if attachment_fresh_only and existing is not None:
             # A runner appeared after the attachment lookup; it never saw
             # the staged files, so refuse rather than adopt it (#2739).
@@ -1690,6 +1978,7 @@ async def _claim_or_resume(
                 fresh_only=attachment_fresh_only,
                 caller_run=caller_run,
                 **identity_arguments,
+                **_personal_kwargs(personal),
             )
         except asyncio.CancelledError:
             # @spec HTTP-INVOCATION-EXECUTION-18: only unfinished cancellation ends this carry.
@@ -1714,6 +2003,7 @@ async def _claim_or_resume(
             agent_name=agent_name,
             runner_resources=runner_resources,
             caller_run=caller_run,
+            **_personal_kwargs(personal),
         )
         return await validate_wait_claim(handle)
     try:
@@ -1725,6 +2015,7 @@ async def _claim_or_resume(
             runner_resources=runner_resources,
             fresh_only=attachment_fresh_only,
             caller_run=caller_run,
+            **_personal_kwargs(personal),
         )
         return await validate_wait_claim(handle)
     except SuspendedThreadError:
@@ -1740,6 +2031,7 @@ async def _claim_or_resume(
             agent_name=agent_name,
             runner_resources=runner_resources,
             caller_run=caller_run,
+            **_personal_kwargs(personal),
         )
         return await validate_wait_claim(handle)
 

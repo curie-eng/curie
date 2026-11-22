@@ -7,6 +7,7 @@ kind scenario remains the proof that the product completes an issue.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import fcntl
 import json
 import os
@@ -52,10 +53,100 @@ def test_missing_replay_transcript_refuses_before_resource_mutation(
     missing = tmp_path / "missing-transcript.json"
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
-    args = fe.parse_args(["scripted", "--transcript", str(missing)])
+    args = fe.parse_args(["scripted", "--scenario", "publication", "--transcript", str(missing)])
 
     assert sk.main(args) == fe.EXIT_CONFIG
     assert "transcript" in capsys.readouterr().err.lower()
+
+
+def test_facts_configuration_needs_no_model_transcript(tmp_path: Path) -> None:
+    args = fe.parse_args(
+        ["scripted", "--scenario", "facts", "--transcript", str(tmp_path / "missing.json")]
+    )
+    sk.validate_configuration(args)
+    assert sk.ScriptedRun(args).model is None
+
+
+def test_facts_recording_refuses_before_resource_mutation(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    args = fe.parse_args(["scripted", "--scenario", "facts", "--record"])
+    assert sk.main(args) == fe.EXIT_CONFIG
+    assert "never records" in capsys.readouterr().err
+
+
+def test_recording_another_scenario_refuses_before_resource_mutation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    args = fe.parse_args(["scripted", "--scenario", "jira-one-ticket", "--record"])
+    assert sk.main(args) == fe.EXIT_CONFIG
+    assert "only the publication scenario supports recording" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("violation", [None, "admission", "request", "tool", "route"])
+def test_facts_scenario_executes_assertions_and_refuses_violations(
+    tmp_path: Path, violation: str | None
+) -> None:
+    import copy
+    import types
+
+    sample = json.loads((REPO_ROOT / "tests/vectors/factory-facts-v1.examples.json").read_text())[0]
+    sample["label_route"]["route"] = "github_user_via_app"
+    sample["request"]["comment_id"] = "4"
+    if violation == "admission":
+        sample["admission"] = "requested"
+    if violation == "request":
+        sample["request"]["comment_id"] = "3"
+    if violation == "tool":
+        sample["executables"][0]["state"] = "present"
+    if violation == "route":
+        sample["label_route"]["route"] = "github_user"
+    args = fe.parse_args(["scripted", "--scenario", "facts"])
+    driver = sk.ScriptedRun(args)
+    calls: list[Any] = []
+
+    class Stub:
+        request_log: list[Any] = []
+
+        def __init__(self) -> None:
+            self.rows: list[dict[str, Any]] = []
+
+        def add_issue_comment(
+            self, number: int, body: str, *, author: Any, app: Any = None
+        ) -> dict[str, Any]:
+            row = {"id": len(self.rows) + 1}
+            self.rows.append(row)
+            return row
+
+    def kubectl(*args: Any, **kwargs: Any) -> str:
+        calls.append(args)
+        return '{"items":[]}'
+
+    def api(method: str, path: str, body: Any = None) -> Any:
+        calls.append((method, path))
+        return {"items": []}
+
+    def wait(request: str) -> dict[str, Any]:
+        calls.append(("wait", request))
+        return copy.deepcopy(sample)
+
+    driver.stub = Stub()
+    driver.kubectl = kubectl
+    driver.facts_api = api
+    driver.wait_facts = wait
+    driver.sql = lambda query: {"work_items": 0, "execution_requests": 0, "deliveries": 2}
+    driver.run_tool_facts = lambda: calls.append(("tool-facts",))
+    github = types.SimpleNamespace(HUMAN={"type": "User"}, BOT={"type": "Bot"})
+    if violation is None:
+        driver.run_facts(github)
+        assert driver.evidence["model_requests"] == []
+        assert driver.evidence["api_work_items"] == driver.evidence["api_execution_requests"] == 0
+        assert any("restart" in call for call in calls)
+    else:
+        with pytest.raises(sk.ScriptedScenarioError):
+            driver.run_facts(github)
 
 
 def test_record_without_upstream_key_refuses_before_resource_mutation(
@@ -66,7 +157,10 @@ def test_record_without_upstream_key_refuses_before_resource_mutation(
     monkeypatch.delenv("CURIE_FACTORY_RECORD_KEY", raising=False)
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
-    args = fe.parse_args(["scripted", "--record", "--transcript", str(tmp_path / "record.json")])
+    args = fe.parse_args(
+        ["scripted", "--scenario", "publication", "--record",
+         "--transcript", str(tmp_path / "record.json")]
+    )
 
     assert sk.main(args) == fe.EXIT_CONFIG
     assert "CURIE_FACTORY_RECORD_KEY" in capsys.readouterr().err
@@ -90,7 +184,7 @@ def test_malformed_replay_transcript_refuses_before_resource_mutation(
     malformed.write_text(content)
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
-    args = fe.parse_args(["scripted", "--transcript", str(malformed)])
+    args = fe.parse_args(["scripted", "--scenario", "publication", "--transcript", str(malformed)])
 
     assert sk.main(args) == fe.EXIT_CONFIG
     assert "transcript" in capsys.readouterr().err.lower()
@@ -112,21 +206,61 @@ def test_well_formed_replay_transcript_passes_configuration(tmp_path: Path) -> N
             }
         )
     )
-    args = fe.parse_args(["scripted", "--transcript", str(transcript)])
+    args = fe.parse_args(["scripted", "--scenario", "publication", "--transcript", str(transcript)])
 
     sk.validate_configuration(args)
 
 
-def _replay_args(tmp_path: Path) -> Any:
+def _replay_args(tmp_path: Path, *, scenario: str = "publication") -> Any:
     transcript = tmp_path / "transcript.json"
     transcript.write_text(json.dumps({"version": 1, "exchanges": []}))
-    return fe.parse_args(["scripted", "--transcript", str(transcript)])
+    return fe.parse_args(["scripted", "--scenario", scenario, "--transcript", str(transcript)])
 
 
 def _evidence(tmp_path: Path) -> dict[str, Any]:
     files = list((tmp_path / "target/factory-e2e").glob("scripted-*.json"))
     assert len(files) == 1
     return json.loads(files[0].read_text())
+
+
+@pytest.fixture
+def scripted_decisions_bundle(tmp_path: Path) -> Path:
+    bundle = tmp_path / "bundle"
+    hooks = bundle / "hooks"
+    hooks.mkdir(parents=True)
+    helper = REPO_ROOT / "examples/dark-factory/hooks/decisions_section.py"
+    (hooks / helper.name).write_bytes(helper.read_bytes())
+    return bundle
+
+
+@pytest.mark.parametrize(
+    "case",
+    json.loads((REPO_ROOT / "tests/vectors/factory-decisions-section.json").read_text())["cases"],
+    ids=lambda case: case["id"],
+)
+def test_scripted_publication_decisions_match_the_shared_contract(
+    case: dict[str, Any], scripted_decisions_bundle: Path,
+) -> None:
+    pull = {"body": case["body"]}
+    if case["valid"]:
+        assert sk.assert_pull_request_decisions(scripted_decisions_bundle, pull) == len(
+            case["entries"]
+        )
+    else:
+        with pytest.raises(sk.ScriptedScenarioError, match="invalid Decisions section"):
+            sk.assert_pull_request_decisions(scripted_decisions_bundle, pull)
+
+
+def test_replayed_publication_contains_valid_decisions(scripted_decisions_bundle: Path) -> None:
+    transcript = json.loads(sk.TRANSCRIPT.read_text())
+    publications = [
+        block["input"]
+        for exchange in transcript["exchanges"]
+        for block in exchange["message"]["content"]
+        if block.get("name") == "mcp__curie__publish_changes"
+    ]
+    assert len(publications) == 1
+    assert sk.assert_pull_request_decisions(scripted_decisions_bundle, publications[0]) > 0
 
 
 def test_scripted_driver_records_the_curie_bin_it_used(
@@ -144,6 +278,8 @@ def test_scripted_driver_records_the_curie_bin_it_used(
         assert run.command(run.curie, "build").strip() == str(candidate_curie)
 
     monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+    # This test is about the binary; its stubbed install has no scenario to run.
+    monkeypatch.setattr(sk.ScriptedRun, "runs_one_ticket", False)
 
     assert sk.main(_replay_args(tmp_path)) == 0
     evidence = _evidence(tmp_path)
@@ -175,6 +311,8 @@ def test_scripted_driver_resolves_relative_and_path_binaries(
         assert run.command(run.curie, "build").strip() == str(candidate_curie)
 
     monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+    # This test is about the binary; its stubbed install has no scenario to run.
+    monkeypatch.setattr(sk.ScriptedRun, "runs_one_ticket", False)
 
     assert sk.main(_replay_args(tmp_path)) == 0
     evidence = _evidence(tmp_path)
@@ -264,7 +402,7 @@ def test_partial_resource_creation_failure_deletes_every_attempted_owned_resourc
     assert "connection lost after create" in evidence["error"]
     assert evidence["cleanup_verified"] is True
     assert evidence["cleanup_errors"] == []
-    assert ("docker", "rm", "-f", evidence["registry"]) in calls
+    assert ("docker", "rm", "-f", "-v", evidence["registry"]) in calls
     cluster_delete = ("kind", "delete", "cluster", "--name", evidence["cluster"])
     assert (cluster_delete in calls) is (failure_stage == "cluster")
     assert not list((tmp_path / "scratch").iterdir())
@@ -312,7 +450,7 @@ def test_remaining_owned_cluster_overrides_a_successful_scenario(
     assert evidence["cleanup_verified"] is False
     assert "owned kind cluster remains after teardown" in evidence["cleanup_errors"]
     assert "owned kind node container remains after teardown" in evidence["cleanup_errors"]
-    assert ("docker", "rm", "-f", evidence["registry"]) in calls
+    assert ("docker", "rm", "-f", "-v", evidence["registry"]) in calls
 
 
 def test_cluster_delete_error_does_not_prevent_registry_deletion(
@@ -339,7 +477,7 @@ def test_cluster_delete_error_does_not_prevent_registry_deletion(
     evidence = _evidence(tmp_path)
     assert evidence["cleanup_verified"] is False
     assert any("owned cluster deletion failed" in error for error in evidence["cleanup_errors"])
-    assert ("docker", "rm", "-f", evidence["registry"]) in calls
+    assert ("docker", "rm", "-f", "-v", evidence["registry"]) in calls
 
 
 def test_unexpected_real_model_request_fails_and_records_evidence_after_endpoint_cleanup(
@@ -432,7 +570,7 @@ def _assert_remaining_teardown_attempted(
     calls: list[tuple[str, ...]],
 ) -> None:
     assert ("kind", "delete", "cluster", "--name", run.cluster) in calls
-    assert ("docker", "rm", "-f", run.registry) in calls
+    assert ("docker", "rm", "-f", "-v", run.registry) in calls
     assert run.workdir is not None and not run.workdir.exists()
 
 
@@ -570,8 +708,48 @@ def test_failed_registry_delete_and_verification_still_remove_owned_workdir(
     errors = run.cleanup()
     assert any("owned registry verification failed" in error for error in errors)
     assert run.evidence["cleanup_verified"] is False
-    assert ("docker", "rm", "-f", run.registry) in calls
+    assert ("docker", "rm", "-f", "-v", run.registry) in calls
     assert run.workdir is not None and not run.workdir.exists()
+
+
+def test_teardown_removes_anonymous_volumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown removes anonymous volumes with the containers that own them."""
+
+    run = _cleanup_run(tmp_path, monkeypatch)
+    calls: list[tuple[str, ...]] = []
+    labelled_listings = 0
+
+    def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal labelled_listings
+        calls.append(argv)
+        output = ""
+        if argv[:3] == ("docker", "ps", "-aq") and any(
+            "label=curie.factory-scripted=" in arg for arg in argv
+        ):
+            labelled_listings += 1
+            if labelled_listings == 1:
+                output = "deadbeef\n"
+        elif argv[:3] not in {
+            ("kind", "delete", "cluster"),
+            ("kind", "get", "clusters"),
+            ("docker", "rm", "-f"),
+            ("docker", "ps", "-aq"),
+        }:
+            raise AssertionError(f"unexpected external command: {argv}")
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+
+    assert run.cleanup() == []
+    # docker rm --volumes removes anonymous volumes associated with the container.
+    # https://docs.docker.com/reference/cli/docker/container/rm/
+    rm_argv = [argv for argv in calls if argv[:2] == ("docker", "rm")]
+    assert ("docker", "rm", "-f", "-v", run.registry) in rm_argv
+    assert ("docker", "rm", "-f", "-v", "deadbeef") in rm_argv
+    assert all("-v" in argv for argv in rm_argv)
 
 
 def test_registry_publishes_the_explicit_port_its_mirror_names(
@@ -616,7 +794,10 @@ def _recording_run(
     monkeypatch.setenv("FACTORY_RUN_ID", run_id)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.delenv("CURIE_FACTORY_RECORD_BASELINE_REMAINING", raising=False)
-    args = fe.parse_args(["scripted", "--record", "--transcript", str(tmp_path / "record.json")])
+    args = fe.parse_args(
+        ["scripted", "--scenario", "publication", "--record",
+         "--transcript", str(tmp_path / "record.json")]
+    )
     run = sk.ScriptedRun(args)
     monkeypatch.setattr(run, "provider_remaining", lambda: remaining)
     monkeypatch.setattr(run, "command", lambda *_args, **_kwargs: str(tmp_path / "repo/.git"))
@@ -1134,28 +1315,152 @@ def test_recording_runs_sharing_a_ledger_forward_serially_with_ample_budget(
         _close_models(model_module, models, set())
 
 
-def test_driver_pins_the_local_docker_engine_over_an_inherited_remote_context(
+@pytest.mark.parametrize("inherited_host", [None, ""])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ssh://builder@engine.example.com",
+        "tcp://engine.example.com:2376",
+        "unix:///run/example/docker.sock",
+        "npipe:////./pipe/docker_engine",
+    ],
+)
+def test_driver_resolves_the_selected_docker_context_once_for_every_engine(
+    inherited_host: str | None,
+    endpoint: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """kind, docker and the registry must all talk to the same local engine."""
+    monkeypatch.setenv("DOCKER_CONTEXT", "example-builder")
+    if inherited_host is None:
+        monkeypatch.delenv("DOCKER_HOST", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_HOST", inherited_host)
+    calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
-    monkeypatch.setenv("DOCKER_CONTEXT", "remote-box")
+    def command(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, dict(kwargs["env"])))
+        if argv[:3] == ("docker", "context", "inspect"):
+            # Docker exposes the endpoint through context inspect's Go template:
+            # https://docs.docker.com/reference/cli/docker/context/inspect/
+            assert argv == (
+                "docker", "context", "inspect", "example-builder",
+                "--format", "{{json .Endpoints.docker.Host}}",
+            )
+            return subprocess.CompletedProcess(argv, 0, json.dumps(endpoint) + "\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
     run = sk.ScriptedRun(_replay_args(tmp_path))
-    assert run.env["DOCKER_CONTEXT"] == "default"
+    run.command("docker", "info")
+    run.command("kind", "get", "clusters")
+    run.command("docker", "buildx", "ls")
+
+    assert len(calls) == 4
+    assert calls[0][1]["DOCKER_CONTEXT"] == "example-builder"
+    assert calls[0][1].get("DOCKER_HOST") == inherited_host
+    assert [argv for argv, _env in calls[1:]] == [
+        ("docker", "info"), ("kind", "get", "clusters"), ("docker", "buildx", "ls"),
+    ]
+    for _argv, env in calls[1:]:
+        assert env["DOCKER_CONTEXT"] == "default"
+        assert env["DOCKER_HOST"] == endpoint
+        assert env["BUILDX_BUILDER"] == "default"
 
 
-def test_driver_pins_the_default_docker_context_and_keeps_an_inherited_docker_host(
+@pytest.mark.parametrize("context", [None, "default", "example-builder"])
+def test_driver_preserves_an_explicit_docker_host_without_inspecting_context(
+    context: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The default context is the engine DOCKER_HOST names, so keep DOCKER_HOST."""
+    if context is None:
+        monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_CONTEXT", context)
+    endpoint = "ssh://builder@engine.example.com"
+    monkeypatch.setenv("DOCKER_HOST", endpoint)
+    environments: list[dict[str, str]] = []
 
-    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
-    monkeypatch.setenv("DOCKER_HOST", "unix:///run/example/docker.sock")
+    def command(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert argv == ("docker", "info")
+        environments.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
     run = sk.ScriptedRun(_replay_args(tmp_path))
-    assert run.env["DOCKER_CONTEXT"] == "default"
-    assert run.env["DOCKER_HOST"] == "unix:///run/example/docker.sock"
+    assert environments == []
+    run.command("docker", "info")
+    assert len(environments) == 1
+    assert environments[0]["DOCKER_CONTEXT"] == "default"
+    assert environments[0]["DOCKER_HOST"] == endpoint
+
+
+@pytest.mark.parametrize("context", [None, "", "default"])
+def test_driver_keeps_default_docker_selection_without_inspecting_context(
+    context: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if context is None:
+        monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_CONTEXT", context)
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    environments: list[dict[str, str]] = []
+
+    def command(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert argv == ("docker", "info")
+        environments.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    assert environments == []
+    run.command("docker", "info")
+    assert len(environments) == 1
+    assert environments[0]["DOCKER_CONTEXT"] == "default"
+    assert "DOCKER_HOST" not in environments[0]
+
+
+@pytest.mark.parametrize(
+    "resolution",
+    [
+        "failed-inspect", "missing-docker", "timeout", "malformed-json", "null",
+        '""', '"ssh://"', '"not-an-endpoint"', '"ssh://engine.example.com with spaces"',
+    ],
+)
+def test_unresolvable_docker_context_refuses_before_resource_mutation(
+    resolution: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("DOCKER_CONTEXT", "example-builder")
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.ScriptedRun, "execute", _refuse_external_command)
+    monkeypatch.setattr(sk.ScriptedRun, "cleanup", _refuse_external_command)
+    calls: list[tuple[str, ...]] = []
+
+    def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if len(argv) == 2 and argv[1] == "--version":
+            return subprocess_run(argv, capture_output=True, text=True, check=False)
+        calls.append(argv)
+        assert argv[:4] == ("docker", "context", "inspect", "example-builder")
+        if resolution == "missing-docker":
+            raise FileNotFoundError("docker is unavailable")
+        if resolution == "timeout":
+            raise subprocess.TimeoutExpired(argv, 30)
+        if resolution == "failed-inspect":
+            return subprocess.CompletedProcess(argv, 1, "", "context is unavailable")
+        return subprocess.CompletedProcess(argv, 0, resolution, "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_CONFIG
+    assert "example-builder" in capsys.readouterr().err
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("docker_host", [None, "", "unix:///var/run/docker.sock"])
@@ -1392,7 +1697,11 @@ def _image_check_commands(
     return calls, mutating
 
 
-@pytest.mark.parametrize("missing", sk.IMAGES)
+# The publication replay needs the dispatcher image for the channel gateway.
+GATEWAY_IMAGES = (*sk.IMAGES, sk.GATEWAY_IMAGE)
+
+
+@pytest.mark.parametrize("missing", GATEWAY_IMAGES)
 def test_missing_local_image_refuses_as_configuration_before_resource_creation(
     missing: str,
     tmp_path: Path,
@@ -1422,20 +1731,73 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
         image for argv in calls if argv[:3] == ("docker", "image", "inspect")
         for image in argv[3:]
     }
-    assert sorted(inspected) == sorted(sk.IMAGES)
+    assert sorted(inspected) == sorted(GATEWAY_IMAGES)
     assert mutating, "the run must proceed past the image check"
     assert mutating[0][:2] in {("docker", "run"), ("kind", "create")}
     first_mutation = calls.index(mutating[0])
     assert all(
-        calls.index(("docker", "image", "inspect", image)) < first_mutation for image in sk.IMAGES
+        calls.index(("docker", "image", "inspect", image)) < first_mutation
+        for image in GATEWAY_IMAGES
     )
     assert "stop at first resource command" in _evidence(tmp_path)["error"]
 
 
+
+def test_admitted_candidate_map_keeps_image_refs_through_budget_and_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate_curie: Path,
+) -> None:
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent))
+    from c4_admitted_kind import CANDIDATE_CLI_ENV, CANDIDATE_IMAGES_ENV, AdmittedKind
+
+    monkeypatch.setenv("DOCKER_HOST", "tcp://docker.example.com:2376")
+
+    monkeypatch.setenv(CANDIDATE_CLI_ENV, str(candidate_curie))
+    monkeypatch.setenv(CANDIDATE_IMAGES_ENV, "curie-{component}:candidate")
+    monkeypatch.setenv("CURIE_LOCAL_STUB_HOST", "192.0.2.10")
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(sk.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 2**40})())
+    monkeypatch.setattr(sk, "client_loopback_port_is_free", lambda _port: True)
+    run = AdmittedKind(tmp_path, candidate_curie)
+    expected = tuple(run.images.values())
+    inspected: list[tuple[str, ...]] = []
+    imported: list[str] = []
+
+    class ImportsComplete(Exception):
+        pass
+
+    def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        output = ""
+        if argv[:3] == ("docker", "image", "inspect"):
+            refs = argv[3:]
+            assert all(ref in expected for ref in refs), refs
+            inspected.append(refs)
+            output = json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1024} for _ in refs])
+        elif argv[:2] == ("docker", "inspect"):
+            output = json.dumps([
+                {"NetworkSettings": {"Networks": {"kind": {"Gateway": "192.0.2.1"}}}}
+            ])
+        elif argv[:2] == ("docker", "version"):
+            output = "linux/amd64"
+        elif argv[:3] == ("kind", "get", "nodes"):
+            output = "acme-control-plane"
+        elif argv[:2] == ("docker", "exec"):
+            output = '[plugins."io.containerd.grpc.v1.cri".containerd]\nsnapshotter="overlayfs"\n'
+        elif argv[:3] == ("bash", "-o", "pipefail"):
+            imported.append(argv[-1])
+            if len(imported) == len(expected):
+                raise ImportsComplete
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+    with pytest.raises(ImportsComplete):
+        run.execute()
+    assert expected in inspected
+    assert tuple(imported) == expected
+
 def test_failed_publication_evidence_survives_verdict_without_transport_or_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
     request_id = "00000000-0000-0000-0000-000000000001"
     run.evidence["execution_request_id"] = request_id
     run.evidence["final_comment"] = {"body": f"<!-- curie-execution-request:{request_id} -->"}
@@ -1472,7 +1834,7 @@ def test_failed_publication_evidence_survives_verdict_without_transport_or_crede
 def test_publication_trust_uses_actual_worker_namespace_or_refuses(
     publication_namespace: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
     ca_file = tmp_path / "ca.pem"
     run.stub = type("StubCa", (), {"ca_file": ca_file})()
     calls: list[tuple[str, ...]] = []
@@ -1502,7 +1864,7 @@ def test_publication_trust_uses_actual_worker_namespace_or_refuses(
 def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
     run.secrets = ["example-sensitive-token"]
     calls: list[tuple[str, ...]] = []
     remaining = True
@@ -1544,7 +1906,14 @@ def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
 
 
 # Observed Docker image inspect Size values from a fresh main candidate build.
-_CANDIDATE_IMAGE_BYTES = (716245847, 708133868, 74690291, 1065367629)
+# The dispatcher figure is an estimate of the same order as the API image.
+_CANDIDATE_IMAGE_BYTES = {
+    "curie-api:local": 716245847,
+    "curie-worker:local": 708133868,
+    "curie-ui:local": 74690291,
+    "curie-runner:latest": 1065367629,
+    sk.GATEWAY_IMAGE: 700 * 1024**2,
+}
 
 
 @pytest.mark.parametrize("free_gib", [20, 8])
@@ -1563,7 +1932,7 @@ def test_runtime_disk_budget_reserves_candidate_import_and_workloads(
             return "kind v0.24.0"
         if argv[:3] == ("docker", "image", "inspect"):
             return json.dumps([
-                {"Size": _CANDIDATE_IMAGE_BYTES[sk.IMAGES.index(image)]}
+                {"Size": _CANDIDATE_IMAGE_BYTES[image]}
                 for image in argv[3:]
             ])
         assert argv[:2] in _READ_ONLY_PREREQUISITES
@@ -1600,6 +1969,7 @@ _LAYER_STAGE_IMAGE_BYTES = {
     "curie-api:local": 150 * 1024**2,
     "curie-worker:local": 150 * 1024**2,
     "curie-ui:local": 150 * 1024**2,
+    sk.GATEWAY_IMAGE: 150 * 1024**2,
     "curie-runner:latest": 745 * 1024**2,
 }
 _OBSERVED_HOSTED_FREE_BYTES = 26525540352
@@ -1714,3 +2084,1010 @@ def test_runner_layer_disk_budget_follows_the_runner_image(
         with pytest.raises(fe.ConfigError, match=str(_RUNNER_LAYER_BUDGET_BYTES)):
             run.deploy("localhost:5000")
         assert builds == []
+
+
+# Per-agent model lanes and the Slack recorder, offline. Each capability has a
+# negative control that fails when the capability is removed.
+
+import scripted_lanes as lanes  # noqa: E402
+import scripted_scenario as sso  # noqa: E402
+
+MODEL_SCRIPT = REPO_ROOT / "tools/model-script/model_script.py"
+RECORDED = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
+SHA = "0123456789abcdef0123456789abcdef01234567"
+REVIEWER = "Reviewer agent."
+
+
+@pytest.fixture
+def model_module() -> Any:
+    return sk._module("factory_model_script_lanes", MODEL_SCRIPT)
+
+
+def _frame(issue: int) -> str:
+    return (
+        "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\n"
+        "person: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n"
+        f"https://192.0.2.1:8443/acme-corp/acme-bot/issues/{issue}\n"
+        "[end-user-message curie-sender-boundary]"
+    )
+
+
+def _request(
+    issue: int, *, reviewer: bool = False, turns: list[dict[str, Any]] | None = None
+) -> bytes:
+    system = REVIEWER if reviewer else "Dark factory."
+    messages = [{"role": "user", "content": [{"type": "text", "text": _frame(issue)}]}]
+    messages += turns or []
+    return json.dumps(
+        {"system": [{"type": "text", "text": f"Platform preamble.\n\n{system}"}],
+         "messages": messages, "stream": True}
+    ).encode()
+
+
+def _tool_turn(output: str) -> list[dict[str, Any]]:
+    return [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_a", "name": "Bash",
+                                           "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_a",
+                                      "content": output}]},
+    ]
+
+
+def _text(exchange: dict[str, Any] | None) -> str:
+    assert exchange is not None
+    return json.dumps(exchange["message"])
+
+
+def _two_agent_router(model_module: Any) -> tuple[Any, lanes.LaneRouter]:
+    """The recorded implementation lane and a reviewer lane that shares its lane key."""
+
+    script = model_module.ModelScript(RECORDED)
+    recorded = model_module.load_transcript(RECORDED)
+    reviewer = [dict(recorded[0], message={"content": [{"type": "text", "text": "review ok"}]})]
+    router = lanes.LaneRouter({"reviewer": REVIEWER})
+    router.add(lanes.Lane("implementation", lanes.IMPLEMENTATION, 3815, recorded))
+    router.add(lanes.Lane("reviewer", "reviewer", 3815, reviewer))
+    router.install(script, model_module)
+    return script, router
+
+
+def test_agents_on_one_issue_collapse_without_lanes(model_module: Any) -> None:
+    """Negative control: the scripted model alone gives both agents one lane key."""
+    plain = model_module.ModelScript(RECORDED)
+    try:
+        reviewer = plain._match("POST", "/v1/messages", _request(3815, reviewer=True))
+        assert "Skill" in _text(reviewer)
+    finally:
+        plain._server.server_close()
+
+
+def test_router_answers_each_agent_from_its_own_lane(model_module: Any) -> None:
+    script, router = _two_agent_router(model_module)
+    try:
+        reviewer = script._match("POST", "/v1/messages", _request(3815, reviewer=True))
+        assert "review ok" in _text(reviewer)
+        implementation = script._match("POST", "/v1/messages", _request(3815))
+        assert "Skill" in _text(implementation) and "review ok" not in _text(implementation)
+        evidence = router.evidence()
+        assert evidence["reviewer"]["served_ordinals"] == [0]
+        assert evidence["implementation"]["served_ordinals"] == [0]
+        assert evidence["unrouted"] == []
+    finally:
+        script._server.server_close()
+
+
+def test_a_second_session_of_a_lane_is_not_answered(model_module: Any) -> None:
+    script, router = _two_agent_router(model_module)
+    try:
+        assert script._match("POST", "/v1/messages", _request(3815, reviewer=True))
+        assert script._match("POST", "/v1/messages", _request(3815, reviewer=True)) is None
+        assert router.unrouted and router.unrouted[-1]["lane"] == "reviewer"
+    finally:
+        script._server.server_close()
+
+
+def test_a_non_default_agent_never_borrows_the_implementation_transcript(
+    model_module: Any,
+) -> None:
+    script, router = _two_agent_router(model_module)
+    try:
+        assert script._match("POST", "/v1/messages", _request(3999, reviewer=True)) is None
+        assert router.unrouted == [{"agent": "reviewer", "issue": None}]
+    finally:
+        script._server.server_close()
+
+
+def test_an_answer_carries_the_revision_the_sandbox_printed(model_module: Any) -> None:
+    script = model_module.ModelScript(RECORDED)
+    recorded = model_module.load_transcript(RECORDED)
+    second = next(e for e in recorded if e["ordinal"] == 1)
+    placeholder = dict(
+        second, message={"content": [{"type": "text", "text": lanes.REVISION_PLACEHOLDER}]}
+    )
+    router = lanes.LaneRouter({})
+    router.add(lanes.Lane("implementation", lanes.IMPLEMENTATION, 3815, [recorded[0], placeholder]))
+    router.install(script, model_module)
+    try:
+        assert script._match("POST", "/v1/messages", _request(3815))
+        # No printed commit, no answer: the negative control.
+        bare = _tool_turn("Exit code 2\nerror: unknown unit k")
+        assert script._match("POST", "/v1/messages", _request(3815, turns=bare)) is None
+        assert router.unrouted[-1] == {"lane": "implementation", "missing": "observed_revision"}
+        turn = _tool_turn(f"Exit code 2\n{SHA}\nerror: unknown unit k")
+        answer = script._match("POST", "/v1/messages", _request(3815, turns=turn))
+        assert SHA in _text(answer) and lanes.REVISION_PLACEHOLDER not in _text(answer)
+        assert router.evidence()["implementation"]["observed_revisions"] == [SHA]
+    finally:
+        script._server.server_close()
+
+
+def test_a_resolver_supplies_the_lane_of_an_issue_the_platform_creates(
+    model_module: Any,
+) -> None:
+    script = model_module.ModelScript(RECORDED)
+    recorded = model_module.load_transcript(RECORDED)
+    router = lanes.LaneRouter({})
+    router.resolvers.append(
+        lambda agent, issue: lanes.Lane(
+            "implementation-created", agent, issue, lanes.retarget(recorded, 3815, issue)
+        )
+        if issue == 3904
+        else None
+    )
+    router.install(script, model_module)
+    try:
+        answer = script._match("POST", "/v1/messages", _request(3904))
+        assert "issues/3904" in _text(answer) and "3815" not in _text(answer)
+        assert router.lanes[(lanes.IMPLEMENTATION, 3904)].served == [0]
+        # Another issue has no resolver: it falls back to the recorded transcript.
+        assert "Skill" in _text(script._match("POST", "/v1/messages", _request(3815)))
+    finally:
+        script._server.server_close()
+
+
+def test_retarget_rewrites_whole_issue_numbers_only() -> None:
+    exchanges = [{"lane_key": "issue 3815 port 38150", "ordinal": 0,
+                  "message": {"content": [{"type": "text", "text": "Closes #3815"}]}}]
+    (moved,) = lanes.retarget(exchanges, 3815, 3904)
+    assert moved["lane_key"] == "issue 3904 port 38150"
+    assert moved["message"]["content"][0]["text"] == "Closes #3904"
+    with pytest.raises(lanes.LaneError):
+        lanes.retarget(exchanges, 1234, 3904)
+
+
+def _slack_call(recorder: lanes.SlackRecorder, method: str, body: bytes, kind: str) -> Any:
+    request = Request(
+        recorder.base_url + method, data=body, method="POST",
+        headers={"Content-Type": kind, "Authorization": "Bearer xoxb-example"},
+    )
+    with urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+
+def test_slack_recorder_records_posts_and_answers_like_slack() -> None:
+    recorder = lanes.SlackRecorder()
+    recorder.start()
+    try:
+        root = _slack_call(recorder, "chat.postMessage",
+                           json.dumps({"channel": sso.SLACK_CHANNEL, "text": "root"}).encode(),
+                           "application/json")
+        assert root["ok"] and root["channel"] == sso.SLACK_CHANNEL
+        reply = _slack_call(
+            recorder, "chat.postMessage",
+            f"channel={sso.SLACK_CHANNEL}&text=line&thread_ts={root['ts']}".encode(),
+            "application/x-www-form-urlencoded",
+        )
+        assert reply["ts"] != root["ts"]
+        _slack_call(recorder, "auth.test", b"{}", "application/json")
+        posts = recorder.posts()
+        assert [(p.text, p.thread_ts) for p in posts] == [("root", None), ("line", root["ts"])]
+        assert recorder.unauthenticated == 0
+        assert "xoxb-example" not in json.dumps(recorder.calls)
+    finally:
+        recorder.close()
+
+
+def test_slack_recorder_negative_control_counts_only_message_posts() -> None:
+    recorder = lanes.SlackRecorder()
+    recorder.start()
+    try:
+        _slack_call(recorder, "conversations.info", b"{}", "application/json")
+        assert recorder.posts() == []
+        assert [call["method"] for call in recorder.calls] == ["conversations.info"]
+    finally:
+        recorder.close()
+
+
+def test_scripted_values_route_slack_to_the_recorder_only_when_asked() -> None:
+    common = dict(model_base_url="http://192.0.2.1:9", github_api="https://192.0.2.1:8/api/v3",
+                  clone_base="https://192.0.2.1:8", ca_configmap="ca", runner_image="r")
+    values = sk.scripted_values(**common, slack_api_base_url="http://192.0.2.1:7/api/")
+    assert values["worker"]["slackApiBaseUrl"] == "http://192.0.2.1:7/api/"
+    assert values["dispatcher"]["slack"]["botToken"] == sk.SCRIPTED_SLACK_BOT_TOKEN
+    assert values["dispatcher"]["deploy"] is False
+    plain = sk.scripted_values(**common)
+    assert "slackApiBaseUrl" not in plain["worker"]
+    assert "slack" not in plain["dispatcher"]
+
+# The channel gateway runs on the dispatcher image, so a run that enables it
+# builds, inspects and imports that image into its cluster.
+
+
+def test_enabled_gateway_builds_and_imports_the_dispatcher_image_the_chart_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _replay_args(tmp_path)
+    args.build_images = True
+    run = sk.ScriptedRun(args)
+    assert run.gateway_enabled()
+    values = sk.scripted_values(
+        model_base_url="http://192.0.2.1:9",
+        github_api="https://192.0.2.1:8443/api/v3",
+        clone_base="https://192.0.2.1:8443",
+        ca_configmap="ca",
+        runner_image="localhost:5000/curie-runner",
+        slack_api_base_url="http://192.0.2.1:7/api/",
+    )
+    assert values["dispatcher"]["slack"]["botToken"], "the gateway is enabled"
+    image = values["dispatcher"]["image"]
+    chart_image = f"{image['repository']}:{image['tag']}"
+    assert chart_image == sk.GATEWAY_IMAGE
+
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(sk.ScriptedRun, "check_disk", lambda _self, _stage, **_kwargs: None)
+    monkeypatch.setattr(sk.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path / "work"))
+    monkeypatch.setattr(run, "start_registry", lambda: (5000, "localhost:5000"))
+    (tmp_path / "work").mkdir()
+    builds: dict[str, str] = {}
+    inspected: set[str] = set()
+    imported: list[str] = []
+
+    def command(*argv: str, **_kwargs: Any) -> str:
+        if argv[:2] == ("kind", "version"):
+            return "kind v0.24.0"
+        if argv[:3] == ("docker", "image", "inspect"):
+            inspected.update(argv[3:])
+            return json.dumps([{"Size": 1024} for _ in argv[3:]])
+        if argv[:2] == ("docker", "build"):
+            builds[argv[argv.index("-t") + 1]] = argv[argv.index("-f") + 1]
+        if argv[:2] == ("docker", "inspect"):
+            return json.dumps(
+                [{"NetworkSettings": {"Networks": {"kind": {"Gateway": "172.18.0.1"}}}}]
+            )
+        return ""
+
+    def load_images(_command: Any, cluster: str, images: Any) -> None:
+        assert cluster == run.cluster
+        imported.extend(images)
+        raise sk.ScriptedScenarioError("imported")
+
+    monkeypatch.setattr(run, "command", command)
+    monkeypatch.setattr(sk.kind_images, "load_images", load_images)
+    with pytest.raises(sk.ScriptedScenarioError, match="imported"):
+        run.execute()
+    assert builds[chart_image] == "apps/dispatcher/Dockerfile"
+    assert chart_image in inspected
+    assert chart_image in imported
+
+
+def _gateway_argv(scenario: str, *extra: str) -> Any:
+    return fe.parse_args(["scripted", "--scenario", scenario, *extra])
+
+
+def test_gateway_runs_only_on_the_publication_install() -> None:
+    publication = sk.ScriptedRun(_gateway_argv("publication"))
+    assert publication.gateway_enabled()
+    assert sk.GATEWAY_IMAGE in publication.image_refs
+
+    class NoSlack(sk.ScriptedRun):
+        SLACK_PROGRESS = False
+
+    for run in (
+        sk.ScriptedRun(_gateway_argv("facts")),
+        sk.ScriptedRun(_gateway_argv("jira-one-ticket")),
+        sk.ScriptedRun(_gateway_argv("publication", "--record")),
+        NoSlack(_gateway_argv("publication")),
+    ):
+        assert not run.gateway_enabled()
+        assert sk.GATEWAY_IMAGE not in run.image_refs
+
+
+def test_every_subclass_that_drives_its_own_scenario_runs_no_gateway(tmp_path: Path) -> None:
+    """A subclass left on the default would start the gateway on its own install."""
+
+    from c4_admitted_kind import AdmittedKind
+    from test_c4_held_cancellation import HeldRun
+
+    assert AdmittedKind(tmp_path, Path("curie")).gateway_enabled() is False
+    held = HeldRun.__new__(HeldRun)
+    held.args = _gateway_argv("publication")
+    assert held.gateway_enabled() is False
+
+
+def _post(method: str, text: str | None, *, thread_ts: str | None, ts: str,
+          channel: str = sso.SLACK_CHANNEL) -> lanes.SlackPost:
+    return lanes.SlackPost(method, channel, text, thread_ts, ts)
+
+
+PULL_REQUEST = "https://192.0.2.1:8443/acme-corp/acme-bot/pull/2"
+ROOT_TEXT = sso.SLACK_ROOT_PREFIX + ": started"
+
+
+def _slack_run(
+    ready: str | None = "root", ready_channel: str = sso.SLACK_CHANNEL, extra_card: bool = False
+) -> list[lanes.SlackPost]:
+    """Posts as a real SlackRecorder holds them: one root, one card, a ready reply.
+
+    ``ready`` is the thread the ready reply lands in: ``root`` (correct), another
+    thread's ts, or None for no ready reply at all.
+    """
+
+    recorder = lanes.SlackRecorder()
+    recorder.start()
+
+    def call(method: str, body: dict[str, Any], channel: str = sso.SLACK_CHANNEL) -> Any:
+        body = {"channel": channel, **body}
+        return _slack_call(recorder, method, json.dumps(body).encode(), "application/json")
+
+    try:
+        root = call("chat.postMessage", {"text": ROOT_TEXT})
+        card = call("chat.postMessage", {"text": "card", "thread_ts": root["ts"]})
+        call("chat.update", {"ts": card["ts"], "text": "card, finished"})
+        # Another scenario's thread: ignored.
+        call("chat.postMessage", {"text": "Factory run: other", "thread_ts": "9.9"})
+        if extra_card:
+            call("chat.postMessage", {"text": "card again", "thread_ts": root["ts"]})
+        if ready is not None:
+            call("chat.postMessage", {
+                "text": f"Opened {PULL_REQUEST}",
+                "thread_ts": root["ts"] if ready == "root" else ready,
+            }, ready_channel)
+        return recorder.posts()
+    finally:
+        recorder.close()
+
+
+def test_slack_progress_accepts_root_card_and_ready() -> None:
+    counts = sso.assert_slack_progress(_slack_run(), sso.SLACK_CHANNEL, PULL_REQUEST)
+    assert counts == {"root": 1, "card": 1, "ready": 1}
+
+
+def test_slack_progress_refuses_a_missing_or_misthreaded_ready_post() -> None:
+    for posts in (_slack_run(ready=None), _slack_run(ready="9.9")):
+        with pytest.raises(sso.ScenarioAssertionError, match="ready reply"):
+            sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+class _RecordedSlack:
+    """Stands in for the run's recorder with the posts a real SlackRecorder held."""
+
+    def __init__(self, posts: list[lanes.SlackPost]) -> None:
+        self._posts = posts
+
+    def posts(self) -> list[lanes.SlackPost]:
+        return self._posts
+
+
+def _publication_run(posts: list[lanes.SlackPost]) -> sk.ScriptedRun:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    run.slack = _RecordedSlack(posts)  # type: ignore[assignment]
+    run.evidence["pull_request"] = {"html_url": PULL_REQUEST}
+    return run
+
+
+def test_the_recorder_stamps_each_post_with_its_receive_time() -> None:
+    before = time.monotonic()
+    posts = _slack_run()
+    after = time.monotonic()
+    assert posts and all(before <= post.received_at <= after for post in posts)
+
+
+def test_the_run_records_the_slack_post_counts_in_its_evidence() -> None:
+    run = _publication_run(_slack_run())
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
+
+
+def test_the_run_fails_when_the_ready_reply_lands_outside_the_root_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sk, "SLACK_PROGRESS_SECONDS", 0)
+    run = _publication_run(_slack_run(ready="9.9"))
+    with pytest.raises(sk.ScriptedScenarioError, match="Slack progress: .*ready reply"):
+        run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
+
+
+def test_a_run_without_the_gateway_does_not_wait_for_slack() -> None:
+    run = sk.ScriptedRun(_gateway_argv("jira-one-ticket"))
+    run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
+
+
+def test_the_run_binds_the_factory_agent_to_the_slack_channel_before_the_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _publication_run([])
+    run.evidence["agent_id"] = "agent-example"
+    run.env.update(CURIE_API_URL="http://api.example.com", CURIE_API_KEY="example-key")
+    calls: list[tuple[str, str, Any]] = []
+
+    def http_json(method: str, url: str, **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        calls.append((method, url, kwargs["body"]))
+        return 200, {}
+
+    monkeypatch.setattr(fe, "http_json", http_json)
+    monkeypatch.setattr(run, "kubectl", lambda *_args, **_kwargs: "")
+    run.bind_slack()
+    assert calls == [
+        ("POST", "http://api.example.com/agents/agent-example/channels",
+         {"kind": "slack", "address": sso.SLACK_CHANNEL}),
+        ("PATCH", "http://api.example.com/agents/agent-example",
+         {"factory_slack_channel": sso.SLACK_CHANNEL}),
+    ]
+    monkeypatch.setattr(fe, "http_json", lambda *_a, **_k: (409, {}))
+    with pytest.raises(sk.ScriptedScenarioError, match="Slack binding returned HTTP 409"):
+        run.bind_slack()
+
+
+def test_slack_progress_refuses_a_ready_reply_in_another_channel_or_a_second_card() -> None:
+    other = "C0EXAMPLE8"
+    with pytest.raises(sso.ScenarioAssertionError, match="ready reply"):
+        sso.assert_slack_progress(
+            _slack_run(ready_channel=other), sso.SLACK_CHANNEL, PULL_REQUEST
+        )
+    with pytest.raises(sso.ScenarioAssertionError, match="one card"):
+        sso.assert_slack_progress(_slack_run(extra_card=True), sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+def test_slack_progress_ignores_an_update_of_the_card_in_another_channel() -> None:
+    posts = [
+        lanes.SlackPost(p.method, "C0EXAMPLE8" if p.method == "chat.update" else p.channel,
+                        p.text, p.thread_ts, p.ts)
+        for p in _slack_run()
+    ]
+    with pytest.raises(sso.ScenarioAssertionError, match="never updated"):
+        sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+def _received_at(posts: list[lanes.SlackPost], seconds: float) -> list[lanes.SlackPost]:
+    """The same posts as the recorder received them ``seconds`` after the final comment."""
+
+    return [dataclasses.replace(post, received_at=seconds) for post in posts]
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch, now: float) -> None:
+    monkeypatch.setattr(
+        sk, "time", type("Clock", (), {"monotonic": staticmethod(lambda: now),
+                                       "sleep": staticmethod(lambda _s: None)})
+    )
+
+
+def test_a_settled_result_after_the_bound_is_late(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = _publication_run(_received_at(_slack_run(), 181.0))
+    run.final_comment_at = 0.0
+    _clock(monkeypatch, 182.0)
+    with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+        run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
+
+
+def test_posts_received_on_time_pass_however_late_the_run_looks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorder had everything one second after the final comment; the check ran at 181."""
+
+    run = _publication_run(_received_at(_slack_run(), 1.0))
+    run.final_comment_at = 0.0
+    _clock(monkeypatch, 181.0)
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
+
+
+def test_identical_posts_are_judged_by_their_receive_time_not_the_check_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for received, passes in ((179.0, True), (181.0, False)):
+        run = _publication_run(_received_at(_slack_run(), received))
+        run.final_comment_at = 0.0
+        _clock(monkeypatch, 400.0)
+        if passes:
+            run.wait_for_slack_progress()
+            assert "slack_posts" in run.evidence
+        else:
+            with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+                run.wait_for_slack_progress()
+
+
+def test_the_bound_starts_at_the_final_comment_not_at_the_slack_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _publication_run(_received_at(_slack_run(), 190.0))
+    run.final_comment_at = 0.0
+    _clock(monkeypatch, 190.0)
+    with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+        run.wait_for_slack_progress()
+
+
+def test_a_duplicate_card_that_arrives_after_the_first_check_fails_the_run() -> None:
+    run = _publication_run(_slack_run())
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
+    run.slack = _RecordedSlack(_slack_run(extra_card=True))  # type: ignore[assignment]
+    with pytest.raises(sk.ScriptedScenarioError, match="end of the run: .*one card"):
+        run.verify_slack_progress()
+
+
+def test_the_publication_install_fails_without_its_recorder() -> None:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    run.evidence["pull_request"] = {"html_url": PULL_REQUEST}
+    with pytest.raises(sk.ScriptedScenarioError, match="recorder did not start"):
+        run.wait_for_slack_progress()
+    with pytest.raises(sk.ScriptedScenarioError, match="recorder did not start"):
+        run.bind_slack()
+
+
+def test_the_publication_binds_slack_then_labels_then_waits_then_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    calls: list[str] = []
+    monkeypatch.setattr(run, "bind_slack", lambda: calls.append("bind"))
+    monkeypatch.setattr(run, "label_issue", lambda _github: calls.append("label"))
+    monkeypatch.setattr(run, "wait_for_final", lambda: calls.append("wait"))
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "wait_for_slack_progress", lambda: calls.append("slack"))
+    monkeypatch.setattr(run, "verify_slack_progress", lambda: calls.append("slack-final"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+    run.router = lanes.LaneRouter({})
+    run.run_publication(None)
+    assert calls == ["bind", "label", "wait", "observe", "slack", "one-ticket", "slack-final"]
+
+
+def test_slack_progress_refuses_a_card_that_was_never_updated() -> None:
+    posts = [p for p in _slack_run() if p.method != "chat.update"]
+    with pytest.raises(sso.ScenarioAssertionError, match="never updated"):
+        sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+def test_slack_progress_refuses_a_second_root_post() -> None:
+    posts = _slack_run()
+    posts.append(_post("chat.postMessage", ROOT_TEXT, thread_ts=None, ts="7.7"))
+    with pytest.raises(sso.ScenarioAssertionError, match="one Slack root post"):
+        sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+# one-ticket (#5788): the scenario runs on every replayed install, and its
+# verdict is the evidence file's ``one_ticket.result``.
+
+import one_ticket_run  # noqa: E402
+import one_ticket_scenario as ots  # noqa: E402
+
+
+@pytest.mark.parametrize("outcome", ["passed", "failed"])
+def test_the_one_ticket_verdict_reaches_the_evidence_file_and_the_exit_code(
+    outcome: str, candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+
+    def one_ticket_execute(self: one_ticket_run.OneTicket, _github: Any) -> None:
+        if outcome == "failed":
+            raise ots.OneTicketAssertionError("a second request after the bot comment")
+        self.evidence["result"] = "passed"
+
+    def execute(run: sk.ScriptedRun) -> None:
+        run.router = lanes.LaneRouter({})
+        run.run_one_ticket(None)
+
+    monkeypatch.setattr(one_ticket_run.OneTicket, "execute", one_ticket_execute)
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+
+    assert sk.main(_replay_args(tmp_path)) == (0 if outcome == "passed" else fe.EXIT_FAILED)
+    evidence = _evidence(tmp_path)
+    assert evidence["one_ticket"]["result"] == outcome
+    assert evidence["result"] == outcome
+    if outcome == "failed":
+        assert "second request after the bot comment" in evidence["error"]
+        assert evidence["one_ticket"]["error"] == "a second request after the bot comment"
+
+
+def test_the_scripted_command_fails_when_the_one_ticket_scenario_did_not_run(
+    candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.ScriptedRun, "execute", lambda _run: None)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+
+    evidence = _evidence(tmp_path)
+    assert evidence["result"] == "failed"
+    assert evidence["error"] == "the one-ticket scenario did not run"
+    assert "one_ticket" not in evidence
+
+
+def test_the_scripted_command_fails_when_the_one_ticket_scenario_did_not_pass(
+    candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+
+    def execute(run: sk.ScriptedRun) -> None:
+        run.one_ticket = one_ticket_run.OneTicket(run, lanes.LaneRouter({}))
+
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+    assert _evidence(tmp_path)["error"] == "the one-ticket scenario did not pass"
+
+
+@pytest.mark.parametrize(
+    ("argv", "required"),
+    [
+        (["scripted", "--scenario", "publication"], True),
+        (["scripted", "--scenario", "publication", "--record"], False),
+        (["scripted", "--scenario", "facts"], False),
+    ],
+)
+def test_the_one_ticket_verdict_is_owed_by_every_replay_of_an_install_and_no_other_run(
+    argv: list[str], required: bool
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(argv))
+
+    assert run.one_ticket_required() is required
+    assert (run.one_ticket_verdict_error() is not None) is required
+
+
+def test_the_scenarios_after_the_publication_scenario_call_the_one_ticket_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The call site itself: removing the call from ``run_scenarios`` fails this test."""
+
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
+    run.router = lanes.LaneRouter({})
+    calls: list[str] = []
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "wait_for_slack_progress", lambda: calls.append("slack"))
+    monkeypatch.setattr(run, "verify_slack_progress", lambda: calls.append("slack-final"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+
+    run.run_scenarios(None)
+
+    assert calls == ["observe", "slack", "one-ticket", "slack-final"]
+
+
+def test_a_fixture_that_owns_its_agents_does_not_run_the_one_ticket_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from c4_admitted_kind import AdmittedKind
+
+    run = AdmittedKind(tmp_path, Path("curie"))
+    run.router = lanes.LaneRouter({})
+    calls: list[str] = []
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+
+    run.run_scenarios(None)
+
+    assert calls == ["observe"]
+    assert run.one_ticket_required() is False
+
+
+def test_only_the_scripted_command_runs_the_one_ticket_scenario_on_its_install() -> None:
+    # The c4 fixtures subclass ScriptedRun to provision their own agents and
+    # drive their own tickets; the one-ticket flow needs the agent execute makes
+    # and a free fixture repository, so it is theirs to skip.
+    from c4_admitted_kind import AdmittedKind
+    from test_c4_held_cancellation import HeldRun
+
+    assert sk.ScriptedRun.runs_one_ticket is True
+    assert AdmittedKind.runs_one_ticket is False
+    assert HeldRun.runs_one_ticket is False
+
+
+def test_the_publication_scenario_installs_the_one_ticket_lane_and_the_gateway() -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
+    assert run.gateway_enabled()
+    assert run.one_ticket is None
+    model = sk._module("factory_model_script_one_ticket", MODEL_SCRIPT)
+    lane = one_ticket_run.build_lane(model)
+    assert (lane.agent, lane.issue) == (lanes.IMPLEMENTATION, ots.ISSUE)
+    assert lane.exchanges, "the transcript holds both sessions"
+
+
+# The learned rules chain (#5799): its configuration, its driver and its recording.
+
+import learned_rules_lanes as lrl  # noqa: E402
+import learned_rules_run as lrr  # noqa: E402
+
+
+def _chain_transcripts(tmp_path: Path, *, skip: str | None = None) -> Path:
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    first.parent.mkdir(exist_ok=True)
+    for letter, path in lrl.transcript_paths(first).items():
+        if letter != skip:
+            path.write_text(json.dumps({"version": 1, "exchanges": []}))
+    return first
+
+
+def _chain_args(transcript: Path, *extra: str) -> Any:
+    return fe.parse_args(
+        ["scripted", "--scenario", "learned-rules", "--transcript", str(transcript), *extra]
+    )
+
+
+@pytest.mark.parametrize("missing", ["b", "c"])
+def test_learned_rules_replay_without_a_sibling_refuses_before_any_external_command(
+    missing: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    first = _chain_transcripts(tmp_path, skip=missing)
+
+    assert sk.main(_chain_args(first)) == fe.EXIT_CONFIG
+    assert f"learned-rules-chain-{missing}.json is missing" in capsys.readouterr().err
+
+
+def test_learned_rules_replay_refuses_a_malformed_sibling_and_an_unpaired_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    first = _chain_transcripts(tmp_path)
+    first.with_name("learned-rules-chain-c.json").write_text('{"version": 1, "exchanges": [')
+    assert sk.main(_chain_args(first)) == fe.EXIT_CONFIG
+    assert "learned-rules-chain-c.json is malformed" in capsys.readouterr().err
+
+    unpaired = tmp_path / "chain" / "transcript.json"
+    unpaired.write_text(json.dumps({"version": 1, "exchanges": []}))
+    assert sk.main(_chain_args(unpaired)) == fe.EXIT_CONFIG
+    assert "is not named <stem>-a.json" in capsys.readouterr().err
+
+
+def test_learned_rules_replay_with_all_three_transcripts_passes_configuration(
+    tmp_path: Path,
+) -> None:
+    sk.validate_configuration(_chain_args(_chain_transcripts(tmp_path)))
+
+
+def test_learned_rules_may_record_with_the_key_and_writes_the_chain_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    recording = fe.parse_args(["scripted", "--scenario", "learned-rules", "--record"])
+    sk.validate_configuration(recording)
+    run = lrr.LearnedRulesRun(recording)
+    assert run.transcripts["a"] == lrr.RECORD_TARGET
+    assert run.transcripts["b"].name == "learned-rules-chain-b.json"
+    # A named target must be an A file, since the B and C files sit beside it.
+    sk.validate_configuration(_chain_args(tmp_path / "x-a.json", "--record"))
+    with pytest.raises(fe.ConfigError, match="<stem>-a.json"):
+        sk.validate_configuration(_chain_args(tmp_path / "x.json", "--record"))
+
+
+def test_learned_rules_recording_without_the_key_refuses_before_any_external_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("CURIE_FACTORY_RECORD_KEY", raising=False)
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    args = fe.parse_args(["scripted", "--scenario", "learned-rules", "--record"])
+    assert sk.main(args) == fe.EXIT_CONFIG
+    assert "CURIE_FACTORY_RECORD_KEY" in capsys.readouterr().err
+
+
+def test_main_runs_the_learned_rules_scenario_in_its_own_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    ran: list[type] = []
+
+    def execute(run: sk.ScriptedRun) -> None:
+        ran.append(type(run))
+
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+    assert sk.main(_chain_args(_chain_transcripts(tmp_path))) == 0
+    assert ran == [lrr.LearnedRulesRun]
+    evidence = _evidence(tmp_path)
+    assert evidence["learned_rules"]["scenario"] == "learned-rules"
+
+
+def test_the_learned_rules_scenario_owes_no_one_ticket_verdict_and_the_others_still_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chain = lrr.LearnedRulesRun(_chain_args(_chain_transcripts(tmp_path)))
+    assert chain.one_ticket_required() is False
+    assert chain.one_ticket_verdict_error() is None
+    assert not chain.gateway_enabled() and sk.GATEWAY_IMAGE not in chain.image_refs
+    assert chain.router_fallback() is False
+    run = sk.ScriptedRun(_replay_args(tmp_path, scenario="publication"))
+    assert run.one_ticket_required() is True
+    assert run.one_ticket_verdict_error() == "the one-ticket scenario did not run"
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    recording = fe.parse_args(["scripted", "--scenario", "publication", "--record"])
+    assert sk.ScriptedRun(recording).one_ticket_required() is False
+
+
+def test_the_default_hooks_route_the_existing_scenarios_as_before(tmp_path: Path) -> None:
+    model = sk._module("factory_model_script_hooks", MODEL_SCRIPT)
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    assert run.model_options(model) == {}
+    assert run.router_fallback() is True
+    router = run.make_router(model)
+    assert router is not None and router.agent_markers == {}
+    assert [lane.name for lane in router.lanes.values()] == ["one-ticket"]
+    values: dict[str, Any] = {"api": {"extraEnv": [{"name": "X", "value": "1"}]}}
+    run.extend_install_values(values)
+    assert values == {"api": {"extraEnv": [{"name": "X", "value": "1"}]}}
+
+
+def test_learned_rules_install_values_add_the_oidc_settings_by_secret_reference(
+    tmp_path: Path,
+) -> None:
+    run = lrr.LearnedRulesRun(_chain_args(_chain_transcripts(tmp_path)))
+    values: dict[str, Any] = {
+        "api": {"extraEnv": [{"name": "KEEP", "value": "1"}, {"name": "CURIE_OIDC_ISSUER"}]}
+    }
+    run.extend_install_values(values)
+    env = {entry["name"]: entry for entry in values["api"]["extraEnv"]}
+    assert env["KEEP"] == {"name": "KEEP", "value": "1"}
+    assert env["CURIE_OIDC_ISSUER"]["value"] == run.issuer
+    assert run.issuer.endswith(".svc.cluster.local:5556/dex")
+    assert env["CURIE_OIDC_CLIENT_SECRET"] == {
+        "name": "CURIE_OIDC_CLIENT_SECRET",
+        "valueFrom": {"secretKeyRef": {"name": lrr.OIDC_SECRET, "key": lrr.OIDC_SECRET_KEY}},
+    }
+    assert env["CURIE_OIDC_REDIRECT_URI"]["value"] == run.redirect_uri
+    assert env["CURIE_OIDC_ADMIT_ALL_AUTHENTICATED"]["value"] == "true"
+    assert len([e for e in values["api"]["extraEnv"] if e["name"] == "CURIE_OIDC_ISSUER"]) == 1
+
+
+class _RecordedStub:
+    host = "192.0.2.10"
+    port = 34567
+    base_url = "https://192.0.2.10:34567"
+
+
+class _RecordedModel:
+    def __init__(self, exchanges: list[dict[str, Any]], tags: list[str | None]) -> None:
+        self._exchanges = exchanges
+        self.recorded_tags = tags
+        self._lock = threading.Lock()
+
+
+def _recorded(lane: str, text: str) -> dict[str, Any]:
+    return {
+        "lane_key": lane,
+        "ordinal": 0,
+        "message": {"type": "message", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def test_a_learned_rules_recording_is_split_by_ticket_and_scrubbed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    run = lrr.LearnedRulesRun(_chain_args(first, "--record"))
+    run.stub = _RecordedStub()
+    run.model = _RecordedModel(
+        [
+            _recorded("a0", "cloned https://192.0.2.10:34567/acme-corp/acme-bot.git"),
+            _recorded("b0", "host 192.0.2.10:34567"),
+            _recorded("a1", "pushed to 192.0.2.10"),
+            _recorded("c0", "done"),
+        ],
+        ["a", "b", "a", "c"],
+    )
+    # A committed A file from an earlier recording; ModelScript dumps elsewhere.
+    first.parent.mkdir()
+    first.write_text(json.dumps({"version": 1, "exchanges": [{"stale": True}]}))
+    run.workdir = tmp_path / "work"
+    assert run.model_transcript() == run.workdir / "recording-raw.json"
+    assert run.model_transcript() not in run.transcripts.values()
+    run.write_recording()
+
+    model = sk._module("factory_model_script_split", MODEL_SCRIPT)
+    written = {letter: model.load_transcript(path) for letter, path in run.transcripts.items()}
+    assert [e["lane_key"] for e in written["a"]] == ["a0", "a1"]
+    assert [e["lane_key"] for e in written["b"]] == ["b0"]
+    assert [e["lane_key"] for e in written["c"]] == ["c0"]
+    texts = json.dumps(written)
+    assert "192.0.2.10" not in texts
+    assert "https://stub.example.test/acme-corp/acme-bot.git" in texts
+    assert "host stub.example.test" in texts
+    assert run.evidence["recorded_exchanges"] == {"a": 2, "b": 1, "c": 1}
+
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.model = _RecordedModel([_recorded("x", "cloned 192.0.2.10:34567")], [None])
+    with pytest.raises(lanes.LaneError, match="no known ticket tag"):
+        run.write_recording()
+    # A failed split leaves every committed file as it was.
+    assert {letter: path.read_text() for letter, path in run.transcripts.items()} == committed
+
+
+@pytest.mark.parametrize(
+    ("exchanges", "tags", "passed"),
+    [
+        # A failure after ticket A's model calls: the split alone would succeed and
+        # replace B and C with empty transcripts.
+        ([_recorded("a0", "one"), _recorded("a1", "two")], ["a", "a"], False),
+        # A failure after the model was set up and before its first call.
+        ([], [], False),
+        # The control: a chain the judge passed writes all three files.
+        (
+            [_recorded("a0", "one"), _recorded("b0", "two"), _recorded("c0", "three")],
+            list("abc"),
+            True,
+        ),
+    ],
+    ids=["failed-after-a", "failed-before-first-call", "passed-chain-writes"],
+)
+def test_cleanup_replaces_the_replay_fixtures_only_after_a_passed_chain(
+    exchanges: list[dict[str, Any]],
+    tags: list[str | None],
+    passed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    # The cluster, registry and endpoint teardown is not under test here.
+    monkeypatch.setattr(sk.ScriptedRun, "cleanup", lambda _self: [])
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    first.parent.mkdir()
+    run = lrr.LearnedRulesRun(_chain_args(first, "--record"))
+    for path in run.transcripts.values():
+        path.write_text(json.dumps({"version": 1, "exchanges": [{"committed": path.name}]}))
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.stub = _RecordedStub()
+    run.model = _RecordedModel(list(exchanges), list(tags))
+    run.workdir = tmp_path / "work"
+    if passed:
+        run.chain["result"] = "passed"
+    run.cleanup()
+    after = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    assert (after != committed) is passed
+    if passed:
+        assert [e["lane_key"] for e in json.loads(after["b"])["exchanges"]] == ["b0"]
+
+
+@pytest.mark.parametrize("failure", ["teardown", "transcript-write"])
+def test_a_passed_chain_replaces_no_fixture_when_teardown_or_a_write_fails(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
+    monkeypatch.setattr(
+        sk.ScriptedRun,
+        "cleanup",
+        lambda _self: (
+            ["owned kind cluster remains after teardown"] if failure == "teardown" else []
+        ),
+    )
+    original_write_text = Path.write_text
+
+    def write_text(self: Path, *args: Any, **kwargs: Any) -> int:
+        if failure == "transcript-write" and "learned-rules-chain-b.json" in self.name:
+            raise OSError("disk full")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    first = tmp_path / "chain" / "learned-rules-chain-a.json"
+    first.parent.mkdir()
+    run = lrr.LearnedRulesRun(_chain_args(first, "--record"))
+    for path in run.transcripts.values():
+        committed_text = json.dumps({"version": 1, "exchanges": [{"committed": path.name}]})
+        original_write_text(path, committed_text)
+    committed = {letter: path.read_text() for letter, path in run.transcripts.items()}
+    run.stub = _RecordedStub()
+    run.model = _RecordedModel(
+        [_recorded("a0", "one"), _recorded("b0", "two"), _recorded("c0", "three")], list("abc")
+    )
+    run.workdir = tmp_path / "work"
+    run.chain["result"] = "passed"
+
+    errors = run.cleanup()
+
+    assert errors
+    assert {letter: path.read_text() for letter, path in run.transcripts.items()} == committed
+    assert not list(first.parent.glob("*.tmp"))

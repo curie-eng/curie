@@ -51,11 +51,17 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from curie_internal.approval_reminder import ApprovalReminderV1
-from curie_telemetry import operation_span, record_metric
+from curie_telemetry import (
+    agent_metric_label,
+    observed_agent_metric_labels,
+    operation_span,
+    record_metric,
+)
 from fastapi import HTTPException
 from opentelemetry.trace import SpanKind, StatusCode
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from curie_api.crud import agents as crud_agents
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import publications as crud_publications
 
@@ -106,22 +112,32 @@ async def sweep_due_reminders(
 async def observe_pending_approvals(
     session: AsyncSession, *, now: datetime | None = None
 ) -> None:
-    """Publish authoritative fleet inventory; observation never gates a sweep."""
+    """Publish authoritative per-agent inventory; observation never gates a sweep."""
 
     try:
-        count, oldest = await crud_approvals.pending_approval_inventory(session)
+        inventory = await crud_approvals.pending_approval_inventory(session)
     except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning("pending approval telemetry observation failed (%s)", type(exc).__name__)
         return
+    buckets: dict[str, tuple[int, datetime | None]] = {}
+    for agent_name, count, oldest in inventory:
+        label = agent_metric_label(agent_name)
+        prior_count, prior_oldest = buckets.get(label, (0, None))
+        if prior_oldest is not None and (oldest is None or prior_oldest < oldest):
+            oldest = prior_oldest
+        buckets[label] = (prior_count + count, oldest)
     observed_at = now or datetime.now(UTC).replace(tzinfo=None)
-    attributes = {
-        "service.name": "curie-api",
-        "operation": "observe",
-        "outcome": "pending",
-    }
-    record_metric("curie.approval.pending", count, attributes=attributes)
-    age = 0.0 if oldest is None else max(0.0, (observed_at - oldest).total_seconds())
-    record_metric("curie.approval.pending.age", age, attributes=attributes)
+    for label in sorted(observed_agent_metric_labels()):
+        count, oldest = buckets.get(label, (0, None))
+        attributes = {
+            "service.name": "curie-api",
+            "operation": "observe",
+            "outcome": "pending",
+            "agent": label,
+        }
+        record_metric("curie.approval.pending", count, attributes=attributes)
+        age = 0.0 if oldest is None else max(0.0, (observed_at - oldest).total_seconds())
+        record_metric("curie.approval.pending.age", age, attributes=attributes)
 
 
 class SealedExpiryCursor:
@@ -172,7 +188,7 @@ async def sweep_expired_approvals(
     # @spec HTTP-APPROVAL-CONTINUITY-10: only rows without stored provenance are
     # legacy candidates, and the pass pages past any it classifies as selected,
     # so rows this writer must leave pending never fill its batch.
-    approval_work: list[tuple[uuid.UUID, Any]] = []
+    approval_work: list[tuple[uuid.UUID, Any, str]] = []
     after: tuple[datetime, uuid.UUID] | None = None
     for _ in range(_LEGACY_PAGES):
         page = await crud_approvals.list_expired_pending_approvals(
@@ -193,7 +209,12 @@ async def sweep_expired_approvals(
                 )
                 continue
             if not selected and len(approval_work) < limit:
-                approval_work.append((record.id, approval_trace_context(record)))
+                agent = (
+                    await crud_agents.get_agent(session, record.agent_id)
+                    if record.agent_id is not None else None
+                )
+                label = agent_metric_label(agent.name if agent is not None else None)
+                approval_work.append((record.id, approval_trace_context(record), label))
         if len(approval_work) >= limit or len(page) < limit:
             break
     sealed_ids: list[uuid.UUID] = []
@@ -237,7 +258,7 @@ async def sweep_expired_approvals(
             logger.warning("selected approval %s expired; resume left owed", approval_id)
 
     flipped = 0
-    for approval_id, stored_parent in approval_work:
+    for approval_id, stored_parent, metric_agent in approval_work:
         # @spec HTTP-APPROVAL-CONTINUITY-14: classify again under the identity
         # reader lock in the transaction the flip commits; a role change since
         # the page read leaves a now-selected row to the sealing owner.
@@ -299,6 +320,7 @@ async def sweep_expired_approvals(
                 attributes={
                     "service.name": "curie-api",
                     "operation": "expire",
+                    "agent": metric_agent,
                     "outcome": "expired",
                 },
             )

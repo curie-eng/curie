@@ -39,13 +39,18 @@ from curie_api.schemas.publications import (
 )
 from curie_api.schemas.workspaces import RepositoryCredentialOut
 
-from .. import factory_ci, factory_progress
+from .. import factory_ci, factory_progress, memory_rules_context, requester_instruction_context
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
 )
 from ..config import get_settings
 from ..deps import SessionDep
+from ..factory_comment_text import (
+    append_github_ask_line,
+    end_trailing_decisions,
+    without_trailing_blank_lines,
+)
 from ..factory_rediscovery import issue_marker, publishing_code_host
 from ..forges.config import RepositoryBindingConfig
 from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
@@ -89,6 +94,7 @@ from ..publication_verification import (
     VerifiedPublicationCommit,
     forge_failure,
     publication_base_ref,
+    publication_revision_ids,
     verify_publication_commit,
 )
 from ..repository_access import (
@@ -465,6 +471,29 @@ async def _refresh_publication_lineage(
     return lineage
 
 
+async def _github_publication_mention(
+    request: Request, session: AsyncSession, work_item_request_id: uuid.UUID
+) -> str | None:
+    """The GitHub tracker's mention for this request, or None for any other kind."""
+
+    execution = await session.get(ExecutionRequest, work_item_request_id)
+    if execution is None:
+        return None
+    work_item = await session.get(WorkItem, execution.work_item_id)
+    if work_item is None or work_item.tracker_kind != GITHUB:
+        return None
+    registry = getattr(request.app.state, "forges", None)
+    if registry is None:
+        return None
+    tracker = registry.github_tracker()
+    if tracker is None:
+        return None
+    mention = tracker.config.mention
+    if not isinstance(mention, str) or not mention.strip():
+        return None
+    return mention
+
+
 @internal_router.post(
     "",
     response_model=PublicationOut,
@@ -477,6 +506,17 @@ async def create_publication(
     session: SessionDep,
     response: Response,
 ) -> PublicationOut:
+    # #5798: only the platform writes the learned rules line. Refused before any
+    # other work, so a patch problem never masks the reserved line.
+    if memory_rules_context.carries_annotation(data.body):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.learned_rules_annotation_reserved",
+                "message": "a line starting with 'Learned rules:' is written only "
+                "by the platform; remove it and publish again",
+            },
+        )
     try:
         patch = data.decoded_patch()
     except ValueError as exc:
@@ -489,9 +529,24 @@ async def create_publication(
             f"publication patch exceeds the {patch_limit_bytes}-byte limit",
         )
     traceparent = canonicalize_traceparent(request.headers.get(TRACEPARENT_STREAM_FIELD))
+    # ADR 0278 section 6: only the platform writes the requester annotation.
+    if requester_instruction_context.carries_annotation(data.body):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.requester_annotation_reserved",
+                "message": "a line starting with 'Requester preferences:' is written only "
+                "by the platform; remove it and publish again",
+            },
+        )
 
     if data.work_item_request_id is not None:
         work_item_request_id = data.work_item_request_id
+        # Everything the platform adds below follows the agent's text. Close a
+        # trailing Decisions section first so none of it joins that section.
+        sectioned = end_trailing_decisions(data.body or "")
+        if sectioned != (data.body or ""):
+            data = data.model_copy(update={"body": sectioned})
         prior_paths = (
             await session.scalars(
                 select(Publication.changed_paths).where(
@@ -516,7 +571,7 @@ async def create_publication(
         if factory_ci.python_paths(changed_paths):
             try:
                 observations = await factory_progress.read_verification_observations(
-                    session, data.work_item_request_id
+                    session, work_item_request_id
                 )
             except ValueError as exc:
                 raise HTTPException(
@@ -579,7 +634,7 @@ async def create_publication(
             body = data.body or ""
             missing = [statement for statement in statements if statement not in body]
             if missing:
-                body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
+                body = f"{without_trailing_blank_lines(body)}\n\n{'\n'.join(missing)}"
                 data = data.model_copy(update={"body": body})
         # Every factory pull request body references its ticket (#4358 plan D7),
         # in the tracker's own form; a body that already carries it is kept.
@@ -593,9 +648,28 @@ async def create_publication(
                 body = f"{body}\n\n{reference}" if body else reference
             marker = issue_marker(issue)
             if marker not in (line.strip() for line in body.splitlines()):
-                body = f"{body.rstrip()}\n\n{marker}"
+                body = f"{without_trailing_blank_lines(body)}\n\n{marker}"
             if body != data.body:
                 data = data.model_copy(update={"body": body})
+        # The ask line sits immediately before the ADR 0278 evidence line, which
+        # stays last. With no applied selection the ask line is last. GitHub only.
+        mention = await _github_publication_mention(request, session, work_item_request_id)
+        if mention is not None:
+            asked = append_github_ask_line(data.body or "", mention)
+            if asked != (data.body or ""):
+                data = data.model_copy(update={"body": asked})
+        # Last, from the acknowledged execution record (ADR 0278 section 6), and
+        # before the publication contract is captured below.
+        digest = await requester_instruction_context.applied_digest(session, work_item_request_id)
+        if digest is not None:
+            annotated = requester_instruction_context.annotate(data.body or "", digest)
+            data = data.model_copy(update={"body": annotated})
+        # The learned rules line (#5798), from the same acknowledged record, goes
+        # immediately before the requester line, which stays last.
+        applied = await memory_rules_context.applied_rules(session, work_item_request_id)
+        if applied is not None:
+            annotated = memory_rules_context.annotate(data.body or "", applied)
+            data = data.model_copy(update={"body": annotated})
 
     async def metadata_check() -> None:
         if patch:
@@ -851,6 +925,7 @@ async def advance_publication_lineage(
                 publication,
                 commit_sha=data.head_sha,
                 base_branch=base_branch,
+                revision_ids=publication_revision_ids(publication),
             )
         lineage = await crud_lineages.advance_publication_lineage(
             session,

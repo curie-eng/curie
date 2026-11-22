@@ -116,7 +116,9 @@ def test_a_refused_issue_read_mint_leaves_the_tool_off_and_the_turn_running(
     from curie_worker.workitem_dispatch import WorkItemConflict
 
     class _Refusing(_WorkItems):
-        async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        async def issue_read_context(
+            self, request_id: uuid.UUID, *, publication_recovery: bool
+        ) -> tuple[str, str]:
             self.calls.append("issue_read_context")
             raise WorkItemConflict("invalid_context")
 

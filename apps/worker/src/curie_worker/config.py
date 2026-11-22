@@ -284,6 +284,14 @@ class WorkerConfig(BaseSettings):
     # Local model demo path: the worker can point the runner at an
     # Anthropic-compatible local endpoint without changing the fake-model default.
     model_base_url: str = Field(default="", validation_alias="CURIE_MODEL_BASE_URL")
+    # Minimum remaining model credit in USD for a sufficient model_credit fact
+    # (issue 5581). The worker observer reads it. Zero still contacts the
+    # provider. A negative value is refused at startup.
+    factory_min_model_credit_usd: float = Field(
+        default=10,
+        ge=0,
+        validation_alias="CURIE_FACTORY_MIN_MODEL_CREDIT_USD",
+    )
     # The endpoint's wire protocol and the env var(s) carrying the credential
     # (#514), both declared rather than inferred. Operator scope like
     # model_base_url: they select which env var a credential is read from and
@@ -325,6 +333,21 @@ class WorkerConfig(BaseSettings):
         StaticConnectorEndpoints | None, NoDecode, BeforeValidator(parse_endpoint_json)
     ] = Field(default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS")
     sandbox_substrate: str = Field(default="kubernetes", validation_alias="CURIE_SANDBOX_SUBSTRATE")
+    # The dedicated namespace holding personal Claude custody Secrets (#5377,
+    # ADR 0268), rendered from the chart's personalClaude.grantNamespace. Empty
+    # means personal custody is unconfigured: every personal grant read is
+    # refused authentication-required, never answered with a service credential.
+    personal_grant_namespace: str = Field(
+        default="", validation_alias="CURIE_PERSONAL_GRANT_NAMESPACE"
+    )
+    # The installation's model auth mode (#5378, ADR 0268), the same
+    # FACTORY_MODEL_AUTH_MODE the API reads. A WorkItem execution takes its mode
+    # from its ExecutionRequest, never from here; this decides only lanes with
+    # no owner (plain runs, cron, evals), which a personal installation refuses
+    # personal_owner_required, and that personal mode needs Kubernetes.
+    factory_model_auth_mode: Literal["service", "personal"] = Field(
+        default="service", validation_alias="FACTORY_MODEL_AUTH_MODE"
+    )
 
     # The Ed25519 seed that signs each sandbox's connector caller token
     # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
@@ -1184,6 +1207,18 @@ class WorkerConfig(BaseSettings):
     workspace_recovery_collect_interval_s: float = Field(
         default=30.0, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S"
     )
+    # Publication candidate retention (#5428). On by default; when on (which
+    # requires the internal worker token and managed workspaces), a started
+    # WorkItem run's publication snapshot and trusted base are retained as a
+    # private, non-authorizing candidate before validation, and the worker
+    # supervises the candidate object collector. Separate from recovery.
+    # Set false when this process has no token or no managed workspaces.
+    publication_candidates_enabled: bool = Field(
+        default=True, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
+    )
+    publication_candidates_collect_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S"
+    )
     # The inbound-attachment lane's resource envelope (#2567). These are the
     # operator's handles on ``AttachmentLimits``, whose own defaults these
     # literals mirror -- the chart templates the same three numbers into the
@@ -1266,6 +1301,22 @@ class WorkerConfig(BaseSettings):
             if not self.workspace_enabled:
                 raise ValueError(
                     "CURIE_WORKSPACE_RECOVERY_ENABLED requires CURIE_WORKSPACE_ENABLED"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_publication_candidate_capture(self) -> WorkerConfig:
+        # The candidate capture (#5428) authenticates its ledger calls with the
+        # worker token and retains the claim's trusted base, which only managed
+        # workspaces have. Refused before operation, not discovered per run.
+        if self.publication_candidates_enabled:
+            if not self.internal_worker_token:
+                raise ValueError(
+                    "CURIE_PUBLICATION_CANDIDATES_ENABLED requires CURIE_INTERNAL_WORKER_TOKEN"
+                )
+            if not self.workspace_enabled:
+                raise ValueError(
+                    "CURIE_PUBLICATION_CANDIDATES_ENABLED requires CURIE_WORKSPACE_ENABLED"
                 )
         return self
 
@@ -1484,6 +1535,9 @@ class WorkerConfig(BaseSettings):
     factory_slack_interval_s: float = Field(
         default=2.0, gt=0, validation_alias="CURIE_FACTORY_SLACK_INTERVAL_S"
     )
+    # Console origin for the rejected-plan DM's reconnect button (#5720).
+    # Empty omits the button. The value is an absolute http(s) origin.
+    console_origin: str = Field(default="", validation_alias="CURIE_CONSOLE_ORIGIN")
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
     cron_tick_interval_s: float = Field(

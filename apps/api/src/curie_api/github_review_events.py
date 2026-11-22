@@ -35,6 +35,31 @@ def human_sender(value: Any) -> tuple[int, str]:
     return _human(value)
 
 
+def label_actor(event: dict[str, Any], *, app_id: str) -> tuple[int, str]:
+    """Read the canonical label actor; App provenance contributes no authority."""
+
+    actor = event.get("actor")
+    if not isinstance(actor, dict):
+        raise FeedbackIgnored("actor_unverifiable")
+    login = actor.get("login")
+    if not isinstance(login, str) or not login or login.casefold() == "ghost":
+        raise FeedbackIgnored("actor_unverifiable")
+    positive_identifier(actor.get("id"), "actor_unverifiable")
+    if actor.get("type") == "Bot":
+        raise FeedbackIgnored("actor_bot")
+    try:
+        sender = human_sender(actor)
+    except FeedbackIgnored:
+        raise FeedbackIgnored("actor_unverifiable") from None
+    via = event.get("performed_via_github_app")
+    if via is not None:
+        if not isinstance(via, dict) or type(via.get("id")) is not int:
+            raise FeedbackIgnored("actor_unverifiable")
+        if str(via["id"]) == app_id:
+            raise FeedbackIgnored("actor_own_app")
+    return sender
+
+
 def payload_object(value: Any, code: str) -> dict[str, Any]:
     return _object(value, code)
 
@@ -95,8 +120,14 @@ class UnverifiedFeedback:
         # delivery ID for the same comment/review cannot create a second turn.
         # Installation identity is authorization provenance, not comment
         # identity: reinstalling the same App must not replay an old comment.
-        identity = f"{self.repository_id}:{self.event}:{self.feedback_id}"
-        return f"github-feedback-{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
+        return feedback_event_id(self.repository_id, self.event, self.feedback_id)
+
+
+def feedback_event_id(repository_id: int, event: str, feedback_id: int) -> str:
+    """The per-event identity of one comment or review (`UnverifiedFeedback.event_id`)."""
+
+    identity = f"{repository_id}:{event}:{feedback_id}"
+    return f"github-feedback-{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
 
 
 def _object(value: Any, code: str) -> dict[str, Any]:
@@ -138,13 +169,22 @@ def _human(value: Any) -> tuple[int, str]:
 
 
 def parse_feedback(
-    event: str, payload: Any, delivery_id: str, *, github_html_base: str
+    event: str,
+    payload: Any,
+    delivery_id: str,
+    *,
+    github_html_base: str,
+    allow_empty_review: bool = False,
 ) -> UnverifiedFeedback:
     """Retain actionable human feedback claims or return an explicit refusal.
 
     Actions/fields follow the provider's webhook-event documentation:
     https://docs.github.com/en/webhooks/webhook-events-and-payloads
     ``issue_comment`` also covers ordinary issues, which cannot own a PR lineage.
+
+    ``allow_empty_review`` parses a submitted review with a blank or null body
+    as body ``""``: the factory admits a review whole, and its inline comments
+    may carry all of it (#5794). Every other blank body is refused.
     """
 
     definition = _REVIEW_EVENTS.get(event)
@@ -190,7 +230,13 @@ def parse_feedback(
         raise FeedbackIgnored("unauthorized_association")
     feedback_id = _positive(feedback.get("id"), "invalid_feedback")
     body = feedback.get("body")
-    if not isinstance(body, str) or not body.strip():
+    if (
+        allow_empty_review
+        and event == "pull_request_review"
+        and (body is None or (isinstance(body, str) and not body.strip()))
+    ):
+        body = ""
+    elif not isinstance(body, str) or not body.strip():
         raise FeedbackIgnored("empty_feedback")
     if len(body) > _MAX_FEEDBACK_LENGTH:
         raise FeedbackIgnored("feedback_too_large")
@@ -229,6 +275,9 @@ def parse_feedback(
         }:
             raise FeedbackIgnored("non_actionable_review")
         created = _instant(feedback.get("submitted_at"), "invalid_feedback_time")
+        # A submitted review is its own batch key; its inline comments name it
+        # as pull_request_review_id.
+        review_id = feedback_id
     else:
         created = _instant(feedback.get("created_at"), "invalid_feedback_time")
         updated = _instant(feedback.get("updated_at"), "invalid_feedback_time")

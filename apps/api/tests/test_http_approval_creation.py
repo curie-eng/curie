@@ -510,5 +510,3 @@ def test_resumed_turn_suspends_again_under_its_original_invoker(
     retry["request_id"] = str(uuid.uuid4())
     assert accepted(post(case, retry), retry, duplicate=True)["id"] == created["id"]
     assert len(case.provider.requests) == calls + 1
-
-

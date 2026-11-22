@@ -9,6 +9,7 @@ cap, a failed reviewer call, and the publication gate.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -41,6 +43,8 @@ from curie_runner.verification import (
     preflight_workspace_verification,
 )
 
+from examples.tests.test_pull_request_follow_up_detection import production_follow_up_objectives
+
 pytestmark = pytest.mark.xdist_independent
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +55,19 @@ CONTRACT_FILE = BUNDLE / "verification" / "contract.md"
 CONTEXT_LIMIT = 10_000
 PLAN, DIFF = "dark-factory:plan-reviewer", "dark-factory:diff-reviewer"
 PUBLISH = "mcp__curie__publish_changes"
+VALID_PR_BODY = "## Decisions\nNone: the change follows directly from the acceptance criteria.\n"
+DECISIONS_CASES = json.loads(
+    (REPO_ROOT / "tests" / "vectors" / "factory-decisions-section.json").read_text()
+)["cases"]
+
+
+def _publish_input(tool: str, tool_input: dict[str, Any] | None) -> dict[str, Any]:
+    """A publish call with no input, or the placeholder body "b", carries a valid
+    Decisions section, so review policy tests are not refused by that check."""
+    tool_input = dict(tool_input or {})
+    if tool == PUBLISH and (not tool_input or tool_input.get("body") == "b"):
+        tool_input["body"] = VALID_PR_BODY
+    return tool_input
 
 
 REPORT = "mcp__curie__report_progress"
@@ -251,7 +268,7 @@ class Session:
         return json.loads(done.stdout) if done.stdout.strip() else None
 
     def pre(self, tool: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
-        out = self.fire("PreToolUse", tool_name=tool, tool_input=tool_input or {})
+        out = self.fire("PreToolUse", tool_name=tool, tool_input=_publish_input(tool, tool_input))
         assert out is not None
         decision: dict[str, Any] = out["hookSpecificOutput"]
         return decision
@@ -690,6 +707,225 @@ def test_publish_only_after_the_diff_reviewer_approves(session: Session) -> None
     rework(session, 1)
     session.review(DIFF, reply(DIFF, "APPROVE"))
     assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+
+
+@pytest.mark.parametrize("case", DECISIONS_CASES, ids=lambda case: case["id"])
+def test_decisions_parser_shared_vectors(
+    case: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_decisions")
+    if case["valid"]:
+        assert hook.parse_decisions_section(case["body"]) == case["entries"]
+    else:
+        with pytest.raises(ValueError):
+            hook.parse_decisions_section(case["body"])
+
+
+@pytest.mark.parametrize("case", DECISIONS_CASES, ids=lambda case: case["id"])
+def test_publish_decisions_vectors_and_body_recovery(
+    session: Session, case: dict[str, Any]
+) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    before = _saved_state(session)
+    decision = session.pre(PUBLISH, {"body": case["body"]})
+    assert decision["permissionDecision"] == ("allow" if case["valid"] else "deny")
+    if not case["valid"]:
+        reason = decision["permissionDecisionReason"]
+        assert all(part in reason for part in ("## Decisions", "Rejected:", "Evidence:", "None:"))
+        assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    after = _saved_state(session)
+    assert after["stopped"] is None
+    assert after["plan"] == before["plan"]
+    assert after["diff"] == before["diff"]
+    assert after["diff_approved_fingerprint"] == before["diff_approved_fingerprint"]
+
+
+def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    before = _saved_state(session)
+    refused = session.pre(PUBLISH, {"title": "t"})
+    assert refused["permissionDecision"] == "deny"
+    assert "## Decisions" in refused["permissionDecisionReason"]
+    assert _saved_state(session) == before
+    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+
+
+ENTRY = (
+    "1. Keep integers. Rejected: floats, because the tests compare integers. "
+    "(plan) Evidence: tests."
+)
+
+
+def _cited(count: int) -> str:
+    return "".join(f"Answered on the ticket by a maintainer: decision {n}.\n" for n in range(count))
+
+
+@pytest.mark.parametrize(
+    ("body", "allowed"),
+    [
+        # One line per answer relied on: nine answers do not trip the seven-entry cap.
+        (f"## Decisions\n{ENTRY}\n{_cited(9)}", True),
+        (f"## Decisions\n{_cited(9)}", True),
+        (f"## Decisions\n{ENTRY}\n{_cited(1)}\n## Checklist\n1. Done.\n", True),
+        # The cap still holds for numbered decisions, and the None declaration is not
+        # mixed with citation lines.
+        (
+            "## Decisions\n"
+            + "\n".join(ENTRY.replace("1.", f"{n}.", 1) for n in range(1, 8))
+            + f"\n8. x. Rejected: y, because z. (plan) Evidence: w.\n{_cited(1)}",
+            False,
+        ),
+        (
+            "## Decisions\nNone: the change follows directly from the acceptance criteria.\n"
+            + _cited(1),
+            False,
+        ),
+        # A citation prefix alone or with no author text is not a citation line.
+        ("## Decisions\nAnswered on the ticket by \n", False),
+        (f"## Decisions\n{ENTRY}\n  {_cited(1)}", False),
+    ],
+)
+def test_publish_decisions_accepts_one_citation_line_per_answer(
+    session: Session, body: str, allowed: bool
+) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    decision = session.pre(PUBLISH, {"body": body})
+    assert decision["permissionDecision"] == ("allow" if allowed else "deny")
+
+
+ADVERSARIAL_ENTRY = "x. Rejected: y, because z. (nomatch) Evidence: w. "
+
+
+def test_publish_decisions_adversarial_sections_are_denied_quickly(
+    session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_decisions_adversarial")
+    # Repeated separators made the earlier regex backtrack for minutes; a hook
+    # timeout lets the publication through, so each body must be refused fast.
+    under_cap = "## Decisions\n1. " + ADVERSARIAL_ENTRY * 130
+    over_cap = "## Decisions\n1. " + ADVERSARIAL_ENTRY * 2000
+    for body in (under_cap, over_cap):
+        started = time.monotonic()
+        with pytest.raises(ValueError):
+            hook.parse_decisions_section(body)
+        assert time.monotonic() - started < 1.0
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    for body in (under_cap, over_cap):
+        started = time.monotonic()
+        refused = session.pre(PUBLISH, {"title": "t", "body": body})
+        assert time.monotonic() - started < 20.0
+        assert refused["permissionDecision"] == "deny"
+        assert "## Decisions" in refused["permissionDecisionReason"]
+
+
+def _publish_main(hook: Any, monkeypatch: pytest.MonkeyPatch, raw: bytes) -> int:
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"))
+    code: int = hook.main()
+    return code
+
+
+def _publish_event(tmp_path: Path) -> bytes:
+    event = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-publish",
+        "cwd": str(tmp_path),
+        "tool_name": PUBLISH,
+        "tool_input": {"title": "t", "body": VALID_PR_BODY},
+    }
+    return json.dumps(event).encode()
+
+
+@pytest.mark.parametrize("raw", [b"{not json", b"\xff\xfe\x00", b"[]", b""])
+def test_publish_hook_denies_unreadable_input(
+    raw: bytes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_unreadable_input")
+    assert _publish_main(hook, monkeypatch, raw) == 2
+    assert "refusing" in capsys.readouterr().err
+
+
+def test_hook_denies_deeply_nested_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_nested_input")
+    raw = b'{"a": ' + b"[" * 12000 + b"]" * 12000 + b"}"
+    assert _publish_main(hook, monkeypatch, raw) == 2
+    assert "refusing" in capsys.readouterr().err
+
+
+def test_publish_hook_denies_on_its_own_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_exception")
+
+    def broken(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(hook, "pre_publish", broken)
+    assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 2
+    assert "RuntimeError" in capsys.readouterr().err
+
+
+def test_publish_hook_denies_at_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_deadline")
+    release = threading.Event()
+
+    def stuck(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+        # Bounded so a hook that waits for its check fails here instead of hanging.
+        release.wait(timeout=5)
+        return dict(hook._allow("late"))
+
+    # The shipped deadline is below the runner's 60 second hook timeout.
+    assert hook.PUBLISH_DEADLINE_SECONDS < 60
+    monkeypatch.setattr(hook, "pre_publish", stuck)
+    monkeypatch.setattr(hook, "PUBLISH_DEADLINE_SECONDS", 0.05)
+    try:
+        assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 2
+    finally:
+        release.set()
+    assert "did not finish" in capsys.readouterr().err
+
+
+def test_publish_hook_still_allows_a_decision_that_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_liveness")
+    monkeypatch.setattr(hook, "pre_publish", lambda state, tool_input: hook._allow("ok"))
+    assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+@pytest.mark.parametrize("case_id", ["answers-recorded-decision", "admits-unrecorded-decision"])
+def test_decision_followup_eval_grades_the_answer(case_id: str) -> None:
+    from curie_worker.eval.models import EvalSuite
+
+    suite = EvalSuite.model_validate_json((BUNDLE / "evals" / "cases.json").read_text())
+    case = next(case for case in suite.cases if case.id == case_id)
+    fixtures = json.loads(
+        (REPO_ROOT / "cli/tests/data/eval_falsifiability_fixtures.json").read_text()
+    )
+    key = f"dark-factory/{case_id}"
+    for answer in [fixtures["exemplars"][key], *fixtures["paraphrases"][key]]:
+        assert case.grader.grade(answer)
+    for answer in fixtures["counterexamples"][key]:
+        assert not case.grader.grade(answer)
+    for empty_answer in (
+        "",
+        "Done.",
+        "No changes needed:",
+        "No changes needed: Decisions entry 1.",
+        case.input,
+        "No changes needed: the pull request is already complete; I answered "
+        "by citing Decisions entry 1. Nothing in the question asked for a code change.",
+    ):
+        assert not case.grader.grade(empty_answer)
 
 
 def test_a_new_message_continues_the_run_and_a_new_session_starts_fresh(
@@ -2040,7 +2276,9 @@ def test_the_hook_phase_order_matches_phases_json(monkeypatch: pytest.MonkeyPatc
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     ids = [p["id"] for p in json.loads((BUNDLE / "progress" / "phases.json").read_text())["phases"]]
-    assert list(module.PHASE_ORDER) == ids
+    # #5790 added `investigate` without editing review_gate.py, which open #5348
+    # also edits; the gate never observes that phase, so its order skips it.
+    assert list(module.PHASE_ORDER) == [phase for phase in ids if phase != "investigate"]
 
 
 # --- #3851 criterion 4: a fresh execution driven through hooks.json -------------
@@ -2055,17 +2293,24 @@ class HooksJsonRuntime:
     A tool no matcher names never starts the hook. Allowed edits are applied to
     the checkout and allowed Bash commands really run in it, then the result
     event fires: ``PostToolUse`` on success, ``PostToolUseFailure`` otherwise.
+    Every registered hook runs, and ``dispatch`` returns the outputs of the
+    hook whose command names ``hook`` (the review gate unless asked), so these
+    assertions see the review gate alone while the investigation gate also runs.
     """
 
-    def __init__(self, session: Session, bundle: Path = BUNDLE) -> None:
+    def __init__(
+        self, session: Session, bundle: Path = BUNDLE, *, other_hooks: bool = True
+    ) -> None:
         self.session = session
         self.bundle = bundle
+        # A test that counts the review gate's own Git calls runs it alone.
+        self.other_hooks = other_hooks
         self.hooks = json.loads((bundle / "hooks" / "hooks.json").read_text())["hooks"]
         self.env = {**session.env, "CLAUDE_PLUGIN_ROOT": str(bundle)}
         self.invocations: list[tuple[str, str | None]] = []
 
     def dispatch(
-        self, event: str, tool: str | None = None, **fields: Any
+        self, event: str, tool: str | None = None, *, hook: str = "review_gate.py", **fields: Any
     ) -> list[dict[str, Any] | None]:
         outs: list[dict[str, Any] | None] = []
         for entry in self.hooks.get(event, []):
@@ -2073,8 +2318,10 @@ class HooksJsonRuntime:
             if matcher not in (None, "", "*"):
                 if tool is None or not re.fullmatch(matcher, tool):
                     continue
-            for hook in entry["hooks"]:
-                command = hook["command"].replace("${CLAUDE_PLUGIN_ROOT}", str(self.bundle))
+            for registered in entry["hooks"]:
+                if hook not in registered["command"] and not self.other_hooks:
+                    continue
+                command = registered["command"].replace("${CLAUDE_PLUGIN_ROOT}", str(self.bundle))
                 payload: dict[str, Any] = {
                     "session_id": "sess-fresh",
                     "hook_event_name": event,
@@ -2091,14 +2338,16 @@ class HooksJsonRuntime:
                     text=True,
                     env=self.env,
                     check=True,
-                    timeout=hook.get("timeout", 60),
+                    timeout=registered.get("timeout", 60),
                 )
+                if hook not in registered["command"]:
+                    continue
                 self.invocations.append((event, tool))
                 outs.append(json.loads(done.stdout) if done.stdout.strip() else None)
         return outs
 
     def pre(self, tool: str, tool_input: dict[str, Any]) -> dict[str, Any] | None:
-        outs = self.dispatch("PreToolUse", tool, tool_input=tool_input)
+        outs = self.dispatch("PreToolUse", tool, tool_input=_publish_input(tool, tool_input))
         assert len(outs) == 1, (tool, outs)
         return outs[0]
 
@@ -2204,7 +2453,7 @@ class HooksJsonRuntime:
 
     def decision(self, tool: str, tool_input: dict[str, Any] | None = None) -> str:
         """The PreToolUse permission decision for a gated, non-edit tool call."""
-        out = self.pre(tool, tool_input or {})
+        out = self.pre(tool, _publish_input(tool, tool_input))
         assert out is not None, tool
         return str(out["hookSpecificOutput"]["permissionDecision"])
 
@@ -3924,3 +4173,58 @@ def test_task_notification_preserves_approval_until_a_later_edit(session: Sessio
     assert _saved_state(session) == before
     (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
+_FOLLOW_UP_OBJECTIVES = production_follow_up_objectives()
+
+
+def _follow_up_session(tmp_path: Path, objective: str) -> Session:
+    """A run whose opening prompt is one production follow-up, inside the sender frame."""
+
+    session = Session(tmp_path)
+    session.fire(
+        "UserPromptSubmit",
+        prompt=frame_user_turn("message", "octocat", objective, "github"),
+    )
+    session.load_workflow()
+    return session
+
+
+@pytest.mark.parametrize(
+    "objective", list(_FOLLOW_UP_OBJECTIVES.values()), ids=list(_FOLLOW_UP_OBJECTIVES)
+)
+def test_a_pull_request_follow_up_refuses_an_empty_diff_review(
+    tmp_path: Path, objective: str
+) -> None:
+    """#5728 AC3: an empty candidate admits no diff review and does not stop the run."""
+
+    session = _follow_up_session(tmp_path, objective)
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    decision = session.pre("Agent", {"subagent_type": DIFF, "description": "diff", "prompt": "p"})
+    assert decision["permissionDecision"] == "deny"
+    assert "candidate patch is empty" in decision["permissionDecisionReason"]
+    refused = [
+        event
+        for event in session.gate_events()
+        if event.get("curie_gate") == "review_refused"
+        and event.get("cause") == "empty_candidate_patch"
+    ]
+    assert refused
+    assert _saved_state(session)["stopped"] is None
+    assert _saved_state(session)["pull_request_follow_up"] is True
+
+
+@pytest.mark.parametrize(
+    "objective", list(_FOLLOW_UP_OBJECTIVES.values()), ids=list(_FOLLOW_UP_OBJECTIVES)
+)
+def test_a_pull_request_follow_up_still_admits_a_nonempty_diff_review(
+    tmp_path: Path, objective: str
+) -> None:
+    """A follow-up that edited the checkout still gets a diff review."""
+
+    session = _follow_up_session(tmp_path, objective)
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    rework(session, 1)
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert not any(event.get("cause") == "empty_candidate_patch" for event in session.gate_events())
+    assert _saved_state(session)["stopped"] is None

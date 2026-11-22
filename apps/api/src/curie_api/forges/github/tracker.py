@@ -26,24 +26,32 @@ https://docs.github.com/en/rest/issues/issues#list-repository-issues
 https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
 https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue
 https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+https://docs.github.com/en/rest/issues/issues#create-an-issue
+https://docs.github.com/en/rest/issues/issues#get-an-issue
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
-from curie_api.forges.errors import NotFound, Unauthorized, Unavailable, Unsupported
+from curie_api.forges.errors import (
+    NotFound,
+    Unauthorized,
+    Unavailable,
+    Unsupported,
+)
 from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
 from curie_api.forges.github.marked_comments import REFUSED_STATUSES, github_request
-from curie_api.forges.github.review_polling import human_actor
+from curie_api.forges.github.review_polling import human_actor, trailing_id
 from curie_api.forges.github.transport import (
     PollUnavailable,
     get_all,
@@ -54,6 +62,7 @@ from curie_api.forges.github.transport import (
     repository_identity_matches,
 )
 from curie_api.forges.github.transport import Unavailable as TransportUnavailable
+from curie_api.forges.ports import TrackerFacts
 from curie_api.forges.types import (
     GITHUB,
     Actor,
@@ -62,10 +71,13 @@ from curie_api.forges.types import (
     NoticePage,
     PullRequest,
     RepositoryRef,
+    SourceContent,
     TicketLabels,
+    TrackerComment,
     TrackerIssueRef,
 )
-from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
+from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_factory
+from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from curie_api.github_review_truth import verify_sender_write_permission
 from curie_api.repo_full_name import repo_url_path
 
@@ -75,11 +87,34 @@ logger = logging.getLogger("curie_api.factory_notices")
 _ISSUE_READ_PROVIDER_TIMEOUT_SECONDS = 5.0
 _ISSUE_READ_MAX_RESPONSE_BYTES = 2_097_152
 _ISSUE_READ_COMMENTS_PER_PAGE = 100
-# Ten pages is a thousand comments. A longer thread is truncated and says so,
-# rather than turning one tool call into an unbounded walk of the API.
+# Ten pages is a thousand comments. A longer thread reads the ten pages ending
+# at its last page, so the newest comments (the ones that carry the latest
+# answer) are kept, and says the earlier ones were not read.
 _ISSUE_READ_MAX_COMMENT_PAGES = 10
 # A port listing longer than this many pages is not trusted to be complete.
 _MAX_PAGES = 50
+
+
+_LINK_LAST = re.compile(r'<([^>]*)>\s*;\s*rel="last"')
+
+
+def _last_page(headers: httpx.Headers) -> int | None:
+    """The last page number from the `Link` header's `rel="last"` entry.
+
+    https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
+    GitHub sends `rel="last"` whenever there is a following page and omits the
+    header on a single page. None means a `rel="next"` without a `rel="last"`,
+    which the read follows forward instead.
+    """
+
+    link = headers.get("link", "")
+    found = _LINK_LAST.search(link)
+    if found is None:
+        return None if 'rel="next"' in link else 1
+    values = parse_qs(urlsplit(found.group(1)).query).get("page", [])
+    if len(values) != 1 or not values[0].isdecimal() or int(values[0]) < 1:
+        raise Unavailable("issue comments")
+    return int(values[0])
 
 
 @dataclass(frozen=True)
@@ -96,7 +131,7 @@ class IssueContent:
     state: str | None
     author: str | None
     comments: list[IssueComment]
-    comments_truncated: bool
+    earlier_comments_omitted: bool
 
 
 @dataclass(frozen=True)
@@ -105,6 +140,16 @@ class IssueFacts:
 
     labels: set[str]
     default_branch: str | None
+
+
+@dataclass(frozen=True)
+class IssueState:
+    """One issue as GitHub answers it now (#5380): its state, its label names,
+    and whether the number is a pull request's."""
+
+    state: str | None
+    labels: frozenset[str]
+    pull_request: bool
 
 
 def last_label_event(events: list[Any], label: str) -> dict[str, Any] | None:
@@ -170,7 +215,7 @@ async def read_repository(
 def _status_error(status: int, what: str) -> Exception:
     if status == 401:
         return Unauthorized(what)
-    if status == 404:
+    if status in {404, 410}:
         return NotFound(what)
     return Unavailable(what)
 
@@ -222,8 +267,13 @@ class GitHubTracker:
         label: str,
         mention: str,
         app_id: str,
+        own_login: TokenSource,
         page_size: int = 100,
     ) -> None:
+        """``own_login`` answers the login this adapter's token writes as: the
+        App's bot user ``<slug>[bot]`` (`GitHubTrackerConnection` reads the slug
+        under the App JWT)."""
+
         if page_size < 1:
             raise ValueError("page_size must be positive")
         self._client = client
@@ -234,8 +284,10 @@ class GitHubTracker:
         self.repository_id = repository_id
         self._repo_path = f"/repos/{repo_url_path(repo_full_name)}"
         self._token = token
+        self._own_login = own_login
         self.label = label
         self.mention = mention
+        self.app_id = app_id
         self._page_size = page_size
         self._comments = GitHubMarkedComments(
             client,
@@ -247,9 +299,121 @@ class GitHubTracker:
             app_id=app_id,
         )
 
+    async def app_slug(self) -> str | None:
+        """The App login this tracker writes as, or None when it cannot be read.
+
+        ``own_login`` is ``<slug>[bot]``. A login that is not that shape is not
+        an App slug, and a lookup failure leaves the configured mention as the
+        only match.
+        """
+
+        try:
+            login = await self._own_login()
+        except Unavailable:
+            return None
+        if not isinstance(login, str) or not login.endswith("[bot]"):
+            return None
+        slug = login[: -len("[bot]")]
+        return slug or None
+
     @property
     def marked_comments(self) -> GitHubMarkedComments:
         return self._comments
+
+    @property
+    def facts(self) -> TrackerFacts:
+        return self
+
+    @property
+    def repository(self) -> RepositoryRef:
+        return RepositoryRef(self.kind, self.host, str(self.repository_id), self.repo_full_name)
+
+    def facts_comment(self, value: Mapping[str, Any]) -> TrackerComment | None:
+        number = trailing_id(value.get("issue_url"))
+        comment_id, body = value.get("id"), value.get("body")
+        if (
+            number is None
+            or type(comment_id) is not int
+            or comment_id <= 0
+            or not isinstance(body, str)
+        ):
+            return None
+        try:
+            actor_id, login = label_actor(
+                {
+                    "actor": value.get("user"),
+                    "performed_via_github_app": value.get("performed_via_github_app"),
+                },
+                app_id=self.app_id,
+            )
+            actor = Actor(str(actor_id), login)
+        except FeedbackIgnored:
+            actor = None
+        return TrackerComment(
+            comment_id,
+            self.issue(number),
+            body,
+            actor,
+            value.get("performed_via_github_app") is not None,
+            parse_time(value.get("updated_at")),
+        )
+
+    async def read_comment(self, comment_id: int) -> TrackerComment:
+        """Re-read request content and provenance through the installation credential."""
+        comment = self.facts_comment(await self.issue_comment(comment_id))
+        if comment is None:
+            raise Unavailable("comment")
+        return comment
+
+    async def issue_comment(self, comment_id: int) -> dict[str, Any]:
+        """One issue comment as GitHub answers it now, through the installation
+        credential: its ``user``, ``performed_via_github_app``, ``issue_url``
+        and ``created_at`` are the factory's own read, not a payload's claim
+        (#5787). A 404 is `NotFound`; any other failure, or a payload that is
+        not this comment, is a `ForgeError`.
+
+        https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
+        """
+
+        value = await self._get(f"{self._repo_path}/issues/comments/{comment_id}")
+        if not isinstance(value, dict) or value.get("id") != comment_id:
+            raise Unavailable("comment")
+        return value
+
+    async def facts_issue_is_plain(self, ref: TrackerIssueRef) -> bool:
+        number = self._number(ref)
+        try:
+            issue = await self._get(f"{self._repo_path}/issues/{number}")
+        except (NotFound, Unauthorized):
+            raise Unavailable("issue") from None
+        if (
+            not isinstance(issue, dict)
+            or type(issue.get("number")) is not int
+            or issue["number"] != number
+        ):
+            raise Unavailable("issue")
+        return "pull_request" not in issue
+
+    async def facts_writer(self, comment: TrackerComment) -> Actor | None:
+        """Reuse admission's immutable-user effective write permission check."""
+        actor = comment.actor
+        if actor is None:
+            return None
+        self._number(comment.issue)
+        try:
+            await verify_sender_write_permission(
+                self._client,
+                api=self._api,
+                token=await self._token(),
+                repo_path=self._repo_path,
+                sender_id=int(actor.id),
+                sender_login=actor.login,
+            )
+        except FeedbackIgnored as exc:
+            if exc.code == "sender_permission_unavailable":
+                raise Unavailable("actor_unreadable") from None
+            return None
+        return actor
 
     def issue(self, number: int) -> TrackerIssueRef:
         return TrackerIssueRef(GITHUB, self.host, str(self.repository_id), str(number))
@@ -353,7 +517,12 @@ class GitHubTracker:
             occurred_at=parse_time(event.get("created_at")),
         )
 
-    def _mention_notice(self, comment: Any, cursor: str) -> MarkedNotice | None:
+    def _mention_notice(
+        self, comment: Any, cursor: str, app_slug: str | None, answering: Collection[int]
+    ) -> MarkedNotice | None:
+        """A mention, or on an ``answering`` issue number any comment by a
+        person as an answer (#5789 decision 8): one comment, one notice."""
+
         if not isinstance(comment, dict) or comment.get("performed_via_github_app") is not None:
             return None
         comment_id = _positive_int(comment.get("id"))
@@ -364,7 +533,6 @@ class GitHubTracker:
             comment_id is None
             or not isinstance(body, str)
             or not body.strip()
-            or not mentions_login(body, self.mention)
             or not isinstance(issue_url, str)
             # A pull request conversation comment is review feedback, not a marking.
             or (isinstance(html_url, str) and "/pull/" in html_url)
@@ -375,12 +543,15 @@ class GitHubTracker:
         sender = human_actor({"user": comment.get("user")})
         if number is None or sender is None:
             return None
+        answer = number in answering
+        if not answer and not mentions_factory(body, self.mention, app_slug):
+            return None
         return MarkedNotice(
             issue=self.issue(number),
-            marker=f"@{self.mention}",
+            marker=self.label if answer else f"@{self.mention}",
             actor=Actor(str(sender[0]), sender[1]),
             event_id=str(comment_id),
-            disposition=Disposition.MENTION,
+            disposition=Disposition.ANSWER if answer else Disposition.MENTION,
             cursor=cursor,
             occurred_at=parse_time(comment.get("created_at")),
         )
@@ -408,9 +579,21 @@ class GitHubTracker:
         return self._event_notice({**event, "issue": {"number": number}}, cursor)
 
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         events_after, comments_after = _parse_cursor(cursor)
+        answers = {
+            int(issue.issue_id)
+            for issue in answering
+            if issue.kind == GITHUB
+            and issue.host == self.host
+            and issue.scope_id == str(self.repository_id)
+            and issue.issue_id.isdigit()
+        }
         # Read every listing before returning any notice or cursor.
         events = await self._pages(f"{self._repo_path}/issues/events", {})
         comments = await self._pages(
@@ -419,6 +602,7 @@ class GitHubTracker:
             newer_than=comments_after,
         )
         notices: list[MarkedNotice] = []
+        app_slug = await self.app_slug()
         newest_event = events_after
         fresh = [
             event
@@ -438,7 +622,9 @@ class GitHubTracker:
             if comment_id is None:
                 continue
             newest_comment = max(newest_comment, comment_id)
-            notice = self._mention_notice(comment, f"{newest_event}:{comment_id}")
+            notice = self._mention_notice(
+                comment, f"{newest_event}:{comment_id}", app_slug, answers
+            )
             if notice is not None:
                 notices.append(notice)
         next_cursor = f"{newest_event}:{newest_comment}"
@@ -453,12 +639,16 @@ class GitHubTracker:
         number = self._number(notice.issue)
         issue = await self._issue(number)
         if issue is None:
-            return False
+            return notice.disposition is Disposition.CANCEL
         names = label_names(issue) or set()
         state = issue.get("state")
         if notice.disposition is Disposition.CANCEL:
+            if state not in {"open", "closed"} or label_names(issue) is None:
+                raise Unavailable("issue_state")
             return state == "closed" or self.label not in names
         if state != "open":
+            return False
+        if notice.disposition is Disposition.ANSWER and self.label not in names:
             return False
         if notice.disposition is Disposition.ADMIT:
             if self.label not in names:
@@ -479,7 +669,10 @@ class GitHubTracker:
             and isinstance(user, dict)
             and str(user.get("id")) == notice.actor.id
             and isinstance(body, str)
-            and mentions_login(body, self.mention)
+            and (
+                notice.disposition is Disposition.ANSWER
+                or mentions_factory(body, self.mention, await self.app_slug())
+            )
         )
 
     async def marking_actor(self, issue: TrackerIssueRef, marker: str) -> Actor | None:
@@ -509,13 +702,28 @@ class GitHubTracker:
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         content = await self.read_issue_content(self._number(issue))
         parts = [f"# {content.title}", content.body]
+        if content.earlier_comments_omitted:
+            parts.append("_Earlier comments were not read._")
         for comment in content.comments:
             author = comment.author or "unknown"
             when = f" at {comment.created_at}" if comment.created_at else ""
             parts.append(f"## Comment by {author}{when}\n\n{comment.body}")
-        if content.comments_truncated:
-            parts.append("_Later comments were not read._")
         return "\n\n".join(parts) + "\n"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's title and body from one issue read, never its comments.
+
+        https://docs.github.com/en/rest/issues/issues#get-an-issue
+        An empty body reads back as null and is the empty text.
+        """
+
+        found = await self._issue(self._number(issue))
+        if found is None:
+            raise NotFound("issue")
+        title = found.get("title")
+        if not isinstance(title, str):
+            raise Unavailable("issue")
+        return SourceContent(title=title, body=_text(found.get("body")))
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         """The issue's labels from one issue read; GitHub has no components."""
@@ -699,12 +907,30 @@ class GitHubTracker:
                     raise Unavailable("issue")
             return json.loads(body), response.headers
 
+    async def _comment_page(
+        self, base: str, token: str, page: int
+    ) -> tuple[list[Any], httpx.Headers]:
+        batch, headers = await self._stream_json(
+            f"{base}/comments",
+            token=token,
+            params={"per_page": _ISSUE_READ_COMMENTS_PER_PAGE, "page": page},
+        )
+        if not isinstance(batch, list):
+            raise Unavailable("issue comments")
+        return batch, headers
+
     async def read_issue_content(self, number: int) -> IssueContent:
         """The issue and its comments, verbatim, addressed by repository id.
 
         Addressing the repository by its numeric id keeps a rename or a transfer
         from redirecting the read to a different repository than the WorkItem's.
         Nothing is parsed into the platform or stored.
+
+        A thread of more than a thousand comments returns the newest thousand,
+        oldest first. That costs at most 12 comment page requests plus the issue
+        (page 1, the ten pages ending at the last page, and one earlier page
+        when the last page is partial). A listing with `rel="next"` but no
+        `rel="last"` is followed forward for at most ten pages, else refused.
         """
 
         base = f"{self._api}/repositories/{self.repository_id}/issues/{number}"
@@ -712,30 +938,47 @@ class GitHubTracker:
         try:
             issue, _ = await self._stream_json(base, token=token)
             comments: list[IssueComment] = []
-            truncated = False
-            for page in range(1, _ISSUE_READ_MAX_COMMENT_PAGES + 1):
-                batch, headers = await self._stream_json(
-                    f"{base}/comments",
-                    token=token,
-                    params={"per_page": _ISSUE_READ_COMMENTS_PER_PAGE, "page": page},
-                )
-                if not isinstance(batch, list):
-                    raise Unavailable("issue comments")
-                for comment in batch:
-                    if not isinstance(comment, dict):
+            first_batch, headers = await self._comment_page(base, token, 1)
+            last_page = _last_page(headers)
+            pages: dict[int, list[Any]] = {1: first_batch}
+            if last_page is None:
+                # No `rel="last"`: follow `rel="next"` for at most ten pages. A
+                # longer listing cannot have its newest comments located.
+                last_page = 1
+                while 'rel="next"' in headers.get("link", ""):
+                    if last_page == _ISSUE_READ_MAX_COMMENT_PAGES:
                         raise Unavailable("issue comments")
-                    created = comment.get("created_at")
-                    comments.append(
-                        IssueComment(
-                            author=_login(comment.get("user")),
-                            created_at=created if isinstance(created, str) else None,
-                            body=_text(comment.get("body")),
-                        )
+                    last_page += 1
+                    pages[last_page], headers = await self._comment_page(base, token, last_page)
+            first = max(1, last_page - _ISSUE_READ_MAX_COMMENT_PAGES + 1)
+            for page in range(first, last_page + 1):
+                if page not in pages:
+                    pages[page] = (await self._comment_page(base, token, page))[0]
+            if (
+                last_page > _ISSUE_READ_MAX_COMMENT_PAGES
+                and len(pages[last_page]) < _ISSUE_READ_COMMENTS_PER_PAGE
+            ):
+                # A partial last page leaves the newest ten pages short of a
+                # thousand comments, so one earlier page completes the window.
+                first -= 1
+                if first not in pages:
+                    pages[first] = (await self._comment_page(base, token, first))[0]
+            window = [c for page in range(first, last_page + 1) for c in pages[page]]
+            limit = _ISSUE_READ_MAX_COMMENT_PAGES * _ISSUE_READ_COMMENTS_PER_PAGE
+            earlier_omitted = last_page > _ISSUE_READ_MAX_COMMENT_PAGES
+            if earlier_omitted:
+                window = window[-limit:]
+            for comment in window:
+                if not isinstance(comment, dict):
+                    raise Unavailable("issue comments")
+                created = comment.get("created_at")
+                comments.append(
+                    IssueComment(
+                        author=_login(comment.get("user")),
+                        created_at=created if isinstance(created, str) else None,
+                        body=_text(comment.get("body")),
                     )
-                if 'rel="next"' not in headers.get("link", ""):
-                    break
-            else:
-                truncated = True
+                )
         except (httpx.HTTPError, ValueError):
             raise Unavailable("issue") from None
         if (
@@ -753,7 +996,7 @@ class GitHubTracker:
             state=state if isinstance(state, str) else None,
             author=_login(issue.get("user")),
             comments=comments,
-            comments_truncated=truncated,
+            earlier_comments_omitted=earlier_omitted,
         )
 
     # GitHub intake reads ------------------------------------------------
@@ -821,19 +1064,37 @@ class GitHubTracker:
                 if issue.get("state") != "open":
                     raise FactoryRefused("issue_not_open")
                 await self._verify_mention(notice, token)
-        await verify_sender_write_permission(
-            self._client,
-            api=self._api,
-            token=token,
-            repo_path=self._repo_path,
-            sender_id=notice.sender_id,
-            sender_login=notice.sender_login,
-        )
+        if notice.disposition != "admit":
+            await verify_sender_write_permission(
+                self._client,
+                api=self._api,
+                token=token,
+                repo_path=self._repo_path,
+                sender_id=notice.sender_id,
+                sender_login=notice.sender_login,
+            )
         default_branch = repository.get("default_branch")
         return IssueFacts(
             labels=names,
             default_branch=default_branch if isinstance(default_branch, str) else None,
         )
+
+    async def label_permission(self, notice: FactoryNotice) -> str | None:
+        """Authorize a canonical actor after duplicate and delegated-output checks."""
+        try:
+            await verify_sender_write_permission(
+                self._client,
+                api=self._api,
+                token=await self._token(),
+                repo_path=self._repo_path,
+                sender_id=notice.sender_id,
+                sender_login=notice.sender_login,
+            )
+        except FeedbackIgnored as exc:
+            if exc.code == "sender_permission_refused":
+                return "actor_no_permission"
+            raise FeedbackUnavailable(exc.code) from None
+        return None
 
     async def _verify_mention(self, notice: FactoryNotice, token: str) -> None:
         comment = await get_github_json(
@@ -857,8 +1118,37 @@ class GitHubTracker:
         ):
             raise FactoryRefused("sender_mismatch")
         body = comment.get("body")
-        if not isinstance(body, str) or not mentions_login(body, self.mention):
+        if not isinstance(body, str) or not mentions_factory(
+            body, self.mention, await self.app_slug()
+        ):
             raise FactoryRefused("ordinary_comment")
+
+    async def issue_state(self, number: int) -> IssueState:
+        """The issue's state and labels now, and whether it is a pull request (#5380).
+
+        https://docs.github.com/en/rest/issues/issues#get-an-issue: every pull
+        request is also an issue, and its issue payload carries a
+        ``pull_request`` key. A 404 is `NotFound`, which no retry changes; any
+        other failure, or a payload that does not name this issue or lists
+        malformed labels, is `Unavailable`.
+        """
+
+        issue = await self._get(f"{self._repo_path}/issues/{number}")
+        if (
+            not isinstance(issue, dict)
+            or type(issue.get("number")) is not int
+            or issue["number"] != number
+        ):
+            raise Unavailable("issue")
+        names = label_names(issue)
+        if names is None:
+            raise Unavailable("issue")
+        state = issue.get("state")
+        return IssueState(
+            state=state if isinstance(state, str) else None,
+            labels=frozenset(names),
+            pull_request="pull_request" in issue,
+        )
 
     async def issue_events(self, number: int) -> list[Any]:
         """Every event on one issue, in GitHub's order, or `Unavailable`."""

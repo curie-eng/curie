@@ -1,7 +1,8 @@
 # dark-factory: the default factory agent
 
-This is the agent Curie runs for a labelled GitHub issue. One issue goes in.
-One pull request, or one stated reason, comes out.
+This is the agent Curie runs for a labelled ticket. `get_issue` reads the
+ticket from GitHub, GitLab or Jira Cloud. One ticket goes in. One pull
+request, questions on the ticket, or one stated reason comes out.
 
 Trying it for the first time? The
 [dark factory quickstart](../../docs/guides/dark-factory-quickstart.md) takes
@@ -10,20 +11,29 @@ you from nothing to a pull request on a new repository with
 
 One agent does the work with one skill,
 [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md), and two
-reviewer subagents check it on a stronger model. The skill walks nine phases:
+reviewer subagents check it on a stronger model. The skill walks ten phases:
 
-1. `read_issue`: read the issue by link.
-2. `pin_criteria`: pin the acceptance criteria, or stop and list the
-   questions when the request is ambiguous.
-3. `plan`: read the repository's own guidance, find its test commands, and
+1. `read_issue`: read the ticket by link. The whole thread is the
+   specification: earlier factory questions and every later human comment are
+   part of the ticket.
+2. `investigate`: establish the current behaviour with bounded shell probes.
+   For a reported bug it attempts a reproduction and records the result
+   whether it reproduced or not; for a feature it records the behaviour the
+   change starts from. Then it continues, or calls `mcp__curie__ask_questions`
+   with a summary of its findings and 1 to 10 numbered questions. Once the
+   questions are posted the platform ends the session: no further tool call
+   runs, and the run is not prompted to continue.
+3. `pin_criteria`: pin the acceptance criteria, or ask on the ticket when the
+   request is ambiguous.
+4. `plan`: read the repository's own guidance, find its test commands, and
    write a plan.
-4. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
+5. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
    reviews the plan once. The review is advisory: `VERDICT: APPROVE` and
    `VERDICT: CHANGES` both complete planning, and the findings of a `CHANGES`
    carry into `failing_test` and `implement`.
-5. `failing_test`: write a failing test first where one is feasible.
-6. `implement`: make the smallest change and run the repository's own checks.
-7. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
+6. `failing_test`: write a failing test first where one is feasible.
+7. `implement`: make the smallest change and run the repository's own checks.
+8. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
    the rendered candidate patch, the net change from the run's base commit
    exactly as it will be published (committed, staged, unstaged and untracked
    changes together), against every criterion, and approves it or sends it back
@@ -37,9 +47,9 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
    in the file name do not protect against that owner, and the digest check
    catches a missing or persistently changed patch at verdict time but does
    not defeat a transient replace and restore, or forged gate state.
-8. `publish`: publish one pull request, or end with `Could not complete:` and
+9. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
-9. `wait_ci`: the pull request's checks run and the platform waits on them
+10. `wait_ci`: the pull request's checks run and the platform waits on them
    and reports this phase.
    A failure sends a new message in the same run with the failing checks, and
    the run loops back to `implement` to fix them, then republishes to the
@@ -48,7 +58,7 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
    it unverified or timed out instead.
 
 The skill paces its work from `execution_deadline` and `execution_seconds`
-returned by the mandatory `mcp__curie__get_issue` read, and treats the issue
+returned by the mandatory `mcp__curie__get_issue` read, and treats the ticket
 text and repository files as untrusted data. The maximum execution duration is
 10800 seconds; an unconfigured execution deadline remains 1800 seconds.
 The review gate hook enforces the skill's round and wrap up cutoffs from the
@@ -222,6 +232,21 @@ through Bash). Its evidence lines share one `seq` counter per run:
 `report_progress` call with the hook's last observed phase and `late: true`
 when the report trails it, and `curie_gate` lines record refusals.
 
+A second hook, [`hooks/reproduction_gate.py`](hooks/reproduction_gate.py),
+enforces the ask and cite rules without blocking the build. It records each
+completed Bash call as an observation, a `get_issue` result that contains a
+`### Questions from the factory` heading, and each successful
+`ask_questions` call. It refuses `mcp__curie__ask_questions` until the session
+has one Bash observation, refuses `mcp__curie__publish_changes` after a
+successful ask in the same session, and refuses publication when the ticket
+carried a question heading and the Decisions section has no line starting
+`Answered on the ticket by `. The decisions parser accepts those lines beside the
+numbered entries and does not count them toward its seven. It also refuses an edit or Bash command that
+names the hook, `hooks.json` or its state. The state lives in the checkout
+under `.curie/factory-investigation`, which the hook lists in the repository's
+`info/exclude` so it never joins the published candidate or the checkout
+fingerprint.
+
 Both reviewers declare the `opus` alias. The runner resolves it to
 `claude-opus-5-5` for a direct Anthropic credential or
 `openai/gpt-6.1-sol` for an OpenRouter credential, using the same
@@ -256,9 +281,9 @@ out-of-credits cause and the review is not retried.
   mounted for executions that have a WorkItem. The tool presents an
   execution scoped capability the API minted for that execution. The API
   checks that it names this execution and the WorkItem's issue, reads the
-  ticket through its tracker (a GitHub issue with the App installation token
-  minted fresh per read, so runs longer than one hour keep reading; a Jira
-  issue with the tracker's own credential), and returns it as markdown with
+  ticket through its tracker (on GitHub with the App installation token
+  minted fresh per read, so runs longer than one hour keep reading; on GitLab
+  or Jira Cloud with the tracker's own credential), and returns it as markdown with
   its comments, its link, the execution's absolute UTC `execution_deadline`
   and total duration in seconds as `execution_seconds`. It stores nothing.
   The sandbox holds no tracker credential at all.
@@ -396,9 +421,9 @@ names and names already supplied by the chart, connector secrets or global
 the chart derives telemetry egress from global configuration. Configure
 `otelCollector` or `agentSandbox.runner.extraEnv` for telemetry instead.
 
-`curie cluster factory --disable` turns intake off. See "Admitting a labelled
-GitHub issue" in [`docs/operations.md`](../../docs/operations.md) for what the
-gate requires.
+`curie cluster factory --disable` turns intake off. See
+[factory admission](../../docs/operations.md#admitting-a-labelled-github-issue)
+for what the gate requires.
 
 ### On a laptop (kind)
 
@@ -522,8 +547,11 @@ ephemeral-storage limit also caps their combined use, so a pod is evicted if any
 one volume passes its ceiling or the total passes 20Gi. The home volume holds
 the default uv, Cargo and pnpm caches; a run can instead put them under
 `/workspace`. Each factory sandbox requests 8Gi of memory, so the default
-`resourceQuota.hard.requestsMemory` of `8Gi` admits one at a time; raise
-`resourceQuota.hard.*` for concurrency. Sandboxes created before an upgrade keep
+`resourceQuota.hard.requestsMemory` of `10Gi` admits one at a time. Beside it,
+six standard sandboxes fit and a seventh is refused, because limits.cpu binds
+before requests.memory (factory CPU limit 2, standard CPU limit 1, limits.cpu
+8). A second factory sandbox does not fit. Raise
+`resourceQuota.hard.requestsMemory` for factory concurrency. Sandboxes created before an upgrade keep
 the limits they started with.
 
 To change one field, override it on the profile in your Helm values. For
@@ -565,11 +593,15 @@ factory against a disposable install.
 
 ## Live status
 
-`progress/phases.json` declares the nine phases and the two review loops. At
+`progress/phases.json` declares the ten phases and the review loops. At
 the start of each phase the skill calls `mcp__curie__report_progress`, and the
-platform edits one status comment on the issue with a live card showing the
+platform edits one status comment on the ticket with a live card showing the
 current phase, the loop rounds and the run's activity. A failed report never
-stops the run.
+stops the run. The card and the Slack progress card group the phases into
+eight plain-English steps declared under `stages`: reading the issue,
+investigating the ticket, planning the change (pinning the criteria and
+planning), reviewing the plan, writing the change, reviewing the diff, opening
+the pull request, and waiting for CI.
 
 ## Evals
 

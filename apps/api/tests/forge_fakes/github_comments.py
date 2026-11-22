@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from forge_fakes.github import (
     INSTALLATION_ID,
+    LABEL,
     REPO,
     REPO_ID,
     GitHubAPI,
@@ -62,6 +63,7 @@ def check_run(
         "status": status,
         "conclusion": conclusion if status == "completed" else None,
         "started_at": started_at,
+        "check_suite": {"id": 202},
         "output": {"title": title, "summary": summary},
     }
 
@@ -222,8 +224,16 @@ class _GitHubComments(BaseHTTPRequestHandler):
         subject = _ISSUE_OR_PR.match(path)
         if subject is not None:
             number = int(subject.group(1))
+            if "/issues/" in path and number in server.issue_statuses:
+                self._send(server.issue_statuses[number], {"message": "Issue read refused"})
+                return
             payload: dict[str, Any] = {
-                "number": number, "title": server.titles.get(number, f"Issue {number}")
+                "number": number,
+                "title": server.titles.get(number, f"Issue {number}"),
+                "state": "open",
+                "labels": [
+                    {"name": name} for name in {LABEL, *server.issue_labels.get(number, set())}
+                ],
             }
             if "/pulls/" in path:
                 # GitHub computes mergeability asynchronously and returns null.
@@ -247,6 +257,7 @@ class _GitHubComments(BaseHTTPRequestHandler):
                     }
                 )
                 payload.update(server.pull_script[index])
+            payload.update(server.issue_overrides.get(number, {}))
             self._send(
                 200,
                 payload,
@@ -278,18 +289,41 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if commit is not None:
             sha, kind = commit.group(1), commit.group(2)
             script = server.ci_scripts.get(sha) or server.ci_script
-            if kind == "check-runs":
+            params = parse_qs(urlsplit(self.path).query)
+            page = int(params.get("page", ["1"])[0])
+            per_page = int(params.get("per_page", ["100"])[0])
+            server.ci_pages.append((sha, kind, page))
+            if kind == "check-runs" and page == 1:
                 index = min(server.ci_cursor.get(sha, -1) + 1, len(script) - 1)
                 server.ci_cursor[sha] = index
                 server.ci_observations.append(sha)
-                self._send(script[index][0], script[index][1])
-            else:
-                index = max(server.ci_cursor.get(sha, 0), 0)
-                self._send(script[index][2], script[index][3])
+                if server.on_ci_read is not None:
+                    server.on_ci_read()
+            index = max(server.ci_cursor.get(sha, 0), 0)
+            status, payload = script[index][:2] if kind == "check-runs" else script[index][2:]
+            field = "check_runs" if kind == "check-runs" else "statuses"
+            if isinstance(payload, dict) and isinstance(payload.get(field), list):
+                start = (page - 1) * per_page
+                payload = {**payload, field: payload[field][start : start + per_page]}
+                if (sha, kind, page) in server.ci_page_totals:
+                    payload["total_count"] = server.ci_page_totals[(sha, kind, page)]
+            self._send(status, payload)
             return True
         annotations = re.fullmatch(rf"/repos/{repo}/check-runs/([0-9]+)/annotations", path)
         if annotations is not None:
             self._send(200, server.annotations.get(int(annotations.group(1)), []))
+            return True
+        if path == f"/repos/{REPO}":
+            # https://docs.github.com/en/rest/repos/repos#get-a-repository
+            self._send(
+                200,
+                {
+                    "id": REPO_ID,
+                    "full_name": REPO,
+                    "private": server.repository_private is True,
+                    "default_branch": "main",
+                },
+            )
             return True
         rules = re.fullmatch(rf"/repos/{repo}/rules/branches/(.+)", path)
         if rules is not None:
@@ -436,6 +470,11 @@ class _CommentServer(ThreadingHTTPServer):
         self.lost_response_paths: set[str] = set()
         # #3097 CI fake. The default is one green check run, so every suite that
         # opens a pull request stays on the success path.
+        self.issue_statuses: dict[int, int] = {}
+        self.issue_overrides: dict[int, dict[str, Any]] = {}
+        self.ci_pages: list[tuple[str, str, int]] = []
+        self.ci_page_totals: dict[tuple[str, str, int], int] = {}
+        self.on_ci_read: Any = None
         self.ci_script: list[CiEntry] = [ci_green()]
         self.ci_scripts: dict[str, list[CiEntry]] = {}
         self.ci_cursor: dict[str, int] = {}
@@ -453,6 +492,9 @@ class _CommentServer(ThreadingHTTPServer):
         # Branch name -> (status, body) for GET /rules/branches/{branch}.
         # Missing means HTTP 404, which contributes no required check names.
         self.rules: dict[str, tuple[int, Any]] = {}
+        # GET /repos/{owner}/{repo} ``private``. False is a public repository.
+        # https://docs.github.com/en/rest/repos/repos#get-a-repository
+        self.repository_private = False
         # Branch name -> protection object included on GET /branches/{branch}.
         self.protections: dict[str, dict[str, Any]] = {}
         # #3741. 403 matches a token with no Actions write permission.

@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal, Protocol
 
 import httpx
 
@@ -99,7 +99,14 @@ def _error_code(exc: BaseException) -> str:
 
 
 class RecoveryObjectStore(WorkspaceObjectStore):
-    """Private recovery object storage, restricted to the recovery namespace."""
+    """Private recovery object storage, restricted to the recovery namespace.
+
+    ``namespace`` is the one subtree this store may touch; a subclass for another
+    private object family names its own, disjoint subtree.
+    """
+
+    namespace: ClassVar[str] = RECOVERY_NAMESPACE
+    _outside_message: ClassVar[str] = "recovery object key is outside the recovery namespace"
 
     def __init__(self, *, client: Any, bucket: str, prefix: str = "private") -> None:
         super().__init__(client=client, bucket=bucket, prefix=prefix)
@@ -107,10 +114,9 @@ class RecoveryObjectStore(WorkspaceObjectStore):
     def _key(self, key: str) -> str:
         clean = key.lstrip("/")
         parts = clean.split("/")
-        if ".." in parts or not (
-            clean == RECOVERY_NAMESPACE or clean.startswith(f"{RECOVERY_NAMESPACE}/")
-        ):
-            raise ValueError("recovery object key is outside the recovery namespace")
+        namespace = self.namespace
+        if ".." in parts or not (clean == namespace or clean.startswith(f"{namespace}/")):
+            raise ValueError(self._outside_message)
         return f"{self._prefix}/{clean}"
 
     def upload_verified(
@@ -1012,21 +1018,36 @@ class RecoveryCollectionPass:
     failed: int
 
 
+class CollectionLedger(Protocol):
+    """The two ledger operations one collection pass needs."""
+
+    async def claim_collection(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def finalize_collection(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+
 class RecoveryCollector:
-    """Delete ledger-claimed recovery objects outside any lock, then finalize them."""
+    """Delete ledger-claimed objects outside any lock, then finalize them.
+
+    The ledger is any one exposing ``claim_collection`` and ``finalize_collection``
+    (recovery checkpoints, publication candidates); ``label`` names that family in
+    the logs. The claim, delete and finalize algorithm is the same for every one.
+    """
 
     def __init__(
         self,
         *,
-        ledger: WorkspaceRecoveryClient,
+        ledger: CollectionLedger,
         store: RecoveryObjectStore,
         collector_id: str,
         limit: int = 100,
+        label: str = "workspace recovery",
     ) -> None:
         self._ledger = ledger
         self._store = store
         self._collector_id = collector_id
         self._limit = limit
+        self._label = label
 
     async def collect_once(self) -> RecoveryCollectionPass:
         """One pass. Raises ``RecoveryStorageError("ledger_unavailable")`` if claiming fails."""
@@ -1069,8 +1090,8 @@ class RecoveryCollector:
         result = RecoveryCollectionPass(len(claims), deleted, finalized, conflicts, failed)
         logger.log(
             logging.INFO if claims else logging.DEBUG,
-            "workspace recovery collection claimed=%d deleted=%d finalized=%d "
-            "conflicts=%d failed=%d",
+            "%s collection claimed=%d deleted=%d finalized=%d conflicts=%d failed=%d",
+            self._label,
             result.claimed,
             result.deleted,
             result.finalized,
@@ -1084,10 +1105,10 @@ class RecoveryCollector:
             try:
                 await self.collect_once()
             except RecoveryStorageError as exc:
-                logger.warning("workspace recovery collection skipped code=%s", exc.code)
+                logger.warning("%s collection skipped code=%s", self._label, exc.code)
             except Exception as exc:  # noqa: BLE001 - typed fault boundary
                 logger.warning(
-                    "workspace recovery collection pass failed cause=%s", type(exc).__name__
+                    "%s collection pass failed cause=%s", self._label, type(exc).__name__
                 )
             try:
                 await asyncio.wait_for(shutdown.wait(), timeout=interval_s)

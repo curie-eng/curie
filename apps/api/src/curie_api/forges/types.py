@@ -103,6 +103,18 @@ class Actor:
         _require_text("Actor", id=self.id, login=self.login)
 
 
+@dataclass(frozen=True)
+class TrackerComment:
+    """Comment content and provenance read by a tracker, before facts authorization."""
+
+    id: int
+    issue: TrackerIssueRef
+    body: str
+    actor: Actor | None
+    via_app: bool
+    updated_at: datetime | None
+
+
 class PullRequestState(enum.StrEnum):
     OPEN = "open"
     MERGED = "merged"
@@ -557,14 +569,18 @@ class Disposition(enum.StrEnum):
     ADMIT = "admit"
     CANCEL = "cancel"
     MENTION = "mention"
+    ANSWER = "answer"
 
 
 @dataclass(frozen=True)
 class MarkedNotice:
-    """One marking on a tracker issue: a label applied or removed, or a mention.
+    """One marking on a tracker issue: a label applied or removed, a mention,
+    or an answer (a person's comment on an issue with a factory question,
+    mention or not; never an admission or a cancellation).
 
     ``event_id`` is the tracker's immutable id for the event (a GitHub timeline
-    event id, a webhook delivery id, or a comment id for a mention). ``cursor``
+    event id, a webhook delivery id, or a comment id for a mention or an
+    answer; GitLab namespaces a note as ``note:<id>``). ``cursor``
     is the opaque poll position just after this notice. ``occurred_at`` is when
     the tracker says the event happened, or None when it reported no usable
     time; admission treats None as unknown and decides fail-closed (#4629).
@@ -577,6 +593,21 @@ class MarkedNotice:
     disposition: Disposition
     cursor: str
     occurred_at: datetime | None
+
+
+@dataclass(frozen=True)
+class SourceContent:
+    """An issue's own title and description, as the tracker stores them now
+    (ADR 0277 decision 4, #5586).
+
+    Never comments, labels or rendered markdown: a new comment, including the
+    factory's own status and result comments, leaves it unchanged. A tracker
+    whose description is structured (Jira's document format) carries its
+    canonical JSON text in ``body``.
+    """
+
+    title: str
+    body: str
 
 
 @dataclass(frozen=True)
@@ -647,11 +678,16 @@ class StoredEvidence:
 
 @dataclass(frozen=True)
 class MarkedComment:
-    """A status comment the adapter's own identity wrote, carrying a marker."""
+    """A status comment the adapter's own identity wrote, carrying a marker.
+
+    ``created_at`` is the comment's creation time on the tracker's own clock,
+    when the tracker reported it; never part of equality.
+    """
 
     id: str
     target: ReplyTarget
     body: str
+    created_at: datetime | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

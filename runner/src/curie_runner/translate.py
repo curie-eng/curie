@@ -25,6 +25,7 @@ from aci_protocol import (
     ErrorEvent,
     Final,
     OutboundEvent,
+    RetryCondition,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
@@ -41,8 +42,8 @@ from claude_agent_sdk import (
     UserMessage,
 )
 from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
+from curie_internal.provider_scope import ProviderScope
 from curie_telemetry.redact import redact_text
-from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
 from .final_answer import (
@@ -54,7 +55,13 @@ from .final_answer import (
 from .history import ConversationMessage
 from .otel import _GenerationSpan
 from .progress import ProgressActivity
-from .side_effects import SideEffectClassifier
+from .provider_retry import (
+    credential_rejected_condition,
+    credit_exhausted_condition,
+    rate_limited_condition,
+    usage_limited_condition,
+)
+from .side_effects import ARGUMENTS_WITHHELD_TOOLS, SideEffectClassifier
 
 # Longest raw tool reply this will parse into a recordable ``result``. The reply
 # travels the wire and lands in a durable record, so an unbounded connector
@@ -88,6 +95,9 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         "max-turns",
         # #4333: the model endpoint was unreachable at the transport layer.
         "model-unreachable",
+        # #5377 (ADR 0268): personal mode had no usable owner grant, or the
+        # provider rejected it. The owner replaces or reconnects the enrollment.
+        "authentication-required",
     }
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
@@ -214,6 +224,14 @@ def is_credit_refusal(message: AssistantMessage) -> bool:
     return _is_credit_exhausted(message.error or "", _provider_error_text(message))
 
 
+def credential_rejection_condition(
+    message: AssistantMessage, scope: ProviderScope | None
+) -> RetryCondition | None:
+    """The retry condition for a credential rejection, read off its provider text."""
+
+    return credential_rejected_condition(_provider_error_text(message), scope)
+
+
 @dataclass
 class TurnState:
     """Mutable per-turn state threaded through translation."""
@@ -231,6 +249,15 @@ class TurnState:
     # Subscription windows cannot be fixed by retrying. This latch outranks
     # credit and recoverable failures until the terminal result (#4120).
     usage_limited: bool = False
+    # Runner-internal, never a wire field (#5426): the scope of the credential
+    # this turn authenticates with, None when it cannot be named. Set by the
+    # session; it names the scope on every RetryCondition this turn builds.
+    provider_scope: ProviderScope | None = None
+    # Runner-internal, never a wire field (#5426): the RetryCondition of the
+    # latched usage or credit refusal, with the same precedence as the latches
+    # above (usage outranks credit). Re-emitted by ``_restore_provider_error``
+    # so the last error frame of the turn still carries it.
+    retry_condition: RetryCondition | None = None
     # The summary passed to the approval-request tool (ADR-0010), captured off
     # the ToolUseBlock so the session can end the turn awaiting-approval. None
     # when no approval was requested this turn.
@@ -294,26 +321,6 @@ class TurnState:
     # reported as errored *because we interrupted it*, instead of reporting a
     # failure with nothing to approve.
     approval_halt_requested: bool = False
-    # The exact tool ID and input of every publication call seen on the
-    # stream this turn (#2294), in call order. Captured here, decided in
-    # ``SessionRunner._observe_publication_calls``: this module stays pure and
-    # never touches the ApprovalGate, so the same seam serves the live turn and
-    # the offline fake. Not a rare path: against the real SDK the stream reaches
-    # the session before the CLI dispatches PreToolUse, so this list is what
-    # normally writes the record first and the hook's own block then finds it
-    # standing. It is load-bearing for the case where neither SDK layer recorded
-    # the call at all and the turn would otherwise finalize DONE with nothing to
-    # approve.
-    publication_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
-    # How many of ``publication_calls`` the session has already acted on, so the
-    # observation runs exactly once per call even though it is invoked on every
-    # message of the turn.
-    publication_calls_observed: int = 0
-    # Why a publication call could NOT be recorded (a malformed proposal, or a
-    # gate that does not carry the publish tool). Runner-internal, never a wire
-    # field: the session turns it into a fail-closed classified failure, because
-    # a publication the runner cannot record must not look like a clean turn.
-    publication_unrecorded: str | None = None
     # Call id -> live tool name for EVERY call seen this turn (#3486), read-only
     # ones included, unlike ``pending_actions``. Popped by the result that
     # closes the call, so a result for an id this turn never saw, or a second
@@ -323,8 +330,7 @@ class TurnState:
     # for each result that closed a call
     # in ``open_tool_calls``, in arrival order (#3486). Wire-level facts only,
     # never the result's content. Captured here, counted in
-    # ``SessionRunner._observe_tool_results``: the same split as
-    # ``publication_calls``, and for the same reason.
+    # ``SessionRunner._observe_tool_results``, so this module stays pure.
     tool_results: list[tuple[str, str, bool, bool]] = field(default_factory=list)
     # How many of ``tool_results`` the session has already counted.
     tool_results_observed: int = 0
@@ -401,7 +407,15 @@ def translate_message(
         # an otherwise-successful run.
         if message.rate_limit_info.status == "rejected":
             state.error_classification = "rate-limit"
-            return [ErrorEvent(message="model rate limit reached", classification="rate-limit")]
+            return [
+                ErrorEvent(
+                    message="model rate limit reached",
+                    classification="rate-limit",
+                    retry_condition=rate_limited_condition(
+                        message.rate_limit_info.resets_at, state.provider_scope
+                    ),
+                )
+            ]
         return []
     # UserMessage, SystemMessage, and StreamEvent carry no outbound-visible
     # content in the v0.1 contract; they are intentionally dropped.
@@ -440,12 +454,18 @@ def _translate_assistant(
     error = getattr(message, "error", None)
     if error:
         provider_text = _provider_error_text(message)
+        condition: RetryCondition | None = None
         if _is_usage_limited(error, provider_text):
             mapped = USAGE_LIMITED_CLASSIFICATION
             state.usage_limited = True
+            condition = usage_limited_condition(state.provider_scope)
+            state.retry_condition = condition
         elif _is_credit_exhausted(error, provider_text):
             mapped = CREDIT_EXHAUSTED_CLASSIFICATION
             state.credit_exhausted = True
+            condition = credit_exhausted_condition(provider_text, state.provider_scope)
+            if not state.usage_limited:
+                state.retry_condition = condition
         elif _is_model_unreachable(error, provider_text):
             mapped = MODEL_UNREACHABLE_CLASSIFICATION
         elif error == "server_error":
@@ -456,7 +476,7 @@ def _translate_assistant(
         detail = f"model error: {error}"
         if provider_text:
             detail = f"{detail}: {provider_text}"
-        events.append(ErrorEvent(message=detail, classification=mapped))
+        events.append(ErrorEvent(message=detail, classification=mapped, retry_condition=condition))
 
     if activity is not None:
         activity.observe_assistant_message()
@@ -491,13 +511,6 @@ def _translate_assistant(
                 # inferred. It is not proof this runner executed the tool.
                 gen.tool_use(block.id, block.name)
             # @spec RUNNER-TOOL-ACCESS-3: a read-only turn captures no request.
-            if block.name == PLATFORM_PUBLISH_TOOL_NAME and state.tool_access is None:
-                # Wire-level capture only (#2294). The session decides what to
-                # do with it; recording it here would put gate state in a
-                # deliberately pure module.
-                state.publication_calls.append(
-                    (block.id, block.input if isinstance(block.input, dict) else {})
-                )
             if block.name == APPROVAL_TOOL_NAME and state.tool_access is None:
                 # A policy gate fired (ADR-0010). Capture the summary (and the
                 # optional route, #247) at the wire level so the real path
@@ -537,7 +550,12 @@ def _translate_assistant(
                         tool=block.name,
                         detail="non-idempotent tool executed",
                         call_id=block.id,
-                        arguments=block.input if isinstance(block.input, dict) else None,
+                        arguments=(
+                            block.input
+                            if isinstance(block.input, dict)
+                            and block.name not in ARGUMENTS_WITHHELD_TOOLS
+                            else None
+                        ),
                     )
                 )
                 state.side_effect_emitted = True
@@ -594,16 +612,24 @@ def _translate_user(
                 sub_text = _result_text(block.content)
                 if _is_usage_limited("", sub_text):
                     state.usage_limited = True
+                    condition = usage_limited_condition(state.provider_scope)
+                    state.retry_condition = condition
                     if state.error_classification != USAGE_LIMITED_CLASSIFICATION:
                         state.error_classification = USAGE_LIMITED_CLASSIFICATION
                         events.append(
                             ErrorEvent(
                                 message=f"subagent model error: {_redact_and_clip(sub_text)}",
                                 classification=USAGE_LIMITED_CLASSIFICATION,
+                                retry_condition=condition,
                             )
                         )
                 elif _CREDIT_EXHAUSTED_TEXT.search(sub_text):
                     state.credit_exhausted = True
+                    condition = credit_exhausted_condition(
+                        _redact_and_clip(sub_text), state.provider_scope
+                    )
+                    if not state.usage_limited:
+                        state.retry_condition = condition
                     if (
                         not state.usage_limited
                         and state.error_classification != CREDIT_EXHAUSTED_CLASSIFICATION
@@ -613,6 +639,7 @@ def _translate_user(
                             ErrorEvent(
                                 message=f"subagent model error: {_redact_and_clip(sub_text)}",
                                 classification=CREDIT_EXHAUSTED_CLASSIFICATION,
+                                retry_condition=condition,
                             )
                         )
         tool = state.pending_actions.pop(block.tool_use_id, None)
@@ -679,7 +706,8 @@ def _restore_provider_error(state: TurnState) -> list[OutboundEvent]:
     """Re-emit a latched provider refusal when a later error replaced it.
 
     The worker keeps the classification of the last ErrorEvent, so a latched
-    refusal must be the last one before the Final. Usage outranks credit.
+    refusal must be the last one before the Final. Usage outranks credit. The
+    re-emitted frame carries the latched RetryCondition (#5426).
     """
 
     if state.usage_limited:
@@ -697,6 +725,7 @@ def _restore_provider_error(state: TurnState) -> list[OutboundEvent]:
         ErrorEvent(
             message=message,
             classification=classification,
+            retry_condition=state.retry_condition,
         )
     ]
 
@@ -711,12 +740,14 @@ def _translate_result(
         events: list[OutboundEvent] = []
         if _is_usage_limited(subtype, text):
             state.usage_limited = True
+            state.retry_condition = usage_limited_condition(state.provider_scope)
             if state.error_classification != USAGE_LIMITED_CLASSIFICATION:
                 state.error_classification = USAGE_LIMITED_CLASSIFICATION
                 events.append(
                     ErrorEvent(
                         message=_redact_and_clip(text),
                         classification=USAGE_LIMITED_CLASSIFICATION,
+                        retry_condition=state.retry_condition,
                     )
                 )
         elif state.error_classification is None:

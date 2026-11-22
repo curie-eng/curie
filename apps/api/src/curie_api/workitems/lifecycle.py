@@ -8,26 +8,30 @@ and avoid attaching unrelated pending work.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
+from curie_internal.requester_coding_instructions import EvidenceState
 from curie_telemetry.redact import redact_text
-from sqlalchemy import and_, case, exists, func, or_, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import and_, case, exists, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from .. import transcripts
+from .. import factory_questions, factory_retry_policy, memory_rules_admission, transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
+from ..factory_retry_policy import Disposition, DispositionKind, RetryFacts, RetrySafety
 from ..forges.errors import ForgeError
 from ..forges.registry import forges_registry
 from ..forges.trackers import comment_prefix, issue_link, reply_route
 from ..forges.types import RepositoryRef, TrackerIssueRef
+from ..memory_rules_admission import MemoryRulesEvidence, MemoryRulesUnavailable
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
@@ -49,6 +53,15 @@ from ..personal_execution import (
     mode_of,
     snapshot_columns,
 )
+from ..requester_instruction_admission import (
+    add_snapshot,
+    evidence,
+    metadata,
+    request_selection_columns,
+    selection_columns,
+)
+from ..schemas.workitems import CodingInstructionsMetadata, MemoryRulesMetadata
+from . import resource_gate
 
 if TYPE_CHECKING:
     # factory_base reaches this module through factory_notices at import time.
@@ -79,8 +92,13 @@ ConflictCode = Literal[
     "publication_ineligible",
     "publication_pending",
     "termination_observation_required",
+    # A gated request's start did not deliver a strictly larger limit (#5427).
+    "resource_gate_unmet",
     # An explicit personal owner that differs from the WorkItem it raced to (#5376).
     OwnerMismatchCode,
+    # The repository's accepted learned rules cannot be pinned within their
+    # bounds (#5798); admission writes nothing.
+    "memory_rules_unavailable",
 ]
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
@@ -90,8 +108,61 @@ AWAITING_PUBLICATION = (*IN_FLIGHT_PUBLICATION, "succeeded")
 _UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop", "revision_unchanged"})
 # Longest provider message a factory notice keeps (#3073).
 _NOTICE_DETAIL_MAX = 4000
-# Consecutive owner_lost requests a WorkItem runs before a person is needed (ADR 0206).
-OWNER_LOST_RETRY_LIMIT = 3
+# Automatic fresh requests a WorkItem may receive over its lifetime, shared by
+# owner loss and ordinary failures (ADR 0269).
+AUTOMATIC_RETRY_LIMIT = 2
+# Every condition a blocked successor may wait on has a releaser: a provider
+# probe or a resource gate (#5424).
+_RELEASED_CONDITIONS: Final = factory_retry_policy.PROVIDER_GATES | resource_gate.GATE_CONDITIONS
+# Backoff before each slot's successor, and the deterministic jitter around it.
+AUTOMATIC_RETRY_DELAYS_S = (30, 120)
+AUTOMATIC_RETRY_JITTER = 0.2
+# Started terminal statuses whose runtime teardown an enrollment fence can owe
+# (#5377). A force-settled ``cancelled`` request owes one too, by its own path.
+TEARDOWN_TERMINAL_STATUSES = ("completed", "failed", "expired")
+# A personal request ending with one of these is resumed by its owner after a
+# replace or reconnect, so its WorkItem keeps its transcript (#5377). A personal
+# request whose start deferrals ran out (``start_failed``, #5378) is resumed the
+# same way, after reconnect and revalidation.
+_RESUMABLE_PERSONAL_CAUSES = frozenset(
+    {"enrollment_fenced", "authentication_required", "start_failed"}
+)
+
+
+@dataclass(frozen=True)
+class RetryConditionFact:
+    """The provider retry condition a worker carried to settlement (#5424).
+
+    Already validated against the ACI grammar at the wire boundary; this is
+    the typed fact the lifecycle persists and the policy reads.
+    """
+
+    reason: str
+    retry_at: datetime | None
+    scope_key: str | None
+
+
+def automatic_retry_delay_seconds(work_item_id: uuid.UUID, slot: int) -> float:
+    """The backoff before slot ``slot``'s successor, jittered by WorkItem identity.
+
+    Keyed by the WorkItem and slot so a replayed settlement computes the same
+    delay, and different WorkItems do not wake together.
+    """
+
+    base = AUTOMATIC_RETRY_DELAYS_S[slot - 1]
+    digest = sha256(f"{work_item_id}:{slot}".encode()).digest()
+    unit = int.from_bytes(digest[:8], "big") / 2**64
+    return base * (1 - AUTOMATIC_RETRY_JITTER + 2 * AUTOMATIC_RETRY_JITTER * unit)
+
+
+# The worker limits of a start that claimed no sandbox: nothing was observed.
+NO_DELIVERED_LIMITS: Mapping[str, Any] = {
+    "memory_bytes": None,
+    "ephemeral_storage_bytes": None,
+    "scratch_bytes": {},
+    "max_turns": None,
+}
+
 
 _NO_READMIT: dict[str, Any] = {
     "readmit_request_id": None,
@@ -314,6 +385,9 @@ class WorkItemSnapshot:
     model_auth_mode: ModelAuthMode
     owner_principal_id: uuid.UUID | None
     enrollment_generation: int | None
+    requester_principal_id: uuid.UUID | None
+    coding_instructions: CodingInstructionsMetadata
+    memory_rules: MemoryRulesMetadata
 
 
 @dataclass(frozen=True)
@@ -334,6 +408,9 @@ class ExecutionRequestSnapshot:
     model_auth_mode: ModelAuthMode
     owner_principal_id: uuid.UUID | None
     enrollment_generation: int | None
+    coding_instructions_selection_id: uuid.UUID | None
+    coding_instructions_evidence: EvidenceState
+    memory_rules_evidence: MemoryRulesEvidence
 
 
 @dataclass(frozen=True)
@@ -355,7 +432,7 @@ class WorkItemConflict:
 WorkItemResult = WorkItemOutcome | WorkItemConflict
 
 
-def _work_item_snapshot(row: WorkItem) -> WorkItemSnapshot:
+def _work_item_snapshot(row: WorkItem, memory_rule_numbers: Sequence[int]) -> WorkItemSnapshot:
     return WorkItemSnapshot(
         id=row.id,
         tracker_issue=row.tracker_issue,
@@ -371,6 +448,9 @@ def _work_item_snapshot(row: WorkItem) -> WorkItemSnapshot:
         model_auth_mode=mode_of(row.model_auth_mode),
         owner_principal_id=row.owner_principal_id,
         enrollment_generation=row.enrollment_generation,
+        requester_principal_id=row.requester_principal_id,
+        coding_instructions=metadata(row),
+        memory_rules=memory_rules_admission.metadata(row, memory_rule_numbers),
     )
 
 
@@ -391,6 +471,9 @@ def _request_snapshot(row: ExecutionRequest) -> ExecutionRequestSnapshot:
         model_auth_mode=mode_of(row.model_auth_mode),
         owner_principal_id=row.owner_principal_id,
         enrollment_generation=row.enrollment_generation,
+        coding_instructions_selection_id=row.coding_instructions_selection_id,
+        coding_instructions_evidence=evidence(row.coding_instructions_evidence),
+        memory_rules_evidence=memory_rules_admission.evidence(row.memory_rules_evidence),
     )
 
 
@@ -401,8 +484,12 @@ async def outcome(
     *,
     replayed: bool = False,
 ) -> WorkItemOutcome:
+    numbers: Sequence[int] = ()
+    if work_item.memory_rules_state == "selected":
+        pinned = await memory_rules_admission.rule_numbers(session, [work_item.id])
+        numbers = pinned.get(work_item.id, ())
     result = WorkItemOutcome(
-        work_item=_work_item_snapshot(work_item),
+        work_item=_work_item_snapshot(work_item, numbers),
         request=_request_snapshot(request) if request is not None else None,
         replayed=replayed,
     )
@@ -493,11 +580,16 @@ async def settle_terminal(
     That is the factory comment and, per ADR-0170, deleting the thread's
     transcript: a terminal WorkItem's history is not resumed again. A queued
     revision, an active request (an owner_lost successor, ADR 0206) or a
-    pending relabel continues the WorkItem, so its transcript survives.
+    pending relabel continues the WorkItem, so its transcript survives. So
+    does a personal request stopped by an enrollment fence or ending
+    authentication-required on an uncancelled WorkItem (#5377, ADR 0268
+    section 3): its owner resumes it after a replace or reconnect. A personal
+    request that ended ``start_failed`` keeps it too (#5378).
     """
 
     if request.terminal_at is None:
         return
+    await factory_questions.settle_round(session, work_item, request)
     await _queue_notice(session, work_item, request, detail=detail)
     continuing = await session.scalar(
         select(ExecutionRequest.id)
@@ -507,8 +599,156 @@ async def settle_terminal(
         )
         .limit(1)
     )
-    if continuing is None and work_item.readmit_request_id is None:
+    resumable = (
+        request.model_auth_mode == "personal"
+        and request.terminal_cause in _RESUMABLE_PERSONAL_CAUSES
+        and work_item.cancelled_at is None
+    )
+    if continuing is None and work_item.readmit_request_id is None and not resumable:
         await transcripts.expire_for_work_item(session, work_item)
+
+
+async def question_rounds_to_redrive(session: AsyncSession, *, limit: int) -> list[uuid.UUID]:
+    """WorkItems whose question round an older API replica settled past."""
+
+    return await factory_questions.rows_an_older_replica_settled(
+        session, unpublished_causes=_UNPUBLISHED_CAUSES, limit=limit
+    )
+
+
+async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UUID) -> None:
+    """Apply the round settlement an older API replica skipped (#5785).
+
+    The API rolls one replica at a time, so during an upgrade a replica built
+    before the question rounds can settle, cancel or expire a request whose
+    round a new replica posted. It runs the same transitions without the
+    round hooks: its finish leaves an asker that ended without a pull
+    request ``failed`` instead of with the question ending, and its
+    cancellation keeps the row. Under the WorkItem lock, and only while the
+    row is still one the selection names, this applies what the settlement on
+    this version would have:
+
+    1. A cancelled WorkItem's row is deleted, as its cancellation would.
+    2. An asker whose posted round is current and that failed with an
+       unpublished cause takes the question ending after all: ``completed``
+       with ``questions_asked``, and its status comment is reopened to say
+       so. Not when a publication owns its terminus, or when a request other
+       than the round's queued answer was admitted after it and has not
+       ended (a retry the older replica started): the attempt continues, so
+       converting would start a second one.
+       This holds too when the queued answer already ran and settled here,
+       which left the row ``cleared``.
+    3. ``settle_round`` then runs for the terminal asker, and for the
+       terminal queued answer of an ``answered`` row, exactly as at
+       settlement.
+    4. The status label recorded for the converted asker and for that answer
+       is forgotten, so the status pass writes the ticket's label again: an
+       older pass records labels while keeping ``curie-factory:questions``,
+       which it does not know, on the ticket.
+
+    The caller commits.
+    """
+
+    work_item = await lock_work_item(session, work_item_id)
+    if work_item is None:
+        return
+    row = await factory_questions.locked_round(session, work_item_id)
+    if row is None:
+        return
+    # Selected before the lock: a relabel and a new ask since then make the
+    # row a new round this version settles itself.
+    if not await factory_questions.rows_an_older_replica_settled(
+        session, unpublished_causes=_UNPUBLISHED_CAUSES, limit=1, work_item_id=work_item_id
+    ):
+        return
+    if work_item.cancelled_at is not None:
+        await factory_questions.delete_for_cancellation(session, work_item_id)
+        return
+    pending_id = row.pending_request_id
+    answered = row.state == factory_questions.ANSWERED
+    posted = row.state in (factory_questions.OUTSTANDING, factory_questions.ANSWERED) or (
+        row.state == factory_questions.CLEARED and row.comment_id is not None
+    )
+    converted = False
+    asker = await lock_request(session, work_item_id=work_item_id, request_id=row.asking_request_id)
+    if asker is not None and asker.terminal_at is not None:
+        if posted and await _older_question_ending(session, work_item, asker, pending_id):
+            converted = True
+            await session.execute(
+                update(ExecutionRequest)
+                .where(
+                    ExecutionRequest.id == asker.id,
+                    ExecutionRequest.version == asker.version,
+                    ExecutionRequest.status == "failed",
+                )
+                .values(
+                    status="completed",
+                    terminal_cause=factory_questions.QUESTIONS_ASKED,
+                    version=ExecutionRequest.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+            await session.execute(
+                update(FactoryStatusComment)
+                .where(FactoryStatusComment.execution_request_id == asker.id)
+                .values(
+                    terminal_cause=factory_questions.QUESTIONS_ASKED,
+                    applied_label=None,
+                    finalized_at=case(
+                        (FactoryStatusComment.refused_at.is_(None), None),
+                        else_=FactoryStatusComment.finalized_at,
+                    ),
+                    sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
+                )
+            )
+            asker = await reload_request(session, asker.id)
+        if row.state != factory_questions.CLEARED:
+            await factory_questions.settle_round(session, work_item, asker)
+    if pending_id is None or asker is None or pending_id == asker.id:
+        return
+    pending = await reload_request(session, pending_id)
+    # Only this round's answer: a relabel that superseded an earlier round's
+    # answer leaves that request, ended before this round was posted, on its
+    # row.
+    if (
+        pending.terminal_at is None
+        or row.answer_after is None
+        or pending.terminal_at <= row.answer_after
+    ):
+        return
+    if answered:
+        await factory_questions.settle_round(session, work_item, pending)
+    elif not converted:
+        return
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(FactoryStatusComment.execution_request_id == pending.id)
+        .values(applied_label=None)
+    )
+
+
+async def _older_question_ending(
+    session: AsyncSession,
+    work_item: WorkItem,
+    asker: ExecutionRequest,
+    pending_id: uuid.UUID | None,
+) -> bool:
+    """Whether a terminal asker earned the question ending its settlement skipped."""
+
+    if asker.status != "failed" or (asker.terminal_cause or "").strip() not in _UNPUBLISHED_CAUSES:
+        return False
+    if await _publication_owns_terminus(session, work_item, asker):
+        return False
+    # A later request that already ended continued nothing: a queued mention
+    # can run, and ask, after a higher-sequence relabel ended.
+    later = select(ExecutionRequest.id).where(
+        ExecutionRequest.work_item_id == work_item.id,
+        ExecutionRequest.sequence > asker.sequence,
+        ExecutionRequest.terminal_at.is_(None),
+    )
+    if pending_id is not None:
+        later = later.where(ExecutionRequest.id != pending_id)
+    return await session.scalar(later.limit(1)) is None
 
 
 CancellationCause = Literal["issue_cancelled", "issue_deleted"]
@@ -672,6 +912,7 @@ async def create_or_get_work_item(
     base: ResolvedBase | None = None,
     trigger_label: str | None,
     owner: OwnerTuple | None = None,
+    requester_principal_id: uuid.UUID | None = None,
 ) -> WorkItemResult:
     """Insert the WorkItem, or return the existing one for the same issue.
 
@@ -698,12 +939,31 @@ async def create_or_get_work_item(
             "enrollment_generation": None,
         }
     )
+    current = await session.scalar(select(WorkItem.id).where(*for_tracker_issue(issue)))
+    coding_values: dict[str, Any] = {}
+    selected = None
+    memory_values: dict[str, Any] = {}
+    memory_selected = None
+    if current is None:
+        # Pinned once, at the first admission (#5798): a WorkItem an admission
+        # reuses keeps the rules it pinned.
+        try:
+            memory_values, memory_selected = await memory_rules_admission.selection_columns(
+                session, agent_id=agent_id, repository=repository
+            )
+        except MemoryRulesUnavailable:
+            return await _conflict(session, "memory_rules_unavailable")
+        coding_values, selected = await selection_columns(
+            session, agent_id=agent_id, principal_id=requester_principal_id
+        )
     new_id = uuid.uuid4()
     statement = (
         insert(WorkItem)
         .values(
             id=new_id,
             **owner_values,
+            **coding_values,
+            **memory_values,
             **work_item_identity_values(issue, repository),
             code_host_installation_id=code_host_installation_id,
             agent_id=agent_id,
@@ -728,8 +988,16 @@ async def create_or_get_work_item(
     try:
         async with session.begin_nested():
             inserted_id = await session.scalar(statement)
+            if inserted_id is not None:
+                await add_snapshot(session, work_item_id=inserted_id, selection=selected)
+                await memory_rules_admission.add_snapshot(
+                    session, work_item_id=inserted_id, selection=memory_selected
+                )
+                await session.flush()
     except IntegrityError:
         return await _conflict(session, "identity_mismatch")
+    except MemoryRulesUnavailable:
+        return await _conflict(session, "memory_rules_unavailable")
 
     work_item = await session.scalar(
         select(WorkItem)
@@ -763,17 +1031,26 @@ async def _insert_waiting_request(
     expected_work_item_version: int,
     columns: Mapping[str, Any] | None = None,
     base_settle_until: datetime | None = None,
+    reserve_automatic_retry: bool,
 ) -> bool:
     """Allocate the next sequence and insert a waiting request; the caller commits.
 
     False when the WorkItem moved past ``expected_work_item_version`` or was
-    cancelled. An ``IntegrityError`` leaves the savepoint rolled back. The
-    request snapshots ``work_item``'s owner tuple, so ``work_item`` is the
-    locked row and ``columns`` never names an owner fact (#5376).
+    cancelled, or, with ``reserve_automatic_retry``, when its automatic
+    allowance is spent. An ``IntegrityError`` leaves the savepoint rolled
+    back. The request snapshots ``work_item``'s owner tuple, so ``work_item``
+    is the locked row and ``columns`` never names an owner fact (#5376). The
+    allowance slot is reserved in the same statement that bumps the version
+    and sequence, so no successor exists without its slot (ADR 0269).
     """
 
     assert_no_owner_columns(columns or {})
     sequence = work_item.next_sequence
+    allowance: tuple[ColumnElement[bool], ...] = ()
+    reservation: dict[str, Any] = {}
+    if reserve_automatic_retry:
+        allowance = (WorkItem.automatic_retries_used < AUTOMATIC_RETRY_LIMIT,)
+        reservation = {"automatic_retries_used": WorkItem.automatic_retries_used + 1}
     async with session.begin_nested():
         changed_id: uuid.UUID | None = await session.scalar(
             update(WorkItem)
@@ -781,11 +1058,13 @@ async def _insert_waiting_request(
                 WorkItem.id == work_item.id,
                 WorkItem.version == expected_work_item_version,
                 WorkItem.cancelled_at.is_(None),
+                *allowance,
             )
             .values(
                 version=WorkItem.version + 1,
                 next_sequence=WorkItem.next_sequence + 1,
                 updated_at=func.clock_timestamp(),
+                **reservation,
             )
             .returning(WorkItem.id)
         )
@@ -801,6 +1080,8 @@ async def _insert_waiting_request(
                 base_settle_until=base_settle_until,
                 version=1,
                 **snapshot_columns(work_item),
+                **request_selection_columns(work_item),
+                **memory_rules_admission.request_selection_columns(work_item),
                 **(columns or {}),
             )
         )
@@ -853,6 +1134,7 @@ async def create_execution_request(
             wait_deadline=wait_deadline,
             base_settle_until=base_settle_until,
             expected_work_item_version=expected_work_item_version,
+            reserve_automatic_retry=False,
         )
     except IntegrityError:
         work_item = await reload_work_item(session, work_item_id)
@@ -945,6 +1227,8 @@ async def create_revision_request(
                     wait_deadline=None,
                     version=1,
                     **snapshot_columns(work_item),
+                    **request_selection_columns(work_item),
+                    **memory_rules_admission.request_selection_columns(work_item),
                     **snapshot,
                 )
             )
@@ -987,6 +1271,24 @@ async def _lineage_closed_for(
     )
 
 
+def _has_no_change_marker(detail: str | None) -> bool:
+    """Whether any line starts with the no-change marker.
+
+    Leading whitespace on the line, then one leading run of blockquote (`>`)
+    and emphasis (`*` and `_`) markers, is ignored. A marker later in the
+    line does not count, and "No changes needed because" does not count.
+    """
+
+    if not detail:
+        return False
+    marker = "No changes needed:"
+    for line in detail.splitlines():
+        candidate = line.lstrip().lstrip(">*_").lstrip()
+        if candidate.startswith(marker):
+            return True
+    return False
+
+
 async def _unchanged_follow_up(
     session: AsyncSession,
     work_item: WorkItem,
@@ -995,7 +1297,7 @@ async def _unchanged_follow_up(
 ) -> bool:
     """An explicit no-change reply can complete a follow-up on its open PR."""
 
-    if detail is None or not detail.strip().startswith("No changes needed:"):
+    if not _has_no_change_marker(detail):
         return False
     # The objective opens with the issue link admission wrote, so the
     # comparison reads the same link. An issue that cannot be linked (no
@@ -1124,7 +1426,17 @@ async def start_execution_where(
     expected_request_version: int,
     extra_where: Sequence[ColumnElement[bool]],
     extra_values: Mapping[str, Any],
+    delivered_limits: Mapping[str, Any],
 ) -> WorkItemResult:
+    """Start a waiting request.
+
+    ``delivered_limits`` holds the limits the worker read from the sandbox it
+    claimed for this attempt (#5427). The start records them with the two
+    allowances the API enforces, and a gated request starts only when the
+    record delivers strictly more of its gated dimension; otherwise the start
+    is refused ``resource_gate_unmet`` and nothing changes.
+    """
+
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
         return await _conflict(
@@ -1154,12 +1466,16 @@ async def start_execution_where(
         )
     # Same transaction as the transition: the owning agent's operator override,
     # else the platform default (#3071).
-    agent_deadline = await session.scalar(
-        select(Agent.execution_deadline_seconds).where(Agent.id == work_item.agent_id)
+    deadline_seconds = await execution_deadline_seconds(session, work_item.agent_id)
+    record = resource_gate.delivered_record(
+        delivered_limits,
+        history_capacity_bytes=get_settings().transcript_max_thread_bytes,
+        execution_seconds=deadline_seconds,
     )
-    deadline_seconds = (
-        agent_deadline if agent_deadline is not None else DEFAULT_EXECUTION_DEADLINE_SECONDS
-    )
+    if request.resource_gate is not None and not resource_gate.gate_met(
+        request.resource_gate, record
+    ):
+        return await _conflict(session, "resource_gate_unmet", work_item=work_item, request=request)
     values: dict[str, Any] = {
         "status": "running",
         "started_at": now,
@@ -1169,8 +1485,16 @@ async def start_execution_where(
         # A started request is no longer failing preparation (#4930). Cleared
         # by this same CAS, so a refused or stale start leaves it intact.
         "last_start_failure_detail": None,
+        # A gate is satisfied only by this start, so it clears with it.
+        "blocked_on": None,
         **extra_values,
     }
+    # The record names the epoch this same UPDATE writes, read from the row's
+    # values as the statement assigns them.
+    epoch = values.get("runtime_epoch", ExecutionRequest.runtime_epoch)
+    values["delivered_limits"] = func.jsonb_build_object("runtime_epoch", epoch).op(
+        "||", return_type=JSONB
+    )(literal(record, type_=JSONB))
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -1203,6 +1527,15 @@ async def start_execution_where(
     return await outcome(session, work_item, request)
 
 
+async def execution_deadline_seconds(session: AsyncSession, agent_id: uuid.UUID) -> int:
+    """The agent's operator execution deadline override, else the platform default."""
+
+    agent_deadline = await session.scalar(
+        select(Agent.execution_deadline_seconds).where(Agent.id == agent_id)
+    )
+    return agent_deadline if agent_deadline is not None else DEFAULT_EXECUTION_DEADLINE_SECONDS
+
+
 async def start_execution(
     session: AsyncSession,
     *,
@@ -1219,6 +1552,8 @@ async def start_execution(
         expected_request_version=expected_request_version,
         extra_where=(),
         extra_values={"execution_attempts": 1},
+        # No worker claimed a sandbox for this start, so it observed no limit.
+        delivered_limits=NO_DELIVERED_LIMITS,
     )
 
 
@@ -1265,7 +1600,13 @@ async def expire_waiting(
         .values(
             status="expired",
             terminal_at=now,
-            terminal_cause="capacity_wait_expired",
+            # A request blocked on a typed condition names that wait (ADR 0269);
+            # blocked_on stays on the row so the condition is still readable.
+            terminal_cause=(
+                "retry_condition_expired"
+                if request.blocked_on is not None
+                else "capacity_wait_expired"
+            ),
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1277,6 +1618,149 @@ async def expire_waiting(
     request = await reload_request(session, request_id)
     await settle_terminal(session, work_item, request, detail=None)
     return await outcome(session, work_item, request)
+
+
+ConditionReleaseRefusal = Literal[
+    "not_found",
+    "work_item_cancelled",
+    "readmit_pending",
+    "stale_version",
+    "not_waiting",
+    "already_started",
+    "not_blocked",
+    "waiting_deadline_elapsed",
+    "condition_mismatch",
+    "not_cleared",
+]
+
+
+@dataclass(frozen=True)
+class ConditionRelease:
+    """What one ``release_retry_condition`` call did.
+
+    ``refusal`` is None when the block was lifted. ``condition`` names the
+    block the request carried when it was read, when one was read.
+    """
+
+    request_id: uuid.UUID
+    condition: str | None
+    refusal: ConditionReleaseRefusal | None
+
+    @property
+    def released(self) -> bool:
+        return self.refusal is None
+
+
+async def _condition_release(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    condition: str | None,
+    refusal: ConditionReleaseRefusal | None,
+) -> ConditionRelease:
+    await session.commit()
+    return ConditionRelease(request_id=request_id, condition=condition, refusal=refusal)
+
+
+async def release_retry_condition(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    expected_work_item_version: int,
+    expected_request_version: int,
+    recheck: Callable[[], Awaitable[bool]],
+) -> ConditionRelease:
+    """Lift a verified provider block from a waiting automatic successor (#5426).
+
+    In one transaction with the WorkItem and request locked: refuse a cancelled
+    WorkItem, a pending relabel, a stale version, a request that is not
+    waiting, already started, not blocked, or past its waiting deadline by
+    database time, and a block that the factory policy no longer derives from
+    the predecessor's persisted cause, safety fact and condition. Only then is
+    ``recheck`` (a fresh read of the verifying evidence) awaited, and only its
+    True clears ``blocked_on`` and makes the request due now, by a version
+    compare-and-set. The allowance count, the waiting deadline, the
+    predecessor and every other request are left alone, and the count is not
+    consulted: admitting this successor is what spent its slot. A second call
+    finds no block and changes nothing.
+    """
+
+    work_item = await lock_work_item(session, work_item_id)
+    if work_item is None:
+        return await _condition_release(session, request_id, None, "not_found")
+    if work_item.cancelled_at is not None:
+        return await _condition_release(session, request_id, None, "work_item_cancelled")
+    if work_item.readmit_request_id is not None:
+        return await _condition_release(session, request_id, None, "readmit_pending")
+    if work_item.version != expected_work_item_version:
+        return await _condition_release(session, request_id, None, "stale_version")
+    request = await lock_request(session, work_item_id=work_item_id, request_id=request_id)
+    if request is None:
+        return await _condition_release(session, request_id, None, "not_found")
+    condition = request.blocked_on
+    if request.version != expected_request_version:
+        return await _condition_release(session, request_id, condition, "stale_version")
+    if request.status != "waiting":
+        return await _condition_release(session, request_id, condition, "not_waiting")
+    if request.started_at is not None:
+        return await _condition_release(session, request_id, condition, "already_started")
+    if condition is None:
+        return await _condition_release(session, request_id, None, "not_blocked")
+    deadline = request.wait_deadline
+    if deadline is None or await database_now(session) >= deadline:
+        return await _condition_release(session, request_id, condition, "waiting_deadline_elapsed")
+    predecessor: ExecutionRequest | None = None
+    if request.retry_of_request_id is not None:
+        predecessor = await session.scalar(
+            select(ExecutionRequest)
+            .where(
+                ExecutionRequest.id == request.retry_of_request_id,
+                ExecutionRequest.work_item_id == work_item_id,
+            )
+            .execution_options(populate_existing=True)
+        )
+    if predecessor is None or predecessor.status != "failed":
+        return await _condition_release(session, request_id, condition, "condition_mismatch")
+    safety = predecessor.retry_safety
+    disposition = factory_retry_policy.decide(
+        RetryFacts(
+            cause=predecessor.terminal_cause or "",
+            safety=(
+                cast(RetrySafety, safety)
+                if safety in ("no_effects", "flagged", "uncertain")
+                else None
+            ),
+            condition_reason=predecessor.retry_condition_reason,
+            condition_retry_at=predecessor.retry_condition_retry_at,
+            condition_scope_key=predecessor.retry_condition_scope_key,
+        )
+    )
+    if not disposition.successor or disposition.condition != condition:
+        return await _condition_release(session, request_id, condition, "condition_mismatch")
+    if not await recheck():
+        return await _condition_release(session, request_id, condition, "not_cleared")
+    changed_id: uuid.UUID | None = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request_id,
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.version == expected_request_version,
+            ExecutionRequest.status == "waiting",
+            ExecutionRequest.started_at.is_(None),
+            ExecutionRequest.blocked_on == condition,
+            ExecutionRequest.wait_deadline > func.clock_timestamp(),
+        )
+        .values(
+            blocked_on=None,
+            dispatch_not_before=func.clock_timestamp(),
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        return await _condition_release(session, request_id, condition, "stale_version")
+    return await _condition_release(session, request_id, condition, None)
 
 
 async def adopt_orphan_publication_lineage(
@@ -1547,6 +2031,9 @@ async def link_publication_lineage(
                 session, "lineage_already_owned", work_item=work_item, request=request
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    from ..factory_notices import mark_status_comment_stale
+
+    await mark_status_comment_stale(session, work_item_id)
     work_item = await reload_work_item(session, work_item_id)
     return await outcome(session, work_item, request)
 
@@ -1563,7 +2050,25 @@ async def terminalize_execution(
     detail: str | None,
     ci_fix_round: int | None,
     extra_where: Sequence[ColumnElement[bool]],
+    retry_safety: RetrySafety | None,
+    retry_condition: RetryConditionFact | None,
+    exhausted_volume: str | None,
+    finisher: Literal["worker", "control_plane"],
 ) -> WorkItemResult:
+    """Settle a running request completed or failed.
+
+    ``retry_safety`` and ``retry_condition`` are the worker's typed facts
+    (ADR 0269); a settlement the API makes itself passes None for both. They
+    are written by the terminal UPDATE, and a failed request whose facts the
+    factory policy allows may admit its automatic successor in this same
+    transaction, before terminal settlement. ``exhausted_volume`` is the
+    scratch volume a ``sandbox_scratch_exhausted`` finish named (#5427); the
+    terminal UPDATE adds it to the request's delivered limits record, where
+    the successor's gate reads it. ``finisher`` names who ends the run: the
+    worker's own finish, or a settlement the control plane makes itself. It
+    decides what becomes of a lease parked at the execution deadline.
+    """
+
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
         return await _conflict(
@@ -1670,6 +2175,15 @@ async def terminalize_execution(
         if await _unchanged_follow_up(session, work_item, request, detail):
             status = "completed"
             cause = "completed"
+        elif (
+            await factory_questions.question_ending(session, work_item.id, request.id)
+            == factory_questions.QUESTIONS_ASKED
+        ):
+            # The question ending (#5785): a request whose posted questions
+            # are this WorkItem's current round settles completed, so it never
+            # spends an automatic failure successor and is never needs-human.
+            status = "completed"
+            cause = factory_questions.QUESTIONS_ASKED
     if status == "failed" and cause.strip() == "approval_create_failed":
         pending = await session.scalar(
             select(Publication.id)
@@ -1683,11 +2197,48 @@ async def terminalize_execution(
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
+    if status == "failed" and await factory_questions.rounds_exhausted_for(
+        session, work_item.id, request.id
+    ):
+        # Refused past the round cap (#5785, decision 14): however this
+        # request fails, it is terminal and needs a human.
+        cause = factory_questions.QUESTION_ROUNDS_EXHAUSTED
     # The Python check above allows a pull request that already opened to
     # complete after the deadline. The UPDATE has to use the same exception,
     # or the deadline predicate rejects the row and the next pass cancels it.
     deadline_guard = (
         () if opened else (ExecutionRequest.execution_deadline > func.clock_timestamp(),)
+    )
+    # A request with no delivered record keeps none: concatenation with NULL
+    # is NULL, so a named volume alone never makes a record a gate could use.
+    volume_values: dict[str, Any] = (
+        {}
+        if exhausted_volume is None
+        else {
+            "delivered_limits": ExecutionRequest.delivered_limits.op("||", return_type=JSONB)(
+                func.jsonb_build_object(resource_gate.EXHAUSTED_VOLUME_KEY, exhausted_volume)
+            )
+        }
+    )
+    # ADR 0268 decision 4 gives a personal owner one active process. A started
+    # personal request's sandbox claim holds that slot until a worker deletes
+    # it, and the worker's own release runs only when its turn settles the
+    # request, so this write owes the teardown (#5840): terminate wakes follow
+    # until a worker records the runtime gone. When the control plane settles
+    # the run, a parked CI or approval hold is released so any worker can claim
+    # it at once. When the worker finishes it, a parked hold becomes the short
+    # lease an ordinary finish leaves, so its ADR 0251 recovery capture keeps
+    # live authority and the wake waits for that lease to lapse. Service rows
+    # are unchanged.
+    teardown_values: dict[str, Any] = (
+        {
+            "teardown_unconfirmed_at": func.clock_timestamp(),
+            "runtime_heartbeat_expires_at": (
+                _shorten_parked_hold() if finisher == "worker" else _release_parked_hold()
+            ),
+        }
+        if request.model_auth_mode == "personal" and request.started_at is not None
+        else {}
     )
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
@@ -1703,8 +2254,16 @@ async def terminalize_execution(
             status=status,
             terminal_at=now,
             terminal_cause=cause.strip(),
+            retry_safety=retry_safety,
+            retry_condition_reason=None if retry_condition is None else retry_condition.reason,
+            retry_condition_retry_at=None if retry_condition is None else retry_condition.retry_at,
+            retry_condition_scope_key=(
+                None if retry_condition is None else retry_condition.scope_key
+            ),
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
+            **volume_values,
+            **teardown_values,
         )
         .returning(ExecutionRequest.id)
     )
@@ -1722,6 +2281,24 @@ async def terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
+    if request.status == "failed":
+        disposition = factory_retry_policy.decide(
+            RetryFacts(
+                cause=request.terminal_cause or "",
+                safety=retry_safety,
+                condition_reason=None if retry_condition is None else retry_condition.reason,
+                condition_retry_at=None if retry_condition is None else retry_condition.retry_at,
+                condition_scope_key=(
+                    None if retry_condition is None else retry_condition.scope_key
+                ),
+            )
+        )
+        # Before settlement, so the successor keeps the transcript (ADR 0269).
+        work_item = await reload_work_item(session, work_item_id)
+        if await admit_automatic_successor(
+            session, work_item, request, origin="ordinary", disposition=disposition
+        ):
+            work_item = await reload_work_item(session, work_item_id)
     await settle_terminal(session, work_item, request, detail=detail)
     return await outcome(session, work_item, request)
 
@@ -1733,6 +2310,8 @@ async def complete_execution(
     request_id: uuid.UUID,
     expected_work_item_version: int,
     expected_request_version: int,
+    retry_safety: RetrySafety | None,
+    retry_condition: RetryConditionFact | None,
 ) -> WorkItemResult:
     return await terminalize_execution(
         session,
@@ -1745,6 +2324,10 @@ async def complete_execution(
         detail=None,
         ci_fix_round=None,
         extra_where=(),
+        retry_safety=retry_safety,
+        retry_condition=retry_condition,
+        exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -1756,6 +2339,8 @@ async def fail_execution(
     cause: str,
     expected_work_item_version: int,
     expected_request_version: int,
+    retry_safety: RetrySafety | None,
+    retry_condition: RetryConditionFact | None,
 ) -> WorkItemResult:
     return await terminalize_execution(
         session,
@@ -1768,6 +2353,10 @@ async def fail_execution(
         detail=None,
         ci_fix_round=None,
         extra_where=(),
+        retry_safety=retry_safety,
+        retry_condition=retry_condition,
+        exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -1895,6 +2484,10 @@ async def settle_ci_verdict(
                 detail=detail,
                 ci_fix_round=None,
                 extra_where=(),
+                retry_safety=None,
+                retry_condition=None,
+                exhausted_volume=None,
+                finisher="control_plane",
             )
         if isinstance(result, WorkItemOutcome):
             await session.execute(
@@ -1921,6 +2514,10 @@ async def settle_ci_verdict(
         detail=detail,
         ci_fix_round=None,
         extra_where=(),
+        retry_safety=None,
+        retry_condition=None,
+        exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -1978,6 +2575,21 @@ def _release_parked_hold() -> ColumnElement[datetime]:
     )
 
 
+def _shorten_parked_hold() -> ColumnElement[datetime]:
+    # A worker finishing a turn that ran under a parked CI or approval hold
+    # keeps a live short lease, as any other finish does, so its ADR 0251
+    # recovery capture keeps live authority; the terminate wake waits for that
+    # lease to lapse (#5840). An ordinary short lease is kept as it is.
+    return case(
+        (
+            ExecutionRequest.runtime_heartbeat_expires_at == ExecutionRequest.execution_deadline,
+            func.clock_timestamp()
+            + timedelta(seconds=get_settings().work_item_runtime_ttl_seconds),
+        ),
+        else_=ExecutionRequest.runtime_heartbeat_expires_at,
+    )
+
+
 async def request_cancellation(
     session: AsyncSession,
     *,
@@ -2029,6 +2641,10 @@ async def request_cancellation(
         return await _conflict(session, "stale_version", work_item=work_item)
 
     await _cancel_queued_requests(session, work_item_id, now, cause)
+    # The WorkItem's question ends with it (#5785, decision 15): the row is
+    # deleted, so no comment is an answer; the sweep above cancelled any
+    # queued answer follow-up. The lifetime round count stays.
+    await factory_questions.delete_for_cancellation(session, work_item_id)
 
     active = await lock_active_request(session, work_item_id)
     if active is not None and active.status == "waiting":
@@ -2072,7 +2688,7 @@ async def request_cancellation(
     elif (
         active is not None
         and active.status == "cancellation_requested"
-        and active.terminal_cause in ("execution_deadline", "owner_lost")
+        and active.terminal_cause in ("execution_deadline", "owner_lost", "enrollment_fenced")
     ):
         await session.execute(
             update(ExecutionRequest)
@@ -2111,6 +2727,10 @@ async def readmit(
 ) -> WorkItemResult:
     """Start a new run on an existing WorkItem because the label was added again.
 
+    A request created now gets its completion contract from admission's
+    snapshot write; a relabel deferred behind a stopping run selects its
+    contract when `admit_pending_readmit` creates it (ADR 0277, #5586).
+
     A waiting request is superseded in the same transaction. A running request
     is asked to stop, and the relabel is stored on the WorkItem until that
     request reaches a terminus; the returned request is then the old one. A
@@ -2138,6 +2758,11 @@ async def readmit(
             .limit(1)
         )
         return await outcome(session, work_item, predecessor, replayed=True)
+    if work_item.cancelled_at is not None:
+        # A cancellation deletes the question row, but one an older API
+        # replica took during a rolling upgrade kept it; the relabel must not
+        # inherit the cancelled round (#5785).
+        await factory_questions.delete_for_cancellation(session, work_item_id)
     now = await database_now(session)
     moving = await session.scalar(
         select(FactoryBaseTransition)
@@ -2250,6 +2875,7 @@ async def readmit(
         )
         superseded = await reload_request(session, active.id)
         await _queue_notice(session, work_item, superseded, detail=None)
+        await factory_questions.settle_round(session, work_item, superseded)
     version: int | None = await session.scalar(
         update(WorkItem)
         .where(WorkItem.id == work_item_id)
@@ -2293,6 +2919,9 @@ async def admit_pending_readmit(
     if active is not None and active.status != "waiting":
         await session.commit()
         return None
+    if work_item.cancelled_at is not None:
+        # As in readmit: drop a round an older replica's cancellation kept.
+        await factory_questions.delete_for_cancellation(session, work_item_id)
     moving = await session.scalar(
         select(FactoryBaseTransition.id)
         .where(
@@ -2339,6 +2968,7 @@ async def admit_pending_readmit(
         active.version += 1
         await session.flush()
         await _queue_notice(session, work_item, active, detail=None)
+        await factory_questions.settle_round(session, work_item, active)
     version: int | None = await session.scalar(
         update(WorkItem)
         .where(WorkItem.id == work_item_id)
@@ -2586,6 +3216,83 @@ async def request_owner_lost_cancellation(
     return await outcome(session, work_item, request)
 
 
+@dataclass(frozen=True)
+class EnrollmentFence:
+    """The requests one enrollment fence changed (#5377), by id."""
+
+    stopping: tuple[uuid.UUID, ...]
+    pending_teardown: tuple[uuid.UUID, ...]
+
+
+async def fence_enrollment_generation(
+    session: AsyncSession, *, tenant_id: uuid.UUID, owner_principal_id: uuid.UUID
+) -> EnrollmentFence:
+    """Fence every personal request of one owner after a replace or disconnect.
+
+    ADR 0268 section 3. Runs in the caller's transaction, which already holds
+    the owner's WorkItems and requests locked and owns the commit; nothing here
+    commits. Every existing request of the owner ran under a generation at or
+    below the enrollment's, so each is superseded:
+
+    1. A ``running`` request becomes ``cancellation_requested`` with cause
+       ``enrollment_fenced``; a parked approval or CI hold is released so any
+       worker can claim the termination. It ends ``failed`` once a worker
+       records the teardown.
+    2. A started ``completed``, ``failed`` or ``expired`` request with no
+       termination observation is marked ``teardown_unconfirmed_at``, so
+       terminate wakes run until a worker records its runtime gone. A
+       completed or failed one is normally marked already by its own terminal
+       write (#5840); this covers rows that ended without the mark, such as
+       rows settled before it.
+    3. ``cancellation_requested`` requests already end with an observation,
+       and ``queued`` and ``waiting`` ones are fenced by their generation, so
+       neither changes. The WorkItem is never cancelled.
+    """
+
+    owner = (
+        ExecutionRequest.tenant_id == tenant_id,
+        ExecutionRequest.owner_principal_id == owner_principal_id,
+        ExecutionRequest.model_auth_mode == "personal",
+    )
+    stopping = await session.scalars(
+        update(ExecutionRequest)
+        .where(*owner, ExecutionRequest.status == "running")
+        .values(
+            status="cancellation_requested",
+            terminal_cause="enrollment_fenced",
+            cancellation_requested_at=func.clock_timestamp(),
+            runtime_heartbeat_expires_at=_release_parked_hold(),
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    stopped = tuple(stopping.all())
+    pending = await session.scalars(
+        update(ExecutionRequest)
+        .where(
+            *owner,
+            ExecutionRequest.status.in_(TEARDOWN_TERMINAL_STATUSES),
+            ExecutionRequest.started_at.is_not(None),
+            or_(
+                ExecutionRequest.termination_observation.is_(None),
+                func.btrim(ExecutionRequest.termination_observation) == "",
+            ),
+            ExecutionRequest.teardown_unconfirmed_at.is_(None),
+        )
+        .values(
+            teardown_unconfirmed_at=func.clock_timestamp(),
+            # A lease parked at the deadline would keep another worker from
+            # claiming the teardown until then.
+            runtime_heartbeat_expires_at=_release_parked_hold(),
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    return EnrollmentFence(stopping=stopped, pending_teardown=tuple(pending.all()))
+
+
 async def record_runtime_termination(
     session: AsyncSession,
     *,
@@ -2628,7 +3335,11 @@ async def record_runtime_termination_where(
         return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
-    if request.status == "cancelled" and request.teardown_unconfirmed_at is not None:
+    if (
+        request.status in ("cancelled", *TEARDOWN_TERMINAL_STATUSES)
+        and request.terminal_at is not None
+        and request.teardown_unconfirmed_at is not None
+    ):
         return await _confirm_settled_teardown(
             session,
             work_item=work_item,
@@ -2649,10 +3360,17 @@ async def record_runtime_termination_where(
         terminal_status = "cancelled"
     elif request.terminal_cause == "execution_deadline":
         terminal_status = "expired"
-    elif request.terminal_cause == "owner_lost":
+    elif request.terminal_cause in ("owner_lost", "enrollment_fenced"):
         terminal_status = "failed"
     else:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
+    terminal_cause = request.terminal_cause
+    if terminal_status == "failed" and await factory_questions.rounds_exhausted_for(
+        session, work_item_id, request_id
+    ):
+        # Refused past the round cap (#5785, decision 14): losing its owner
+        # afterwards does not buy an owner loss successor.
+        terminal_cause = factory_questions.QUESTION_ROUNDS_EXHAUSTED
     now = await database_now(session)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
@@ -2665,6 +3383,7 @@ async def record_runtime_termination_where(
         )
         .values(
             status=terminal_status,
+            terminal_cause=terminal_cause,
             terminal_at=now,
             termination_observation=termination_observation,
             version=ExecutionRequest.version + 1,
@@ -2677,109 +3396,313 @@ async def record_runtime_termination_where(
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
     # Before settlement, so the successor keeps the transcript (ADR 0206).
-    if await _admit_owner_lost_successor(session, work_item, request):
+    if await admit_automatic_successor(
+        session, work_item, request, origin="owner_loss", disposition=None
+    ):
         work_item = await reload_work_item(session, work_item_id)
     await settle_terminal(session, work_item, request, detail=None)
     return await outcome(session, work_item, request)
 
 
-async def owner_lost_streak(
+async def automatic_successor_of(
+    session: AsyncSession, request: ExecutionRequest
+) -> ExecutionRequest | None:
+    """The automatic successor admitted when ``request`` settled, if any (ADR 0269)."""
+
+    row: ExecutionRequest | None = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.retry_of_request_id == request.id)
+    )
+    return row
+
+
+async def admit_automatic_successor(
     session: AsyncSession,
-    work_item_id: uuid.UUID,
+    work_item: WorkItem,
+    predecessor: ExecutionRequest,
     *,
-    through_sequence: int | None = None,
-) -> int:
-    """Consecutive owner_lost terminals on a WorkItem, newest first (ADR 0206).
-
-    Requests that have not ended, such as a queued revision, are skipped.
-    ``through_sequence`` counts back from that request instead of the newest.
-    """
-
-    query = (
-        select(ExecutionRequest.terminal_cause)
-        .where(
-            ExecutionRequest.work_item_id == work_item_id,
-            ExecutionRequest.terminal_at.is_not(None),
-        )
-        .order_by(ExecutionRequest.sequence.desc())
-    )
-    if through_sequence is not None:
-        query = query.where(ExecutionRequest.sequence <= through_sequence)
-    streak = 0
-    for cause in await session.scalars(query):
-        if cause != "owner_lost":
-            break
-        streak += 1
-    return streak
-
-
-async def owner_lost_successor_admitted(session: AsyncSession, request: ExecutionRequest) -> bool:
-    """Whether settling this owner_lost request admitted its successor.
-
-    The successor is inserted in the settling transaction, so its created_at
-    (that transaction's start) is not after the request's terminal_at. A later
-    loss's successor is created in a later transaction.
-    """
-
-    if request.terminal_at is None:
-        return False
-    found = await session.scalar(
-        select(ExecutionRequest.id)
-        .where(
-            ExecutionRequest.work_item_id == request.work_item_id,
-            ExecutionRequest.sequence > request.sequence,
-            ExecutionRequest.owner_lost_retry.is_(True),
-            ExecutionRequest.created_at <= request.terminal_at,
-        )
-        .limit(1)
-    )
-    return found is not None
-
-
-async def _admit_owner_lost_successor(
-    session: AsyncSession, work_item: WorkItem, lost: ExecutionRequest
+    origin: Literal["owner_loss", "ordinary"],
+    disposition: Disposition | None,
 ) -> bool:
-    """Admit a new waiting request for work its lost owner took down (ADR 0206).
+    """Admit one fresh waiting request for a failed request (ADR 0206, ADR 0269).
 
-    Call with the WorkItem locked, after ``lost`` settled failed/owner_lost and
-    in the same transaction. The successor re-runs the lost request's snapshot
-    on the WorkItem's recorded base. A cancelled WorkItem, a pending relabel, a
-    closed pull request lineage, a request waiting on its publication, or the
-    third loss in a row admits nothing.
+    Call with the WorkItem locked at its current version, after
+    ``predecessor`` settled failed, in the same transaction and before
+    terminal settlement. The successor re-runs the predecessor's snapshot on
+    the WorkItem's recorded base and spends one slot of the WorkItem's shared
+    automatic allowance, reserved in the same statement that allocates it.
+
+    Every origin refuses a cancelled WorkItem, a pending relabel, a closed
+    pull request lineage, a request its publication still owns, a Curie
+    budget refusal, a spent allowance and a request whose ask was refused
+    for the question round cap (ADR 0286 decision 8), whatever its cause,
+    so owner loss cannot outrun the cap. Owner loss keeps its teardown based
+    exception: it needs no safety fact and adds no delay. An
+    ordinary failure needs the worker's proved ``no_effects``, a policy
+    disposition that allows a successor, and no queued newer revision. A
+    publication failure instead goes to ``_admit_publication_recovery``.
+
+    A limit condition (#5427) admits a gated successor instead: it carries the
+    limit the predecessor's attempt actually had, and the reconciler offers
+    it every probe interval until a start delivers strictly more. A
+    predecessor without that delivered value admits no successor.
+
+    A successor is admitted blocked only when something can release it: a
+    resource gate, or a provider gate whose predecessor names a probed scope
+    and no reset time. A condition wait naming any other condition, and a
+    successor that would block with no releaser (such as a provider time at
+    or past the waiting deadline), admits nothing and spends no slot (#5424).
     """
 
     if (
-        lost.status != "failed"
-        or lost.terminal_cause != "owner_lost"
+        predecessor.status != "failed"
         or work_item.cancelled_at is not None
         or work_item.readmit_request_id is not None
-        or await _publication_owns_terminus(session, work_item, lost)
-        or await _lineage_closed_for(session, work_item, lost.reply_target_pr_number)
-        or await owner_lost_streak(session, work_item.id) >= OWNER_LOST_RETRY_LIMIT
+        or work_item.automatic_retries_used >= AUTOMATIC_RETRY_LIMIT
+        or predecessor.terminal_cause
+        in ("budget_exceeded", factory_questions.QUESTION_ROUNDS_EXHAUSTED)
+        or await factory_questions.rounds_exhausted_for(session, work_item.id, predecessor.id)
     ):
         return False
-    budget = timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    if (
+        origin == "ordinary"
+        and disposition is not None
+        and disposition.kind == DispositionKind.PUBLICATION_RECOVERY
+    ):
+        return await _admit_publication_recovery(session, work_item, predecessor, owner_lost=False)
+    if predecessor.execution_kind == "publication_recovery":
+        # Another publication failure is admitted above, as publication
+        # recovery, before this branch. Owner loss admits the same candidate
+        # again inside the shared allowance. Any other failure here admits
+        # nothing. None of these paths starts an implementation run (#5429).
+        if origin == "owner_loss" and predecessor.terminal_cause == "owner_lost":
+            return await _admit_publication_recovery(
+                session, work_item, predecessor, owner_lost=True
+            )
+        return False
+    if origin == "owner_loss":
+        if predecessor.terminal_cause != "owner_lost":
+            return False
+    elif (
+        predecessor.terminal_cause == "owner_lost"
+        or predecessor.retry_safety != "no_effects"
+        or disposition is None
+        or not disposition.successor
+        or (
+            disposition.kind == DispositionKind.CONDITION_WAIT
+            and disposition.condition not in _RELEASED_CONDITIONS
+        )
+    ):
+        return False
+    if await _publication_owns_terminus(
+        session, work_item, predecessor
+    ) or await _lineage_closed_for(session, work_item, predecessor.reply_target_pr_number):
+        return False
+    if origin == "ordinary":
+        queued = await session.scalar(
+            select(ExecutionRequest.id)
+            .where(
+                ExecutionRequest.work_item_id == work_item.id,
+                ExecutionRequest.status == "queued",
+            )
+            .limit(1)
+        )
+        if queued is not None:
+            return False
+
+    now = await database_now(session)
+    wait_deadline = now + timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    slot = work_item.automatic_retries_used + 1
+    dispatch_not_before = now
+    # Set only for a successor an older dispatcher must never claim.
+    guarded_dispatch_not_before: datetime | None = None
+    blocked_on: str | None = None
+    gate: dict[str, Any] | None = None
+    if origin == "ordinary":
+        assert disposition is not None
+        due = now + timedelta(seconds=automatic_retry_delay_seconds(work_item.id, slot))
+        provider_time = disposition.not_before
+        if provider_time is not None and provider_time > due:
+            due = provider_time
+        if disposition.kind == DispositionKind.RETRY_BACKOFF:
+            # Without a provider time the successor is always scheduled.
+            blocked = provider_time is not None and due >= wait_deadline
+        elif disposition.kind == DispositionKind.CONDITION_WAIT:
+            # Only a provider time can schedule a condition; otherwise it blocks.
+            blocked = provider_time is None or due >= wait_deadline
+        else:
+            return False
+        if disposition.condition in resource_gate.GATE_CONDITIONS:
+            gate = resource_gate.gate_for(
+                disposition.condition,
+                predecessor.delivered_limits,
+                source_request_id=predecessor.id,
+                source_runtime_epoch=predecessor.runtime_epoch,
+            )
+            if gate is None:
+                return False
+            # A gated wait is probed, not slept until its deadline. Only this
+            # release reads the gate, so the probe time is guarded: an older
+            # dispatcher would start the retry without checking it.
+            blocked_on = disposition.condition
+            guarded_dispatch_not_before = now + timedelta(
+                seconds=get_settings().work_item_resource_gate_probe_seconds
+            )
+            dispatch_not_before = wait_deadline
+        elif blocked:
+            # Only a provider probe releases any other block, and only for a
+            # probed scope with no reset time; otherwise nothing would wait.
+            if not factory_retry_policy.provider_gate_releasable(
+                disposition.condition,
+                predecessor.retry_condition_reason,
+                predecessor.retry_condition_retry_at,
+                predecessor.retry_condition_scope_key,
+            ):
+                return False
+            blocked_on = disposition.condition
+            dispatch_not_before = wait_deadline
+        else:
+            dispatch_not_before = due
     admitted = await _insert_waiting_request(
         session,
         work_item,
         request_id=uuid.uuid4(),
-        wait_deadline=await database_now(session) + budget,
+        wait_deadline=wait_deadline,
         expected_work_item_version=work_item.version,
+        reserve_automatic_retry=True,
         columns={
-            "owner_lost_retry": True,
-            "objective": lost.objective,
-            "requester": lost.requester,
-            "reply_kind": lost.reply_kind,
-            "reply_address": lost.reply_address,
-            "reply_conversation_id": lost.reply_conversation_id,
-            "reply_target_kind": lost.reply_target_kind,
-            "reply_target_pr_number": lost.reply_target_pr_number,
-            "reply_target_comment_id": lost.reply_target_comment_id,
-            "reply_target_url": lost.reply_target_url,
+            "owner_lost_retry": origin == "owner_loss",
+            "objective": predecessor.objective,
+            "requester": predecessor.requester,
+            "reply_kind": predecessor.reply_kind,
+            "reply_address": predecessor.reply_address,
+            "reply_conversation_id": predecessor.reply_conversation_id,
+            "reply_target_kind": predecessor.reply_target_kind,
+            "reply_target_pr_number": predecessor.reply_target_pr_number,
+            "reply_target_comment_id": predecessor.reply_target_comment_id,
+            "reply_target_url": predecessor.reply_target_url,
+            # Counted starts span the automatic chain (#5155, ADR 0269).
+            "start_deferrals": predecessor.start_deferrals,
+            "retry_of_request_id": predecessor.id,
+            "retry_origin_request_id": predecessor.retry_origin_request_id or predecessor.id,
+            "dispatch_not_before": dispatch_not_before,
+            "guarded_dispatch_not_before": guarded_dispatch_not_before,
+            "blocked_on": blocked_on,
+            "resource_gate": gate,
         },
     )
-    # The WorkItem is locked and was checked above, so its version holds.
+    # The WorkItem is locked and its count was checked above, so the
+    # reservation holds.
     assert admitted
+    return True
+
+
+async def _admit_publication_recovery(
+    session: AsyncSession, work_item: WorkItem, predecessor: ExecutionRequest, *, owner_lost: bool
+) -> bool:
+    """Admit one publication recovery successor for a failed publication (#5429).
+
+    Called from ``admit_automatic_successor`` after its common refusals, in
+    the predecessor's settling transaction. The successor reruns no model, so
+    only a worker reported ``uncertain`` effect refuses; ``no_effects``,
+    ``flagged`` and an API settlement with no worker fact are allowed. The
+    predecessor's own settled publication is the failure being recovered, so
+    only a publication still in flight on the request, lineage or conversation,
+    or a ready applied base move, owns the terminus. A closed lineage, a queued
+    newer revision or no exact retained candidate admits nothing.
+
+    The successor is admitted and the candidate handed to it in one savepoint:
+    a refused transfer rolls back the request and its allowance slot together.
+    """
+
+    from .. import publication_candidates
+
+    if predecessor.retry_safety == "uncertain" or not get_settings().publication_candidates_enabled:
+        return False
+    scope = Publication.workspace_conversation_id == work_item.conversation_id
+    if work_item.publication_lineage_id is not None:
+        scope = or_(scope, Publication.lineage_id == work_item.publication_lineage_id)
+    in_flight = await session.scalar(
+        select(Publication.id)
+        .where(
+            or_(Publication.execution_request_id == predecessor.id, scope),
+            Publication.status.in_(IN_FLIGHT_PUBLICATION),
+        )
+        .limit(1)
+    )
+    if (
+        in_flight is not None
+        or await _applied_base_transition(session, work_item, predecessor, ready=True) is not None
+        or await _lineage_closed_for(session, work_item, predecessor.reply_target_pr_number)
+    ):
+        return False
+    queued = await session.scalar(
+        select(ExecutionRequest.id)
+        .where(ExecutionRequest.work_item_id == work_item.id, ExecutionRequest.status == "queued")
+        .limit(1)
+    )
+    if queued is not None:
+        return False
+    try:
+        candidate = await publication_candidates.recovery_candidate(session, work_item, predecessor)
+    except publication_candidates.CandidateRefusal:
+        return False
+    if candidate is None:
+        return False
+
+    now = await database_now(session)
+    wait_deadline = now + timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    slot = work_item.automatic_retries_used + 1
+    due = now + timedelta(seconds=automatic_retry_delay_seconds(work_item.id, slot))
+    request_id = uuid.uuid4()
+    try:
+        async with session.begin_nested():
+            admitted = await _insert_waiting_request(
+                session,
+                work_item,
+                request_id=request_id,
+                wait_deadline=wait_deadline,
+                expected_work_item_version=work_item.version,
+                reserve_automatic_retry=True,
+                # The same copied facts as an ordinary automatic successor.
+                columns={
+                    "owner_lost_retry": owner_lost,
+                    "objective": predecessor.objective,
+                    "requester": predecessor.requester,
+                    "reply_kind": predecessor.reply_kind,
+                    "reply_address": predecessor.reply_address,
+                    "reply_conversation_id": predecessor.reply_conversation_id,
+                    "reply_target_kind": predecessor.reply_target_kind,
+                    "reply_target_pr_number": predecessor.reply_target_pr_number,
+                    "reply_target_comment_id": predecessor.reply_target_comment_id,
+                    "reply_target_url": predecessor.reply_target_url,
+                    "start_deferrals": predecessor.start_deferrals,
+                    "retry_of_request_id": predecessor.id,
+                    "retry_origin_request_id": (
+                        predecessor.retry_origin_request_id or predecessor.id
+                    ),
+                    # An older dispatcher reads no execution kind and would
+                    # start this as an implementation run, so only the
+                    # guarded time makes it due (migration 0182).
+                    "dispatch_not_before": wait_deadline,
+                    "guarded_dispatch_not_before": due,
+                    "blocked_on": None,
+                    "execution_kind": "publication_recovery",
+                    "recovery_candidate_id": candidate.id,
+                    "recovery_candidate_sha256": candidate.content_sha256,
+                },
+            )
+            # The WorkItem is locked and its count was checked by the caller.
+            assert admitted
+            await publication_candidates.transfer_ownership(
+                session,
+                work_item_id=work_item.id,
+                candidate_id=candidate.id,
+                to_request_id=request_id,
+            )
+    except publication_candidates.CandidateRefusal:
+        # Nothing of the admission stands; reload the rolled back WorkItem.
+        await reload_work_item(session, work_item.id)
+        return False
     return True
 
 
@@ -2791,10 +3714,14 @@ async def _confirm_settled_teardown(
     termination_observation: str,
     extra_where: Sequence[ColumnElement[bool]],
 ) -> WorkItemResult:
-    """Record a late worker teardown for a force-settled cancellation.
+    """Record a worker teardown a terminal request still owes.
 
-    The request is already terminal and its notice already went out, so this
-    only replaces the placeholder observation and clears the flag.
+    Either a force-settled cancellation or a started completed, failed or
+    expired request its own terminal write (#5840) or an enrollment fence
+    (#5377) marked. The request is already
+    terminal and its notice already went out, so this only records the
+    observation (replacing a settle placeholder) and clears the flag. Its
+    status, cause, ``terminal_at`` and runtime epoch stay as they were.
     """
 
     if not termination_observation.strip():
@@ -2810,7 +3737,8 @@ async def _confirm_settled_teardown(
             ExecutionRequest.id == request.id,
             ExecutionRequest.work_item_id == work_item.id,
             ExecutionRequest.version == request.version,
-            ExecutionRequest.status == "cancelled",
+            ExecutionRequest.status == request.status,
+            ExecutionRequest.terminal_at.is_not(None),
             ExecutionRequest.teardown_unconfirmed_at.is_not(None),
             *extra_where,
         )

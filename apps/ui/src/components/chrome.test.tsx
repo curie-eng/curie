@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { Topbar } from "./Topbar";
 import { Sidebar } from "./Sidebar";
 import { StoreProvider } from "../state/store";
@@ -53,5 +53,16 @@ describe("chrome workspace name", () => {
     vi.mocked(useWired).mockReturnValue(wiredValue({ orgName: "Curie" }));
     renderChrome();
     expect(screen.getAllByText("Curie").length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("sidebar navigation order", () => {
+  it("lists Memory directly after Factory", () => {
+    vi.mocked(useWired).mockReturnValue(wiredValue({}));
+    renderChrome();
+    const labels = within(screen.getByRole("navigation")).getAllByRole("button").map((b) => b.textContent ?? "");
+    const at = (name: string) => labels.findIndex((l) => l.startsWith(name));
+    expect(at("Memory")).toBe(at("Factory") + 1);
+    expect(at("Memory")).toBeGreaterThan(-1);
   });
 });

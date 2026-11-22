@@ -151,6 +151,34 @@ async def _bind_publication_context(
     return event.model_copy(update={"publication_context": context}), remaining_s
 
 
+async def _continuation_refused(self: Kernel, run: WorkItemRun, asked: bool) -> str | None:
+    """Why an unpublished turn must not be re-prompted, else None.
+
+    The request status when it is readable and not running, or
+    ``questions_asked`` when the API recorded this request's question round as
+    posted (ADR 0286 decision 2, #5785). ``asked`` is an ``ask_questions`` call
+    whose result was not an error; when the API cannot confirm its round either
+    way (the read failed, or an older API omits the field) the turn is not
+    re-prompted either, since the round may be posted. A refused or failed ask,
+    or any other unreadable request, is re-prompted, as before.
+    """
+
+    if self._work_items is None:
+        return None
+    try:
+        async with asyncio.timeout(constants._REQUEST_STATUS_READ_TIMEOUT_S):
+            view = await self._work_items.get_request(run.request_id)
+    except (WorkItemConflict, WorkItemTransportError, TimeoutError):
+        return "questions_unconfirmed" if asked else None
+    if view.status != "running":
+        return view.status
+    if view.questions_posted:
+        return "questions_asked"
+    if view.questions_posted is None and asked:
+        return "questions_unconfirmed"
+    return None
+
+
 async def _request_not_running(self: Kernel, run: WorkItemRun) -> str | None:
     """The request status when it is readable and not running, else None."""
 
@@ -180,11 +208,11 @@ async def _continue_unpublished(
     channel_read_grant: channel_read.TurnChannelReadGrant | None = None,
     attachment_turn: attachment_access.AttachmentAccessTurn | None = None,
 ) -> failures.TurnOutcome:
-    """Re-prompt a factory execute turn that ended without publishing, ONCE.
+    """Re-prompt an unpublished factory turn once, preserving explicit PR no-change replies.
 
-    The returned outcome merges both turns: the tools either called, and the
-    first turn's reply when the continuation said nothing. A continuation
-    that cannot start is a runner failure, not an early stop (#3128).
+    Merge tool evidence from both turns. Keep the first reply when the
+    continuation is empty, or ahead of a PR continuation that declines changes.
+    A continuation that cannot start is a runner failure, not an early stop (#3128).
     """
 
     parsed = parse_work_item_event_id(qevent.event_id)
@@ -201,12 +229,26 @@ async def _continue_unpublished(
         or PLATFORM_PUBLISH_TOOL_NAME in outcome.tools_called
     ):
         return outcome
+    has_recorded_pr = bool(run.recorded_pr_url and run.recorded_pr_url.strip())
+    no_change_prefix = "No changes needed:"
+    read_only = not outcome.saw_side_effect and all(
+        failures._is_context_tool(tool) or tool == constants._PROGRESS_TOOL_NAME
+        for tool in outcome.tools_called
+    )
+    if (
+        has_recorded_pr
+        and read_only
+        and outcome.assistant_text.strip().startswith(no_change_prefix)
+    ):
+        return outcome
     left = run.bound_remaining_s(remaining_s)
     if left is not None and left <= constants._MIN_ATTEMPT_BUDGET_S:
         return outcome
     # #4191: the request status is the authority for a requested cancel; a
-    # cancelled request is not re-prompted.
-    status = await self._request_not_running(run)
+    # cancelled request is not re-prompted. ADR 0286 decision 2: neither is a
+    # request whose question round the API recorded as posted, since asking
+    # ends it. A refused or failed ask posted nothing and still continues.
+    status = await self._continuation_refused(run, outcome.questions_ask_succeeded)
     if status is not None:
         logger.info("work-item continuation skipped for %s: request %s", qevent.event_id, status)
         return outcome
@@ -249,6 +291,8 @@ async def _continue_unpublished(
                 left, rebound = self._bound_requester_turn(handle, left)
                 window_bound = window_bound or rebound
                 if attachment_turn is None:
+                    # #5378: the continuation opens a turn too.
+                    await claim._authorize_turn_start(handle)
                     turn = await self._runner.start_turn(
                         handle.base_url, event, token=handle.token or None, remaining_s=left
                     )
@@ -264,6 +308,7 @@ async def _continue_unpublished(
                         event = await attachment_access.with_attachment_access(
                             self, event, handle, left, turn=attachment_turn
                         )
+                        await claim._authorize_turn_start(handle)
                         turn = await self._runner.start_turn(
                             handle.base_url, event, token=handle.token or None, remaining_s=left
                         )
@@ -336,7 +381,10 @@ async def _continue_unpublished(
                 continued=True,
             )
         except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
-            # Preaccept failures retain normal retry policy. An accepted stream
+            # A preaccept failure on a CI fix or approval resume wake retains the
+            # kernel retry policy. On the execute wake's own continuation the
+            # SQL lifecycle owns the retry, so the turn settles once and reports
+            # uncertain. An accepted stream
             # whose lock exit failed has already latched the no-retry fence above.
             # A requested cancel stops the continuation instead (#4191).
             status = await self._request_not_running(run)
@@ -373,10 +421,25 @@ async def _continue_unpublished(
             workspace_inferred_repo=inferred,
         )
         second.tools_called = outcome.tools_called | second.tools_called
+        second.questions_ask_succeeded = (
+            outcome.questions_ask_succeeded or second.questions_ask_succeeded
+        )
         second.saw_side_effect = outcome.saw_side_effect or second.saw_side_effect
         second.continued = True
         if not second.assistant_text.strip():
             second.assistant_text = outcome.assistant_text
+        elif (
+            has_recorded_pr
+            and second.terminal_ok
+            and second.status in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT)
+            and PLATFORM_PUBLISH_TOOL_NAME not in second.tools_called
+            and second.assistant_text.strip().startswith(no_change_prefix)
+            and outcome.assistant_text.strip()
+        ):
+            first_reply = outcome.assistant_text.strip()
+            if not first_reply.startswith(no_change_prefix):
+                first_reply = f"{no_change_prefix} {first_reply}"
+            second.assistant_text = f"{first_reply}\n\n{second.assistant_text.strip()}"
         return second
     finally:
         if turn is not None:

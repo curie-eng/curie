@@ -544,6 +544,9 @@ mod tests {
         assert_eq!(labels.len(), 5);
         assert!(labels
             .iter()
+            .any(|(name, _)| name == "curie-factory:queued"));
+        assert!(labels
+            .iter()
             .all(|(_, color)| color.len() == 7 && color.starts_with('#')));
     }
 }

@@ -496,6 +496,11 @@ async def update_agent(
     if data.memory_writes is not None:
         # Same plain-None rule as `memory`: omitted (or null) is unchanged.
         agent = await crud_agents.update_agent_memory_writes(session, agent, data.memory_writes)
+    if data.memory_rule_proposals is not None:
+        # Same plain-None rule as `memory_writes` (#5796): omitted is unchanged.
+        agent = await crud_agents.update_agent_memory_rule_proposals(
+            session, agent, data.memory_rule_proposals
+        )
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
         agent = await crud_agents.update_agent_approval_tools(
@@ -619,6 +624,11 @@ async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             {"code": "workspace_recovery.retained_objects"},
+        ) from None
+    except crud_agents.PublicationCandidatesRetained:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "publication_candidates.retained_objects"},
         ) from None
 
 
@@ -1201,6 +1211,9 @@ async def read_version_connectors(
                     grant_store=grant_store,
                     gated_tools=gated,
                     e2e=e2e_install,
+                    # The operator's ServiceAccount for each of this agent's
+                    # connectors that has one; the bundle cannot name one.
+                    service_accounts=settings.connector_service_accounts_for(agent_name),
                 )
             except ValueError as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc

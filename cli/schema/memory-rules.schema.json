@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/memory-rules/v1.1.json",
+  "title": "curie cluster memory --rules | --accept | --reject | --remove --json",
+  "description": "The learned rule list the API returned, the changed rule an accept, reject or remove returned, or an offline request plan.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "in_force_limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rules"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rule": {
+          "type": "object"
+        },
+        "applies_from": {
+          "enum": [
+            "next_ticket",
+            "next_session"
+          ]
+        }
+      },
+      "required": [
+        "rule",
+        "applies_from"
+      ]
+    }
+  ]
+}

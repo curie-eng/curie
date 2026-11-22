@@ -11,6 +11,7 @@ production deployments.
 """
 
 import json
+import re
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
@@ -38,8 +39,8 @@ from curie_internal.driver_declaration import (
 )
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
-from plugin_format.connector_render import ConnectorProxy, GrantStore
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from plugin_format.connector_render import ConnectorProxy, GrantStore, is_service_account_name
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
@@ -55,6 +56,8 @@ _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
 _DEV_DEFAULT_REMEDIATION_AUTHORITY_KEY = PUBLISHED_DEFAULT_REMEDIATION_AUTHORITY_KEY
+# A Kubernetes namespace name, the shape personal_claude_custody_namespace_ck pins.
+_DNS_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
 
 # The key of the chart Secret that holds the Valkey password, the same key the
 # API, worker and dispatcher read VALKEY_PASSWORD from (#5550).
@@ -188,6 +191,15 @@ class Settings(BaseSettings):
     workspace_max_archive_bytes: int = Field(
         default=268435456, gt=0, validation_alias="CURIE_WORKSPACE_MAX_ARCHIVE_BYTES"
     )
+    # Private publication candidates (#5428): on by default. A disabled ledger
+    # refuses new captures and readers but still drains through collection.
+    # The chart renders this off when managed workspaces are off.
+    publication_candidates_enabled: bool = Field(
+        default=True, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
+    )
+    publication_candidate_max_bytes: int = Field(
+        default=1073741824, gt=0, validation_alias="CURIE_PUBLICATION_CANDIDATE_MAX_BYTES"
+    )
 
     @model_validator(mode="after")
     def _validate_workspace_recovery(self) -> "Settings":
@@ -259,6 +271,12 @@ class Settings(BaseSettings):
     langfuse_host: str = "http://localhost:23000"
     langfuse_public_key: str = "pk-lf-curie-dev"
     langfuse_secret_key: str = "sk-lf-curie-dev"
+    # Which Langfuse read API generation to call. "v3" uses the legacy traces /
+    # observations / metrics endpoints (the compose and chart pin, and every
+    # self-hosted v3). "v4" uses Observations API v2 and Metrics API v2, the
+    # only read path on Langfuse Cloud from 2026-11-16, when Langfuse removes the
+    # legacy read APIs there.
+    langfuse_api_version: Literal["v3", "v4"] = "v3"
 
     # RustFS / S3 for immutable plugin bundles (compose stack RustFS on 29000).
     # The credentials default to EMPTY on purpose (#1559): an empty credential
@@ -336,12 +354,16 @@ class Settings(BaseSettings):
     # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
     # the missed-label backstop. The poll interval is the GitHub tracker's.
     factory_intake: Literal["poll", "webhook"] = "poll"
-    # The model auth mode tracker ingress admits with (#5376, ADR 0268). Tracker
-    # events carry no verified owner, so with "personal" a new issue refuses
-    # personal_owner_required before any WorkItem exists, and only a WorkItem
-    # already bound to an owner accepts a revision or readmission. The default
-    # keeps service admissions.
+    # Personal GitHub labels use the linked requester and normal owner validation.
     factory_model_auth_mode: Literal["service", "personal"] = "service"
+    factory_github_app_client_id: str = ""
+    factory_github_app_client_secret: SecretStr = SecretStr("")
+    # ADR 0278 (#5592): the worker and runner deliver, validate and acknowledge
+    # the pinned document, so admission selects it by default.
+    requester_coding_instructions_apply: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY"),
+    )
     factory_base_label_settle_s: int = Field(default=60, ge=0)
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
@@ -355,6 +377,11 @@ class Settings(BaseSettings):
     # lineage, to record one merged or closed outside a publication (#3831).
     # Runs with the work item reconciler and factory ingress; 0 disables it.
     factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
+    # How often the API settles learned rule candidates (ADR 0287, #5796) of a
+    # pull request an older replica recorded merged or closed without settling.
+    # It runs whatever the reconciler and factory switches say, so it has no
+    # off value: no setting may strand a candidate.
+    memory_rule_settlement_interval_s: float = Field(default=60, gt=0, allow_inf_nan=False)
     # How often the API publishes optional UI evidence a worker uploaded for a
     # recorded publication, as one marked pull request comment. It reads the
     # code publication and never changes it; 0 disables it.
@@ -673,6 +700,17 @@ class Settings(BaseSettings):
             "WORK_ITEM_BACKOFF_MAX_SECONDS",
         ),
     )
+    # How often a retry gated on a raised resource limit is offered again
+    # (#5427): the dispatch delay after its admission and after every
+    # ``resource_gate_unmet`` defer, which is never counted as a start.
+    work_item_resource_gate_probe_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RESOURCE_GATE_PROBE_SECONDS",
+            "WORK_ITEM_RESOURCE_GATE_PROBE_SECONDS",
+        ),
+    )
     work_item_start_deferral_limit: int = Field(
         default=5,
         gt=0,
@@ -728,6 +766,47 @@ class Settings(BaseSettings):
     # cluster; when unset the API tries in-cluster config, and if neither is
     # available the logs endpoint degrades to 503 rather than crashing.
     kube_config_path: str | None = None
+
+    # Personal Claude enrollment custody (#5377, ADR 0268 section 4). The
+    # dedicated namespace that holds each enrollment generation's immutable
+    # grant Secret. Empty leaves custody unconfigured: the owner mutations answer
+    # 503 custody_unconfigured and write nothing, and no custody reconciler runs.
+    # The custody client is private to custody and reads kube_config_path, or
+    # in-cluster config when that is unset.
+    personal_grant_namespace: str = Field(
+        default="", validation_alias=AliasChoices("CURIE_PERSONAL_GRANT_NAMESPACE")
+    )
+    # The custody cleanup loop (personal_custody_reconciler.py). It runs only
+    # when the grant namespace is set, and never depends on factory enablement.
+    personal_custody_reconciler_enabled: bool = Field(
+        default=True, validation_alias=AliasChoices("CURIE_PERSONAL_CUSTODY_RECONCILER_ENABLED")
+    )
+    personal_custody_reconcile_interval_seconds: int = Field(
+        default=30,
+        gt=0,
+        validation_alias=AliasChoices("CURIE_PERSONAL_CUSTODY_RECONCILE_INTERVAL_SECONDS"),
+    )
+    # How long a staged custody row may wait for its writer to publish before a
+    # reclaim may abandon it. Far above one Secret create plus two transactions.
+    personal_custody_stage_lease_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias=AliasChoices("CURIE_PERSONAL_CUSTODY_STAGE_LEASE_SECONDS"),
+    )
+    # Bound on one custody Secret request. The client never retries.
+    personal_custody_kube_timeout_seconds: float = Field(
+        default=10,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices("CURIE_PERSONAL_CUSTODY_KUBE_TIMEOUT_SECONDS"),
+    )
+    # Hold personal enrollment writes and personal trusted admission while the
+    # API replicas of this installation run different pod templates (#5377): an
+    # older replica would expire a personal transcript a fenced run must keep.
+    # Single-instance stacks and the test suite set it false explicitly.
+    personal_rollout_hold: bool = Field(
+        default=True, validation_alias=AliasChoices("CURIE_PERSONAL_ROLLOUT_HOLD")
+    )
     metrics_default_window_hours: int = 168  # 7 days
     # Durable state store size caps (#248). A hard non-goal of the store is that
     # it never becomes a database product, so a single value and a whole
@@ -923,6 +1002,16 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME", "connector_grant_store_secret_name"
         ),
     )
+    # The operator's ServiceAccount for one agent's hosted connector, as the
+    # JSON list the chart renders from `connectorServiceAccounts`. Contract:
+    # docs/interfaces/connector-host/INTERFACE.md, "A connector's own
+    # ServiceAccount". Validated at boot by `_validate_connector_service_accounts`.
+    connector_service_accounts: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_SERVICE_ACCOUNTS", "connector_service_accounts"
+        ),
+    )
     e2e_connector_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),
@@ -1021,6 +1110,57 @@ class Settings(BaseSettings):
                 if name.strip()
             ),
         )
+
+    def _connector_service_account_map(self) -> dict[tuple[str, str], str]:
+        """``(agent, connector) -> ServiceAccount`` from the operator's list.
+
+        Raises ``ValueError`` naming ``CURIE_CONNECTOR_SERVICE_ACCOUNTS`` on any
+        entry the renderer could not use.
+        """
+
+        env = "CURIE_CONNECTOR_SERVICE_ACCOUNTS"
+        raw = self.connector_service_accounts.strip()
+        if not raw:
+            return {}
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError:
+            raise ValueError(f"{env} is not valid JSON") from None
+        if not isinstance(entries, list):
+            raise ValueError(f"{env} must be a JSON list of entries")
+        keys = {"agent", "connector", "serviceAccountName"}
+        mapping: dict[tuple[str, str], str] = {}
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or set(entry) != keys:
+                raise ValueError(
+                    f"{env} entry {index} must be an object with exactly the keys "
+                    "agent, connector and serviceAccountName"
+                )
+            if not all(isinstance(entry[key], str) and entry[key].strip() for key in keys):
+                raise ValueError(f"{env} entry {index} has an empty or non-string value")
+            account = entry["serviceAccountName"]
+            if not is_service_account_name(account):
+                raise ValueError(
+                    f"{env} entry {index} serviceAccountName {account!r} is not a Kubernetes "
+                    "ServiceAccount name (a DNS-1123 subdomain of at most 253 characters)"
+                )
+            pair = (entry["agent"], entry["connector"])
+            if pair in mapping:
+                raise ValueError(
+                    f"{env} names agent {pair[0]!r} connector {pair[1]!r} more than once"
+                )
+            mapping[pair] = account
+        return mapping
+
+    def connector_service_accounts_for(self, agent: str) -> dict[str, str]:
+        """The operator-named ServiceAccount of each of ``agent``'s connectors
+        that has one, keyed by connector name."""
+
+        return {
+            connector: account
+            for (owner, connector), account in self._connector_service_account_map().items()
+            if owner == agent
+        }
 
     def connector_grant_store(self) -> GrantStore:
         """Where the caller proxy spends grants: a credential-free address and
@@ -1143,6 +1283,13 @@ class Settings(BaseSettings):
             self.connector_proxy()
         except ValueError as exc:
             raise ValueError(f"the connector caller proxy is misconfigured: {exc}") from None
+        return self
+
+    @model_validator(mode="after")
+    def _validate_connector_service_accounts(self) -> "Settings":
+        # At boot, not at the first render: a list the renderer cannot use
+        # would otherwise surface as a 500 on every connector deploy.
+        self._connector_service_account_map()
         return self
 
     @model_validator(mode="after")
@@ -1277,6 +1424,15 @@ class Settings(BaseSettings):
     def oidc_enabled(self) -> bool:
         """Whether generic OIDC login is configured (the issuer is the switch)."""
         return bool(self.oidc_issuer.strip())
+
+    @field_validator("personal_grant_namespace")
+    @classmethod
+    def _check_personal_grant_namespace(cls, value: str) -> str:
+        """Empty, or a namespace name custody rows can record (migration 0160's CHECK)."""
+
+        if value and not _DNS_LABEL.fullmatch(value):
+            raise ValueError("CURIE_PERSONAL_GRANT_NAMESPACE must be a Kubernetes namespace name")
+        return value
 
     @field_validator("oidc_required_claims", mode="before")
     @classmethod

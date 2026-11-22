@@ -84,10 +84,16 @@ os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
 # Production enables the work-item reconciler. Suite create_app() must not:
 # a 5s pass races TRUNCATE on the shared engine. Loop tests construct it.
 os.environ.setdefault("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+# The learned rule settlement sweep has no off switch; its first sweep waits one
+# interval, so a suite app's never runs. Its tests drive start_rule_settlement.
+os.environ.setdefault("MEMORY_RULE_SETTLEMENT_INTERVAL_S", "86400")
 # The deploy notice outbox reconciler likewise: its 5s pass holds pooled
 # connections from the TestClient's loop, which a test driving the same app
 # from its own loop then receives (#1331). Its tests call reconcile_once.
 os.environ.setdefault("CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED", "false")
+# The suite's create_app() is one process with no pod template to compare, which
+# the personal rollout hold (#5377) treats as held. Its tests turn it back on.
+os.environ.setdefault("CURIE_PERSONAL_ROLLOUT_HOLD", "false")
 get_settings.cache_clear()
 # A dedicated placeholder attester key for authenticated chat approval tests.
 # It is intentionally distinct from the platform key: sharing those keys would
@@ -216,7 +222,9 @@ async def _truncate() -> None:
                     "curie.agent_versions, curie.agents, "
                     "curie.console_sessions, curie.github_review_deliveries, "
                     "curie.factory_poll_cursors, curie.tenant_identity_providers, "
-                    "curie.personal_claude_enrollments CASCADE"
+                    "curie.factory_facts_requests, "
+                    "curie.personal_claude_enrollments, "
+                    "curie.personal_claude_custody CASCADE"
                 )
             )
     finally:

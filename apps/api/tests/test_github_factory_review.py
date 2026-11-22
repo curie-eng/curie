@@ -14,6 +14,9 @@ https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
 https://docs.github.com/en/rest/pulls/comments#get-a-review-comment-for-a-pull-request
 https://docs.github.com/en/rest/pulls/reviews#get-a-review-for-a-pull-request
 https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+Review feedback is admitted per submitted review (#5794), which also reads the
+review's comments; inline comments name their review as pull_request_review_id:
+https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
 The reply side is covered in test_factory_terminus.py:
 https://docs.github.com/en/rest/pulls/comments#create-a-reply-for-a-review-comment
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
@@ -26,10 +29,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import itertools
+import json
 import sys
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +57,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import (  # noqa: E402
+    APP_SLUG,
     INSTALLATION_ID,
     LABEL,
     MENTION,
@@ -90,12 +96,15 @@ def _pr_url(pr: int) -> str:
 
 
 class ReviewGitHubAPI(GitHubAPI):
-    """Adds the pull request and feedback reads the review verifier makes."""
+    """Adds the pull request and feedback reads the review verifier makes, and
+    the review's comment listing review admission makes (REST shapes, upper
+    case review states)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.pulls: dict[int, dict[str, Any]] = {}
         self.feedback: dict[str, dict[str, Any]] = {}
+        self.review_comments: dict[str, list[dict[str, Any]]] = {}
 
     def open_pull(self, pr: int) -> None:
         repo = {"id": REPO_ID, "full_name": REPO}
@@ -111,6 +120,11 @@ class ReviewGitHubAPI(GitHubAPI):
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path in self.review_comments:
+            page = int(request.url.params.get("page", "1"))
+            size = int(request.url.params.get("per_page", "30"))
+            listed = self.review_comments[path][(page - 1) * size : page * size]
+            return httpx.Response(200, json=listed)
         if path in self.feedback:
             return httpx.Response(200, json=self.feedback[path])
         prefix = f"/repos/{REPO}/pulls/"
@@ -133,8 +147,14 @@ def _feedback_event(
     app: dict[str, Any] | None = None,
     installation_id: int = INSTALLATION_ID,
     state: str = "open",
+    review_id: int | None = None,
+    review_state: str = "COMMENTED",
 ) -> tuple[dict[str, Any], int]:
-    """Build one signed-payload shape and register the provider's current copy."""
+    """Build one signed-payload shape and register the provider's current copy.
+
+    An inline comment belongs to the submitted review ``review_id`` (a new one
+    in ``review_state`` by default), which the App reads with its comments.
+    """
 
     fid = feedback_id if feedback_id is not None else next(_FEEDBACK)
     author = user if user is not None else _sender()
@@ -174,18 +194,35 @@ def _feedback_event(
         current["issue_url"] = f"{api_base}/repos/{REPO}/issues/{pr}"
         api.feedback[f"/repos/{REPO}/issues/comments/{fid}"] = current
     elif event == "pull_request_review_comment":
+        review = review_id if review_id is not None else fid + 500000
         feedback.update(
             {
                 "commit_id": HEAD,
                 "path": "src/acme/helper.py",
                 "line": 12,
-                "pull_request_review_id": fid + 500000,
+                "pull_request_review_id": review,
             }
         )
         current = copy.deepcopy(feedback)
         current["pull_request_url"] = f"{api_base}/repos/{REPO}/pulls/{pr}"
         payload.update({"pull_request": pull, "comment": feedback})
         api.feedback[f"/repos/{REPO}/pulls/comments/{fid}"] = current
+        review_path = f"/repos/{REPO}/pulls/{pr}/reviews/{review}"
+        api.feedback.setdefault(
+            review_path,
+            {
+                "id": review,
+                "body": "",
+                "user": dict(author),
+                "state": review_state,
+                "commit_id": HEAD,
+                "submitted_at": "2026-09-20T10:00:00Z",
+                "author_association": "MEMBER",
+                "html_url": f"{_pr_url(pr)}#pullrequestreview-{review}",
+                "pull_request_url": f"{api_base}/repos/{REPO}/pulls/{pr}",
+            },
+        )
+        api.review_comments.setdefault(f"{review_path}/comments", []).append(copy.deepcopy(current))
     else:
         feedback.update(
             {
@@ -194,9 +231,14 @@ def _feedback_event(
                 "submitted_at": "2026-09-20T10:00:00Z",
             }
         )
+        # The REST read names the state in upper case; the webhook in lower.
         current = copy.deepcopy(feedback)
+        current["state"] = "CHANGES_REQUESTED"
+        current["pull_request_url"] = f"{api_base}/repos/{REPO}/pulls/{pr}"
         payload.update({"action": "submitted", "pull_request": pull, "review": feedback})
-        api.feedback[f"/repos/{REPO}/pulls/{pr}/reviews/{fid}"] = current
+        review_path = f"/repos/{REPO}/pulls/{pr}/reviews/{fid}"
+        api.feedback[review_path] = current
+        api.review_comments.setdefault(f"{review_path}/comments", [])
     return payload, fid
 
 
@@ -397,15 +439,30 @@ def _owned(client: TestClient, api: ReviewGitHubAPI) -> tuple[int, int, dict[str
     return number, pr, first
 
 
-def _reply_target(event: str, pr: int, fid: int) -> dict[str, Any]:
-    """Where the revision's status reply lands, as admission stores it (#3831)."""
+def _feedback_link(event: str, pr: int, fid: int) -> str:
+    """The URL a revision stores for feedback ``fid``.
 
-    thread = event == "pull_request_review_comment"
+    Review feedback is admitted per submitted review (#5794): an inline comment
+    of `_feedback_event` stores its review's URL, whichever piece came first.
+    """
+
+    if event == "pull_request_review_comment":
+        return f"{_pr_url(pr)}#pullrequestreview-{fid + 500000}"
+    return f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
+
+
+def _reply_target(event: str, pr: int, fid: int) -> dict[str, Any]:
+    """Where the revision's status reply lands, as admission stores it (#3831).
+
+    A submitted review, its inline comments included, is answered in the pull
+    request conversation (#5794).
+    """
+
     return {
-        "reply_target_kind": "review_thread" if thread else "pull_request",
+        "reply_target_kind": "pull_request",
         "reply_target_pr_number": str(pr),
-        "reply_target_comment_id": str(fid) if thread else None,
-        "reply_target_url": f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}",
+        "reply_target_comment_id": None,
+        "reply_target_url": _feedback_link(event, pr, fid),
     }
 
 
@@ -435,7 +492,7 @@ def test_authorized_mention_admits_the_next_request_on_the_same_work_item(
     assert revision["work_item_id"] == first["work_item_id"]
     assert revision["status"] == "waiting"
     objective = revision["objective"]
-    assert objective.splitlines()[0] == f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
+    assert objective.splitlines()[0] == _feedback_link(event, pr, fid)
     assert _mention() in objective
     assert revision["reply_kind"] == "github"
     assert revision["reply_address"] == REPO
@@ -448,6 +505,90 @@ def test_authorized_mention_admits_the_next_request_on_the_same_work_item(
         "reply_target_comment_id": None,
         "reply_target_url": None,
     }
+
+
+def _review_publication(work_item_id: uuid.UUID, revision: int, status: str, body: str) -> None:
+    stamp = datetime(2026, 1, 1) + timedelta(minutes=revision)
+    _execute(
+        "WITH approval AS ("
+        "INSERT INTO curie.approvals "
+        "(id, agent_id, conversation_id, author, summary, reply_kind, reply_channel, "
+        "dedupe_key, status, purpose) "
+        "SELECT :approval, agent_id, conversation_id, 'fixture', 'Publish changes', "
+        "'github', repository_path, :dedupe, 'approved', 'publication' "
+        "FROM curie.work_items WHERE id = :work_item RETURNING id) "
+        "INSERT INTO curie.publications "
+        "(id, approval_id, deployment_id, lineage_id, revision_number, repo_full_name, "
+        "status, base_sha, changed_paths, title, body, reply_kind, reply_channel, "
+        "created_at, terminal_at) "
+        "SELECT :id, approval.id, lineage.deployment_id, lineage.id, :revision, "
+        "lineage.repo_full_name, :status, lineage.base_sha, CAST('[]' AS jsonb), "
+        "'Update parser', :body, 'github', lineage.repo_full_name, "
+        ":created_at, :terminal_at "
+        "FROM curie.thread_publication_lineages lineage "
+        "JOIN curie.work_items item ON item.publication_lineage_id = lineage.id "
+        "CROSS JOIN approval "
+        "WHERE item.id = :work_item",
+        {
+            "id": uuid.uuid4(),
+            "approval": uuid.uuid4(),
+            "dedupe": f"review-body-{uuid.uuid4().hex}",
+            "work_item": work_item_id,
+            "revision": revision,
+            "status": status,
+            "body": body,
+            "created_at": stamp,
+            "terminal_at": None if status == "pending" else stamp,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "publication_body",
+    ["The parser accepts quoted fields.", "é" * 20000, "é" * 20001, None],
+    ids=["latest-succeeded", "at-limit", "clipped", "no-succeeded"],
+)
+def test_review_objective_carries_latest_succeeded_pull_request_body(
+    factory: tuple[TestClient, ReviewGitHubAPI], publication_body: str | None
+) -> None:
+    client, api = factory
+    number, pr, first = _owned(client, api)
+    api.pulls[pr]["body"] = "Provider description differs from the stored publication."
+    if publication_body is not None:
+        _review_publication(first["work_item_id"], 1, "succeeded", "Earlier description")
+        _review_publication(first["work_item_id"], 2, "succeeded", publication_body)
+    _review_publication(first["work_item_id"], 3, "failed", "Unpublished failed description")
+    _review_publication(first["work_item_id"], 4, "pending", "Unpublished pending description")
+    question = f"@{MENTION} why does the parser need this check?"
+    payload, fid = _feedback_event(api, "pull_request_review_comment", pr, question)
+
+    response = _post(client, "pull_request_review_comment", payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    revision = _requests(number)[1]
+    prose, _separator, last_line = revision["objective"].rpartition("\n")
+    assert (
+        "Answer from the pull request body's Decisions section and the current diff first."
+        in prose
+    )
+    assert "Start the revision pipeline only when the comment asks for a change." in prose
+    provenance = json.loads(last_line)
+    # The inline comment's review is submitted with no text of its own.
+    assert provenance["body"] == ""
+    assert provenance["sender"] == SENDER
+    assert provenance["comments"] == [{"path": "src/acme/helper.py", "line": 12, "body": question}]
+    assert revision["requester"] == f"github:{SENDER_ID}:{SENDER}"
+    assert _stored_reply_target(revision) == _reply_target("pull_request_review_comment", pr, fid)
+    if publication_body is None:
+        assert "pull_request_body" not in provenance
+        assert "pull_request_body_truncated" not in provenance
+    else:
+        assert provenance["pull_request_body"] == publication_body[:20000]
+        if len(publication_body) > 20000:
+            assert provenance["pull_request_body_truncated"] is True
+        else:
+            assert "pull_request_body_truncated" not in provenance
 
 
 def test_review_admission_retains_issue_lock_until_caller_commit(
@@ -615,13 +756,49 @@ def _refused(
     assert len(_requests(number)) == 1
 
 
-def test_ordinary_comment_without_the_mention_is_ignored(
-    factory: tuple[TestClient, ReviewGitHubAPI],
+@pytest.mark.parametrize("handle", (APP_SLUG, f"{APP_SLUG}[bot]"))
+def test_app_slug_mention_on_a_factory_pr_is_admitted_once(
+    factory: tuple[TestClient, ReviewGitHubAPI], handle: str
 ) -> None:
     client, api = factory
     number, pr, _first = _owned(client, api)
-    payload, _ = _feedback_event(api, "issue_comment", pr, "looks fine to me, thanks")
-    _refused(client, number, "issue_comment", payload, "ordinary_comment")
+    payload, _fid = _feedback_event(api, "issue_comment", pr, f"@{handle} please look")
+    delivery = str(uuid.uuid4())
+
+    first = _post(client, "issue_comment", payload, delivery=delivery)
+    same = _post(client, "issue_comment", payload, delivery=delivery)
+    fresh = _post(client, "issue_comment", payload, delivery=str(uuid.uuid4()))
+
+    assert first.json()["status"] == "factory_admitted", first.text
+    assert same.json()["status"] == "factory_duplicate", same.text
+    assert fresh.json()["status"] == "factory_duplicate", fresh.text
+    assert len(_requests(number)) == 2
+
+
+def test_ordinary_comment_without_the_mention_admits_one_revision(
+    factory: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    """A plain comment on a factory pull request asks for a revision (#5794)."""
+
+    client, api = factory
+    number, pr, first = _owned(client, api)
+    payload, fid = _feedback_event(api, "issue_comment", pr, "please rename the helper")
+
+    response = _post(client, "issue_comment", payload)
+    replay = _post(client, "issue_comment", payload)
+
+    assert response.json()["status"] == "factory_admitted", response.text
+    assert replay.json()["status"] == "factory_duplicate", replay.text
+    rows = _requests(number)
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert rows[1]["work_item_id"] == first["work_item_id"]
+    assert rows[1]["objective"].splitlines()[0] == _feedback_link("issue_comment", pr, fid)
+    assert _stored_reply_target(rows[1]) == _reply_target("issue_comment", pr, fid)
+    assert _rows(
+        "SELECT plain_feedback_revisions FROM curie.thread_publication_lineages "
+        "WHERE pr_number = :pr",
+        {"pr": pr},
+    ) == [{"plain_feedback_revisions": 1}]
 
 
 def test_bot_sender_is_refused(factory: tuple[TestClient, ReviewGitHubAPI]) -> None:
@@ -752,9 +929,7 @@ def test_review_mention_during_live_run_waits_then_becomes_next_request(
     revision = rows[1]
     assert revision["status"] == "queued"
     assert revision["work_item_id"] == first["work_item_id"]
-    assert revision["objective"].splitlines()[0] == (
-        f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
-    )
+    assert revision["objective"].splitlines()[0] == _feedback_link(event, pr, fid)
     assert _stored_reply_target(revision) == _reply_target(event, pr, fid)
     assert (
         len(
@@ -850,27 +1025,19 @@ def test_review_admission_survives_work_item_version_change_during_verification(
     _own_pull_request(first["work_item_id"], pr)
     _mark_running(client, first["id"])
     payload, fid = _feedback_event(api, "issue_comment", pr, _mention())
-    verify = github_factory_review.verify_feedback_truth
+    verify = github_factory_review.verify_feedback_in_repository
     bumped = False
 
     async def verify_with_version_change(
         feedback: Any,
         lineage: Any,
+        verified: Any,
         *,
         settings: Any,
         client: httpx.AsyncClient,
-        credentials: github_app.GitHubCredentials,
-        api_url: str,
     ) -> str:
         nonlocal bumped
-        head = await verify(
-            feedback,
-            lineage,
-            settings=settings,
-            client=client,
-            credentials=credentials,
-            api_url=api_url,
-        )
+        head = await verify(feedback, lineage, verified, settings=settings, client=client)
         if bumped:
             return head
         bumped = True
@@ -885,7 +1052,9 @@ def test_review_admission_survives_work_item_version_change_during_verification(
             await engine.dispose()
         return head
 
-    monkeypatch.setattr(github_factory_review, "verify_feedback_truth", verify_with_version_change)
+    monkeypatch.setattr(
+        github_factory_review, "verify_feedback_in_repository", verify_with_version_change
+    )
 
     response = _post(client, "issue_comment", payload)
     replay = _post(client, "issue_comment", payload, delivery=str(uuid.uuid4()))
@@ -1091,3 +1260,237 @@ def test_factory_review_truth_mints_with_the_code_host_credential(
         client_cm.__exit__(None, None, None)
         github_app._RESOLVERS.clear()
         get_settings.cache_clear()
+
+
+# --- #5378: review feedback admits under the installation's mode ------------------------
+
+PERSONAL_WORKER_TOKEN = "factory-review-personal-worker"
+OWNER_MARK = "test-factory-review-owner-"
+# The owner's enrollment generation; not 1, so a default generation is caught.
+GENERATION = 2
+_TUPLE = "tenant_id, model_auth_mode, owner_principal_id, enrollment_generation"
+
+
+def _installation_mode(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """Switch the installation's ``FACTORY_MODEL_AUTH_MODE``, as an operator's
+    restart does; the webhook route reads its settings anew on the next delivery."""
+
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", mode)
+    get_settings.cache_clear()
+
+
+def _owner_tuples(work_item_id: uuid.UUID) -> dict[uuid.UUID, tuple[Any, ...]]:
+    """The owner tuple of the WorkItem and of every one of its requests, by id."""
+
+    found = _rows(
+        f"SELECT id, {_TUPLE} FROM curie.work_items WHERE id = :id "
+        f"UNION ALL SELECT id, {_TUPLE} FROM curie.execution_requests WHERE work_item_id = :id",
+        {"id": work_item_id},
+    )
+    return {
+        row["id"]: (
+            row["tenant_id"],
+            row["model_auth_mode"],
+            row["owner_principal_id"],
+            row["enrollment_generation"],
+        )
+        for row in found
+    }
+
+
+def _seed_owner() -> uuid.UUID:
+    """An active default-tenant principal enrolled at ``GENERATION`` (standing in for #5377)."""
+
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    principal_id = uuid.uuid4()
+    _execute(
+        "INSERT INTO curie.principals (id, tenant_id, idp_subject, type, status, display_name) "
+        "VALUES (:id, :tenant, :subject, 'human', 'active', 'Acme Owner')",
+        {"id": principal_id, "tenant": DEFAULT_TENANT_ID, "subject": f"{OWNER_MARK}{principal_id}"},
+    )
+    _execute(
+        "INSERT INTO curie.personal_claude_enrollments "
+        "(id, tenant_id, principal_id, generation, active, version) "
+        "VALUES (:id, :tenant, :principal, :generation, true, 1)",
+        {
+            "id": uuid.uuid4(),
+            "tenant": DEFAULT_TENANT_ID,
+            "principal": principal_id,
+            "generation": GENERATION,
+        },
+    )
+    return principal_id
+
+
+def _drop_owners() -> None:
+    """Remove the seeded owners with every WorkItem, request and enrollment naming them."""
+
+    _execute(
+        "TRUNCATE curie.execution_requests, curie.work_items, "
+        "curie.personal_claude_enrollments CASCADE",
+        {},
+    )
+    _execute(
+        "DELETE FROM curie.principals WHERE idp_subject LIKE :mark", {"mark": f"{OWNER_MARK}%"}
+    )
+
+
+@pytest.fixture
+def personal_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_db: None,
+    review_api: ReviewGitHubAPI,
+    tmp_path: Path,
+) -> Any:
+    """The ``factory`` app, also accepting the worker's trusted owner-bearing admission."""
+
+    monkeypatch.delenv("FACTORY_MODEL_AUTH_MODE", raising=False)
+    _boot(monkeypatch, review_api, {"INTERNAL_WORKER_TOKEN": PERSONAL_WORKER_TOKEN}, tmp_path)
+    client_cm, client, external = _client_with_agent(review_api)
+    try:
+        yield client, review_api
+    finally:
+        client.portal.call(external.aclose)
+        client_cm.__exit__(None, None, None)
+        get_settings.cache_clear()
+        _drop_owners()
+
+
+def _owned_personal(
+    client: TestClient, api: ReviewGitHubAPI, owner: uuid.UUID
+) -> tuple[int, int, dict[str, Any]]:
+    """``_owned`` for a personal WorkItem: the trusted admission names ``owner`` (#5376)."""
+
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    number = next(_ISSUES)
+    api.issue_number = number
+    (agent,) = _rows("SELECT id FROM curie.agents")
+    admitted = client.post(
+        "/v1/internal/work-items/admissions",
+        headers={"X-Curie-Worker-Token": PERSONAL_WORKER_TOKEN},
+        json={
+            "agent_id": str(agent["id"]),
+            "kind": "github",
+            "address": REPO,
+            "reply_conversation_id": f"issue-{number}",
+            "tracker": {
+                "kind": "github",
+                "host": "github.com",
+                "scope_id": str(REPO_ID),
+                "issue_id": str(number),
+            },
+            "repository": {
+                "code_host_kind": "github",
+                "host": "github.com",
+                "project_id": str(REPO_ID),
+                "path": REPO,
+            },
+            "code_host_installation_id": INSTALLATION_ID,
+            "objective": f"Resolve {REPO}#{number}",
+            "requester": f"github:{SENDER_ID}:{SENDER}",
+            "request_id": str(uuid.uuid4()),
+            "model_auth_mode": "personal",
+            "owner": {
+                "tenant_id": str(DEFAULT_TENANT_ID),
+                "principal_id": str(owner),
+                "enrollment_generation": GENERATION,
+            },
+        },
+    )
+    assert admitted.status_code == 200, admitted.text
+    (first,) = _requests(number)
+    pr = next(_PULLS)
+    api.open_pull(pr)
+    _own_pull_request(first["work_item_id"], pr)
+    _complete(client, first["id"])
+    return number, pr, first
+
+
+@pytest.mark.parametrize("event", EVENTS)
+def test_review_feedback_on_a_personal_installation_refuses_a_legacy_service_work_item(
+    factory: tuple[TestClient, ReviewGitHubAPI], monkeypatch: pytest.MonkeyPatch, event: str
+) -> None:
+    """#5378: review feedback supplies the installation's mode, as tracker ingress does.
+
+    A WorkItem admitted as service before the installation switched to
+    personal mode has no owner. On the personal installation a writer's
+    review mention on its pull request is refused ``personal_owner_required``:
+    no revision, no owner invented, every tuple still service. Liveness: back
+    on the service setting the same kind of feedback admits a service revision.
+
+    Falsifiable: a review admission that passes service mode whatever the
+    installation's mode admits the mention on the personal installation.
+    """
+
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    client, api = factory
+    number, pr, first = _owned(client, api)
+    service = (DEFAULT_TENANT_ID, "service", None, None)
+    legacy = {first["work_item_id"]: service, first["id"]: service}
+    assert _owner_tuples(first["work_item_id"]) == legacy
+
+    _installation_mode(monkeypatch, "personal")
+    payload, _ = _feedback_event(api, event, pr, _mention())
+    _refused(client, number, event, payload, "personal_owner_required")
+    assert _owner_tuples(first["work_item_id"]) == legacy
+
+    _installation_mode(monkeypatch, "service")
+    payload, _ = _feedback_event(api, event, pr, _mention())
+    response = _post(client, event, payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    (_first, revision) = _requests(number)
+    assert _owner_tuples(first["work_item_id"]) == {**legacy, revision["id"]: service}
+
+
+@pytest.mark.parametrize("installation", ["service", "personal"])
+def test_review_feedback_on_a_personal_work_item_keeps_its_owner_tuple(
+    personal_factory: tuple[TestClient, ReviewGitHubAPI],
+    monkeypatch: pytest.MonkeyPatch,
+    installation: str,
+) -> None:
+    """#5378: a reviewer's revision of a personal WorkItem runs as the WorkItem's owner.
+
+    The reviewer is a write collaborator, not the owner. On a service and a
+    personal installation alike the revision is admitted with the reviewer as
+    its requester and the locked WorkItem's tuple as its owner, and a
+    reconstructed worker resolver projects that owner. Reviewers never supply
+    ownership. Liveness for the refusal above on a personal installation.
+    """
+
+    import personal_execution_support as support
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    client, api = personal_factory
+    owner = _seed_owner()
+    number, pr, first = _owned_personal(client, api, owner)
+    personal = (DEFAULT_TENANT_ID, "personal", owner, GENERATION)
+    work_item_id = first["work_item_id"]
+    assert _owner_tuples(work_item_id) == {work_item_id: personal, first["id"]: personal}
+
+    _installation_mode(monkeypatch, installation)
+    payload, _ = _feedback_event(api, "pull_request_review_comment", pr, _mention())
+    response = _post(client, "pull_request_review_comment", payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    (_first, revision) = _requests(number)
+    assert revision["requester"] == f"github:{SENDER_ID}:{SENDER}"
+    assert _owner_tuples(work_item_id) == {
+        work_item_id: personal,
+        first["id"]: personal,
+        revision["id"]: personal,
+    }
+    projected = support.resolve_execution_owners([revision["id"]], tenant_id=DEFAULT_TENANT_ID)
+    resolved = projected[revision["id"]]
+    assert resolved is not None
+    assert (
+        resolved.work_item_id,
+        resolved.tenant_id,
+        resolved.model_auth_mode,
+        resolved.owner_principal_id,
+        resolved.enrollment_generation,
+    ) == (work_item_id, *personal)

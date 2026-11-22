@@ -6,14 +6,15 @@ console render those strings verbatim. The module reads canonical WorkItem,
 ExecutionRequest, publication-lineage, Publication, Approval, factory status
 comment and execution phase report rows; it writes nothing and adds no store.
 The title and progress strip come from the status comment rows and the phase
-reports through ``factory_progress.phase_view``, the same derivation the
-GitHub status card uses (#4102).
+reports through ``curie_internal.factory_phase_view.phase_view``, the same
+derivation the GitHub status card uses (#4102).
 
 Output is an allowlist: every view is built from explicit fields below, never
 from an ORM row, so a runtime-owner token, a reply transport address, a patch,
 a publication body/error or an approval summary cannot reach an operator even
 when a new column is added later. CI is observed live on the detail route
-only and never persisted; any failure to observe is ``unavailable`` with a
+only; bounded recovery stores separate item-level proof. Any failed live read is
+``unavailable`` with a
 fixed reason code that never carries a response body, header, URL or token.
 """
 
@@ -24,7 +25,9 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
+from typing import Literal, cast
 
+from curie_internal.factory_phase_view import phase_view
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +36,8 @@ from curie_api.forges.hosts import issue_url as tracker_issue_url
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import RepositoryRef, RollupState
 from curie_api.schemas.workitems import (
+    ResourceGateOut,
+    WorkItemCiObservationOut,
     WorkItemCiOut,
     WorkItemCiState,
     WorkItemCorrectnessOut,
@@ -47,19 +52,23 @@ from curie_api.schemas.workitems import (
     WorkItemTrackerOut,
 )
 
+from . import memory_rules_admission
 from .config import Settings
 from .factory_notices import start_failed_sentence
-from .factory_progress import phase_view
+from .factory_retry_policy import RetrySafety, condition_text
 from .models import (
     Approval,
     ExecutionRequest,
     ExecutionRequestPhaseReport,
+    FactoryCiObservation,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
 )
 from .personal_execution import mode_of
+from .requester_instruction_admission import evidence, metadata
+from .workitems.lifecycle import AUTOMATIC_RETRY_LIMIT
 
 OBJECTIVE_LIMIT = 512
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -121,6 +130,9 @@ def _cause(
                 f"the {_deadline_seconds(req)} s execution deadline elapsed"
             ),
             "owner_lost": "the runtime owner stopped heartbeating",
+            "enrollment_fenced": (
+                "the owner replaced or disconnected the personal Claude enrollment"
+            ),
         }
         return (
             f"cancellation requested: {cause} ({reasons.get(cause or '', 'unknown')}); "
@@ -130,6 +142,22 @@ def _cause(
         deadline = req.wait_deadline
         if deadline is None:
             raise ValueError("a waiting request has no capacity deadline")
+        if req.blocked_on is not None:
+            text = (
+                f"automatic retry blocked on {req.blocked_on}: it waits for "
+                f"{condition_text(req.blocked_on)}"
+            )
+            if now >= deadline:
+                return (
+                    f"{text}; the waiting deadline elapsed at {_iso(deadline)} "
+                    "and expiry is pending the reconciler"
+                )
+            return f"{text}; waiting deadline {_iso(deadline)}"
+        if req.retry_of_request_id is not None and now < req.dispatch_due:
+            return (
+                f"automatic retry scheduled for {_iso(req.dispatch_due)}; "
+                f"waiting deadline {_iso(deadline)}"
+            )
         text = "waiting for sandbox capacity"
         if req.last_deferral_reason == "admission_unavailable":
             text = "waiting for sandbox admission observations"
@@ -161,6 +189,13 @@ def _cause(
             text += f"; pull request #{lineage.pr_number} is retained"
         return text
     if state == "expired":
+        # The state shape check keeps blocked_on on every retry_condition_expired row.
+        if cause == "retry_condition_expired" and req.blocked_on is not None:
+            return (
+                f"expired: retry_condition_expired, the automatic retry was still blocked on "
+                f"{req.blocked_on} ({condition_text(req.blocked_on)}) when its waiting "
+                f"deadline {_iso(req.wait_deadline)} elapsed"
+            )
         if cause == "capacity_wait_expired":
             return (
                 "expired: capacity_wait_expired, sandbox admission did not complete before the "
@@ -179,7 +214,17 @@ def _cause(
                 + _previous_start_failure(req)
             )
         text = f"failed: {cause}"
-        if cause == "deadline_halted":
+        if cause == "enrollment_fenced":
+            text += (
+                "; the owner replaced or disconnected the personal Claude enrollment, "
+                "so the run was stopped; revalidate the enrollment to resume"
+            )
+        elif cause == "authentication_required":
+            text += (
+                "; the personal Claude grant was missing or refused, reconnect or "
+                "replace the enrollment, then revalidate to resume"
+            )
+        elif cause == "deadline_halted":
             text += (
                 "; the run hit the delivery budget, raise "
                 "worker.deliveryBudgetSeconds if the work needs longer"
@@ -251,8 +296,14 @@ def derive_outcome(
     now: datetime,
     *,
     issue_url: str,
+    observation: FactoryCiObservation | None = None,
+    memory_rule_numbers: Sequence[int] = (),
 ) -> WorkItemOutcomeOut:
-    """Derive one operator view. Pure: no I/O. ``ci`` is left null."""
+    """Derive one operator view. Pure: no I/O. ``ci`` is left null.
+
+    ``memory_rule_numbers`` are the WorkItem's pinned learned rule numbers,
+    read from its snapshot by the caller.
+    """
 
     ordered = sorted(requests, key=lambda r: r.sequence)
     req = _current_request(ordered)
@@ -300,6 +351,20 @@ def derive_outcome(
     else:
         state = "completed_unpublished"
 
+    observed_completion = (
+        observation is not None
+        and observation.status == "completed"
+        and req is not None
+        and observation.request_id == req.id
+        and item.cancelled_at is None
+        and lineage is not None
+        and lineage.status == "open"
+        and observation.lineage_id == lineage.id
+        and observation.head_sha == lineage.head_sha
+    )
+    if observed_completion:
+        state = "published"
+
     snapshot = next(
         (
             r
@@ -338,7 +403,11 @@ def derive_outcome(
         created_at=item.created_at,
         updated_at=item.updated_at,
         state=state,
-        actionable_cause=_cause(state, req, lineage, publication, approval, now),
+        actionable_cause=(
+            "ci_observed_after_run"
+            if observed_completion
+            else _cause(state, req, lineage, publication, approval, now)
+        ),
         objective=objective[:OBJECTIVE_LIMIT] if objective is not None else None,
         objective_truncated=truncated,
         requester=snapshot.requester if snapshot is not None else None,
@@ -354,11 +423,30 @@ def derive_outcome(
         ),
         correctness=WorkItemCorrectnessOut(),
         ci=None,
+        ci_observation=(
+            WorkItemCiObservationOut(
+                status=cast(
+                    Literal["observing", "completed", "expired", "invalidated"], observation.status
+                ),
+                head_sha=observation.head_sha,
+                reason=observation.reason,
+                created_at=observation.created_at,
+                expires_at=observation.expires_at,
+                observed_at=observation.observed_at,
+            )
+            if observation is not None
+            else None
+        ),
         requests=[_request_view(r) for r in ordered],
         tenant_id=item.tenant_id,
         model_auth_mode=mode_of(item.model_auth_mode),
         owner_principal_id=item.owner_principal_id,
         enrollment_generation=item.enrollment_generation,
+        requester_principal_id=item.requester_principal_id,
+        coding_instructions=metadata(item),
+        memory_rules=memory_rules_admission.metadata(item, memory_rule_numbers),
+        automatic_retries_used=item.automatic_retries_used,
+        automatic_retry_limit=AUTOMATIC_RETRY_LIMIT,
     )
 
 
@@ -403,6 +491,30 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
         model_auth_mode=mode_of(req.model_auth_mode),
         owner_principal_id=req.owner_principal_id,
         enrollment_generation=req.enrollment_generation,
+        coding_instructions_selection_id=req.coding_instructions_selection_id,
+        coding_instructions_evidence=evidence(req.coding_instructions_evidence),
+        memory_rules_evidence=memory_rules_admission.evidence(req.memory_rules_evidence),
+        retry_of_request_id=req.retry_of_request_id,
+        retry_kind=(
+            "owner_loss"
+            if req.owner_lost_retry
+            else "failure"
+            if req.retry_of_request_id is not None
+            else None
+        ),
+        dispatch_not_before=req.dispatch_due,
+        blocked_on=req.blocked_on,
+        resource_gate=(
+            None
+            if req.resource_gate is None
+            else ResourceGateOut.model_validate(
+                {
+                    key: req.resource_gate.get(key)
+                    for key in ("condition", "dimension", "volume", "failed_limit")
+                }
+            )
+        ),
+        retry_safety=cast(RetrySafety | None, req.retry_safety),
     )
 
 
@@ -548,6 +660,15 @@ async def _views(
         ).all():
             reports[report.execution_request_id].append(report)
 
+    observations = {
+        row.request_id: row
+        for row in (
+            await session.scalars(
+                select(FactoryCiObservation).where(FactoryCiObservation.work_item_id.in_(ids))
+            )
+        ).all()
+    }
+    pinned_rules = await memory_rules_admission.rule_numbers(session, ids)
     views = []
     for item in items:
         item_requests = requests.get(item.id, [])
@@ -576,6 +697,8 @@ async def _views(
             pending_turn,
             now,
             issue_url=tracker_issue_url(settings, item.tracker_issue, item.repository),
+            observation=observations.get(current_request.id) if current_request else None,
+            memory_rule_numbers=pinned_rules.get(item.id, ()),
         )
         view.title = _title(comments[item.id], sequences)
         comment_row = latest_comment.get(item.id)

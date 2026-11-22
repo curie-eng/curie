@@ -355,3 +355,1563 @@ Transcripts are parsed in memory; the ledger keeps only sanitized per-session
 facts, never a raw transcript. A transcript whose final record is unterminated
 or unreadable makes that attempt's usage unknown, so the budget judge fails
 rather than counting a partial session.
+
+## Two-owner scenario (#5379)
+
+`personal_profile.py --scenario two-owner` proves issue #5379 against ADR 0268
+section 6 rows 4, 5, 7, 11 and 12: two independently enrolled owners share one
+installation and keep separate grants through execution, approval, CI repair,
+recovery and disconnect. Its code is `personal_two_owner.py` (live driver, a
+subclass of the single-profile harness) and `personal_two_owner_support.py`
+(pure core: ceilings, inputs, manifest, ledger, gate, judges). Every
+single-profile flag is refused under `--scenario`; the scenario reads one
+private inputs file instead.
+
+### What each criterion proves
+
+1. `owners` and `roles`: both owners run the implementer, plan reviewer, diff
+   reviewer, real tools and a bundle hook on their own grant only. WorkItem,
+   every request, custody and delivery identity, session and CLI reads agree on
+   tenant, immutable owner and generation, and no installation-wide grant exists.
+2. `approval` and `publication`: before the first paid phase an unpaid drill
+   proves the channel gateway delivers routed cards (two drill cards, the
+   unlisted operator refused, one rejected and one approved, nothing started or
+   pushed), so a broken gateway fails before any reservation. Then a listed
+   operator rejects A's first publication and approves its fresh successor and
+   B's publications, an unlisted operator gets 403, nothing is pushed before
+   approval, and approved trees equal the reviewed workspace on the branch the
+   API reports.
+3. `ci-repair`: a real failing check on B's published head reaches production
+   CI ingestion; the production repair keeps B's owner and grant, pushes a
+   repaired head and its latest and required checks pass.
+4. `restarts`: pod, worker and native-process interruptions each keep the
+   WorkItem, conversation, owner and generation, and show a fresh native
+   process continuing on the same owner's grant. Each one must observe the old
+   runtime gone and confirm the epoch it held: A2's request bound on A2's claim
+   past A1's epoch (a terminal A1 alone never passes), B's request still
+   running at B1's epoch under the new worker, and #5378's process checks for
+   the CLI kill. The durable marker must appear in the fresh native session's
+   own transcript, the product's history replay, not only in central storage.
+   The fresh runtime's workspace, read before its first prompt release, and
+   the interrupted one's where a runner existed, must hold the branch head and
+   every committed blob's SHA-256 as the owned forge serves them (B1's
+   published head for the worker stop, which has no runner).
+5. `wrong-owner`: before A's authorized continuation, B's admission on A's
+   issue, B's replay of A1's request, B's personal-context read and B's
+   adoption of A's WorkItem (`POST .../personal-context/revalidate` with B's
+   tenant, agent and principal at the current WorkItem, request and enrollment
+   versions) are refused; A's binding and versions are unchanged, no request
+   is created or started, and A's own revalidation at the same versions passes
+   the owner check without rebinding. A's continuation then runs with its
+   original tuple.
+6. `disconnect`: A's disconnect during active work fences and tears A down; B
+   makes a new tool call after A's confirmed stop and publishes a passing head;
+   after a worker restart A cannot launch, reuse or resume.
+7. `budget` and `cleanup`: every start was reserved and settled from native
+   usage inside the ceiling, and every owned resource is absent with no grant
+   bytes in any scanned channel. Every required channel must show scanned bytes
+   and every capture a read source with no failed read, and the pod_logs
+   receipt must name every pod the driver removed; the card residue must
+   name every delivered card, drill cards included, as left in its channel.
+   `rehearsal` judges the unpaid rehearsal ledger.
+
+### Inputs file
+
+`--inputs-file` is one JSON object: a regular file you own, mode 0600, at most
+64 KiB, not a symlink, in a directory no group or other user can write. Every
+path is absolute, unknown or duplicate keys are refused, and any credential-like
+key or token-shaped string is refused as `inline_grant_refused`. Grant bytes
+never appear in it; it names grant files, which `check_grant_file` validates.
+
+```json
+{
+  "target": {"context": "kube-context", "namespace": "pto-demo", "release": "pto-demo",
+             "registry": "127.0.0.1:5999", "docker_context": "builder",
+             "kubeconfig": "/path/to/kubeconfig"},
+  "forge": {"app_dir": "/path/to/app-kit"},
+  "gateway": {"resolution_channel": "C0EXAMPLE1",
+              "slack_bot_token_file": "/path/to/bot-token-file"},
+  "independent_accounts": true,
+  "owners": {"a": {"grant_file": "/path/to/grant-a", "usable_until": "2026-11-12T20:00:00Z"},
+             "b": {"grant_file": "/path/to/grant-b", "usable_until": 1794000000}},
+  "prior_item_output_tokens": 0,
+  "probe_cli": "claude"
+}
+```
+
+1. The setup descriptor (`images`, `rehearse`, `forge-probe`) holds only
+   `target`, `forge`, `gateway` and optionally `probe_cli`. Owners,
+   `independent_accounts` or any `grant_file` in it is `setup_inputs_carry_grants`.
+2. The live descriptor (`preflight`, `run`) must set `independent_accounts` to
+   exactly `true` (the caller's independent-enrollment assertion, else
+   `independence_unasserted`). The two grant files must differ by resolved
+   path, inode and content digest (`duplicate_owner_grant`).
+3. `usable_until` is ISO 8601 with an offset or epoch seconds, stated by the
+   caller. Each must be at least 10,200 s (live plus cleanup) after now, else
+   `lifetime_insufficient`; the run records the window and the budget judge
+   checks it covers the live end.
+4. `prior_item_output_tokens` is the item's earlier actual spend (0 to 81,919).
+   It counts against `item_output_token_cap` (default 32,768, explicitly approved
+   maximum 81,920). Each run still has its separate 32,768-token limit.
+   The next attempt records 49,152 prior tokens and an item cap of 81,920.
+5. `namespace` is at most 56 characters because the driver also owns
+   `<namespace>-grants`, the custody namespace, created before helm.
+
+### Commands
+
+Use `p rehearse --publish-probe` with a separate setup descriptor and run ID
+to walk the paid lifecycle without inference. After the drill it replaces the
+owned runner template's command with the runner on its existing fake model. Each
+turn writes native-shaped transcripts under a model name that is plainly fake,
+writes a fixture file and calls `publish_changes`, so the product parks the
+session on its real publication approval and suspends it, deleting its pod. The
+ledger is marked zero-cost: a rehearsal that may reserve and open the live clocks
+but loads no grant. The probes are settled not started, then the paid phases run
+in the live order with the real capture, settlement, card, operator and forge
+code, until the first phase the fake tier cannot reach. A phase's failed checks
+are recorded under `zero-cost` and the walk goes on; a capture or settlement
+failure still fences. `p judge` on that ledger runs each criterion's real checks
+next to a failing `live_ledger`, so it never passes a live criterion. The fake
+tier has no native CLI, so no hook holds, native session binding, prompt
+interruption or real model checks happen; those need a paid run.
+
+```sh
+p() {
+  python3 tools/factory-e2e/personal_profile.py "$@" \
+    --scenario two-owner --candidate "$SHA" \
+    --state-dir "$STATE_DIR" --run-id "$RUN_ID"
+}
+p images --inputs-file "$PRIVATE_SETUP_FILE"
+p rehearse --inputs-file "$PRIVATE_SETUP_FILE"
+p forge-probe --inputs-file "$PRIVATE_SETUP_FILE"
+p preflight --inputs-file "$PRIVATE_LIVE_FILE" --approve-live "$APPROVED_CEILING"
+p run --inputs-file "$PRIVATE_LIVE_FILE" --approve-live "$APPROVED_CEILING"
+p judge --criterion all
+```
+
+1. `images` builds the candidate images and the gated private bundle, and
+   mirrors a pinned Dex image into the run's loopback registry. Use a distinct
+   rehearsal run ID.
+2. `rehearse` is unpaid and takes no grant and no `--approve-live`: namespace,
+   install, Dex logins per owner, forge issues, delivered-card controls
+   (unlisted 403, authorized reject and approve, the same drill a live run
+   takes before its first reservation), wrong-owner admission and adoption
+   controls with the worker stopped, post-restart refusals, the fence and
+   cleanup. It cannot pass a live criterion.
+3. `forge-probe` is the single-profile write probe plus read-only CI reads.
+4. `preflight` is unpaid and mutates nothing: exact approval string, inputs
+   file safety, windows, the schedule check, and image digests. It does not
+   authenticate grants or sessions.
+5. `run` performs the one live run. A second `run` for the same run ID is
+   refused; there is no retry flag.
+6. `judge` reads receipts only: no inputs file, no credential, no inference.
+   Criteria: `owners`, `roles`, `approval`, `publication`, `ci-repair`,
+   `restarts`, `wrong-owner`, `disconnect`, `budget`, `cleanup`, `rehearsal`,
+   `all`. Output carries `not_met` for items reported but never failing and
+   `observed` for recorded observations that are never required.
+
+The approved ceiling, exactly as `approved_ceiling()` builds it:
+
+```text
+sessions=16,turns=192,session-turns=32,output-tokens=32768,session-output-tokens=8192,owner-output-tokens=16384,session-seconds=600,live-seconds=9600,cleanup-seconds=600,paid-retries=0,probe-model=claude-haiku-5-5,probe-output-tokens=32,probe-turns=1,probe-seconds=30
+```
+
+### The 16-start manifest
+
+Each group is reserved and persisted before the native start it covers, in
+this order. A group's per-session share is `min(8192, floor(available /
+sessions))` with `available` the smaller of the owner's and the aggregate's
+remaining output tokens, counting settled actual usage and charging unknown
+usage at its full share. Turns per session are `min(32, (192 - used) /
+sessions)`.
+
+| Group | Owner | Sessions | Production transition that starts it |
+|---|---|---|---|
+| a-probe | A | 1 probe | driver grant probe in an empty HOME, before A1 |
+| a1 | A | implementer, plan reviewer, diff reviewer | trusted admission, execute turn; reviewers via the Agent tool |
+| a2 | A | implementer, plan reviewer, diff reviewer | admission of the fresh successor after rejection |
+| b-probe | B | 1 probe | driver grant probe, before B1 |
+| b1 | B | implementer, plan reviewer, diff reviewer | trusted admission, execute turn |
+| b-r1 | B | implementer, held at its prompt, zero usage | the `factory_ci` round-2 continuation consumed after the worker restart (reserved before B1's card is resolved) |
+| a3 | A | implementer | admission of the authorized follow-up; ended by disconnect |
+| b-r2 | B | implementer, diff reviewer, second diff reviewer | kernel runner-error retry on the same request and epoch |
+
+Transitions that start nothing: kernel publish continuation, reviewer start
+inside a reserved group, approval resolve and rejection, the publication job,
+CI polling and rerun, the owner-lost refusal, pod deletion at a park, the
+wrong-owner controls, disconnect terminate and worker restarts. Fenced as
+unplanned starts: an owner-lost successor, a round-3 repair, an unpublished
+continuation of a CI turn, and any session the harvest cannot map to a
+reservation. The unpaid schedule check (G-SESSION-PLAN, run by `preflight` and
+`rehearse`) simulates the manifest on planning usage (implementer 2,700, plan
+reviewer 1,000, diff reviewer 800, probe 32 output tokens) and requires 16
+starts, a share of at least 2,700 for implementer groups and 1,000 for others,
+at least 16 turns per session, each owner at most 16,384 and the aggregate at
+most the smaller of 32,768 and the item cap minus prior spend, and every production transition mapped.
+
+### Live phase order
+
+1. Unpaid: `refusals`, `namespace`, `images`, `install`, `setup` (Dex login and
+   enrollment per owner), `forge`, `drill` (an undelivered card fails here,
+   before any reservation or native start). Then `probe-a`, `attempt-a1`
+   (parks on card 1, refuses the unlisted operator and rejects as the listed
+   operator immediately after card delivery). Every
+   attempt's pod is deleted at its park after terminal capture, so each later
+   start is a fresh native process.
+2. `wrong-owner`, then `reject-a1` (verifies the earlier rejection),
+   `attempt-a2` (fresh successor in a new pod), `approve-a2`, `probe-b`,
+   `attempt-b1` (parks on card 3).
+3. `approve-b1` once A is quiescent: B-r1 is reserved before B1's card is
+   resolved, because the worker keeps running to publish and production may
+   start the repair early. Until `worker-stop` observes the worker gone, any
+   B-r1 runner pod is watched for; its first hold counts against B-r1, is never
+   released, and fails the run as a scenario-order start. Then `worker-stop`:
+   B's real failing check queues the round-2 repair while the worker is down.
+4. `queue-a3` (A3 reserved with B-r1 open at its share, admitted with the
+   worker stopped), `worker-start` (a new worker pod), `hold-both` (B-r1 held
+   at its prompt, A3 runs one tool and is held).
+5. `disconnect-a`, `process-interruption` (B-r1's CLI killed and runner PID 1
+   signalled; the kernel retries as B-r2), `approve-b2`, `post-disconnect`
+   (another worker restart; A cannot launch, reuse or resume, B stays active).
+6. The fence (worker to zero, runner pods deleted without grace, their claims
+   deleted, active owners disconnected), cleanup and inventory. On success,
+   failure and signal the fence is the first action of finalize, before any
+   charge, observation or wait for the worker's graceful exit; it first
+   captures the logs of the pods it removes, as every planned removal does
+   (see interpretation 9). Before teardown
+   the capture audit reads, in memory, every container instance's log
+   (previous instances included) in the release and grant namespaces, both
+   namespaces' events, the run's WorkItems, approvals, audits, publications
+   and pull requests, and Langfuse's ClickHouse trace tables. One cleanup
+   clock starts before the fence and covers every step; a cleanup past 600 s is
+   recorded (`cleanup_within_window` false) and fails the cleanup judge while
+   the remaining teardown still runs.
+
+### Response gate and subagent limits
+
+The private bundle gains `hooks/two_owner_gate.py` on `UserPromptSubmit`,
+`PreToolUse` (`*`), `Stop` and `SubagentStop`. Each hook writes a hold file keyed
+by its pid and start time and waits up to 240 s (hook timeout 250 s) for a
+release; a timeout fails closed. A long-lived in-pod stream reports holds to
+the driver, which waits until the harvest has read the transcript to the
+reported size, recomputes usage, and releases only if the session share,
+per-session cap, turns, 600 s, owner allocation (16,384) and aggregate guard
+all hold. Every ceiling is inclusive: usage at a ceiling is within it, above
+it is a breach. A Stop or SubagentStop hold asks for nothing more, so it passes
+at a ceiling; any other hold precedes one more response, so it stops once the
+share, a turn limit or the time is reached, or when one more response (2,048
+tokens) could cross the per-session cap, the owner allocation or the aggregate
+guard. Zero usage is a reading only at a session's initial prompt hold; at any
+other hold a missing, unreadable or incomplete transcript is unknown usage,
+and a synthetic or API-error record is a native error that keeps its sanitized
+class. A stop never answers the hold (a blocked call would be answered by
+another model request): it deletes the runner pod while the hook still holds,
+charges every open session at its full share, fences and fails the run.
+
+Each run's clock is on the driver's monotonic clock and starts at the first
+observation of its native process (the runner container's start when the pod
+reports it, else the pod's discovery or its first hold); subagents run inside
+that process and share it, and it never stops. A watchdog thread, also run at
+every wait, stops a run at 600 s while its native process may still ask the
+model for more, including while the main session is idle after Stop, stops a
+kept hold 15 s before its hook gives up, and fences paid starts when the 9,600 s live window
+ends, even while the main thread is blocked in a call. Known runner pods are
+deleted before any log read, scale call, claim discovery or lock wait on exit.
+Finalize keeps the watchdog until the fence has stopped execution and grant
+delivery. Settlement uses the shared lock. Before the first prompt release the
+driver writes `/tmp/pto-gate/limits.json` with the pod's reviewer allowance from
+its group (one plan and one diff reviewer for three-role groups, two diff
+reviewers for b-r2, none for probes, a3 and b-r1). An absent file, a missing
+type or a spent allowance denies the Agent call.
+
+### CI repair fixture
+
+A's issue asks only for a nonce line, so A's CI passes. B's issue asks for
+`unitconv/tests/test_ci_ack.py` with exact content: skipped unless
+`GITHUB_HEAD_REF` is set, otherwise it fails unless `CI_ACK.md` at the root has
+the line `ci ack: <GITHUB_HEAD_REF>`, printing an `::error file=CI_ACK.md` line.
+The head ref (`curie/publication-<hex>`) exists only after the first
+publication, so B's first head fails in real Actions CI. The driver observes
+the failure, the single rerun (or its forbidden refusal) and the production
+`work-item-<request>-ci-2` event, then the repair adds `CI_ACK.md`.
+
+### Ledger and public output
+
+The private SQLite ledger (`ledger.sqlite3` in `$STATE_DIR`, mode 0600) holds
+reservations per owner and group, sanitized per-session facts and native error
+classes, every observation each criterion judges, cleanup steps, inventories and
+the token scan over stdout, stderr, children, http, harvest, ledger, evidence,
+forge, pod_logs, events, api_captures, publication_captures and traces, with a
+capture receipt (sources read, failed reads) per capture channel and the trace
+backend the install values imply. The pod_logs receipt also names, by digest,
+each pod the driver removed: `before_deletion` when every log read before the
+removal succeeded, `uncaptured` otherwise. A rehearsal has no harvest or forge
+channel. The ledger also commits content-free timing events as capture arrives:
+process and transcript starts, every assistant record timestamp and allowlisted
+stop reason, Stop/SubagentStop, native turn-end records, approval creation, card
+delivery, operator resolution, observed runner turn end, PR opening, pod removal
+and the watchdog clock reading at a fence. Session paths and record keys are
+digests. Partial records wait for their next chunk; historical transcript bytes
+from an earlier runtime are excluded. Missing native timestamps stay missing;
+an observation time does not replace them. A failed run retains these events
+even when full usage settlement is impossible.
+`traces_backend` `absent` (telemetry disabled) is the only way to pass without a
+trace capture; an external backend fails the audit.
+Public output is verdicts, booleans, counts and refusal codes: no identifier, no
+transcript, no grant, session or client value. Grants travel only by file; the
+CLI reads session files the driver writes 0600 and the finalizer removes.
+
+### Interpretations recorded for reviewers
+
+1. Pod recreation lands at the quiescent approval park between A's first and
+   second attempts; A1's pod is deleted after its terminal capture and A2 must
+   run in a new pod. After the process interruption the product may restart
+   the runner container in place or recover onto a new pod on B's claim; both
+   pass as a fresh process, the new pod gets its own gate and capture mapped to
+   B-r2's reservation, and which one happened is recorded under `observed`
+   (`process_recovery`, `process_same_pod`, `process_container_restarted`).
+   The same claim, request and epoch continue either way.
+2. B's fourth repair start is a second diff-review round, admitted only when the
+   first returns changes, so b-r2 reserves for it either way.
+3. Principal sessions are minted during the run through a run-local identity
+   provider, so `preflight` validates file safety, windows, schedule and images,
+   and the run validates sessions through `/console/principal`.
+4. Code-host steering by another owner was observed admitted under the original
+   owner, with billing remaining that owner's; whether this should be admitted
+   is a product question. It is not the wrong-owner Slack steer control.
+5. `curie cluster message` cannot target a GitHub-issue conversation, so no
+   message control is recorded.
+6. A run's 600 s clock counts its native process's whole life from the first
+   observation, including idle time after the main session's Stop, because a
+   previously released subagent may still be generating.
+7. The watchdog acts at its deadline (600 s, 9,600 s), as the ceiling decision
+   says; settled usage exactly at a ceiling still passes the budget judge.
+8. The drill runs in the live run too. A publication approval owes no model
+   wake and the approved drill publication's push Job fails fetching its
+   all-zero base, so the drill starts no native session and pushes nothing;
+   the driver also checks both after the drill.
+9. Each planned runtime removal captures the runner's logs and transcripts
+   first, including A's disconnect and B's process interruption. Worker logs
+   are read before planned scale-downs. Each log read is bounded at 10 s and
+   scanned in memory. Emergency exits delete known runners first; any missing
+   capture is recorded and fails the audit. The audit checks every runner pod
+   seen during the run, including pods the product removed before finalization.
+   Missing capture makes that group's usage unknown, charges its full share
+   even if previously settled, and prevents a passing result.
+10. Grant windows cover the 9,600 s live window and the 600 s cleanup window;
+    reservations recheck the fixed end of both windows after unpaid preparation.
+11. The shared forge probe polls the ref listing after deleting its own branch,
+    for both scenarios, so an eventually consistent listing can converge before
+    the unchanged absence check. It changes neither ownership nor cleanup scope.
+
+### Not met
+
+Restoring uncommitted workspace edits into a fresh or continuing process is Not
+met and not claimed. It is tracked in #5541. `judge` lists it under `not_met`
+for `restarts` and it never changes a verdict. The workspace reads never write,
+so the observation is the run's nonce in uncommitted paths:
+`pod_uncommitted_restored` and `process_uncommitted_restored` under `observed`
+are `restored`, `not_restored` or `none_before`, beside each interruption's
+porcelain status.
+
+## Personal owner enforcement proof
+
+`personal_owner_enforcement.py` is the live proof for issue #5378: personal
+Claude subscription execution keeps its owner binding across claims, adoption,
+steering and recovery. It builds on #5377's `EnrollmentProof`
+(`apps/worker/tests/sandbox/personal_enrollment_cluster_support.py`) and #5374's
+exact-image harness. The difference from #5377 is the launch boundary: here the
+candidate worker kernel authorizes the owner, reads custody and launches. The
+driver only admits through the API's trusted internal admission route
+(`POST /v1/internal/work-items/admissions` with `X-Curie-Worker-Token`), seeds
+one marker record into a WorkItem's durable transcript through the state API,
+interrupts, and observes. The worker runs from the candidate checkout with
+`FACTORY_MODEL_AUTH_MODE=personal`, the Kubernetes substrate and the production
+custody reader, and holds no model credential.
+
+### Code host and repository workspace
+
+Every WorkItem runs with a real repository workspace against the recorded TLS
+GitHub stub (`tools/github-stub/github_stub.py`), run as `tls_code_host.py`
+runs it and built from its `stub_manifests`: one Pod in the owned namespace on
+the digest-pinned candidate image, a headless Service, and the stub's source
+ConfigMap, which also carries a two-file seed tree and an issue body. The stub
+generates a per-run test CA and seeds a bare `acme-corp/acme-bot` repository;
+only its public certificate leaves the Pod, as the `code-host-ca` ConfigMap.
+The driver creates one stub issue per WorkItem (the refused other principal
+and each interruption pair) and admits each owner WorkItem against that issue,
+the stub's repository id and its installation.
+
+The candidate API and worker are source processes, so they reach the stub
+through a `kubectl port-forward` the driver owns on loopback (the stub's
+certificate names `127.0.0.1`). The API's GitHub API and clone bases point at
+that forward, its App is the stub's App id with a key generated per run that
+reaches only the API process environment, and its repository allowlist is the
+stub repository. Both processes trust the stub CA plus the public roots through
+a private bundle (`SSL_CERT_FILE` for the API, `GIT_SSL_CAINFO` for the
+worker's clone). The worker clones, archives and uploads the checkout as in
+production, and signs the sandbox's one-object read against the object store
+through a relay on the runner API host. The sandbox template gains the chart's
+own `workspace-init` program, read from the candidate's `agent-sandbox.yaml`,
+the chart's default `emptyDir` workspace at `/workspace`, and the chart's
+`codeHostTrust` mount at `/etc/curie/code-host-trust/ca.crt` with
+`CURIE_REPO_CA_BUNDLE`, `GIT_SSL_CAINFO`, `SSL_CERT_FILE` and
+`REQUESTS_CA_BUNDLE` naming it. Publication is on, as in a factory install
+(`CURIE_PUBLICATION_ENABLED=true`, its namespace the owned one): the kernel
+binds a publication context before every workspace-backed execute turn and
+refuses the turn without one. For a WorkItem with no pull request the API's
+context mint answers 204 without a code host read, so the API needs nothing
+more. No proof step publishes, and each objective tells the model to answer
+the kernel's one unpublished continuation with `No changes needed:` and no
+tool, so no publication Job is created.
+After each pair and at the end of the audit, the driver reads the stub's record
+of unsupported calls and fails with the call's method and path if there is one.
+
+### Runner reachability
+
+#5377 drives its turns itself, so its worker never dials a runner. Here the
+worker opens and streams every turn, and runner Service names
+(`<sandbox>.<namespace>.svc.cluster.local`) do not resolve outside the cluster:
+without help every status read fails closed and the request defers before it
+starts. The driver therefore starts the candidate worker through a launcher
+that maps exactly that namespace's Service names to a deterministic loopback
+address (never `127.0.0.1`) and then runs `curie_worker` as `python -m` would;
+every other name resolves as before. On every sweep the driver keeps one
+`kubectl port-forward` per Running runner Pod from that address to the Pod's
+runner port, replaces it when the Pod is recreated or the forward exits, and
+drops it when the Pod goes away. Teardown stops every runner forward and proves
+each address closed.
+
+Every observation is scoped to its own WorkItem: a pod counts only when its
+claim is the `runtime_claim_name` of a started request of that WorkItem, and
+the claim, its `<claim>-tokens` Secret and the Pod are read the moment the pod
+is seen, by the claim name the Pod carries. A claim, Secret or Pod that is
+already gone is recorded missing, never raised.
+Only the start route writes that column and `started_at`, for the owner holding
+the request's acquire, and the driver never acquires; `selection` also requires
+the request's `runtime_owner`, read while it runs (terminal settlement clears
+it), to be the worker's consumer. The owner has one runtime slot (ADR 0268
+decision 2), so after each pair the driver waits until every request is
+terminal, its Pods are gone and no claim carries the owner's label, and stops
+the run, naming it, if a claim outlives its WorkItem.
+
+### Inputs and preconditions
+
+Every target comes from flags and the input file. `--input-file` is a private
+JSON object (mode 0600, owned by the caller) with `kubeconfig` and `curie_bin`
+(absolute paths), `runner_api_host` (this host's IPv4 address as the cluster
+reaches it) and optionally `grant_probe_cli` (default `claude`). `--registry` is
+the caller's loopback registry, `127.0.0.1:PORT` or `localhost:PORT`, with
+manifest deletes enabled. The Docker context must have an SSH endpoint whose
+loopback ports the caller mirrors onto this host's loopback, as #5377 requires.
+The cluster runs the agent-sandbox controller. Run the driver under the
+repository environment (`uv run`), from a clean checkout at `--candidate`.
+
+### Commands
+
+```bash
+uv run python3 tools/factory-e2e/personal_owner_enforcement.py preflight \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT"
+
+uv run python3 tools/factory-e2e/personal_owner_enforcement.py rehearse \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$REHEARSAL_ID"
+
+uv run python3 tools/factory-e2e/personal_owner_enforcement.py run \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT"
+
+uv run python3 tools/factory-e2e/personal_owner_enforcement.py judge \
+  --state-dir "$STATE" --run-id "$RUN_ID" --criterion all
+```
+
+`preflight` is read-only and unpaid. It checks, in order: no service
+credential or fake mode in the caller environment, the flags, the input file,
+the grant file by `stat` only (present, regular, mode 0600, the caller's, 1 to
+4097 bytes; never opened), an expiry that leaves at least 1,620 s, the Python
+environment, a clean checkout at the SHA, `docker info`, the registry's `/v2/`,
+`/readyz` through `--context`, the absence of both namespaces, RBAC for every
+verb the run needs, and an unused run ID. A missing prerequisite is a refusal
+with exit code 2, never a skip. `rehearse` and `run` repeat it, then re-execute
+the driver as a child whose environment holds only `PATH`, `HOME`, `LANG`,
+`SSH_AUTH_SOCK` and the names and paths the proof needs, with stdin from
+`/dev/null`. Only that child opens the grant file.
+
+A separately authorized attempt uses a new run ID. Pass `--prior-run-id` for
+each earlier attempt and `--item-output-token-cap` for the approved combined
+ceiling. The item ledger includes every session from those attempts. Settled
+native usage is measured; missing settlement is charged its full reservation
+share and remains unknown. Reservations and every response check enforce the
+combined cap as well as the unchanged per-attempt ceilings. These accounting
+flags grant no retry authority.
+
+`--phases remaining --reuse-run-id SOURCE_RUN` runs only rejection,
+revalidation, disconnect and the hosted-header audit. The source must be a
+finished live run whose selection, restart and fencing judgments passed,
+allowing only the tracked #5541 observations. The driver refuses reuse when
+any path outside this proof's driver, tests, fixture or README changed. Each
+reused criterion names its original run and candidate in the judge output;
+its observations are never relabeled as fresh proof.
+
+The remaining-phase bootstrap admits an owner-bound generation-1 WorkItem
+without starting a model, seeds the same durable history marker, replaces the
+enrollment with the invalid generation-2 control and explicitly revalidates
+the waiting request. The real worker executes that request. Generation 3
+still replaces the invalid grant, waits for teardown and explicitly
+revalidates that same WorkItem before a fresh native process starts. No SQL
+completion is forged, no live state is restored from a previous test namespace
+and no recovery requirement is dropped. Only the `rejected` and `revalidated`
+native sessions are reserved; each retains its original 1,024-token and
+four-assistant-turn share, and all attempt and item ceilings still apply.
+
+`--phases post-rejection --reuse-run-id SOURCE_RUN` omits the already-proved
+rejection session as well. It requires every rejection check and cleanup to
+have passed in that finished live source. The judge reads those rejection
+checks from the original ledger, naming their original candidate and run on
+each check. Selection, restart and fencing provenance is flattened to its
+original source. Revalidation and later checks must come from the new run.
+The bootstrap admits a waiting request, seeds durable history, advances to
+the invalid generation without starting it, then replaces it with the valid
+grant and explicitly revalidates the same waiting request to generation 3.
+The workspace is checked against the durable repository before native launch
+and again before continued work; the new process is compared with the source
+run's old native identity, whose teardown was confirmed. No failed request or
+completion is fabricated. Only the valid revalidation session is reserved.
+
+`judge --criterion` takes `selection`, `fencing`, `authentication-required`,
+`disconnect`, `restart`, `hosted-header`, `budget`, `cleanup`, `rehearsal` or `all`. It
+reads only the private ledger, compares each observation with the expected
+value defined in `personal_owner_enforcement_support.py`, and prints every
+check's expected and observed value. Exit code 0 is a pass, 1 a failed or
+missing observation, 2 a refusal, and 3 a run whose only shortfall is a
+recorded Not met. A rehearsal ledger supports `--criterion cleanup` and `--criterion rehearsal`.
+The latter retains every reading and marks provider rejection, native tool calls,
+native process epoch confirmation and the native response cap as `rehearsal_only`;
+it never treats them as live proof.
+A fake turn can finish and delete its Pod before log capture, so missing
+captures remain visible as `rehearsal_only`. The live confidentiality judge
+still requires complete captures. Product and cleanup failures fail the rehearsal judge.
+
+### What rehearse covers
+
+`rehearse` starts zero native model sessions. The worker and every runner use
+the runner's offline fake model, the grant is a synthetic value, and any native
+CLI process seen in a runner pod is recorded as an unreserved start, fences
+every start and fails the rehearsal. Against the real cluster it runs:
+
+1. The candidate image build, its push to the caller's registry under a per-run
+   tag, digest pinning, and the revision label and digest check on every pod.
+2. Both owned namespaces, the backing containers, the migration, the stub code
+   host with its CA, forward, issues and seeded repository, the candidate API
+   and worker, the agent deploy, the two OIDC principals and the sentinel
+   hosted connector (Pod, Service, bearer Secret).
+3. For every WorkItem, workspace selection, the worker's clone of the stub
+   repository, the archive upload and the sandbox's `workspace-init` staging.
+4. Enrollment through `curie cluster subscription`, the other principal's
+   refused admission, the owner's admission and the worker-driven personal
+   claim with its owner labels and `<claim>-tokens` grant delivery.
+5. The three interruptions against fake-model turns: SIGKILL of every process
+   in the runner container except the runner, then SIGTERM to the runner, so
+   the container restarts in place; deletion of the runner Pod; SIGKILL of the
+   worker followed by a restart. It observes the recovered pod, labels, durable
+   history, the stub repository's committed state in the workspace and the
+   uncommitted workspace nonce.
+6. The generation advance while the worker is down and the claim retained, the
+   refused revalidation, the old generation's custody refusal, teardown after
+   the worker restarts, revalidation, the later generations' admissions, the
+   disconnect with a waiting request and two worker restarts.
+7. The full finalizer and the absence proof.
+
+Only `run` covers: the grant probe, native CLI sessions under the owner's
+grant, the bundle hooks that hold each session at a Read call and at Stop,
+transcript usage settlement against the ledger, the provider's real rejection
+of the invalid grant, the Bash scan for the hosted header, the sentinel
+challenge and public control through the model, and history replay inside a
+fresh native process. Rehearsal turns end on their own, so an interruption can
+miss its turn; the rehearsal judge reports the observations and their evidence limits.
+
+### Sessions and reservations
+
+The disk limits are explicit caller inputs: `--disk-start-percent` (default 82)
+and `--disk-stop-percent` (default 88). During live runs the driver checks before each reservation
+and native launch and samples every 30 seconds, including during the build.
+At the stop limit it interrupts the native runtime, deletes its Pod, cancels
+owned commands and tears down. Receipts include before, peak and after disk
+percentages; the caller records the final reading after removing its registry.
+
+The approved ceiling is 8 native session attempts, 4 assistant turns per session
+and 32 in total, including publication continuation, 8,192 output tokens in
+total, 180 s per session, 1,440 s live plus 180 s cleanup, zero paid retries,
+and `claude-sonnet-5-5`. Each attempt reserves 1,024 tokens and 4 turns in the
+private ledger. The candidate fixture wraps the SDK's native executable with
+a gate that waits for that committed reservation before executing it; every
+permit is consumed once. A retry without a reservation never executes the
+native CLI. The original native executable remains unchanged.
+
+Each query has 2 turns and a 512-token runner cap; each response has a
+256-token native cap. At each prompt the driver checks that the next query's
+worst case fits the session and run allowance. Tool hooks and Stop hold after
+responses while the driver harvests their usage, with the output-token total
+checked first. Stop is released for continuation only when it fits. Unknown
+usage stops the run. The judge and run receipt include ceilings and observed
+counts.
+
+An independent watchdog interrupts the native process and deletes its Pod at
+the session deadline even if harvesting fails, and fences starts at the live
+window deadline. Cleanup uses one 180 s budget with time reserved for absence
+checks. Namespaced deletion requires the recorded namespace UID and ownership
+label. The capture audit requires complete Pod logs and scans the valid grant,
+invalid grant and hosted header. Grant recovery by Bash fails confidentiality.
+
+Immediately before the first reservation, a one-turn grant probe runs on the
+cheapest model with an empty `HOME`; if it fails, nothing is reserved.
+
+1. `process-interrupted` and `process-recovered`: the first holds at Read, is
+   settled, the second is reserved, and the runner container restarts in place.
+2. `pod-interrupted` and `pod-recovered`: the same, with the Pod deleted.
+3. `worker-interrupted` and `worker-recovered`: the same, with the worker
+   killed. The recovered session is held while the worker is killed again, the
+   grant is replaced by a deliberately invalid one (generation 2), and the
+   retained claim's fate is observed. The fence aims at the started request
+   whose runtime is the retained claim (the recovered session's, else the
+   interrupted one's), never at a request that has not started.
+4. `rejected`: generation 2 on the same WorkItem, admitted once every earlier
+   request is terminal (admission refuses `active_request` while one waits,
+   runs or stops); the provider's 401 must end it `authentication_required`
+   with the transcript and owner intact.
+5. `revalidated`: generation 3 after replace, teardown and revalidation; one
+   response calls the Bash scan, the sentinel `challenge` tool and the public
+   control tool, then answers.
+
+Unknown usage, an unsettled earlier session, an unterminated final transcript
+record or a native start without a reservation stops every later start. Only
+records that exactly match the seeded history are excluded from the count.
+Every synthetic or zero-usage record keeps a sanitized error class.
+
+### Workspace checks
+
+Before each interruption the driver writes a random nonce into an untracked
+file in the sandbox's `/workspace` checkout and reads the checkout's `HEAD`,
+the SHA-256 of every tracked file and its porcelain status; after recovery it
+reads them again in the recovered pod. The stub's bare repository is the
+durable source: `main`'s commit and the SHA-256 of each committed blob. For all
+three interruptions `restart` requires `HEAD` and the committed file hashes to
+equal the stub's on both sides, the interrupted runtime to be gone (the native
+process after a container restart, the Pod UID after deletion, the worker
+process after its kill), a fresh native process, and the same owner labels and
+generation on the recovered claim. For process interruption, Pod identity and
+container restart are observations rather than pass conditions. The driver
+records the exact native process identity before signalling it, observes it
+gone, and confirms the request still binds the captured runtime epoch and
+claim before any successor owner claim appears. It records every driver Pod
+delete call and requires none during this interruption. Live-provider recovery used a fresh
+Pod, while the fake-model rehearsal restarted the container in place. This is
+an observed difference. Fresh-Pod recovery stages the checkout again from its
+durable source, so committed state is restored and the uncommitted nonce is
+absent. Process interruption and Pod recreation both record this observation
+as **Not met: #5541** (blocked by #5092), and neither stops the live scenario.
+The judge exits 3 when tracked restoration observations are the only shortfall.
+The worker interruption records whether the nonce
+survived as information only, since recovery may adopt the retained Pod or
+start a new one. The status before and after is recorded for every pair.
+
+### Live condition audit
+
+The live conditions were checked against ACs 2, 3, 5, 6 and 7 before another
+paid start. No pass condition requires surviving process memory or an
+uncommitted file. The complete set of observations touching those assumptions
+is below; all other conditions remain blocking.
+
+| Condition | AC | Disposition |
+| --- | --- | --- |
+| `process.same_pod` | 7 | Informational; cold-claim recovery may use a fresh Pod. |
+| `process.container_restarted` | 7 | Informational; an in-place restart is not required. |
+| `process.workspace_nonce_restored` | 7 | Observation, Not met: #5541 when absent. |
+| `pod.workspace_nonce_restored` | 7 | Observation, Not met: #5541 when absent. |
+| `worker.workspace_nonce_retained_informational` | 2, 7 | Informational; uncommitted restoration remains #5541. |
+| Each interruption's `git_status_before` and `git_status_after` | 7 | Observations; a clean recreated checkout is allowed. |
+
+AC 2 retains owner/generation fencing, denial across worker restart, old-claim
+and delivery-Secret removal, epoch-confirmed teardown and explicit
+revalidation. AC 3 retains original-owner preservation, durable transcript
+preservation on provider rejection, no service fallback, disconnect denial
+across restart and a fresh revalidated native process. AC 5's HTTP/consumer
+suite checks admission and the persisted owner tuple; it imposes no Pod,
+memory or uncommitted-file requirement. AC 6 retains actual connector/tool
+liveness, public and exposed-marker controls, child credential denials and
+complete captures; scanner files are read in the session that wrote them,
+without crossing a recovery boundary. AC 7 retains durable history and replay,
+committed HEAD and file restoration, owner and authorized generation, fresh
+native processes, interruption-specific old-runtime absence, and a new Pod UID
+for the Pod-deletion case. Process-only interruption and old-epoch confirmation
+before a successor claim binds remain required. The fresh-process and new-Pod
+conditions match explicit AC 3 and AC 7 text and are not converted to observations.
+
+### Remaining evidence capture audit
+
+The native CLI does not reliably persist an authentication failure in its
+project transcript. In observed SDK-bundled CLI 2.1.317 output, stream-json
+assistant/result records expose `api_error_status: 401`; the assistant uses
+the CLI classification `authentication_failed`. The provider's distinct
+`authentication_error` type is in the native debug response body. The sanitized
+fixture is `tests/fixtures/native_auth_refusal.json`.
+
+Every native session now starts a Pod log stream before its launch permit is
+released. Only the deliberately invalid control enables `--debug-file
+/dev/stderr`, after the driver confirms that Pod's delivery Secret contains
+the invalid control. A real grant is refused debug capture. The SDK's normal
+stderr sanitizer forwards the response to the already attached stream.
+The trusted worker records error/final frames from its actual `TurnStream`
+iterator into private SQLite before delivering them to the kernel, reusing
+the enrollment driver's ACI observation mechanism. No frame is replaced.
+The refusal requires both the provider response and a same-epoch ACI
+authentication-required error plus classified-failure final. Missing,
+truncated or conflicting evidence stops with a named capture reason.
+
+Attempt 4's retained runner log and actual worker-consumed ACI journal show a
+`max-turns` error and classified-failure final at the end of the revalidation
+turn. The runner logged that turn end at `10:49:53.236930Z`, before cleanup
+started at `10:49:53.626400Z`. This was a terminal failure, not an approval or
+publication wait, and it was not a successful Stop. ToolSearch consumed the
+first of the fixture's two allowed responses; the second issued Bash and both
+MCP calls in parallel. The trace observed only three response-hook gates for
+the four tool calls. A shared response holding/release filename allowed those
+parallel callbacks to overwrite or remove each other's gates. The executable
+regression starts parallel copies of the actual hook and proves that releasing
+one cannot release another. Each response hook now owns its PID-specific gate.
+The fixture also sets `ENABLE_TOOL_SEARCH=false`, as the unpaid native header
+controls do, so the actual catalog is available within the unchanged two-turn
+query budget. All session, continuation and response ceilings remain unchanged.
+An ACI terminal error now fails revalidation immediately with its classification
+instead of waiting for Stop and misreporting the absence as no fresh process.
+The sanitized real trace is `tests/fixtures/native_revalidation_end.json`.
+
+Attempt 4's last response reading was 258 output tokens and two assistant turns,
+but its ACI failure final carries no usage. Raw native transcript reads had been
+omitted from retained command output. That does not certify final usage: its
+full 1,024-token reservation remains charged. Subsequent response harvests keep
+mode-0600 native records and exact replay seeds in the private evidence directory,
+after the held-value scan, so Pod deletion cannot erase the usage evidence.
+
+Attempt 4's retained rejection ACI final also carries no usage, and no retained
+rejection transcript certifies its output count. The provider's HTTP 401 and
+`authentication_error` plus the matching ACI classification remain real rejection
+proof. Re-judging them offline records unknown usage and charges the rejection's
+full 1,024-token share, alongside revalidation's full share. The conservative item
+total is 6,029 of 16,384 output tokens. The judge reports unknown rejection usage
+as an observation, while measured nonzero rejection output fails its zero-output
+control. A partial measured count can never charge less than either that count
+or its full reservation. Revalidation requires a recorded predecessor identity
+before it compares native processes in any phase scope.
+
+The empty-HOME, filtered-environment unpaid probe ran the real bundled CLI
+through the launch wrapper and stderr sanitizer with an invalid OAuth token.
+It observed HTTP 401, provider type `authentication_error` and zero output
+tokens. Neither an empty capture nor seeded history alone is accepted as
+measured zero usage. Logs remain available after Pod deletion; the final
+audit requires every native log stream to reach successful EOF.
+
+The table names every remaining pass condition and its live evidence source.
+Unpaid tests cover parsers, missing/conflicting inputs, capture ordering,
+grant selection for debug, stream persistence, EOF, scope provenance,
+reservations, response gates and cleanup. The offline rehearsal drives the
+real API, worker, backing services, workspace and connector with its declared
+fake provider; those readings never become paid-provider proof.
+
+| Phase | Conditions | Evidence on the live path |
+| --- | --- | --- |
+| Rejection | `rejected.generation` | The current ExecutionRequest row after explicit revalidation or generation-2 admission. |
+| Rejection | `rejected.capture_source`, `rejected.http_status`, `rejected.provider_error_type` | Provider response in the actual rejected native process's debug stderr, retained by the pre-launch Pod log stream. |
+| Rejection | `rejected.aci_classification` | Actual worker-consumed error/final frames, paired by runner epoch in private SQLite. |
+| Rejection | `rejected.terminal_cause` | The worker's terminal ExecutionRequest row, read through the real database. |
+| Rejection | `rejected.output_tokens` | The paired ACI final output-token count or retained native transcript usage. Missing usage stays unknown and charges the full reservation; a classified refusal alone never certifies zero. |
+| Rejection | `rejected.transcript_preserved` | Durable transcript record IDs before and after the refused request. |
+| Rejection | `rejected.owner_preserved` | The immutable WorkItem owner read after the refusal. |
+| Rejection | `rejected.service_fallback_claims` | Current claim labels, retained provenance for deleted claims and every observed runner Pod. |
+| Revalidation | `revalidated.generation` | The explicit revalidation API response after generation-2 teardown confirmation. |
+| Revalidation | `revalidated.fresh_native_process` | Pod UID, native PID and process-start identity compared with the rejected process. |
+| Revalidation | `revalidated.committed_head_restored`, `revalidated.committed_files_restored` | Real workspace HEAD and tracked-file hashes before rejection and in the fresh valid process, compared with the durable stub repository. |
+| Revalidation | `revalidated.replay_marker_seen` | All retained native transcript files for the recovered session, including any continuation. |
+| Revalidation | `revalidated.assistant_turns_positive` | Complete native assistant usage records, excluding only exactly matched seeded records. |
+| Hosted header | `sentinel.challenge_returned`, `public_control.returned` | Actual tool-result records across the session's complete captured transcript set. |
+| Hosted header | `sentinel.authorized_calls_positive`, `sentinel.unauthorized_calls` | Counters read from the real namespaced sentinel service. |
+| Hosted header | `bash.scan_ran`, `bash.negative_control_found` | Scanner output retained at the first Stop before permitting continuation; the deliberately exposed marker must be present. |
+| Hosted header | `bash.header_found`, `bash.grant_found` | Exact and encoded held-value scans of the captured Bash scanner output. Missing scanner output remains a failure. |
+| Hosted header | `audit.captures_complete` | Every pre-launch native log stream ended successfully; sentinel logs and all declared captures are present. |
+| Hosted header | `audit.header_in_captures`, `audit.grant_in_captures`, `audit.invalid_grant_in_captures` | Blocking scans of complete logs, claim/template manifests and events. |
+| Hosted header | `audit.header_in_ledger_or_output` | Blocking raw-byte scans before retained command output, ledger entries or driver output are published. |
+| Disconnect | `disconnect.generation`, `disconnect.state` | Disconnect API response. |
+| Disconnect | `disconnect.waiting_request_started` | The specifically admitted waiting request's `started_at`. |
+| Disconnect | `disconnect.custody_secrets` | Custody Secret inventory in the owned grant namespace after reconciliation. |
+| Disconnect | `disconnect.claims_after_restarts`, `disconnect.pods_after_restarts`, `disconnect.tokens_secrets_after_restarts` | Claim, Pod and delivery-Secret inventory across both actual worker restarts. |
+| Disconnect | `disconnect.native_sessions_after_restarts` | Launch-gated native process identities observed before and after both restarts. |
+| Disconnect | `disconnect.admission_code`, `disconnect.revalidation_code`, `disconnect.custody_reader_code`, `disconnect.route` | Real admission/revalidation responses, custody-reader refusal and route lookup. |
+| Budget | Recorded session, total-turn and output-token ceilings | The live-window ledger records the same enforced constants used by reservations and query/response gates. |
+| Budget | `spend_guard.breach`, `sessions_within_ceiling`, `every_session_within_share`, `unreserved_starts`, `paid_retries` | Durable reservations, native launch observations, per-response harvests and settlements. |
+| Budget | `usage_known`, `zero_usage_sessions_classified`, per-session assistant turns, total turns/output tokens | Complete native usage records or measured ACI counts; incomplete usage stops the attempt and charges at least its full share. |
+| Budget | `models`, `grant_probe_ok`, `live_seconds_within_ceiling` | Native model metadata, the immediately preceding empty-HOME probe, and measured live/cleanup timestamps. |
+| Budget | `item.output_tokens` | All linked attempts, measured usage, full reservation charges for unknown usage and qualification-probe output. |
+| Cleanup | `namespace.absent`, `grant_namespace.absent`, `claims.absent`, `pods.absent`, `grant_copies.absent` | Post-teardown Kubernetes absence checks in the owned namespaces. |
+| Cleanup | `pvcs.absent`, `pvs.absent` | The pre-teardown ownership inventory and post-teardown volume absence checks. |
+| Cleanup | `code_host.absent`, `registry.absent`, `containers.absent`, `port_forwards.absent`, `processes.absent`, `private_dir.absent` | Registered owned-resource finalizers followed by independent absence checks. |
+| Cleanup | `foreign_untouched.absent`, `finalizer.steps_ok`, `cleanup.within_bound` | Before/after foreign inventories, each finalizer result and measured cleanup timestamps. |
+
+Only a valid-grant pass can prove successful generation-3 native recovery,
+marker recall, positive real assistant usage, actual native hosted-tool/public
+control results and native Bash confidentiality with the real grant. The
+combined real-provider revalidation/disconnect/header run therefore remains
+required. Offline results and a standalone invalid-token probe do not fill
+those acceptance rows.
+
+### Known limits
+
+The workspace volume is the chart's default `emptyDir`, so the run creates no
+PVC; the inventory still records every PVC's bound volume before deletion and
+proves each one absent. The signed workspace read lives 900 s instead of the
+chart's 300 s, so a Pod the controller recreates late in a pair can still stage
+the checkout. Recovery is whatever the product does on its own (the kernel's
+transient retry, or the owner-lost successor after a worker loss); when no
+fresh session starts within 150 s, the WorkItem is cancelled and the recovery
+checks record false. The restarted worker reuses its consumer name, so its
+orphan sweep declares the killed incarnation's running request owner-lost as
+it starts (#3076); the terminate chain tears the retained claim down, the
+settlement admits the successor, and its execute wake follows on the next 2 s
+reconciler pass, so the successor claims within seconds. The API's own
+heartbeat path (expiry a full 24 s TTL in the past, 40 to 48 s after the kill)
+is only the backstop. The rehearsal's offline turn lasts about 6 s and nothing
+holds it, and the runner's fake model has no directive that keeps a turn open,
+so the driver runs only the claim snapshot and the nonce write between the
+boundary and the interruption; the durable history check is an ordered prefix, because a turn
+that ended first appends its own record. Teardown stops the code host and
+runner forwards and the object store relay before #5377's cleanup and proves
+their ports closed; the stub's Pod, Service and ConfigMaps go with the owned
+namespace.
+
+## Requester coding instructions proof
+
+`requester_instructions.py` is the proof driver for issue #5592 (ADR 0278),
+criteria 9 and 10: a WorkItem started by a linked requester receives that
+requester's coding instructions document, the runner acknowledges it before
+model work, reviewers never see it, and the published pull request ends with
+the trusted `Requester preferences: applied; sha256:<digest>` line. It runs on
+the owner enforcement harness above (`OwnerProof`, reused by import): the same
+exact-image build, owned namespaces, Dex OIDC principals, TLS GitHub stub,
+runner forwards, loopback registry, `env -i` child, ledger and bounded
+finalizer. Its own pure logic (documents, slot ledger, spend caps, the two
+programs it runs outside the driver, per-slot assertions and the judge) lives
+in `requester_instructions_support.py`. The API and worker run with
+`FACTORY_MODEL_AUTH_MODE=service` and
+`CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY=true`.
+
+The live run installs the real factory bundle (`examples/dark-factory`, with
+both named reviewers, the implementation skill and the review gate) and refuses
+to start when any of those files is missing. Each slot's transcript scan
+records which named reviewers the session actually ran, and criterion 10 passes
+only when both the plan reviewer and the diff reviewer ran in every slot. The
+live driver builds the factory's declared runner layer on the candidate image
+with `curie build --plugin-dir`, retains its generated connectors lock, and
+compiles the exact serialized bundle through the production Claude harness
+before creating either namespace. A missing or invalid lock refuses setup.
+The rehearse runs the offline fake model, which loads no plugin hooks or
+subagents, so it keeps the owner proof's small fixture bundle.
+
+### Inputs
+
+`rehearse` takes the owner enforcement flags and input file unchanged
+(`--candidate`, `--context`, `--namespace`, `--docker-context`, `--registry`,
+`--input-file`, `--state-dir`, `--run-id`). `preflight` and `run` also take
+these private files, each mode 0600 and owned by the caller:
+
+1. `--app-dir`: a 0700 directory with `app.json` (`id`, `installation_id`,
+   `repo`, the public fixture repository) and `app.pem`, the factory test
+   GitHub App.
+2. `--owner-token-file` and `--second-token-file`: one GitHub user token line
+   each, for the repository owner and the second test account.
+3. `--model-credential-file`: a JSON object with `base_url` (https, or http for an endpoint reached only over a private encrypted network) and
+   `api_key` for the live model endpoint.
+4. `--conflict-file`: a JSON object with `preference` (one line that a rule in
+   the fixture repository contradicts), `forbidden_added_line_regex` (matches
+   an added line that obeys the preference instead of the rule) and
+   `rule_path` (the repository file holding the rule).
+5. `--priority-class`: an existing PriorityClass for the publication Job.
+
+`--model` (default the owner proof's model) and `--slot-seconds` (300 to 3600,
+default 1500) bound the live run.
+
+### Commands
+
+```bash
+uv run python3 tools/factory-e2e/requester_instructions.py rehearse \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$REHEARSAL_ID"
+
+uv run python3 tools/factory-e2e/requester_instructions.py preflight \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --app-dir "$APP_DIR" --owner-token-file "$OWNER_TOKEN" \
+  --second-token-file "$SECOND_TOKEN" --model-credential-file "$MODEL_FILE" \
+  --conflict-file "$CONFLICT_FILE" --priority-class "$PRIORITY_CLASS"
+
+uv run python3 tools/factory-e2e/requester_instructions.py run \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --app-dir "$APP_DIR" --owner-token-file "$OWNER_TOKEN" \
+  --second-token-file "$SECOND_TOKEN" --model-credential-file "$MODEL_FILE" \
+  --conflict-file "$CONFLICT_FILE" --priority-class "$PRIORITY_CLASS"
+
+uv run python3 tools/factory-e2e/requester_instructions.py judge \
+  --state-dir "$STATE" --run-id "$REHEARSAL_ID" --run-id "$RUN_ID" --criterion all
+```
+
+`preflight` is read-only. It runs the owner enforcement driver's checks (no
+service credential in the caller environment, flags, input file, Python
+environment, clean checkout, `docker info`, the registry, `/readyz`, namespace
+absence, RBAC), then an unused run ID in this driver's ledger
+(`requester-instructions.sqlite3`), then the live inputs: the App kit, both
+token files and the model credential file by `stat` only, the conflict file's
+shape and the PriorityClass. A missing prerequisite is a refusal with exit
+code 2. The live model probe, the App token probe and `GET /user` for both
+accounts are not preflight checks; `run` makes them inside the child,
+immediately before the first label, and refuses before any label when one
+fails.
+
+### What rehearse proves (criterion 9)
+
+The rehearsal is unpaid: the runner uses its offline fake model. It creates
+the two OIDC principals, links each to a distinct synthetic GitHub account id
+on the stub's host through `POST /identity/admin/{tenant}/code-host-links`,
+and leaves a third account id unlinked. It resolves all three through the
+production resolver (`resolve_github_requester`), run in a child with the
+API's environment, and stores a different document per linked principal with
+`PUT /coding-instructions` under that principal's console session. Each
+document carries a canary line and a marker preference. It admits one issue
+per actor through the internal admission route in service mode, with the
+requester the resolver returned. The stub records every label as its bot, so a
+human label actor cannot be driven through it; the resolver run is what ties
+the account to the principal. It then reads the API's own records: each linked
+WorkItem is `selected` with the digest of its own principal's document and its
+request's evidence is `applied`, and the unlinked WorkItem is `absent` with
+evidence `none`. Finally it scans the API, worker and every runner Pod log for
+any line of either document, and runs the full finalizer, which deletes
+everything and proves each item absent.
+
+### What run proves (criterion 10)
+
+The live run uses polling intake on the fixture repository, never webhook
+intake. It links the owner and second test accounts by their numeric ids,
+stores the owner's document (one machine-checkable marker preference and the
+conflicting preference) and a different document for the second account, binds
+the agent to the repository under a label made for this run, and runs at most
+three slots in order:
+
+1. The owner labels a new issue.
+2. The second account labels a new issue.
+3. The owner, with the document cleared, labels a new issue (the control).
+
+Each slot is written to the ledger before its label is applied. Per slot the
+driver records whether the WorkItem's requester is that account's principal,
+the request's evidence, the pull request body's last line, the diff's added
+lines, and a scan of every reviewer transcript record (subagent files and
+sidechain lines) in the runner Pod for any line of either document. Slots 1
+and 2 must end with their own document's annotation; slot 1's diff must carry
+the marker and must not obey the conflicting preference; slot 3 must have no
+annotation and no marker. Every reviewer scan must read at least one reviewer
+record and find nothing.
+
+The note tasks allow applicable coding guidance to add content or files. They
+are rendered from structured constraints, checked offline for every planned
+slot and checked again before issue creation. A selected-document proof task
+with a sentence limit, line limit or exclusive file constraint is refused:
+those constraints can defeat the marker or independently forbid the
+dependency preference, confounding the repository-precedence check. The
+task body is identical with and without a profile and contains no marker cue.
+
+Spend is capped as precondition 5 requires: at most 3 slots, a 5 USD cap per
+model session (`DEFAULT_MAX_USD_PER_DAY`), and at most one continuation per
+slot. The image's launch gate holds every native start until the driver
+releases it, and the driver releases at most two per labeled slot; any other
+start fences the run. `CURIE_WORK_ITEM_MAX_TURNS=64` allows SDK tool calls
+within each session and does not set the continuation cap. The live template
+declares `ANTHROPIC_API_KEY` as its credential source and uses the live
+reviewer model. Before releasing a native start, the driver runs the SDK
+credential resolver inside that Pod and requires it to select the installed
+endpoint and key by comparing against digests of the supplied live inputs;
+personal-auth resolution is refused. Forge cleanup reads every page of a minimal
+pull request inventory and rejects unreadable or partial responses.
+
+Each native release records its PID and process start time. The runner's
+shutdown hook terminates those native writers and their descendants, waits
+for exit, and then archives their JSONL files to the owned object store before
+the Pod disappears. A writer that does not exit refuses the archive. The driver
+downloads the final bytes and scans them again, including reviewer completion records that a periodic
+scan can miss. A missing final archive refuses the slot.
+
+### Judge
+
+`judge --criterion {9,10,all}` reads the ledger only and prints a sanitized
+verdict. Criterion 9 is judged from a rehearse run and criterion 10 from a live
+run, each from the run IDs passed. A criterion with no such run, or whose run
+never finished, is reported `missing`, never passed. Each criterion also
+requires its cleanup rows to be clean and every finalizer step to succeed; for
+criterion 10 the slot table must show each slot recorded before its label and
+within its launch cap. Exit code 0 means every judged criterion passed.
+
+### Fail-closed programs
+
+The model probe runs in an `env -i` child with an empty `HOME`; the reviewer
+scan runs in the runner Pod with its needles on stdin. Each exits 2 on input
+it cannot read and 3 at its own 45 s deadline, and the driver treats any
+unreadable answer as a failure, never a clean result.
+
+### Known limits
+
+The live path runs the factory on the same host-process harness as the
+rehearsal, with the real GitHub App and poll intake in the candidate API and a
+publication Job in the owned namespace; the rehearsal does not exercise that
+composition, so only `run` proves it. GitHub's REST API cannot delete issues, so cleanup
+closes the run's issues and pull requests, deletes its branches and label, and
+counts a closed issue as removed.
+
+An unreadable pull request or branch inventory fails cleanup even when known
+objects were removed. The driver continues deleting known objects and records
+the unreadable inventory in its ledger, so the judge cannot call it absent.
+Each live reviewer scan saves the exact parent and reviewer JSONL inputs under
+`$STATE/proof/enrollment-<owner>/transcripts/`, in private directories (0700)
+and files (0600). It captures them again before deleting runner Pods, including
+on a failed run; a capture failure still deletes the Pods and fails cleanup.
+The saved JSONL retains the `subagents` directory structure so the same scanner
+can be applied after teardown. These files contain private session text and
+stay outside public artifacts.
+
+## Personal Slack kickoff acceptance (#5380)
+
+`personal_slack_kickoff.py` is the live proof for issue #5380 acceptance
+criterion 4 and ADR 0268 row 13: a Slack mention that links one issue starts a
+personal factory run on the sender's own grant, and its progress comes back in
+the thread that started it. Everything inside the path is the candidate's own:
+no tracker label, no direct admission call, no injected progress state and no
+fake component. Its stateless helpers come from `personal_profile_support.py`
+in one import block; its own logic lives in `personal_slack_kickoff_support.py`
+and its hermetic tests in `tests/test_personal_slack_kickoff.py`.
+
+### What it proves
+
+The judge has eight criteria, each computed from recorded observations only.
+
+1. `slack`: a separate sender bot posts `<@CURIE_BOT_USER> [test action] <issue URL>`
+   at the testing channel's root with `chat.postMessage`. The candidate's
+   dispatcher receives it over Socket Mode, stores its mention receipt in
+   Valkey (read back by delivery and checked field by field) and logs the
+   enqueue for that delivery. The dispatcher's Socket Mode connection ends at
+   uninstall.
+2. `admission` and `owner`: production identity resolves the sender's bot user
+   to its linked test principal, and trusted admission records exactly one
+   personal WorkItem and one ExecutionRequest with that principal's owner tuple
+   (agent tenant, principal, current enrollment generation), the kickoff
+   request id derived from the delivery, the issue link as the objective, the
+   sender as requester and no trigger label.
+3. `grant`: the factory runs on that owner's grant. Every runner pod reads
+   `CLAUDE_CODE_OAUTH_TOKEN` from its claim's `<claim>-tokens` Secret, runs the
+   candidate runner image, and leaves native transcripts with real usage and no
+   synthetic record. Provider errors from the CLI's debug stderr must agree with
+   the terminal frame. Each role's observed model is recorded
+   (`grant.role_models`) and printed in the judge output.
+4. `progress`: the kickoff thread holds the progress card and one notify
+   reply, read back with `conversations.replies`, and nothing else from the
+   bot. The thread row is origin `kickoff` at the kickoff message, its
+   `card_ts` equals the dispatcher placeholder's ts (observed right after
+   admission, so the card is the placeholder edited in place) and is the first
+   reply, and no root post or retired post kind (`phase`, `pull_request`,
+   `terminal`, `card`) exists. When a pull request exists the card's final
+   message has the header `Factory run: finished`, the seven checklist steps
+   marked done, and a `View pull request #N` button whose url is the observed
+   pull request; exactly one other bot reply exists, and its text is
+   `<@SENDER> your pull request is ready for review: <url>` with a delivered
+   `ready` outbox row. A failed run can show a terminal card and a
+   `this run needs you:` notify, but it fails the successful pull request
+   check and cannot satisfy this acceptance criterion. No bot message
+   contains `Phase `, `Outcome: admitted`, `Run completed`, `PR open:` or a
+   JSON object, and every outbox row was delivered into the thread. The
+   anonymized thread dump (user ids, ts values, team ids, URLs and repository
+   names replaced by stable placeholders, block structure kept) is recorded as
+   `progress.thread_dump` and printed in the `observations` of
+   `judge --criterion progress` (and `all`), for the pull request body.
+5. `refusal`: the enrollment is disconnected through
+   `curie cluster subscription disconnect`, the run waits for teardown to
+   settle, and the same sender kicks off a second fixture issue. The reply in
+   that thread names `enrollment_inactive`, and the WorkItem, request, claim
+   and runner pod counts are unchanged, with zero new native sessions.
+
+`budget` checks the approved ceiling, the reservations and the grant probe, and
+passes on `budget.ceiling_enforced`: every session's charge (observed, or its
+full reservation share when unknown) stays inside its bounds, no bound was
+breached, and the watchdog's recorded checks (`budget.guard_checks`) cover every
+response. An assistant record that carries usage is a response whether or not it
+has an id; an id-less one keeps a stable key and is never dropped. A check of an
+empty harvest does not count. The sessions the product started are recorded
+as `budget.launched_sessions`. A runner session comes from the runner pod
+watcher or a runner log turn start. A subagent run recorded in the harvested
+main transcript, an Agent or Task tool use with its result, is an entry of
+that role whose source is the main transcript. A guard row's `launched` flag
+is that record rather than a constant. A launched runner session with no
+harvested row fails, and a launched subagent with no harvested row of its
+role fails with `subagent_unharvested`. A session with any recorded turn, or
+one that record names, needs at least one response, every response checked,
+and a guard check after its first response. A completed run, one whose pull
+request exists, needs at least one launched implementer.
+The item's earlier charge
+plus this attempt's stays at or under the recorded item cap. Whether usage is exact is
+reported as the `budget.usage_exact` observation with the capture rule's
+failure codes, never as a pass condition (coordinator ruling of 2026-11-13).
+`cleanup` checks that every owned resource is gone and no held secret reached a
+scanned channel.
+
+### Setup the run performs
+
+The run creates its namespace and `<namespace>-grants` for custody, deploys a
+Dex in the namespace, and installs the candidate chart with every image pinned
+by digest from the loopback registry. The dispatcher runs in Socket Mode with
+the test app's bot and app-level tokens from a run-owned Secret created
+through stdin. `testInstallation.enabled` is true with one driver whose
+`channel_id`, `bot_id` and `bot_user_id` come from the sender token's
+`auth.test`. The chart generates the API key, worker token and attester
+secret. The factory is on with the GitHub App as code host and tracker for the
+fixture repository only, `factory.modelAuthMode=personal`, one worker slot
+and no warm pool. Poll intake watches an unused per-run label, so the kickoff
+is the only admission. The agent is deployed from a private copy of
+`examples/dark-factory` that adds only the reservation gate hook, gets a
+`github=<repo>` surface and publication policy `auto` with a per-run branch
+prefix, and its execution deadline and output token budget come from the
+ceiling.
+
+OIDC is split horizon. The issuer is Dex's in-cluster Service name, so the API
+pod can discover it and exchange codes server-side. The driver logs in through
+its own port-forward while presenting the issuer's authority, and dials no
+other origin. The resulting console session must be bound to a principal in
+the agent's tenant, and enrollment runs through
+`curie cluster subscription enroll --token-file` with that session.
+
+One step is setup, not part of the proved path: no API creates a Slack
+identity link, so the sender bot user's link to the test principal is seeded
+`admin_mapped` by SQL, the way #5375 seeds its principal. The ledger records it
+as `setup.slack_link_seeded_admin_mapped`.
+
+Before enrollment the sender posts `<@CURIE_BOT_USER> [test action] ping`, and
+the run waits for Curie's answer in that thread. That proves Socket Mode
+delivery and declared-driver admission without a model turn.
+
+### Inputs
+
+Every target comes from the caller. Nothing names an environment, cluster,
+host, workspace or channel.
+
+1. `--candidate`: a full 40 hex commit that exists locally. Run from a clean
+   checkout at it, under `uv run`.
+2. `--state-dir` (an existing directory you own, mode 0700) and `--run-id`. The
+   ledger is `slack-kickoff-ledger.sqlite3` in the state directory.
+3. `--context` and, optionally, `--kubeconfig`: a throwaway cluster. The
+   agent-sandbox controller is installed with the release when the cluster
+   does not already run one.
+4. `--namespace` (neither it nor `<namespace>-grants` may exist) and
+   `--release` (never `curie`). `--priority-classes PLATFORM,SANDBOX` reuses
+   existing PriorityClasses, which are cluster scoped.
+5. `--docker-context` and `--registry-port` (1024 to 32767, free). The run's
+   registry listens on 127.0.0.1 of that Docker endpoint. The caller mirrors
+   the port onto this host's loopback, and the cluster's nodes must pull
+   `localhost:<port>` from the same loopback.
+6. `--app-dir`: a private directory holding `app.json`
+   (`{"id", "installation_id", "repo"}`) and `app.pem` for a GitHub App
+   installed on an owned fixture repository with contents, pull requests and
+   issues write and checks and statuses read. Use a fixture repository with no
+   CI workflows.
+7. `--curie-bot-token-file` (`xoxb-`), `--app-token-file` (`xapp-`) and
+   `--sender-token-file` (another app's `xoxb-`), each a private mode 0600
+   file of one line, plus `--channel-file` holding `{"channel_id": "C..."}`.
+   Both bots must be members of that channel.
+8. `--isolation-file`: the maintainer's test-app isolation confirmation,
+   `{"confirmed": true, "team_id": "T...", "curie_bot_user_id": "U..."}`. It
+   must name the workspace and bot user the Curie token authenticates as. No
+   Socket Mode client connects before it is checked.
+9. `--grant-file` (a private one-line personal Claude grant) and
+   `--grant-expires-at` (ISO 8601 with an offset, or epoch seconds) with at
+   least 2,700 s remaining.
+10. `--approve-live`: the exact ceiling string below.
+11. `--grant-probe-cli` (default `claude`).
+12. `--item-cap` and `--item-charged-before` (run only): the item's output token
+    cap across attempts and what earlier attempts were charged, recorded before
+    the first reservation. A run whose full charge would pass the cap refuses
+    `item_cap_exceeded`.
+
+The calling shell must hold no service credential and no `CURIE_FAKE_MODEL`.
+The `curie` binary is `CURIE_BIN`, or `cli/target/debug/curie` in the checkout.
+
+### Commands
+
+```bash
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py images \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$IMAGES_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py slack-probe \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$PROBE_ID" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py preflight \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$RUN_ID" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION" \
+  --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT" --approve-live "$CEILING"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py rehearse \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$REHEARSAL_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT" \
+  --namespace "$NS" --release "$RELEASE" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py --live \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT" \
+  --namespace "$NS" --release "$RELEASE" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION" \
+  --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT" --approve-live "$CEILING"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py refusal-connect \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$CONNECT_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT" \
+  --namespace "$NS" --release "$RELEASE" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py judge \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$CONNECT_ID" --criterion refusal-connect
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py judge \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$RUN_ID" --criterion all
+```
+
+`refusal-connect` takes the same installation and Slack inputs as `rehearse`,
+but takes no grant and never enrolls one. It mentions the app once with an
+unlinked sender and once with a linked sender without an enrollment, checks
+that each public thread has only the settled placeholder, and reads each
+private post acknowledgement from worker logs without recording its URL.
+It also counts the unlinked sender's live connect token and verifies that no
+WorkItem, request or runner started. `judge --criterion refusal-connect`
+requires both legs and complete cleanup, and prints anonymized thread dumps.
+
+`images` builds the api, worker, dispatcher and runner images and the
+dark-factory runner layer at the candidate through `git archive` with the OCI
+revision label, pushes them to a per-run `registry:2.8.3`, verifies each by
+digest and revision, then removes the images and the registry. `rehearse` and
+`run` build their own images the same way and check every running pod's digest
+and revision as it appears, runner pods included. `slack-probe` checks both bot
+tokens with `auth.test`, the app-level token with `apps.connections.open` and
+channel membership, then posts one message as the sender, reads it back and
+deletes it. `preflight` is offline. `rehearse` takes no grant and no approval,
+starts no model session, enrolls a well-formed token that was never issued,
+runs the ping, the disconnected control and the paid-start fence against the
+real install, then the full finalizer; it is judged on `slack`, `refusal` and
+`cleanup`. `rehearse --kickoff --approve-live <ceiling> --grant-expires-at <t>`
+also runs the kickoff and read-back on that never-issued token, with the run's
+reservations, watchdog, deadline enforcer, fence and settlement but no grant
+probe, so it can spend nothing; it opens the rehearsal ledger's one live window
+and records `rehearsal.kickoff_diagnostic`. Every live attempt records, in the
+private ledger, each runner's scrubbed 80-line log tail, every container
+termination, the worker's escalation lines and the request's terminal detail.
+`run` (the ticket's `--live`) adds the one paid kickoff. A run ID gets one live
+start, and a plain rehearsal's run ID never gets one. `judge` reads
+only the ledger and refuses a candidate that differs from the recorded one.
+Each command's result is one JSON object of codes and counts; a refusal is
+`{"error", "fix"}` and exits 2.
+
+### The live ceiling
+
+The coordinator's ruling of 2026-11-12 sets the ceiling. `--approve-live` must
+be exactly this string, or the same string with lower values:
+
+```text
+sessions=8,turns=96,session-turns=32,output-tokens=16384,session-output-tokens=8192,session-seconds=300,paid-retries=0
+```
+
+`session-turns.<role>=N` entries may follow `session-turns`, and
+`model.<role>=MODEL` entries may end the string, each sorted by role
+(`diff-reviewer`, `implementer`, `plan-reviewer`). A model entry pins nothing:
+the bundle's roles run exactly as it configures them (reviewers on
+`claude-opus-5-5`, the implementer on the bundle's model), and the entry only
+names the model the judge expects to observe for that role. The string must
+equal its own canonical rendering, `paid-retries` must be 0, and the parsed
+ceiling is recorded before the first reservation. The 32 turns per session
+follow #5540, which recorded 11 to 14 implementer turns; the 16,384 output
+token total is the spend guard.
+
+One attempt reserves five native sessions, one slot per start: the
+implementer, the kernel's publish continuation (a second implementer-role
+session), the plan reviewer and two diff reviewers (one re-review round), so
+`sessions` below 5 is refused. The main implementer slot takes up to half of
+the remaining tokens and turns; the continuation and the reviewers split the
+rest. No share exceeds the per-session caps. Reservations are written to
+the ledger before the kickoff post, and a reservation is refused once the gate
+is closed, a session's usage is unknown, or the budget is exceeded. Inside the
+runner, the private bundle's reservation gate is a `PreToolUse` hook on
+`Agent` and `Task`. It claims one slot file per reviewer start with `O_EXCL`,
+so parallel hooks never share one, and refuses any other subagent type or a
+start past one plan and two diff reviews.
+
+While the attempt runs, every poll reads the native transcripts and checks,
+in this order, output tokens (in total and per native session), then turns,
+then seconds (300 s of wall clock per native session, first record to last,
+never less the time its reviewers ran, and the attempt's whole window). While
+a native process runs, the newest implementer session is charged from its
+first record to now. The runner caps each response at 4,096 output tokens, so
+the overshoot past a reached bound is at most the response in flight. A
+completed response without usage, a session no reservation covers (a third
+implementer session included), or more native sessions than `sessions` also
+ends the attempt; a session still waiting for its first response is only
+bound by its seconds, and settles as unknown if it never answers. Because a
+poll runs only between blocking calls, a deadline thread also checks every
+followed runner about once a second: once a native process has run 300 s
+since it started (no later than its runner container's start), it starts the
+runner interrupt and a `--wait=false` delete of that pod without waiting on
+either, and the next poll records the breach and fences. Ending the attempt
+fences paid starts in a fixed order: the worker Deployment is scaled to zero,
+the ledger gate closes, the worker pods are deleted with a one second grace
+period and awaited, and the driver records whether no worker is Ready. Only
+then is each runner interrupted and its pod deleted, and the deletion awaited,
+even when a worker would not stop. The worker is stopped rather than drained
+because its readiness is a heartbeat file: a draining worker stays Ready while
+its turn handler waits on the runner, which would hold a paid session past its
+bound. The fence fails when a worker is Ready or a runner container still runs.
+The same fence runs in the finalizer whenever a live start was recorded. After
+the attempt settles and until the disconnect's teardown completes, any runner
+the driver did not follow is an unreserved paid start and fences everything.
+ToolSearch calls in the transcripts are counted and reported with the budget.
+
+Settlement takes native usage only when the capture is affirmed complete
+(coordinator rulings of 2026-11-13, a recorded loosening). The runner holds one
+long-lived session, so its CLI never exits before the kernel deletes the pod,
+and a completed request turns terminal only after its pull request opens, which
+is after the pod is gone. The anchor is therefore the runner's own turn-end log
+record, on the same container clock as the harvester's size reports, which run
+every 0.1 s right after each read pass. The capture is affirmed only when the
+attempt ran in one runner pod, no turn started after the last turn end, and the
+request reached terminal; every transcript, subagent transcripts included, is
+whole and ends in an assistant record whose stop reason is `end_turn`,
+`stop_sequence` or `max_tokens`, every tool use has its result, and every
+subagent a result names has its transcript; at least two size reports after the
+turn end all match; no report drops a file; the reassembled bytes equal the
+last report; the harvester never stopped on its own deadline; and the pod was
+deleted when its stream ended. The turn-end record carries no usage, so there
+is no ACI usage to compare. Any failed check leaves every slot unknown and
+charged its full share. The ledger records the verdict, each failure with the
+file (a path digest) and field it read, and a sanitized trace (report times and
+sizes by path digest, turn times) as `budget.capture`, and a transcript
+skeleton (each record's offset, type, subtype, stop reason, usage numbers,
+sidechain flag and agent ids, no content) as `grant.transcript_skeleton`.
+
+### The grant probe
+
+Right before the first reservation, one turn on `claude-haiku-5-5` runs with an
+empty temporary HOME and the grant as its only credential, so a host login
+cannot answer for it. Its model, 32 token output cap and one turn cap are
+recorded under `grant_probe` before it starts, and its result after. It stays
+outside the ceiling only within those bounds: a failure (a weekly limit
+included), a second turn, another model, or unknown or more than 32 output
+tokens refuses the run with `grant_probe_refused` before any reservation.
+
+### Cleanup
+
+The finalizer registers each step before the resource it removes is created,
+runs in reverse order, runs every step, and defers further signals while it
+works. It uninstalls the release and confirms the dispatcher pods are gone,
+deletes the run's Secrets, both namespaces (after UID and label checks),
+cluster-scoped objects and volumes, closes pull requests and deletes branches
+only while their head is this run's published commit (read from
+`GET /publications/{id}`, never by prefix), closes the fixture issues, deletes
+every message in the run's threads with the token that posted it (a message by
+anyone else fails the step), and removes the registry tags, local images,
+registry container and work directory. An inventory of thirteen kinds must then
+read absent, and the GitHub installation token is revoked last. A token scan
+covers stdout, stderr, child output, HTTP bodies, the harvest, the ledger and
+the evidence.
+
+### Known limits
+
+1. The Slack identity link is seeded by SQL as setup.
+2. The registry is reachable only where the cluster's nodes share the Docker
+   endpoint's loopback.
+3. Each `rehearse` and `run` rebuilds its images; `images` alone proves the
+   build and cleans up.
+4. Socket Mode's two-release ownership handoff is not exercised; it needs a
+   real Slack retry across connections.
+5. The hermetic tests replace `kubectl`, `docker`, `helm`, `git` and `openssl`
+   with recording stubs and substitute the Slack Web API. They prove refusals,
+   ordering and the judge, not the live path.
+
+## Scripted learned rules chain (#5799)
+
+`curie dev factory-e2e scripted --scenario learned-rules --transcript
+tools/model-script/transcripts/learned-rules-chain-a.json` proves the learned
+rule chain from outside on one owned kind install, with the GitHub stub, the
+scripted model server and a disposable Dex. It reuses the scripted driver's
+install and ticket A (stub issue 3815), then a reviewer with write access
+posts a review comment that mentions the factory and states a general rule on
+ticket A's pull request. The revision calls `propose_rule`, the merge turns
+the candidate into the proposed rule R1, a principal linked to a read only
+account is refused its acceptance with `memory_rules.write_access_required`
+and the writer's principal accepts it, both through the CLI with a session
+file. Ticket B (3921) is labelled by the writer, whose requester document asks
+for the opposite; its implementer prompt carries the learned rules section
+above the requester section, no reviewer prompt carries it, its pull request
+body names R1 with the work item's digest on the line before the requester
+line, and every added `assertAlmostEqual(` uses `places=6`. After the writer
+removes R1, ticket C (3922) carries none of it. The evidence JSON records one
+step per link under `learned_rules`, and `learned_rules_scenario.assert_chain`
+judges it; the command fails when it raises.
+
+Principal sessions come from a real Dex password login (users
+`writer@example.com` and `reader@example.com`), never a login code. The
+session probe runs before ticket A is labelled and before any model request:
+both sessions must be principal sessions of two distinct principals in the
+agent's tenant. Session values stay in memory, are redacted from every log,
+and reach the CLI only through mode 0600 files in the run directory.
+
+`--transcript` names the ticket A file; the B and C files sit beside it with
+the same stem, `-b.json` and `-c.json`, and the command refuses to start when
+either is missing or malformed. Replay routes each model request to its
+ticket's lane by the raw issue identity, with no fallback, so a request no
+ticket claims fails the run:
+
+```bash
+curie dev factory-e2e scripted --scenario learned-rules --build-images \
+  --transcript tools/model-script/transcripts/learned-rules-chain-a.json
+```
+
+Recording proxies every lane through a live model under the driver's existing
+caps, with the key in `CURIE_FACTORY_RECORD_KEY`. At teardown the exchanges
+are split by ticket, scrubbed of the stub's address, and written to the three
+`learned-rules-chain-*.json` files; an exchange with no ticket fails the run:
+
+```bash
+CURIE_FACTORY_RECORD_KEY=... \
+  curie dev factory-e2e scripted --scenario learned-rules --build-images --record
+```
+
+CI runs the replay as the `learned-rules` suite of the `e2e-scripted-factory`
+job and uploads its evidence as `scripted-learned-rules-evidence-<sha>`. The
+offline tests are `tests/test_learned_rules_scenario.py` (the judge, the
+session probe through `ScriptedRun.execute`, and the revision routing on the
+real stub) and the learned rules cases of `tests/test_scripted_driver.py`.
+
+## Live GitHub chain (#5808)
+
+`factory_e2e.py run --scenario live-github-chain` runs the whole GitHub
+product flow on one install built from the candidate: questions on ticket A,
+a plain answer, a submitted review that revises the pull request and becomes a
+proposed rule after the merge, a reader refused and the writer accepting the
+rule, ticket B carrying it over a conflicting personal instruction, its removal
+before ticket C, and the retired triage path. The driver is
+`live_github_chain.py`; the judge and the evidence sanitizer are
+`live_github_chain_judge.py`.
+
+### Inputs
+
+1. The usual App, fixture repository, actor token and kube context inputs of
+   this harness.
+2. `CURIE_FACTORY_READER_ACCOUNT_ID`: the numeric id of a public account other
+   than the actor, without write access to the fixture repository. Digits
+   only; a refusal never echoes the value.
+3. `CURIE_FACTORY_MODEL_API_KEY` for the full run. `--stop-after links` needs
+   none.
+4. `--live-chain-attempt N` (1 or 2) records which of the at most two attempts
+   this run is. Both chain flags are refused for any other scenario.
+
+### Before any lock or cluster call
+
+The run first installs the sanitizer for the identifiers the configuration
+names, then reads the reader id, the actor, the reader account and the fixture
+repository and installs the full sanitizer, so evidence and logs never carry
+a raw account, repository, App, namespace or context. It then checks that
+every blocker of #5808 has a closing pull request into `curie-eng/curie`'s
+`next` whose merge commit is in the candidate (the full run refuses an unready
+candidate; the stop mode records it and goes on), and it refuses a fixture
+repository with any open issue or pull request. A refused evidence file makes
+the run exit nonzero.
+
+### What `--stop-after links` proves
+
+It installs the candidate with the fake model (any model key or base URL is
+dropped first), a disposable Dex for two OIDC principals, two real logins, a
+session probe that both are principal sessions in the agent's tenant, and the
+code host links of both principals to the actor and the reader. It stops
+before any ticket exists and opens no seed issue, so it can send no model
+request.
+
+### What the full run proves
+
+The eight beats (a) to (h) of #5808 decision 7 in order. Each prerequisite is
+checked before the action that depends on it (rule proposals read on before
+ticket A, the instruction write before ticket B, the removal before ticket C),
+each beat is judged before the next beat's first side effect (beat (c) and its
+revision checks before beat (d) merges), and a model usage sample is required
+before ticket A and after every beat; a missing sample or a delta at the
+spend cap stops the run.
+
+### Teardown
+
+Teardown deletes Dex and the OIDC Secret, the session files, the code host
+links, the run's unbound label (read back as gone), closes the run's issues,
+moves the default branch back to its head before the merge (read back), and
+deletes the namespace. The verdict fails unless every step is verified.
+
+## Live one-ticket on Jira Cloud (#5793)
+
+`factory_e2e.py run --scenario one-ticket --forge jira_cloud --answer-file
+<file> [--issue-file <file>]` runs the one-ticket flow against a real Jira
+Cloud site with a real model on the preflight's `jira_cloud+github` install.
+The driver is `one_ticket_live.py`; `one-ticket` is a loop scenario fixed to
+the `jira_cloud` forge, so any other `--forge` is refused before anything is
+installed. `--issue-file` defaults to `fixtures/one-ticket-jira-issue.md`, a
+ticket that leaves its rounding mode and default precision open, and
+`fixtures/one-ticket-answer.md` answers it.
+
+### Inputs
+
+1. The usual App, fixture repository, actor token, kube context and layer
+   registry inputs, plus `CURIE_FACTORY_MODEL_API_KEY`.
+2. `CURIE_FACTORY_JIRA_ENV_FILE`, in the format of the docstring of
+   `forges/jira_cloud.py`.
+3. `--answer-file`: the labeller's plain answer. It is required, refused when
+   empty or when it mentions anyone, and refused for every other scenario.
+
+### What the run judges
+
+Each beat against its bound, counted from labelling or from the answer:
+`Investigating this ticket.` within 180 seconds of labelling, a question
+comment within 1800 seconds, the answer posted only after the issue carries
+`curie-factory:questions` with no live request in the same read, the second
+request and `Answer received.` each within 180 seconds of the answer, exactly
+one pull request within 3600 seconds of the answer that names the Jira key and
+has a line starting `Answered on the ticket by `, the merge, and
+`Pull request merged:` within 600 seconds of it. It also requires the Jira
+status id read before labelling to equal the one read after the merged notice
+(an id, not a category), at most two requests, a `Usage:` total of at most
+25 USD (`total cost unknown` and a missing line fail), and no Jira issue
+created by the factory account.
+
+### Evidence and check-clean
+
+Before any lock or cluster call the run loads every identity of its
+environment (fixture repository, actor, operator, App, installation, Jira
+site, cloud, project, labeller and bot accounts, kube context, registry,
+binary paths, home) and writes evidence and log lines only through
+`anonymize`, which replaces each value with its role name. The serializer
+refuses evidence that still names one. The outcome summary for the pull
+request body is logged and stored as `outcome_summary`.
+`python3 tools/factory-e2e/one_ticket_live.py check-clean <file>` reloads the
+same identities and prints `clean`, or exits 1 naming only the roles it found;
+an unreadable input exits 2. It needs only the standard library.

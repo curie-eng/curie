@@ -29,6 +29,7 @@ set) is absorbed by the ``event_id`` keyed request id (ADR 0187).
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -52,6 +53,7 @@ from curie_api.forges.types import (
     NoticePage,
     PullRequest,
     RepositoryRef,
+    SourceContent,
     TicketLabels,
     TrackerIssueRef,
 )
@@ -62,7 +64,7 @@ logger = logging.getLogger(__name__)
 WINDOW_MS = 120_000
 SEARCH_FIELDS = ["labels", "status", "components", "updated", "summary", "creator", "created"]
 TICKET_COMMENT_LIMIT = 100
-LATER_COMMENTS = "_Later comments were not read._"
+EARLIER_COMMENTS = "_Earlier comments were not read._"
 _HISTORY = "h"
 _COMMENT = "c"
 _CREATION = "i"
@@ -242,10 +244,12 @@ class JiraTracker:
     """The factory's tracker on one Jira Cloud site scope, for one binding."""
 
     kind = JIRA_CLOUD
+    facts = None
     capabilities: Mapping[Operation, Support] = {
         **dict.fromkeys(TRACKER_OPERATIONS, Support.SUPPORTED),
         # No core caller reads dependencies yet (ADR 0165 is a Draft, decision 19).
         Operation.DEPENDENCIES: Support.NOOP,
+        Operation.FACTS_EXCHANGE: Support.UNSUPPORTED,
     }
 
     def __init__(
@@ -419,16 +423,23 @@ class JiraTracker:
         return jql + " ORDER BY updated ASC"
 
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         """Decisions 6 to 12 with the cursor of plan D2 (module docstring).
 
         Every search page is read first, then each issue's whole changelog, then
         its comments back to the window start, then each running issue; any
-        failed read raises before a cursor exists.
+        failed read raises before a cursor exists. On an ``answering`` issue
+        every comment by a person is an answer, mention or not (#5789).
         """
 
         start = None if cursor is None else Cursor.parse(cursor)
+        answers = self._own_ids(answering)
+        live = self._own_ids(running)
         zone = await self._verify_identity()
         found = await self._transport.search_jql(
             self._jql(start, zone), SEARCH_FIELDS, page_size=self._page_size
@@ -451,9 +462,26 @@ class JiraTracker:
         known = frozenset() if start is None else start.ids
         histories = {issue_id: await self._changelog(issue_id) for issue_id in issues}
         read_back = floor if start is None else window
+        # A first poll delivers a running issue's mentions since its label was
+        # last added (see `_mention_notices`).
+        labelled_at = {
+            issue_id: self._labelled_at(ref, fields, histories[issue_id])
+            for issue_id, (ref, _updated, fields) in issues.items()
+            if start is None and issue_id in live and issue_id not in answers
+        }
         comments: dict[str, list[dict[str, Any]]] = {}
         for issue_id in issues:
-            comments[issue_id] = await self._recent_comments(issue_id, read_back)
+            # A first poll reads an answering issue's comments in full, and a
+            # running issue's back to its label add: they are delivered (see
+            # `_mention_notices`), since a label whose cursor was never saved
+            # polls as a first poll again.
+            if start is None and issue_id in answers:
+                back = None
+            elif labelled_at.get(issue_id) is not None and read_back is not None:
+                back = min(labelled_at[issue_id] or read_back, read_back)
+            else:
+                back = read_back
+            comments[issue_id] = await self._recent_comments(issue_id, back)
         considered: dict[str, int] = {}
         pending: list[_Pending] = []
         for issue_id, (ref, _updated, fields) in issues.items():
@@ -463,7 +491,16 @@ class JiraTracker:
                 )
             )
             pending.extend(
-                self._mention_notices(ref, comments[issue_id], start, window, known, considered)
+                self._mention_notices(
+                    ref,
+                    comments[issue_id],
+                    start,
+                    window,
+                    known,
+                    considered,
+                    answering=issue_id in answers,
+                    since=labelled_at.get(issue_id),
+                )
             )
         for ref in running:
             cancel = await self._cancellation(ref)
@@ -490,6 +527,28 @@ class JiraTracker:
             ),
             cursor=page_cursor,
         )
+
+    def _own_ids(self, refs: Sequence[TrackerIssueRef]) -> set[str]:
+        return {
+            ref.issue_id
+            for ref in refs
+            if ref.kind == JIRA_CLOUD and ref.host == self.host and ref.scope_id == self._scope_id
+        }
+
+    def _labelled_at(
+        self,
+        ref: TrackerIssueRef,
+        fields: Mapping[str, Any],
+        histories: Sequence[Mapping[str, Any]],
+    ) -> int | None:
+        """When the label was last added to the issue (a changelog add, else
+        the issue's creation with it), or None when neither says."""
+
+        latest = self._latest(histories, lambda h: adds_label(h, self.label))
+        if latest is not None:
+            return jira_ms(latest.get("created"))
+        creation = self._creation_notice(ref, fields, histories, self.label)
+        return None if creation is None else creation.at
 
     async def _recent_comments(self, issue_id: str, floor: int | None) -> list[dict[str, Any]]:
         """The issue's comments newest first, back to ``floor`` (decision 11)."""
@@ -556,7 +615,23 @@ class JiraTracker:
         window: int | None,
         known: frozenset[str],
         considered: dict[str, int],
+        *,
+        answering: bool,
+        since: int | None,
     ) -> list[_Pending]:
+        """Mentions, or on an ``answering`` issue every comment by a person as an
+        answer (#5789 decision 2): one comment is one notice, never both.
+
+        A first poll remembers older mentions without delivering them, but it
+        delivers an answering issue's answers and, on a running issue, each
+        mention made at or after ``since`` (when its label was last added): a
+        label whose first page held an issue saves no cursor and polls as a
+        first poll again, so a comment remembered here and never delivered
+        would be lost. The answer core's fence refuses a comment older than
+        the question, its receipt makes a replay harmless, and a replayed
+        mention replays under its request id."""
+
+        disposition = Disposition.ANSWER if answering else Disposition.MENTION
         notices: list[_Pending] = []
         for comment in reversed(comments):
             comment_id = comment.get("id")
@@ -567,19 +642,23 @@ class JiraTracker:
                 or created is None
                 or not isinstance(comment_id, str | int)
                 or not str(comment_id).isdigit()
-                or not mentions(comment.get("body"), self._mention)
+                or (not answering and not mentions(comment.get("body"), self._mention))
             ):
                 continue
             token = f"{_COMMENT}{comment_id}"
             if start is None:
-                # A first poll delivers label adds only; the mention is remembered.
+                # A first poll delivers label adds, answers and a running
+                # issue's mentions since its label add; any other mention is
+                # remembered.
                 considered[token] = created
+                if answering or (since is not None and created >= since):
+                    notices.append(_Pending(ref, actor, str(comment_id), disposition, created))
                 continue
             if window is not None and created < window:
                 continue
             considered[token] = created
             if token not in known:
-                notices.append(_Pending(ref, actor, str(comment_id), Disposition.MENTION, created))
+                notices.append(_Pending(ref, actor, str(comment_id), disposition, created))
         return notices
 
     async def _cancellation(self, ref: TrackerIssueRef) -> _Pending | None:
@@ -611,9 +690,10 @@ class JiraTracker:
         )
 
     async def verify_current(self, notice: MarkedNotice) -> bool:
-        """Re-reads the issue every time (decision 12). An admission or a
-        mention is current only while the issue keeps its label and is not done,
-        so a mention after the label went, or after done, revises nothing."""
+        """Re-reads the issue every time (decision 12). An admission, a mention
+        or an answer is current only while the issue keeps its label and is not
+        done, so a comment after the label went, or after done, revises
+        nothing; a mention or an answer also only while its comment stands."""
 
         issue_id = self._issue_id(notice.issue)
         try:
@@ -627,7 +707,9 @@ class JiraTracker:
         if not labelled or done:
             return False
         if notice.disposition is Disposition.MENTION:
-            return await self._mention_current(issue_id, notice)
+            return await self._comment_current(issue_id, notice, mention=True)
+        if notice.disposition is Disposition.ANSWER:
+            return await self._comment_current(issue_id, notice, mention=False)
         histories = await self._changelog(issue_id)
         latest = self._latest(histories, lambda h: adds_label(h, notice.marker))
         if latest is not None:
@@ -639,7 +721,10 @@ class JiraTracker:
             and creation.actor == notice.actor
         )
 
-    async def _mention_current(self, issue_id: str, notice: MarkedNotice) -> bool:
+    async def _comment_current(self, issue_id: str, notice: MarkedNotice, *, mention: bool) -> bool:
+        """The notice's comment is still on this issue by the same author, and,
+        for a mention, still mentions the bot."""
+
         if not notice.event_id.isdigit():
             return False
         # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/#api-rest-api-3-comment-list-post
@@ -658,7 +743,7 @@ class JiraTracker:
                 located is not None
                 and located.group(1) == issue_id
                 and author == notice.actor
-                and mentions(comment.get("body"), self._mention)
+                and (not mention or mentions(comment.get("body"), self._mention))
             )
         return False
 
@@ -703,7 +788,9 @@ class JiraTracker:
         return any(isinstance(group, dict) and group.get("groupId") == group_id for group in groups)
 
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
-        """Decision 14: title, description, then up to 100 comments oldest first."""
+        """Decision 14: title, description, then the newest 100 comments, oldest
+        first (#5789 decision 7). When there were more, a line after the
+        description says the earlier ones were not read."""
 
         issue_id = self._issue_id(issue)
         fields = _fields(await self._read_issue(issue_id, "summary,description"))
@@ -712,12 +799,15 @@ class JiraTracker:
         description = adf.to_markdown(fields.get("description"))
         if description:
             parts.append(description)
-        comments, total = await self._transport.comments(
+        newest, total = await self._transport.comments(
             issue_id,
-            newest_first=False,
+            newest_first=True,
             page_size=self._page_size,
             limit=TICKET_COMMENT_LIMIT,
         )
+        comments = list(reversed(newest))
+        if total > len(comments):
+            parts.append(EARLIER_COMMENTS)
         for comment in comments:
             author = comment.get("author")
             name = author.get("displayName") if isinstance(author, dict) else None
@@ -727,9 +817,25 @@ class JiraTracker:
                 heading += f" at {created}"
             body = adf.to_markdown(comment.get("body"))
             parts.append(f"{heading}\n\n{body}" if body else heading)
-        if total > len(comments):
-            parts.append(LATER_COMMENTS)
         return "\n\n".join(parts) + "\n"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's ``summary`` and ``description`` fields from one issue read,
+        never its comments. The description is the stored document, as its
+        canonical JSON text (keys sorted, no insignificant whitespace), not
+        rendered markdown; a missing description is the empty text."""
+
+        fields = _fields(await self._read_issue(self._issue_id(issue), "summary,description"))
+        summary = fields.get("summary")
+        if not isinstance(summary, str):
+            raise Unavailable("issue")
+        description = fields.get("description")
+        body = (
+            ""
+            if description is None
+            else json.dumps(description, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        return SourceContent(title=summary, body=body)
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         issue_id = self._issue_id(issue)

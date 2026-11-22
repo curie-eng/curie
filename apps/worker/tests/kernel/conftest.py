@@ -63,7 +63,13 @@ from curie_worker.sandbox import (
     QuotaRejection,
     SandboxSubstrate,
 )
-from curie_worker.sandbox.types import ClaimView, SandboxClient, SandboxView
+from curie_worker.sandbox.types import (
+    ClaimView,
+    DeliveredLimits,
+    RecordedPod,
+    SandboxClient,
+    SandboxView,
+)
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -491,6 +497,15 @@ class FakeK8s:
     unschedulable_message: str | None = None
     termination: Any | None = None
     termination_queries: list[str] = field(default_factory=list)
+    # ADR 0269 (#5427): what pod_limits and claim_limits answer. Unobserved
+    # by default, which never releases a resource gate.
+    delivered: DeliveredLimits | None = None
+    template_limits: DeliveredLimits = field(
+        default_factory=lambda: DeliveredLimits(
+            memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
+    )
+    pod_limit_reads: list[str] = field(default_factory=list)
     template_reaps: list[tuple[set[str], datetime]] = field(default_factory=list)
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
@@ -656,7 +671,11 @@ class FakeK8s:
             self.deleted_claims.append(name)
             self.sandboxes.pop(claim.sandbox_name, None)
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self, *, label_selector: str, request_timeout_seconds: float | None = None
+    ) -> list[ClaimView]:
+        # The owner inventory (#5378) bounds its read; any other caller omits it.
+        assert request_timeout_seconds is None or request_timeout_seconds > 0
         key, _, value = label_selector.partition("=")
         out = []
         for claim in self.claims.values():
@@ -710,12 +729,32 @@ class FakeK8s:
         return self.unschedulable_message
 
     def pod_termination(
-        self, name: str, *, request_timeout_seconds: float, since: datetime
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        since: datetime,
+        recorded: RecordedPod | None = None,
     ) -> Any | None:
         assert request_timeout_seconds > 0
         assert since.tzinfo is not None
+        del recorded
         self.termination_queries.append(name)
         return self.termination
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        assert request_timeout_seconds > 0
+        self.pod_limit_reads.append(name)
+        return self.delivered
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        return self.template_limits
 
     # No Docker repository pool is configured in this suite, so the substrate
     # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.
@@ -766,8 +805,21 @@ class FakeRunner:
                 web.post("/v1/steer", self._steer),
                 web.post("/v1/interrupt", self._interrupt),
                 web.post("/v1/timeout", self._timeout),
+                web.post("/v1/requester-context", self._requester_context),
+                web.post("/v1/memory-rules-context", self._memory_rules_context),
             ]
         )
+        # Envelopes posted before a first turn (ADR 0278), in order.
+        self.requester_contexts: list[dict[str, Any]] = []
+        # When set, the requester context route answers this status and body
+        # instead of acknowledging, as a refusing or older runner would.
+        self.requester_context_answer: tuple[int, dict[str, Any]] | None = None
+        # Learned rules envelopes posted before a first turn (#5798), in order.
+        self.memory_rules_contexts: list[dict[str, Any]] = []
+        # When set, the learned rules route answers this status and body.
+        self.memory_rules_context_answer: tuple[int, dict[str, Any]] | None = None
+        # Each context post in arrival order, with how many turns had opened.
+        self.context_posts: list[tuple[str, int]] = []
         self.turn_active = False
         self.turn_epoch: str | None = None
         self._turn_lock = asyncio.Lock()
@@ -829,6 +881,42 @@ class FakeRunner:
         self.interrupt_headers: list[dict[str, str]] = []
         self.timeout_headers: list[dict[str, str]] = []
         self.status_headers: list[dict[str, str]] = []
+
+    async def _requester_context(self, request: web.Request) -> web.Response:
+        """Acknowledge like the real runner: the selection's digest, or none."""
+
+        envelope = await request.json()
+        self.requester_contexts.append(envelope)
+        self.context_posts.append(("requester", len(self.opened)))
+        if self.requester_context_answer is not None:
+            status, body = self.requester_context_answer
+            return web.json_response(body, status=status)
+        return self._acknowledge(envelope)
+
+    async def _memory_rules_context(self, request: web.Request) -> web.Response:
+        """Acknowledge the learned rules like the real runner (#5798)."""
+
+        envelope = await request.json()
+        self.memory_rules_contexts.append(envelope)
+        self.context_posts.append(("memory_rules", len(self.opened)))
+        if self.memory_rules_context_answer is not None:
+            status, body = self.memory_rules_context_answer
+            return web.json_response(body, status=status)
+        return self._acknowledge(envelope)
+
+    @staticmethod
+    def _acknowledge(envelope: dict[str, Any]) -> web.Response:
+        selection = envelope.get("selection") or {}
+        ack: dict[str, Any] = {
+            "envelope_version": 1,
+            "work_item_id": envelope["work_item_id"],
+            "execution_request_id": envelope["execution_request_id"],
+            "execution_fence": envelope["execution_fence"],
+            "outcome": "applied" if selection.get("kind") == "selected" else "none",
+        }
+        if selection.get("kind") == "selected":
+            ack["sha256"] = selection["sha256"]
+        return web.json_response({"acknowledgment": ack})
 
     async def _status(self, request: web.Request) -> web.Response:
         self.status_headers.append(dict(request.headers))
@@ -1176,6 +1264,7 @@ async def kernel_harness(
     attachment_access: object | None = None,
     recovery_factory: Callable[[object | None], object] | None = None,
     factory_steering: object | None = None,
+    personal_execution_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel. @spec HTTP-INVOCATION-EXECUTION-18."""
@@ -1307,6 +1396,13 @@ async def kernel_harness(
         # The factory Slack steering diversion (#5414); omitted, the kernel has
         # none and every Slack turn takes the ordinary path.
         **({"factory_steering": factory_steering} if factory_steering is not None else {}),
+        # The personal execution authority (#5378), built from the harness's own
+        # Valkey client and config; omitted, the kernel enforces nothing.
+        **(
+            {"personal_execution": personal_execution_factory(async_redis, config)}
+            if personal_execution_factory is not None
+            else {}
+        ),
     )
     killswitch = None
     if with_killswitch:

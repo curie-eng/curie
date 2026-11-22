@@ -1,0 +1,32 @@
+{
+  "name": "factory-selector",
+  "version": "0.1.0",
+  "description": "Example bundle: on a weekday schedule, select open GitHub issues from an editable policy and apply the factory label, then report what was labelled and what was skipped.",
+  "author": { "name": "CurieTech" },
+  "license": "Apache-2.0",
+  "keywords": ["example", "factory", "github", "cron"],
+  "secrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+  "starterPrompts": [
+    "Select factory work from the policy."
+  ],
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": [
+      "github/search_issues",
+      "github/get_issue",
+      "github/update_issue"
+    ],
+    "approvalRequired": [],
+    "deny": []
+  },
+  "triggers": [
+    {
+      "type": "cron",
+      "name": "select-factory-work",
+      "schedule": "0 14 * * 1-5",
+      "timezone": "UTC",
+      "target": "replace-me",
+      "prompt": "Follow the factory-selector skill. Select issues from the bundle policy and report what you labelled and what you skipped."
+    }
+  ]
+}

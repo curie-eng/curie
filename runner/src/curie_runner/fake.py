@@ -16,15 +16,18 @@ import json
 import os
 import re
 import socket
+import tempfile
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 import anyio
 import httpx2
 from claude_agent_sdk import (
     AssistantMessage,
+    RateLimitEvent,
     ResultMessage,
     TextBlock,
     ToolResultBlock,
@@ -34,15 +37,19 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import (
     CanUseTool,
     PermissionResultDeny,
+    RateLimitInfo,
     ToolPermissionContext,
 )
 from mcp import ClientSession
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .adapter import PartialMessageBoundary
 from .approval import (
     APPROVAL_TOOL_NAME,
+    NO_PUBLICATION_GATE_TEXT,
     TURN_PROGRESS_TOOL_NAME,
     ApprovalGate,
+    PublicationLedger,
     process_approval_request,
 )
 from .connectors import CALLER_HEADER
@@ -54,6 +61,26 @@ from .turn_progress import NOT_SHOWN_TEXT, TurnProgress
 
 def _assistant(*blocks: Any, usage: dict[str, Any] | None = None) -> AssistantMessage:
     return AssistantMessage(content=list(blocks), model="fake-model", usage=usage)
+
+
+_SdkError = Literal[
+    "authentication_failed",
+    "billing_error",
+    "rate_limit",
+    "invalid_request",
+    "server_error",
+    "unknown",
+]
+
+
+def _errored(error: _SdkError, text: str) -> AssistantMessage:
+    """An assistant message carrying a provider error, as the SDK delivers one."""
+
+    return AssistantMessage(
+        content=[TextBlock(text=text)] if text else [],
+        model="fake-model",
+        error=error,
+    )
 
 
 def _result(
@@ -482,6 +509,9 @@ def gated_connector_tool_turn(name: str, args: dict[str, Any]) -> list[Any]:
 # permission gate let the call run. It is the offline proof that an approved
 # file write runs exactly once after resume (#5571). Nothing outside the
 # working directory is ever written: ``<name>`` is a single path component.
+# The working directory is the session's own (the mounted managed checkout on a
+# workspace sandbox, as the real CLI's ``cwd`` option), else the process's, so
+# a factory turn on the fake tier changes the checkout it publishes (#5429).
 WRITE_FILE_MARKER = "[fake:write-file"
 _WRITE_FILE_RE = re.compile(r"\[fake:write-file ([A-Za-z0-9._-]+) (\S+)\]")
 
@@ -495,13 +525,16 @@ class _FileWrite:
     content: str
 
 
-def write_file_turn(last: str) -> list[Any]:
-    """A turn that writes one file in the working directory, then answers."""
+def write_file_turn(last: str, cwd: str | None = None) -> list[Any]:
+    """A turn that writes one file in the working directory, then answers.
+
+    ``cwd`` is the session's working directory; None means the process's.
+    """
 
     match = _WRITE_FILE_RE.search(last)
     if match is None or match.group(1) in {".", ".."}:
         return default_turn()
-    path = os.path.join(os.getcwd(), match.group(1))
+    path = os.path.join(cwd or os.getcwd(), match.group(1))
     content = match.group(2)
     return [
         _assistant(TextBlock(text="Writing the file")),
@@ -512,6 +545,234 @@ def write_file_turn(last: str) -> list[Any]:
         _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
         _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
     ]
+
+
+# ``[fake:publish-changes]`` is read only together with a parsed write-file
+# directive (#5429). The turn is that write, then exactly one
+# ``mcp__curie__publish_changes`` tool use. The call goes through the same
+# permission gate as any other scripted tool, so a gated publish pauses the
+# turn where candidate capture happens. A publish marker without a parsed
+# write does not take the turn.
+PUBLISH_CHANGES_MARKER = "[fake:publish-changes]"
+# A fixed proposal the publication gate can record. The directive takes no
+# arguments; title and body stay inside the limits ``ApprovalGate`` accepts.
+PUBLISH_CHANGES_INPUT: dict[str, str] = {
+    "title": "Publish the reviewed change",
+    "body": "Publish the file written in this turn.",
+}
+
+
+def publish_changes_turn(last: str, cwd: str | None = None) -> list[Any]:
+    """The write-file turn followed by one publication tool use."""
+
+    match = _WRITE_FILE_RE.search(last)
+    if match is None or match.group(1) in {".", ".."}:
+        return default_turn()
+    written = write_file_turn(last, cwd)
+    publish = _assistant(
+        ToolUseBlock(id="p1", name=PLATFORM_PUBLISH_TOOL_NAME, input=dict(PUBLISH_CHANGES_INPUT))
+    )
+    return [*written[:3], publish, *written[3:]]
+
+
+# ``[fake:model-fault <kind>]`` emits the SDK shape the real provider uses for
+# that refusal (#5429, #5424, #5426), and nothing else. The production
+# translator classifies it. A marker whose argument does not parse falls back
+# to the default turn and does not fall through to a later directive.
+# ``<s>`` is the provider reset as a Unix timestamp in whole seconds, the same
+# instant ``RateLimitInfo.resets_at`` and the daily-budget RFC 3339 clause name.
+MODEL_FAULT_MARKER = "[fake:model-fault"
+_MODEL_FAULT_RE = re.compile(
+    r"\[fake:model-fault (?:"
+    r"rate-limit (?P<rate>\d+)"
+    r"|daily-budget (?P<budget>\d+)"
+    r"|rate-limit-untimed"
+    r"|generic-403"
+    r"|unreachable"
+    r")\]"
+)
+# Observed 2026-10-29 (#5163): an OpenRouter workspace daily budget refusal.
+# The reset clause is filled from the directive's timestamp. Built by
+# concatenation so the JSON braces are not a format string.
+# A 403 with no credit, budget or documented 401 text (test_translate.py).
+_GENERIC_403_TEXT = 'API Error: 403 {"error":{"message":"invalid api key","code":403}}'
+# #4333: the SDK reports a transport failure as server_error plus this text.
+_UNREACHABLE_TEXT = "API Error: 500 Connection refused"
+
+
+def _utc_stamp(seconds: int) -> str | None:
+    """RFC 3339 UTC for ``seconds``, or None when it is not a real instant."""
+
+    try:
+        when = datetime.fromtimestamp(seconds, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return when.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _rate_limit_event(resets_at: int | None) -> RateLimitEvent:
+    info = RateLimitInfo(status="rejected", resets_at=resets_at)
+    return RateLimitEvent(rate_limit_info=info, uuid="fake-rate-limit", session_id="fake-session")
+
+
+def model_fault_turn(last: str) -> list[Any]:
+    """One provider-fault turn, or the default turn when the argument is bad."""
+
+    match = _MODEL_FAULT_RE.search(last)
+    if match is None:
+        return default_turn()
+    if match.group("rate") is not None:
+        seconds = int(match.group("rate"))
+        if _utc_stamp(seconds) is None:
+            return default_turn()
+        return [
+            _rate_limit_event(seconds),
+            _result(is_error=True, text="model rate limit reached"),
+        ]
+    if match.group("budget") is not None:
+        seconds = int(match.group("budget"))
+        stamp = _utc_stamp(seconds)
+        if stamp is None:
+            return default_turn()
+        text = (
+            'API Error: 403 {"error":{"message":"Workspace daily budget of $20.00 exceeded. '
+            "Contact your org admin. $20.08 of $20.00 used; resets " + stamp + '.",'
+            '"code":403}}'
+        )
+        return [_errored("authentication_failed", text), _result(is_error=True, text=text)]
+    if "rate-limit-untimed" in match.group(0):
+        return [
+            _rate_limit_event(None),
+            _result(is_error=True, text="model rate limit reached"),
+        ]
+    if "generic-403" in match.group(0):
+        return [
+            _errored("authentication_failed", _GENERIC_403_TEXT),
+            _result(is_error=True, text=_GENERIC_403_TEXT),
+        ]
+    return [
+        _errored("server_error", _UNREACHABLE_TEXT),
+        _result(is_error=True, text=_UNREACHABLE_TEXT),
+    ]
+
+
+# Resource exhaustion directives (#5427). ``[fake:hold-memory <MiB>]`` allocates
+# that many MiB inside the runner process, touching every page so the memory
+# is resident, holds it, releases it and answers. ``[fake:fill-scratch <MiB>]``
+# writes that many MiB of zeros to one file in the temporary directory (the
+# runner's /tmp scratch volume in a sandbox, whose root filesystem is read-only)
+# in 1 MiB chunks, holds it, deletes it and answers. Neither emits a tool call, so the
+# turn raises no side effect flag, and neither touches the network. Under a
+# runner limit smaller than the request the kubelet or the kernel ends the
+# runner first, which is the point. Out of range or unparsable arguments fall
+# back to the default turn, like the other directives.
+HOLD_MEMORY_MARKER = "[fake:hold-memory"
+FILL_SCRATCH_MARKER = "[fake:fill-scratch"
+_HOLD_MEMORY_RE = re.compile(r"\[fake:hold-memory (\d{1,5})\]")
+_FILL_SCRATCH_RE = re.compile(r"\[fake:fill-scratch (\d{1,5})\]")
+RESOURCE_DIRECTIVE_MAX_MIB = 16384
+_MIB = 1024 * 1024
+_PAGE = 4096
+# Read at call time, so a test can shorten them. Memory is resident the moment
+# it is touched, so a short hold suffices. The kubelet measures local storage
+# on its own housekeeping cadence, so a scratch file is held long enough for
+# at least one eviction pass to see it.
+HOLD_MEMORY_SECONDS = 5.0
+FILL_SCRATCH_SECONDS = 180.0
+FILL_SCRATCH_FILE = "curie-fake-fill-scratch.bin"
+# A standing directive for every turn of this runner (fake tier only), read at
+# call time: the fake treats it as part of the person's words. A factory turn's
+# text is only the issue link, so a test that needs a directive on a tracker
+# admitted turn sets it per agent through the chart's agentSandbox.runnerEnv.
+STANDING_DIRECTIVE_ENV = "FAKE_MODEL_DIRECTIVE"
+
+
+@dataclass(frozen=True)
+class _HoldMemory:
+    """A scripted allocation of ``mib`` resident MiB, held and then released."""
+
+    mib: int
+
+
+@dataclass(frozen=True)
+class _FillScratch:
+    """A scripted ``mib`` MiB scratch file in the temporary directory, held and then deleted."""
+
+    path: str
+    mib: int
+
+
+def _resource_mib(pattern: re.Pattern[str], last: str) -> int | None:
+    match = pattern.search(last)
+    if match is None:
+        return None
+    mib = int(match.group(1))
+    return mib if 1 <= mib <= RESOURCE_DIRECTIVE_MAX_MIB else None
+
+
+def _resource_answer() -> list[Any]:
+    return [
+        _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
+        _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
+def hold_memory_turn(last: str) -> list[Any]:
+    """A turn that holds the directive's MiB of resident memory, then answers."""
+
+    mib = _resource_mib(_HOLD_MEMORY_RE, last)
+    if mib is None:
+        return default_turn()
+    return [_assistant(TextBlock(text="Holding memory")), _HoldMemory(mib), *_resource_answer()]
+
+
+def fill_scratch_turn(last: str) -> list[Any]:
+    """A turn that fills the directive's MiB of temporary scratch, then answers."""
+
+    mib = _resource_mib(_FILL_SCRATCH_RE, last)
+    if mib is None:
+        return default_turn()
+    path = os.path.join(tempfile.gettempdir(), FILL_SCRATCH_FILE)
+    return [
+        _assistant(TextBlock(text="Filling scratch")),
+        _FillScratch(path, mib),
+        *_resource_answer(),
+    ]
+
+
+def _touch_memory(mib: int) -> bytearray:
+    buffer = bytearray(mib * _MIB)
+    for offset in range(0, len(buffer), _PAGE):
+        buffer[offset] = 1
+    return buffer
+
+
+def _write_scratch(path: str, mib: int) -> None:
+    chunk = bytes(_MIB)
+    with open(path, "wb") as stream:
+        for _ in range(mib):
+            stream.write(chunk)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+async def _hold_memory(mib: int) -> None:
+    buffer = await anyio.to_thread.run_sync(_touch_memory, mib)
+    try:
+        await anyio.sleep(HOLD_MEMORY_SECONDS)
+    finally:
+        del buffer
+
+
+async def _fill_scratch(call: _FillScratch) -> None:
+    try:
+        await anyio.to_thread.run_sync(_write_scratch, call.path, call.mib)
+        await anyio.sleep(FILL_SCRATCH_SECONDS)
+    finally:
+        try:
+            os.unlink(call.path)
+        except FileNotFoundError:
+            pass
 
 
 async def _dial_connector_tool(
@@ -641,14 +902,19 @@ class FakeModelSession:
         post_tool_use_hook: Callable[[Any, str | None, Any], Awaitable[dict[str, Any]]]
         | None = None,
         approval_gate: ApprovalGate | None = None,
+        publication_ledger: PublicationLedger | None = None,
         replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
         turn_progress: TurnProgress | None = None,
         tool_access: TurnToolAccess | None = None,
         connector_servers: Mapping[str, Mapping[str, Any]] | None = None,
+        cwd: str | None = None,
     ) -> None:
         self._script_factory = script_factory or self._default_script
+        # The session's working directory, as the real CLI's ``cwd`` option;
+        # None means the process's own.
+        self._cwd = cwd
         self._connector_servers: Mapping[str, Mapping[str, Any]] = connector_servers or {}
         # The session's progress holder (ADR 0130); None when the tool is not
         # mounted, which the demo answers as "not shown", like no capability.
@@ -676,6 +942,9 @@ class FakeModelSession:
         # the fake tier omits the sole-route auto-bind / unknown-route refusal and
         # silently widens the card -- the exact real-path regression #544 closed.
         self._approval_gate = approval_gate
+        # With no gate, the scripted publish body notes its run here, as the
+        # real body does (#2294).
+        self._publication_ledger = publication_ledger
         self.replay_messages = replay_messages
         self.connected = False
         self.queries: list[str] = []
@@ -697,6 +966,9 @@ class FakeModelSession:
         """
 
         last = _user_message(self.queries[-1] if self.queries else "")
+        standing = os.environ.get(STANDING_DIRECTIVE_ENV, "").strip()
+        if standing:
+            last = f"{last}\n{standing}"
         match = _APPROVAL_MARKER_RE.search(last)
         if match:
             summary = last[match.end() :].strip() or "unspecified request"
@@ -705,8 +977,22 @@ class FakeModelSession:
             return reversible_turn()
         if PROGRESS_DEMO_MARKER in last:
             return progress_demo_turn()
+        # A model fault outranks write-file and gated-connector-tool: the turn
+        # is the provider refusal and makes no tool call. A bad fault argument
+        # returns the default turn here and does not fall through. publish-changes
+        # is not its own branch; it only extends a parsed write-file turn, which
+        # keeps its place above the resource directives and gated-connector-tool.
+        # A bare publish marker falls through.
+        if MODEL_FAULT_MARKER in last:
+            return model_fault_turn(last)
         if WRITE_FILE_MARKER in last:
-            return write_file_turn(last)
+            if PUBLISH_CHANGES_MARKER in last:
+                return publish_changes_turn(last, self._cwd)
+            return write_file_turn(last, self._cwd)
+        if HOLD_MEMORY_MARKER in last:
+            return hold_memory_turn(last)
+        if FILL_SCRATCH_MARKER in last:
+            return fill_scratch_turn(last)
         if GATED_CONNECTOR_TOOL_MARKER in last:
             gated = _parse_gated_connector_tool(last)
             return gated_connector_tool_turn(*gated) if gated else default_turn()
@@ -760,6 +1046,12 @@ class FakeModelSession:
                 continue
             if isinstance(message, _FileWrite):
                 yield self._perform_write(message)
+                continue
+            if isinstance(message, _HoldMemory):
+                await _hold_memory(message.mib)
+                continue
+            if isinstance(message, _FillScratch):
+                await _fill_scratch(message)
                 continue
             if isinstance(message, _ProgressCall):
                 # A refused call already got its refusal from the gate; the
@@ -940,6 +1232,43 @@ class FakeModelSession:
                         ),
                         _result(is_error=True, subtype="error_during_execution"),
                     )
+            if (
+                block.name == PLATFORM_PUBLISH_TOOL_NAME
+                and self._approval_gate is not None
+                and block.id not in self._denied_ids
+            ):
+                # The in-process ``publish_changes`` body, which the CLI runs
+                # only once every PreToolUse decision allowed the call.
+                gate = self._approval_gate
+                if PLATFORM_PUBLISH_TOOL_NAME in gate.required:
+                    refusal = gate.record_publication(dict(block.input))
+                else:
+                    gate.refuse_publication(
+                        "the session carries no publication approval gate,"
+                        " so the request could not be recorded"
+                    )
+                    refusal = NO_PUBLICATION_GATE_TEXT
+                if gate.halt_after_publication():
+                    # The approval hook's PostToolUse halt after the body ran.
+                    answer = refusal or "Publication requested."
+                    return (
+                        _tool_result(block.id, answer, is_error=refusal is not None),
+                        _result(terminal_reason="hook_stopped"),
+                    )
+                self._pending_refusals.append(
+                    _tool_result(block.id, refusal or "Publication requested.", is_error=True)
+                )
+            elif (
+                block.name == PLATFORM_PUBLISH_TOOL_NAME
+                and self._approval_gate is None
+                and self._publication_ledger is not None
+                and block.id not in self._denied_ids
+            ):
+                # The same body with no gate: it refuses and notes the run.
+                self._publication_ledger.refused = True
+                self._pending_refusals.append(
+                    _tool_result(block.id, NO_PUBLICATION_GATE_TEXT, is_error=True)
+                )
         return None
 
     def _without_refused_results(self, message: Any) -> Any:

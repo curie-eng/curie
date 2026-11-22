@@ -54,7 +54,13 @@ from curie_api.forges.types import (
 )
 
 from forge_fakes import jira as jira_fake
-from forge_fakes.github import CONTRACT_APP_ID, REPO, REPO_ID, GitHubRepositoryFake
+from forge_fakes.github import (
+    CONTRACT_APP_ID,
+    CONTRACT_BOT,
+    REPO,
+    REPO_ID,
+    GitHubRepositoryFake,
+)
 
 
 class AdapterHarness(Protocol):
@@ -116,6 +122,11 @@ class AdapterHarness(Protocol):
 
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         """Comments posted on ``target``; on a thread, the replies in it."""
+
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        """``actor`` posts a plain comment ``body`` (no mention, no marker) on
+        ``issue`` from outside the port; returns the tracker's comment id as
+        the intake hands it to the answer core (on GitLab the bare note id)."""
 
     def fail_next_page(self, *, after: int = 0) -> None:
         """The listing page read after ``after`` more successful reads fails once.
@@ -185,6 +196,7 @@ class InMemoryHarness:
             tracker_caps[Operation.DEPENDENCIES] = Support.NOOP
             tracker_caps[Operation.GROUP_MEMBERSHIP] = Support.UNSUPPORTED
             code_caps[Operation.RERUN_FAILED] = Support.NOOP
+            code_caps[Operation.CURRENT_INSTALLATION_CREDENTIAL] = Support.UNSUPPORTED
             code_caps[Operation.CI_DIAGNOSTICS] = Support.UNSUPPORTED
             code_caps[Operation.USER_CAN_WRITE] = Support.UNSUPPORTED
             code_caps[Operation.REQUIRED_CHECKS] = Support.UNSUPPORTED
@@ -260,6 +272,9 @@ class InMemoryHarness:
     ) -> None:
         side = self._comments_side(target)
         side.seed_comment(target, author, side.embed(marker, body))
+
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        return self._tracker.comment(issue, actor, body)
 
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         return self._comments_side(target).comments(target)
@@ -363,6 +378,7 @@ class GitHubHarness:
             label=LABEL,
             mention="curie",
             app_id=str(CONTRACT_APP_ID),
+            own_login=static_token(str(CONTRACT_BOT["login"])),
             page_size=2,
         )
         settings = Settings(github_api_url="https://api.github.com")
@@ -467,6 +483,10 @@ class GitHubHarness:
             self.fake.add_review_comment(
                 number, user, text, app=False, in_reply_to=int(target.thread_id)
             )
+
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        added = self.fake.add_comment(int(issue.issue_id), _github_user(actor), body, app=False)
+        return str(added["id"])
 
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         if target.thread_id is not None:
@@ -585,6 +605,10 @@ class JiraGitHubHarness:
             body,
             properties={"curie.factory": {"marker": marker, "body_sha256": digest}},
         )
+
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        # One ADF paragraph of text, no mention node, by the mapped Jira person.
+        return self.jira.add_comment(issue, self.jira.user_for(actor), body)
 
     def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         if target.issue is None:

@@ -473,11 +473,14 @@ async def validate_id_token(token: str, *, nonce: str) -> OidcClaims:
 
     email = claims.get("email")
     name = claims.get("name")
+    # A padded or blank name is not a label. Dropping it lets the console fall
+    # back to the email instead of rendering whitespace.
+    display_name = name.strip() if isinstance(name, str) else ""
     return OidcClaims(
         issuer=issuer,
         subject=subject,
         email=email if isinstance(email, str) and email else None,
-        display_name=name if isinstance(name, str) and name else None,
+        display_name=display_name or None,
         raw=claims,
     )
 

@@ -9,20 +9,21 @@ dependency: it accepts only a session bound to a principal (a person), never a
 bare login-code session, and no route guarded by it widens through the
 ``require_api_key`` fallback above. But a principal-bound cookie IS one of the
 live sessions ``require_api_key`` accepts, so both dependencies run the same
-``_authorized_principal`` check on it: disabling the principal, suspending its
+``authorized_console_principal`` check on it: disabling the principal, suspending its
 tenant, or repointing the configured issuer closes every route that cookie
 reaches, not only the principal-only ones.
 """
 
 import hmac
-from typing import Annotated
+from dataclasses import dataclass
+from typing import Annotated, Literal
 
 from fastapi import Cookie, Header, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .deps import SessionDep
-from .models import Principal
+from .models import ConsoleSession, Principal
 
 API_KEY_HEADER = "X-API-Key"
 #: The console session cookie (ADR-0083). Defined here rather than beside its
@@ -41,18 +42,29 @@ def verify_platform_key(x_api_key: str | None) -> bool:
     return hmac.compare_digest(x_api_key, get_settings().api_key)
 
 
-async def _authorized_principal(session: AsyncSession, token: str) -> Principal | None:
+async def authorized_console_principal(
+    session: AsyncSession,
+    token: str,
+    *,
+    live_row: ConsoleSession | None = None,
+) -> Principal | None:
     """The principal ``token`` authenticates, if every check still holds.
 
-    Shared by ``require_principal_session`` and ``require_api_key``'s
-    principal-bound sessions, so a principal-bound cookie closes the same way
-    everywhere: disabling the principal, suspending its tenant, or changing
-    the configured issuer takes effect immediately on every route it reaches,
-    not only ``/console/principal``.
+    Shared by ``require_principal_session``, ``require_api_key``'s
+    principal-bound sessions, and ``GET /console/session``, so a principal-bound
+    cookie closes the same way everywhere: disabling the principal, suspending
+    its tenant, or changing the configured issuer takes effect immediately on
+    every route it reaches, not only ``/console/principal``.
+
+    Pass ``live_row`` when the caller already loaded that session. The principal
+    is read from the row, and the token is not looked up again.
     """
     from .crud import console as crud_console
 
-    principal = await crud_console.live_principal_session(session, token)
+    if live_row is None:
+        principal = await crud_console.live_principal_session(session, token)
+    else:
+        principal = await crud_console.principal_for_live_row(session, live_row)
     settings = get_settings()
     if (
         principal is None
@@ -63,12 +75,32 @@ async def _authorized_principal(session: AsyncSession, token: str) -> Principal 
     return principal
 
 
-async def require_api_key(
-    request: Request,
-    x_api_key: Annotated[str | None, Header()] = None,
-) -> None:
+@dataclass(frozen=True)
+class AdministrativeActor:
+    """Who passed administrative authentication, derived only on the server.
+
+    ``platform_key`` has no subject: the key names no person. A console
+    session's subject is ``principal:<principal id>`` when the session is
+    bound to a principal, else ``session:<console session id>``. Never the
+    token, and never anything the request body says.
+    """
+
+    kind: Literal["platform_key", "console_session"]
+    subject: str | None
+
+
+async def authenticate_administrator(
+    request: Request, x_api_key: str | None
+) -> AdministrativeActor:
+    """The ``require_api_key`` check, returning the actor it accepted (ADR-0083).
+
+    The platform key first, with no database read; then a live console
+    session, after the cookie origin check, with a principal-bound session
+    also passing ``authorized_console_principal``. Every refusal is the same 401.
+    """
+
     if verify_platform_key(x_api_key):
-        return
+        return AdministrativeActor(kind="platform_key", subject=None)
     token = request.cookies.get(CONSOLE_SESSION_COOKIE)
     if not token:
         raise HTTPException(
@@ -86,14 +118,33 @@ async def require_api_key(
             # A principal-bound session is only as live as its principal: the
             # bare session row doesn't know the principal was disabled, its
             # tenant suspended, or the issuer changed out from under it.
-            if await _authorized_principal(session, token) is None:
+            if await authorized_console_principal(session, token) is None:
                 row = None
     if row is not None:
-        return
+        subject = (
+            f"principal:{row.principal_id}" if row.principal_id is not None else f"session:{row.id}"
+        )
+        return AdministrativeActor(kind="console_session", subject=subject)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="missing or invalid API key",
     )
+
+
+async def require_api_key(
+    request: Request,
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> None:
+    await authenticate_administrator(request, x_api_key)
+
+
+async def require_administrator(
+    request: Request,
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> AdministrativeActor:
+    """``require_api_key`` for a route that records who acted (#5431)."""
+
+    return await authenticate_administrator(request, x_api_key)
 
 
 async def require_platform_key(
@@ -155,6 +206,7 @@ async def require_internal_adapter_secret(
 
 async def require_principal_session(
     session: SessionDep,
+    request: Request,
     console_session: Annotated[str | None, Cookie(alias=CONSOLE_SESSION_COOKIE)] = None,
 ) -> Principal:
     """Authenticate a person by their OIDC console session; return the principal.
@@ -176,11 +228,12 @@ async def require_principal_session(
     Every refusal is the same 401, so the response does not tell a caller
     whether the cookie was unknown, expired, or valid for someone disabled.
     """
-    principal = await _authorized_principal(session, console_session or "")
+    principal = await authorized_console_principal(session, console_session or "")
     if principal is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing, invalid, or expired principal session",
             headers={"Cache-Control": "no-store"},
         )
+    request.state.principal_session_token = console_session
     return principal

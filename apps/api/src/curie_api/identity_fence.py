@@ -254,6 +254,12 @@ class IdentityFenceMiddleware:
         except (TimeoutError, HTTPException) as error:
             status = error.status_code if isinstance(error, HTTPException) else 408
             detail = error.detail if isinstance(error, HTTPException) else "request body timeout"
+            if request.url.path.startswith("/identity/connect/"):
+                # The browser-facing confirm: same private refusal as the route's own.
+                from .routers.identity_connect import private_refusal
+
+                await private_refusal(request, status, str(detail))(scope, receive, send)
+                return
             headers = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer"}
             await JSONResponse({"detail": detail}, status_code=status, headers=headers)(
                 scope, receive, send
@@ -307,6 +313,12 @@ async def prepare(request: Request) -> bool:
     # Starlette's cached Request forwards these bytes to the route parser.
     request._body = body
     key = request.headers.get("X-API-Key")
+    if request.url.path.startswith("/identity/me/github-link"):
+        from .identity.github_link import require_configuration
+        from .routers.personal_enrollments import require_owner_session_only
+
+        await require_owner_session_only(request)
+        require_configuration(get_settings())
     if request.url.path.startswith(("/identity/authorities", "/identity/roles")):
         await require_platform_key(key)
         return True

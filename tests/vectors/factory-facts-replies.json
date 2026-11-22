@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "factory_app_id": "51",
+  "now": "2026-11-12T09:59:00.123456Z",
+  "request": {
+    "schema_version": 1,
+    "trigger_label": "acme-factory",
+    "executables": [
+      "uv",
+      "jq",
+      "docker"
+    ],
+    "services": [
+      "postgres"
+    ]
+  },
+  "cases": [
+    {
+      "id": "valid_unknown",
+      "accepted": true,
+      "reason": null,
+      "comment": {
+        "id": 201,
+        "user": {
+          "id": 99,
+          "login": "acme-factory[bot]",
+          "type": "Bot"
+        },
+        "performed_via_github_app": {
+          "id": 51
+        },
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: yes, directly\nFactory: enabled, kill switch clear, upgrade pause clear\nSandbox tools: uv unknown · jq unknown · docker unknown\nServices: postgres unknown\nModel credit: unknown\nChecked 09:58 UTC, valid until 10:00 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n  \"expires_at\": \"2026-11-12T10:00:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"eligible\",\n    \"reason\": null\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"unknown\",\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"unknown\",\n    \"reason\": \"observation_missing\",\n    \"observed_at\": null,\n    \"expires_at\": null\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"clear\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "valid_observed",
+      "accepted": true,
+      "reason": null,
+      "comment": {
+        "id": 202,
+        "user": {
+          "id": 99,
+          "login": "acme-factory[bot]",
+          "type": "Bot"
+        },
+        "performed_via_github_app": {
+          "id": 51
+        },
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: yes, directly\nFactory: enabled, kill switch clear, upgrade pause clear\nSandbox tools: uv present · jq present · docker present\nServices: postgres observed\nModel credit: sufficient\nChecked 09:58 UTC, valid until 10:00 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n  \"expires_at\": \"2026-11-12T10:00:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"eligible\",\n    \"reason\": null\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"present\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"present\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"present\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"observed\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"sufficient\",\n    \"reason\": null,\n    \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n    \"expires_at\": \"2026-11-12T10:00:00.123456Z\"\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"clear\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "valid_absent_tool",
+      "accepted": true,
+      "reason": null,
+      "comment": {
+        "id": 203,
+        "user": {
+          "id": 99,
+          "login": "acme-factory[bot]",
+          "type": "Bot"
+        },
+        "performed_via_github_app": {
+          "id": 51
+        },
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: yes, directly\nFactory: enabled, kill switch clear, upgrade pause clear\nSandbox tools: uv absent · jq present · docker present\nServices: postgres observed\nModel credit: sufficient\nChecked 09:58 UTC, valid until 10:00 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n  \"expires_at\": \"2026-11-12T10:00:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"eligible\",\n    \"reason\": null\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"absent\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"present\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"present\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"observed\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"sufficient\",\n    \"reason\": null,\n    \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n    \"expires_at\": \"2026-11-12T10:00:00.123456Z\"\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"clear\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "valid_insufficient_credit",
+      "accepted": true,
+      "reason": null,
+      "comment": {
+        "id": 204,
+        "user": {
+          "id": 99,
+          "login": "acme-factory[bot]",
+          "type": "Bot"
+        },
+        "performed_via_github_app": {
+          "id": 51
+        },
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: yes, directly\nFactory: enabled, kill switch clear, upgrade pause clear\nSandbox tools: uv present · jq present · docker present\nServices: postgres observed\nModel credit: insufficient\nChecked 09:58 UTC, valid until 10:00 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n  \"expires_at\": \"2026-11-12T10:00:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"eligible\",\n    \"reason\": null\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"present\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"present\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"present\",\n      \"basis\": \"selected_image_probe\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"observed\",\n      \"reason\": null,\n      \"observed_at\": \"2026-11-12T09:58:00.123456Z\"\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"insufficient\",\n    \"reason\": null,\n    \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n    \"expires_at\": \"2026-11-12T10:00:00.123456Z\"\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"clear\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "valid_unsupported_credit",
+      "accepted": true,
+      "reason": null,
+      "comment": {
+        "id": 205,
+        "user": {
+          "id": 99,
+          "login": "acme-factory[bot]",
+          "type": "Bot"
+        },
+        "performed_via_github_app": {
+          "id": 51
+        },
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: yes, directly\nFactory: enabled, kill switch clear, upgrade pause clear\nSandbox tools: uv unknown · jq unknown · docker unknown\nServices: postgres unknown\nModel credit: unknown\nChecked 09:58 UTC, valid until 10:00 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n  \"expires_at\": \"2026-11-12T10:00:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"eligible\",\n    \"reason\": null\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"unknown\",\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"unknown\",\n    \"reason\": \"provider_unsupported\",\n    \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n    \"expires_at\": \"2026-11-12T10:00:00.123456Z\"\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"clear\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "valid_paused",
+      "accepted": true,
+      "reason": null,
+      "comment": {
+        "id": 206,
+        "user": {
+          "id": 99,
+          "login": "acme-factory[bot]",
+          "type": "Bot"
+        },
+        "performed_via_github_app": {
+          "id": 51
+        },
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: yes, directly\nFactory: enabled, kill switch clear, upgrade pause paused\nSandbox tools: uv unknown · jq unknown · docker unknown\nServices: postgres unknown\nModel credit: unknown\nChecked 09:58 UTC, valid until 10:00 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n  \"expires_at\": \"2026-11-12T10:00:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"eligible\",\n    \"reason\": null\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"unknown\",\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"unknown\",\n    \"reason\": \"observation_missing\",\n    \"observed_at\": null,\n    \"expires_at\": null\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"paused\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "valid_personal_owner_required",
+      "accepted": true,
+      "reason": null,
+      "comment": {
+        "id": 207,
+        "user": {
+          "id": 99,
+          "login": "acme-factory[bot]",
+          "type": "Bot"
+        },
+        "performed_via_github_app": {
+          "id": 51
+        },
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: no, directly\nFactory: enabled, kill switch clear, upgrade pause clear\nSandbox tools: uv unknown · jq unknown · docker unknown\nServices: postgres unknown\nModel credit: unknown\nChecked 09:58 UTC, valid until 10:00 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n  \"expires_at\": \"2026-11-12T10:00:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"ineligible\",\n    \"reason\": \"personal_owner_required\"\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"unknown\",\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"unknown\",\n    \"reason\": \"observation_missing\",\n    \"observed_at\": null,\n    \"expires_at\": null\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"clear\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "forged",
+      "accepted": false,
+      "reason": "forged",
+      "comment": {
+        "id": 208,
+        "user": {
+          "id": 88,
+          "login": "someone",
+          "type": "User"
+        },
+        "performed_via_github_app": null,
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: yes, directly\nFactory: enabled, kill switch clear, upgrade pause clear\nSandbox tools: uv unknown · jq unknown · docker unknown\nServices: postgres unknown\nModel credit: unknown\nChecked 09:58 UTC, valid until 10:00 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:58:00.123456Z\",\n  \"expires_at\": \"2026-11-12T10:00:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"eligible\",\n    \"reason\": null\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"unknown\",\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"unknown\",\n    \"reason\": \"observation_missing\",\n    \"observed_at\": null,\n    \"expires_at\": null\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"clear\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "stale",
+      "accepted": false,
+      "reason": "stale",
+      "comment": {
+        "id": 209,
+        "user": {
+          "id": 99,
+          "login": "acme-factory[bot]",
+          "type": "Bot"
+        },
+        "performed_via_github_app": {
+          "id": 51
+        },
+        "body": "**Factory facts. No work was started.**\n\nRepository: bound, trigger label `acme-factory`\ndana may start work: yes, directly\nFactory: enabled, kill switch clear, upgrade pause clear\nSandbox tools: uv unknown · jq unknown · docker unknown\nServices: postgres unknown\nModel credit: unknown\nChecked 09:57 UTC, valid until 09:59 UTC. These are facts about this factory, not a verdict on the ticket. Deployment readiness remains unvalidated.\n\n<details><summary>Details (JSON)</summary>\n\n```json\n{\n  \"schema_version\": 1,\n  \"kind\": \"factory_facts\",\n  \"request\": {\n    \"comment_id\": \"101\",\n    \"digest\": \"sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4\"\n  },\n  \"subject\": {\n    \"repository_id\": \"4401\",\n    \"issue_number\": 42,\n    \"trigger_label\": \"acme-factory\"\n  },\n  \"observed_at\": \"2026-11-12T09:57:00.123456Z\",\n  \"expires_at\": \"2026-11-12T09:59:00.123456Z\",\n  \"context_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"binding\": {\n    \"state\": \"bound\",\n    \"reason\": null\n  },\n  \"label_route\": {\n    \"actor_id\": \"77\",\n    \"actor_kind\": \"human\",\n    \"route\": \"github_user\",\n    \"state\": \"eligible\",\n    \"reason\": null\n  },\n  \"executables\": [\n    {\n      \"name\": \"uv\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"jq\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    },\n    {\n      \"name\": \"docker\",\n      \"state\": \"unknown\",\n      \"basis\": null,\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"services\": [\n    {\n      \"name\": \"postgres\",\n      \"state\": \"unknown\",\n      \"reason\": \"observation_missing\",\n      \"observed_at\": null\n    }\n  ],\n  \"model_credit\": {\n    \"state\": \"unknown\",\n    \"reason\": \"observation_missing\",\n    \"observed_at\": null,\n    \"expires_at\": null\n  },\n  \"factory\": {\n    \"enabled\": true,\n    \"kill_switch\": \"clear\",\n    \"upgrade_pause\": \"clear\",\n    \"code_host_credential\": {\n      \"state\": \"unknown\",\n      \"reason\": \"not_probed\",\n      \"observed_at\": null\n    }\n  },\n  \"admission\": \"not_requested\",\n  \"deployment_readiness\": \"unvalidated\"\n}\n```\n\n</details>\n\n<!-- curie-factory-facts:v1 label=acme-factory request=101 digest=sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4 -->\n"
+      }
+    },
+    {
+      "id": "unavailable",
+      "accepted": false,
+      "reason": "unavailable",
+      "comment": null
+    }
+  ]
+}

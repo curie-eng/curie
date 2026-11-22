@@ -40,6 +40,40 @@ _SOURCE_TARGETS = ("ACME_SOURCE_MODEL_KEY", "ACME_SOURCE_SECOND_KEY")
 _CLAIM_TARGETS = ("ACME_CLAIM_MODEL_KEY", "ACME_CLAIM_SECOND_KEY")
 
 
+@pytest.mark.parametrize("personal", [True, False], ids=["personal", "service"])
+def test_installation_endpoint_is_withheld_only_from_personal_claims(personal: bool) -> None:
+    api = _FakeApi()
+    spec = _source_spec()
+    endpoint = {"name": "ANTHROPIC_BASE_URL", "valueFrom": {
+        "secretKeyRef": {"name": "installation-model", "key": "ANTHROPIC_BASE_URL"},
+    }}
+    for container in _containers(spec):
+        container["env"].append(copy.deepcopy(endpoint))
+    _seed_chart(api, spec=spec)
+    pristine = copy.deepcopy(api.objects)
+    env = _personal_env() if personal else {
+        _MODE: "service", "CURIE_RUNNER_TOKEN": "runner-token-placeholder",
+    }
+    if personal:
+        env["ANTHROPIC_BASE_URL"] = "https://model.example.com"
+    _create(api, env)
+    copied = _copied_spec(api)
+    if personal:
+        assert all(
+            entry["name"] != "ANTHROPIC_BASE_URL"
+            for container in _containers(copied) for entry in container["env"]
+        )
+        assert "ANTHROPIC_BASE_URL" not in api.secrets[f"{_CLAIM}-tokens"]["stringData"]
+        assert all(entry["name"] != "ANTHROPIC_BASE_URL" for entry in (
+            api.objects[("sandboxclaims", _CLAIM)]["spec"]["env"]
+        ))
+    else:
+        for container in _containers(copied):
+            entries = [e for e in container["env"] if e["name"] == "ANTHROPIC_BASE_URL"]
+            assert entries == [endpoint]
+    _assert_shared_unchanged(api, pristine)
+
+
 def _source_spec(*, runner_first: bool = True) -> dict[str, Any]:
     spec = _chart_template_spec()
     pod = spec["podTemplate"]["spec"]
