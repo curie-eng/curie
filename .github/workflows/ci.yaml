@@ -2644,6 +2644,12 @@ jobs:
             echo "No CSS asset found in this build; skipping the CSS gzip assertion"
           fi
 
+          # #5827: nginx -T is the config the image actually serves. The exact
+          # POST and the slash-bounded callback stay unlogged. A sibling path
+          # such as /api/identity/me/github-link-extra must fall outside both.
+          bash apps/ui/ci/github-link-nginx.sh
+          docker exec curie-ui-smoke nginx -T | bash apps/ui/ci/github-link-nginx.sh --nginx-t
+
           echo "All UI image header assertions passed"
       - name: "UI: Tear down the UI container and its API upstream"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' && always() }}
