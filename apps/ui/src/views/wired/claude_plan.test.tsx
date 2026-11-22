@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StoreProvider } from "../../state/store";
 import { ConsoleSessionGate } from "../../state/session";
 import { WiredSettings } from "./WiredStubs";
+import { WiredClaudePlan } from "./WiredClaudePlan";
 import { WiredProvider } from "../../state/wired";
 
 // The real view, client and session gate run over a stubbed fetch. Bodies mirror
@@ -349,7 +350,134 @@ describe("claude_plan token never echoed", () => {
   });
 });
 
+describe("claude_plan one write at a time", () => {
+  function deferred() {
+    let resolve!: (response: Response) => void;
+    const promise = new Promise<Response>((settle) => {
+      resolve = settle;
+    });
+    return { promise, resolve };
+  }
+
+  function deletes(): string[] {
+    return fetchMock.mock.calls
+      .filter(([, init]) => (init as RequestInit | undefined)?.method === "DELETE")
+      .map(([url]) => String(url));
+  }
+
+  async function doubleClick(testId: string) {
+    const button = screen.getByTestId(testId);
+    act(() => {
+      button.click();
+      button.click();
+    });
+    await waitFor(() => expect(button).toBeDisabled());
+    return button;
+  }
+
+  it("claude_plan a second Connect while the write is pending sends one request and a 409 still reloads", async () => {
+    let current = absent();
+    setEnrollment(() => current);
+    const gate = deferred();
+    let puts = 0;
+    routes["PUT /api/personal-claude/enrollment"] = () => {
+      puts += 1;
+      current = active(2, 3);
+      return gate.promise;
+    };
+    mount();
+    await status();
+    await userEvent.type(tokenBox(), SENTINEL);
+    await doubleClick("claude-plan-write");
+    expect(puts).toBe(1);
+    const reads = calls("GET", "/api/personal-claude/enrollment").length;
+    await act(async () => {
+      gate.resolve(refusal(409, "stale_version"));
+    });
+    expect(await screen.findByTestId("claude-plan-error")).toHaveTextContent(/The page has reloaded it/);
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 2$/));
+    expect(calls("GET", "/api/personal-claude/enrollment").length).toBeGreaterThan(reads);
+    expect(puts).toBe(1);
+  });
+
+  it("claude_plan a second Replace while the write is pending sends one request", async () => {
+    setEnrollment(() => active(1, 7));
+    const gate = deferred();
+    let puts = 0;
+    routes["PUT /api/personal-claude/enrollment"] = (init) => {
+      puts += 1;
+      expect(JSON.parse(String(init.body))).toMatchObject({ intent: "replace", expected_version: 7 });
+      return gate.promise;
+    };
+    mount();
+    await status();
+    await userEvent.type(tokenBox(), SENTINEL);
+    await doubleClick("claude-plan-write");
+    expect(puts).toBe(1);
+    await act(async () => {
+      gate.resolve(json(200, active(2, 8)));
+    });
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 2$/));
+    expect(puts).toBe(1);
+  });
+
+  it("claude_plan a second Reconnect while the write is pending sends one request", async () => {
+    setEnrollment(() => inactive(9));
+    const gate = deferred();
+    let puts = 0;
+    routes["PUT /api/personal-claude/enrollment"] = (init) => {
+      puts += 1;
+      expect(JSON.parse(String(init.body))).toMatchObject({ intent: "reconnect", expected_version: 9 });
+      return gate.promise;
+    };
+    mount();
+    await status();
+    await userEvent.type(tokenBox(), SENTINEL);
+    await doubleClick("claude-plan-write");
+    expect(puts).toBe(1);
+    await act(async () => {
+      gate.resolve(json(200, active(3, 10)));
+    });
+    await waitFor(() => expect(screen.getByTestId("claude-plan-status")).toHaveTextContent("Connected"));
+    expect(puts).toBe(1);
+  });
+
+  it("claude_plan a second Disconnect while the delete is pending sends one request and a 409 still reloads", async () => {
+    let current = active(1, 6);
+    setEnrollment(() => current);
+    const gate = deferred();
+    routes["DELETE /api/personal-claude/enrollment"] = () => {
+      current = active(2, 7);
+      return gate.promise;
+    };
+    mount();
+    await status();
+    await userEvent.click(screen.getByTestId("claude-plan-disconnect"));
+    await doubleClick("claude-plan-disconnect-confirm");
+    expect(deletes()).toEqual(["/api/personal-claude/enrollment?expected_version=6"]);
+    const reads = calls("GET", "/api/personal-claude/enrollment").length;
+    await act(async () => {
+      gate.resolve(refusal(409, "stale_version"));
+    });
+    expect(await screen.findByTestId("claude-plan-error")).toHaveTextContent(/The page has reloaded it/);
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 2$/));
+    expect(calls("GET", "/api/personal-claude/enrollment").length).toBeGreaterThan(reads);
+    expect(deletes()).toHaveLength(1);
+  });
+});
+
 describe("claude_plan session", () => {
+  it("claude_plan a null session gets the sign-in prompt and no owner form", async () => {
+    render(<WiredClaudePlan />);
+    expect(await screen.findByTestId("claude-plan-sign-in")).toHaveTextContent(
+      "Sign in with your organization to manage your Claude plan",
+    );
+    expect(screen.queryByTestId("claude-plan-token")).toBeNull();
+    expect(screen.queryByTestId("claude-plan-write")).toBeNull();
+    expect(screen.queryByTestId("claude-plan-disconnect")).toBeNull();
+    expect(calls("GET", "/api/personal-claude/enrollment")).toHaveLength(0);
+  });
+
   it("claude_plan operator session gets the sign-in prompt and no form", async () => {
     routes["GET /api/console/session"] = () => json(200, OPERATOR);
     routes["GET /api/console/sign-in-methods"] = () => json(200, { oidc: true });

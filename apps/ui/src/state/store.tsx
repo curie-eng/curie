@@ -11,6 +11,26 @@ import {
 import type { Action, AppState, Nav } from "./types";
 import { pathForRoute, routeForPath } from "./route";
 
+// Views other than Settings share "/". Their history entry records which one,
+// because the path alone cannot. Settings is named by its path.
+const SHARED_NAV = new Set<string>([
+  "overview",
+  "agents",
+  "work-items",
+  "factory",
+  "memory",
+  "evals",
+  "observability",
+  "versions",
+  "connections",
+]);
+
+function restoredNav(value: unknown): Nav | null {
+  if (!value || typeof value !== "object" || !("nav" in value)) return null;
+  const nav = (value as { nav: unknown }).nav;
+  return typeof nav === "string" && SHARED_NAV.has(nav) ? (nav as Nav) : null;
+}
+
 // The first paint opens Settings for the two Settings paths; every other URL,
 // including /agents, stays on Overview.
 export function navForPath(pathname: string): Nav {
@@ -56,9 +76,10 @@ export function reducer(s: AppState, a: Action): AppState {
       };
     case "locate": {
       const route = routeForPath(a.pathname);
+      const nav = a.pathname === "/" && a.nav && SHARED_NAV.has(a.nav) ? a.nav : route.nav;
       return {
         ...s,
-        nav: route.nav,
+        nav,
         settingsSection: route.settingsSection,
         agentDetail: null,
         traceOpen: null,
@@ -162,19 +183,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Keep the address bar on the section the console shows, and show the section
   // the bar names after Back or Forward. The first render adopts the URL it was
   // opened at, so an unknown path is left alone until the person navigates.
-  const synced = useRef(pathForRoute(state.nav, state.settingsSection));
+  // Entries for "/" carry the view, because Agents and Overview share that path.
+  const synced = useRef({ path: pathForRoute(state.nav, state.settingsSection), nav: state.nav });
   useEffect(() => {
-    const onPop = () => dispatch({ type: "locate", pathname: window.location.pathname });
+    const onPop = (event: PopStateEvent) =>
+      dispatch({ type: "locate", pathname: window.location.pathname, nav: restoredNav(event.state) });
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
   useEffect(() => {
     const path = pathForRoute(state.nav, state.settingsSection);
-    if (path === synced.current) return;
-    synced.current = path;
+    if (path === synced.current.path && state.nav === synced.current.nav) return;
+    synced.current = { path, nav: state.nav };
     // Already showing what the address names (after Back or Forward): no new entry.
     const shown = routeForPath(window.location.pathname);
-    if (pathForRoute(shown.nav, shown.settingsSection) !== path) window.history.pushState({}, "", path);
+    const shownPath = pathForRoute(shown.nav, shown.settingsSection);
+    const recorded = restoredNav(window.history.state);
+    const already =
+      shownPath === path &&
+      (path !== "/" || recorded === state.nav || (recorded === null && shown.nav === state.nav));
+    if (!already) window.history.pushState({ nav: state.nav }, "", path);
   }, [state.nav, state.settingsSection]);
 
   // Auto-clear toasts after 2.5s, matching the canon's toast lifetime.

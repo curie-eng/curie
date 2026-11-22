@@ -177,6 +177,38 @@ test.describe("claude_plan", () => {
     await expect(page.getByTestId("claude-plan-status")).toBeVisible();
   });
 
+  test("claude_plan history restores Agents across Back and Forward", async ({ page }) => {
+    await stub(page, { session: "principal" });
+    await page.goto("/settings/claude-plan?api=1");
+    await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+
+    await page.getByRole("button", { name: "Agents", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(page).toHaveURL(/\/settings\/claude-plan$/);
+    await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await expect(page).toHaveURL(/\/$/);
+
+    await page.goto("/settings/claude-plan?api=1");
+    await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+    await page.getByRole("button", { name: "Agents", exact: true }).click();
+    await page.goBack();
+    await expect(page).toHaveURL(/\/settings\/claude-plan/);
+    await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+    await page.goForward();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+
+    await page.goto("/?api=1");
+    await expect(page.getByRole("heading", { name: "Welcome to Curie" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Overview", exact: true })).toHaveAttribute("aria-current", "page");
+    await page.getByRole("button", { name: "Agents", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Welcome to Curie" })).toBeVisible();
+  });
+
   test("claude_plan and route: an operator session sees the sign-in prompt and no form", async ({ page }) => {
     await stub(page, { session: "operator" });
     await page.goto("/settings/claude-plan?api=1");

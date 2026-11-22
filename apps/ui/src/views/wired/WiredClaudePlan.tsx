@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { C } from "../../tokens";
 import { Button, Card, CliHint, Modal, Notice, cliCommand } from "../../primitives";
@@ -131,6 +131,9 @@ function ClaudePlanBody() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
+  // Set before `run` awaits so a second click in the same turn cannot send
+  // another Connect, Replace, Reconnect, or Disconnect.
+  const inflight = useRef(false);
 
   // The query holds status only. Polling runs while teardown is owed and stops
   // at zero.
@@ -158,10 +161,13 @@ function ClaudePlanBody() {
     } finally {
       setToken("");
       setBusy(false);
+      inflight.current = false;
+      setConfirming(false);
     }
   }
 
   function submit(intent: EnrollmentIntent, done: string) {
+    if (inflight.current) return;
     if (!current) return;
     const checked = checkEnrollmentToken(token);
     if (!checked.ok) {
@@ -170,13 +176,15 @@ function ClaudePlanBody() {
       return;
     }
     const version = intent === "enroll" ? null : current.version;
+    inflight.current = true;
     void run(() => writePersonalEnrollment(intent, version, checked.token), done);
   }
 
   function disconnect() {
-    setConfirming(false);
+    if (inflight.current) return;
     if (!current || current.version === null) return;
     const version = current.version;
+    inflight.current = true;
     void run(() => disconnectPersonalEnrollment(version), "Claude plan disconnected");
   }
 
@@ -295,7 +303,7 @@ function ClaudePlanBody() {
             </div>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <Button label="Cancel" testId="claude-plan-disconnect-cancel" onClick={() => setConfirming(false)} />
-              <Button label="Disconnect" variant="danger" testId="claude-plan-disconnect-confirm" onClick={disconnect} />
+              <Button label="Disconnect" variant="danger" testId="claude-plan-disconnect-confirm" disabled={busy} onClick={disconnect} />
             </div>
           </div>
         </Modal>
@@ -304,12 +312,12 @@ function ClaudePlanBody() {
   );
 }
 
-// An operator (login-code) session cannot call the owner API, which accepts only
-// a principal session, so it gets the prompt and no form. Linked accounts (#5719)
-// join this section as further cards below the plan.
+// The owner API accepts only a principal session. A missing session (null
+// outside the sign-in gate) and every other kind get the prompt and no form.
+// Linked accounts join this section as further cards below the plan.
 export function WiredClaudePlan() {
   const session = useOptionalConsoleSession();
-  const principal = session === null || session.kind === "principal";
+  const principal = session?.kind === "principal";
   return (
     <div data-testid="claude-plan-section" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       {principal ? <><ClaudePlanBody /><LinkedAccounts /></> : <SignInPrompt />}
