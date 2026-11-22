@@ -724,7 +724,7 @@ def test_connect_plan_disabled_tenant_cannot_issue_without_directory(
         await s.delete(config)
         tenant.status = "disabled"
         await s.flush()
-        assert await issue(s, tenant) is None
+        assert await issue(s, tenant, allow_personal_issuer=True) is None
 
     run(body)
     get_settings.cache_clear()
