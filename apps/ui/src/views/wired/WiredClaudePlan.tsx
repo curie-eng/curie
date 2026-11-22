@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState, type ReactNode } from "react";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { C } from "../../tokens";
 import { Button, Card, CliHint, Modal, Notice, cliCommand } from "../../primitives";
 import { useStore } from "../../state/store";
@@ -30,6 +30,41 @@ import { LinkedAccounts } from "./LinkedAccounts";
 
 const STATUS_KEY = ["personal-claude-enrollment"] as const;
 const POLL_MS = 5000;
+
+// The form unmounts when the person leaves this Settings section, so a ref
+// inside it would forget a write that is still running. The flight lives on
+// the query client, under this enrollment's query key, and goes away with that
+// client. Another query on the same client is a different key.
+type EnrollmentFlight = { promise?: Promise<unknown> };
+
+const enrollmentFlights = new WeakMap<QueryClient, Map<string, EnrollmentFlight>>();
+
+function enrollmentFlightMap(client: QueryClient): Map<string, EnrollmentFlight> {
+  let map = enrollmentFlights.get(client);
+  if (!map) {
+    map = new Map();
+    enrollmentFlights.set(client, map);
+  }
+  return map;
+}
+
+function enrollmentFlight(client: QueryClient): EnrollmentFlight | undefined {
+  return enrollmentFlightMap(client).get(JSON.stringify(STATUS_KEY));
+}
+
+function claimEnrollmentFlight(client: QueryClient, flight: EnrollmentFlight): boolean {
+  const map = enrollmentFlightMap(client);
+  const key = JSON.stringify(STATUS_KEY);
+  if (map.has(key)) return false;
+  map.set(key, flight);
+  return true;
+}
+
+function releaseEnrollmentFlight(client: QueryClient, flight: EnrollmentFlight) {
+  const map = enrollmentFlightMap(client);
+  const key = JSON.stringify(STATUS_KEY);
+  if (map.get(key) === flight) map.delete(key);
+}
 
 const TOKEN_REFUSALS: Record<Exclude<EnrollmentTokenCheck, { ok: true }>["reason"], string> = {
   empty: "Paste the token that `claude setup-token` printed.",
@@ -128,12 +163,24 @@ function ClaudePlanBody() {
   const { dispatch } = useStore();
   const queryClient = useQueryClient();
   const [token, setToken] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(() => enrollmentFlight(queryClient) !== undefined);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
-  // Set before `run` awaits so a second click in the same turn cannot send
-  // another Connect, Replace, Reconnect, or Disconnect.
-  const inflight = useRef(false);
+
+  // A remount while the write is still running has to stay busy until that
+  // same promise settles. The instance that started it clears itself.
+  useEffect(() => {
+    const flight = enrollmentFlight(queryClient);
+    if (!flight?.promise) return;
+    let live = true;
+    setBusy(true);
+    void flight.promise.finally(() => {
+      if (live) setBusy(false);
+    });
+    return () => {
+      live = false;
+    };
+  }, [queryClient]);
 
   // The query holds status only. Polling runs while teardown is owed and stops
   // at zero.
@@ -147,27 +194,35 @@ function ClaudePlanBody() {
 
   const reload = () => queryClient.invalidateQueries({ queryKey: STATUS_KEY });
 
-  // Run one write. The token leaves this scope only inside `send`, and the
-  // paste box is emptied whether the request succeeded or failed.
-  async function run(send: () => Promise<PersonalEnrollment>, done: string) {
+  // Run one write. The claim happens before `send`, so a second click in the
+  // same turn, or a click after this form remounts, cannot start another.
+  // The token leaves this scope only inside `send`, and the paste box is
+  // emptied whether the request succeeded or failed.
+  function run(send: () => Promise<PersonalEnrollment>, done: string) {
+    const flight: EnrollmentFlight = {};
+    if (!claimEnrollmentFlight(queryClient, flight)) return;
     setBusy(true);
     setError(null);
-    try {
-      queryClient.setQueryData(STATUS_KEY, await send());
-      dispatch({ type: "toast", message: done });
-    } catch (e) {
-      setError(describeEnrollmentError(e));
-      if (e instanceof EnrollmentApiError && (e.status === 409 || e.status === 404)) void reload();
-    } finally {
-      setToken("");
-      setBusy(false);
-      inflight.current = false;
-      setConfirming(false);
-    }
+    flight.promise = (async () => {
+      try {
+        const result = await send();
+        await queryClient.cancelQueries({ queryKey: STATUS_KEY });
+        queryClient.setQueryData(STATUS_KEY, result);
+        dispatch({ type: "toast", message: done });
+      } catch (e) {
+        setError(describeEnrollmentError(e));
+        if (e instanceof EnrollmentApiError && (e.status === 409 || e.status === 404)) void reload();
+      } finally {
+        setToken("");
+        setConfirming(false);
+        releaseEnrollmentFlight(queryClient, flight);
+        setBusy(false);
+      }
+    })();
   }
 
   function submit(intent: EnrollmentIntent, done: string) {
-    if (inflight.current) return;
+    if (enrollmentFlight(queryClient)) return;
     if (!current) return;
     const checked = checkEnrollmentToken(token);
     if (!checked.ok) {
@@ -176,16 +231,14 @@ function ClaudePlanBody() {
       return;
     }
     const version = intent === "enroll" ? null : current.version;
-    inflight.current = true;
-    void run(() => writePersonalEnrollment(intent, version, checked.token), done);
+    run(() => writePersonalEnrollment(intent, version, checked.token), done);
   }
 
   function disconnect() {
-    if (inflight.current) return;
+    if (enrollmentFlight(queryClient)) return;
     if (!current || current.version === null) return;
     const version = current.version;
-    inflight.current = true;
-    void run(() => disconnectPersonalEnrollment(version), "Claude plan disconnected");
+    run(() => disconnectPersonalEnrollment(version), "Claude plan disconnected");
   }
 
   if (query.isPending) return <Notice>Loading…</Notice>;

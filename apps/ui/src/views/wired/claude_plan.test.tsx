@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StoreProvider } from "../../state/store";
@@ -375,6 +375,17 @@ describe("claude_plan one write at a time", () => {
     return button;
   }
 
+  // Workspace unmounts the form. Coming back must still be the same write.
+  async function leaveAndReturn() {
+    await act(async () => {
+      screen.getByRole("button", { name: "Workspace" }).click();
+    });
+    expect(screen.queryByTestId("claude-plan-status")).toBeNull();
+    await act(async () => {
+      screen.getByRole("button", { name: "Claude plan" }).click();
+    });
+  }
+
   it("claude_plan a second Connect while the write is pending sends one request and a 409 still reloads", async () => {
     let current = absent();
     setEnrollment(() => current);
@@ -462,6 +473,71 @@ describe("claude_plan one write at a time", () => {
     expect(await screen.findByTestId("claude-plan-error")).toHaveTextContent(/The page has reloaded it/);
     await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 2$/));
     expect(calls("GET", "/api/personal-claude/enrollment").length).toBeGreaterThan(reads);
+    expect(deletes()).toHaveLength(1);
+  });
+
+  it("claude_plan a deferred Connect stays one write after Workspace and back", async () => {
+    let current = absent();
+    setEnrollment(() => current);
+    const gate = deferred();
+    let puts = 0;
+    routes["PUT /api/personal-claude/enrollment"] = () => {
+      puts += 1;
+      return gate.promise;
+    };
+    mount();
+    await status();
+    await userEvent.type(tokenBox(), SENTINEL);
+    act(() => {
+      screen.getByTestId("claude-plan-write").click();
+    });
+    await waitFor(() => expect(screen.getByTestId("claude-plan-token")).toBeDisabled());
+    expect(puts).toBe(1);
+
+    await leaveAndReturn();
+    await status();
+    fireEvent.change(tokenBox(), { target: { value: SENTINEL } });
+    fireEvent.click(screen.getByTestId("claude-plan-write"));
+    expect(puts).toBe(1);
+    expect(screen.getByTestId("claude-plan-token")).toBeDisabled();
+
+    await act(async () => {
+      current = active(2, 3);
+      gate.resolve(json(200, active(2, 3)));
+    });
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 2$/));
+    expect(puts).toBe(1);
+    expect(screen.getByTestId("claude-plan-token")).toBeEnabled();
+  });
+
+  it("claude_plan a deferred Disconnect stays one delete after Workspace and back", async () => {
+    let current = active(1, 6);
+    setEnrollment(() => current);
+    const gate = deferred();
+    routes["DELETE /api/personal-claude/enrollment"] = () => gate.promise;
+    mount();
+    await status();
+    await userEvent.click(screen.getByTestId("claude-plan-disconnect"));
+    act(() => {
+      screen.getByTestId("claude-plan-disconnect-confirm").click();
+    });
+    await waitFor(() => expect(screen.getByTestId("claude-plan-disconnect-confirm")).toBeDisabled());
+    expect(deletes()).toEqual(["/api/personal-claude/enrollment?expected_version=6"]);
+
+    await leaveAndReturn();
+    await status();
+    const again = screen.getByTestId("claude-plan-disconnect");
+    fireEvent.click(again);
+    const confirm = screen.queryByTestId("claude-plan-disconnect-confirm");
+    if (confirm) fireEvent.click(confirm);
+    expect(deletes()).toHaveLength(1);
+    expect(again).toBeDisabled();
+
+    await act(async () => {
+      current = inactive(7);
+      gate.resolve(json(200, current));
+    });
+    await waitFor(() => expect(screen.getByTestId("claude-plan-status")).toHaveTextContent(/^Disconnected$/));
     expect(deletes()).toHaveLength(1);
   });
 });

@@ -40,8 +40,13 @@ export function navForPath(pathname: string): Nav {
 export function initialState(): AppState {
   const pathname = typeof window === "undefined" ? "/" : window.location.pathname;
   const route = routeForPath(pathname);
+  // "/" does not name the view. A reload keeps the history entry, so the first
+  // paint shows the view that entry recorded. A fresh load has none and stays
+  // on Overview. A Settings path names its own view and ignores the entry.
+  const recorded = typeof window === "undefined" ? null : restoredNav(window.history.state);
+  const nav = pathname === "/" && recorded ? recorded : route.nav;
   return {
-    nav: route.nav,
+    nav,
     settingsSection: route.settingsSection,
     env: "prod",
     obsTab: "traces",

@@ -1,5 +1,5 @@
 import { createElement } from "react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 import { StoreProvider, initialState, navForPath, reducer, useStore } from "./store";
 import { CLAUDE_PLAN_PATH, pathForRoute, routeForPath } from "./route";
@@ -62,6 +62,7 @@ function Probe() {
     createElement("div", { "data-testid": "nav" }, state.nav),
     createElement("div", { "data-testid": "section" }, state.settingsSection),
     createElement("button", { type: "button", onClick: () => dispatch({ type: "go", nav: "agents" }) }, "to-agents"),
+    createElement("button", { type: "button", onClick: () => dispatch({ type: "go", nav: "settings" }) }, "to-settings"),
     createElement(
       "button",
       { type: "button", onClick: () => dispatch({ type: "settingsSection", section: "claude-plan" }) },
@@ -82,6 +83,10 @@ async function traverse(direction: "back" | "forward") {
 }
 
 describe("claude_plan history", () => {
+  afterEach(() => {
+    window.history.replaceState(null, "", "/");
+  });
+
   it("claude_plan history Back from Agents then Claude plan returns to Agents", async () => {
     window.history.replaceState(null, "", "/");
     render(createElement(StoreProvider, null, createElement(Probe)));
@@ -132,5 +137,27 @@ describe("claude_plan history", () => {
     expect(window.history.state).toBeNull();
     expect(initialState().nav).toBe("overview");
     expect(initialState().settingsSection).toBe("workspace");
+  });
+
+  it("claude_plan history a reload of Agents shows Agents and Settings then Back stays there", async () => {
+    window.history.replaceState({ nav: "agents" }, "", "/");
+    const length = window.history.length;
+    render(createElement(StoreProvider, null, createElement(Probe)));
+    expect(window.history.length).toBe(length);
+    expect(screen.getByTestId("nav")).toHaveTextContent("agents");
+    expect(screen.getByTestId("section")).toHaveTextContent("workspace");
+    expect(window.location.pathname).toBe("/");
+    expect(window.history.state).toEqual({ nav: "agents" });
+
+    await act(async () => {
+      screen.getByRole("button", { name: "to-settings" }).click();
+    });
+    expect(screen.getByTestId("nav")).toHaveTextContent("settings");
+    expect(window.location.pathname).toBe("/settings");
+
+    await traverse("back");
+    expect(screen.getByTestId("nav")).toHaveTextContent("agents");
+    expect(window.location.pathname).toBe("/");
+    expect(window.history.state).toEqual({ nav: "agents" });
   });
 });
