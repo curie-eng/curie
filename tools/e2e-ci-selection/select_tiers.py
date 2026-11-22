@@ -63,6 +63,13 @@ FACTORY_PREFIXES = (
     "packages/aci-protocol/src/aci_protocol/turn.py",
     "runner/src/curie_runner/verification.py",
     "runner/src/curie_runner/preflight",
+    # Exact publication files (#5916). The .py suffix keeps a sibling such as
+    # session.py.other from matching.
+    "runner/src/curie_runner/session.py",
+    "runner/src/curie_runner/approval.py",
+    "runner/src/curie_runner/harness/claude/approval.py",
+    "runner/src/curie_runner/translate.py",
+    "runner/src/curie_runner/fake.py",
     "examples/dark-factory",
     "tools/factory-e2e",
     "tools/model-script",
