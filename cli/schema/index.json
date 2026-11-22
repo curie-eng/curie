@@ -331,7 +331,7 @@
       "result": "ModelCreditOutput",
       "kind": "CliOutput",
       "schema": "model-credit.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ObservabilityOnlyOutput",
