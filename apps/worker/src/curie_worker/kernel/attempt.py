@@ -492,23 +492,30 @@ async def _attempt_turn(
                 rejection.hard,
             )
         parsed_execute = parse_work_item_event_id(qevent.event_id)
+        # #5690: one idle-route pass before the first defer of an unstarted
+        # execute. Admission, invalid, budget, and retry refusals still defer.
+        unstarted_execute: WorkItemRun | None = None
         if parsed_execute is not None and parsed_execute.kind in {"execute"}:
-            run = self._work_item_runs.get(parsed_execute.request_id)
-            if run is not None and not run.started:
-                release_order()
-                try:
-                    await run.defer(
-                        "admission_unavailable" if rejection is None else "capacity",
-                        capacity=rejection is not None,
-                        start_failure_detail=None,
-                    )
-                except WorkItemConflict as exc:
-                    logger.info(
-                        "work-item admission defer refused for %s: %s",
-                        qevent.event_id,
-                        exc.code,
-                    )
-                raise failures._WorkItemDeferred() from None
+            candidate_run = self._work_item_runs.get(parsed_execute.request_id)
+            if candidate_run is not None and not candidate_run.started:
+                unstarted_execute = candidate_run
+
+        async def defer_unstarted_execute(reason: str, *, capacity: bool) -> None:
+            assert unstarted_execute is not None
+            release_order()
+            try:
+                await unstarted_execute.defer(
+                    reason,
+                    capacity=capacity,
+                    start_failure_detail=None,
+                )
+            except WorkItemConflict as conflict:
+                logger.info(
+                    "work-item admission defer refused for %s: %s",
+                    qevent.event_id,
+                    conflict.code,
+                )
+            raise failures._WorkItemDeferred() from None
 
         async def capacity_refusal() -> failures.TurnOutcome:
             # Started factory continuations wait in the driving loop:
@@ -521,7 +528,15 @@ async def _attempt_turn(
                 return failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             return await capacity_response()
 
+        async def defer_or_refuse(outcome: str) -> failures.TurnOutcome:
+            self._record_pressure_outcome(outcome)
+            if unstarted_execute is not None:
+                await defer_unstarted_execute("capacity", capacity=True)
+            return await capacity_refusal()
+
         if rejection is None:
+            if unstarted_execute is not None:
+                await defer_unstarted_execute("admission_unavailable", capacity=False)
             if (
                 self._is_approval_resume(qevent.event_id)
                 and self._run_for_event(qevent.event_id) is not None
@@ -537,12 +552,10 @@ async def _attempt_turn(
             raise
 
         if pressure_retried:
-            self._record_pressure_outcome("reclaimed-retry-refused")
-            return await capacity_refusal()
+            return await defer_or_refuse("reclaimed-retry-refused")
 
         if not capacity_rejection_is_valid(rejection):
-            self._record_pressure_outcome("refused-invalid-quota")
-            return await capacity_refusal()
+            return await defer_or_refuse("refused-invalid-quota")
 
         pressure_started = clock.time.monotonic()
         current_remaining = (
@@ -550,8 +563,7 @@ async def _attempt_turn(
         )
         required = constants._PRESSURE_CEILING_S + self._substrate.claim_timeout_seconds
         if current_remaining is None or current_remaining < required:
-            self._record_pressure_outcome("refused-no-budget")
-            return await capacity_refusal()
+            return await defer_or_refuse("refused-no-budget")
 
         reclaimed = await self._reclaim_idle_route(
             thread_key,
@@ -559,13 +571,11 @@ async def _attempt_turn(
             remaining_s=current_remaining,
         )
         if not reclaimed.reclaimed:
-            self._record_pressure_outcome(reclaimed.outcome)
-            return await capacity_refusal()
+            return await defer_or_refuse(reclaimed.outcome)
 
         retry_remaining = current_remaining - (clock.time.monotonic() - pressure_started)
         if retry_remaining <= 0:
-            self._record_pressure_outcome("timeout")
-            return await capacity_refusal()
+            return await defer_or_refuse("timeout")
         logger.info(
             "idle route reclamation freed sandbox capacity; retrying event %s",
             qevent.event_id,
