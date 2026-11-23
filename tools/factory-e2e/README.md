@@ -1893,15 +1893,18 @@ ticket that leaves its rounding mode and default precision open, and
 Each beat against its bound, counted from labelling or from the answer:
 `Investigating this ticket.` within 180 seconds of labelling, a question
 comment within 1800 seconds, the answer posted only after the issue carries
-`curie-factory:questions` with no live request in the same read, the second
+`curie-factory:questions` with no live request in the same read and the asking
+request's terminal comment shows a usage total within the bound, the second
 request and `Answer received.` each within 180 seconds of the answer, exactly
 one pull request within 3600 seconds of the answer that names the Jira key and
 has a line starting `Answered on the ticket by `, the merge, and
 `Pull request merged:` within 600 seconds of it. It also requires the Jira
 status id read before labelling to equal the one read after the merged notice
-(an id, not a category), at most two requests, a `Usage:` total of at most
-25 USD (`total cost unknown` and a missing line fail), and no Jira issue
-created by the factory account.
+(an id, not a category), at most two requests, and no Jira issue created by the
+factory account. After the answer the driver reads aggregate usage from
+`GET /work-items/{id}/usage`. Any estimate above 25 USD stops the run, including
+a partial estimate. The driver requires a complete estimate at or below 25 USD
+both immediately before issuing the merge and in the final evidence.
 
 ### Evidence and check-clean
 
