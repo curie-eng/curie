@@ -308,4 +308,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0286 | [One labelled ticket: the factory investigates, asks on the ticket, and resumes on a plain answer](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md) | Accepted |
 | 0287 | [Learned rules are a memory kind that applies only after a person accepts it](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md) | Accepted |
 | 0288 | [The runner carries a connector's approval ticket to its gated call](0288-the-runner-carries-a-connector-approval-ticket-to-its-gated-call.md) | Accepted |
+| 0289 | [Registered Slack direct messages can carry file shares](0289-registered-slack-direct-messages-can-carry-file-shares.md) | Accepted |
 <!-- END GENERATED: adr-index -->
