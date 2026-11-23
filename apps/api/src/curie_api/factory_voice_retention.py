@@ -3,7 +3,6 @@
 import asyncio
 import logging
 
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .factory_voice import expire_voice_drafts
@@ -18,7 +17,7 @@ async def purge_expired_drafts(
         try:
             async with sessions.begin() as session:
                 expired = await expire_voice_drafts(session)
-        except SQLAlchemyError:
+        except Exception:  # noqa: BLE001 - retry database and transport failures without row data
             _LOG.warning("Factory voice draft purge unavailable")
             expired = 0
         if not expired:

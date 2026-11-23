@@ -5235,11 +5235,12 @@ bases. The callback requires HTTPS on the Console origin.
 
 ### Factory voice drafts
 
-The API accepts voice feedback when its source adapter is configured and
-`FACTORY_VOICE_ENABLED=true`. For Helm installations, set
+The API provides the recognition and draft lifecycle used by factory voice
+adapters. Receiving messages also requires a release with the corresponding
+source adapter installed and configured. For Helm installations, set
 `factory.voiceModelClaim` to the name of a pre-populated PVC in the release
 namespace. This mounts the claim read-only at `/var/run/curie/voice` and enables
-the API setting. An empty claim name leaves recognition off.
+`FACTORY_VOICE_ENABLED=true` for the API. An empty claim name leaves recognition off.
 
 Place `ggml-base.en.bin` in the root of the claim. The Linux API distribution
 uses the CPU build of pywhispercpp. The expected SHA-256 is
@@ -5263,5 +5264,7 @@ deadline runs from intake.
 `FACTORY_VOICE_DRAFT_TTL_SECONDS` defaults to 900. Expiry and terminal decisions
 remove detailed source data and the transcript. A small receipt remains for
 deduplication indefinitely. The API checks for expired drafts every minute.
+Before rolling back to an API version without retention support, stop intake
+and let the current API purge outstanding drafts after their deadlines.
 The confirmation response reports whether steering queued the
 guidance or applied it to an execution request.

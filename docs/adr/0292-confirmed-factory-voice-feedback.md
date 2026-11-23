@@ -20,6 +20,8 @@ Slack file access and GitHub attachment access have different credentials, sourc
 
 ## Slack
 
+The Slack source adapter owns this part of the design.
+
 Socket Mode binds a clip to the receiving app and workspace, original message, sender and file. The worker queues a marker and keeps media and edits out of turn text. The API uses the signed gateway for a fresh thread read and bounded file retrieval, and displays the transcript only in the verified original thread. Native event shape and download fields with an app mention still require provider verification.
 
 ## Consequences
@@ -34,4 +36,4 @@ Calling a hosted transcription API would send audio outside the installation and
 
 ## Acceptance
 
-Maintainer approval of this decision is pending. On acceptance, record the approval reference and identify the realizing API lifecycle, child recognizer and Helm configuration.
+Maintainer approval is pending. On acceptance, record the maintainer, date and approval reference. The implementation lives in `apps/api/src/curie_api/factory_voice.py` (drafts and admission), `apps/api/src/curie_api/factory_voice_child.py` (offline recognition) and `charts/curie/templates/api.yaml` (model mount). [Implementation PR](https://github.com/curie-eng/curie/pull/5938)

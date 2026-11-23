@@ -1341,7 +1341,7 @@ console:
 # A credential names its Secret: existingSecret, existingSecretKey.
 factory:
   enabled: false
-  # A claim containing ggml-base.en.bin enables local CPU voice recognition.
+  # Mount ggml-base.en.bin for the API recognizer. Message intake requires a source adapter.
   voiceModelClaim: ""
   githubAppClientId: ""
   githubAppClientSecretExistingSecret: ""
