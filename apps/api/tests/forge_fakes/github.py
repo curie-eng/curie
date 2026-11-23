@@ -1093,6 +1093,7 @@ class GitHubRepositoryFake:
         # request sides (``head.repo.id``, ``base.repo.id``).
         # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
         self.repository_id = REPO_ID
+        self.visibility = "public"
         self.branches: dict[str, str] = {}
         self.commits: dict[str, dict[str, Any]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
@@ -1159,6 +1160,7 @@ class GitHubRepositoryFake:
         number = self._number()
         self.issues[number] = {
             "number": number,
+            "url": f"{self.api_url}/repos/{REPO}/issues/{number}",
             "title": title,
             "body": body,
             "state": "open",
@@ -1174,6 +1176,7 @@ class GitHubRepositoryFake:
 
         return {
             "number": number,
+            "url": f"{self.api_url}/repos/{REPO}/issues/{number}",
             "state": "open",
             "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/{number}"},
             "labels": [],
@@ -2017,7 +2020,12 @@ class GitHubRepositoryFake:
         if path in {repo, f"/repositories/{REPO_ID}"}:
             return httpx.Response(
                 200,
-                json={"id": REPO_ID, "full_name": REPO, "default_branch": self.default_branch},
+                json={
+                    "id": REPO_ID,
+                    "full_name": REPO,
+                    "visibility": self.visibility,
+                    "default_branch": self.default_branch,
+                },
             )
         if path.startswith(f"{repo}/git/ref/heads/"):
             sha = self.branches.get(path.removeprefix(f"{repo}/git/ref/heads/"))

@@ -99,7 +99,7 @@ from .forges.registry import forges_registry
 from .forges.surfaces import bound_labels
 from .forges.types import TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
-from .github_factory_events import FactoryNotice, mentions_factory
+from .github_factory_events import FactoryNotice, is_voice_body, mentions_factory
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
 from .github_review_truth import VerifiedRepository
 from .models import (
@@ -851,6 +851,7 @@ def _answer_notice(
     *,
     installation_id: int,
     mention: bool,
+    app_slug: str | None,
 ) -> FactoryNotice | None:
     """The notice a listed or re-read issue comment makes for the answer
     intake, or None when it names no issue comment. Its sender is only a
@@ -858,7 +859,12 @@ def _answer_notice(
 
     comment_id = comment.get("id")
     number = trailing_id(comment.get("issue_url"))
-    if type(comment_id) is not int or comment_id <= 0 or number is None:
+    if (
+        is_voice_body(comment.get("body"), tracker.mention, app_slug)
+        or type(comment_id) is not int
+        or comment_id <= 0
+        or number is None
+    ):
         return None
     sender_id, sender_login = human_actor({"user": comment.get("user")}) or (0, "")
     body = comment.get("body")
@@ -941,7 +947,10 @@ async def retry_answers(
     for comment_id in comment_ids:
         try:
             value = await tracker.issue_comment(comment_id)
-            notice = _answer_notice(value, tracker, installation_id=installation_id, mention=False)
+            notice = _answer_notice(
+                value, tracker, installation_id=installation_id,
+                mention=False, app_slug=await tracker.app_slug(),
+            )
             handled = notice is not None and await _admit_answer(
                 sessionmaker, settings, tracker, notice, value
             )
@@ -1108,7 +1117,7 @@ async def _admit_mentions(
         if not isinstance(comment, dict):
             continue
         body = comment.get("body")
-        if comment.get("id") in retried:
+        if is_voice_body(body, tracker.mention, app_slug) or comment.get("id") in retried:
             continue
         if (
             isinstance(body, str)
@@ -1140,7 +1149,8 @@ async def _admit_mentions(
             if answer_on in answering and _edited(comment, threshold):
                 continue
             notice = _answer_notice(
-                comment, tracker, installation_id=installation_id, mention=mentioned
+                comment, tracker, installation_id=installation_id,
+                mention=mentioned, app_slug=app_slug,
             )
             if notice is not None:
                 try:

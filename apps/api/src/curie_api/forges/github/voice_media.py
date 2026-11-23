@@ -8,11 +8,21 @@ from uuid import UUID
 
 import httpx
 
-from .factory_voice_contract import Actor, GitHubConversation, Refused, VoiceMedia, VoiceSource
-from .forges.github.transport import get_github_json, parse_time, repository_identity_matches
-from .github_review_events import FeedbackIgnored, FeedbackUnavailable, human_sender
-from .github_review_truth import VerifiedRepository, verify_sender_write_permission
-from .repo_full_name import repo_url_path
+from curie_api.factory_voice_contract import (
+    Actor,
+    GitHubConversation,
+    Refused,
+    VoiceMedia,
+    VoiceSource,
+)
+from curie_api.forges.github.transport import (
+    get_github_json,
+    parse_time,
+    repository_identity_matches,
+)
+from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, human_sender
+from curie_api.github_review_truth import VerifiedRepository, verify_sender_write_permission
+from curie_api.repo_full_name import repo_url_path
 
 _FILE = r"https://github\.com/user-attachments/files/[1-9][0-9]*/[A-Za-z0-9_-][A-Za-z0-9._-]*\.[wW][aA][vV]"
 _UPLOAD = re.compile(rf"(?:\[[^\[\]\r\n]+\]\((?P<link>{_FILE})\)|(?P<bare>{_FILE}))")
@@ -65,20 +75,16 @@ async def _download(transport: httpx.AsyncBaseTransport, url: str) -> VoiceMedia
     return Refused(reason="invalid_media")
 
 
-async def read_comment_media(
+async def read_voice_comment(
     *,
     api: httpx.AsyncClient,
-    media_transport: httpx.AsyncBaseTransport,
     verified: VerifiedRepository,
     repo_name: str,
     audience: GitHubConversation,
-    tenant_id: UUID,
-    work_item_id: UUID,
     comment_id: int,
     actor_id: int,
     expected_body_sha256: str,
-) -> tuple[VoiceSource, VoiceMedia] | Refused:
-    """The caller supplies the authorized WorkItem and its current repository binding."""
+) -> tuple[str, str] | Refused:
     if (
         verified.api != "https://api.github.com"
         or audience.host != "github.com"
@@ -101,7 +107,8 @@ async def read_comment_media(
         )
         if (
             issue.get("url") != verified.api + issue_path
-            or issue.get("number") != audience.number
+            or type(issue.get("number")) is not int
+            or issue["number"] != audience.number
             or issue.get("state") != "open"
             or ("pull_request" in issue) != (audience.kind == "pull_request")
         ):
@@ -146,6 +153,34 @@ async def read_comment_media(
         return Refused(reason="unavailable")
     except FeedbackIgnored:
         return Refused(reason="forbidden")
+    return body, login
+
+
+async def read_comment_media(
+    *,
+    api: httpx.AsyncClient,
+    media_transport: httpx.AsyncBaseTransport,
+    verified: VerifiedRepository,
+    repo_name: str,
+    audience: GitHubConversation,
+    tenant_id: UUID,
+    work_item_id: UUID,
+    comment_id: int,
+    actor_id: int,
+    expected_body_sha256: str,
+) -> tuple[VoiceSource, VoiceMedia] | Refused:
+    current = await read_voice_comment(
+        api=api,
+        verified=verified,
+        repo_name=repo_name,
+        audience=audience,
+        comment_id=comment_id,
+        actor_id=actor_id,
+        expected_body_sha256=expected_body_sha256,
+    )
+    if isinstance(current, Refused):
+        return current
+    body, _ = current
     match = _UPLOAD.fullmatch(body.strip())
     if match is None:
         return Refused(reason="invalid_media")
@@ -158,8 +193,8 @@ async def read_comment_media(
         work_item_id=work_item_id,
         audience=audience,
         message_id=str(comment_id),
-        actor=Actor(provider_user_id=str(user_id), principal_id=None),
+        actor=Actor(provider_user_id=str(actor_id), principal_id=None),
         attachment_id=hashlib.sha256(url.encode()).hexdigest(),
-        content_sha256=digest,
+        content_sha256=expected_body_sha256,
     )
     return source, media

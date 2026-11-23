@@ -8,8 +8,8 @@ from uuid import UUID
 import httpx
 import pytest
 from curie_api.factory_voice_contract import GitHubConversation, Refused
+from curie_api.forges.github.voice_media import read_comment_media
 from curie_api.github_review_truth import VerifiedRepository
-from curie_api.github_voice_media import read_comment_media
 
 pytestmark = pytest.mark.anyio
 

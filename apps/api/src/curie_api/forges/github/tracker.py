@@ -76,7 +76,12 @@ from curie_api.forges.types import (
     TrackerComment,
     TrackerIssueRef,
 )
-from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_factory
+from curie_api.github_factory_events import (
+    FactoryNotice,
+    FactoryRefused,
+    is_voice_body,
+    mentions_factory,
+)
 from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from curie_api.github_review_truth import verify_sender_write_permission
 from curie_api.repo_full_name import repo_url_path
@@ -533,6 +538,7 @@ class GitHubTracker:
             comment_id is None
             or not isinstance(body, str)
             or not body.strip()
+            or is_voice_body(body, self.mention, app_slug)
             or not isinstance(issue_url, str)
             # A pull request conversation comment is review feedback, not a marking.
             or (isinstance(html_url, str) and "/pull/" in html_url)
@@ -669,6 +675,7 @@ class GitHubTracker:
             and isinstance(user, dict)
             and str(user.get("id")) == notice.actor.id
             and isinstance(body, str)
+            and not is_voice_body(body, self.mention, await self.app_slug())
             and (
                 notice.disposition is Disposition.ANSWER
                 or mentions_factory(body, self.mention, await self.app_slug())

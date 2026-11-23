@@ -2417,6 +2417,31 @@ comment on a fresh issue is the run's only GitHub response, with the pull
 request URL included when publication succeeds, so a `github` binding needs no
 endpoint or adapter.
 
+### GitHub voice feedback
+
+Local replay verifies one WAV attachment in a public GitHub issue comment and
+in a pull request conversation comment. In both cases the adapter reads the
+current comment and checks its author's write access before fetching the
+file. A changed comment or an ambiguous attachment is refused. The webhook
+reports `voice_private_repository` for a private or internal repository.
+Media downloads carry no GitHub credentials.
+
+Voice is off by default. With voice enabled, the issue must already have an
+open factory pull request. The author reviews the transcript in the same
+conversation and replies with `confirm <code>`, `edit <code> <replacement>`
+or `reject <code>`. An edit displays a new code. Only confirmation of the
+displayed version can queue a revision, subject to the plain-feedback cap.
+
+In local replay the CPU model transcribed “Retry” as “reach right”. The author
+corrected the label before confirming. Both conversation types produced one
+revision request on the original WorkItem, including after a duplicate
+confirmation. The resulting change to a live pull request remains unverified.
+
+Two provider checks remain open. The first needs a real browser-uploaded WAV
+in each kind of comment, delivered to the factory by GitHub. The second needs
+a private repository attachment retrieved with the GitHub App installation
+token using the URL from the rendered comment.
+
 ### Driving the factory end to end
 
 `curie dev factory-e2e preflight` proves the signed intake loop against a real

@@ -415,6 +415,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.protected_admission_reconciler = protected_reconciler
         protected_reconciler.start()
+        from .github_factory_review import github_voice_runtime
+
         voice_purge = asyncio.create_task(
             purge_expired_drafts(
                 create_voice_retention_engine(), enabled=settings.factory_voice_enabled
@@ -422,7 +424,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.voice_retention_task = voice_purge
         try:
-            yield
+            async with github_voice_runtime(settings, app.state.sessionmaker, http_client) as voice:
+                app.state.github_voice = voice
+                yield
         finally:
             voice_purge.cancel()
             with suppress(asyncio.CancelledError):

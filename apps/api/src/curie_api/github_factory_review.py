@@ -15,16 +15,18 @@ the pull request says so.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager, suppress
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from fastapi import HTTPException
 from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.factory_admission import ignored
 from curie_api.forges.github.identity import delivery_uuid
@@ -51,7 +53,7 @@ from .forges.registry import ForgeRegistry, forges_registry
 from .forges.trackers import code_host_for_repository, reply_route
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget
 from .github_factory import lock_issue
-from .github_factory_events import mentions_factory
+from .github_factory_events import is_voice_body, mentions_factory, voice_reply
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import (
     FeedbackIgnored,
@@ -72,6 +74,9 @@ from .repo_full_name import repo_url_path
 from .workitem_dispatch import Admission
 from .workitems.lifecycle import WorkItemOutcome
 from .workspace_policy import repository_is_allowed
+
+if TYPE_CHECKING:
+    from .forges.github.voice import GitHubVoice
 
 logger = logging.getLogger(__name__)
 
@@ -108,30 +113,47 @@ def _payload_pull_request(event: str, payload: Any) -> tuple[int, int] | None:
     return repository_id, number
 
 
-async def _owner(
-    session: AsyncSession, settings: Settings, repository_id: int, pr_number: int
+async def conversation_owner(
+    session: AsyncSession,
+    settings: Settings,
+    repository_id: int,
+    number: int,
+    kind: Literal["issue", "pull_request"] = "pull_request",
+    *,
+    lock: bool = False,
 ) -> tuple[WorkItem, ThreadPublicationLineage] | None:
     host, project_id = github_host(settings), str(repository_id)
-    row = (
-        await session.execute(
-            select(WorkItem, ThreadPublicationLineage)
-            .join(
-                ThreadPublicationLineage,
-                ThreadPublicationLineage.id == WorkItem.publication_lineage_id,
-            )
-            .where(
-                ThreadPublicationLineage.code_host_kind == GITHUB,
-                ThreadPublicationLineage.code_host_host == host,
-                ThreadPublicationLineage.repository_project_id == project_id,
-                ThreadPublicationLineage.pr_number == pr_number,
-                WorkItem.code_host_kind == GITHUB,
-                WorkItem.code_host_host == host,
-                WorkItem.repository_project_id == project_id,
-            )
-            .order_by(ThreadPublicationLineage.created_at.desc())
-            .limit(1)
+    conversation = (
+        (ThreadPublicationLineage.pr_number == number,)
+        if kind == "pull_request"
+        else (
+            WorkItem.tracker_kind == GITHUB,
+            WorkItem.tracker_host == host,
+            WorkItem.tracker_scope_id == project_id,
+            WorkItem.tracker_issue_id == str(number),
         )
-    ).first()
+    )
+    query = (
+        select(WorkItem, ThreadPublicationLineage)
+        .join(
+            ThreadPublicationLineage,
+            ThreadPublicationLineage.id == WorkItem.publication_lineage_id,
+        )
+        .where(
+            ThreadPublicationLineage.code_host_kind == GITHUB,
+            ThreadPublicationLineage.code_host_host == host,
+            ThreadPublicationLineage.repository_project_id == project_id,
+            *conversation,
+            WorkItem.code_host_kind == GITHUB,
+            WorkItem.code_host_host == host,
+            WorkItem.repository_project_id == project_id,
+        )
+        .order_by(ThreadPublicationLineage.created_at.desc())
+        .limit(1)
+    )
+    if lock:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    row = (await session.execute(query)).first()
     if row is None:
         return None
     return row[0], row[1]
@@ -143,7 +165,7 @@ async def factory_owns(session: AsyncSession, settings: Settings, event: str, pa
     claimed = _payload_pull_request(event, payload)
     if claimed is None:
         return False
-    return await _owner(session, settings, *claimed) is not None
+    return await conversation_owner(session, settings, *claimed) is not None
 
 
 def is_actionable_feedback(
@@ -270,7 +292,7 @@ async def _review_replay(
     return WebhookResult(status="factory_duplicate")
 
 
-def _bound(lineage: ThreadPublicationLineage) -> BoundReviewLineage:
+def bound_lineage(lineage: ThreadPublicationLineage) -> BoundReviewLineage:
     if (
         lineage.pr_number is None
         or lineage.head_sha is None
@@ -316,9 +338,11 @@ async def admit_parsed_feedback(
     registry = forges_registry(settings)
     mention = factory_tracker(registry).config.mention
     app_slug = await factory_app_slug(registry)
+    if feedback.event == "issue_comment" and is_voice_body(feedback.body, mention, app_slug):
+        raise FeedbackIgnored("voice_comment")
     if not repository_is_allowed(feedback.repo_full_name, settings.github_repo_allowlist):
         raise FeedbackIgnored("repository_not_allowed")
-    owner = await _owner(session, settings, feedback.repository_id, feedback.pr_number)
+    owner = await conversation_owner(session, settings, feedback.repository_id, feedback.pr_number)
     if owner is None:
         raise FeedbackIgnored("lineage_unbound")
     work_item = owner[0]
@@ -332,7 +356,7 @@ async def admit_parsed_feedback(
         raise FeedbackIgnored("lineage_closed")
     if work_item.cancelled_at is not None:
         raise FeedbackIgnored("work_item_cancelled")
-    bound = _bound(lineage)
+    bound = bound_lineage(lineage)
     if (
         feedback.installation_id != work_item.code_host_installation_id
         or feedback.installation_id != bound.installation_id
@@ -460,6 +484,57 @@ async def admit_parsed_feedback(
         reply_target = _reply_target(feedback, work_item)
         texts = [feedback.body]
     plain = not any(mentions_factory(text, mention, app_slug) for text in texts)
+    result = await admit_review_revision(
+        session,
+        settings=settings,
+        work_item=work_item,
+        lineage_id=lineage.id,
+        bound=bound,
+        provenance=provenance,
+        url=url,
+        reply_target=reply_target,
+        request_id=request_id,
+        requester=f"github:{feedback.sender_id}:{feedback.sender_login}",
+        plain=plain,
+    )
+    if (
+        result.errors == [{"code": "plain_feedback_cap"}]
+        and lineage.plain_feedback_capped_at is None
+        and await _post_mention_notice(
+            registry,
+            client,
+            work_item,
+            lineage_id=lineage.id,
+            pr_number=feedback.pr_number,
+            installation_id=feedback.installation_id,
+            mention=mention,
+        )
+    ):
+        await session.execute(
+            update(ThreadPublicationLineage)
+            .where(ThreadPublicationLineage.id == lineage.id)
+            .values(
+                plain_feedback_capped_at=func.now(), updated_at=ThreadPublicationLineage.updated_at
+            )
+        )
+    return result
+
+
+async def admit_review_revision(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    work_item: WorkItem,
+    lineage_id: uuid.UUID,
+    bound: BoundReviewLineage,
+    provenance: dict[str, Any],
+    url: str,
+    reply_target: ReplyTarget,
+    request_id: uuid.UUID,
+    requester: str,
+    plain: bool,
+) -> WebhookResult:
+    """Admit verified feedback in the caller's transaction, with no provider writes."""
     # Provider verification can overlap another WorkItem or lineage writer.
     # Keep both current rows locked through admission and reject changed proof.
     current_item = await session.scalar(
@@ -468,11 +543,11 @@ async def admit_parsed_feedback(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if current_item is None or current_item.publication_lineage_id != lineage.id:
+    if current_item is None or current_item.publication_lineage_id != lineage_id:
         raise FeedbackUnavailable("lineage_changed")
     current = (
         select(ThreadPublicationLineage)
-        .where(ThreadPublicationLineage.id == lineage.id)
+        .where(ThreadPublicationLineage.id == lineage_id)
         .execution_options(populate_existing=True)
     )
     # Plain feedback writes the lineage's count (FOR NO KEY UPDATE), never its
@@ -485,7 +560,7 @@ async def admit_parsed_feedback(
     if current_lineage.status != "open":
         raise FeedbackIgnored("lineage_closed")
     try:
-        current_bound = _bound(current_lineage)
+        current_bound = bound_lineage(current_lineage)
     except FeedbackIgnored:
         raise FeedbackUnavailable("lineage_changed") from None
     if current_bound != bound:
@@ -501,29 +576,9 @@ async def admit_parsed_feedback(
             select(ExecutionRequest.id).where(ExecutionRequest.id == request_id)
         )
         if replay is None:
-            # Post first: a failed post leaves the cap unrecorded, so a later
-            # plain comment posts it again; the marker keeps it one.
-            if current_lineage.plain_feedback_capped_at is None and await _post_mention_notice(
-                registry,
-                client,
-                work_item,
-                lineage_id=current_lineage.id,
-                pr_number=feedback.pr_number,
-                installation_id=feedback.installation_id,
-                mention=mention,
-            ):
-                await session.execute(
-                    update(ThreadPublicationLineage)
-                    .where(ThreadPublicationLineage.id == current_lineage.id)
-                    # The lineage's updated_at is its merge time to readers.
-                    .values(
-                        plain_feedback_capped_at=func.now(),
-                        updated_at=ThreadPublicationLineage.updated_at,
-                    )
-                )
             return ignored("plain_feedback_cap")
     kind, address, conversation = reply_route(
-        registry, work_item.tracker_issue, work_item.repository_path
+        forges_registry(settings), work_item.tracker_issue, work_item.repository_path
     )
     facts = Admission(
         agent_id=work_item.agent_id,
@@ -534,7 +589,7 @@ async def admit_parsed_feedback(
         repository=work_item.repository,
         code_host_installation_id=work_item.code_host_installation_id,
         objective=objective,
-        requester=f"github:{feedback.sender_id}:{feedback.sender_login}",
+        requester=requester,
         request_id=request_id,
         reply_target=reply_target,
         reply_url=url,
@@ -572,9 +627,55 @@ async def admit_parsed_feedback(
     return admission_result(result, facts.request_id)
 
 
+async def voice_comment_address(settings: Settings, event: str, payload: Any) -> str | None:
+    """Return the verified bot address, an empty prefix for bare voice input, or None."""
+    if event != "issue_comment" or not isinstance(payload, dict):
+        return None
+    comment = payload.get("comment")
+    body = comment.get("body") if isinstance(comment, dict) else None
+    if not isinstance(body, str):
+        return None
+    if is_voice_body(body):
+        return ""
+    prefix, space, remainder = body.partition(" ")
+    if prefix.startswith("@") and space and voice_reply(remainder) is not None:
+        registry = forges_registry(settings)
+        mention = factory_tracker(registry).config.mention
+        if voice_reply(body, mention) is not None:
+            return mention
+        app_slug = await factory_app_slug(registry)
+        if app_slug and voice_reply(body, app_slug) is not None:
+            return app_slug
+    return None
+
+
+@asynccontextmanager
+async def github_voice_runtime(
+    settings: Settings,
+    sessions: async_sessionmaker[AsyncSession],
+    client: httpx.AsyncClient,
+) -> AsyncIterator[GitHubVoice | None]:
+    if not settings.factory_enabled or not settings.factory_voice_enabled:
+        yield None
+        return
+    from .factory_voice import build_voice_draft_service
+    from .forges.github.voice import GitHubVoice
+
+    runtime = GitHubVoice(sessions, settings, client, build_voice_draft_service(settings, sessions))
+    task = asyncio.create_task(runtime.run())
+    try:
+        yield runtime
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
 async def handle_factory_review_delivery(
     session: AsyncSession,
     *,
+    voice: GitHubVoice | None,
+    voice_address: str | None,
     settings: Settings,
     client: httpx.AsyncClient,
     event: str,
@@ -599,16 +700,24 @@ async def handle_factory_review_delivery(
         await session.commit()
         return ignored(audit.reason)
     try:
-        feedback = parse_feedback(
-            event,
-            payload,
-            delivery_id,
-            github_html_base=settings.github_html_base,
-            allow_empty_review=True,
-        )
-        outcome = await admit_parsed_feedback(
-            session, feedback, settings=settings, client=client, verified=None
-        )
+        if voice_address is not None:
+            if voice is None:
+                raise FeedbackIgnored("voice_disabled")
+            try:
+                outcome = await voice.handle(session, payload, voice_address)
+            except ForgeError:
+                raise FeedbackUnavailable("voice_unavailable") from None
+        else:
+            feedback = parse_feedback(
+                event,
+                payload,
+                delivery_id,
+                github_html_base=settings.github_html_base,
+                allow_empty_review=True,
+            )
+            outcome = await admit_parsed_feedback(
+                session, feedback, settings=settings, client=client, verified=None
+            )
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()
