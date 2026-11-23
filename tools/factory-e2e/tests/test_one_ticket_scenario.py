@@ -346,10 +346,11 @@ def _intake_verdicts(stub: Any, since: str) -> dict[int, tuple[bool, str]]:
             listed, _ = await tracker.issue_comments_since(since, None)
             assert listed is not None
             threshold = ots.instant(since)
+            app_slug = await tracker.app_slug()
             verdicts: dict[int, tuple[bool, str]] = {}
             for comment in listed:
                 notice = factory_poll_intake._answer_notice(
-                    comment, tracker, installation_id=5501, mention=False
+                    comment, tracker, installation_id=5501, mention=False, app_slug=app_slug
                 )
                 assert notice is not None, "the listed comment names no issue comment"
                 try:
