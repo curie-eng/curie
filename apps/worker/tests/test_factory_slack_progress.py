@@ -849,3 +849,77 @@ def test_progress_card_lost_ack_replays_the_edit_without_another_card_post(stack
     assert len(edits) == 2
     assert edits[0].params["blocks"] == edits[1].params["blocks"]
     assert len(_texts(stack, root)) == 1
+
+
+def _posted_question_round(work_item_id: uuid.UUID, request_id: uuid.UUID) -> None:
+    """The round row a posted question leaves, without a tracker write.
+
+    The finish route reads this row and settles an unpublished ending as
+    ``questions_asked``. The Slack stand-in has no tracker to post through.
+    """
+
+    _rows(
+        "INSERT INTO curie.factory_question_rounds "
+        "(work_item_id, rounds_used, state, asking_request_id, body_sha256, answer_after) "
+        "VALUES (:item, 1, 'outstanding', :request, :digest, now())",
+        {
+            "item": work_item_id,
+            "request": request_id,
+            "digest": "ab" * 32,
+        },
+    )
+
+
+def test_a_cancelled_questions_run_refreshes_the_acknowledged_waiting_card(stack: Stack) -> None:
+    """Cancelling after the waiting card is acknowledged edits that card.
+
+    The claim path has to select the card again. Passing the cancellation
+    flag into the renderer does not prove the posted card changes.
+    """
+
+    _number, request_id, work_item_id, epoch, _root = _kickoff_run(stack)
+    _posted_question_round(work_item_id, request_id)
+    finished = stack.client.post(
+        f"/v1/internal/work-items/requests/{request_id}/finish",
+        headers=stack.internal,
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "no_pull_request",
+            "retry_safety": "no_effects",
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    assert finished.json()["status"] == "completed"
+    assert finished.json()["terminal_cause"] == "questions_asked"
+
+    stack.drain()
+    waiting = _last_card(stack, work_item_id)
+    assert "Waiting on answers" in waiting
+    assert "Reply on the ticket" in waiting
+    (acked,) = _rows(
+        "SELECT card_edited_at > q.terminal_at AS after_terminal "
+        "FROM curie.factory_slack_threads t "
+        "JOIN curie.execution_requests q ON q.work_item_id = t.work_item_id "
+        "WHERE t.work_item_id = :id AND q.id = :request",
+        {"id": work_item_id, "request": request_id},
+    )
+    assert acked["after_terminal"] is True
+
+    since = len(stack.slack.calls)
+    stack.drain()
+    assert _updates_since(stack, since) == []
+
+    (version,) = _rows("SELECT version FROM curie.work_items WHERE id = :id", {"id": work_item_id})
+    cancelled = stack.client.post(
+        f"/v1/internal/work-items/{work_item_id}/cancel",
+        headers=stack.internal,
+        json={"expected_version": version["version"]},
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    stack.drain()
+    stopped = _last_card(stack, work_item_id)
+    assert "Waiting on answers" not in stopped
+    assert "Reply on the ticket" not in stopped
+    assert "The factory label was removed, so an answer starts nothing." in stopped
+    assert "Factory run: stopped" in stopped

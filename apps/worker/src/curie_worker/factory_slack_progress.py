@@ -1066,6 +1066,16 @@ class PostgresFactorySlackStore:
                    q.terminal_at IS NULL
                    OR t.card_edited_at IS NULL
                    OR t.card_edited_at <= q.terminal_at
+                   OR (
+                       q.terminal_cause = 'questions_asked'
+                       AND EXISTS (
+                           SELECT 1
+                             FROM {self._work_items} w
+                            WHERE w.id = t.work_item_id
+                              AND w.cancelled_at IS NOT NULL
+                              AND t.card_edited_at < w.cancelled_at
+                       )
+                   )
                )
                AND (
                    t.card_edited_at IS NULL
