@@ -6907,7 +6907,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="run PR maintenance against a disposable candidate install",
         description="Set CURIE_C4_CANDIDATE_CLI to the compiled candidate binary and "
         "CURIE_C4_CANDIDATE_IMAGES to a pullable image template containing {component}. "
-        "Use --context or CURIE_FACTORY_KUBE_CONTEXT to name a disposable cluster. "
+        "Use --context <context> or CURIE_FACTORY_KUBE_CONTEXT to name a disposable cluster. "
         "The driver creates and removes a fresh namespace and Helm release.",
     )
     maintenance.add_argument("--case", required=True, choices=("active", "late", "recovery"))
