@@ -36,6 +36,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import (
     CanUseTool,
+    PermissionResultAllow,
     PermissionResultDeny,
     RateLimitInfo,
     ToolPermissionContext,
@@ -49,6 +50,7 @@ from .approval import (
     NO_PUBLICATION_GATE_TEXT,
     TURN_PROGRESS_TOOL_NAME,
     ApprovalGate,
+    PolicyApprovalLedger,
     PublicationLedger,
     process_approval_request,
 )
@@ -903,6 +905,7 @@ class FakeModelSession:
         | None = None,
         approval_gate: ApprovalGate | None = None,
         publication_ledger: PublicationLedger | None = None,
+        policy_approval_ledger: PolicyApprovalLedger | None = None,
         replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
@@ -945,6 +948,7 @@ class FakeModelSession:
         # With no gate, the scripted publish body notes its run here, as the
         # real body does (#2294).
         self._publication_ledger = publication_ledger
+        self._policy_approval_ledger = policy_approval_ledger
         self.replay_messages = replay_messages
         self.connected = False
         self.queries: list[str] = []
@@ -1173,14 +1177,6 @@ class FakeModelSession:
                         )
                     )
                     continue
-            if block.name == APPROVAL_TOOL_NAME and self._approval_gate is not None:
-                # Run the real decision table so the container fake tier resolves
-                # the route (sole-route auto-bind, unknown-route refusal) and sets
-                # the same sticky gate flags _merge_gate_block reconciles (#561).
-                # build_can_use_tool below leaves the (un-gated) approval tool
-                # untouched, so this is the only thing that sets the policy fields.
-                payload = block.input if isinstance(block.input, dict) else {}
-                process_approval_request(self._approval_gate, payload)
             if block.name in self._disallowed_tools:
                 # Mirror ClaudeAgentOptions.disallowed_tools: the named tool is
                 # not usable. The ToolUseBlock is still delivered (the real SDK
@@ -1188,6 +1184,8 @@ class FakeModelSession:
                 # execute the write (#2429).
                 self._halted = True
                 continue
+            hook_allowed = False
+            tool_input = block.input
             if self._pre_tool_use_hook is not None:
                 hook_output = await self._pre_tool_use_hook(
                     {"tool_name": block.name, "tool_input": block.input},
@@ -1215,8 +1213,11 @@ class FakeModelSession:
                         _result(terminal_reason="hook_stopped"),
                     )
                 if specific.get("permissionDecision") == "allow":
-                    continue
-            if self._can_use_tool is not None:
+                    if block.name != APPROVAL_TOOL_NAME:
+                        continue
+                    hook_allowed = True
+                    tool_input = specific.get("updatedInput", tool_input)
+            if self._can_use_tool is not None and not hook_allowed:
                 decision = await self._can_use_tool(
                     block.name, block.input, ToolPermissionContext(tool_use_id=block.id)
                 )
@@ -1232,6 +1233,17 @@ class FakeModelSession:
                         ),
                         _result(is_error=True, subtype="error_during_execution"),
                     )
+                if (
+                    isinstance(decision, PermissionResultAllow)
+                    and decision.updated_input is not None
+                ):
+                    tool_input = decision.updated_input
+            if block.name == APPROVAL_TOOL_NAME and block.id not in self._denied_ids:
+                process_approval_request(
+                    self._approval_gate,
+                    tool_input if isinstance(tool_input, dict) else {},
+                    ledger=self._policy_approval_ledger,
+                )
             if (
                 block.name == PLATFORM_PUBLISH_TOOL_NAME
                 and self._approval_gate is not None

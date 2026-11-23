@@ -767,8 +767,7 @@ def _scripted(factory: Any, script: list[Any]) -> Any:
     return build
 
 
-def test_translation_captures_no_request_on_a_read_only_turn() -> None:
-    # @spec RUNNER-TOOL-ACCESS-3: the wire-level capture, on its own.
+def test_translation_records_no_request_in_either_access_mode() -> None:
     from curie_runner.translate import TurnState, translate_message
     from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
@@ -782,10 +781,8 @@ def test_translation_captures_no_request_on_a_read_only_turn() -> None:
     translate_message(message, restricted, SideEffectClassifier(), None)
     translate_message(message, ordinary, SideEffectClassifier(), None)
 
-    # The publish call is not captured here on either turn: only its tool body
-    # records a publication, and a read-only turn refuses the call before that.
     assert restricted.approval_summary is None
-    assert ordinary.approval_summary == "deploy"
+    assert ordinary.approval_summary is None
 
 
 def test_the_final_never_flips_to_awaiting_approval_on_a_read_only_turn() -> None:

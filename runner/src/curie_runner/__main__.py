@@ -42,6 +42,7 @@ from .approval import (
     APPROVAL_SERVER_NAME,
     ApprovalGate,
     ApprovalPolicyError,
+    PolicyApprovalLedger,
     PublicationLedger,
     assert_gates_not_shadowed,
     build_approval_gate,
@@ -1140,6 +1141,7 @@ def build_runner(
     # With no approval gate, the publish body and the session share this to
     # know the body ran (#2294); a gated session keeps that on its gate.
     publication_ledger = PublicationLedger() if approval_gate is None else None
+    policy_approval_ledger = PolicyApprovalLedger() if approval_gate is None else None
     # The accepted standing rules of a run with no work item (#5801). A factory
     # run (``wir`` or the work-item progress URL, which survives a failed
     # issue-read mint) never uses them: its rules and its ``propose_rule`` come
@@ -1432,6 +1434,7 @@ def build_runner(
                 approval_gate,
                 managed_workspace=mounted_workspace is not None,
                 publication_ledger=publication_ledger,
+                policy_approval_ledger=policy_approval_ledger,
                 include_request_approval=carries_request_approval,
                 progress_tool=(
                     build_progress_tool(progress[1], progress[0], progress_activity)
@@ -1730,6 +1733,7 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 publication_ledger=publication_ledger,
+                policy_approval_ledger=policy_approval_ledger,
                 replay_messages=conversation_replay.messages,
                 disallowed_tools=config.catalogue_disallowed_tools,
                 # The same holder the SDK tool closes over, so the scripted
@@ -1802,6 +1806,7 @@ def build_runner(
             approval_gate=approval_gate,
             question_gate=question_halt_gate,
             publication_ledger=publication_ledger,
+            policy_approval_ledger=policy_approval_ledger,
             approval_resumed_kind=config.approval_resumed_kind,
             approval_decision=config.approval_decision,
             false_completion_check=config.false_completion_check,

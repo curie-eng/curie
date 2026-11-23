@@ -179,7 +179,7 @@ def _assert_no_approval_was_recorded(gate: ApprovalGate) -> None:
     assert gate.pending_granted_tool is None
     assert gate.policy_requested is False
     assert gate.policy_rejected is False
-    assert gate.policy_route is None
+    assert gate.policy_approval is None
     assert gate.pending_halt is False
 
 

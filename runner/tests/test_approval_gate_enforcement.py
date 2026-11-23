@@ -80,11 +80,12 @@ from curie_runner.approval import (
     NO_PUBLICATION_GATE_TEXT,
     ApprovalGate,
     ApprovalPolicyError,
+    PolicyApprovalLedger,
     PublicationLedger,
     build_approval_gate,
 )
 from curie_runner.config import RunnerConfig
-from curie_runner.fake import FakeModelSession
+from curie_runner.fake import FakeModelSession, approval_turn
 from curie_runner.harness.claude.approval import (
     build_approval_hook,
     build_approval_server,
@@ -1466,6 +1467,69 @@ def _run_lines(runner: SessionRunner) -> list[str]:
 
     anyio.run(go)
     return lines
+
+
+def test_fake_boot_without_a_gate_records_and_resets_the_policy_request(tmp_path: Path) -> None:
+    runner = build_runner(_config(_bundle(tmp_path)), fake_model=True)
+    summary = f"{APPROVAL_SUMMARY_PREFIX}review the proposal"
+
+    async def go() -> None:
+        await runner.start()
+        try:
+            for text, status in (
+                (f"[fake:request-approval:ops] {summary}", SessionStatus.AWAITING_APPROVAL),
+                ("Continue the review.", SessionStatus.DONE),
+            ):
+                event = Event(type="message", text=text, user="U", ts="1")
+                lines = [line async for line in runner.run_turn(event)]
+                frames = parse_ndjson("".join(lines))
+                final = frames[-1]
+                assert final.type == "final"
+                assert final.status is status
+                if status is SessionStatus.AWAITING_APPROVAL:
+                    assert final.approval_summary == f"[agent-requested] {summary}"
+                    assert final.approval_route == "ops"
+                    assert final.approval_gate_kind == "policy"
+                    assert final.approval_granted_tool is None
+                else:
+                    assert final.approval_summary is None
+                    assert final.approval_route is None
+                    assert final.approval_gate_kind is None
+        finally:
+            await runner.close()
+
+    anyio.run(go)
+
+
+def test_fake_hook_without_a_gate_denies_the_policy_request() -> None:
+    async def deny(tool_input, _call_id, _context):
+        assert tool_input["tool_name"] == APPROVAL_TOOL_NAME
+        return {"hookSpecificOutput": {"permissionDecision": "deny"}}
+
+    ledger = PolicyApprovalLedger()
+    session = FakeModelSession(
+        lambda: approval_turn("Review the proposal", route="ops"),
+        pre_tool_use_hook=deny,
+        policy_approval_ledger=ledger,
+    )
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=lambda: session,
+        ceiling=10_000,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="test",
+        policy_approval_ledger=ledger,
+    )
+    frames = parse_ndjson("".join(_run_lines(runner)))
+    final = frames[-1]
+    assert final.type == "final"
+    assert final.status is SessionStatus.DONE
+    assert final.approval_summary is None
+    assert final.approval_route is None
+    assert final.approval_gate_kind is None
+    assert [frame.tool for frame in frames if frame.type == "tool_note"] == [APPROVAL_TOOL_NAME]
 
 
 def test_publish_call_the_hooks_allowed_is_recorded_by_the_body_and_pauses(

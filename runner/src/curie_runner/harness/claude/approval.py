@@ -23,6 +23,7 @@ from ...approval import (
     APPROVAL_SERVER_NAME,
     NO_PUBLICATION_GATE_TEXT,
     ApprovalGate,
+    PolicyApprovalLedger,
     PublicationLedger,
     _approval_error,
     _decide_gate,
@@ -137,6 +138,7 @@ def build_approval_server(
     question_tool: SdkMcpTool[Any] | None = None,
     propose_rule_tool: SdkMcpTool[Any] | None = None,
     publication_ledger: PublicationLedger | None = None,
+    policy_approval_ledger: PolicyApprovalLedger | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -181,7 +183,7 @@ def build_approval_server(
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
-        return process_approval_request(gate, args)
+        return process_approval_request(gate, args, ledger=policy_approval_ledger)
 
     tools: list[SdkMcpTool[Any]] = [request_approval] if include_request_approval else []
 

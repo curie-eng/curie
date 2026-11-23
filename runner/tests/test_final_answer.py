@@ -16,6 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from claude_agent_sdk import AssistantMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
 from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 from curie_runner import RunTracer, SideEffectClassifier, create_app, plugin
+from curie_runner.approval import PolicyApprovalLedger
 from curie_runner.fake import FakeModelSession, _result, approval_turn
 from curie_runner.mcp_tool_capability import ConnectorCapabilityFailure
 from curie_runner.session import SessionRunner
@@ -64,7 +65,10 @@ def result(content=None, *, call_id="check", parent=None, error=False):
 
 
 def runner_for(script, *, final_answer=None, **kwargs):
-    fake = FakeModelSession(lambda: list(script), truncate_on_interrupt=False)
+    ledger = PolicyApprovalLedger()
+    fake = FakeModelSession(
+        lambda: list(script), truncate_on_interrupt=False, policy_approval_ledger=ledger
+    )
     runner = SessionRunner(
         session_factory=lambda: fake,
         ceiling=0,
@@ -74,6 +78,7 @@ def runner_for(script, *, final_answer=None, **kwargs):
         trace_name="final-answer-test",
         held_secrets=frozenset(),
         final_answer=final_answer,
+        policy_approval_ledger=ledger,
         **kwargs,
     )
     return runner, fake

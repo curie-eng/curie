@@ -428,37 +428,50 @@ def resolve_policy_route(
     )
 
 
-def process_approval_request(gate: ApprovalGate | None, args: dict[str, Any]) -> dict[str, Any]:
-    """Apply one ``request_approval`` call to ``gate`` and return the model result.
+@dataclass(frozen=True)
+class PolicyApproval:
+    summary: str
+    route: str | None
+    gate_kind: str = field(default="policy", init=False)
 
-    The single source of truth for the approval-request outcome, invoked from
-    BOTH the in-process MCP tool (real SDK path) and ``FakeModelSession`` (offline
-    path), so the two tiers resolve routes identically (#561). It mutates the
-    sticky policy flags on ``gate`` and returns the tool result the model sees.
-    """
+
+@dataclass
+class PolicyApprovalLedger:
+    """The approval tool's per-turn record when there is no approval gate."""
+
+    request: PolicyApproval | None = None
+
+    def reset(self) -> None:
+        self.request = None
+
+
+def process_approval_request(
+    gate: ApprovalGate | None,
+    args: dict[str, Any],
+    *,
+    ledger: PolicyApprovalLedger | None = None,
+) -> dict[str, Any]:
+    """Record an executed ``request_approval`` in both the real and fake tiers."""
 
     if gate is not None:
         # policy_requested is sticky-True: any call this turn means a policy
-        # gate was raised. The per-request outcome (rejected/route), though,
-        # must be fully determined by THIS call so the last call in the turn
-        # wins -- a retry with a valid route after an is_error refusal must
-        # clear the prior rejection, or _merge_gate_block drops the approval
-        # the retry created (#544, Decision B recovery path).
+        # gate tool ran. A retry replaces the outcome of the previous call.
         gate.policy_requested = True
         gate.policy_rejected = False
-        gate.policy_route = None
+        gate.policy_approval = None
     summary = str(args.get("summary") or "").strip()
     if not summary:
         if gate is not None:
             gate.policy_rejected = True
         return _approval_error("Rejected: pass a non-empty summary of what needs approval.")
+    summary = guard_reserved_summary(summary)
     rejected, route, error = resolve_policy_route(_distinct_routes(gate), args.get("route"))
     if rejected:
         if gate is not None:
             gate.policy_rejected = True
         assert error is not None
         return _approval_error(error)
-    if route is not None and gate is not None:
+    if gate is not None:
         granted = gate.grantable_tool_for_route(route)
         if granted is not None and _proxied_connector_tool(gate, granted):
             # A policy approval carries no arguments, so the worker cannot mint
@@ -469,7 +482,12 @@ def process_approval_request(gate: ApprovalGate | None, args: dict[str, Any]) ->
             # is not named: it selects the approver audience.
             gate.policy_rejected = True
             return _approval_error(_proxied_policy_refusal(granted))
-        gate.policy_route = route
+        gate.policy_approval = PolicyApproval(summary, route)
+    elif ledger is not None:
+        # No gate means there are no manifest routes to resolve in the runner.
+        # Carry the optional name through for the worker to resolve.
+        route = str(args.get("route") or "").strip() or None
+        ledger.request = PolicyApproval(summary, route)
     return _APPROVAL_OK
 
 
@@ -647,20 +665,14 @@ class ApprovalGate:
     # gate: ``pending_gate_kind='permission'`` and ``pending_granted_tool`` is
     # the exact tool ``can_use_tool`` denied -- the trusted, runner-held value
     # the resume-turn grant binds to, never parsed from a string and never
-    # model-supplied. A policy gate never sets these (it authorizes a business
-    # decision, never a tool); its provenance is stamped in translate.py.
+    # model-supplied. A policy request records its own provenance separately.
     pending_gate_kind: str | None = None
     pending_granted_tool: str | None = None
     pending_granted_arguments: dict[str, Any] | None = None
-    # Policy-gate route reconciliation (#544, Decision B), set by the
-    # request_approval tool when the model calls it: whether a request was made
-    # this turn, whether it was refused (ambiguous/unknown route -> no approval
-    # is created), and the RESOLVED route an accepted request carries onto the
-    # final. The session reconciles these at turn end so the final carries the
-    # manifest-resolved route rather than the raw model argument.
+    # Policy approval outcome, set by the tool body after PreToolUse allows it.
     policy_requested: bool = False
     policy_rejected: bool = False
-    policy_route: str | None = None
+    policy_approval: PolicyApproval | None = None
     grant_tool: str | None = None
     # The canonical arguments the approver saw (#3174), carried on the trusted
     # resume boot input (#3255). When set, the grant admits only a call whose
@@ -770,7 +782,7 @@ class ApprovalGate:
         self.pending_granted_arguments = None
         self.policy_requested = False
         self.policy_rejected = False
-        self.policy_route = None
+        self.policy_approval = None
         self.publication_title = None
         self.publication_body = None
         self.publication_attempted = False
