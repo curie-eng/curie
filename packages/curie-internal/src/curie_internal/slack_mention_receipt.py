@@ -14,7 +14,8 @@ The receipt version identifies the source:
 1. Version 1, a person. Written for a person's mention that replies in a
    channel thread (``root_ts`` is the thread, ``message_ts`` the reply) and for
    a person's top-level channel mention whose text links an issue
-   (``curie_internal.issue_links``), where ``root_ts == message_ts``.
+   (``curie_internal.issue_links``), where ``root_ts == message_ts``. A coded
+   voice reply also binds the receiving workspace, app and addressed bot.
 2. Version 2, an ADR 0202 declared test driver on a test installation, in the
    driver's own channel. ``user_id`` and ``evidence.user_id`` are the declared
    driver's bot user and ``driver_bot_id`` its declared bot id; the event's
@@ -24,10 +25,8 @@ The receipt version identifies the source:
    body is empty and only a confirmed voice draft may supply steering text.
 
 ``driver_bot_id`` is present exactly on version 2 and is left out of a version
-1 receipt's serialized form, so version 1 bytes are the ones written before
-version 2 existed. A consumer that only judges version 1 (steering) refuses
-version 2 and root receipts itself; the API rechecks receipt to delivery
-equality before it decides anything.
+1 receipt's serialized form. Ordinary text receipts retain their original
+bytes. The API checks the receipt against the delivery before admission.
 
 ``kickoff_request_id`` is the deterministic ExecutionRequest id a kickoff
 admits under, derived from the receiving identity and the delivery, so a
@@ -36,6 +35,7 @@ redelivery finds the request it already admitted.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -53,9 +53,29 @@ from pydantic import (
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 
-from .keyspace import SLACK_MENTION_RECEIPT_PREFIX
+from .factory_voice_reply import VOICE_REPLY
+from .keyspace import SLACK_MENTION_RECEIPT_PREFIX, SLACK_VOICE_SOURCE_PREFIX
 
+FACTORY_VOICE_TURN = "[Factory voice feedback]"
 _VOICE_FIELDS = ("voice_file_id", "api_app_id", "team_id", "content_sha256")
+
+
+def voice_reply_text(raw_text: str, bot_user_id: str) -> str | None:
+    """Return the exact code-bearing reply after the receiving bot's leading mention."""
+    prefix = re.match(rf"^[ \t]*<@{re.escape(bot_user_id)}(?:\|[^>]+)?>[ \t]+", raw_text)
+    if prefix is None:
+        return None
+    reply = raw_text[prefix.end() :]
+    return reply if VOICE_REPLY.fullmatch(reply) else None
+
+
+_STORE_VOICE_SOURCE = """
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[3]) then
+    redis.call('SET', KEYS[2], ARGV[2], 'NX', 'EX', ARGV[3])
+    return 1
+end
+return 0
+"""
 
 
 class MalformedMentionReceiptError(ValueError):
@@ -88,19 +108,33 @@ class SlackMentionReceipt(BaseModel):
     team_id: str | None = Field(default=None, pattern=r"^T[A-Z0-9]+$")
     content_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
+    bot_user_id: str | None = Field(default=None, pattern=r"^[UW][A-Z0-9]+$")
+
     @model_validator(mode="after")
     def _version_fields(self) -> Self:
         if (self.version == 2) != (self.driver_bot_id is not None):
             raise ValueError("driver_bot_id is required exactly on version 2")
-        if self.version != 3:
-            if self.model_fields_set.intersection(_VOICE_FIELDS):
-                raise ValueError("voice fields require a version 3 receipt")
+        if self.version == 1 and self.bot_user_id is not None:
+            if (
+                not self.api_app_id
+                or not self.team_id
+                or {"voice_file_id", "content_sha256"} & self.model_fields_set
+                or voice_reply_text(self.body, self.bot_user_id) is None
+            ):
+                raise ValueError("incomplete voice decision receipt")
+        elif self.version == 3:
+            if (
+                any(getattr(self, name) is None for name in _VOICE_FIELDS)
+                or self.body
+                or "bot_user_id" in self.model_fields_set
+            ):
+                raise ValueError("incomplete voice source receipt")
+        elif self.model_fields_set.intersection((*_VOICE_FIELDS, "bot_user_id")):
+            raise ValueError("unexpected voice receipt fields")
+        else:
             return self
-        if any(getattr(self, name) is None for name in _VOICE_FIELDS):
-            raise ValueError("missing voice receipt source identity or text digest")
         if (
-            self.body
-            or self.root_ts == self.message_ts
+            self.root_ts == self.message_ts
             or not re.fullmatch(r"[CG][A-Z0-9]+", self.channel)
             or not re.fullmatch(r"[UW][A-Z0-9]+", self.user_id)
             or not re.fullmatch(r"[0-9]+\.[0-9]+", self.root_ts)
@@ -116,8 +150,8 @@ class SlackMentionReceipt(BaseModel):
         data: dict[str, Any] = handler(self)
         if self.driver_bot_id is None:
             data.pop("driver_bot_id", None)
-        if self.version != 3:
-            for name in _VOICE_FIELDS:
+        for name in (*_VOICE_FIELDS, "bot_user_id"):
+            if getattr(self, name) is None:
                 data.pop(name, None)
         return data
 
@@ -136,11 +170,69 @@ def receipt_key(delivery_id: str) -> str:
     return f"{SLACK_MENTION_RECEIPT_PREFIX}{delivery_id}"
 
 
+def voice_source_key(
+    channel_identity: str, team_id: str, app_id: str, channel: str, root_ts: str, message_ts: str
+) -> str:
+    scope = [channel_identity, team_id, app_id, channel, root_ts, message_ts]
+    digest = hashlib.sha256(json.dumps(scope, separators=(",", ":")).encode()).hexdigest()
+    return f"{SLACK_VOICE_SOURCE_PREFIX}{digest}"
+
+
+async def read_voice_source_receipt(
+    redis: AsyncRedis,
+    *,
+    channel_identity: str,
+    team_id: str,
+    app_id: str,
+    channel: str,
+    root_ts: str,
+    message_ts: str,
+) -> SlackMentionReceipt | None:
+    scope = (channel_identity, team_id, app_id, channel, root_ts, message_ts)
+    delivery = await redis.get(voice_source_key(*scope))
+    if delivery is None:
+        return None
+    delivery_id = delivery.decode() if isinstance(delivery, bytes) else delivery
+    receipt = await read_receipt(redis, delivery_id)
+    if receipt is None or receipt.version != 3 or receipt.delivery_id != delivery_id:
+        return None
+    observed = (
+        receipt.channel_identity,
+        receipt.team_id,
+        receipt.api_app_id,
+        receipt.channel,
+        receipt.root_ts,
+        receipt.message_ts,
+    )
+    return receipt if observed == scope else None
+
+
 def write_receipt(redis: Redis, receipt: SlackMentionReceipt, *, ttl_s: int) -> bool:
     """Store ``receipt`` once; False when a receipt for the delivery already exists."""
 
     if ttl_s <= 0:
         raise ValueError("mention receipt TTL must be positive")
+    if receipt.version == 3:
+        assert receipt.team_id and receipt.api_app_id
+        source_key = voice_source_key(
+            receipt.channel_identity,
+            receipt.team_id,
+            receipt.api_app_id,
+            receipt.channel,
+            receipt.root_ts,
+            receipt.message_ts,
+        )
+        return bool(
+            redis.eval(
+                _STORE_VOICE_SOURCE,
+                2,
+                receipt_key(receipt.delivery_id),
+                source_key,
+                receipt.model_dump_json(),
+                receipt.delivery_id,
+                ttl_s,
+            )
+        )
     stored = redis.set(
         receipt_key(receipt.delivery_id),
         receipt.model_dump_json(),
@@ -168,10 +260,14 @@ async def read_receipt(redis: AsyncRedis, delivery_id: str) -> SlackMentionRecei
 
 
 __all__ = [
+    "FACTORY_VOICE_TURN",
     "MalformedMentionReceiptError",
     "SlackMentionReceipt",
     "kickoff_request_id",
     "read_receipt",
+    "read_voice_source_receipt",
     "receipt_key",
+    "voice_reply_text",
+    "voice_source_key",
     "write_receipt",
 ]

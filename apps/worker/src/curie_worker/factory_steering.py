@@ -85,6 +85,7 @@ from channel_protocol import (
 from curie_internal.factory_cause import PERSONAL_RESUME_RUNTIME_LIVE
 from curie_internal.issue_links import find_issue_links
 from curie_internal.slack_mention_receipt import (
+    FACTORY_VOICE_TURN,
     MalformedMentionReceiptError,
     SlackMentionReceipt,
     kickoff_request_id,
@@ -503,6 +504,12 @@ class FactorySteeringClient:
         except _READ_ERRORS as exc:
             # Unknown, so possibly a mapped root: never ordinary chat.
             raise SteeringUnavailable("factory run mapping could not be read") from exc
+        if qevent.text == FACTORY_VOICE_TURN:
+            from .factory_slack_voice import decide_voice
+
+            return await decide_voice(
+                self, turn, mapping=mapping, deadline=deadline, record_intent=record_intent
+            )
         if mapping is None:
             return await self._unmapped(turn, deadline=deadline, record_intent=record_intent)
         if mapping.kickoff_replay:

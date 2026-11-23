@@ -34,6 +34,7 @@ from curie_channel_gateway.slack.app import build_app
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.identities import SlackIdentityCredentials, delivery_key
 from curie_channel_gateway.slack.identity import slack_evidence
+from curie_internal.slack_mention_receipt import FACTORY_VOICE_TURN
 from curie_internal.turn_queue import from_stream_fields
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -591,7 +592,8 @@ def test_native_voice_receipt_binds_original_file_and_text_digest_on_replay(
     assert _stored(redis_client, delivery_id) == receipt
     (queued,) = _queued(redis_client, config)
     assert queued.event_id == delivery_id
-    assert [attachment.id for attachment in queued.attachments] == ["F0EXAMPLE1"]
+    assert queued.text == FACTORY_VOICE_TURN
+    assert queued.attachments == []
 
 
 @pytest.mark.parametrize(
@@ -710,3 +712,33 @@ def test_text_mention_with_an_ordinary_document_keeps_its_text_receipt(
 
     receipt = _stored(redis_client, event_id)
     assert (receipt.version, receipt.body) == (1, event["text"])
+
+
+@pytest.mark.parametrize("wrong_receiver", [False, True])
+def test_native_draft_decision_queues_only_an_opaque_marker(
+    redis_client: redis.Redis, config: DispatcherConfig, delivered: list[str], wrong_receiver: bool
+) -> None:
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    del event["files"]
+    event["text"] = "<@U0BOT> edit abcdef012345.4  Keep <@U0OTHER> & the timeout."
+    if wrong_receiver:
+        body["authorizations"][0]["user_id"] = "U0OTHER"
+    _deliver(config, redis_client, event_id, event, payload=body)
+
+    (queued,) = _queued(redis_client, config)
+    assert queued.text == FACTORY_VOICE_TURN
+    assert queued.attachments == []
+    if wrong_receiver:
+        assert redis_client.get(_receipt_key(event_id)) is None
+    else:
+        receipt = _stored(redis_client, event_id)
+        assert receipt.version == 1
+        assert receipt.body == event["text"]
+        assert (receipt.api_app_id, receipt.team_id, receipt.bot_user_id) == (
+            "A0EXAMPLE1",
+            "T1",
+            "U0BOT",
+        )

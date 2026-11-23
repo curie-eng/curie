@@ -566,6 +566,8 @@ async def _decide(
     if checked is None:
         return _refused("receipt_mismatch")
     receipt, evidence = checked
+    if receipt.version == 3 or receipt.bot_user_id is not None:
+        return _refused("receipt_mismatch")
     request_id = kickoff_request_id(data.channel_identity, data.delivery_id)
     replayed = await _replay(session, data, request_id)
     if replayed is not None:

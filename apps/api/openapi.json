@@ -10452,6 +10452,57 @@
         "title": "FactorySlackSteerOut",
         "type": "object"
       },
+      "FactorySlackVoiceOut": {
+        "properties": {
+          "disposition": {
+            "anyOf": [
+              {
+                "enum": [
+                  "queued",
+                  "applied"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disposition"
+          },
+          "outcome": {
+            "enum": [
+              "pending",
+              "draft",
+              "confirmed",
+              "rejected",
+              "refused"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "replayed": {
+            "default": false,
+            "title": "Replayed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "title": "FactorySlackVoiceOut",
+        "type": "object"
+      },
       "FactoryWake": {
         "additionalProperties": false,
         "properties": {
@@ -38174,6 +38225,65 @@
           }
         },
         "summary": "Steer Factory Run",
+        "tags": [
+          "internal-factory-slack"
+        ]
+      }
+    },
+    "/v1/internal/factory-slack/voice": {
+      "post": {
+        "operationId": "voice_factory_run_v1_internal_factory_slack_voice_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorySlackSteerIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactorySlackVoiceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Voice Factory Run",
         "tags": [
           "internal-factory-slack"
         ]

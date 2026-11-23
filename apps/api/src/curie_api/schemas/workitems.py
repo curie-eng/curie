@@ -492,6 +492,13 @@ class FactorySlackSteerOut(BaseModel):
     reason: str | None = None
 
 
+class FactorySlackVoiceOut(BaseModel):
+    outcome: Literal["pending", "draft", "confirmed", "rejected", "refused"]
+    disposition: Literal["queued", "applied"] | None = None
+    replayed: bool = False
+    reason: str | None = None
+
+
 # Every answer the factory Slack kickoff route gives (#5380). ``not_factory``
 # sends the mention down the ordinary chat path; every other refusal is final
 # for its delivery and is replied in its thread. Only an unavailable code host

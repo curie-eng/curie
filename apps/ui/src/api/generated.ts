@@ -3762,6 +3762,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/factory-slack/voice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Voice Factory Run */
+        post: operations["voice_factory_run_v1_internal_factory_slack_voice_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/github/reviews/{event_id}/reserve": {
         parameters: {
             query?: never;
@@ -9628,6 +9645,23 @@ export interface components {
             request_id?: string | null;
             /** Request Status */
             request_status?: string | null;
+        };
+        /** FactorySlackVoiceOut */
+        FactorySlackVoiceOut: {
+            /** Disposition */
+            disposition?: ("queued" | "applied") | null;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "pending" | "draft" | "confirmed" | "rejected" | "refused";
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Replayed
+             * @default false
+             */
+            replayed?: boolean;
         };
         /** FactoryWake */
         FactoryWake: {
@@ -23004,6 +23038,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FactorySlackSteerOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    voice_factory_run_v1_internal_factory_slack_voice_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorySlackSteerIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactorySlackVoiceOut"];
                 };
             };
             /** @description Validation Error */

@@ -5378,3 +5378,21 @@ Before rolling back to an API version without retention support, stop intake
 and let the current API purge outstanding drafts after their deadlines.
 The confirmation response reports whether steering queued the
 guidance or applied it to an execution request.
+
+### Slack voice feedback in a factory run thread
+
+Factory voice feedback is off by default. With the voice service enabled, use
+a threaded app mention for the clip. The receiving Slack app needs access to
+the thread and the hosted file. Curie checks the sender's linked identity
+and current factory feedback permissions before retrieving any bytes.
+
+When the transcript arrives, mention the same app in the same thread with
+`confirm <code>` to submit the displayed text, `reject <code>` to close the
+draft, or `edit <code> <replacement text>` to request a correction. An edit
+produces a new code. Only the original author can confirm it. A queued
+acknowledgement means the factory has accepted guidance. An applied
+acknowledgement identifies guidance consumed by an execution.
+
+Local replay exercises the assumed native clip file object. The event Slack
+delivers for a native clip with an app mention, its download fields, and the
+installed app's access to those bytes still require live verification.

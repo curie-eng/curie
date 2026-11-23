@@ -70,7 +70,12 @@ from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_internal.driver_declaration import DeclaredDriver
 from curie_internal.issue_links import find_issue_links
-from curie_internal.slack_mention_receipt import SlackMentionReceipt, write_receipt
+from curie_internal.slack_mention_receipt import (
+    FACTORY_VOICE_TURN,
+    SlackMentionReceipt,
+    voice_reply_text,
+    write_receipt,
+)
 from curie_internal.turn_queue import claim_event, enqueue
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind
@@ -648,6 +653,26 @@ def _delivery_canary(
     return False
 
 
+def _verified_voice_receiver(
+    body: dict[str, Any], bot_user_id: str | None, authorized_team_id: str | None
+) -> bool:
+    authorizations = body.get("authorizations")
+    if (
+        not authorized_team_id
+        or body.get("team_id") != authorized_team_id
+        or not isinstance(authorizations, list)
+        or len(authorizations) != 1
+        or not isinstance(authorizations[0], dict)
+    ):
+        return False
+    receiver = authorizations[0]
+    return (
+        receiver.get("is_bot") is True
+        and receiver.get("user_id") == bot_user_id
+        and receiver.get("team_id") == authorized_team_id
+    )
+
+
 def _voice_mention_receipt(
     *,
     body: dict[str, Any],
@@ -669,21 +694,7 @@ def _voice_mention_receipt(
         or re.search(rf"<@{re.escape(bot_user_id)}(?:\|[^>]*)?>", raw_text) is None
     ):
         return None
-    authorizations = body.get("authorizations")
-    if (
-        not authorized_team_id
-        or body.get("team_id") != authorized_team_id
-        or not isinstance(authorizations, list)
-        or len(authorizations) != 1
-        or not isinstance(authorizations[0], dict)
-    ):
-        return None
-    receiver = authorizations[0]
-    if (
-        receiver.get("is_bot") is not True
-        or receiver.get("user_id") != bot_user_id
-        or receiver.get("team_id") != authorized_team_id
-    ):
+    if not _verified_voice_receiver(body, bot_user_id, authorized_team_id):
         return None
     file_id = hosted_voice_clip_id(event)
     evidence = slack_evidence(body)
@@ -793,9 +804,22 @@ def _write_mention_receipt(
         evidence = slack_evidence(body)
     if evidence is None:
         return
-    write_receipt(
-        redis_client,
-        SlackMentionReceipt(
+    fields: dict[str, Any] = {}
+    if bot_user_id and voice_reply_text(text, bot_user_id) is not None:
+        if (
+            version != 1
+            or event.get("type") != "app_mention"
+            or event.get("text") != text
+            or any(key in event for key in ("bot_id", "bot_profile", "app_id"))
+            or event.get("channel_type") not in (None, "group", "channel")
+            or body.get("type") != "event_callback"
+            or not _verified_voice_receiver(body, bot_user_id, authorized_team_id)
+        ):
+            return
+        fields.update(bot_user_id=bot_user_id, api_app_id=body.get("api_app_id"),
+                      team_id=authorized_team_id)
+    try:
+        receipt = SlackMentionReceipt(
             version=version,
             delivery_id=delivery_id,
             channel_identity=minted_adapter(slack_identity),
@@ -806,9 +830,13 @@ def _write_mention_receipt(
             body=text,
             evidence=evidence,
             driver_bot_id=driver_bot_id,
-        ),
-        ttl_s=config.mention_receipt_ttl_seconds,
-    )
+            **fields,
+        )
+    except ValidationError:
+        if fields:
+            return
+        raise
+    write_receipt(redis_client, receipt, ttl_s=config.mention_receipt_ttl_seconds)
 
 
 def process_event(
@@ -1024,23 +1052,32 @@ def process_event(
                 web_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=REFUSAL)
                 return None
 
-        # @spec slack-alert-followup-context: Decision. After the claim, so a
-        # duplicate asks Slack nothing; before the placeholder, and it never
-        # raises, so the claim -> placeholder -> XADD order holds. A reply in a
-        # thread this bot rooted carries that root as untrusted context; every
-        # other message is returned unchanged.
-        text = SlackThreadContext(redis_client, web_client, config, logger=log).resolve(
-            event=event,
-            lane=lane,
-            bot_user_id=bot_user_id,
-            bot_id=bot_id,
-            text=text,
+        voice_turn = (
+            lane == "mention"
+            and channel.startswith(("C", "G"))
+            and event.get("channel_type") not in ("im", "mpim")
+            and (
+                (
+                    isinstance(event.get("files"), list)
+                    and any(
+                        isinstance(file, dict) and file.get("subtype") == "slack_audio"
+                        for file in event["files"]
+                    )
+                )
+                or (bot_user_id is not None and voice_reply_text(raw_text, bot_user_id) is not None)
+            )
         )
-        # Same seam as the thread root: after the claim, before the placeholder,
-        # and it never raises, so a history failure still mints the turn.
-        text = SlackDmContinuity(web_client, config, logger=log).resolve(
-            event, bot_user_id, bot_id, text, body=body,
-        )
+        if voice_turn:
+            text = FACTORY_VOICE_TURN
+            attachments = []
+        else:
+            text = SlackThreadContext(redis_client, web_client, config, logger=log).resolve(
+                event=event, lane=lane, bot_user_id=bot_user_id, bot_id=bot_id, text=text,
+            )
+            text = SlackDmContinuity(web_client, config, logger=log).resolve(
+                event, bot_user_id, bot_id, text, body=body,
+            )
+            attachments = derive_attachments(event)
 
         return _mint_turn(
             web_client=web_client,
@@ -1052,11 +1089,7 @@ def process_event(
             delivery_kind="slack event",
             author=author,
             text=text,
-            # Read from the SAME event and deliberately not from `derive_text`,
-            # whose non-empty-text passthrough is byte-identical by decision
-            # (#2006) and must stay that way. A comment plus an upload therefore
-            # carries both halves: the comment as Slack sent it, and the refs.
-            attachments=derive_attachments(event),
+            attachments=attachments,
             channel=channel,
             thread_ts=thread_ts,
             slack_identity=slack_identity,

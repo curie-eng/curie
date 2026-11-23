@@ -25,6 +25,7 @@ from curie_internal.slack_mention_receipt import (
     kickoff_request_id,
     read_receipt,
     receipt_key,
+    voice_reply_text,
     write_receipt,
 )
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW, connect_or_skip
@@ -240,3 +241,63 @@ def test_voice_receipt_round_trips_without_text_or_driver() -> None:
 def test_voice_receipt_refuses_mixed_or_incomplete_authority(changes: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         SlackMentionReceipt.model_validate({**_voice_fields(), **changes})
+
+
+def test_decision_binding_preserves_literal_edit_and_rejects_partial_or_unaddressed_authority():
+    fields = {
+        **_fields("person_thread_reply"),
+        "api_app_id": "A0EXAMPLE1",
+        "team_id": "T0EXAMPLE1",
+        "bot_user_id": "U0BOT",
+        "body": "<@U0BOT|agent> edit abcdef012345.2  keep <@U0BOT> and the timeout  ",
+    }
+    verified = SlackMentionReceipt.model_validate(fields)
+    assert json.loads(verified.model_dump_json()) == fields
+    assert voice_reply_text(verified.body, "U0BOT") == (
+        "edit abcdef012345.2  keep <@U0BOT> and the timeout  "
+    )
+    for changed in [
+        {"team_id": None},
+        {"api_app_id": None},
+        {"bot_user_id": "U0OTHER"},
+        {"body": "<@U0BOT> confirm"},
+        {"body": "please <@U0BOT> confirm abcdef012345.2"},
+        {"message_ts": fields["root_ts"]},
+        {"version": 3},
+    ]:
+        with pytest.raises(ValidationError):
+            SlackMentionReceipt.model_validate({**fields, **changed})
+
+
+def test_source_index_requires_the_live_original_receipt(valkey: redis.Redis) -> None:
+    from curie_internal.slack_mention_receipt import read_voice_source_receipt, voice_source_key
+
+    fields = _voice_fields()
+    fields["message_ts"] = f"1800000000.{uuid.uuid4().int}"
+    fields["delivery_id"] = f"Ev0EXAMPLE{uuid.uuid4().hex}"
+    receipt = SlackMentionReceipt.model_validate(fields)
+    scope = dict(
+        channel_identity=receipt.channel_identity,
+        team_id=fields["team_id"],
+        app_id=fields["api_app_id"],
+        channel=receipt.channel,
+        root_ts=receipt.root_ts,
+        message_ts=receipt.message_ts,
+    )
+
+    async def read(**params: str) -> SlackMentionReceipt | None:
+        async with AsyncRedis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None) as db:
+            return await read_voice_source_receipt(db, **params)
+
+    assert write_receipt(valkey, receipt, ttl_s=60)
+    try:
+        assert asyncio.run(read(**scope)) == receipt
+        other_message = receipt.model_copy(update={"message_ts": "1800000000.000002"})
+        assert not write_receipt(valkey, other_message, ttl_s=60)
+        other_scope = {**scope, "message_ts": other_message.message_ts}
+        assert not valkey.exists(voice_source_key(**other_scope))
+        assert asyncio.run(read(**{**scope, "app_id": "A0OTHER"})) is None
+        valkey.delete(receipt_key(receipt.delivery_id))
+        assert asyncio.run(read(**scope)) is None
+    finally:
+        valkey.delete(receipt_key(receipt.delivery_id), voice_source_key(**scope))

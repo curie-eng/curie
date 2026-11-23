@@ -26,6 +26,7 @@ CLUSTER_REPLY_KEY_PREFIX = "curie:cluster-message-replies"
 WORK_ITEM_CI_RERUN_PREFIX = "curie:work-item:ci-rerun"
 WORK_ITEM_REVIEW_FEEDBACK_PREFIX = "curie:work-item:review-feedback"
 SLACK_MENTION_RECEIPT_PREFIX = "curie:slack-mention-receipt:"
+SLACK_VOICE_SOURCE_PREFIX = "curie:slack-voice-source:"
 
 
 def kill_key(agent_id: uuid.UUID) -> str:

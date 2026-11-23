@@ -31,6 +31,7 @@ from .senders import SlackSenderIdentities
 from .slack_sink import SlackReplyAdapter
 from .tokens import SlackProviderConfig, slack_bot_tokens
 from .user_emails import SlackUserEmails
+from .voice import SlackVoiceGateway
 
 
 class GatewayConfig(BaseSettings):
@@ -133,6 +134,7 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
             files={name: SlackFileClient(token=token) for name, token in tokens.items() if token},
             providers=GatewayProviders(
                 public_channel=sink.verify_public_channel,
+                voice=SlackVoiceGateway(http, tokens, base_url=config.slack_api_base_url or None),
                 channel=SlackChannelReader(http, tokens),
                 canvas=SlackCanvasReader(http, tokens),
                 senders=SlackSenderIdentities(tokens, base_url=config.slack_api_base_url or None),
