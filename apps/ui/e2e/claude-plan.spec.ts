@@ -31,11 +31,17 @@ interface Seen {
 
 async function stub(
   page: Page,
-  opts: { session: "principal" | "operator"; start?: Enrollment; staleWrites?: number[] },
-): Promise<{ seen: Seen[] }> {
+  opts: { session: "principal" | "operator"; start?: Enrollment; staleWrites?: number[]; holdWrites?: boolean },
+): Promise<{ seen: Seen[]; releaseWrites: () => void }> {
   const seen: Seen[] = [];
   let current: Enrollment = opts.start ?? { state: "absent", generation: null, version: null, teardown: none };
   let writes = 0;
+  let releaseWrites = () => {};
+  const held = opts.holdWrites
+    ? new Promise<void>((resolve) => {
+        releaseWrites = resolve;
+      })
+    : null;
   const json = (route: Route, status: number, body: unknown) =>
     route.fulfill({ status, contentType: "application/json", headers: { "Cache-Control": "no-store" }, body: JSON.stringify(body) });
 
@@ -54,12 +60,14 @@ async function stub(
   await page.route((u) => u.pathname === "/api/config", (route) => json(route, 200, { org_name: "Globex Corporation" }));
   await page.route(
     (u) => u.pathname === ENROLLMENT,
-    (route) => {
+    async (route) => {
       const req = route.request();
       seen.push({ method: req.method(), url: req.url(), headers: req.headers(), body: req.postData() });
       if (req.method() === "GET") return json(route, 200, current);
       if (req.method() === "PUT") {
-        if (opts.staleWrites?.includes(writes++)) return json(route, 409, { detail: { code: "stale_version" } });
+        const attempt = writes++;
+        if (held && attempt === 0) await held;
+        if (opts.staleWrites?.includes(attempt)) return json(route, 409, { detail: { code: "stale_version" } });
         current = { state: "active", generation: (current.generation ?? 0) + 1, version: (current.version ?? 0) + 1, teardown: none };
         return json(route, 200, current);
       }
@@ -67,7 +75,7 @@ async function stub(
       return json(route, 200, current);
     },
   );
-  return { seen };
+  return { seen, releaseWrites };
 }
 
 test.describe("claude_plan", () => {
@@ -175,6 +183,69 @@ test.describe("claude_plan", () => {
     await expect(page).toHaveURL(/\/$/);
     await page.goBack();
     await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+  });
+
+  test("claude_plan history restores Agents across Back and Forward", async ({ page }) => {
+    await stub(page, { session: "principal" });
+    await page.goto("/settings/claude-plan?api=1");
+    await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+
+    await page.getByRole("button", { name: "Agents", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(page).toHaveURL(/\/settings\/claude-plan$/);
+    await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await expect(page).toHaveURL(/\/$/);
+
+    await page.goto("/settings/claude-plan?api=1");
+    await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+    await page.getByRole("button", { name: "Agents", exact: true }).click();
+    await page.goBack();
+    await expect(page).toHaveURL(/\/settings\/claude-plan/);
+    await expect(page.getByTestId("claude-plan-status")).toBeVisible();
+    await page.goForward();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+
+    await page.goto("/?api=1");
+    await expect(page.getByRole("heading", { name: "Welcome to Curie" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Overview", exact: true })).toHaveAttribute("aria-current", "page");
+    await page.getByRole("button", { name: "Agents", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Welcome to Curie" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Agents", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(page.getByText("Workspace name")).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Agents", exact: true })).toBeVisible();
+    await expect(page).toHaveURL(/\/$/);
+  });
+
+  test("claude_plan a pending connect stays blocked after Workspace and back", async ({ page }) => {
+    const { seen, releaseWrites } = await stub(page, { session: "principal", holdWrites: true });
+    await page.goto("/settings/claude-plan?api=1");
+    await page.getByTestId("claude-plan-token").fill(SENTINEL);
+    await page.getByTestId("claude-plan-write").click();
+    await expect(page.getByTestId("claude-plan-token")).toBeDisabled();
+    await expect.poll(() => seen.filter((entry) => entry.method === "PUT").length).toBe(1);
+
+    await page.getByRole("button", { name: "Workspace" }).click();
+    await expect(page.getByText("Workspace name")).toBeVisible();
+    await page.getByRole("button", { name: "Claude plan" }).click();
+    await expect(page.getByTestId("claude-plan-token")).toBeDisabled();
+    expect(seen.filter((entry) => entry.method === "PUT").length).toBe(1);
+
+    releaseWrites();
+    await expect(page.getByTestId("claude-plan-generation")).toHaveText("Generation 1");
+    expect(seen.filter((entry) => entry.method === "PUT").length).toBe(1);
+    expect(await page.locator("body").innerText()).not.toContain(SENTINEL);
   });
 
   test("claude_plan and route: an operator session sees the sign-in prompt and no form", async ({ page }) => {

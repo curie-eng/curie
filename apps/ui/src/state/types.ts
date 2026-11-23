@@ -60,7 +60,9 @@ export type Action =
   | { type: "go"; nav: Nav }
   | { type: "settingsSection"; section: SettingsSection }
   // The browser moved (Back, Forward): show what the path names.
-  | { type: "locate"; pathname: string }
+  // On `/`, `nav` is the view stored with that history entry. Missing nav
+  // stays on the path, which is Overview.
+  | { type: "locate"; pathname: string; nav?: Nav | null }
   | { type: "openModal"; modal: ModalKind }
   | { type: "closeModal" }
   | { type: "toast"; message: string | null }
