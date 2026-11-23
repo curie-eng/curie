@@ -71,11 +71,24 @@ class SlackSteeringRun(sk.ScriptedRun):
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__(args)
+        self.namespace = f"test-slack-steering-{self.run_id}"
+        self.release = f"curie-{self.run_id}"
+        if args.build_images:
+            self.owned_build_tag = f"steering-{self.run_id}"
+            self.runner_source = f"curie-runner:{self.owned_build_tag}"
+            self.image_refs = tuple(
+                f"{image.rsplit(':', 1)[0]}:{self.owned_build_tag}" for image in self.image_refs
+            )
         self.guidance = SteeringRouter()
         self.advanced: set[str] = set()
 
     def gateway_enabled(self) -> bool:
         return True
+
+    def extend_install_values(self, values: dict[str, Any]) -> None:
+        if self.owned_build_tag:
+            for component in ("api", "worker", "ui", sk.GATEWAY_COMPONENT):
+                values[component]["image"]["tag"] = self.owned_build_tag
 
     def make_router(self, model_module: Any) -> SteeringRouter:
         return self.guidance
@@ -85,7 +98,7 @@ class SlackSteeringRun(sk.ScriptedRun):
             "-n",
             self.namespace,
             "exec",
-            "deployment/curie-api",
+            f"deployment/{self.release}-api",
             "--",
             "python",
             "-c",
