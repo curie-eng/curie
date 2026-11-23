@@ -2437,10 +2437,11 @@ revision, subject to the plain-feedback cap. Immediate refusal codes appear
 only in the webhook response. To retry a transient confirmation failure,
 post a new comment with the same confirmation code.
 
-In local replay the CPU model transcribed “Retry” as “reach right”. The author
-corrected the label before confirming. Both conversation types produced one
-revision request on the original WorkItem, including after a duplicate
-confirmation. The resulting change to a live pull request remains unverified.
+In local replay, the CPU model produced a draft for each WAV fixture. The
+author edited each draft and confirmed its new code. The issue conversation
+and the pull request conversation each queued one revision on the original
+WorkItem. Repeated confirmations queued no additional revisions. The diff
+on a live pull request remains unverified.
 
 Two provider checks remain open. The first needs a real browser-uploaded WAV
 in each kind of comment, delivered to the factory by GitHub. The second needs
