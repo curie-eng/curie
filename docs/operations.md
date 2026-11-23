@@ -841,7 +841,7 @@ install of Curie on the same cluster (which normally means two releases
 sharing the default name `curie` in different namespaces), tearing one down
 never touches the other's namespaces.
 
-The sweep waits at most 300 seconds. If an owned namespace is still present,
+The sweep waits at most 300s, plus up to 300s more while only namespace-controller objects (events, endpoints, endpoint slices, kube-root-ca.crt) remain. If an owned namespace is still present,
 the command exits 3 and names the namespace, its phase, its conditions, and
 the remaining objects. It does not remove finalizers or finalize the
 namespace. Rerunning is safe.
