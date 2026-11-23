@@ -23,7 +23,11 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
-from claude_agent_sdk.types import PermissionResultDeny, ToolPermissionContext
+from claude_agent_sdk.types import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import ApprovalGate
@@ -31,9 +35,11 @@ from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
 from curie_runner.harness.claude.approval import (
     build_approval_hook,
+    build_approval_server,
     build_can_use_tool,
 )
 from curie_runner.session import SessionRunner
+from mcp import types as mcp_types
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from sdk_cli_support import sdk_cli_available
 from starlette.requests import Request
@@ -194,7 +200,14 @@ async def _boot(
 
 
 class _PublicationModel(FakeModelSession):
-    """An external model that can receive the stream before its SDK callbacks."""
+    """An external model that can receive the stream before its SDK callbacks.
+
+    It emulates the CLI around each publish call: the PreToolUse hook and the
+    permission callback decide it, a refusal becomes the error tool result, and
+    an allowed call runs the real ``publish_changes`` tool body (the one place a
+    publication is recorded), then the approval hook's PostToolUse callbacks,
+    whose ``continue_`` False ends the turn.
+    """
 
     def __init__(
         self,
@@ -209,14 +222,31 @@ class _PublicationModel(FakeModelSession):
         self.proposals = proposals
         self.stream_first = stream_first
         self.before_call = before_call
-        self.permissions: list[PermissionResultDeny] = []
+        self.decisions: list[PermissionResultAllow | PermissionResultDeny] = []
         self.hooks: list[dict[str, Any]] = []
         self.pending_after_stream: list[bool] = []
         self.tool_results: list[ToolResultBlock] = []
 
+    async def _run_body(self, proposal: dict[str, Any]) -> tuple[bool, str]:
+        server = build_approval_server(self.gate, managed_workspace=True)
+        entry = server["instance"].get_request_handler("tools/call")
+        assert entry is not None
+        result = await entry.handler(
+            None,
+            mcp_types.CallToolRequestParams(
+                name=PLATFORM_PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+                arguments=proposal,
+            ),
+        )
+        payload = result.model_dump()
+        text = " ".join(str(item.get("text") or "") for item in payload.get("content") or [])
+        return payload.get("is_error") is True, text
+
     async def receive_turn(self) -> AsyncIterator[Any]:
         permission = build_can_use_tool(self.gate)
-        hook = build_approval_hook(self.gate)["PreToolUse"][0].hooks[0]
+        approval_hooks = build_approval_hook(self.gate)
+        hook = approval_hooks["PreToolUse"][0].hooks[0]
+        post_hooks = approval_hooks["PostToolUse"][0].hooks
         for index, (call_id, proposal) in enumerate(self.proposals):
             if self.before_call is not None:
                 self.before_call(index)
@@ -242,16 +272,35 @@ class _PublicationModel(FakeModelSession):
                     ToolPermissionContext(tool_use_id=call_id),
                 ),
             )
-            assert isinstance(decision, PermissionResultDeny)
             self.hooks.append(hook_result)
-            self.permissions.append(decision)
+            self.decisions.append(decision)
             if not self.stream_first:
                 yield message
-            result = ToolResultBlock(tool_use_id=call_id, content=decision.message, is_error=True)
+            if isinstance(decision, PermissionResultDeny):
+                result = ToolResultBlock(
+                    tool_use_id=call_id, content=decision.message, is_error=True
+                )
+                self.tool_results.append(result)
+                yield UserMessage(content=[result])
+                if decision.interrupt:
+                    return
+                continue
+            # Both layers allowed it (the hook by abstaining), so the CLI runs
+            # the tool body and then every PostToolUse callback.
+            assert isinstance(decision, PermissionResultAllow)
+            assert hook_result == {}
+            is_error, text = await self._run_body(proposal)
+            result = ToolResultBlock(tool_use_id=call_id, content=text, is_error=is_error)
             self.tool_results.append(result)
             yield UserMessage(content=[result])
-            if decision.interrupt:
-                return
+            post_input = {
+                "tool_name": PLATFORM_PUBLISH_TOOL_NAME,
+                "tool_input": proposal,
+                "tool_response": text,
+            }
+            for post in post_hooks:
+                if (await post(post_input, call_id, {})).get("continue_") is False:
+                    return
         yield _success()
 
 
@@ -269,8 +318,10 @@ async def _run(
 def _assert_refusal(
     model: _PublicationModel, gate: ApprovalGate, frames: list[dict[str, Any]], reason: str
 ) -> None:
-    assert reason in model.permissions[0].message
-    assert model.permissions[0].interrupt is False
+    decision = model.decisions[0]
+    assert isinstance(decision, PermissionResultDeny)
+    assert reason in decision.message
+    assert decision.interrupt is False
     hook = model.hooks[0]
     assert hook["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert reason in hook["hookSpecificOutput"]["permissionDecisionReason"]
@@ -490,9 +541,17 @@ def test_refused_proposal_can_be_corrected_with_a_file_change_in_the_same_turn(
             )
             frames = await _run(runner, model, _event(_context(head, url)))
             assert len(model.queries) == 1
-            assert len(model.permissions) == 2
-            assert model.permissions[0].interrupt is False
-            assert model.permissions[1].interrupt is True
+            assert len(model.decisions) == 2
+            refused, corrected = model.decisions
+            assert isinstance(refused, PermissionResultDeny)
+            assert refused.interrupt is False
+            # The corrected call is allowed and its tool body records it once.
+            assert isinstance(corrected, PermissionResultAllow)
+            assert model.hooks[1] == {}
+            assert [result.is_error for result in model.tool_results] == [True, False]
+            # Nothing is recorded on sight of either call, only by the body.
+            assert model.pending_after_stream == [False, False]
+            assert gate.pending_halt is True
             assert frames[-1]["status"] == "awaiting-approval"
             assert frames[-1]["approval_granted_tool"] == PLATFORM_PUBLISH_TOOL_NAME
             assert gate.publication_title == "Publish corrected documentation"
@@ -547,7 +606,11 @@ def test_body_only_revision_reaches_publication_approval(
                 gate, [("bodyfix", {"title": TITLE, "body": changed_body})]
             )
             frames = await _run(runner, model, _event(_context(head, url)))
+            assert isinstance(model.decisions[0], PermissionResultAllow)
+            assert model.tool_results[0].is_error is False
+            assert model.pending_after_stream == [False]
             assert frames[-1]["status"] == "awaiting-approval"
+            assert frames[-1]["approval_granted_tool"] == PLATFORM_PUBLISH_TOOL_NAME
             assert gate.publication_body == changed_body
             assert gate.publication_title == TITLE
             assert len(calls) == 1
@@ -569,6 +632,8 @@ def test_file_change_does_not_contact_unavailable_metadata_provider(
             assert gate is not None
             model = _PublicationModel(gate, [("files", {"title": TITLE, "body": BODY})])
             frames = await _run(runner, model, _event(_context(head, url)))
+            assert isinstance(model.decisions[0], PermissionResultAllow)
+            assert model.tool_results[0].is_error is False
             assert frames[-1]["status"] == "awaiting-approval"
             assert gate.publication_title == TITLE
             assert gate.publication_body == BODY
@@ -598,9 +663,12 @@ def test_identical_arguments_with_a_new_call_id_require_fresh_truth(
             )
             frames = await _run(runner, model, _event(_context(head, url)))
             assert len(calls) == 2
-            assert "no_change" in model.permissions[0].message
-            assert "stale_context" in model.permissions[1].message
-            assert all(not decision.interrupt for decision in model.permissions)
+            first, later = model.decisions
+            assert isinstance(first, PermissionResultDeny)
+            assert isinstance(later, PermissionResultDeny)
+            assert "no_change" in first.message
+            assert "stale_context" in later.message
+            assert not first.interrupt and not later.interrupt
             assert frames[-1]["status"] == "done"
             assert gate.pending_summary is None
 
@@ -631,11 +699,16 @@ def test_precheck_budget_counts_shared_calls_once_and_does_not_block_file_correc
             )
             frames = await _run(runner, model, _event(_context(head, url)))
             assert len(calls) == 5
-            assert len(model.permissions) == 7
-            assert all("no_change" in decision.message for decision in model.permissions[:5])
-            assert "rate" in model.permissions[5].message.casefold()
-            assert all(not decision.interrupt for decision in model.permissions[:6])
-            assert model.permissions[6].interrupt is True
+            assert len(model.decisions) == 7
+            refusals = model.decisions[:6]
+            assert all(isinstance(decision, PermissionResultDeny) for decision in refusals)
+            assert all("no_change" in decision.message for decision in refusals[:5])
+            assert "rate" in refusals[5].message.casefold()
+            assert all(not decision.interrupt for decision in refusals)
+            # The file correction is allowed and its body records it once.
+            assert isinstance(model.decisions[6], PermissionResultAllow)
+            assert [result.is_error for result in model.tool_results] == [True] * 6 + [False]
+            assert gate.pending_halt is True
             assert frames[-1]["status"] == "awaiting-approval"
 
     anyio.run(go)
@@ -669,8 +742,10 @@ def test_local_commits_cannot_be_mistaken_for_an_unchanged_publication(
             frames = await _run(runner, model, _event(_context(head, url)))
             # #5230: the commit on top of the prepared head is the publication
             # candidate, so it reaches approval without a metadata comparison.
-            assert "head_changed" not in model.permissions[0].message
-            assert model.permissions[0].interrupt is True
+            assert isinstance(model.decisions[0], PermissionResultAllow)
+            assert model.hooks[0] == {}
+            assert model.tool_results[0].is_error is False
+            assert "head_changed" not in str(model.tool_results[0].content)
             assert frames[-1]["status"] == "awaiting-approval"
             assert gate.publication_title == TITLE
             assert gate.publication_body == BODY
@@ -707,6 +782,11 @@ def test_warm_turn_replaces_context_and_drops_it_when_next_event_has_none(
             assert third[-1]["status"] == "awaiting-approval"
             assert len(model.queries) == 3
             assert [call["capability"] for call in calls] == [CAPABILITY, fresh["capability"]]
+            assert [type(decision) for decision in model.decisions] == [
+                PermissionResultDeny,
+                PermissionResultDeny,
+                PermissionResultAllow,
+            ]
             assert gate.publication_title == TITLE
 
     anyio.run(go)

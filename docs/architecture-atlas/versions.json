@@ -1,6 +1,6 @@
 {
   "schemaVersion": "1.0",
-  "defaultVersion": "v0.16.4",
+  "defaultVersion": "v0.17.0",
   "versions": [
     {
       "id": "v0.7.1",
@@ -433,6 +433,14 @@
       "date": "2026-11-21",
       "branch": "main",
       "commit": "99eb2f2e8cc9e0070add8d5e2d13eda36c44de3c"
+    },
+    {
+      "id": "v0.17.0",
+      "label": "v0.17.0",
+      "file": "snapshots/v0.17.0.json",
+      "date": "2026-11-22",
+      "branch": "next",
+      "commit": "f52fa0ab2b367a69677343a3c374dfd012758c25"
     }
   ]
 }

@@ -44,7 +44,6 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 from curie_internal.provider_scope import ProviderScope
 from curie_telemetry.redact import redact_text
-from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
 from .final_answer import (
@@ -322,26 +321,6 @@ class TurnState:
     # reported as errored *because we interrupted it*, instead of reporting a
     # failure with nothing to approve.
     approval_halt_requested: bool = False
-    # The exact tool ID and input of every publication call seen on the
-    # stream this turn (#2294), in call order. Captured here, decided in
-    # ``SessionRunner._observe_publication_calls``: this module stays pure and
-    # never touches the ApprovalGate, so the same seam serves the live turn and
-    # the offline fake. Not a rare path: against the real SDK the stream reaches
-    # the session before the CLI dispatches PreToolUse, so this list is what
-    # normally writes the record first and the hook's own block then finds it
-    # standing. It is load-bearing for the case where neither SDK layer recorded
-    # the call at all and the turn would otherwise finalize DONE with nothing to
-    # approve.
-    publication_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
-    # How many of ``publication_calls`` the session has already acted on, so the
-    # observation runs exactly once per call even though it is invoked on every
-    # message of the turn.
-    publication_calls_observed: int = 0
-    # Why a publication call could NOT be recorded (a malformed proposal, or a
-    # gate that does not carry the publish tool). Runner-internal, never a wire
-    # field: the session turns it into a fail-closed classified failure, because
-    # a publication the runner cannot record must not look like a clean turn.
-    publication_unrecorded: str | None = None
     # Call id -> live tool name for EVERY call seen this turn (#3486), read-only
     # ones included, unlike ``pending_actions``. Popped by the result that
     # closes the call, so a result for an id this turn never saw, or a second
@@ -351,8 +330,7 @@ class TurnState:
     # for each result that closed a call
     # in ``open_tool_calls``, in arrival order (#3486). Wire-level facts only,
     # never the result's content. Captured here, counted in
-    # ``SessionRunner._observe_tool_results``: the same split as
-    # ``publication_calls``, and for the same reason.
+    # ``SessionRunner._observe_tool_results``, so this module stays pure.
     tool_results: list[tuple[str, str, bool, bool]] = field(default_factory=list)
     # How many of ``tool_results`` the session has already counted.
     tool_results_observed: int = 0
@@ -533,13 +511,6 @@ def _translate_assistant(
                 # inferred. It is not proof this runner executed the tool.
                 gen.tool_use(block.id, block.name)
             # @spec RUNNER-TOOL-ACCESS-3: a read-only turn captures no request.
-            if block.name == PLATFORM_PUBLISH_TOOL_NAME and state.tool_access is None:
-                # Wire-level capture only (#2294). The session decides what to
-                # do with it; recording it here would put gate state in a
-                # deliberately pure module.
-                state.publication_calls.append(
-                    (block.id, block.input if isinstance(block.input, dict) else {})
-                )
             if block.name == APPROVAL_TOOL_NAME and state.tool_access is None:
                 # A policy gate fired (ADR-0010). Capture the summary (and the
                 # optional route, #247) at the wire level so the real path

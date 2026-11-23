@@ -37,6 +37,8 @@ import scripted_lanes as lanes  # noqa: E402
 REPO_ROOT = TOOLS.parents[1]
 STUB = REPO_ROOT / "tools/github-stub/github_stub.py"
 MODEL_SCRIPT = REPO_ROOT / "tools/model-script/model_script.py"
+REPRODUCTION_GATE = REPO_ROOT / "examples/dark-factory/hooks/reproduction_gate.py"
+DECISIONS_SECTION = REPO_ROOT / "examples/dark-factory/hooks/decisions_section.py"
 SEED_TREE = TOOLS / "fixtures/unitconv"
 RECORDING = REPO_ROOT / "tools/github-stub/recordings/curie-pr-3400.json"
 REPOSITORY = "acme-corp/acme-bot"
@@ -600,6 +602,34 @@ def test_the_asked_questions_are_exactly_two_and_the_publication_closes_the_issu
     (publish,) = [c for c in calls if c["name"] == "mcp__curie__publish_changes"]
     assert f"Closes #{ots.ISSUE}" in publish["input"]["body"]
     assert "3815" not in json.dumps(exchanges)
+
+
+def test_the_github_lane_publication_cites_the_answer_its_labeller_posted() -> None:
+    """Session 2's body cites the answer the GitHub lane admits, by its author.
+
+    The lane's one authorized answer is ``ANSWER_TEXT``, posted by the stub's
+    labeller, and a GitHub ticket read names a comment's author by login. The
+    body must carry that citation, which is also what the dark factory's
+    reproduction gate requires once the ticket carries the factory's questions,
+    inside a Decisions section the review gate's grammar accepts. The runner
+    honours those gates' denies, so a body either refuses would be denied in
+    the run and the model asked for an exchange the transcript does not hold.
+    """
+
+    reproduction = _load("one_ticket_reproduction_gate", REPRODUCTION_GATE)
+    decisions = _load("one_ticket_decisions_section", DECISIONS_SECTION)
+    model = _load("one_ticket_model_script_gates", MODEL_SCRIPT)
+    (body,) = run.publication_bodies(model.load_transcript(run.TRANSCRIPT))
+
+    assert run.ANSWER_AUTHOR == GITHUB.HUMAN["login"]
+    citation = f"Answered on the ticket by {GITHUB.HUMAN['login']}: {run.ANSWER_TEXT}"
+    assert run.answer_citation(GITHUB.HUMAN["login"]) == citation
+    assert body.splitlines().count(citation) == 1
+    assert [
+        line for line in body.splitlines() if line.startswith("Answered on the ticket by ")
+    ] == [citation]
+    assert reproduction.cited(body)
+    assert len(decisions.parse_decisions_section(body)) == 2
 
 
 def test_the_publication_scenario_routes_a_fixture_issue_it_never_labelled_to_the_fallback(
