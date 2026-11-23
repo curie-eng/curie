@@ -1799,6 +1799,20 @@ pub struct WorkItemOutcome {
     pub ci: Option<WorkItemCi>,
     pub ci_observation: Option<WorkItemCiObservation>,
     pub requests: Vec<WorkItemRequest>,
+    pub memory_rules: WorkItemMemoryRules,
+}
+
+/// `MemoryRulesMetadata`: the learned rules pinned at the work item's
+/// admission (#5798). Numbers and digest only; the API never sends the text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemMemoryRules {
+    pub state: String,
+    #[serde(default)]
+    pub count: u64,
+    #[serde(default)]
+    pub rule_numbers: Vec<u64>,
+    pub sha256: Option<String>,
+    pub format_version: Option<u64>,
 }
 
 /// `WorkItemRetryOut`: the answer to `POST /work-items/{id}/retry` (#5431),

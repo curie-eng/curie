@@ -4,7 +4,14 @@ import { C } from "../../tokens";
 import { Card, SectionTitle, EmptyState, Notice, Button, CliHint, cliCommand } from "../../primitives";
 import { useStore } from "../../state/store";
 import { useWired } from "../../state/wired";
-import { ApiError, getWorkItem, listWorkItems, type WorkItemOutcome } from "../../api/client";
+import {
+  ApiError,
+  getWorkItem,
+  listMemoryRules,
+  listWorkItems,
+  type MemoryRule,
+  type WorkItemOutcome,
+} from "../../api/client";
 import { issueRef } from "./factoryParts";
 
 // Factory outcomes console (#2577): the GitHub-issue-driven agent's queue of
@@ -195,6 +202,62 @@ function WorkItemRow({ item, onOpen }: { item: WorkItemOutcome; onOpen: () => vo
   );
 }
 
+// The pinned rules are named by number and digest on the work item; the text
+// is read from the agent's rule list (every state, so a rule removed after
+// admission still resolves). A rule matches on the repository scope the work
+// item froze at admission plus its number, since numbers repeat across scopes.
+function repositoryScopeKey(repo: WorkItemOutcome["repository"]): string {
+  return `${repo.code_host_kind}:${repo.host}:${repo.project_id}`;
+}
+
+function PinnedRules({ item }: { item: WorkItemOutcome }) {
+  const pinned = item.memory_rules;
+  const numbers = pinned?.rule_numbers ?? [];
+  const rulesQuery = useQuery({
+    queryKey: ["memoryRules", item.agent_id],
+    enabled: numbers.length > 0,
+    queryFn: () => listMemoryRules(item.agent_id),
+  });
+  if (!pinned || pinned.state !== "selected" || numbers.length === 0) return null;
+  const scopeKey = repositoryScopeKey(item.repository);
+  const byNumber = new Map<number, MemoryRule>();
+  for (const rule of rulesQuery.data?.rules ?? []) {
+    if (rule.scope_kind === "repository" && rule.scope_key === scopeKey) byNumber.set(rule.number, rule);
+  }
+  return (
+    <div data-testid="work-item-learned-rules">
+      <div style={{ color: C.muted, fontSize: 11, marginBottom: 3 }}>learned rules</div>
+      <div style={{ color: C.muted, fontSize: 12, marginBottom: 6 }}>
+        {`${pinned.count} pinned when this work item was admitted`}
+        {pinned.sha256 ? (
+          <>
+            {" · "}
+            <span style={{ fontFamily: C.mono }} title={pinned.sha256}>
+              sha256 {pinned.sha256.slice(0, 12)}
+            </span>
+          </>
+        ) : null}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {numbers.map((n) => {
+          const rule = byNumber.get(n);
+          return (
+            <div key={n} data-testid="work-item-learned-rule" style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
+              <span style={{ fontFamily: C.mono, fontSize: 12, color: C.text2 }}>{`R${n}`}</span>
+              <span>
+                {rule ? rule.text : <span style={{ color: C.muted }}>{rulesQuery.isPending ? "Loading rule text…" : "Rule text unavailable."}</span>}
+                {rule && rule.state !== "accepted" ? (
+                  <span style={{ color: C.muted, fontSize: 12 }}>{` (${rule.state} since)`}</span>
+                ) : null}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function WorkItemDetail({ item }: { item: WorkItemOutcome }) {
   return (
     <Card>
@@ -260,6 +323,7 @@ function WorkItemDetail({ item }: { item: WorkItemOutcome }) {
             </div>
           </div>
         ) : null}
+        <PinnedRules item={item} />
         {item.requests.length > 0 ? (
           <div>
             <div style={{ color: C.muted, fontSize: 11, marginBottom: 3 }}>requests</div>

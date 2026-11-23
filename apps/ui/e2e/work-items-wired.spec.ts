@@ -56,6 +56,7 @@ function item(overrides: Record<string, unknown> = {}) {
         last_deferral_reason: null,
       },
     ],
+    memory_rules: { state: "absent", count: 0, rule_numbers: [], sha256: null, format_version: null },
     ...overrides,
   };
 }
@@ -124,4 +125,76 @@ test("a detail 404 says the item no longer exists", async ({ page }) => {
 
   await page.getByTestId("work-item-row").click();
   await expect(page.getByText(/no longer exists/i)).toBeVisible();
+});
+
+const PINNED_RULES = {
+  state: "selected",
+  count: 2,
+  rule_numbers: [1, 4],
+  sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  format_version: 1,
+};
+
+function rule(number: number, text: string, state = "accepted") {
+  return {
+    id: `00000000-0000-4000-8000-00000000000${number}`,
+    number,
+    label: `R${number}`,
+    scope_kind: "repository",
+    scope_key: "github:github.com:4401",
+    scope_label: "acme-corp/acme-bot",
+    state,
+    text,
+    reason: "Reviewers asked for it twice.",
+    source_url: null,
+    proposed_by: "github:6601:octocat",
+    proposed_at: "2026-11-18T09:00:00Z",
+    accepted_by: null,
+    accepted_at: null,
+    rejected_by: null,
+    rejected_at: null,
+    removed_by: null,
+    removed_at: null,
+    version: 1,
+  };
+}
+
+test("a detail names the learned rules pinned at admission, and an item with none shows no heading", async ({ page }) => {
+  await stubWorkItems(page, [item({ memory_rules: PINNED_RULES })]);
+  await page.route(/\/api\/work-items\/[^/?]+(\?.*)?$/, (route) =>
+    route.fulfill(json(200, item({ memory_rules: PINNED_RULES }))),
+  );
+  await page.route(
+    (url) => /\/api\/agents\/[^/]+\/memory\/rules$/.test(url.pathname),
+    (route) =>
+      route.fulfill(
+        json(200, {
+          rules: [
+            rule(1, "Run the formatter before pushing."),
+            rule(2, "Not pinned on this item."),
+            rule(4, "Keep migrations reversible.", "removed"),
+          ],
+          scopes: [],
+          in_force_limit: 20,
+        }),
+      ),
+  );
+  await openWorkItems(page);
+  await page.getByTestId("work-item-row").click();
+
+  const rules = page.getByTestId("work-item-learned-rules");
+  await expect(rules).toContainText("2 pinned when this work item was admitted");
+  await expect(rules.getByTestId("work-item-learned-rule")).toHaveCount(2);
+  await expect(rules).toContainText("Run the formatter before pushing.");
+  await expect(rules).toContainText("Keep migrations reversible.");
+  await expect(rules).not.toContainText("Not pinned on this item.");
+});
+
+test("a detail with no pinned rules shows no learned rules section", async ({ page }) => {
+  await stubWorkItems(page, [item()]);
+  await openWorkItems(page);
+  await page.getByTestId("work-item-row").click();
+
+  await expect(page.getByTestId("work-item-detail")).toBeVisible();
+  await expect(page.getByTestId("work-item-learned-rules")).toHaveCount(0);
 });

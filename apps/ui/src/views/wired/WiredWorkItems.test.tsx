@@ -10,8 +10,11 @@ import {
   ApiError,
   getAgents,
   getWorkItem,
+  listMemoryRules,
   listWorkItems,
   type AgentOut,
+  type MemoryRule,
+  type MemoryRules,
   type WorkItemOutcome,
 } from "../../api/client";
 
@@ -26,6 +29,7 @@ vi.mock("../../api/client", async (importOriginal) => {
     getConfig: vi.fn().mockResolvedValue({}),
     listWorkItems: vi.fn(),
     getWorkItem: vi.fn(),
+    listMemoryRules: vi.fn(),
   };
 });
 
@@ -74,6 +78,7 @@ function outcome(overrides: Partial<WorkItemOutcome> = {}): WorkItemOutcome {
         last_deferral_reason: null,
       },
     ],
+    memory_rules: { state: "absent", count: 0, rule_numbers: [], sha256: null, format_version: null },
     ...overrides,
   } as WorkItemOutcome;
 }
@@ -106,6 +111,44 @@ function wrapper() {
       </QueryClientProvider>
     );
   };
+}
+
+const DIGEST = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+const PINNED: WorkItemOutcome["memory_rules"] = {
+  state: "selected",
+  count: 2,
+  rule_numbers: [1, 4],
+  sha256: DIGEST,
+  format_version: 1,
+};
+
+function rule(overrides: Partial<MemoryRule>): MemoryRule {
+  return {
+    id: "rule-id",
+    number: 1,
+    label: "R1",
+    scope_kind: "repository",
+    scope_key: "github:github.com:4401",
+    scope_label: "acme-corp/acme-bot",
+    state: "accepted",
+    text: "",
+    reason: "",
+    source_url: null,
+    proposed_by: "factory",
+    proposed_at: "2026-09-01T00:00:00Z",
+    accepted_by: null,
+    accepted_at: null,
+    rejected_by: null,
+    rejected_at: null,
+    removed_by: null,
+    removed_at: null,
+    version: 1,
+    ...overrides,
+  } as MemoryRule;
+}
+
+function rulesList(rules: MemoryRule[]): MemoryRules {
+  return { rules, scopes: [], in_force_limit: 20 } as MemoryRules;
 }
 
 function renderView() {
@@ -361,5 +404,60 @@ describe("WiredWorkItems (#2577)", () => {
     expect(
       screen.getByRole("button", { name: /copy command: curie (local|cluster) work-items/i }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("pinned learned rules on the detail (#5798)", () => {
+  async function openDetail(item: WorkItemOutcome) {
+    vi.mocked(listWorkItems).mockResolvedValue({ items: [item], limit: 50, truncated: false });
+    vi.mocked(getWorkItem).mockResolvedValue(item);
+    renderView();
+    await userEvent.click(await screen.findByTestId("work-item-row"));
+    return screen.findByTestId("work-item-detail");
+  }
+
+  it("lists each pinned rule by number with its text, and the digest", async () => {
+    vi.mocked(listMemoryRules).mockResolvedValue(
+      rulesList([
+        rule({ id: "a", number: 1, label: "R1", text: "Run the formatter before pushing." }),
+        rule({ id: "b", number: 2, label: "R2", text: "Not pinned on this item." }),
+        rule({ id: "c", number: 4, label: "R4", text: "Keep migrations reversible.", state: "removed" }),
+        // Same number in another repository's scope must not be taken.
+        rule({ id: "d", number: 1, label: "R1", scope_key: "github:github.com:9999", text: "Other repo rule." }),
+      ]),
+    );
+
+    const detail = await openDetail(outcome({ memory_rules: PINNED }));
+
+    const rules = await within(detail).findAllByTestId("work-item-learned-rule");
+    expect(rules).toHaveLength(2);
+    expect(rules[0]).toHaveTextContent("R1");
+    expect(rules[0]).toHaveTextContent("Run the formatter before pushing.");
+    expect(rules[1]).toHaveTextContent("R4");
+    expect(rules[1]).toHaveTextContent("Keep migrations reversible.");
+    expect(rules[1]).toHaveTextContent("removed since");
+    expect(detail).not.toHaveTextContent("Other repo rule.");
+    expect(detail).not.toHaveTextContent("Not pinned on this item.");
+    expect(detail).toHaveTextContent("2 pinned when this work item was admitted");
+    expect(detail).toHaveTextContent(DIGEST.slice(0, 12));
+    expect(listMemoryRules).toHaveBeenCalledWith("ag-1");
+  });
+
+  it("still names the pinned numbers when the rule text cannot be read", async () => {
+    vi.mocked(listMemoryRules).mockRejectedValue(new ApiError(403, "forbidden"));
+
+    const detail = await openDetail(outcome({ memory_rules: PINNED }));
+
+    await waitFor(() => expect(within(detail).getAllByText("Rule text unavailable.")).toHaveLength(2));
+    expect(detail).toHaveTextContent("R1");
+    expect(detail).toHaveTextContent("R4");
+  });
+
+  it("shows nothing extra, and reads no rules, for an item with none pinned", async () => {
+    const detail = await openDetail(outcome());
+
+    expect(detail).not.toHaveTextContent(/learned rules/i);
+    expect(within(detail).queryByTestId("work-item-learned-rules")).toBeNull();
+    expect(listMemoryRules).not.toHaveBeenCalled();
   });
 });

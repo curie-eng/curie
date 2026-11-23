@@ -21,6 +21,7 @@ const UNREACHABLE_API_URL: &str = "http://127.0.0.1:1";
 /// A cause string the CLI cannot have special-cased: it must be rendered
 /// verbatim, never re-derived.
 const CAUSE: &str = "no capacity before the waiting deadline (capacity_wait_expired) zq-verbatim-7";
+const RULES_DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -131,7 +132,14 @@ fn item(state: &str) -> Value {
             "termination_observation": null,
             "capacity_deferrals": 2,
             "last_deferral_reason": "capacity"
-        }]
+        }],
+        "memory_rules": {
+            "state": "selected",
+            "count": 2,
+            "rule_numbers": [1, 4],
+            "sha256": RULES_DIGEST,
+            "format_version": 1
+        }
     })
 }
 
@@ -241,6 +249,48 @@ fn list_json_is_the_stable_envelope_and_validates_against_the_schema() {
         .expect("GET /work-items was called");
     assert_eq!(request.method, "GET");
     assert_eq!(request.header("x-api-key"), Some(TEST_API_KEY));
+}
+
+/// #5798: the API pins learned rules per work item and the `--json` output
+/// must carry that field exactly as the API sent it, for the list and for one item.
+#[test]
+fn json_carries_the_pinned_memory_rules_for_list_and_detail() {
+    let pinned = json!({
+        "state": "selected",
+        "count": 2,
+        "rule_numbers": [1, 4],
+        "sha256": RULES_DIGEST,
+        "format_version": 1
+    });
+    let unpinned = json!({
+        "state": "absent",
+        "count": 0,
+        "rule_numbers": [],
+        "sha256": null,
+        "format_version": null
+    });
+    let mut bare = detail_item();
+    bare["memory_rules"] = unpinned.clone();
+    let list = list_body(vec![detail_item(), bare.clone()], 200, false);
+    let detail = detail_item().to_string();
+    let server = serve(move |req| match route(&req.path) {
+        "/work-items" => Response::json(200, &list),
+        p if p == format!("/work-items/{ITEM_ID}") => Response::json(200, &detail),
+        _ => Response::json(500, "{}"),
+    });
+
+    let listed = local(&[], &server.base_url, true);
+    assert_eq!(listed.status.code(), Some(0), "{}", describe(&listed));
+    let value = one_object(&listed);
+    assert_eq!(value["items"][0]["memory_rules"], pinned);
+    assert_eq!(value["items"][1]["memory_rules"], unpinned);
+    assert_schema(&value);
+
+    let single = local(&[ITEM_ID], &server.base_url, true);
+    assert_eq!(single.status.code(), Some(0), "{}", describe(&single));
+    let value = one_object(&single);
+    assert_eq!(value["item"]["memory_rules"], pinned);
+    assert_schema(&value);
 }
 
 #[test]
