@@ -348,7 +348,7 @@ Never invent the product convention or silently expand scope.
 
 Call `mcp__curie__ask_questions` once, with:
 
-1. `summary`: 1 to 4,000 characters on what the investigation found,
+1. `summary`: 1 to 600 characters on what the investigation found,
    including the reproduction result (reproduced, not reproduced, or not
    exercisable and why) and the command it rests on.
 2. `questions`: 1 to 10 strings, each one self-contained question of at most

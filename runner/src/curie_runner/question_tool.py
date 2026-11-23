@@ -39,7 +39,7 @@ from .completion_contract import (
 
 logger = logging.getLogger(__name__)
 
-SUMMARY_MAX_CHARS = 4_000
+SUMMARY_MAX_CHARS = 600
 QUESTIONS_MAX = 10
 QUESTION_MAX_CHARS = 1_000
 ROUNDS_LIMIT = 3
@@ -58,7 +58,7 @@ QUESTIONS_SCHEMA: dict[str, Any] = {
         "summary": {
             "type": "string",
             "description": "What the investigation found, including a reproduction result "
-            "when there is one: 1 to 4,000 characters, not only whitespace.",
+            "when there is one: 1 to 600 characters, not only whitespace.",
         },
         "questions": {
             "type": "array",
@@ -223,8 +223,9 @@ def questions_handler(
                 # too long.
                 return _error(
                     "The questions were refused because the posted comment would be too "
-                    "long. Shorten the summary and the questions, use fewer line breaks, "
-                    "and leave out tokens and credentials, then call again."
+                    "long. Shorten the summary to about 600 characters and shorten the "
+                    "questions, use fewer line breaks, and leave out tokens and "
+                    "credentials, then call again."
                 )
             if code is not None and _CODE_RE.match(code):
                 return _error(f"The questions were refused: {code}.")

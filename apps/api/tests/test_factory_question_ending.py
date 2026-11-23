@@ -166,7 +166,8 @@ def _answer(work_item_id: uuid.UUID, pending: uuid.UUID) -> None:
 
     tr._exec(
         "UPDATE curie.factory_question_rounds SET state = 'answered', "
-        "pending_request_id = :pending, version = version + 1 WHERE work_item_id = :id",
+        "pending_request_id = :pending, version = version + 1, "
+        "updated_at = clock_timestamp() WHERE work_item_id = :id",
         {"pending": pending, "id": work_item_id},
     )
 
@@ -362,6 +363,31 @@ def test_status_comment_names_the_round_and_carries_the_questions_label(
     assert "WAITING ON ANSWERS" in svg
     assert "Waiting on answers" in svg
     assert "SUCCEEDED" not in svg
+
+
+def test_an_answered_round_drops_the_waiting_label(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _client, _github, sink = admitted
+    job = _asked(admitted, monkeypatch, 959)
+    tr._finish(job, "failed", "no_pull_request")
+    _reconcile()
+    assert "Status: WAITING ON ANSWERS" in _status_body(sink, job.request_id)
+
+    revision = _queue_revision(job)
+    _answer(job.work_item_id, revision)
+    _reconcile()
+    body = _status_body(sink, job.request_id)
+    assert "Status: WAITING ON ANSWERS" not in body
+    assert "SUCCEEDED" not in body
+    assert "Status: QUESTIONS ASKED" in body
+    assert "Questions asked (round 1 of 3)" in body
+    svg = _card_svg(job.client, job.request_id)
+    assert "WAITING ON ANSWERS" not in svg
+    assert "Waiting on answers" not in svg
+    assert "SUCCEEDED" not in svg
+    assert "QUESTIONS ASKED" in svg
+    assert "Questions asked" in svg
 
 
 # Criterion 8: the investigating line ---------------------------------------------------
@@ -717,10 +743,15 @@ def test_a_question_comment_rendered_after_cancel_does_not_ask_for_an_answer(
     assert "Answer in a plain comment" not in body
     assert "Questions asked (round 1 of 3). The factory label was removed" in body
     assert "Status: WAITING ON ANSWERS" not in body
+    assert "SUCCEEDED" not in body
+    assert "Status: QUESTIONS ASKED" in body
     assert _state_labels(sink, 957) == set()
     svg = _card_svg(job.client, job.request_id)
     assert "WAITING ON ANSWERS" not in svg
     assert "Waiting on answers" not in svg
+    assert "SUCCEEDED" not in svg
+    assert "QUESTIONS ASKED" in svg
+    assert "Questions asked" in svg
 
 
 async def _cancel_now(job: tr._Run) -> Any:

@@ -110,6 +110,8 @@ class CardInput:
     no_pull_request: bool = False
     pr_open: bool = False
     next_owner: str | None = None
+    # A questions_asked completion that is not waiting on an outstanding round.
+    questions_asked: bool = False
 
 
 def _text(value: object, limit: int | None = None) -> str:
@@ -252,6 +254,7 @@ def render_card(card: CardInput) -> str:
         card.publishing,
         retrying=card.retrying,
         waiting_on_answers=card.waiting_on_answers,
+        questions_asked=card.questions_asked,
     )
     subject = f"{card.repo} #{card.issue_number}"
     if card.revision_pr is not None:
@@ -287,6 +290,8 @@ def render_card(card: CardInput) -> str:
         state_line = "No pull request published"
     if card.waiting_on_answers:
         state_line = "Waiting on answers"
+    elif card.questions_asked:
+        state_line = "Questions asked"
     if reviewer:
         review_text = f"reviewer {reviewer}"
     if cap is not None and card.phase_view.staged:

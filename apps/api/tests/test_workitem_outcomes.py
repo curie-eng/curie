@@ -1632,7 +1632,9 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
         cancelled: bool,
         admitted_at: datetime | None = None,
         merged_at: datetime | None = None,
+        closed_at: datetime | None = None,
     ) -> workitem_outcomes.WorkItemOutcomeOut:
+        when_closed = now if closed_at is None else closed_at
         item = WorkItem(
             id=work_item_id,
             agent_id=uuid.uuid4(),
@@ -1644,7 +1646,7 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
             code_host_host="github.com",
             repository_project_id="101",
             repository_path=REPO,
-            cancelled_at=now if cancelled else None,
+            cancelled_at=when_closed if cancelled else None,
             created_at=now,
             updated_at=now,
             model_auth_mode="service",
@@ -1730,6 +1732,52 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
     )
     assert after_merge.state == "cancelled"
     assert not after_merge.actionable_cause.startswith("completed:")
+    closed_before = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now - timedelta(minutes=30),
+        admitted_at=now - timedelta(hours=1),
+        merged_at=now,
+    )
+    assert closed_before.state == "cancelled"
+    assert not closed_before.actionable_cause.startswith("completed:")
+    closed_later = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        merged_at=now - timedelta(minutes=30),
+    )
+    assert closed_later.state == "cancelled"
+    assert not closed_later.actionable_cause.startswith("completed:")
+    at_the_window = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now - timedelta(minutes=10),
+        admitted_at=now - timedelta(hours=1),
+        merged_at=now,
+    )
+    assert at_the_window.state == "published"
+    assert at_the_window.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    outside_the_window = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now - timedelta(minutes=10, seconds=1),
+        admitted_at=now - timedelta(hours=1),
+        merged_at=now,
+    )
+    assert outside_the_window.state == "cancelled"
+    assert not outside_the_window.actionable_cause.startswith("completed:")
 
 
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:

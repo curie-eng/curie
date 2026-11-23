@@ -97,7 +97,7 @@ class QuestionsSubmission(BaseModel):
 
     summary: Any = Field(
         default=None,
-        description="What the investigation found, 1 to 4,000 characters, including a "
+        description="What the investigation found, 1 to 600 characters, including a "
         "reproduction result when there is one.",
     )
     questions: Any = Field(

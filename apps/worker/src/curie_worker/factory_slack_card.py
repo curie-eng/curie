@@ -27,7 +27,9 @@ from channel_protocol import MESSAGE_VERSION, MessageLink, OutboundMessage
 from curie_internal.factory_cause import cause_text
 from curie_internal.factory_phase_view import WAIT_CI_PHASE, PhaseView, phase_view
 
-CardState = Literal["starting", "working", "needs a person", "finished", "stopped"]
+CardState = Literal[
+    "starting", "working", "needs a person", "finished", "stopped", "waiting on answers"
+]
 
 _TEXT_MAX: Final = 2000
 _NOTE_MAX: Final = 100
@@ -123,6 +125,9 @@ class CardRequest:
     # The card sentence follows the recorded terminal cause, not this flag.
     plan_still_connected: bool = False
     personal: bool = False
+    # The work item was cancelled after a questions run. The card then stops
+    # instead of saying the run is waiting on an answer.
+    work_item_cancelled: bool = False
 
 
 def _view(request: CardRequest) -> PhaseView | None:
@@ -138,6 +143,8 @@ def card_state(request: CardRequest, view: PhaseView | None) -> CardState:
         return "stopped"
     if request.status in _NEEDS_A_PERSON:
         return "needs a person"
+    if request.status == "completed" and request.terminal_cause == "questions_asked":
+        return "stopped" if request.work_item_cancelled else "waiting on answers"
     if request.status == "completed":
         return "finished"
     published = request.pr_url is not None
@@ -194,6 +201,9 @@ def _footer(state: CardState, request: CardRequest, now: datetime) -> str:
     if state == "finished":
         end = request.published_at or request.terminal_at or now
         return f"Finished in {_clock((end - request.started_at).total_seconds())}"
+    if state == "waiting on answers":
+        end = request.terminal_at or now
+        return f"Waiting on answers after {_clock((end - request.started_at).total_seconds())}"
     if state in ("stopped", "needs a person"):
         end = request.terminal_at or now
         return f"Stopped after {_clock((end - request.started_at).total_seconds())}"
@@ -275,6 +285,19 @@ def render_card(subject: CardSubject, request: CardRequest, *, now: datetime) ->
         if url is not None:
             label = f"View issue {subject.issue_label}"
             links.append(MessageLink(label=label[:_LINK_LABEL_MAX], url=url))
+    elif state == "waiting on answers":
+        body.extend(["", ":question: *Waiting on answers.* Reply on the ticket to continue."])
+        url = _http(subject.issue_url)
+        if url is not None:
+            label = f"View issue {subject.issue_label}"
+            links.append(MessageLink(label=label[:_LINK_LABEL_MAX], url=url))
+    elif state == "stopped" and request.terminal_cause == "questions_asked":
+        body.extend(
+            [
+                "",
+                "Questions were asked. The factory label was removed, so an answer starts nothing.",
+            ]
+        )
     message = OutboundMessage(
         version=MESSAGE_VERSION,
         header=f"Factory run: {state}",

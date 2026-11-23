@@ -28,7 +28,13 @@ from sqlalchemy import select
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card
-from ..factory_notices import cause_text, is_waiting_on_answers, retry_successor
+from ..factory_notices import (
+    cause_text,
+    is_waiting_on_answers,
+    question_round_outstanding,
+    questions_asked_completion,
+    retry_successor,
+)
 from ..factory_progress import (
     PROGRESS_SCOPE,
     ProgressReport,
@@ -218,6 +224,7 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             run_handoff = RunHandoff.model_validate(row.run_handoff)
         except ValueError:
             pass
+    round_outstanding = await question_round_outstanding(session, work_item.id, request.id)
     body = render_card(
         CardInput(
             repo=work_item.repository_path,
@@ -228,8 +235,12 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             publishing=publishing,
             retrying=retrying,
             waiting_on_answers=is_waiting_on_answers(
-                request.status, terminal, work_item.cancelled_at
+                request.status,
+                terminal,
+                work_item.cancelled_at,
+                round_outstanding=round_outstanding,
             ),
+            questions_asked=questions_asked_completion(request.status, terminal),
             started_at=request.started_at,
             terminal_at=request.terminal_at,
             now=datetime.now(UTC),

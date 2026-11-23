@@ -63,6 +63,7 @@ from .models import (
     FactoryAnswerReceipt,
     FactoryQuestionRound,
     FactoryQuestionRoundCount,
+    FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
@@ -80,10 +81,11 @@ ANSWER_LINE: Final = (
     "ticket can answer; no mention or relabel is needed."
 )
 
-# Input bounds (decision 2): a blank line would break the numbered list on
-# every tracker renderer, and the totals keep the composed body under Jira's
-# 30,000 character comment cut.
-SUMMARY_MAX_CHARS: Final = 4_000
+# Input bounds (decision 2). The posted summary is capped at 600 characters
+# so the comment stays a short finding plus the questions. A blank line would
+# break the numbered list on every tracker renderer, and the totals keep the
+# composed body under Jira's 30,000 character comment cut.
+SUMMARY_MAX_CHARS: Final = 600
 QUESTION_MAX_CHARS: Final = 1_000
 QUESTIONS_MAX: Final = 10
 # The composed comment, after sanitization and redaction, is refused above
@@ -176,9 +178,12 @@ _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
 _BLOCK_OPENER = re.compile(r"#{1,6}(?=[ \t]|$)|>|[-+*](?=[ \t]|$)|<|\|")
 # A thematic break or a setext underline.
 _RULE_LINE = re.compile(r"(?:[-*_][ \t]*){3,}|=+[ \t]*|-+[ \t]*")
-# An ordered list marker. A question line must not open or continue a list
-# that merges with the numbered questions.
+# An ordered list marker. The summary and a question line must not open or
+# continue a list that merges with the numbered questions.
 _ORDERED_MARKER = re.compile(r"^([ \t]*\d{1,9})([.)])(?=[ \t]|$)", re.MULTILINE)
+# A summary line that opens with `<` is an HTML block on CommonMark. Escaped,
+# it stays text, so it cannot swallow the questions or the answer line.
+_HTML_OPENER = re.compile(r"^([ \t]*)<", re.MULTILINE)
 
 
 def _inert(text: str) -> str:
@@ -188,8 +193,8 @@ def _inert(text: str) -> str:
     (hiding what follows or imitating a platform marker) or mention anyone,
     exactly like the tracker result (``publishable_model_text``). A run of
     three or more backticks or tildes gets a U+200B between its characters, so
-    an unclosed code fence in a question cannot swallow the answer line
-    below it.
+    an unclosed code fence in the summary or a question cannot swallow the
+    numbered questions or the answer line below it.
     """
 
     return _FENCE_RUN.sub(lambda run: "\u200b".join(run.group(0)), publishable_model_text(text))
@@ -198,22 +203,24 @@ def _inert(text: str) -> str:
 def compose_body(round_number: int, summary: str, questions: list[str]) -> str:
     """The comment the platform writes for one round (decision 4).
 
-    The model supplies the summary and the questions. ``input_valid`` still
-    checks the summary, and it is not posted: it repeated the investigation
-    above questions that are already required to be self-contained. The
-    heading, the numbering and the answer line are fixed, so the wording is
-    identical on every tracker. Each question stays one list item: its
-    continuation lines are indented to the item's content column and none of
-    its lines can open a block. The marker a tracker adds around this body is
-    separate and is not part of the composed text.
+    The model supplies the summary and the questions. The heading, the
+    numbering and the answer line are fixed, so the wording is identical on
+    every tracker. The summary is the short finding the decision requires,
+    escaped so it cannot open a list, a fence or an HTML block. Each question
+    stays one list item: its continuation lines are indented to the item's
+    content column and none of its lines can open a block. The marker a
+    tracker adds around this body is separate and is not part of the composed
+    text.
     """
 
-    del summary
     numbered = "\n".join(
         _list_item(index, question) for index, question in enumerate(questions, start=1)
     )
+    prose = _ORDERED_MARKER.sub(r"\1\\\2", _visible(summary))
+    prose = _HTML_OPENER.sub(r"\1\\<", prose)
     return (
         f"### Questions from the factory (round {round_number} of {ROUND_LIMIT})\n\n"
+        f"{prose}\n\n"
         f"{numbered}\n\n"
         f"{ANSWER_LINE}\n"
     )
@@ -651,6 +658,27 @@ async def settle_round(
     )
 
 
+async def _reopen_questions_status(session: AsyncSession, request_id: uuid.UUID) -> None:
+    """Let the status pass rewrite this request's questions comment once.
+
+    The comment finalizes when the questions are posted. An answer or a
+    cancellation changes the pill, so the next pass has to edit it. A sync
+    that already holds the lease keeps the row due on its writeback.
+    """
+
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.execution_request_id == request_id,
+            FactoryStatusComment.refused_at.is_(None),
+        )
+        .values(
+            finalized_at=None,
+            sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
+        )
+    )
+
+
 async def delete_for_cancellation(session: AsyncSession, work_item_id: uuid.UUID) -> None:
     """Delete the WorkItem's question row in its cancellation transaction.
 
@@ -659,9 +687,18 @@ async def delete_for_cancellation(session: AsyncSession, work_item_id: uuid.UUID
     queued answer follow-up. The lifetime round count is a separate row that
     stays, so a relabel, which reuses the WorkItem, does not reset the cap
     (ADR 0286 decision 8). The caller holds the WorkItem lock; a round being
-    recorded holds the question row, so this waits for it.
+    recorded holds the question row, so this waits for it. The asking
+    request's status comment is reopened first, so it stops saying the run is
+    waiting on an answer.
     """
 
+    asking_request_id = await session.scalar(
+        select(FactoryQuestionRound.asking_request_id).where(
+            FactoryQuestionRound.work_item_id == work_item_id
+        )
+    )
+    if asking_request_id is not None:
+        await _reopen_questions_status(session, asking_request_id)
     await session.execute(
         delete(FactoryQuestionRound).where(FactoryQuestionRound.work_item_id == work_item_id)
     )
@@ -1092,6 +1129,7 @@ async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts
     if not _after_fence(facts.created_at, facts.comment_id, row.answer_after, row.comment_id):
         return AnswerOutcome(NOT_AFTER_QUESTION, None, False)
     seen_version, seen_state, seen_pending = row.version, row.state, row.pending_request_id
+    asking_request_id = row.asking_request_id
     pending = seen_pending
     # A waiting request past its wait deadline can no longer be claimed; the
     # expiry sweep (on the same clock) ends it, so an answer never coalesces
@@ -1163,4 +1201,5 @@ async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts
             # Unreachable while the WorkItem lock is held: every other writer
             # of an outstanding or answered row takes it first.
             raise AnswerNotAdmitted("question_row_changed")
+        await _reopen_questions_status(session, asking_request_id)
     return result

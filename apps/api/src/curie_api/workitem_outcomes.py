@@ -24,7 +24,7 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
 from curie_internal.factory_phase_view import phase_view
@@ -104,15 +104,36 @@ def _previous_start_failure(req: ExecutionRequest) -> str:
     return f"; previous start failure: {detail}" if detail else ""
 
 
+# The merge write and the issue-close write land a few minutes apart. A close
+# outside this window was not caused by the merge.
+_MERGE_CLOSE_TOLERANCE = timedelta(minutes=10)
+
+
+def _close_matches_merge(cancelled_at: datetime | None, merged_at: datetime | None) -> bool:
+    """Whether ``cancelled_at`` is the close GitHub writes when the merge lands."""
+
+    if cancelled_at is None or merged_at is None:
+        return False
+    return (
+        merged_at - _MERGE_CLOSE_TOLERANCE
+        <= cancelled_at
+        <= merged_at + _MERGE_CLOSE_TOLERANCE
+    )
+
+
 def _merged_completion(
-    req: ExecutionRequest | None, lineage: ThreadPublicationLineage | None
+    req: ExecutionRequest | None,
+    lineage: ThreadPublicationLineage | None,
+    *,
+    cancelled_at: datetime | None = None,
 ) -> bool:
     """Whether this request is the run that merged its own pull request.
 
     The merge stamp is the lineage's ``updated_at``. A request admitted after
     that stamp, or one that finished for another cause, is a later run that
     still points at the merged pull request. A lineage with no stamp skips the
-    time check.
+    admission time check. A close counts only when it lands in the merge's
+    window. A close before the merge, or a much later close, does not.
     """
 
     if (
@@ -127,6 +148,8 @@ def _merged_completion(
     merged_at = lineage.updated_at
     if merged_at is not None and (req.created_at is None or req.created_at > merged_at):
         return False
+    if cancelled_at is not None and not _close_matches_merge(cancelled_at, merged_at):
+        return False
     return True
 
 
@@ -138,7 +161,7 @@ def _cause(
     approval: Approval | None,
     now: datetime,
     *,
-    issue_closed: bool,
+    cancelled_at: datetime | None,
 ) -> str:
     if req is None:
         if state == "cancelled":
@@ -281,8 +304,8 @@ def _cause(
         )
     if state == "published":
         assert lineage is not None
-        if _merged_completion(req, lineage):
-            closed = " and closed the issue" if issue_closed else ""
+        if _merged_completion(req, lineage, cancelled_at=cancelled_at):
+            closed = " and closed the issue" if cancelled_at is not None else ""
             return f"completed: pull request #{lineage.pr_number} merged{closed}"
         return f"pull request #{lineage.pr_number} opened; CI and review are the next signals"
     # completed_unpublished
@@ -365,7 +388,8 @@ def derive_outcome(
     elif req.status == "running":
         state = "running"
     elif req.status == "cancelled" or (
-        item.cancelled_at is not None and not _merged_completion(req, lineage)
+        item.cancelled_at is not None
+        and not _merged_completion(req, lineage, cancelled_at=item.cancelled_at)
     ):
         state = "cancelled"
     elif req.status == "expired":
@@ -443,7 +467,7 @@ def derive_outcome(
                 publication,
                 approval,
                 now,
-                issue_closed=item.cancelled_at is not None,
+                cancelled_at=item.cancelled_at,
             )
         ),
         objective=objective[:OBJECTIVE_LIMIT] if objective is not None else None,

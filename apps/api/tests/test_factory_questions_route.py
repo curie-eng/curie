@@ -63,23 +63,24 @@ ANSWER_LINE = (
 
 
 def _frame(round_number: int, summary: str, questions: list[str]) -> str:
-    del summary
     items = "\n".join(f"{n}. {q}" for n, q in enumerate(questions, start=1))
     return (
-        f"### Questions from the factory (round {round_number} of 3)\n\n{items}\n\n{ANSWER_LINE}\n"
+        f"### Questions from the factory (round {round_number} of 3)\n\n"
+        f"{summary}\n\n{items}\n\n{ANSWER_LINE}\n"
     )
 
 
-def test_questions_comment_keeps_questions_and_drops_the_summary() -> None:
+def test_questions_comment_keeps_a_short_summary() -> None:
     summary = "Steps tried:\n1. run the export and compare the row counts."
     questions = [
         "Should the trailing empty row be kept?",
         "Which delimiter do callers expect?",
     ]
     body = factory_questions.compose_body(1, summary, questions)
-    assert body == _frame(1, summary, questions)
-    assert summary not in body
     assert "### Questions from the factory (round 1 of 3)" in body
+    assert "Steps tried:" in body
+    assert "1\\. run the export and compare the row counts." in body
+    assert summary not in body
     assert "1. Should the trailing empty row be kept?" in body
     assert "2. Which delimiter do callers expect?" in body
     assert body.rstrip().endswith(ANSWER_LINE)
@@ -92,7 +93,8 @@ def test_a_posted_question_is_redacted_and_a_fence_cannot_swallow_the_answer() -
     body = factory_questions.compose_body(1, summary, questions)
     assert secret not in body
     assert "[REDACTED" in body
-    assert "traceback, never closed" not in body
+    assert "Ran it with" in body
+    assert "traceback, never closed" in body
     assert "@someone" not in body and "@\u200bsomeone" in body
     assert not any(line.lstrip().startswith(("```", "~~~")) for line in body.splitlines())
     assert "\n1. Should @\u200bsomeone own this?\n" in body
@@ -171,7 +173,7 @@ def test_two_questions_post_one_marked_comment_and_record_round_one(
 def test_inputs_at_the_bounds_are_posted(admitted: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     job = _running(admitted, monkeypatch, 802)
     questions = ["q" * 1000 for _ in range(9)] + ["first line\nsecond line"]
-    response = _ask(job, summary="s" * 4000, questions=questions)
+    response = _ask(job, summary="s" * 600, questions=questions)
     assert response.status_code == 200, response.text
     (body,) = _marked(job)
     # The continuation line sits at the item's content column, inside item 10.
@@ -203,7 +205,8 @@ def test_model_text_is_redacted_mention_free_and_cannot_hold_the_frame_in_a_fenc
     (body,) = _marked(job)
     assert secret not in body
     assert "[REDACTED" in body
-    assert "traceback, never closed" not in body
+    assert "Ran it with" in body
+    assert "traceback, never closed" in body
     assert "@someone" not in body and "@\u200bsomeone" in body
     # No line of the composed comment opens a fence, so the numbered questions
     # and the answer line render as the frame, not as code.
@@ -469,10 +472,10 @@ def test_jira_posts_the_largest_ordinary_input_with_the_answer_line_last(
 ) -> None:
     # Liveness: the biggest input inside decision 2's bounds still posts whole.
     prose = "The export writes two rows for three input rows when the last is blank. "
-    summary = (prose * 60)[:4000].strip()
+    summary = (prose * 60)[:600].strip()
     questions = [f"{n}: " + (prose * 15)[: 1000 - 4].strip() + "?" for n in range(10)]
     questions[-1] = questions[-1][:900] + "\nSecond line?"
-    assert len(summary) <= 4000 and all(len(question) <= 1000 for question in questions)
+    assert len(summary) <= 600 and all(len(question) <= 1000 for question in questions)
     response = _ask(jira_case, summary=summary, questions=questions)
     assert response.status_code == 200, response.text
     (comment,) = jira_case.fake.issue(jira_case.issue_id).comments
@@ -484,11 +487,11 @@ def test_refused_input_that_redaction_grows_past_the_bound_writes_nothing(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Each ``token=x`` (7 characters) is redacted to a 33 character
-    # placeholder assignment. The summary is not posted, and the ten questions
-    # alone still compose past Jira's 30,000 character cut.
-    summary = ("token=x " * 500).strip()
+    # placeholder assignment. The summary stays under 600 characters. The ten
+    # questions alone still compose past Jira's 30,000 character cut.
+    summary = ("token=x " * 70).strip()
     questions = [("token=x " * 125).strip()] * 10
-    assert len(summary) <= 4000 and all(len(question) <= 1000 for question in questions)
+    assert len(summary) <= 600 and all(len(question) <= 1000 for question in questions)
     assert len(factory_questions.compose_body(1, summary, questions)) > BODY_LIMIT
     job = _running(admitted, monkeypatch, 814)
     refused = _ask(job, summary=summary, questions=questions)

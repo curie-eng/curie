@@ -78,6 +78,8 @@ def _view(round_label: str | None = "round 1 of 3") -> PhaseView:
 def test_questions_only_status_says_waiting_on_answers() -> None:
     label, color, live = pill_for("completed", False, waiting_on_answers=True)
     assert (label, color, live) == ("WAITING ON ANSWERS", "#0969da", False)
+    asked, asked_color, asked_live = pill_for("completed", False, questions_asked=True)
+    assert (asked, asked_color, asked_live) == ("QUESTIONS ASKED", "#0969da", False)
     assert pill_for("completed", False)[0] == "SUCCEEDED"
     declaration = {
         "phases": [
@@ -776,6 +778,40 @@ def test_a_questions_only_card_says_waiting_on_answers() -> None:
     )
     assert "WAITING ON ANSWERS" in svg
     assert "Waiting on answers" in svg
+    assert "SUCCEEDED" not in svg
+
+
+def test_a_questions_only_card_does_not_say_succeeded_once_the_round_ends() -> None:
+    declaration = json.loads(BUNDLE_PHASES.read_text())
+    reports = [
+        ExecutionRequestPhaseReport(
+            id=1, execution_request_id=REQUEST, phase="investigate", loop_round=None
+        )
+    ]
+    view = phase_view(declaration, reports, "completed", "questions_asked")
+    now = datetime(2026, 11, 16, 12, 30, 5, tzinfo=UTC)
+    svg = render_card(
+        CardInput(
+            repo="acme-corp/acme-bot",
+            issue_number=42,
+            title="Add Kelvin to the unit converter",
+            revision_pr=None,
+            status="completed",
+            publishing=False,
+            started_at=now - timedelta(minutes=12),
+            terminal_at=now,
+            now=now,
+            activity=None,
+            note=None,
+            phase_view=view,
+            cause_text=None,
+            questions_asked=True,
+        )
+    )
+    assert "QUESTIONS ASKED" in svg
+    assert "Questions asked" in svg
+    assert "WAITING ON ANSWERS" not in svg
+    assert "Waiting on answers" not in svg
     assert "SUCCEEDED" not in svg
     assert "Completed" not in svg
     assert "#0969da" in svg
