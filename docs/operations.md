@@ -5264,6 +5264,8 @@ deadline runs from intake.
 `FACTORY_VOICE_DRAFT_TTL_SECONDS` defaults to 900. Expiry and terminal decisions
 remove detailed source data and the transcript. A small receipt remains for
 deduplication indefinitely. The API checks for expired drafts every minute.
+With voice disabled, the sweep releases its database connection and stops
+as soon as no draft holds source data.
 Before rolling back to an API version without retention support, stop intake
 and let the current API purge outstanding drafts after their deadlines.
 The confirmation response reports whether steering queued the

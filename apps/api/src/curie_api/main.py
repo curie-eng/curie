@@ -44,6 +44,7 @@ from .db import (
     create_liveness_engine,
     create_sessionmaker,
     create_source_gate_engine,
+    create_voice_retention_engine,
 )
 from .evalqueue import EvalQueue
 from .factory_voice_retention import purge_expired_drafts
@@ -414,11 +415,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.protected_admission_reconciler = protected_reconciler
         protected_reconciler.start()
-        voice_retention_engine = create_engine()
-        source_resources.push_async_callback(voice_retention_engine.dispose)
         voice_purge = asyncio.create_task(
-            purge_expired_drafts(create_sessionmaker(voice_retention_engine))
+            purge_expired_drafts(
+                create_voice_retention_engine(), enabled=settings.factory_voice_enabled
+            )
         )
+        app.state.voice_retention_task = voice_purge
         try:
             yield
         finally:

@@ -27,6 +27,12 @@ def create_engine() -> AsyncEngine:
     return create_async_engine(get_settings().database_url, pool_pre_ping=True)
 
 
+def create_voice_retention_engine() -> AsyncEngine:
+    return create_async_engine(
+        get_settings().database_url, pool_size=1, max_overflow=0, pool_pre_ping=True
+    )
+
+
 def create_liveness_engine() -> AsyncEngine:
     """Reserve a small database pool for readiness and worker heartbeats."""
     return create_async_engine(

@@ -11,6 +11,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
+from curie_api import factory_voice_retention
 from curie_api.config import get_settings
 from curie_api.factory_confirmed_steering import (
     ConfirmedText,
@@ -37,11 +38,13 @@ from curie_api.factory_voice_contract import (
     VoiceMedia,
     VoiceSource,
 )
+from curie_api.main import create_app
 from curie_api.models import DEFAULT_TENANT_ID, Agent, FactoryVoiceDraft, WorkItem
 from factory_run_support import _run
 from factory_voice_fakes import FixtureVoiceRecognizer
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import Connection, Engine, delete, event, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 AUDIO = b"fixture media from the authorized source"
 BODY_HASH = hashlib.sha256(b"original comment").hexdigest()
@@ -650,5 +653,64 @@ def test_invalid_sources_and_disabled_intake_do_not_open_media() -> None:
         assert await disabled.submit(source, unread) == Refused(reason="disabled")
         assert not opened and await provider.sequence() == 1
         assert not await service.process_pending("github", provider)
+
+    _run(go)
+
+
+@pytest.mark.parametrize(
+    ("enabled", "pending"),
+    [(False, False), (False, True), (True, False)],
+    ids=["disabled-empty", "disabled-draining", "enabled-empty"],
+)
+def test_lifespan_drains_voice_retention(
+    enabled: bool, pending: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "factory_voice_enabled", enabled)
+    monkeypatch.setattr(factory_voice_retention, "SWEEP_INTERVAL", 0.01)
+
+    async def go(sessions: async_sessionmaker[AsyncSession]) -> None:
+        first = None
+        if pending:
+            service, provider, _ = await setup_voice(sessions)
+            first = await draft(service, provider)
+
+        app = create_app()
+        async with app.router.lifespan_context(app):
+            task = app.state.voice_retention_task
+            sweeps: asyncio.Queue[Engine] = asyncio.Queue()
+
+            def observe(conn: Connection) -> None:
+                if asyncio.current_task() is task:
+                    sweeps.put_nowait(conn.engine)
+
+            event.listen(Engine, "begin", observe)
+            try:
+                async with asyncio.timeout(10):
+                    engine = await sweeps.get()
+                    pool = engine.pool
+                    assert isinstance(pool, AsyncAdaptedQueuePool)
+                    assert pool.size() == 1 and pool._max_overflow == 0
+                    if first is not None:
+                        assert await sweeps.get() is engine
+                        async with sessions.begin() as session:
+                            row = await session.get_one(FactoryVoiceDraft, first.draft_id)
+                            assert row.transcript == TEXT
+                            row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                    if enabled:
+                        assert await sweeps.get() is engine
+                        assert not task.done() and engine.pool is pool
+                    else:
+                        await asyncio.shield(task)
+                        assert engine.pool is not pool and pool.checkedin() == 0
+                        if first is None:
+                            assert sweeps.empty()
+                        else:
+                            async with sessions() as session:
+                                row = await session.get_one(FactoryVoiceDraft, first.draft_id)
+                                assert row.status == "expired"
+                                assert row.source is None and row.transcript is None
+            finally:
+                event.remove(Engine, "begin", observe)
+        assert task.done() and pool.checkedin() == 0
 
     _run(go)

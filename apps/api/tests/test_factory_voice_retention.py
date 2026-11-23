@@ -5,13 +5,17 @@ import logging
 import socket
 
 import pytest
+from curie_api import factory_voice_retention
 from curie_api.factory_voice_retention import purge_expired_drafts
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("anyio_backend", ["asyncio"])
-async def test_purge_retries_a_refused_connection(caplog: pytest.LogCaptureFixture) -> None:
+async def test_purge_retries_a_refused_connection(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(factory_voice_retention, "SWEEP_INTERVAL", 0)
     logger = logging.getLogger("curie_api.factory_voice_retention")
     retried = asyncio.Event()
     messages: list[str] = []
@@ -28,7 +32,7 @@ async def test_purge_retries_a_refused_connection(caplog: pytest.LogCaptureFixtu
         port = reserved.getsockname()[1]
         engine = create_async_engine(f"postgresql+asyncpg://example@127.0.0.1:{port}/example")
         logger.addHandler(observer)
-        task = asyncio.create_task(purge_expired_drafts(async_sessionmaker(engine), interval=0))
+        task = asyncio.create_task(purge_expired_drafts(engine, enabled=False))
         try:
             async with asyncio.timeout(3):
                 await retried.wait()
@@ -42,5 +46,3 @@ async def test_purge_retries_a_refused_connection(caplog: pytest.LogCaptureFixtu
                 await task
             except asyncio.CancelledError:
                 pass
-            finally:
-                await engine.dispose()
