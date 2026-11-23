@@ -64,6 +64,7 @@ detail, and documentation drift on one version-selectable system diagram.
 - [Frozen contracts](#frozen-contracts)
 - [Deployment, CI, and release](#deployment-ci-and-release)
 - [What is built vs deferred](#what-is-built-vs-deferred)
+- [Glossary](#glossary)
 
 ## Clause status
 
@@ -158,7 +159,7 @@ focused diagram docs, each a single clean picture:
 
 - **[How a message comes in and a reply goes out](docs/diagrams/message-flow.md)** — the core loop.
 - **[Kubernetes architecture](docs/diagrams/kubernetes.md)** — the cluster and how a sandbox pod is built.
-- **[The ACI](docs/diagrams/aci.md)** — the ACI, short for Agent Container Interface: the frozen contract between the worker and the agent in the box.
+- **[The ACI](docs/diagrams/aci.md)** — the [ACI](#glossary), short for Agent Container Interface: the frozen contract between the worker and the agent in the box.
 - **[Factory work items and publication](#factory-work-items-and-publication)**: how a labelled GitHub issue becomes a pull request.
 
 ```mermaid
@@ -248,7 +249,7 @@ Curie leans on these systems rather than building its own (ADR-0007,
 [`docs/adr/0007-adopt-not-build-boundaries.md`](docs/adr/0007-adopt-not-build-boundaries.md)):
 
 - Langfuse (traces + evals)
-- Kubernetes Agent Sandbox (interactive runtime)
+- [Kubernetes Agent Sandbox](#glossary) (interactive runtime)
 - Slack Bolt (Socket Mode)
 - AgentMail (the email inbox, and the SPF/DKIM/DMARC filtering in front of it; see [`docs/operations.md`](docs/operations.md))
 - Valkey Streams (queue)
@@ -1432,3 +1433,36 @@ because a stale Deferred list understates the product:
 
 Only the OpenAI *wire format* is
 genuinely absent.
+
+## Glossary
+
+Terms used across README, ARCHITECTURE, and AGENTS before being defined
+anywhere central. Each entry is one or two sentences; the linked section or
+document is the canonical definition.
+
+- **ACI protocol** — Agent Container Interface: the frozen session protocol
+  between the worker and the agent in the box (open/steer/interrupt, NDJSON
+  `text_delta` / tool notes / `final`, budget, side-effect flag). The Pydantic
+  models in `packages/aci-protocol` are the source of truth; the committed JSON
+  Schema and the generated TypeScript and Rust are derived from them. See
+  [Frozen contracts](#frozen-contracts).
+- **Agent Sandbox substrate** — Kubernetes Agent Sandbox
+  (`kubernetes-sigs/agent-sandbox`), the interactive runtime substrate: the
+  worker claims a `Sandbox` from a `SandboxWarmPool` and dials the runner at
+  its `.status.serviceFQDN`. Batch and eval runs use plain Kubernetes Jobs
+  instead. See [ADR-0002](docs/adr/0002-kubernetes-agent-sandbox-as-runtime-substrate.md).
+- **Frozen contract** — An interface every lane compiles against across three
+  languages (`packages/aci-protocol`, `packages/plugin-format`) that never
+  changes from a dependent lane: a task that needs it to change stops and
+  escalates, and the schema-compat gate fails on drift. See
+  [Frozen contracts](#frozen-contracts).
+- **Finish-race** — A 409 from a steer probe on a retained live sandbox whose
+  turn already ended: the follow-up arrived just as the turn finished, so the
+  worker records the `finish-race` route instead of treating the 409 as a
+  steer failure, and the follow-up proceeds on a new turn (or the replacement
+  path).
+- **Parity ladder** — The bounded guarantee that each named core rung (Skill,
+  Local, Cluster) packages one canonical source tree independently, requires
+  matching SHA256 digests, and exercises that artifact through its own `curie`
+  path. In CI the three rungs are the `e2e-ladder`, `e2e-ladder-release`, and
+  `e2e-ladder-cluster` jobs. See [Vision: parity ladder](docs/VISION_PARITY_LADDER.md).
