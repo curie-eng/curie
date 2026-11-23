@@ -889,7 +889,7 @@ async def question_round_outstanding(
     if found is None:
         return False
     state, asking_request_id = found
-    return state == OUTSTANDING and asking_request_id == request_id
+    return bool(state == OUTSTANDING and asking_request_id == request_id)
 
 
 def _questions_comment_due() -> Any:
