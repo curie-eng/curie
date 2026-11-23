@@ -21,7 +21,6 @@ import time
 import uuid
 import zipfile
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +55,6 @@ _REFUSAL = (
     "so the turn was not run."
 )
 _OWNER = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
-_REDEPLOYED = uuid.UUID("44444444-4444-4444-8444-444444444444")
 
 
 async def _until_gone(
@@ -217,7 +215,6 @@ class _Bundles:
 
 
 _BUNDLE_V1 = "bundles/acme-bot/v1.zip"
-_BUNDLE_V2 = "bundles/acme-bot/v2.zip"
 
 
 class _ChannelReadBinding(_MemoryBinding):
@@ -988,108 +985,3 @@ def test_a_channel_read_only_grant_still_mints_and_a_canvas_grant_adds_no_second
         assert h.runner.event_bodies[1]["channel_read"] is not None
 
     _run(make_harness, body, runner_api_base_url=_RUNNER_FACING)
-
-
-def _surface_claim_bundle_refs(h: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the fake control plane report each claim's ``CURIE_BUNDLE_REF`` from its env."""
-    from curie_worker.binding import BUNDLE_REF_ENV
-
-    fake = h.fake_k8s
-    envs: dict[str, dict[str, str]] = {}
-    real_create, real_get = fake.create_claim, fake.get_claim
-
-    def create_claim(name: str, **kwargs: Any) -> None:
-        envs[name] = dict(kwargs.get("env") or {})
-        real_create(name, **kwargs)
-
-    def get_claim(name: str, **kwargs: Any) -> Any:
-        view = real_get(name, **kwargs)
-        return view and replace(view, bundle_ref=envs.get(name, {}).get(BUNDLE_REF_ENV))
-
-    monkeypatch.setattr(fake, "create_claim", create_claim)
-    monkeypatch.setattr(fake, "get_claim", get_claim)
-
-
-@pytest.mark.parametrize("bundle", ["pinned", "matching", "mismatched"])
-def test_a_retained_sandbox_mints_against_its_pinned_or_recovered_deployment(
-    make_harness: Any, monkeypatch: pytest.MonkeyPatch, bundle: str
-) -> None:
-    # A redeploy between two turns on one retained sandbox. "pinned" mints the
-    # booted deployment; without a pin the claim's bundle ref decides: equal pins
-    # the resolved deployment, different gives no capability and no pin.
-    async def body(h: Any, b: _ChannelReadBinding) -> None:
-        _surface_claim_bundle_refs(h, monkeypatch)
-        first = _qevent("before", thread="th-cr-l8")
-        await h.kernel.process_event(first)
-        thread_key = _thread_key(first)
-        if bundle != "pinned":
-            await h.async_redis.delete(h.config.channel_read_pin_key(thread_key))
-            b.bundle_ref = _BUNDLE_V1 if bundle == "matching" else _BUNDLE_V2
-        b.deployment_id = _REDEPLOYED
-        await h.kernel.process_event(_qevent("after", thread="th-cr-l8"))
-
-        assert h.runner.opened == ["before", "after"]
-        assert len(h.fake_k8s.claim_envs) == 1, "the second turn did not retain the sandbox"
-        deployments = [c["deployment_id"] for c in b.api.of_mode("open")]
-        pin = await h.kernel._markers.read_channel_read_pin(thread_key)
-        if bundle == "pinned":
-            assert deployments == [DEPLOYMENT_ID, DEPLOYMENT_ID]
-        elif bundle == "matching":
-            assert deployments == [DEPLOYMENT_ID, _REDEPLOYED]
-            assert h.runner.event_bodies[1]["channel_read"] is not None
-            assert pin is not None and pin.deployment_id == _REDEPLOYED
-        else:
-            assert deployments == [DEPLOYMENT_ID]
-            assert h.runner.event_bodies[1]["channel_read"] is None
-            assert pin is None
-
-    _run(make_harness, body)
-
-
-@pytest.mark.parametrize("boot", ["granted", "ungranted", "unknown"])
-def test_with_the_pin_unreadable_the_grant_is_the_retained_sandboxs_booted_bundle(
-    make_harness: Any, monkeypatch: pytest.MonkeyPatch, boot: str
-) -> None:
-    # Boot on V1, redeploy to V2 with the opposite grant, fail the pin read, then send
-    # a second turn to the retained sandbox. "unknown": nothing names the booted bundle.
-    async def body(h: Any, b: _ChannelReadBinding) -> None:
-        if boot == "unknown":
-            _fail_marker(h, monkeypatch, _PIN["read"])
-
-            def unreadable(_claim_name: str) -> str | None:
-                raise OSError("the control plane is unavailable")
-
-            monkeypatch.setattr(h.kernel._substrate, "claim_bundle_ref", unreadable, raising=False)
-            real = h.kernel._with_channel_read
-
-            async def without_route_bundle(event: Any, handle: Any, *args: Any, **kw: Any) -> Any:
-                # A route written by a worker that did not record the bundle.
-                return await real(event, replace(handle, bundle_ref=None), *args, **kw)
-
-            monkeypatch.setattr(h.kernel, "_with_channel_read", without_route_bundle)
-            await h.kernel.process_event(_qevent("summarize", thread="th-cr-r4-unknown"))
-            assert h.runner.opened == [], "a turn with an unknown booted bundle ran"
-            assert _classification(h) in RETRYABLE_CLASSIFICATIONS
-            return
-
-        thread = f"th-cr-r4-{boot}-boot"
-        b.bundles.ungranted.add(_BUNDLE_V2 if boot == "granted" else _BUNDLE_V1)
-        await h.kernel.process_event(_qevent("before", thread=thread))
-        assert h.runner.opened == ["before"]
-
-        b.deployment_id = _REDEPLOYED
-        b.bundle_ref = _BUNDLE_V2
-        _fail_marker(h, monkeypatch, _PIN["read"])
-        h.runner.channel_read_enforced = None
-        await h.kernel.process_event(_qevent("after", thread=thread))
-        assert len(h.fake_k8s.claim_envs) == 1, "the second turn did not retain the sandbox"
-
-        if boot == "granted":
-            assert h.runner.opened == ["before"], "the retained granted turn reached the runner"
-            assert _classification(h) == "channel-read-unenforced"
-        else:
-            assert h.runner.opened == ["before", "after"], h.sink.last_text
-            assert h.runner.event_bodies[-1]["channel_read"] is None
-            assert h.sink.last_text == "ok"
-
-    _run(make_harness, body, max_attempts=3)

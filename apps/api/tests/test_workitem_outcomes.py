@@ -1571,6 +1571,8 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         updated_at=now,
         model_auth_mode="service",
         coding_instructions_state="absent",
+        memory_rules_state="absent",
+        memory_rules_count=0,
         coding_instructions_absence_reason="historical",
         # The database default an inserted row would carry.
         automatic_retries_used=0,
@@ -1594,6 +1596,7 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         requester=REQUESTER,
         model_auth_mode="service",
         coding_instructions_evidence="none",
+        memory_rules_evidence="none",
         # The database defaults an inserted row would carry.
         dispatch_not_before=now,
         owner_lost_retry=False,
@@ -1638,6 +1641,8 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         updated_at=now,
         model_auth_mode="service",
         coding_instructions_state="absent",
+        memory_rules_state="absent",
+        memory_rules_count=0,
         coding_instructions_absence_reason="historical",
         # The database default an inserted row would carry.
         automatic_retries_used=0,
@@ -1660,6 +1665,7 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         requester=REQUESTER,
         model_auth_mode="service",
         coding_instructions_evidence="none",
+        memory_rules_evidence="none",
         # The database defaults an inserted row would carry.
         dispatch_not_before=now,
         owner_lost_retry=False,

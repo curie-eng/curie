@@ -6,10 +6,12 @@ installation token flow (`curie_api.github_app`), the CI read in
 truth verifier make. Every operation, the optional ones included, is
 supported.
 
-Failures surface only as the classes in `curie_api.forges.errors`, each
-carrying a fixed reason code (``str(error)``) and never a response body,
-header, URL or token. Addressing is by ``RepositoryRef.path`` (GitHub's
-``owner/name``), as every GitHub call made before the port did.
+Failures surface only as the classes in `curie_api.forges.errors`. The reason
+string (``str(error)``) stays a fixed code and never a response body, header,
+URL or token. A 403 may also set ``Unauthorized.provider_message`` to GitHub's
+clipped ``message`` so the CI notice can quote it. Addressing is by
+``RepositoryRef.path`` (GitHub's ``owner/name``), as every GitHub call made
+before the port did.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ import re
 from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -110,12 +112,54 @@ _PERMANENT_CI_REASONS = {
     "github_forbidden": Unauthorized,
     # A 403 names the read GitHub refused (#5222); each stays permanent, so a
     # refused read is never read as an empty rollup or required-check set.
+    # The one exception is a plan-gated branch-rules 403 on a private
+    # repository, handled in ``required_checks`` before this map is consulted.
     ci.FORBIDDEN_LIST_CHECK_RUNS: Unauthorized,
     ci.FORBIDDEN_GET_COMBINED_STATUS: Unauthorized,
     ci.FORBIDDEN_GET_BRANCH_RULES: Unauthorized,
     ci.FORBIDDEN_GET_BRANCH: Unauthorized,
     "github_not_found": NotFound,
 }
+
+
+# GitHub Free serves repository rulesets on public repositories only.
+# A private repository on that plan answers
+# ``GET /repos/{owner}/{repo}/rules/branches/{branch}`` with HTTP 403 and this
+# message. The plan boundary is documented at
+# https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
+# and the read at https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch.
+# The sentence is matched with or without the trailing period GitHub's prose
+# sometimes adds. Any other message stays a refusal.
+PLAN_GATED_BRANCH_RULES_MESSAGE = (
+    "Upgrade to GitHub Pro or make this repository public to enable this feature"
+)
+_PLAN_GATED_BRANCH_RULES_MESSAGES = frozenset(
+    {PLAN_GATED_BRANCH_RULES_MESSAGE, PLAN_GATED_BRANCH_RULES_MESSAGE + "."}
+)
+_GITHUB_MESSAGE_MAX = 200
+
+
+def _github_message(response: httpx.Response) -> str | None:
+    """GitHub's clipped ``message``, or None when the body has none.
+
+    https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api
+    """
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    raw = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        return None
+    text = " ".join(redact_text(raw).split())
+    if not text:
+        return None
+    return text[:_GITHUB_MESSAGE_MAX]
+
+
+def _plan_gated_branch_rules_message(message: str | None) -> bool:
+    return message in _PLAN_GATED_BRANCH_RULES_MESSAGES
 
 
 def _ruleset_contexts(rules: Any) -> set[str]:
@@ -180,7 +224,8 @@ def _protection_contexts(payload: Any) -> set[str]:
 
 
 def _ci_error(reason: str) -> ForgeError:
-    return _PERMANENT_CI_REASONS.get(reason, Unavailable)(reason)
+    # The map mixes constructors. The call is a ForgeError. Mypy sees Any.
+    return cast(ForgeError, _PERMANENT_CI_REASONS.get(reason, Unavailable)(reason))
 
 
 def _run_state(run: Mapping[str, Any]) -> CheckState:
@@ -636,7 +681,12 @@ class GitHubCodeHost:
             if response.headers.get("x-ratelimit-remaining") == "0":
                 raise Unavailable("github_rate_limited")
             # Name the read GitHub refused (#5222); a bare reason stays generic.
-            raise Unauthorized(_FORBIDDEN_OPERATIONS.get(operation, "github_forbidden"))
+            # The clipped message is for the status comment. ``diagnostics``
+            # still decides whether the log records it.
+            raise Unauthorized(
+                _FORBIDDEN_OPERATIONS.get(operation, "github_forbidden"),
+                provider_message=_github_message(response),
+            )
         if response.status_code == 404:
             raise NotFound("github_not_found")
         if response.status_code == 429:
@@ -1293,6 +1343,58 @@ class GitHubCodeHost:
             raise _ci_error(detail.reason or "github_error")
         return detail
 
+    async def _repository_private(self, repository: RepositoryRef, token: str) -> bool | None:
+        """Whether ``repository`` is private, or None when that cannot be read.
+
+        https://docs.github.com/en/rest/repos/repos#get-a-repository
+        ``private`` is the visibility boolean. Anything else, including a
+        failed read, is not private.
+        """
+
+        try:
+            payload = await self._json(
+                "GET",
+                self._repo(repository.path),
+                token=token,
+                diagnostics=False,
+            )
+        except ForgeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        private = payload.get("private")
+        if type(private) is not bool:
+            return None
+        return private
+
+    async def _branch_rules(
+        self, repository: RepositoryRef, token: str, repo: str, encoded: str
+    ) -> Any:
+        """Rules for ``encoded``, or an empty list when that source has none.
+
+        A plan-gated 403 on a private repository is an empty list. Every other
+        refusal propagates.
+        """
+
+        try:
+            return await self._json(
+                "GET",
+                f"{repo}/rules/branches/{encoded}",
+                token=token,
+                operation="get_branch_rules",
+                diagnostics=False,
+            )
+        except NotFound:
+            return []
+        except Unauthorized as failure:
+            if (
+                str(failure) == ci.FORBIDDEN_GET_BRANCH_RULES
+                and _plan_gated_branch_rules_message(failure.provider_message)
+                and await self._repository_private(repository, token) is True
+            ):
+                return []
+            raise
+
     async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
         """Names required on ``branch`` before GitHub will merge.
 
@@ -1302,26 +1404,26 @@ class GitHubCodeHost:
         HTTP 404 on the rules endpoint, an empty rules list, a rules list with
         no required status checks rule, a missing protection object, and a
         protection object with no required status checks all contribute no
-        names from that source. HTTP 404 on the branch endpoint is
-        ``github_not_found``. A 403 names the read it refused
-        (``github_forbidden_get_branch_rules`` or ``github_forbidden_get_branch``,
-        #5222) and never yields an empty set. Every other failure uses the same
+        names from that source. A plan-gated 403 on the rules endpoint does
+        the same, and only then: the repository's ``private`` field is true
+        (https://docs.github.com/en/rest/repos/repos#get-a-repository) and
+        GitHub's message is ``PLAN_GATED_BRANCH_RULES_MESSAGE``. HTTP 404 on
+        the branch endpoint is ``github_not_found``. Any other 403 names the
+        read it refused (``github_forbidden_get_branch_rules`` or
+        ``github_forbidden_get_branch``, #5222), carries GitHub's message, and
+        never yields an empty set. A plan-gated message on a public repository,
+        a different message, or a visibility read that does not answer
+        ``private: true`` stays that refusal. A 403 with
+        ``x-ratelimit-remaining: 0`` is ``github_rate_limited`` and stays
+        transient: the wait retries until the CI deadline and then ends
+        ``ci_timeout``. It is not this empty-list fallback. HTTP 401 and 5xx use the same
         reason ``observe_ci`` raises for that failure.
         """
 
         token = await self._token(repository.path)
         repo = self._repo(repository.path)
         encoded = quote(branch, safe="")
-        try:
-            rules = await self._json(
-                "GET",
-                f"{repo}/rules/branches/{encoded}",
-                token=token,
-                operation="get_branch_rules",
-                diagnostics=False,
-            )
-        except NotFound:
-            rules = []
+        rules = await self._branch_rules(repository, token, repo, encoded)
         names = _ruleset_contexts(rules)
         payload = await self._json(
             "GET",

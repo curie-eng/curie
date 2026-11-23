@@ -94,7 +94,6 @@ def test_the_declared_capabilities_follow_decisions_14_and_19() -> None:
         Operation.LINK_PULL_REQUEST: Support.NOOP,
         Operation.DEPENDENCIES: Support.NOOP,
         Operation.GROUP_MEMBERSHIP: Support.UNSUPPORTED,
-        Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
         Operation.FACTS_EXCHANGE: Support.UNSUPPORTED,
     }
     assert dict(code_host.capabilities) == {
@@ -249,7 +248,7 @@ async def test_a_sub_path_install_builds_web_and_issue_urls_on_the_sub_path() ->
     assert gitlab_registry(api_url=SUB_PATH_API).tracker(TRACKER_NAME).issue_url(issue) == expected
     assert fake.requests == []
 
-    await tracker.poll_marked(None, running=())
+    await tracker.poll_marked(None, running=(), answering=())
     credential = await code_host.credential(fake.repository(), CredentialScope.PUSH)
     assert credential.origin == f"https://{HOST}/gitlab"
     paths = [request.url.raw_path.decode() for request in fake.requests]

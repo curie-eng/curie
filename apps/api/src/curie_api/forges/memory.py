@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
@@ -31,8 +31,6 @@ from curie_api.forges.capabilities import (
 )
 from curie_api.forges.errors import (
     Ambiguous,
-    ForgeError,
-    LinkedIssueUnconfirmed,
     NotFound,
     Unavailable,
     Unsupported,
@@ -55,7 +53,6 @@ from curie_api.forges.types import (
     FactoryPublication,
     FeedbackKind,
     FeedbackPage,
-    LinkedIssue,
     MarkedComment,
     MarkedNotice,
     NormalizedCheck,
@@ -77,11 +74,6 @@ from curie_api.forges.types import (
     TrackerComment,
     TrackerIssueRef,
     UpsertResult,
-    body_sha256,
-    ends_with_marker,
-    linked_issue_body,
-    linked_issue_marker,
-    valid_output_identity,
 )
 from curie_api.publication_policy import is_publication_branch
 
@@ -127,41 +119,22 @@ class PageFaults:
 class WriteFaults:
     """Injectable write failures, one shot each, keyed by `Operation`.
 
-    `InMemoryTracker` honours them for `Operation.CREATE_LINKED_ISSUE` and its
-    `InMemoryMarkedComments` for `Operation.UPSERT_MARKED`; both share the one
-    object the tracker was built with (``InMemoryTracker.write_faults``).
+    `InMemoryMarkedComments` honours them for `Operation.UPSERT_MARKED`; a
+    tracker's marked comments share the one object the tracker was built with
+    (``InMemoryTracker.write_faults``).
     """
 
     def __init__(self) -> None:
         self._lost: set[Operation] = set()
         self._aborts: dict[Operation, BaseException] = {}
-        self._refusals: dict[Operation, ForgeError] = {}
 
     def lose_next_response(self, operation: Operation) -> None:
         """A lost response.
 
         For `Operation.UPSERT_MARKED` the next call does its work, writes
-        included, then raises `Unavailable` instead of answering. For
-        `Operation.CREATE_LINKED_ISSUE` it applies to the next create write:
-        the issue is written, then the answer is lost, so the adapter relists
-        within the call as a real adapter does. It returns the issue when the
-        relist sees it (``created`` False) and raises `LinkedIssueUnconfirmed`
-        when it does not (`InMemoryTracker.hide_new_from_listing`)."""
+        included, then raises `Unavailable` instead of answering."""
 
         self._lost.add(operation)
-
-    def refuse_next_write(self, operation: Operation, error: ForgeError) -> None:
-        """The next create write of `Operation.CREATE_LINKED_ISSUE` is refused
-        definitely with ``error`` and writes nothing, as a 401 or 422 is."""
-
-        self._refusals[operation] = error
-
-    def refusal(self, operation: Operation) -> None:
-        """Called by an adapter just before the write a refusal answers."""
-
-        error = self._refusals.pop(operation, None)
-        if error is not None:
-            raise error
 
     def lost(self, operation: Operation) -> bool:
         """Consume an armed lost response for ``operation``; True when one was."""
@@ -228,6 +201,7 @@ class _Comment:
     author: Actor
     body: str
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryMarkedComments(_Declared):
@@ -257,6 +231,10 @@ class InMemoryMarkedComments(_Declared):
         self._page_size = page_size
         self._threads: dict[ReplyTarget, list[_Comment]] = {}
         self._ids = itertools.count(1)
+        # The tracker's own clock, which stamps each comment's creation time,
+        # and the shape of its comment ids (numeric by default).
+        self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self.comment_id: Callable[[int], str] = str
 
     @staticmethod
     def embed(marker: str, body: str) -> str:
@@ -272,12 +250,15 @@ class InMemoryMarkedComments(_Declared):
     def seed_comment(self, target: ReplyTarget, author: Actor, body: str) -> str:
         """A comment someone else (or a past run) left; returns its id."""
 
-        comment = _Comment(str(next(self._ids)), author, body)
+        comment = _Comment(self.comment_id(next(self._ids)), author, body, created_at=self.clock())
         self._accept(target).append(comment)
         return comment.id
 
     def comments(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
         return [(comment.author, comment.body) for comment in self._accept(target)]
+
+    def _find(self, target: ReplyTarget, comment_id: str) -> _Comment | None:
+        return next((item for item in self._accept(target) if item.id == comment_id), None)
 
     async def find_marked(self, target: ReplyTarget, marker: str) -> MarkedComment | None:
         self._gate(Operation.FIND_MARKED)
@@ -288,7 +269,7 @@ class InMemoryMarkedComments(_Declared):
             for comment in thread[start : start + self._page_size]:
                 # Only our own identity's comments count; a pasted marker does not.
                 if comment.author == self.identity and embedded in comment.body:
-                    return MarkedComment(comment.id, target, comment.body)
+                    return MarkedComment(comment.id, target, comment.body, comment.created_at)
         return None
 
     async def find_facts(self, target: ReplyTarget, prefix: str) -> MarkedComment | None:
@@ -339,10 +320,15 @@ class InMemoryMarkedComments(_Declared):
                 return UpsertResult(found, written=False)
             comment.body = text
             self._ledger.record()
-            return UpsertResult(MarkedComment(comment.id, target, text), written=True)
+            return UpsertResult(
+                MarkedComment(comment.id, target, text, comment.created_at), written=True
+            )
         comment_id = self.seed_comment(target, self.identity, text)
         self._ledger.record()
-        return UpsertResult(MarkedComment(comment_id, target, text), written=True)
+        created = next(item for item in thread if item.id == comment_id)
+        return UpsertResult(
+            MarkedComment(comment_id, target, text, created.created_at), written=True
+        )
 
 
 @dataclass
@@ -354,6 +340,7 @@ class _Issue:
     dependencies: tuple[TrackerIssueRef, ...] = ()
     linked: list[PullRequestRef] = field(default_factory=list)
     author: Actor = REPORTER
+    closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -365,6 +352,9 @@ class _TimelineEvent:
     marker: str
     actor: Actor
     at: datetime
+    # A plain comment's body; None for a label event or `mention_in_comment`.
+    # A comment's notice kind is decided at poll time (`InMemoryTracker.comment`).
+    body: str | None = None
 
 
 class InMemoryTracker(_Declared):
@@ -401,16 +391,6 @@ class InMemoryTracker(_Declared):
         self.ledger = ledger or WriteLedger()
         self.faults = faults or PageFaults()
         self.write_faults = write_faults or WriteFaults()
-        # Each composed body a `create_linked_issue` create wrote, in order.
-        self.sent_issue_bodies: list[str] = []
-        # How many own-issue listings `create_linked_issue` has run.
-        self.linked_listings = 0
-        # Listing lag: issues absent from the creator listing yet readable
-        # directly, as a fresh GitHub issue is for a few seconds. While
-        # ``hide_new_from_listing`` is set every issue the port creates starts
-        # hidden.
-        self.hide_new_from_listing = False
-        self._hidden: set[TrackerIssueRef] = set()
         self._page_size = page_size
         self._issues: dict[TrackerIssueRef, _Issue] = {}
         self._timeline: list[_TimelineEvent] = []
@@ -489,22 +469,6 @@ class InMemoryTracker(_Declared):
 
         self._issue(issue).title = title
 
-    def hide_from_listing(self, issue: TrackerIssueRef) -> None:
-        """Listing lag: ``issue`` is absent from the creator listing
-        `create_linked_issue` reads, yet still readable directly, so an
-        ``expected`` read still finds it."""
-
-        self._issue(issue)
-        self._hidden.add(issue)
-
-    def show_in_listing(self, issue: TrackerIssueRef | None = None) -> None:
-        """The lag ends for ``issue``, or for every hidden issue when None."""
-
-        if issue is None:
-            self._hidden.clear()
-        else:
-            self._hidden.discard(issue)
-
     def issues(self, *, author: Actor | None = None) -> list[TrackerIssueRef]:
         """Every issue in creation order, only those ``author`` created when given."""
 
@@ -548,6 +512,43 @@ class InMemoryTracker(_Declared):
         self._issue(issue)
         return self._record(issue, Disposition.MENTION, f"@{self.mention}", actor)
 
+    def comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        """``actor`` comments ``body`` on ``issue`` from outside the port; returns
+        the comment id.
+
+        The comment takes its id from the same counter as the adapter's own
+        marked comments and its creation time from their ``clock``, so it
+        orders against a factory question as on a real tracker. A poll
+        delivers it as `Disposition.ANSWER` when ``issue`` is ``answering``,
+        as `Disposition.MENTION` when ``body`` mentions ``@<mention>``, and not
+        at all otherwise; never when ``actor`` is the adapter's own identity.
+        Not a port write: no ledger entry.
+        """
+
+        self._issue(issue)
+        target = ReplyTarget.on_issue(issue)
+        comment_id = self._comments.seed_comment(target, actor, body)
+        created = self._comments._find(target, comment_id)
+        assert created is not None
+        self._timeline.append(
+            _TimelineEvent(
+                position=len(self._timeline) + 1,
+                event_id=comment_id,
+                issue=issue,
+                disposition=Disposition.ANSWER,
+                marker=self.label,
+                actor=actor,
+                at=created.created_at,
+                body=body,
+            )
+        )
+        return comment_id
+
+    def close_issue(self, issue: TrackerIssueRef) -> None:
+        """A person closes ``issue``. Not a port write: no ledger entry."""
+
+        self._issue(issue).closed = True
+
     def labels(self, issue: TrackerIssueRef) -> frozenset[str]:
         return frozenset(self._issue(issue).labels)
 
@@ -580,21 +581,44 @@ class InMemoryTracker(_Declared):
             return True
         return event.marker == self.label
 
+    def _mentions(self, body: str) -> bool:
+        pattern = rf"(?<![\w.@-])@{re.escape(self.mention)}(?![\w.-])"
+        return re.search(pattern, body, re.IGNORECASE) is not None
+
+    def _event_notice(
+        self, event: _TimelineEvent, answering: Collection[TrackerIssueRef]
+    ) -> MarkedNotice | None:
+        if event.body is None:
+            return self._notice(event) if self._marks(event) else None
+        if event.actor == self.identity:
+            return None
+        if event.issue in answering:
+            return self._notice(event)
+        if self._mentions(event.body):
+            return self._notice(
+                replace(event, disposition=Disposition.MENTION, marker=f"@{self.mention}")
+            )
+        return None
+
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         self._gate(Operation.POLL_MARKED)
         start = _cursor_position(cursor)
         unread = self._timeline[start:]
+        answers = frozenset(answering)
         notices: list[MarkedNotice] = []
         for offset in range(0, len(unread), self._page_size):
             # Read every page before returning any notice or cursor.
             self.faults.read_page("timeline")
-            notices.extend(
-                self._notice(event)
-                for event in unread[offset : offset + self._page_size]
-                if self._marks(event)
-            )
+            for event in unread[offset : offset + self._page_size]:
+                notice = self._event_notice(event, answers)
+                if notice is not None:
+                    notices.append(notice)
         if not unread:
             self.faults.read_page("timeline")
         seen = {(notice.issue, notice.event_id) for notice in notices}
@@ -627,6 +651,15 @@ class InMemoryTracker(_Declared):
             return False
         if notice.disposition is Disposition.MENTION:
             return any(event.event_id == notice.event_id for event in self._timeline)
+        if notice.disposition is Disposition.ANSWER:
+            # Open and labelled now, and the comment still stands (#5789 decision 3).
+            comment = self._comments._find(ReplyTarget.on_issue(notice.issue), notice.event_id)
+            return (
+                self.label in issue.labels
+                and not issue.closed
+                and comment is not None
+                and comment.author == notice.actor
+            )
         if notice.disposition is Disposition.CANCEL:
             return self.label not in issue.labels
         latest = self._last(notice.issue, Disposition.ADMIT)
@@ -708,110 +741,6 @@ class InMemoryTracker(_Declared):
         if own:
             return (f"Closes #{issue.issue_id}",)
         return (f"Closes {issue.scope_id}#{issue.issue_id}",)
-
-    @staticmethod
-    def embed_linked_marker(output_identity: str) -> str:
-        """How this adapter carries the linked issue marker: an HTML comment."""
-
-        return f"<!-- {linked_issue_marker(output_identity)} -->"
-
-    def _own_marked(self, embedded: str) -> list[_Issue]:
-        """Issues in this scope our own identity created whose last line is
-        ``embedded``, read page by page as a creator-filtered listing is."""
-
-        self.linked_listings += 1
-        own = [
-            found
-            for found in self._issues.values()
-            if found.ref.scope_id == self.scope_id
-            and found.author == self.identity
-            and found.ref not in self._hidden
-        ]
-        matches: list[_Issue] = []
-        for start in range(0, max(len(own), 1), self._page_size):
-            self.faults.read_page("issues")
-            matches.extend(
-                found
-                for found in own[start : start + self._page_size]
-                if ends_with_marker(found.body, embedded)
-            )
-        return matches
-
-    async def create_linked_issue(
-        self,
-        source: TrackerIssueRef,
-        *,
-        output_identity: str,
-        title: str,
-        body: str,
-        labels: Collection[str],
-        expected: TrackerIssueRef | None = None,
-        reconcile_only: bool = False,
-    ) -> LinkedIssue:
-        """The port operation over dict state; honours ``write_faults`` for
-        `Operation.CREATE_LINKED_ISSUE`. The related-source line is
-        ``Related to <issue_url(source)>.``; the marker is
-        `embed_linked_marker`. A create counts one ledger write and appends
-        the composed body to ``sent_issue_bodies``; an issue it creates while
-        ``hide_new_from_listing`` is set is hidden from the listing. With
-        ``expected`` it reads that issue directly and never lists or creates;
-        with ``reconcile_only`` it lists and never creates (see the port)."""
-
-        self._gate(Operation.CREATE_LINKED_ISSUE)
-        if expected is not None and reconcile_only:
-            raise ValueError("expected and reconcile_only are exclusive")
-        valid_output_identity(output_identity)
-        self._issue(source)
-        self.write_faults.before(Operation.CREATE_LINKED_ISSUE)
-        embedded = self.embed_linked_marker(output_identity)
-        text = linked_issue_body(
-            body, related=f"Related to {self.issue_url(source)}.", embedded=embedded
-        )
-        if expected is not None:
-            # A recorded output is read directly, never listed or recreated.
-            recorded = self._issues.get(expected)
-            if (
-                recorded is None
-                or recorded.ref.scope_id != self.scope_id
-                or recorded.author != self.identity
-                or not ends_with_marker(recorded.body, embedded)
-            ):
-                raise NotFound("linked_issue")
-            return self._linked(recorded, text, created=False)
-        matches = self._own_marked(embedded)
-        if len(matches) > 1:
-            raise Ambiguous("linked_issue")
-        if matches:
-            return self._linked(matches[0], text, created=False)
-        if reconcile_only:
-            raise NotFound("linked_issue")
-        self.write_faults.refusal(Operation.CREATE_LINKED_ISSUE)
-        ref = TrackerIssueRef(self.kind, self.host, self.scope_id, self._next_issue_id())
-        found = _Issue(ref, title, text, labels=set(labels), author=self.identity)
-        self._issues[ref] = found
-        if self.hide_new_from_listing:
-            self._hidden.add(ref)
-        self.sent_issue_bodies.append(text)
-        self.ledger.record()
-        if not self.write_faults.lost(Operation.CREATE_LINKED_ISSUE):
-            return self._linked(found, text, created=True)
-        # The answer was lost: relist within the call, as a real adapter does.
-        confirmed = self._own_marked(embedded)
-        if len(confirmed) > 1:
-            raise Ambiguous("linked_issue")
-        if not confirmed:
-            raise LinkedIssueUnconfirmed("linked_issue_unconfirmed")
-        return self._linked(confirmed[0], text, created=False)
-
-    def _linked(self, found: _Issue, sent: str, *, created: bool) -> LinkedIssue:
-        return LinkedIssue(
-            issue=found.ref,
-            url=self.issue_url(found.ref),
-            labels=frozenset(found.labels),
-            body_sha256=body_sha256(found.body),
-            sent_body_sha256=body_sha256(sent),
-            created=created,
-        )
 
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         if not self._gate(Operation.LINK_PULL_REQUEST):

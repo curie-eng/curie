@@ -1,6 +1,6 @@
 [package]
 name = "curie"
-version = "0.16.2"
+version = "0.17.0"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 # Test files are integration modules or independently declared Cargo targets.
@@ -78,6 +78,7 @@ unicode-width = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 serde_urlencoded = "0.7"
 # Content-addressed bundle identity: sha256 of the packed tar.gz, the same
 # digest `apps/api` records for that bundle on deploy (#1087).
@@ -133,7 +134,7 @@ ed25519-dalek = { version = "3.0", default-features = false, features = ["fast",
 # GLIBC_2.28 floor, both assert that floor, and the x86_64 artifact runs on
 # Amazon Linux 2023 -- i.e. the `CLI runs on old glibc` job, not `cargo audit`,
 # is the check that governs this line. Revisit only if that job regresses.
-jsonwebtoken = { version = "11.0.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+jsonwebtoken = { version = "12.0.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

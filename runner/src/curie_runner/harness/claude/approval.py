@@ -21,7 +21,9 @@ from ...approval import (
     _DENY_MESSAGE,
     _TOOL_NAME,
     APPROVAL_SERVER_NAME,
+    NO_PUBLICATION_GATE_TEXT,
     ApprovalGate,
+    PublicationLedger,
     _approval_error,
     _decide_gate,
     process_approval_request,
@@ -131,7 +133,9 @@ def build_approval_server(
     memory_tools: Sequence[SdkMcpTool[Any]] = (),
     issue_tool: SdkMcpTool[Any] | None = None,
     attachment_tools: Sequence[SdkMcpTool[Any]] = (),
-    tracker_result_tool: SdkMcpTool[Any] | None = None,
+    question_tool: SdkMcpTool[Any] | None = None,
+    propose_rule_tool: SdkMcpTool[Any] | None = None,
+    publication_ledger: PublicationLedger | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -164,8 +168,14 @@ def build_approval_server(
     ``issue_tool`` (ADR 0187) is the ``get_issue`` tool, appended only for an
     execution with a WorkItem, when the worker injected its read capability.
 
-    ``tracker_result_tool`` (ADR 0277) is ``submit_tracker_result``, appended
-    only when the API answered this execution's contract as tracker_result.
+    ``question_tool`` (#5785) is ``ask_questions``, appended only when the API
+    answered this execution's contract as implementation.
+
+    ``propose_rule_tool`` (ADR 0287, #5796) is ``propose_rule``, appended only
+    when the API's contract answer offered a rule proposal to a real model.
+
+    ``publication_ledger`` is where the ``publish_changes`` body notes that it
+    ran in a session with no ``gate``; the session reads the same object.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
@@ -175,23 +185,27 @@ def build_approval_server(
     tools: list[SdkMcpTool[Any]] = [request_approval] if include_request_approval else []
 
     @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
-    async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
+    async def publish_changes(args: dict[str, Any]) -> dict[str, Any]:
         # Discovery is unconditional so every session carries the publication
         # protocol. Authority is still mount-keyed in ``build_approval_gate``:
         # an unmounted session cannot create a publication approval, and a
         # direct invocation fails without mutating gate state.
-        if not managed_workspace:
-            return _approval_error(
-                "No managed repository workspace is mounted at /workspace; "
-                "publication cannot be requested from this session."
-            )
-        # Defence in depth: the permission callback must deny the call before
-        # execution. If a harness bypasses that callback, the in-process tool
-        # still performs no action and grants no capability.
-        return _approval_error(
-            "Publication is performed only by the platform after human approval; "
-            "this sandbox tool cannot execute it directly."
-        )
+        if not managed_workspace or gate is None or PLATFORM_PUBLISH_TOOL_NAME not in gate.required:
+            # The body ran, so the session fails the turn closed unless
+            # something else owns it (#2294). A session with no gate reads the
+            # runner's ledger instead, never this answer's text.
+            if gate is not None:
+                gate.refuse_publication(_NO_PUBLICATION_GATE)
+            elif publication_ledger is not None:
+                publication_ledger.refused = True
+            return _approval_error(NO_PUBLICATION_GATE_TEXT)
+        # The one recording path: the CLI runs this body only after every
+        # PreToolUse hook, the bundle's included, allowed the call. Recording
+        # never publishes; the platform does that after human approval.
+        refusal = gate.record_publication(args if isinstance(args, dict) else {})
+        if refusal is not None:
+            return _approval_error(refusal)
+        return {"content": [{"type": "text", "text": _PUBLISH_RECORDED_TEXT}]}
 
     tools.append(publish_changes)
     if progress_tool is not None:
@@ -202,8 +216,10 @@ def build_approval_server(
     tools.extend(attachment_tools)
     if issue_tool is not None:
         tools.append(issue_tool)
-    if tracker_result_tool is not None:
-        tools.append(tracker_result_tool)
+    if question_tool is not None:
+        tools.append(question_tool)
+    if propose_rule_tool is not None:
+        tools.append(propose_rule_tool)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
@@ -399,17 +415,7 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
         # exactly this tool lets one call through (no block recorded, the
         # approved action completes) and re-arms the gate. ``_decide_gate``
         # applies this rule (shared with the hook below).
-        try:
-            decision = await _decide_gate(gate, tool_name, tool_input, _context.tool_use_id)
-        except ValueError as exc:
-            # #4460: a malformed publication proposal is denied WITHOUT the
-            # interrupt, so the model receives the reason and can correct the
-            # call in this same turn. The fail-closed session rule still ends
-            # the turn classified-failure if nothing valid is ever recorded.
-            return PermissionResultDeny(
-                message=f"Publication request was not recorded: {exc}. Correct it and retry.",
-                interrupt=False,
-            )
+        decision = await _decide_gate(gate, tool_name, tool_input, _context.tool_use_id)
         if decision.refusal is not None:
             return PermissionResultDeny(
                 message=decision.refusal, interrupt=not decision.continue_turn
@@ -425,7 +431,9 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
             # record. Prose is not a halt mechanism; this flag is. It rides the
             # DENY only: an allow that carried it would kill every ungated call.
             return PermissionResultDeny(message=_DENY_MESSAGE, interrupt=True)
-        return PermissionResultAllow()
+        # ADR 0288 decision 2: an approved call whose ticket copy differed
+        # runs with the grant's stored arguments (``PermissionResultAllow.updated_input``).
+        return PermissionResultAllow(updated_input=decision.updated_input)
 
     return can_use_tool
 
@@ -434,6 +442,16 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
 # surfaced as the CLI's stop reason, not as the approval summary (which is
 # ``pending_summary``, built by ``summarize_tool_call``).
 _HOOK_STOP_REASON = "Paused for human approval: an approval-required tool call was denied."
+_QUESTIONS_STOP_REASON = "The questions are posted on the ticket, so this session has ended."
+_NO_PUBLICATION_GATE = (
+    "the session carries no publication approval gate, so the request could not be recorded"
+)
+_PUBLISH_STOP_REASON = "Paused for human approval: the publication request is recorded."
+# The publish_changes tool result once the request is recorded. The PostToolUse
+# halt normally ends the turn before the model reads it.
+_PUBLISH_RECORDED_TEXT = (
+    "Publication requested. A human reviews it before the platform publishes. End your turn now."
+)
 
 # Why the hook allows a call outright. Only ever emitted after the one-shot
 # post-approval grant (#430) has actually been spent, so it can state that.
@@ -457,6 +475,14 @@ def _hook_field(hook_input: Any, key: str) -> Any:
     return getattr(hook_input, key, None)
 
 
+def _has_hook_field(hook_input: Any, key: str) -> bool:
+    """Whether a hook input carries ``key`` at all, as a mapping key or an attribute."""
+
+    if isinstance(hook_input, Mapping):
+        return key in hook_input
+    return hasattr(hook_input, key)
+
+
 def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
     """The ``PreToolUse`` hook that no permission rule can shadow (#1852).
 
@@ -469,11 +495,14 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
     (``claude_agent_sdk/types.py:1945-1947``). ``matcher=None`` matches every
     tool call, which is the whole claim.
 
-    Returns the ``{"PreToolUse": [HookMatcher]}`` mapping ``__main__`` MERGES
-    into the bundle's own hooks (#272). Note that the CLI dispatches every
-    matcher on one event **concurrently** (``types.py:1956-1961``), so this hook
-    must not assume it runs before a bundle's hook, and its position in the
-    merged list is construction order, not precedence.
+    Returns the ``{"PreToolUse": [HookMatcher], "PostToolUse": [HookMatcher]}``
+    mapping ``__main__`` MERGES into the bundle's own hooks (#272); the
+    PostToolUse matcher only ends the turn after a posted question round or a
+    recorded publication.
+    Note that the CLI dispatches every matcher on one event **concurrently**
+    (``types.py:1956-1961``), so this hook must not assume it runs before a
+    bundle's hook, and its position in the merged list is construction order,
+    not precedence.
 
     Three outcomes, keyed on gate membership:
 
@@ -530,7 +559,13 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             return {}
         # A policy-bearing bundle must classify every MCP call in this hook;
         # unlike can_use_tool, PreToolUse cannot be shadowed by another allow.
-        if gate.tool_policy is None and tool_name not in gate.required:
+        # A posted question round (ADR 0286 decision 11) refuses every tool,
+        # gated or not, so the hook decides even for an ungated one.
+        if (
+            gate.tool_policy is None
+            and tool_name not in gate.required
+            and not gate.questions_posted
+        ):
             return {}
 
         raw_input = _hook_field(hook_input, "tool_input")
@@ -539,23 +574,7 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         # ``_decide_gate`` applies the shared ungated/granted/blocked rule (also
         # used by ``build_can_use_tool`` above); the grant, if any, is spent as
         # a side effect of this call.
-        try:
-            decision = await _decide_gate(gate, tool_name, tool_input, _tool_use_id)
-        except ValueError as exc:
-            # #4460: deny without the turn-stopping control fields. Omitting
-            # ``continue_`` leaves the SDK's default (continue), so the model
-            # receives this reason as the tool result and can issue the
-            # corrected call in this same turn, which the reason itself asks
-            # for. The fail-closed session rule still ends the turn
-            # classified-failure if nothing valid is ever recorded.
-            reason = f"Publication request was not recorded: {exc}. Correct it and retry."
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                },
-            }
+        decision = await _decide_gate(gate, tool_name, tool_input, _tool_use_id)
         if decision.refusal is not None:
             if decision.continue_turn:
                 return {
@@ -586,13 +605,18 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             # This WARNING is the only way to correlate "approval granted" with
             # "the call may not have actually run" from pod logs.
             logger.warning("approval one-shot grant spent tool=%s", tool_name)
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": _HOOK_GRANT_REASON,
-                }
+            allowed: dict[str, Any] = {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": _HOOK_GRANT_REASON,
             }
+            if decision.updated_input is not None:
+                # ADR 0288 decision 2: the approved call runs with the
+                # grant's stored arguments, so the connector receives the exact
+                # ticket the API verified rather than the model's second copy.
+                # ``updatedInput`` is declared on PreToolUseHookSpecificOutput.
+                allowed["updatedInput"] = decision.updated_input
+            return {"hookSpecificOutput": allowed}
 
         # ``continue_`` and ``stopReason`` are ``SyncHookJSONOutput`` common
         # control fields (claude_agent_sdk/types.py:520-561): "Whether Claude
@@ -612,8 +636,75 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             "stopReason": _HOOK_STOP_REASON,
         }
 
+    async def turn_stop(
+        hook_input: Any,
+        _tool_use_id: str | None,
+        _context: Any,
+    ) -> dict[str, Any]:
+        # ADR 0286 decision 11 (#5785): once ``ask_questions`` has posted the
+        # round, the same turn-stopping control fields the deny above carries
+        # end the turn right after that call, before the model is asked again.
+        # The PreToolUse refusal stays as the backstop for any call the CLI
+        # had already dispatched beside it.
+        if gate.questions_posted:
+            return {"continue_": False, "stopReason": _QUESTIONS_STOP_REASON}
+        # A publication is recorded by the tool body, which the CLI runs only
+        # after every PreToolUse hook allowed it, so the halt for approval
+        # lands here, after the call ran, never on sight of the call.
+        if (
+            _hook_field(hook_input, "tool_name") == PLATFORM_PUBLISH_TOOL_NAME
+            and gate.halt_after_publication()
+        ):
+            return {"continue_": False, "stopReason": _PUBLISH_STOP_REASON}
+        return {}
+
     # ``Any`` for the same reason ``hooks.py::_make_callback`` uses it: the SDK's
     # ``HookCallback`` alias is typed against its TypedDict union, and a plain
     # ``dict[str, Any]`` return is not assignable to it.
     callback: Any = approval_hook
-    return {"PreToolUse": [HookMatcher(matcher=None, hooks=[callback])]}
+    post: list[Any] = []
+    if gate.proxied_connector_servers:
+        # ADR 0288 decision 1: remember the tickets hosted connectors
+        # return. PostToolUse runs before the model sees the result, so a
+        # ticket is remembered before any call that copies it can be decided.
+        post.append(build_ticket_observer(gate))
+    post.append(turn_stop)
+    return {
+        "PreToolUse": [HookMatcher(matcher=None, hooks=[callback])],
+        "PostToolUse": [HookMatcher(matcher=None, hooks=post)],
+    }
+
+
+def build_ticket_observer(gate: ApprovalGate) -> Any:
+    """The PostToolUse callback that feeds ``ApprovalGate.observe_tool_result``.
+
+    Observation only: it always returns ``{}``, so it never changes a tool's
+    result, blocks anything or stops the turn, and it swallows its own errors
+    because a raising hook is reported to the model as a hook error. A failed
+    observation stops the carry for the conversation, since the reply it could
+    not read may hold a competing source.
+    """
+
+    async def ticket_observer(
+        hook_input: Any,
+        _tool_use_id: str | None,
+        _context: Any,
+    ) -> dict[str, Any]:
+        try:
+            tool_name = _hook_field(hook_input, "tool_name")
+            if not isinstance(tool_name, str) or not tool_name or not _has_hook_field(
+                hook_input, "tool_response"
+            ):
+                # A malformed input names no tool or carries no reply, so the
+                # reply it stands for was not read.
+                gate.ticket_carry.stop("an observation had no tool name or reply")
+            else:
+                gate.observe_tool_result(tool_name, _hook_field(hook_input, "tool_response"))
+        except Exception:  # noqa: BLE001 - observation must never fail a tool call.
+            # The unread reply may hold a second possible source of a later
+            # copy, so nothing is restored for the rest of the conversation.
+            logger.warning("approval ticket observation failed", exc_info=True)
+            gate.ticket_carry.stop("an observation failed")
+        return {}
+
+    return ticket_observer

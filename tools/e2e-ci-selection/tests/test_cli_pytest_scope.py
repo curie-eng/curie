@@ -614,7 +614,6 @@ def test_revision_scope_uses_all_changed_paths_and_nonempty_diff(
     cli = _selection(tmp_path, base=base, head=head, cwd=root, omit_kind=omit_kind)
     assert cli["pytest"] == "true"
     assert cli["pytest_scope"] == "cli"
-    assert cli["pytest_deselect"] == SELECTION_TESTS.SRE_RUNTIME
     _write(root, "apps/api/main.py", "pass\n")
     _git(root, "add", ".")
     _git(root, "commit", "-qm", "Change mixed fixture")

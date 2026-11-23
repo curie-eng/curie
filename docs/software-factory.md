@@ -127,13 +127,13 @@ below. The skill does not deploy a factory or guarantee that a task can finish.
 
 ## Read a factory pull request
 
-After a factory run, `curie factory explain` reads that issue's factory pull requests with your own GitHub login. Pass `owner/repo#number` or a github.com issue URL:
+After a factory run, `curie factory explain` reads that issue's factory pull requests with your own GitHub login. Pass `owner/repo#number` or a github.com issue URL. The reference must be an issue, not a pull request; a pull request reference exits 2 with a usage error:
 
 ```bash
-curie factory explain curie-eng/curie#120 --json
+curie factory explain curie-eng/curie#5239 --json
 ```
 
-The command checks `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. It never reads the Curie platform key. Each match prints the pull request summary, the parsed Decisions entries, verification counts, review text, forge review states, and head-commit checks. The pull request summary and the Decisions entries are the plan record. Zero matches print `no factory pull request`. A pull request that never wrote `## Decisions` reports `not recorded`.
+The command checks `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. It never reads the Curie platform key. Each match prints the pull request summary, the parsed Decisions entries, verification counts, review text, forge review states, and head-commit checks. The pull request summary and the Decisions entries are the plan record. Zero matches print `no factory pull request`. A pull request that never wrote `## Decisions` reports `not recorded`. A Decisions section ends at the next `## ` heading or at a line that is exactly `---`; the platform writes that line before the closing reference, issue marker and ask line it adds after the agent's text, so a section the agent left last still parses. A section that is malformed reports `unparsed`.
 
 ## Delegate, inspect, and refine
 
@@ -169,17 +169,48 @@ provide the equivalent provider-specific steps.
    invoke
    `$review-pr <pr-url>`. The [PR review guide](guides/factory-pr-review.md)
    covers component details, coverage, manual tests and approved feedback.
-5. **Request a revision.** Use a new issue comment explicitly mentioning the
-   configured App login, such as `@<app-slug>`, with your requested change.
-   Ordinary comments and edits do not execute work. Authorized PR mentions
-   and review feedback are also supported when configured. Feedback
-   publication requires a new human approval even where initial factory
-   publication is automatic; see the operations reference.
+5. **Answer questions or request a revision.** When the factory needs
+   something it cannot find, it investigates first, then posts its numbered
+   questions as one comment on the ticket and stops; the ticket carries
+   `curie-factory:questions`. Answer with a plain comment on the ticket, from
+   someone who could have started it (on Jira, someone the binding allows to
+   start work). No mention and no relabel: the factory reads the whole thread
+   and starts again. It asks at most three rounds per ticket. Edits, bot
+   comments and comments older than the question never answer it. On the pull
+   request, an authorized reviewer's plain
+   comment starts a revision on GitHub, with no mention. So does a submitted
+   Comment or Request changes review, and one submitted review is one revision
+   (its body and all its inline comments together). An approving review starts
+   none unless a comment mentions the factory. Each
+   pull request allows 10 plain-comment revisions; the factory then posts one
+   notice and a mention, such as `@<app-slug>`, is required. A mention is not
+   counted against that cap, but it is not a bypass. On GitHub it starts a
+   revision only when its author currently has write or admin access, the pull
+   request is open and bound to the factory's lineage, and the comment or
+   review is against the pull request's current head. GitLab and Bitbucket
+   still require the mention and read it by polling: the lineage must be open,
+   the code host must confirm the comment is current, and its author must be
+   allowed (GitLab asks the host for write access; Bitbucket Cloud and Data
+   Center cannot report it, so Bitbucket requires the binding's
+   `reviewFeedbackAllowlist`). That path compares no head.
+   To teach the factory a rule it keeps, turn on learned-rule proposals
+   (`curie cluster overrides <agent> --memory-rule-proposals on`), give
+   reusable feedback on an open factory pull request, and merge the revised
+   pull request. A person with write access to the repository, signed in to
+   the console, then opens Memory, Learned rules, Proposed and chooses
+   Accept. The rule applies from the next ticket; see the
+   [admin guide](guides/factory-admin-guide.md#let-the-factory-propose-rules-and-accept-them).
+   Outside an open question, a later issue comment must explicitly mention the
+   configured App login to start work; ordinary issue comments and edits do
+   not. Feedback publication requires a new human approval even where initial
+   factory publication is automatic; see the operations reference.
 6. **Stop or retry deliberately.** Remove the factory label or close the issue
    to cancel. Running work remains cancellation requested until termination
    is observed; an existing PR remains open and linked. After resolving a
-   failure or answering clarification, re-add the label or send an authorized
-   mention. Relabelling replaces the current run; inspect existing work first.
+   failure, re-add the label or send an authorized mention. To answer the
+   factory's questions, comment on the ticket and leave the label in place;
+   removing it cancels the question. Relabelling replaces the current run;
+   inspect existing work first.
    After a reinstall or lost factory storage, a still-labelled issue whose
    factory pull request is open is not run again; its status comment links
    that pull request, and several open ones are refused until one remains. A
@@ -258,7 +289,7 @@ is authoritative for base-branch failures, required Python checks, and timeouts.
 
 ## Follow a run's progress in Slack
 
-A factory agent can name one Slack channel for run progress. Set it with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}`; `null` clears it. The agent must already have exactly one Slack channel binding for that channel, and that binding's app identity posts. Otherwise the API answers 409 `factory_slack_channel_unbound`. Runs that are live at or after that moment get one Slack root message per WorkItem, kept across revisions, with phase reports, the pull request link and each run's terminal outcome posted in its thread. A WorkItem keeps its thread when the channel changes: later revisions still post in the channel its root went to, and only WorkItems that start afterwards root in the new channel. Tracker status comments are unchanged. Delivery is at least once, a rejected post stays owed and retries, and a late-committed phase report can arrive out of order.
+A factory agent can name one Slack channel for run progress. Set it with `curie cluster factory-progress <agent> --slack-channel C0EXAMPLE1`, clear it with `--no-slack-channel`, and inspect it by passing neither flag; `curie local factory-progress` does the same on the local stack. The Console agent page has the same setting as the field "Slack progress channel". The agent must already have exactly one Slack channel binding for that channel, and that binding's app identity posts. If it is not, `factory-progress` fails and names the command that fits. A missing binding is fixed with `curie cluster surfaces <agent> --add slack=C0EXAMPLE1`, or, when another agent already holds the default Slack identity on that channel, with `curie cluster surfaces <agent> --add slack=C0EXAMPLE1 --adapter <identity>` under a free declared identity. A channel bound under more than one Slack identity is fixed by listing the bindings with `curie cluster surfaces <agent>` and removing the extra with `curie cluster surfaces <agent> --remove slack=C0EXAMPLE1 --adapter <identity>`. Run each fix, and then `factory-progress` again, against the same target as the failed command. As API reference, the command sends `PATCH /agents/{agent_id}` with `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears it), and the API answers 409 `factory_slack_channel_unbound` when the agent does not have exactly one such binding. Runs that are live at or after that moment get one Slack root message per WorkItem, kept across revisions, whose first reply is a progress card edited in place as the run moves through its steps, with one reply mentioning the requester when the pull request is ready or the run needs a person. A WorkItem keeps its thread when the channel changes: later revisions still post in the channel its root went to, and only WorkItems that start afterwards root in the new channel. Clearing the channel stops every thread the progress lane rooted for it: no new WorkItem roots there, and the existing configured threads get no further replies and no further card edits either. A thread started by a Slack kickoff keeps its own progress either way (see [Factory Slack kickoff](operations.md#factory-slack-kickoff) and [Factory Slack progress](operations.md#factory-slack-progress)). Tracker status comments are unchanged. Delivery is at least once, and a rejected post stays owed and retries.
 
 A person steers by explicitly mentioning the app in that run thread, which asks for a revision of the same pull request on its existing branch. Plain thread replies do not steer. The API resolves the Slack sender in the receiving app's workspace, requires one active operator-managed GitHub account link for that person on the pull request's host, reads the account's current login and the pull request (open, on the run's branch), applies the existing pull request write authority, and admits the revision through the existing revision queue; a running request queues it behind. The full reply is kept as JSON in the revision objective, and no approval is added. A personal WorkItem, which runs on its owner's own Claude subscription, is steered only by its owner while their enrollment is active at the WorkItem's generation, and its revision runs as that owner; on an installation in personal mode a service WorkItem cannot be steered. Every other case is refused and the refusal code is posted in the thread. Nothing in a mapped root starts ordinary chat. GitHub is the only code host with account links today, so other hosts refuse. Worker settings are in the [operations reference](operations.md#factory-slack-progress), and account links in [factory Slack steering](operations.md#factory-slack-steering).
 

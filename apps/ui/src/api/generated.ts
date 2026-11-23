@@ -941,6 +941,97 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/memory/rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Rules
+         * @description The agent's proposed, accepted, rejected and removed rules, by scope and number.
+         *
+         *     The platform key and a console session bound to no principal read any
+         *     agent. A principal's console session reads only an agent of its own
+         *     tenant: another tenant's agent is the same 404 as an unknown one, for
+         *     every filter and scope, so its rules, reasons and deciders never leave it.
+         */
+        get: operations["list_rules_agents__agent_id__memory_rules_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept Rule
+         * @description Accept a proposed rule. The decision is recorded now. A repository rule takes
+         *     effect at the next ticket's admission (#5798), and a running request keeps the
+         *     rules it was admitted with; an agent or binding scope rule takes effect at the
+         *     agent's next session start (#5801).
+         */
+        post: operations["accept_rule_agents__agent_id__memory_rules__rule_id__accept_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reject Rule
+         * @description Reject a proposed rule; it never applies.
+         */
+        post: operations["reject_rule_agents__agent_id__memory_rules__rule_id__reject_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/memory/rules/{rule_id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Remove Rule
+         * @description Remove an accepted rule. The decision is recorded now. A repository rule
+         *     stops applying at the next ticket's admission (#5798), and a running request
+         *     keeps the rules it was admitted with; an agent or binding scope rule stops
+         *     applying at the agent's next session start (#5801).
+         */
+        post: operations["remove_rule_agents__agent_id__memory_rules__rule_id__remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/memory/{index}": {
         parameters: {
             query?: never;
@@ -1091,6 +1182,58 @@ export interface paths {
         get: operations["list_namespaces_agents__agent_id__state_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Rules
+         * @description The accepted rules a non-factory session loads at its start (#5801).
+         *
+         *     A scoped sandbox state credential with memory claims (the boot read
+         *     credential or a turn's write credential) gets ``ChannelRulesOut``: the
+         *     agent's ``memory_rule_proposals`` as ``proposals_enabled`` and the
+         *     ``accepted`` rules of the agent scope, then of the binding scope the
+         *     credential's ``binding`` claim names (none for a credential with no
+         *     binding), each ordered by acceptance and at most 16 per scope. Never a
+         *     proposed, rejected or removed rule, and never another binding's.
+         *
+         *     Every other caller (the platform key, the bundle token and a legacy token)
+         *     gets what ``GET /agents/{agent_id}/state/{namespace}`` answers for the
+         *     ``_rules`` namespace: the key/value entries stored there, as a list of
+         *     ``StateEntryOut``, after the same checks. A state credential signed for
+         *     another agent is 403 here, where the key/value routes answer 401.
+         */
+        get: operations["read_rules_agents__agent_id__state__rules_get"];
+        put?: never;
+        /**
+         * Propose Rule
+         * @description Propose one learned rule for this turn (ADR 0287 decision 7, #5801).
+         *
+         *     Only the per-turn memory write credential (ADR 0188) may propose: the
+         *     platform key, the bundle token, a legacy token and a read credential are
+         *     refused 403. The body is exactly ``rule``, ``reason`` and an optional
+         *     ``scope`` (``channel``, the default, or ``agent``); everything else comes
+         *     from the credential: the scope key from its ``binding`` claim, the source
+         *     turn from ``turn`` and the proposer from ``sender``. The rule is stored
+         *     ``proposed`` with the next number of its scope and applies only after a
+         *     person accepts it, from the agent's next session. A turn the worker
+         *     reported ended is refused 403; the agent's ``memory_rule_proposals`` off
+         *     is 403 ``rule_proposal_not_eligible``; a second proposal of one turn is
+         *     409 ``rule_already_proposed``; a malformed body is 422 ``invalid_body`` and
+         *     text outside the bounds 422 ``invalid_text``, ``too_large`` or
+         *     ``reserved_text``. No refusal and no log line carries the submitted text.
+         */
+        post: operations["propose_rule_agents__agent_id__state__rules_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2861,6 +3004,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/identity/me/github-link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start Github Link */
+        post: operations["start_github_link_identity_me_github_link_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/github-link/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Github Link Callback */
+        get: operations["github_link_callback_identity_me_github_link_callback_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Links */
+        get: operations["list_links_identity_me_links_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/links/{link_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Unlink */
+        delete: operations["unlink_identity_me_links__link_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/identity/resolve": {
         parameters: {
             query?: never;
@@ -4356,6 +4567,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Memory Rules Context
+         * @description The running request's version 1 learned rules envelope, for the current fence.
+         */
+        post: operations["read_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge Memory Rules Context
+         * @description Accept the relayed acknowledgment only for the current request and fence.
+         */
+        post: operations["acknowledge_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_acknowledgment_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/work-items/requests/{request_id}/owner-lost": {
         parameters: {
             query?: never;
@@ -4858,17 +5109,14 @@ export interface paths {
         put?: never;
         /**
          * Read Completion Contract
-         * @description The execution's completion contract; for a tracker result request, the
-         *     reservation of its one model session.
+         * @description The execution's completion contract.
          *
-         *     The first call for a tracker result request reads the source issue's
-         *     title and body, mints the request's grant and reserves the session; any
-         *     later call is 409 ``session_already_started``, so a second runner starts
-         *     no model. An implementation request reserves nothing and gets no grant.
-         *     A publication recovery request (#5429) passes the same fences as an
-         *     implementation request, reserves nothing, and is answered
-         *     ``publication_recovery`` with no execution binding, so its runner
-         *     constructs no model session.
+         *     An implementation request is answered with its ADR 0278 execution
+         *     binding. A publication recovery request (#5429) passes the same fences and
+         *     is answered ``publication_recovery`` with no execution binding, so its
+         *     runner constructs no model session. A capability that does not name its
+         *     WorkItem's issue, a cancelled WorkItem, and a request that can no longer
+         *     run are 409 ``invalid_context``.
          */
         post: operations["read_completion_contract_work_items_completion_contract_post"];
         delete?: never;
@@ -4894,7 +5142,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/work-items/tracker-result": {
+    "/work-items/questions": {
         parameters: {
             query?: never;
             header?: never;
@@ -4904,17 +5152,53 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Submit Tracker Result
-         * @description Seal the execution's one tracker result and attempt its delivery once.
+         * Post Questions
+         * @description Post this execution's numbered questions on its own ticket (#5785).
          *
-         *     Refuses (409, nothing written) an implementation request, a request
-         *     whose session was never reserved, a second submission, a source issue
-         *     whose title or body changed since the reservation, and every grant fence
-         *     (`RefusalReason`); an invalid proposal is 422 with field paths and codes
-         *     only. An accepted result is answered with its delivery state after one
-         *     inline attempt; the WorkItem reconciler retries an owed one.
+         *     The platform composes the comment and writes it as one marked comment per
+         *     asking request through the tracker's marked-comment write. The round is
+         *     recorded ``posting`` and committed before the tracker write, and
+         *     ``outstanding`` after it, with the answer fence read from the database
+         *     clock then. A replay of the same body by the same request answers the
+         *     first result with no second write. Refusals are 409 with a fixed code and
+         *     nothing echoed; a tracker failure is 503 ``tracker_unavailable`` and
+         *     leaves the round ``posting``, which settlement treats as not asked. The
+         *     body is read only after the capability is verified, and any body that is
+         *     not a JSON object inside the bounds is 409 ``invalid_questions``.
          */
-        post: operations["submit_tracker_result_work_items_tracker_result_post"];
+        post: operations["post_questions_work_items_questions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/rule-proposal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Post Rule Proposal
+         * @description Store this execution's one learned rule candidate (#5796, ADR 0287).
+         *
+         *     The capability's request and WorkItem decide everything but the text: the
+         *     agent, the repository scope, the source request, pull request lineage and
+         *     URL, and the proposer (the request's verified requester). The candidate
+         *     stays hidden until the pull request merges. A capability that does not
+         *     name its WorkItem's issue is 409 ``invalid_context``; a request that is
+         *     not an eligible revision is 403 ``rule_proposal_not_eligible``; a second
+         *     proposal of the request is 409 ``rule_already_proposed``; a body that is
+         *     not one JSON object of exactly ``rule`` and ``reason`` strings is 422
+         *     ``invalid_body``; text outside the bounds is 422 ``invalid_text``,
+         *     ``too_large`` or ``reserved_text``. No refusal and no log line carries the
+         *     submitted text.
+         */
+        post: operations["post_rule_proposal_work_items_rule_proposal_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5582,6 +5866,11 @@ export interface components {
             /** Memory */
             memory: boolean;
             /**
+             * Memory Rule Proposals
+             * @default false
+             */
+            memory_rule_proposals?: boolean;
+            /**
              * Memory Writes
              * @default false
              */
@@ -5681,6 +5970,8 @@ export interface components {
             } | null;
             /** Memory */
             memory?: boolean | null;
+            /** Memory Rule Proposals */
+            memory_rule_proposals?: boolean | null;
             /** Memory Writes */
             memory_writes?: boolean | null;
             /** Model */
@@ -7751,6 +8042,67 @@ export interface components {
             thread_id?: string | null;
         };
         /**
+         * ChannelRuleOut
+         * @description One accepted rule a session loads at its start.
+         */
+        ChannelRuleOut: {
+            /**
+             * Accepted At
+             * Format: date-time
+             */
+            accepted_at: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Number */
+            number: number;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding";
+            /** Scope Label */
+            scope_label: string;
+            /** Text */
+            text: string;
+        };
+        /** ChannelRuleRefusal */
+        ChannelRuleRefusal: {
+            detail: components["schemas"]["ChannelRuleRefusalDetail"];
+        };
+        /**
+         * ChannelRuleRefusalDetail
+         * @description A coded refusal of the state router's learned rule routes.
+         */
+        ChannelRuleRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Fix */
+            fix: string;
+            /** Message */
+            message: string;
+        };
+        /**
+         * ChannelRulesOut
+         * @description The accepted rules a non-factory session loads at its start (#5801).
+         */
+        ChannelRulesOut: {
+            /**
+             * Proposals Enabled
+             * @description Whether the agent may propose rules (`memory_rule_proposals`).
+             */
+            proposals_enabled: boolean;
+            /**
+             * Rules
+             * @description Accepted rules of the agent scope, then of the credential's binding scope, each ordered by acceptance, at most 16 per scope.
+             */
+            rules: components["schemas"]["ChannelRuleOut"][];
+        };
+        /**
          * ChannelSelector
          * @description A bound channel named by the agent. ``kind`` is required in practice and
          *     refused by name when absent, so the agent learns what to send.
@@ -7938,29 +8290,23 @@ export interface components {
         };
         /**
          * CompletionContractOut
-         * @description How the execution completes (ADR 0277, #5586): by a pull request
-         *     (``implementation``), by one delivered tracker result (``tracker_result``),
-         *     or by publishing a retained publication candidate with no model run
+         * @description How the execution completes: by a pull request (``implementation``), or
+         *     by publishing a retained publication candidate with no model run
          *     (``publication_recovery``, #5429).
          *
-         *     ``result_kinds`` are the kinds the deployed policy allows and
-         *     ``session_usd_allowance`` the per-session model allowance in USD (the
-         *     agent's dollar limit, else 5); both empty for ``implementation`` and
-         *     ``publication_recovery``. A ``publication_recovery`` answer also carries
-         *     no ``execution``: that process runs no model, so it waits for no requester
-         *     context.
+         *     ``execution`` is the ADR 0278 binding of an ``implementation`` execution.
+         *     A ``publication_recovery`` answer carries none: that process runs no
+         *     model, so it waits for no requester context.
          */
         CompletionContractOut: {
             /**
              * Completion Contract
              * @enum {string}
              */
-            completion_contract: "implementation" | "tracker_result" | "publication_recovery";
-            execution?: components["schemas"]["ExecutionBindingOut"] | null;
-            /** Result Kinds */
-            result_kinds: string[];
-            /** Session Usd Allowance */
-            session_usd_allowance: number | null;
+            completion_contract: "implementation" | "publication_recovery";
+            execution: components["schemas"]["ExecutionBindingOut"] | null;
+            /** Rule Proposal */
+            rule_proposal: boolean;
         };
         /**
          * ConnectorManifests
@@ -9142,6 +9488,9 @@ export interface components {
          *     malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
          *     the message's own at root. ``author`` is the turn's Slack user id; the
          *     receipt must name the same delivery, route and sender.
+         *     ``placeholder_ts`` is the ts of the dispatcher's placeholder reply under
+         *     the mention, None when it posted none; an admission stores it as the
+         *     run's progress card.
          */
         FactorySlackKickoffIn: {
             /** Author */
@@ -9152,6 +9501,8 @@ export interface components {
             channel_identity: string;
             /** Delivery Id */
             delivery_id: string;
+            /** Placeholder Ts */
+            placeholder_ts?: string | null;
             /** Receipt */
             receipt: {
                 [key: string]: unknown;
@@ -9166,6 +9517,8 @@ export interface components {
          *     admission refusal code for ``admission_refused``.
          */
         FactorySlackKickoffOut: {
+            /** Connect Url */
+            connect_url?: string | null;
             /** Issue Url */
             issue_url?: string | null;
             /**
@@ -9173,6 +9526,8 @@ export interface components {
              * @enum {string}
              */
             outcome: "admitted" | "not_factory" | "receipt_mismatch" | "test_driver_refused" | "binding_missing" | "binding_ambiguous" | "link_missing" | "link_multiple" | "link_malformed" | "link_host_unsupported" | "link_pull_request" | "sender_unverified" | "enrollment_inactive" | "issue_inaccessible" | "issue_closed" | "publication_exists" | "base_refused" | "thread_conflict" | "authority_changed" | "admission_refused";
+            /** Plan Url */
+            plan_url?: string | null;
             /** Reason */
             reason?: string | null;
             /**
@@ -9285,11 +9640,8 @@ export interface components {
              */
             outcome: "completed" | "failed";
             retry_condition?: components["schemas"]["RetryCondition"] | null;
-            /**
-             * Retry Safety
-             * @enum {string}
-             */
-            retry_safety: "no_effects" | "flagged" | "uncertain";
+            /** Retry Safety */
+            retry_safety?: ("no_effects" | "flagged" | "uncertain") | null;
             /** Runtime Epoch */
             runtime_epoch: number;
         };
@@ -9347,6 +9699,11 @@ export interface components {
          * @enum {string}
          */
         GateKind: "permission" | "policy";
+        /** GithubLinkStartOut */
+        GithubLinkStartOut: {
+            /** Authorize Url */
+            authorize_url: string;
+        };
         /**
          * GraderOut
          * @description A deterministic grader, mirroring the frozen eval-case Grader shape
@@ -10022,6 +10379,162 @@ export interface components {
             source_trace_ids?: string[];
         };
         /**
+         * MemoryRuleAuthRefusal
+         * @description A refused credential or console origin: one plain reason string.
+         */
+        MemoryRuleAuthRefusal: {
+            /** Detail */
+            detail: string;
+        };
+        /** MemoryRuleDecider */
+        MemoryRuleDecider: {
+            /** Display Name */
+            display_name: string | null;
+            /**
+             * Principal Id
+             * Format: uuid
+             */
+            principal_id: string;
+        };
+        /**
+         * MemoryRuleDecision
+         * @description The body of an accept, reject or remove: the version the person saw.
+         */
+        MemoryRuleDecision: {
+            /** Expected Version */
+            expected_version: number;
+        };
+        /** MemoryRuleDecisionOut */
+        MemoryRuleDecisionOut: {
+            /**
+             * Applies From
+             * @description When the decision takes effect. `next_ticket` for a repository scope rule: at the next ticket's admission; a running request keeps the rules it was admitted with. `next_session` for an agent or binding scope rule: at the next session start of the agent; a running session keeps the rules it loaded (#5801).
+             * @enum {string}
+             */
+            applies_from: "next_ticket" | "next_session";
+            rule: components["schemas"]["MemoryRuleOut"];
+        };
+        /** MemoryRuleOut */
+        MemoryRuleOut: {
+            /** Accepted At */
+            accepted_at: string | null;
+            accepted_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Label */
+            label: string;
+            /** Number */
+            number: number;
+            /**
+             * Proposed At
+             * Format: date-time
+             */
+            proposed_at: string;
+            /** Proposed By */
+            proposed_by: string;
+            /** Reason */
+            reason: string;
+            /** Rejected At */
+            rejected_at: string | null;
+            rejected_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /** Removed At */
+            removed_at: string | null;
+            removed_by: components["schemas"]["MemoryRuleDecider"] | null;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding" | "repository";
+            /** Scope Label */
+            scope_label: string;
+            /** Source Url */
+            source_url: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "proposed" | "accepted" | "rejected" | "removed";
+            /** Text */
+            text: string;
+            /** Version */
+            version: number;
+        };
+        /**
+         * MemoryRuleRefusal
+         * @description Every coded learned rule refusal, a malformed request's 422 included.
+         */
+        MemoryRuleRefusal: {
+            detail: components["schemas"]["MemoryRuleRefusalDetail"];
+        };
+        /**
+         * MemoryRuleRefusalDetail
+         * @description A coded refusal: ``code`` is ``memory_rules.<name>``.
+         */
+        MemoryRuleRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Current Version */
+            current_version?: number | null;
+            /** Fix */
+            fix: string;
+            /** Limit */
+            limit?: number | null;
+            /** Limit Bytes */
+            limit_bytes?: number | null;
+            /** Message */
+            message: string;
+        };
+        /** MemoryRuleScopeOut */
+        MemoryRuleScopeOut: {
+            /** In Force Count */
+            in_force_count: number;
+            /** Scope Key */
+            scope_key: string;
+            /**
+             * Scope Kind
+             * @enum {string}
+             */
+            scope_kind: "agent" | "binding" | "repository";
+            /** Scope Label */
+            scope_label: string;
+        };
+        /**
+         * MemoryRulesMetadata
+         * @description The learned rules pinned at admission (#5798): numbers and digest, never the text.
+         */
+        MemoryRulesMetadata: {
+            /**
+             * Count
+             * @default 0
+             */
+            count?: number;
+            /** Format Version */
+            format_version?: 1 | null;
+            /** Rule Numbers */
+            rule_numbers?: number[];
+            /** Sha256 */
+            sha256?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "absent" | "selected";
+        };
+        /** MemoryRulesOut */
+        MemoryRulesOut: {
+            /** In Force Limit */
+            in_force_limit: number;
+            /** Rules */
+            rules: components["schemas"]["MemoryRuleOut"][];
+            /** Scopes */
+            scopes: components["schemas"]["MemoryRuleScopeOut"][];
+        };
+        /**
          * MemoryTraceBackOut
          * @description The learned-from trace-back for one memory entry (#266).
          *
@@ -10212,6 +10725,30 @@ export interface components {
              * Format: uuid
              */
             request_id: string;
+        };
+        /** OwnedLinkOut */
+        OwnedLinkOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Display Label */
+            display_label: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Provider */
+            provider: string;
+        };
+        /** OwnedLinksOut */
+        OwnedLinksOut: {
+            /** Github Link Available */
+            github_link_available: boolean;
+            /** Links */
+            links: components["schemas"]["OwnedLinkOut"][];
         };
         /** Owner */
         Owner: {
@@ -11004,6 +11541,16 @@ export interface components {
              * Format: uuid
              */
             revision_id: string;
+        };
+        /**
+         * QuestionsOut
+         * @description The posted round: ``round`` of ``rounds_limit`` for the WorkItem.
+         */
+        QuestionsOut: {
+            /** Round */
+            round: number;
+            /** Rounds Limit */
+            rounds_limit: number;
         };
         /**
          * QueuedTurn
@@ -12403,6 +12950,18 @@ export interface components {
             repo_full_name: string;
         };
         /**
+         * RuleProposalOut
+         * @description A stored proposal: a hidden candidate, shown to a person only after the
+         *     pull request merges.
+         */
+        RuleProposalOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "candidate";
+        };
+        /**
          * RunnerPods
          * @description The runner sandbox pods in a namespace (populates the Logs pod dropdown).
          */
@@ -12419,11 +12978,6 @@ export interface components {
              * Format: uuid
              */
             agent_id: string;
-            /**
-             * Completion Contract
-             * @enum {string}
-             */
-            completion_contract: "implementation" | "tracker_result";
             context: components["schemas"]["FactoryContext"] | null;
             /** Conversation Id */
             conversation_id: string;
@@ -12437,7 +12991,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "tracker_result_no_revision" | "resource_gate_unmet" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
+            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "resource_gate_unmet" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -13044,42 +13598,6 @@ export interface components {
             /** Scope Id */
             scope_id: string;
         };
-        /**
-         * TrackerResultOut
-         * @description The accepted result after one inline delivery attempt.
-         *
-         *     ``state`` ``owed`` means the platform keeps retrying until the delivery
-         *     deadline. ``result_comment_url`` is the source issue's marked result
-         *     comment and ``ticket_url`` the published ticket, each once delivered.
-         */
-        TrackerResultOut: {
-            /** Result Comment Url */
-            result_comment_url: string | null;
-            /**
-             * Result Kind
-             * @enum {string}
-             */
-            result_kind: "ticket" | "findings";
-            /**
-             * State
-             * @enum {string}
-             */
-            state: "owed" | "delivered" | "failed";
-            /** Ticket Url */
-            ticket_url: string | null;
-        };
-        /**
-         * TrackerResultSubmission
-         * @description The runner result tool's call: one typed proposal, validated by the API
-         *     (`curie_api.factory_tracker_results.parse_proposal`).
-         */
-        TrackerResultSubmission: {
-            /**
-             * Proposal
-             * @description A ticket or findings proposal object.
-             */
-            proposal: unknown;
-        };
         /** Transfer */
         Transfer: {
             /** Transfer Id */
@@ -13522,6 +14040,7 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            memory_rules: components["schemas"]["MemoryRulesMetadata"];
             /**
              * Model Auth Mode
              * @default service
@@ -13571,7 +14090,7 @@ export interface components {
         };
         /**
          * WorkItemProgressOut
-         * @description The latest execution's progress, derived by ``factory_progress.phase_view``.
+         * @description The latest execution's progress, derived by ``factory_phase_view.phase_view``.
          */
         WorkItemProgressOut: {
             /** Current */
@@ -13640,6 +14159,12 @@ export interface components {
             last_deferral_reason: string | null;
             /** Last Start Failure Detail */
             last_start_failure_detail: string | null;
+            /**
+             * Memory Rules Evidence
+             * @default none
+             * @enum {string}
+             */
+            memory_rules_evidence?: "none" | "pending" | "applied" | "failed";
             /**
              * Model Auth Mode
              * @default service
@@ -16211,6 +16736,328 @@ export interface operations {
             };
         };
     };
+    list_rules_agents__agent_id__memory_rules_get: {
+        parameters: {
+            query?: {
+                state?: ("proposed" | "accepted" | "rejected" | "removed") | null;
+                scope_kind?: ("agent" | "binding" | "repository") | null;
+                scope_key?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRulesOut"];
+                };
+            };
+            /** @description No platform key or live console session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description Console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found`: no such agent, or a principal session of another tenant */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    accept_rule_agents__agent_id__memory_rules__rule_id__accept_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    reject_rule_agents__agent_id__memory_rules__rule_id__reject_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
+    remove_rule_agents__agent_id__memory_rules__rule_id__remove_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                rule_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRuleDecision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleDecisionOut"];
+                };
+            };
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+        };
+    };
     edit_memory_agents__agent_id__memory__index__put: {
         parameters: {
             query?: never;
@@ -16536,6 +17383,175 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_rules_agents__agent_id__state__rules_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `ChannelRulesOut` for a scoped sandbox credential with memory claims; for every other caller the `_rules` key/value namespace listing, as `GET /agents/{agent_id}/state/{namespace}` answers it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRulesOut"] | components["schemas"]["StateEntryOut"][];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description Another agent's credential, a released credential, or one naming no valid channel */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `agent_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description `rules_unavailable`, or the credential could not be checked (a plain string) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+        };
+    };
+    propose_rule_agents__agent_id__state__rules_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Reason
+                     * @description Why it should always apply, at most 240 UTF-8 bytes.
+                     */
+                    reason: string;
+                    /**
+                     * Rule
+                     * @description The rule, one line of at most 240 UTF-8 bytes.
+                     */
+                    rule: string;
+                    /**
+                     * Scope
+                     * @description `channel`: the credential's own binding. `agent`: every channel.
+                     * @default channel
+                     * @enum {string}
+                     */
+                    scope?: "channel" | "agent";
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleOut"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description A credential that may not propose (a plain string: another agent's, not a turn credential, read-only, released, or its turn ended), or `rule_proposal_not_eligible` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `agent_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description `rule_already_proposed` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"];
+                };
+            };
+            /** @description `invalid_body`, `invalid_text`, `too_large` or `reserved_text`, or a malformed agent id */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description `rule_proposal_unavailable`, or the credential or its turn could not be checked (a plain string) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
                 };
             };
         };
@@ -20167,6 +21183,131 @@ export interface operations {
             };
         };
     };
+    start_github_link_identity_me_github_link_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubLinkStartOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    github_link_callback_identity_me_github_link_callback_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+                "__Host-curie_github_link_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            307: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_links_identity_me_links_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnedLinksOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    unlink_identity_me_links__link_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                link_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityLinkRevokedOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     resolve_identity_resolve_post: {
         parameters: {
             query?: never;
@@ -23342,6 +24483,84 @@ export interface operations {
             };
         };
     };
+    read_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContextBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    acknowledge_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_acknowledgment_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcknowledgmentBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     declare_work_item_owner_lost_v1_internal_work_items_requests__request_id__owner_lost_post: {
         parameters: {
             query?: never;
@@ -24392,7 +25611,7 @@ export interface operations {
             };
         };
     };
-    submit_tracker_result_work_items_tracker_result_post: {
+    post_questions_work_items_questions_post: {
         parameters: {
             query?: never;
             header?: {
@@ -24403,7 +25622,18 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TrackerResultSubmission"];
+                "application/json": {
+                    /**
+                     * Questions
+                     * @description 1 to 10 questions, each 1 to 1,000 characters with no blank line.
+                     */
+                    questions?: unknown;
+                    /**
+                     * Summary
+                     * @description What the investigation found, 1 to 4,000 characters, including a reproduction result when there is one.
+                     */
+                    summary?: unknown;
+                };
             };
         };
         responses: {
@@ -24413,7 +25643,53 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TrackerResultOut"];
+                    "application/json": components["schemas"]["QuestionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_rule_proposal_work_items_rule_proposal_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Reason
+                     * @description Why the feedback states a general rule, at most 240 UTF-8 bytes.
+                     */
+                    reason: string;
+                    /**
+                     * Rule
+                     * @description The rule, one sentence of at most 240 UTF-8 bytes.
+                     */
+                    rule: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleProposalOut"];
                 };
             };
             /** @description Validation Error */

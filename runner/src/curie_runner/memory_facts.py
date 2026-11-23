@@ -70,6 +70,8 @@ Agent memory: don't save anything here.
 
 Nothing is kept for later unless a remember or update call succeeds. When someone asks you to remember something worth keeping, make it stick, or set a standing instruction, and the rules above allow it, save it to channel memory with remember. If they want it in every channel, still save it to channel memory and tell them it only applies in this channel. Never say you saved, noted or will remember something unless that call succeeded. If it was refused or failed, say so.
 
+When someone states how you should always work from now on and the propose_rule tool is available, propose it as a standing rule with propose_rule instead of saving it to memory with remember; a person must accept it before it applies. A plain fact still goes to memory.
+
 Use remember for a new fact, update to change a fact by its id, and forget to remove one. Save one fact per call."""  # noqa: E501
 
 # Shown where the guidance would go when a turn has channel memory but writes

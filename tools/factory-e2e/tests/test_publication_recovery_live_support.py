@@ -1,9 +1,13 @@
-"""The #5429 AC3 driver's inputs, install values and judgements, without a cluster.
+"""The #5429 AC3 driver's inputs, install values, judgements and fixture scheduling.
 
 The live driver (test_factory_publication_recovery_live.py) runs only on a
 caller's throwaway cluster. These checks pin what it refuses before touching
 anything, the values it installs, and that each judgement fails on the
 outcome it exists to catch and passes on the shape a correct recovery leaves.
+
+The scheduling cases require a throwaway cluster. Enable them with
+``CURIE_FACTORY_FIXTURE_SCHEDULING_LIVE=1`` and ``CURIE_FACTORY_KUBE_CONTEXT``.
+They exercise real Pod admission and scheduling on a tainted synthetic Node.
 """
 
 from __future__ import annotations
@@ -11,15 +15,21 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import candidate_install as ci
+import factory_e2e as fe
 import publication_recovery_live as prl
 import pytest
+import resource_retry_support as rrs
 import tls_code_host as tch
+import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 DRIVER = "tools/factory-e2e/tests/test_factory_publication_recovery_live.py"
@@ -32,6 +42,196 @@ BRANCH = "curie/publication-0123"
 TITLE = "Publish the reviewed change"
 BODY = "Publish the file written in this turn."
 PUBLISHED_BODY = f"{BODY}\n\nCloses #1\n\n<!-- curie-factory-issue -->"
+SCHEDULING_FLAG = "CURIE_FACTORY_FIXTURE_SCHEDULING_LIVE"
+SCHEDULING_LABEL = "curie.dev/forge-fixture-scheduling"
+SCHEDULING_SLOT = "curie.dev/forge-fixture-slot"
+
+
+def _place_on_fixture_node(pod: dict[str, Any], node: str) -> None:
+    spec = pod["spec"]
+    spec["nodeSelector"] = {SCHEDULING_LABEL: node}
+    spec["tolerations"] = [
+        {"key": SCHEDULING_LABEL, "operator": "Equal", "value": node, "effect": "NoSchedule"}
+    ]
+    spec["terminationGracePeriodSeconds"] = 0
+    resources = spec["containers"][0].setdefault("resources", {})
+    for bound in ("requests", "limits"):
+        resources.setdefault(bound, {})[SCHEDULING_SLOT] = "1"
+
+
+def _create_scheduling_object(
+    install: ci.CandidateInstall, resource: str, manifest: dict[str, Any]
+) -> None:
+    metadata = manifest["metadata"]
+    name = metadata["name"]
+    if install.kubectl("get", resource, name, "--ignore-not-found", "-o", "name").strip():
+        pytest.fail(f"{resource}/{name} already exists", pytrace=False)
+    install.rendered.append((resource, name))
+    metadata["annotations"] = {
+        ci.HELM_RELEASE_NAME: install.inputs.release,
+        ci.HELM_RELEASE_NAMESPACE: install.inputs.namespace,
+        fe.RUN_ANNOTATION: install.run_id,
+    }
+    install.kubectl("create", "-f", "-", input_text=json.dumps(manifest))
+
+
+def _create_scheduling_probe(install: ci.CandidateInstall, name: str) -> None:
+    namespace = install.inputs.namespace
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "priorityClassName": f"{namespace}-{name}",
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "securityContext": {
+                "runAsNonRoot": True,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [
+                {
+                    "name": name,
+                    "image": install.inputs.images["worker"],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                }
+            ],
+        },
+    }
+    _place_on_fixture_node(pod, namespace)
+    install.kubectl("create", "-f", "-", input_text=json.dumps(pod))
+
+
+def _scheduling_pod(install: ci.CandidateInstall, name: str) -> dict[str, Any]:
+    raw = install.kubectl(
+        "-n", install.inputs.namespace, "get", "pod", name, "--ignore-not-found", "-o", "json"
+    )
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _wait_for_synthetic_binding(install: ci.CandidateInstall, name: str) -> bool:
+    return bool(
+        rrs.poll_until(
+            lambda: (
+                _scheduling_pod(install, name).get("spec", {}).get("nodeName")
+                == install.inputs.namespace
+            ),
+            timeout=30,
+            interval=0.5,
+        )
+    )
+
+
+@pytest.fixture(params=("stub", "proxy"))
+def forge_fixture_scheduling(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> Iterator[tuple[ci.CandidateInstall, str, str]]:
+    if SCHEDULING_FLAG not in os.environ:
+        pytest.skip(f"set {SCHEDULING_FLAG}=1 to exercise the real scheduler")
+    if os.environ[SCHEDULING_FLAG] != "1":
+        pytest.fail(f"{SCHEDULING_FLAG} must be 1", pytrace=False)
+    context = os.environ.get(prl.NAMES.context, "").strip()
+    if not context or not shutil.which("kubectl") or not shutil.which("helm"):
+        pytest.fail(f"{SCHEDULING_FLAG}=1 requires {prl.NAMES.context}, kubectl and helm")
+    namespace = f"test-forge-fixture-{request.param}"
+    image = "registry.test/curie-worker:fixture"
+    inputs = ci.Inputs(context, namespace, "curie-forge-fixture", "", {"worker": image}, "Always")
+    install = ci.CandidateInstall(inputs, tmp_path)
+    install.kubectl("get", "--raw", "/readyz")
+    if install.kubectl("get", "namespace", namespace, "--ignore-not-found", "-o", "name").strip():
+        pytest.fail(f"namespace {namespace} already exists", pytrace=False)
+
+    try:
+        install.create_namespace()
+        _create_scheduling_object(
+            install,
+            "nodes",
+            {
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": namespace, "labels": {SCHEDULING_LABEL: namespace}},
+                "spec": {
+                    "taints": [
+                        {"key": SCHEDULING_LABEL, "value": namespace, "effect": "NoSchedule"}
+                    ]
+                },
+            },
+        )
+        capacity = {"cpu": "4", "memory": "4Gi", "pods": "32", SCHEDULING_SLOT: "2"}
+        now = datetime.now(UTC).isoformat()
+        node_status = {
+            "capacity": capacity,
+            "allocatable": capacity,
+            "conditions": [
+                {
+                    "type": "Ready",
+                    "status": "True",
+                    "lastHeartbeatTime": now,
+                    "lastTransitionTime": now,
+                }
+            ],
+        }
+        install.kubectl(
+            "patch",
+            "node",
+            namespace,
+            "--subresource=status",
+            "--type=merge",
+            "-p",
+            json.dumps({"status": node_status}),
+        )
+        sandbox_priority = yaml.safe_load((ci.CHART / "values.yaml").read_text())[
+            "priorityClasses"
+        ]["sandbox"]["value"]
+        for name, priority in (("sentinel", 50_000), ("sandbox", sandbox_priority)):
+            _create_scheduling_object(
+                install,
+                ci.PRIORITY_CLASS_RESOURCE,
+                {
+                    "apiVersion": "scheduling.k8s.io/v1",
+                    "kind": "PriorityClass",
+                    "metadata": {"name": f"{namespace}-{name}"},
+                    "value": priority,
+                    "preemptionPolicy": "PreemptLowerPriority",
+                    "globalDefault": False,
+                },
+            )
+
+        if request.param == "stub":
+            manifests = install.stub_manifests(prl.SEED_FILES, prl.SEED_ISSUE)
+        else:
+            manifests = prl.proxy_manifests(namespace, image, inputs.pull_policy, owner={})
+        pod = next(item for item in manifests if item["kind"] == "Pod")
+        fixture_name = pod["metadata"]["name"]
+        _place_on_fixture_node(pod, namespace)
+        install.create_fixture_manifests(manifests)
+        _create_scheduling_probe(install, "sentinel")
+        for name in (fixture_name, "sentinel"):
+            if not _wait_for_synthetic_binding(install, name):
+                pytest.fail(f"the scheduler did not bind {name} before the sandbox was admitted")
+        fixture_uid = _scheduling_pod(install, fixture_name)["metadata"]["uid"]
+        _create_scheduling_probe(install, "sandbox")
+        yield install, fixture_name, fixture_uid
+    finally:
+        failures = [step for step in install.teardown.run() if not step["ok"]]
+        if failures:
+            pytest.fail(f"fixture scheduling teardown failed: {failures}")
+
+
+def test_forge_fixture_survives_sandbox_preemption(
+    forge_fixture_scheduling: tuple[ci.CandidateInstall, str, str],
+) -> None:
+    install, fixture_name, fixture_uid = forge_fixture_scheduling
+    assert _wait_for_synthetic_binding(install, "sandbox"), "the sandbox never acquired a slot"
+    fixture = _scheduling_pod(install, fixture_name)
+    assert fixture.get("metadata", {}).get("uid") == fixture_uid, (
+        f"the sandbox preempted the forge fixture {fixture_name}"
+    )
+    assert not fixture["metadata"].get("deletionTimestamp")
+    assert not _scheduling_pod(install, "sentinel"), "the sandbox did not preempt the sentinel"
 
 
 # --------------------------------------------------------------------------
@@ -349,7 +549,6 @@ def _recovered(**override: Any) -> dict[str, Any]:
         "runtime_epoch": 2,
         "runtime_claim_name": "claim-b",
         "started_at": "2026-11-16T08:06:00+00:00",
-        "model_session_reserved_at": None,
         "recovery_candidate_id": CANDIDATE,
         "recovery_candidate_sha256": "c" * 64,
     }
@@ -429,7 +628,6 @@ def test_judge_recovery_accepts_a_capture_snapshot_with_no_flushed_tokens() -> N
         ({"successor": {"started_at": "2026-11-16T08:04:00+00:00"}}, "before the original"),
         ({"successor": {"recovery_candidate_id": "x"}}, "different candidate"),
         ({"successor": {"recovery_candidate_sha256": "e" * 64}}, "digest differs"),
-        ({"successor": {"model_session_reserved_at": "2026-11-16T08:06:01Z"}}, "model session"),
         (
             {"candidate_after": {**_candidate(), "patch": {"sha256": "9" * 64, "size_bytes": 1}}},
             "objects changed",

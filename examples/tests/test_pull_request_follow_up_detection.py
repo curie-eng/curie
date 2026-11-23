@@ -29,6 +29,7 @@ from curie_api.forges.types import (
 )
 from curie_api.github_factory_review import _objective as github_objective
 from curie_api.github_review_events import UnverifiedFeedback
+from curie_api.github_review_store import feedback_provenance
 from curie_runner.sender_frame import frame_user_turn
 
 HOOK = Path(__file__).resolve().parents[1] / "dark-factory" / "hooks" / "review_gate.py"
@@ -76,7 +77,7 @@ def production_follow_up_objectives() -> dict[str, str]:
     )
     return {
         "github": github_objective(
-            feedback, _GITHUB_URL, {"pull_request_body": "## Decisions\nNone."}
+            feedback_provenance(feedback), _GITHUB_URL, {"pull_request_body": "## Decisions\nNone."}
         ),
         "forge": forge_objective(
             forge_feedback,

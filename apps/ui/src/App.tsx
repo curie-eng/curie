@@ -21,6 +21,9 @@ const WiredAgentDetail = lazy(() =>
 const WiredWorkItems = lazy(() =>
   import("./views/wired/WiredWorkItems").then((m) => ({ default: m.WiredWorkItems })),
 );
+const WiredMemoryPage = lazy(() =>
+  import("./views/wired/WiredMemoryPage").then((m) => ({ default: m.WiredMemoryPage })),
+);
 const WiredFactory = lazy(() =>
   import("./views/wired/WiredFactory").then((m) => ({ default: m.WiredFactory })),
 );
@@ -54,6 +57,8 @@ function Main() {
       return <WiredWorkItems />;
     case "factory":
       return <WiredFactory />;
+    case "memory":
+      return <WiredMemoryPage />;
     case "evals":
       return <WiredEvals />;
     case "observability":
@@ -73,12 +78,12 @@ export function App() {
   const { envDev } = useStore();
   return (
     <div style={{ fontFamily: C.sans, color: C.text, minHeight: "100vh", background: C.page }}>
-      <div style={{ display: "flex", minHeight: "100vh" }}>
+      <div className="app-shell" style={{ display: "flex", minHeight: "100vh" }}>
         <Sidebar />
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
           <Topbar />
           {envDev ? <DevBanner /> : null}
-          <div style={{ flex: 1, padding: "28px 36px", maxWidth: 1280, width: "100%", margin: "0 auto" }}>
+          <div className="app-main" style={{ flex: 1, padding: "28px 36px", maxWidth: 1280, width: "100%", margin: "0 auto" }}>
             <Suspense fallback={<Notice>Loading…</Notice>}>
               <Main />
             </Suspense>

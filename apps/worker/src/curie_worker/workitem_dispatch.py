@@ -49,10 +49,6 @@ class WorkItemTransportError(Exception):
     """5xx or unreachable API; the wake must stay pending for retry."""
 
 
-CompletionContract = Literal["implementation", "tracker_result"]
-CONTRACT_IMPLEMENTATION: CompletionContract = "implementation"
-CONTRACT_TRACKER_RESULT: CompletionContract = "tracker_result"
-
 # What an execute wake does (ADR 0269, #5429): an implementation request opens
 # model turns; a publication_recovery request boots the validation runtime and
 # publishes its one retained candidate without any model turn.
@@ -136,11 +132,6 @@ class WorkItemAcquireGrant:
     # before this request claims. None on every other request.
     resource_gate: ResourceGate | None
     predecessor_claim_name: str | None
-    # How the request completes (ADR 0277, #5586): an implementation request
-    # ends in a pull request, a tracker_result request in one tracker result.
-    # An API that predates the field sends none, which means implementation.
-    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
-
     @property
     def agent_id(self) -> uuid.UUID:
         return self.context.agent_id
@@ -152,7 +143,6 @@ class WorkItemStartGrant:
     execution_deadline: datetime
     remaining_s: float
     heartbeat_interval_s: float
-    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
 
 
 @dataclass(frozen=True)
@@ -169,7 +159,6 @@ class WorkItemRunning:
     execution_deadline: datetime
     context: FactoryContext | None
     refusal: str | None
-    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
 
 
 @dataclass(frozen=True)
@@ -185,6 +174,9 @@ class WorkItemRequestView:
     runtime_epoch: int
     runtime_claim_name: str | None
     runtime_sandbox_name: str | None
+    # Whether the API recorded this request's question round as posted (ADR
+    # 0286, #5785). None when the answer did not say: an older API omits it.
+    questions_posted: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -314,24 +306,6 @@ def _optional_name(value: object) -> str | None:
     return None if value is None else _required_string(value)
 
 
-def _completion_contract(body: dict[str, Any]) -> CompletionContract:
-    """The request's completion contract; absent means implementation.
-
-    Any value other than the two known contracts is an unusable body, never
-    read as implementation: a tracker_result run must not lose its limits to
-    a misspelled field.
-    """
-
-    value = body.get("completion_contract")
-    if value is None:
-        return CONTRACT_IMPLEMENTATION
-    if value == CONTRACT_IMPLEMENTATION:
-        return CONTRACT_IMPLEMENTATION
-    if value == CONTRACT_TRACKER_RESULT:
-        return CONTRACT_TRACKER_RESULT
-    raise ValueError("unknown completion contract")
-
-
 def _execution_kind(body: dict[str, Any]) -> tuple[ExecutionKind, uuid.UUID | None]:
     """The request's execution kind and recovery candidate, read strictly.
 
@@ -406,7 +380,6 @@ class WorkItemDispatchClient:
                 recovery_candidate_id=recovery_candidate_id,
                 resource_gate=_resource_gate(body["resource_gate"]),
                 predecessor_claim_name=_optional_name(body["predecessor_claim_name"]),
-                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -482,7 +455,6 @@ class WorkItemDispatchClient:
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
                 remaining_s=float(body["remaining_s"]),
                 heartbeat_interval_s=float(body["heartbeat_interval_s"]),
-                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -566,7 +538,6 @@ class WorkItemDispatchClient:
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
                 context=context,
                 refusal=refusal,
-                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -726,6 +697,11 @@ class WorkItemDispatchClient:
                 runtime_epoch=int(epoch) if epoch is not None else 0,
                 runtime_claim_name=_optional_str(body.get("runtime_claim_name")),
                 runtime_sandbox_name=_optional_str(body.get("runtime_sandbox_name")),
+                questions_posted=(
+                    body["questions_posted"]
+                    if isinstance(body.get("questions_posted"), bool)
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -795,6 +771,35 @@ class WorkItemDispatchClient:
         evidence = body.get("evidence")
         if evidence not in ("none", "applied", "failed"):
             raise WorkItemTransportError("requester context acknowledgment was unusable")
+        return str(evidence)
+
+    async def memory_rules_context(
+        self, request_id: uuid.UUID, *, runtime_epoch: int
+    ) -> dict[str, Any]:
+        """The running request's learned rules envelope (#5798)."""
+
+        return await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/memory-rules-context",
+            {"runtime_epoch": runtime_epoch},
+        )
+
+    async def acknowledge_memory_rules_context(
+        self,
+        request_id: uuid.UUID,
+        *,
+        runtime_epoch: int,
+        acknowledgment: dict[str, Any] | None,
+        reason: str | None,
+    ) -> str:
+        """Relay the runner's learned rules acknowledgment, or the worker's failure."""
+
+        body = await self._post(
+            f"/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
+            {"runtime_epoch": runtime_epoch, "acknowledgment": acknowledgment, "reason": reason},
+        )
+        evidence = body.get("evidence")
+        if evidence not in ("none", "applied", "failed"):
+            raise WorkItemTransportError("learned rules acknowledgment was unusable")
         return str(evidence)
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -882,10 +887,6 @@ class WorkItemRun:
         self.conversation_id = grant.conversation_id
         self.wait_deadline = grant.wait_deadline
         self.context = grant.context
-        # Learned at acquire (or from the running row of an adopted run),
-        # before the capability mint and the sandbox claim. Only ever widened
-        # to tracker_result afterwards, never narrowed (see ``start``).
-        self.completion_contract: CompletionContract = grant.completion_contract
         # Fixed at admission and learned only at acquire (#5429). A run adopted
         # from its running row is a continuation (an approval resume or a CI
         # round), never the execute wake a recovery runs on, so it has none.
@@ -916,6 +917,10 @@ class WorkItemRun:
         # Cancellation, termination, deadline and owner loss never set it.
         self.recovery_eligible = False
         self.held = False
+        # Set while this run's own finish call is in flight and after it ends,
+        # so a heartbeat refused because that finish committed is not read as
+        # a lost epoch (#5840).
+        self._finish_done: asyncio.Event | None = None
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None
         self.sandbox_name: str | None = None
@@ -984,11 +989,6 @@ class WorkItemRun:
             self.started = True
             self.runtime_epoch = grant.runtime_epoch
             self.execution_deadline = grant.execution_deadline
-            if grant.completion_contract == CONTRACT_TRACKER_RESULT:
-                # The contract is fixed at admission, so the two answers
-                # agree. Should they not, the stricter one governs: a
-                # tracker_result run is never continued, retried or published.
-                self.completion_contract = CONTRACT_TRACKER_RESULT
         interval = max(_MIN_HEARTBEAT_INTERVAL_S, grant.heartbeat_interval_s)
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(interval),
@@ -1001,12 +1001,6 @@ class WorkItemRun:
         """Publish the one retained candidate with no model turn (ADR 0269, #5429)."""
 
         return self.execution_kind == EXECUTION_PUBLICATION_RECOVERY
-
-    @property
-    def is_tracker_result(self) -> bool:
-        """One investigation session that ends in a tracker result (ADR 0277)."""
-
-        return self.completion_contract == CONTRACT_TRACKER_RESULT
 
     def bound_remaining_s(self, remaining_s: float | None) -> float | None:
         if self.execution_deadline is None:
@@ -1049,19 +1043,24 @@ class WorkItemRun:
     ) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
-        await self._client.finish(
-            self.request_id,
-            runtime_epoch=self.runtime_epoch,
-            outcome=outcome,
-            cause=cause,
-            detail=detail,
-            ci_fix_round=ci_fix_round,
-            retry_safety=retry_safety,
-            retry_condition=retry_condition,
-            exhausted_volume=exhausted_volume,
-            budget_s=self._write_budget_s(),
-        )
-        self.finished = True
+        done = asyncio.Event()
+        self._finish_done = done
+        try:
+            await self._client.finish(
+                self.request_id,
+                runtime_epoch=self.runtime_epoch,
+                outcome=outcome,
+                cause=cause,
+                detail=detail,
+                ci_fix_round=ci_fix_round,
+                retry_safety=retry_safety,
+                retry_condition=retry_condition,
+                exhausted_volume=exhausted_volume,
+                budget_s=self._write_budget_s(),
+            )
+            self.finished = True
+        finally:
+            done.set()
 
     async def close(self) -> None:
         """Drop renewal and heartbeat. A stop in flight is allowed to finish."""
@@ -1147,6 +1146,8 @@ class WorkItemRun:
                     )
                 except WorkItemConflict as exc:
                     if exc.code == "stale_owner":
+                        if await self._own_finish_committed():
+                            return
                         await self._invoke_stop(self._on_stale)
                         return
                     logger.warning(
@@ -1173,6 +1174,27 @@ class WorkItemRun:
                     return
         except asyncio.CancelledError:
             raise
+
+    async def _own_finish_committed(self) -> bool:
+        """True when a ``stale_owner`` heartbeat answer is this run's own finish.
+
+        The API refuses a heartbeat for any row that is no longer running, so a
+        beat already in flight when this run's finish commits comes back
+        ``stale_owner`` too, and its answer can arrive before or after the
+        finish answer. Reading it as a lost epoch would abandon the run, and an
+        abandoned run releases nothing, so a failed run would skip its ADR 0251
+        recovery capture and the personal teardown wake would delete the
+        workspace (#5840). Wait for a finish in flight to end, then trust only
+        a committed finish. ``_finish_or_settle`` marks a ``not_running`` answer
+        finished in the same step the finish raises, before this wait resumes.
+        A finish refused or lost on the wire leaves ``finished`` false, and the
+        stale answer keeps abandoning as before.
+        """
+
+        done = self._finish_done
+        if done is not None:
+            await done.wait()
+        return self.finished
 
     async def _invoke_stop(self, callback: StopCallback) -> None:
         self._stopping = True

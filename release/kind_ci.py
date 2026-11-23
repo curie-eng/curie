@@ -94,7 +94,7 @@ def required_job_names(repo_root: Path, *, deadline: float) -> frozenset[str]:
             "E2E required",
             *(
                 f"E2E chart runtime regressions (kind, Calico, {leg})"
-                for leg in ("chart", "upgrade", "workload")
+                for leg in ("chart", "upgrade", "workload-1", "workload-2")
             ),
             *(
                 f"E2E scripted factory (kind, scripted model, {suite})"
@@ -105,6 +105,7 @@ def required_job_names(repo_root: Path, *, deadline: float) -> frozenset[str]:
                     "initial-binding-3",
                     "static-token-rotation",
                     "fresh-install",
+                    "learned-rules",
                 )
             ),
             *(f"Admitted agent runtime regressions (kind, shard {n}/7)" for n in range(1, 8)),

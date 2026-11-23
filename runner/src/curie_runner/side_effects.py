@@ -69,6 +69,33 @@ PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
     | STATE_READ_TOOL_NAMES
 )
 
+# Platform tools that always write outside the sandbox. ``ask_questions``
+# (#5785, decision 16) posts a comment on the ticket, an external write, so a
+# turn that asked is not replayed blind. ``propose_rule`` (ADR 0287, #5796)
+# stores a rule candidate on the platform, one per execution request. The
+# classifier treats every name here as side-effecting even if a harness
+# declaration lists it as read-only, and the import time check below keeps
+# the two sets from overlapping.
+PLATFORM_SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset(
+    {"mcp__curie__ask_questions", "mcp__curie__propose_rule"}
+)
+
+# Side-effecting tools whose call arguments never leave the runner, on the action
+# frame or in the turn's transcript record (its portable messages and native
+# checkpoint, see ``adapter``). ``ask_questions`` carries the question text,
+# which ADR 0286 decision 4 keeps on the tracker only: the action ledger and the
+# transcript record that the call happened, not what it asked. ``propose_rule``
+# (ADR 0287, #5796) carries a rule that stays hidden until its pull request
+# merges and a person accepts it, and text the API refused must never be readable
+# anywhere, so its arguments are withheld the same way.
+ARGUMENTS_WITHHELD_TOOLS: frozenset[str] = frozenset(
+    {"mcp__curie__ask_questions", "mcp__curie__propose_rule"}
+)
+
+assert not (PLATFORM_SIDE_EFFECTING_TOOLS & PLATFORM_IDEMPOTENT_TOOLS), (
+    "a platform side-effecting tool must not be in the idempotent set"
+)
+
 # The Claude Code harness adapter's declared read-only tool set. Names match the
 # claude-agent-sdk tool identifiers (PascalCase). Per ADR-0060 each harness
 # declares its own read-only set; this is the Claude adapter's declaration and
@@ -108,7 +135,7 @@ class SideEffectClassifier:
             if readonly_tools is not None
             else CLAUDE_READONLY_TOOLS
         )
-        self._idempotent = declared | PLATFORM_IDEMPOTENT_TOOLS
+        self._idempotent = (declared | PLATFORM_IDEMPOTENT_TOOLS) - PLATFORM_SIDE_EFFECTING_TOOLS
 
     def is_side_effecting(self, tool_name: str) -> bool:
         """True if executing ``tool_name`` may cause a non-idempotent side effect."""

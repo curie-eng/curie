@@ -107,6 +107,110 @@ pub(crate) struct SubscriptionSession {
     pub(crate) dry_run: bool,
 }
 
+/// The learned rule flags of `cluster memory`. `--rules` lists; `--accept`,
+/// `--reject` and `--remove` act as the signed-in person, so they read a
+/// private session file and never the platform key.
+#[derive(Args, Debug, Default, Clone)]
+#[group(skip)]
+#[command(group(clap::ArgGroup::new("rule_surface").multiple(true)))]
+pub(crate) struct MemoryRuleArgs {
+    /// List learned rules (`GET /agents/{id}/memory/rules`).
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
+        ],
+        group = "rule_surface"
+    )]
+    pub(crate) rules: bool,
+    /// With --rules, show only rules in this state: proposed, accepted,
+    /// rejected or removed.
+    #[arg(long, value_name = "STATE", requires = "rules")]
+    pub(crate) rule_state: Option<String>,
+    /// With --rules, show only rules of this exact scope key.
+    #[arg(
+        long,
+        value_name = "KEY",
+        requires = "rules",
+        conflicts_with = "channel"
+    )]
+    pub(crate) scope_key: Option<String>,
+    /// With --rules, show only the agent scope rules (not a channel's or a
+    /// repository's). `--channel KIND=ADDRESS` with --rules selects one
+    /// bound channel instead.
+    #[arg(
+        long,
+        requires = "rule_surface",
+        conflicts_with_all = ["channel", "scope_key"]
+    )]
+    pub(crate) agent_scope: bool,
+    /// Accept this proposed rule. With --channel KIND=ADDRESS or --agent-scope
+    /// the rule must be in that scope or nothing is sent. Needs --expected-version and --session-file.
+    #[arg(
+        long,
+        value_name = "RULE_ID",
+        groups = ["rule_action", "rule_verb", "rule_surface"],
+        requires_all = ["expected_version", "session_file"],
+        conflicts_with_all = [
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
+            "reject", "remove",
+        ]
+    )]
+    pub(crate) accept: Option<String>,
+    /// Reject this proposed rule. Needs --expected-version and --session-file.
+    #[arg(
+        long,
+        value_name = "RULE_ID",
+        groups = ["rule_action", "rule_verb", "rule_surface"],
+        requires_all = ["expected_version", "session_file"],
+        conflicts_with_all = [
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
+            "accept", "remove",
+        ]
+    )]
+    pub(crate) reject: Option<String>,
+    /// Remove this accepted rule. Needs --expected-version and --session-file.
+    #[arg(
+        long,
+        value_name = "RULE_ID",
+        groups = ["rule_action", "rule_verb", "rule_surface"],
+        requires_all = ["expected_version", "session_file"],
+        conflicts_with_all = [
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
+            "accept", "reject",
+        ]
+    )]
+    pub(crate) remove: Option<String>,
+    /// Version of the rule to change, as `--rules` reports it.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(i64).range(1..),
+        requires = "rule_action"
+    )]
+    pub(crate) expected_version: Option<i64>,
+    /// Private file (mode 0600 or stricter) holding only the value of your
+    /// Console session cookie, __Host-curie_console_session. Used by --accept,
+    /// --reject and --remove, which never send the platform key. With --rules
+    /// it lists with the session instead of the platform key.
+    #[arg(long, value_name = "PATH", requires = "rule_surface")]
+    pub(crate) session_file: Option<PathBuf>,
+}
+
+impl MemoryRuleArgs {
+    /// The one rule change asked for, with the rule id.
+    pub(crate) fn action(&self) -> Option<(commands::MemoryRuleVerb, String)> {
+        use commands::MemoryRuleVerb as Verb;
+        [
+            (Verb::Accept, &self.accept),
+            (Verb::Reject, &self.reject),
+            (Verb::Remove, &self.remove),
+        ]
+        .into_iter()
+        .find_map(|(verb, id)| id.clone().map(|id| (verb, id)))
+    }
+}
+
 /// The grant file an enroll, replace or reconnect sends.
 #[derive(Args, Debug, Clone)]
 pub(crate) struct SubscriptionTokenFile {
@@ -540,6 +644,29 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Open loopback port-forwards to the Console and Langfuse of a release
+    /// whose services are ClusterIP (`cluster up --no-expose`, and what
+    /// `factory quickstart` installs). Runs in the foreground; the
+    /// forwards exist only while it runs. Press Ctrl-C to stop them.
+    Access {
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Local port for the Console. Default: derived from the service port
+        /// the way `cluster status` names it (18080 for the default UI port).
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        ui_port: Option<u16>,
+        /// Local port for Langfuse. Default: 23000, the port the chart's
+        /// Langfuse sign-in URL (`langfuse.nextauthUrl`) names.
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        langfuse_port: Option<u16>,
+        /// Print the commands that would run and exit without executing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show the release's observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
         /// Query platform observability data through the Curie API. Omit to
@@ -641,6 +768,12 @@ pub(crate) enum ClusterAction {
         /// Select polling or webhook intake. Omit to keep the recorded mode.
         #[arg(long, value_parser = ["poll", "webhook"])]
         intake: Option<String>,
+        /// Select the installation's model auth mode (factory.modelAuthMode):
+        /// service or personal. Personal needs the Kubernetes sandbox
+        /// substrate. Given alone, it writes only the mode and leaves intake
+        /// as recorded. Omit to keep the recorded mode.
+        #[arg(long, value_parser = ["service", "personal"], conflicts_with_all = ["disable", "repo_runners", "repo_docker"])]
+        model_auth_mode: Option<String>,
         /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.
         /// Sets `api.githubRepoAllowlist`. With --app-id, pass at least one
         /// --repo or use --all-installed-repos to allow the whole installation.
@@ -1072,6 +1205,14 @@ pub(crate) enum ClusterAction {
         /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
+        /// Let the agent propose memory rules on or off
+        /// (`memory_rule_proposals`, #5796, #5801). A factory run reads it at
+        /// its next request's completion contract; any other agent at its next
+        /// session in a channel, where it also needs --memory-writes on. A
+        /// person still accepts any proposed rule; the agent never activates
+        /// one itself.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        memory_rule_proposals: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -1100,6 +1241,42 @@ pub(crate) enum ClusterAction {
         /// Remove the branch prefix.
         #[arg(long)]
         clear_branch_prefix: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read or set the Slack channel one agent's factory runs post progress to
+    /// (`PATCH /agents/{id}`, `factory_slack_channel`).
+    ///
+    /// This is its own verb, not a flag on `curie cluster factory`: that
+    /// command configures release-wide Helm intake, has no API connection and
+    /// no agent argument, so a per-agent setting there would be ambiguous.
+    ///
+    /// With neither flag this inspects. The agent must already hold exactly
+    /// one Slack binding with an identity for the channel; add it first with
+    /// `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>` (when another
+    /// agent already holds the default Slack identity on that channel, add it
+    /// under a free declared identity with `--adapter <identity>`), or, when
+    /// the channel is bound under several identities, remove the extra with
+    /// `curie cluster surfaces <agent> --remove slack=<CHANNEL_ID> --adapter
+    /// <identity>`. Binding it is a separate decision because it also makes
+    /// the agent answer there.
+    ///
+    /// `--no-slack-channel` clears the configured progress channel: the
+    /// progress lane stops rooting runs there and stops replying and editing
+    /// cards in the threads it already rooted. A thread that a Slack kickoff
+    /// started keeps its own progress either way.
+    FactoryProgress {
+        /// Agent name or id.
+        agent: String,
+        /// Post progress to this Slack channel id (public C..., private G...).
+        #[arg(long, value_name = "CHANNEL_ID", conflicts_with = "no_slack_channel")]
+        slack_channel: Option<String>,
+        /// Clear the configured progress channel.
+        #[arg(long)]
+        no_slack_channel: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -1450,6 +1627,8 @@ pub(crate) enum ClusterAction {
         channel: Option<String>,
         #[command(flatten)]
         guidance: MemoryGuidanceArgs,
+        #[command(flatten)]
+        rules: MemoryRuleArgs,
     },
     /// The action ledger and its undo: list and read an agent's recorded
     /// actions, ask for an undo, and read an execution's receipt.

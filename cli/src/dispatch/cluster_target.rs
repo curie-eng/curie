@@ -98,6 +98,9 @@ pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Op
         | ClusterAction::Status {
             namespace, release, ..
         }
+        | ClusterAction::Access {
+            namespace, release, ..
+        }
         | ClusterAction::Observability {
             namespace, release, ..
         }
@@ -137,6 +140,7 @@ pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Op
         | ClusterAction::Resume { conn, .. }
         | ClusterAction::Overrides { conn, .. }
         | ClusterAction::PublicationPolicy { conn, .. }
+        | ClusterAction::FactoryProgress { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
         | ClusterAction::Callers { conn, .. }
         | ClusterAction::AccessPolicy { conn, .. }
@@ -244,6 +248,11 @@ pub(crate) fn retarget_cluster_action(
             release: current_release,
             ..
         }
+        | ClusterAction::Access {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
         | ClusterAction::Observability {
             namespace: current_namespace,
             release: current_release,
@@ -299,6 +308,7 @@ pub(crate) fn retarget_cluster_action(
         | ClusterAction::Resume { conn, .. }
         | ClusterAction::Overrides { conn, .. }
         | ClusterAction::PublicationPolicy { conn, .. }
+        | ClusterAction::FactoryProgress { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
         | ClusterAction::Callers { conn, .. }
         | ClusterAction::AccessPolicy { conn, .. }

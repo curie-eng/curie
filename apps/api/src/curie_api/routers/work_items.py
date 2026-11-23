@@ -12,11 +12,16 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 
 from curie_api.workitems.lifecycle import RetryConditionFact, WorkItemConflict, WorkItemOutcome
 
-from .. import personal_execution, requester_instruction_context, workitem_dispatch
+from .. import (
+    factory_questions,
+    memory_rules_context,
+    personal_execution,
+    requester_instruction_context,
+    workitem_dispatch,
+)
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import LivenessSessionDep, SessionDep
-from ..factory_tracker_result_runtime import CompletionContractName
 from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..personal_execution import ModelAuthMode, OwnerContext
 from ..wirebody import RetryConditionBody
@@ -184,9 +189,11 @@ class FinishBody(BaseModel):
     # The CI fix round whose turn ended unpublished (#4330). Required for
     # ``ci_fix_unpublished`` and refused for every other cause.
     ci_fix_round: int | None = Field(default=None, ge=CI_FIRST_FIX_ROUND, le=CI_MAX_ROUNDS)
-    # The worker's typed safety fact for this turn (ADR 0269). Required with
-    # no default: a missing fact is refused, never read as clean.
-    retry_safety: Literal["no_effects", "flagged", "uncertain"]
+    # The worker's typed safety fact for this turn (ADR 0269). A worker from
+    # an earlier release sends none; the body carries no protocol version to
+    # tell it from a current worker, so a missing fact is accepted as unknown:
+    # stored as NULL, which admits no implementation retry, never as clean.
+    retry_safety: Literal["no_effects", "flagged", "uncertain"] | None = None
     # The provider retry condition the worker received, decoded tolerantly.
     retry_condition: RetryConditionBody | None = None
     # The scratch volume a scratch exhaustion filled (#5427). Required for
@@ -200,6 +207,13 @@ class FinishBody(BaseModel):
             raise ValueError("ci_fix_unpublished requires ci_fix_round")
         if not unpublished and self.ci_fix_round is not None:
             raise ValueError("ci_fix_round is only valid with cause ci_fix_unpublished")
+        return self
+
+    @model_validator(mode="after")
+    def _safety_absent_not_null(self) -> Self:
+        # Only an omitted fact reads as unknown; an explicit null is no fact.
+        if "retry_safety" in self.model_fields_set and self.retry_safety is None:
+            raise ValueError("retry_safety must be a safety fact when present")
         return self
 
     @model_validator(mode="after")
@@ -244,9 +258,6 @@ class RunningWorkItemRequest(BaseModel):
     repository_path: str
     context: workitem_dispatch.FactoryContext | None
     refusal: workitem_dispatch.RefusalCode | None
-    # How the running request completes (ADR 0277): by a pull request, or by
-    # one delivered tracker result with no pull request.
-    completion_contract: CompletionContractName
 
 
 class PersonalContextRequestOut(BaseModel):
@@ -381,7 +392,6 @@ async def running_work_item_request(
         repository_path=row.repository_path,
         context=row.context,
         refusal=row.refusal,
-        completion_contract=row.completion_contract,
     )
 
 
@@ -411,7 +421,13 @@ async def get_work_item_request(
     row = await workitem_dispatch.get_request(session, request_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": "not_found"})
-    return workitem_dispatch.request_view(row)
+    view = workitem_dispatch.request_view(row)
+    # ADR 0286 decision 2 (#5785): the worker does not re-prompt a request
+    # whose question round is posted, since asking ends it.
+    view["questions_posted"] = await factory_questions.round_posted(
+        session, row.work_item_id, row.id
+    )
+    return view
 
 
 @router.post("/{work_item_id}/cancel")
@@ -508,7 +524,6 @@ async def acquire_work_item_request(
         "wait_deadline": result.wait_deadline,
         "repository_path": result.repository_path,
         "context": result.context,
-        "completion_contract": result.completion_contract,
         "execution_kind": result.execution_kind,
         "recovery_candidate_id": result.recovery_candidate_id,
         "resource_gate": result.resource_gate,
@@ -561,7 +576,6 @@ async def start_work_item_request(
         "execution_deadline": result.execution_deadline,
         "remaining_s": result.remaining_s,
         "heartbeat_interval_s": result.heartbeat_interval_s,
-        "completion_contract": result.completion_contract,
     }
 
 
@@ -711,5 +725,41 @@ async def acknowledge_requester_context(
 
     result = await requester_instruction_context.accept_acknowledgment(session, request_id, body)
     if isinstance(result, requester_instruction_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return {"evidence": result}
+
+
+# Learned rules (#5798), delivered beside the requester envelope ---------------------
+
+
+@router.post("/requests/{request_id}/memory-rules-context")
+async def read_memory_rules_context(
+    request_id: uuid.UUID,
+    body: memory_rules_context.ContextBody,
+    session: SessionDep,
+    response: Response,
+) -> dict[str, Any]:
+    """The running request's version 1 learned rules envelope, for the current fence."""
+
+    response.headers["Cache-Control"] = "no-store"
+    result = await memory_rules_context.read_envelope(
+        session, request_id, runtime_epoch=body.runtime_epoch
+    )
+    await session.rollback()
+    if isinstance(result, memory_rules_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return result
+
+
+@router.post("/requests/{request_id}/memory-rules-context/acknowledgment")
+async def acknowledge_memory_rules_context(
+    request_id: uuid.UUID,
+    body: memory_rules_context.AcknowledgmentBody,
+    session: SessionDep,
+) -> dict[str, Any]:
+    """Accept the relayed acknowledgment only for the current request and fence."""
+
+    result = await memory_rules_context.accept_acknowledgment(session, request_id, body)
+    if isinstance(result, memory_rules_context.Refused):
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
     return {"evidence": result}

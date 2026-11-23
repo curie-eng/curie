@@ -34,18 +34,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
 from curie_api.forges.errors import (
-    Ambiguous,
-    ForgeError,
-    LinkedIssueUnconfirmed,
     NotFound,
     Unauthorized,
     Unavailable,
@@ -69,7 +67,6 @@ from curie_api.forges.types import (
     GITHUB,
     Actor,
     Disposition,
-    LinkedIssue,
     MarkedNotice,
     NoticePage,
     PullRequest,
@@ -78,12 +75,6 @@ from curie_api.forges.types import (
     TicketLabels,
     TrackerComment,
     TrackerIssueRef,
-    body_sha256,
-    ends_with_marker,
-    linked_issue_body,
-    linked_issue_marker,
-    publication_url,
-    valid_output_identity,
 )
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_factory
 from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
@@ -96,11 +87,34 @@ logger = logging.getLogger("curie_api.factory_notices")
 _ISSUE_READ_PROVIDER_TIMEOUT_SECONDS = 5.0
 _ISSUE_READ_MAX_RESPONSE_BYTES = 2_097_152
 _ISSUE_READ_COMMENTS_PER_PAGE = 100
-# Ten pages is a thousand comments. A longer thread is truncated and says so,
-# rather than turning one tool call into an unbounded walk of the API.
+# Ten pages is a thousand comments. A longer thread reads the ten pages ending
+# at its last page, so the newest comments (the ones that carry the latest
+# answer) are kept, and says the earlier ones were not read.
 _ISSUE_READ_MAX_COMMENT_PAGES = 10
 # A port listing longer than this many pages is not trusted to be complete.
 _MAX_PAGES = 50
+
+
+_LINK_LAST = re.compile(r'<([^>]*)>\s*;\s*rel="last"')
+
+
+def _last_page(headers: httpx.Headers) -> int | None:
+    """The last page number from the `Link` header's `rel="last"` entry.
+
+    https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
+    GitHub sends `rel="last"` whenever there is a following page and omits the
+    header on a single page. None means a `rel="next"` without a `rel="last"`,
+    which the read follows forward instead.
+    """
+
+    link = headers.get("link", "")
+    found = _LINK_LAST.search(link)
+    if found is None:
+        return None if 'rel="next"' in link else 1
+    values = parse_qs(urlsplit(found.group(1)).query).get("page", [])
+    if len(values) != 1 or not values[0].isdecimal() or int(values[0]) < 1:
+        raise Unavailable("issue comments")
+    return int(values[0])
 
 
 @dataclass(frozen=True)
@@ -117,7 +131,7 @@ class IssueContent:
     state: str | None
     author: str | None
     comments: list[IssueComment]
-    comments_truncated: bool
+    earlier_comments_omitted: bool
 
 
 @dataclass(frozen=True)
@@ -227,32 +241,6 @@ def issue_url(html_base: str, repo_full_name: str, issue: TrackerIssueRef) -> st
     return f"{html_base.rstrip('/')}/{repo_full_name}/issues/{issue.issue_id}"
 
 
-def linked_listing_params(own: str) -> dict[str, str]:
-    """The query of the linked issue lookup: every issue ``own`` created, in
-    any state, oldest first
-    (https://docs.github.com/en/rest/issues/issues#list-repository-issues).
-    ``per_page`` and ``page`` are added by the pager."""
-
-    return {"creator": own, "state": "all", "sort": "created", "direction": "asc"}
-
-
-def created_by(item: Mapping[str, Any], own: str) -> bool:
-    """Whether the listed issue's author is ``own``, the App's bot user.
-
-    The login is compared case-insensitively and the account type must be
-    ``Bot``, so a person's issue never counts even if a listing ignored the
-    ``creator`` filter.
-    """
-
-    user = item.get("user")
-    if not isinstance(user, dict):
-        return False
-    login = user.get("login")
-    return (
-        isinstance(login, str) and login.casefold() == own.casefold() and user.get("type") == "Bot"
-    )
-
-
 class GitHubTracker:
     """The factory's tracker on one GitHub repository."""
 
@@ -284,8 +272,7 @@ class GitHubTracker:
     ) -> None:
         """``own_login`` answers the login this adapter's token writes as: the
         App's bot user ``<slug>[bot]`` (`GitHubTrackerConnection` reads the slug
-        under the App JWT). ``create_linked_issue`` counts only issues that
-        login created."""
+        under the App JWT)."""
 
         if page_size < 1:
             raise ValueError("page_size must be positive")
@@ -373,13 +360,25 @@ class GitHubTracker:
 
     async def read_comment(self, comment_id: int) -> TrackerComment:
         """Re-read request content and provenance through the installation credential."""
-        value = await self._get(f"{self._repo_path}/issues/comments/{comment_id}")
-        if not isinstance(value, dict) or value.get("id") != comment_id:
-            raise Unavailable("comment")
-        comment = self.facts_comment(value)
+        comment = self.facts_comment(await self.issue_comment(comment_id))
         if comment is None:
             raise Unavailable("comment")
         return comment
+
+    async def issue_comment(self, comment_id: int) -> dict[str, Any]:
+        """One issue comment as GitHub answers it now, through the installation
+        credential: its ``user``, ``performed_via_github_app``, ``issue_url``
+        and ``created_at`` are the factory's own read, not a payload's claim
+        (#5787). A 404 is `NotFound`; any other failure, or a payload that is
+        not this comment, is a `ForgeError`.
+
+        https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
+        """
+
+        value = await self._get(f"{self._repo_path}/issues/comments/{comment_id}")
+        if not isinstance(value, dict) or value.get("id") != comment_id:
+            raise Unavailable("comment")
+        return value
 
     async def facts_issue_is_plain(self, ref: TrackerIssueRef) -> bool:
         number = self._number(ref)
@@ -519,8 +518,11 @@ class GitHubTracker:
         )
 
     def _mention_notice(
-        self, comment: Any, cursor: str, app_slug: str | None
+        self, comment: Any, cursor: str, app_slug: str | None, answering: Collection[int]
     ) -> MarkedNotice | None:
+        """A mention, or on an ``answering`` issue number any comment by a
+        person as an answer (#5789 decision 8): one comment, one notice."""
+
         if not isinstance(comment, dict) or comment.get("performed_via_github_app") is not None:
             return None
         comment_id = _positive_int(comment.get("id"))
@@ -531,7 +533,6 @@ class GitHubTracker:
             comment_id is None
             or not isinstance(body, str)
             or not body.strip()
-            or not mentions_factory(body, self.mention, app_slug)
             or not isinstance(issue_url, str)
             # A pull request conversation comment is review feedback, not a marking.
             or (isinstance(html_url, str) and "/pull/" in html_url)
@@ -542,12 +543,15 @@ class GitHubTracker:
         sender = human_actor({"user": comment.get("user")})
         if number is None or sender is None:
             return None
+        answer = number in answering
+        if not answer and not mentions_factory(body, self.mention, app_slug):
+            return None
         return MarkedNotice(
             issue=self.issue(number),
-            marker=f"@{self.mention}",
+            marker=self.label if answer else f"@{self.mention}",
             actor=Actor(str(sender[0]), sender[1]),
             event_id=str(comment_id),
-            disposition=Disposition.MENTION,
+            disposition=Disposition.ANSWER if answer else Disposition.MENTION,
             cursor=cursor,
             occurred_at=parse_time(comment.get("created_at")),
         )
@@ -575,9 +579,21 @@ class GitHubTracker:
         return self._event_notice({**event, "issue": {"number": number}}, cursor)
 
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         events_after, comments_after = _parse_cursor(cursor)
+        answers = {
+            int(issue.issue_id)
+            for issue in answering
+            if issue.kind == GITHUB
+            and issue.host == self.host
+            and issue.scope_id == str(self.repository_id)
+            and issue.issue_id.isdigit()
+        }
         # Read every listing before returning any notice or cursor.
         events = await self._pages(f"{self._repo_path}/issues/events", {})
         comments = await self._pages(
@@ -606,7 +622,9 @@ class GitHubTracker:
             if comment_id is None:
                 continue
             newest_comment = max(newest_comment, comment_id)
-            notice = self._mention_notice(comment, f"{newest_event}:{comment_id}", app_slug)
+            notice = self._mention_notice(
+                comment, f"{newest_event}:{comment_id}", app_slug, answers
+            )
             if notice is not None:
                 notices.append(notice)
         next_cursor = f"{newest_event}:{newest_comment}"
@@ -630,6 +648,8 @@ class GitHubTracker:
             return state == "closed" or self.label not in names
         if state != "open":
             return False
+        if notice.disposition is Disposition.ANSWER and self.label not in names:
+            return False
         if notice.disposition is Disposition.ADMIT:
             if self.label not in names:
                 return False
@@ -649,7 +669,10 @@ class GitHubTracker:
             and isinstance(user, dict)
             and str(user.get("id")) == notice.actor.id
             and isinstance(body, str)
-            and mentions_factory(body, self.mention, await self.app_slug())
+            and (
+                notice.disposition is Disposition.ANSWER
+                or mentions_factory(body, self.mention, await self.app_slug())
+            )
         )
 
     async def marking_actor(self, issue: TrackerIssueRef, marker: str) -> Actor | None:
@@ -679,12 +702,12 @@ class GitHubTracker:
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         content = await self.read_issue_content(self._number(issue))
         parts = [f"# {content.title}", content.body]
+        if content.earlier_comments_omitted:
+            parts.append("_Earlier comments were not read._")
         for comment in content.comments:
             author = comment.author or "unknown"
             when = f" at {comment.created_at}" if comment.created_at else ""
             parts.append(f"## Comment by {author}{when}\n\n{comment.body}")
-        if content.comments_truncated:
-            parts.append("_Later comments were not read._")
         return "\n\n".join(parts) + "\n"
 
     async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
@@ -852,201 +875,6 @@ class GitHubTracker:
 
         return (await self.closing_reference(issue, repository),)
 
-    # Linked output issues (ADR 0277) ------------------------------------
-
-    @staticmethod
-    def embed_linked_marker(output_identity: str) -> str:
-        """How GitHub carries the linked issue marker: a hidden HTML comment."""
-
-        return f"<!-- {linked_issue_marker(output_identity)} -->"
-
-    async def _linked_matches(self, own: str, embedded: str) -> list[int]:
-        """Numbers of the repository's issues ``own`` created whose last
-        non-empty body line is ``embedded``, oldest first.
-
-        Lists repository issues filtered by creator, never the search API,
-        whose index lags a create
-        (https://docs.github.com/en/rest/issues/issues#list-repository-issues).
-        That listing returns pull requests too, marked by a ``pull_request``
-        key; they are skipped. The creator filter is the server's; the owner
-        check (`created_by`) is ours. A listing past the page bound, an own
-        item whose body is not text, or a matching item without a usable
-        number is `Unavailable`: absence is proven only by a readable listing.
-        """
-
-        items = await self._pages(f"{self._repo_path}/issues", linked_listing_params(own))
-        matches: list[int] = []
-        for item in items:
-            if (
-                not isinstance(item, dict)
-                or "pull_request" in item
-                or not created_by(item, own)
-                or not ends_with_marker(_text(item.get("body")), embedded)
-            ):
-                continue
-            number = _positive_int(item.get("number"))
-            if number is None:
-                raise Unavailable("linked_issue")
-            matches.append(number)
-        return matches
-
-    async def _create_issue(self, title: str, body: str, labels: Collection[str]) -> int | None:
-        """POST the issue; its number, or None when the answer is uncertain.
-
-        https://docs.github.com/en/rest/issues/issues#create-an-issue
-        The token is read before anything is sent, so its failure keeps its
-        type. A transport error, a 5xx, a 2xx other than 201 or an unreadable
-        201 may have created it, so it is None and the caller relists. A
-        definite refusal, which created nothing, raises: 401 or 403
-        `Unauthorized`, 404 `NotFound`, 422 ``Unavailable("unprocessable")``,
-        and any other 3xx or 4xx ``Unavailable("linked_issue")``.
-        """
-
-        template = "/repos/{owner}/{repo}/issues"
-        headers = github_headers(await self._token())
-        try:
-            response = await github_request(
-                self._client,
-                "POST",
-                f"{self._api}{self._repo_path}/issues",
-                path_template=template,
-                headers=headers,
-                json={"title": title, "body": body, "labels": sorted(set(labels))},
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            return None
-        status = response.status_code
-        if status in {401, 403}:
-            raise Unauthorized("linked_issue")
-        if status == 404:
-            raise NotFound("linked_issue")
-        if status == 422:
-            raise Unavailable("unprocessable")
-        if 300 <= status < 500:
-            raise Unavailable("linked_issue")
-        if status != 201:
-            return None
-        try:
-            payload = response.json()
-        except ValueError:
-            return None
-        return _positive_int(payload.get("number")) if isinstance(payload, dict) else None
-
-    async def _single(self, own: str, embedded: str) -> int | None:
-        matches = await self._linked_matches(own, embedded)
-        if len(matches) > 1:
-            raise Ambiguous("linked_issue")
-        return matches[0] if matches else None
-
-    async def create_linked_issue(
-        self,
-        source: TrackerIssueRef,
-        *,
-        output_identity: str,
-        title: str,
-        body: str,
-        labels: Collection[str],
-        expected: TrackerIssueRef | None = None,
-        reconcile_only: bool = False,
-    ) -> LinkedIssue:
-        """One issue in this repository linked to ``source`` (ADR 0277).
-
-        The body ends with ``Related to #<source>.``, a bare same-repository
-        reference that makes GitHub's cross-reference and neither closes the
-        source nor records a dependency, then `embed_linked_marker`. The
-        modes and the error contract are the port's. The lookup is
-        `_linked_matches`; the create is `_create_issue`; every result is read
-        back (https://docs.github.com/en/rest/issues/issues#get-an-issue) for
-        its body digest, labels and ``html_url``. With ``expected`` nothing is
-        listed or created: `_recorded_issue` reads that issue directly.
-
-        Everything before `_create_issue` sends its request keeps its error
-        type. Once the request may have reached GitHub, every failure except
-        `Ambiguous` (a relist that found two) is `LinkedIssueUnconfirmed`.
-        """
-
-        if expected is not None and reconcile_only:
-            raise ValueError("expected and reconcile_only are exclusive")
-        valid_output_identity(output_identity)
-        source_number = self._number(source)
-        embedded = self.embed_linked_marker(output_identity)
-        text = linked_issue_body(body, related=f"Related to #{source_number}.", embedded=embedded)
-        own = await self._own_login()
-        if expected is not None:
-            return await self._recorded_issue(expected, own, embedded, text)
-        number = await self._single(own, embedded)
-        if number is not None:
-            return await self._linked_issue(number, text, created=False)
-        if reconcile_only:
-            raise NotFound("linked_issue")
-        written = await self._create_issue(title, text, labels)
-        # From here the create may have been written: nothing proves it absent.
-        try:
-            if written is not None:
-                return await self._linked_issue(written, text, created=True)
-            confirmed = await self._single(own, embedded)
-            if confirmed is None:
-                raise LinkedIssueUnconfirmed("linked_issue_unconfirmed")
-            return await self._linked_issue(confirmed, text, created=False)
-        except (Ambiguous, LinkedIssueUnconfirmed):
-            raise
-        except (ForgeError, httpx.HTTPError, ValueError):
-            raise LinkedIssueUnconfirmed("linked_issue_unconfirmed") from None
-
-    async def _recorded_issue(
-        self, expected: TrackerIssueRef, own: str, embedded: str, sent: str
-    ) -> LinkedIssue:
-        """The recorded output issue read directly, with no listing
-        (https://docs.github.com/en/rest/issues/issues#get-an-issue).
-
-        ``NotFound("linked_issue")`` unless it is in this repository, is not a
-        pull request, `created_by` ``own``, and its last non-empty line is
-        ``embedded``.
-        """
-
-        try:
-            number = self._number(expected)
-        except NotFound:
-            raise NotFound("linked_issue") from None
-        found = await self._issue(number)
-        if (
-            found is None
-            or not created_by(found, own)
-            or not ends_with_marker(_text(found.get("body")), embedded)
-        ):
-            raise NotFound("linked_issue")
-        return self._linked_result(number, found, sent, created=False)
-
-    async def _linked_issue(self, number: int, sent: str, *, created: bool) -> LinkedIssue:
-        found = await self._issue(number)
-        if found is None:
-            raise Unavailable("linked_issue")
-        return self._linked_result(number, found, sent, created=created)
-
-    def _linked_result(
-        self, number: int, found: dict[str, Any], sent: str, *, created: bool
-    ) -> LinkedIssue:
-        # An empty body reads back as null; anything else that is not text
-        # cannot be digested and is `Unavailable`.
-        body = _text(found.get("body"))
-        names = label_names(found)
-        if names is None:
-            raise Unavailable("linked_issue")
-        ref = self.issue(number)
-        try:
-            url = publication_url(found.get("html_url"), self._html_base)
-        except Unavailable:
-            url = issue_url(self._html_base, self.repo_full_name, ref)
-        return LinkedIssue(
-            issue=ref,
-            url=url,
-            labels=frozenset(names),
-            body_sha256=body_sha256(body),
-            sent_body_sha256=body_sha256(sent),
-            created=created,
-        )
-
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         self._number(issue)
 
@@ -1079,12 +907,30 @@ class GitHubTracker:
                     raise Unavailable("issue")
             return json.loads(body), response.headers
 
+    async def _comment_page(
+        self, base: str, token: str, page: int
+    ) -> tuple[list[Any], httpx.Headers]:
+        batch, headers = await self._stream_json(
+            f"{base}/comments",
+            token=token,
+            params={"per_page": _ISSUE_READ_COMMENTS_PER_PAGE, "page": page},
+        )
+        if not isinstance(batch, list):
+            raise Unavailable("issue comments")
+        return batch, headers
+
     async def read_issue_content(self, number: int) -> IssueContent:
         """The issue and its comments, verbatim, addressed by repository id.
 
         Addressing the repository by its numeric id keeps a rename or a transfer
         from redirecting the read to a different repository than the WorkItem's.
         Nothing is parsed into the platform or stored.
+
+        A thread of more than a thousand comments returns the newest thousand,
+        oldest first. That costs at most 12 comment page requests plus the issue
+        (page 1, the ten pages ending at the last page, and one earlier page
+        when the last page is partial). A listing with `rel="next"` but no
+        `rel="last"` is followed forward for at most ten pages, else refused.
         """
 
         base = f"{self._api}/repositories/{self.repository_id}/issues/{number}"
@@ -1092,30 +938,47 @@ class GitHubTracker:
         try:
             issue, _ = await self._stream_json(base, token=token)
             comments: list[IssueComment] = []
-            truncated = False
-            for page in range(1, _ISSUE_READ_MAX_COMMENT_PAGES + 1):
-                batch, headers = await self._stream_json(
-                    f"{base}/comments",
-                    token=token,
-                    params={"per_page": _ISSUE_READ_COMMENTS_PER_PAGE, "page": page},
-                )
-                if not isinstance(batch, list):
-                    raise Unavailable("issue comments")
-                for comment in batch:
-                    if not isinstance(comment, dict):
+            first_batch, headers = await self._comment_page(base, token, 1)
+            last_page = _last_page(headers)
+            pages: dict[int, list[Any]] = {1: first_batch}
+            if last_page is None:
+                # No `rel="last"`: follow `rel="next"` for at most ten pages. A
+                # longer listing cannot have its newest comments located.
+                last_page = 1
+                while 'rel="next"' in headers.get("link", ""):
+                    if last_page == _ISSUE_READ_MAX_COMMENT_PAGES:
                         raise Unavailable("issue comments")
-                    created = comment.get("created_at")
-                    comments.append(
-                        IssueComment(
-                            author=_login(comment.get("user")),
-                            created_at=created if isinstance(created, str) else None,
-                            body=_text(comment.get("body")),
-                        )
+                    last_page += 1
+                    pages[last_page], headers = await self._comment_page(base, token, last_page)
+            first = max(1, last_page - _ISSUE_READ_MAX_COMMENT_PAGES + 1)
+            for page in range(first, last_page + 1):
+                if page not in pages:
+                    pages[page] = (await self._comment_page(base, token, page))[0]
+            if (
+                last_page > _ISSUE_READ_MAX_COMMENT_PAGES
+                and len(pages[last_page]) < _ISSUE_READ_COMMENTS_PER_PAGE
+            ):
+                # A partial last page leaves the newest ten pages short of a
+                # thousand comments, so one earlier page completes the window.
+                first -= 1
+                if first not in pages:
+                    pages[first] = (await self._comment_page(base, token, first))[0]
+            window = [c for page in range(first, last_page + 1) for c in pages[page]]
+            limit = _ISSUE_READ_MAX_COMMENT_PAGES * _ISSUE_READ_COMMENTS_PER_PAGE
+            earlier_omitted = last_page > _ISSUE_READ_MAX_COMMENT_PAGES
+            if earlier_omitted:
+                window = window[-limit:]
+            for comment in window:
+                if not isinstance(comment, dict):
+                    raise Unavailable("issue comments")
+                created = comment.get("created_at")
+                comments.append(
+                    IssueComment(
+                        author=_login(comment.get("user")),
+                        created_at=created if isinstance(created, str) else None,
+                        body=_text(comment.get("body")),
                     )
-                if 'rel="next"' not in headers.get("link", ""):
-                    break
-            else:
-                truncated = True
+                )
         except (httpx.HTTPError, ValueError):
             raise Unavailable("issue") from None
         if (
@@ -1133,7 +996,7 @@ class GitHubTracker:
             state=state if isinstance(state, str) else None,
             author=_login(issue.get("user")),
             comments=comments,
-            comments_truncated=truncated,
+            earlier_comments_omitted=earlier_omitted,
         )
 
     # GitHub intake reads ------------------------------------------------

@@ -40,7 +40,6 @@ from curie_api.forges.gitlab.transport import (
 from curie_api.forges.types import (
     Actor,
     Disposition,
-    LinkedIssue,
     MarkedNotice,
     NoticePage,
     PullRequest,
@@ -57,15 +56,13 @@ TRACKER_CAPABILITIES: Mapping[Operation, Support] = {
     Operation.LINK_PULL_REQUEST: Support.NOOP,
     Operation.DEPENDENCIES: Support.NOOP,
     Operation.GROUP_MEMBERSHIP: Support.UNSUPPORTED,
-    # Linked output issues are GitHub only (ADR 0277); no fallback path.
-    Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
     Operation.FACTS_EXCHANGE: Support.UNSUPPORTED,
 }
 # The overlap between poll windows (decision 8): it absorbs clock skew and
 # issues committed late.
 OVERLAP = timedelta(seconds=120)
 TICKET_NOTE_LIMIT = 100
-LATER_COMMENTS = "_Later comments were not read._"
+EARLIER_COMMENTS = "_Earlier comments were not read._"
 _LABEL = "label"
 _NOTE = "note"
 _STATE = "state"
@@ -254,13 +251,21 @@ class GitLabTracker:
     # Polling --------------------------------------------------------------------
 
     async def poll_marked(
-        self, cursor: str | None, *, running: Sequence[TrackerIssueRef]
+        self,
+        cursor: str | None,
+        *,
+        running: Sequence[TrackerIssueRef],
+        answering: Sequence[TrackerIssueRef],
     ) -> NoticePage:
         """Decision 8 with the cursor of the module docstring. Every listing
         page is read first, then each issue's label events and notes, then each
-        running issue; any failed read raises before a cursor exists."""
+        running issue; any failed read raises before a cursor exists. On an
+        ``answering`` issue every note by a person is an answer, mention or not
+        (#5789)."""
 
         start = None if cursor is None else Cursor.parse(cursor)
+        answers = self._own_ids(answering)
+        live = self._own_ids(running)
         if start is None:
             params: dict[str, str | int] = {
                 "labels": self.label,
@@ -298,11 +303,25 @@ class GitLabTracker:
             notes = _events(_NOTE, await self._notes(path))
             ref = self._ref(iid)
             if start is None:
-                pending.extend(await self._first_poll(ref, labels, notes, floor, considered))
+                pending.extend(
+                    await self._first_poll(
+                        ref,
+                        labels,
+                        notes,
+                        floor,
+                        considered,
+                        answering=str(iid) in answers,
+                        live=str(iid) in live,
+                    )
+                )
                 continue
             window = start.time - OVERLAP
             pending.extend(await self._label_notices(ref, labels, window, known, considered))
-            pending.extend(await self._mention_notices(ref, notes, window, known, considered))
+            pending.extend(
+                await self._mention_notices(
+                    ref, notes, window, known, considered, answering=str(iid) in answers
+                )
+            )
         pending.sort(key=lambda item: (item.at, item.event_id))
         delivered = {(item.issue, item.event_id) for item in pending}
         for ref in running:
@@ -331,6 +350,15 @@ class GitLabTracker:
             cursor=page_cursor,
         )
 
+    def _own_ids(self, refs: Sequence[TrackerIssueRef]) -> set[str]:
+        return {
+            ref.issue_id
+            for ref in refs
+            if ref.kind == types.GITLAB
+            and ref.host == self.host
+            and ref.scope_id == self._project_id
+        }
+
     async def _first_poll(
         self,
         ref: TrackerIssueRef,
@@ -338,13 +366,66 @@ class GitLabTracker:
         notes: list[_Event],
         floor: datetime,
         considered: dict[str, datetime],
+        *,
+        answering: bool,
+        live: bool,
     ) -> list[_Pending]:
-        """No cursor: only the latest add of the label is a notice, and only when
-        a person made it. Everything else in the overlap is remembered."""
+        """No cursor: the latest add of the label is a notice when a person made
+        it, on an ``answering`` issue every note by a person is an answer, and
+        on a ``live`` (running) issue every mention since that latest add is a
+        mention. Label events and mentions in the overlap are remembered; a
+        plain note on an issue that is not answering is not, as on a later
+        poll, so a plain answer read under a snapshot taken before its
+        question is delivered by the next poll once the issue is answering.
 
-        for event in (*labels, *notes):
+        Answers and those mentions are delivered because a label whose first
+        page held an issue saves no cursor and polls as a first poll again; a
+        note remembered here and never delivered would be lost. The notes are
+        listed in full, the answer core's fence refuses one older than the
+        question, its receipt makes a replay harmless, and a replayed mention
+        replays under its request id."""
+
+        for event in labels:
             if event.at >= floor:
                 considered[event.token] = event.at
+        for note in notes:
+            body = note.payload.get("body")
+            if note.at >= floor and isinstance(body, str):
+                if answering or self._mention.search(body):
+                    considered[note.token] = note.at
+        delivered: list[_Pending] = []
+        since = None if answering or not live else self._labelled_at(labels)
+        if answering or since is not None:
+            disposition = Disposition.ANSWER if answering else Disposition.MENTION
+            for note in notes:
+                body = note.payload.get("body")
+                if not isinstance(body, str):
+                    continue
+                if not answering and (
+                    since is None or note.at < since or not self._mention.search(body)
+                ):
+                    continue
+                actor = await self._transport.is_person(note.payload.get("author"))
+                if actor is not None:
+                    considered[note.token] = note.at
+                    delivered.append(_Pending(ref, actor, note.token, disposition, note.at))
+        return delivered + await self._first_admission(ref, labels, considered)
+
+    def _labelled_at(self, labels: list[_Event]) -> datetime | None:
+        """When the label was last added to the issue, or None."""
+
+        adds = [
+            e
+            for e in labels
+            if e.payload.get("action") == "add" and _label_name(e.payload) == self.label
+        ]
+        return max((e.at for e in adds), default=None)
+
+    async def _first_admission(
+        self, ref: TrackerIssueRef, labels: list[_Event], considered: dict[str, datetime]
+    ) -> list[_Pending]:
+        """The latest add of the label, when a person made it."""
+
         adds = [
             e.payload
             for e in labels
@@ -393,18 +474,27 @@ class GitLabTracker:
         window: datetime,
         known: frozenset[str],
         considered: dict[str, datetime],
+        *,
+        answering: bool,
     ) -> list[_Pending]:
+        """Mentions, or on an ``answering`` issue every note by a person as an
+        answer (#5789 decision 2): one note is one notice, never both. System
+        notes were dropped when the notes were listed."""
+
+        disposition = Disposition.ANSWER if answering else Disposition.MENTION
         notices = []
         for note in notes:
             body = note.payload.get("body")
-            if note.at < window or not isinstance(body, str) or not self._mention.search(body):
+            if note.at < window or not isinstance(body, str):
+                continue
+            if not answering and not self._mention.search(body):
                 continue
             considered[note.token] = note.at
             if note.token in known:
                 continue
             actor = await self._transport.is_person(note.payload.get("author"))
             if actor is not None:
-                notices.append(_Pending(ref, actor, note.token, Disposition.MENTION, note.at))
+                notices.append(_Pending(ref, actor, note.token, disposition, note.at))
         return notices
 
     async def _cancellation(self, ref: TrackerIssueRef) -> _Pending | None:
@@ -444,7 +534,8 @@ class GitLabTracker:
     async def verify_current(self, notice: MarkedNotice) -> bool:
         """Re-reads the issue every time. A cancellation holds while the label is
         gone or the issue closed; an admission while its add is the latest one
-        on the open, labelled issue; a mention while its note stands."""
+        on the open, labelled issue; a mention while its note stands; an answer
+        while its note stands on the open, labelled issue (#5789 decision 3)."""
 
         path = self._issue_path(notice.issue)
         try:
@@ -456,9 +547,11 @@ class GitLabTracker:
         if notice.disposition is Disposition.CANCEL:
             return not labelled or closed
         if notice.disposition is Disposition.MENTION:
-            return await self._mention_current(path, notice)
+            return await self._note_current(path, notice, mention=True)
         if not labelled or closed:
             return False
+        if notice.disposition is Disposition.ANSWER:
+            return await self._note_current(path, notice, mention=False)
         latest = _latest(
             [
                 e
@@ -468,7 +561,10 @@ class GitLabTracker:
         )
         return latest is not None and f"{_LABEL}:{latest['id']}" == notice.event_id
 
-    async def _mention_current(self, path: str, notice: MarkedNotice) -> bool:
+    async def _note_current(self, path: str, notice: MarkedNotice, *, mention: bool) -> bool:
+        """The notice's note still stands on this issue, not a system note, by
+        the same author, and, for a mention, still mentions the account."""
+
         kind, _, note_id = notice.event_id.partition(":")
         if kind != _NOTE or not note_id.isdigit():
             return False
@@ -481,7 +577,7 @@ class GitLabTracker:
             note.get("system") is not True
             and actor_of(note.get("author")) == notice.actor
             and isinstance(body, str)
-            and self._mention.search(body) is not None
+            and (not mention or self._mention.search(body) is not None)
         )
 
     async def marking_actor(self, issue: TrackerIssueRef, marker: str) -> Actor | None:
@@ -507,26 +603,16 @@ class GitLabTracker:
     async def in_group(self, actor: Actor, group_id: str) -> bool:
         raise Unsupported(Operation.GROUP_MEMBERSHIP)
 
-    async def create_linked_issue(
-        self,
-        source: TrackerIssueRef,
-        *,
-        output_identity: str,
-        title: str,
-        body: str,
-        labels: Collection[str],
-        expected: TrackerIssueRef | None = None,
-        reconcile_only: bool = False,
-    ) -> LinkedIssue:
-        """Declared unsupported: linked output issues are GitHub only (ADR 0277)."""
-
-        raise Unsupported(Operation.CREATE_LINKED_ISSUE)
-
     # Tickets and labels -----------------------------------------------------------
 
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
-        """Decision 12: title, description, then up to 100 non-system notes
-        oldest first. GitLab markdown passes through unchanged."""
+        """Decision 12: title, description, then the newest 100 non-system notes,
+        oldest first (#5789 decision 7); when there were more, a line after the
+        description says the earlier ones were not read. GitLab markdown
+        passes through unchanged.
+
+        https://docs.gitlab.com/api/notes/#list-project-issue-notes: ``sort``
+        ``desc`` with ``order_by`` ``created_at`` lists the newest first."""
 
         path = self._issue_path(issue)
         payload = await self._transport.get_object(path)
@@ -538,7 +624,7 @@ class GitLabTracker:
         notes: list[dict[str, Any]] = []
         more = False
         async for page in self._transport.pages(
-            f"{path}/notes", {"sort": "asc", "order_by": "created_at"}
+            f"{path}/notes", {"sort": "desc", "order_by": "created_at"}
         ):
             for note in page:
                 if note.get("system") is True:
@@ -549,7 +635,9 @@ class GitLabTracker:
                 notes.append(note)
             if more:
                 break
-        for note in notes:
+        if more:
+            parts.append(EARLIER_COMMENTS)
+        for note in reversed(notes):
             author = actor_of(note.get("author"))
             heading = f"## Comment by {author.login if author is not None else 'unknown'}"
             created = note.get("created_at")
@@ -557,8 +645,6 @@ class GitLabTracker:
                 heading += f" at {created}"
             body = note.get("body")
             parts.append(f"{heading}\n\n{body}" if isinstance(body, str) and body else heading)
-        if more:
-            parts.append(LATER_COMMENTS)
         return "\n\n".join(parts) + "\n"
 
     async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:

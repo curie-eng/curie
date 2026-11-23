@@ -43,10 +43,11 @@ use curie::api::{
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
-    ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, HookFireOutput,
-    HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
-    ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, SubscriptionOutput,
-    SubscriptionVerb, VersionsOutput, WakeKeyOutput, WorkItemsOutput,
+    ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, FactoryProgressOutput,
+    HookFireOutput, HookOutput, KillOutput, MemoryChannel, MemoryOutput, MemoryRulesOutput,
+    OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
+    SkillApprovalsOutput, SubscriptionOutput, SubscriptionVerb, VersionsOutput, WakeKeyOutput,
+    WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -407,6 +408,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         upgrade: curie::ops::UpgradeStatusView::idle(None),
         delivery: curie::completion_outbox::Report::unknown(),
         credentials: Vec::new(),
+        factory_model_auth_mode: None,
     })
 }
 
@@ -451,6 +453,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 execution_deadline_seconds: Some(90),
                 runner_resources: None,
                 memory_writes: true,
+                memory_rule_proposals: true,
                 changed: true,
             },
         ],
@@ -465,6 +468,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                changed: false,
+            },
+        ],
+    );
+    m.insert(
+        "FactoryProgressOutput",
+        samples![
+            "DryRun" => FactoryProgressOutput::DryRun(plan()),
+            "Done" => FactoryProgressOutput::Done {
+                agent: "acme-bot".to_string(),
+                factory_slack_channel: Some("C0EXAMPLE1".to_string()),
                 changed: false,
             },
         ],
@@ -615,6 +629,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 source: "operator".to_string(),
                 fresh_session_required: true,
                 message_verb: "local".to_string(),
+            },
+        ],
+    );
+    m.insert(
+        "MemoryRulesOutput",
+        samples![
+            "DryRun" => MemoryRulesOutput::DryRun(plan()),
+            "Rules" => MemoryRulesOutput::Rules(
+                curie::api::parse_memory_rules(memory_rules_vector("list"))
+                    .expect("the recorded rule list parses"),
+            ),
+            "Changed" => MemoryRulesOutput::Changed {
+                verb: curie::commands::MemoryRuleVerb::Accept,
+                change: Box::new(
+                    curie::api::parse_memory_rule_change(memory_rules_vector("accept_binding"))
+                        .expect("the recorded binding accept parses"),
+                ),
             },
         ],
     );
@@ -957,6 +988,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "DryRun" => FactoryIntakeOutput::DryRun(plan()),
             "Done" => FactoryIntakeOutput::Done { enabled: true },
             "RepositoriesUpdated" => FactoryIntakeOutput::RepositoriesUpdated { enabled: false, repos: vec!["acme/bot".into()] },
+            "ModelAuthModeSet" => FactoryIntakeOutput::ModelAuthModeSet { mode: "personal".into() },
         ],
     );
     m.insert(
@@ -1317,4 +1349,13 @@ fn every_variant_sample_validates_against_its_mapped_schema() {
         "only {checked} variant samples validated; the registry has shrunk unexpectedly \
          and the gate would pass vacuously"
     );
+}
+
+/// One recorded API response from `tests/vectors/memory-rules-responses.json`.
+fn memory_rules_vector(key: &str) -> serde_json::Value {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/memory-rules-responses.json"
+    ))
+    .expect("the memory rules vector is JSON");
+    vector[key].clone()
 }

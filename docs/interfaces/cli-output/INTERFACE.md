@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 85 outputs behind one trait
+impls: 87 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 85 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 87 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -66,10 +66,13 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-85 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+87 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 `CodingInstructionsOutput` in `cli/src/commands/coding_instructions.rs` reports the owner
 profile and whether this deployment applies it to factory runs, or a dry-run plan.
+
+`MemoryRulesOutput` in `cli/src/commands/memory_rules.rs` reports an agent's learned
+rules, the result of accepting, rejecting or removing one, or a dry-run plan.
 
 `MigrationOutput` in `cli/src/process_migrate.rs` reports the completed offline
 protected-process migration as one JSON object or a human confirmation.
@@ -87,7 +90,7 @@ protected-process migration as one JSON object or a human confirmation.
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
   `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `MemoryGuidanceOutput`, `HookOutput`, `ApprovalsOutput`, `RequesterIdentityOutput`,
-  `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `WorkItemsOutput`, `WorkItemRetryOutput`,
+  `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `FactoryProgressOutput`, `WorkItemsOutput`, `WorkItemRetryOutput`,
   `SchedulesOutput`, `HookFireOutput`, `WakeKeyOutput` (the `local`/`cluster hook wake-key` read or rotation: the read carries the secret and generation, the rotation carries the generation only), `ChannelsOutput`, `CallersOutput`, `AccessPolicyOutput`,
   `DirectoryOutput` (a directory administration plan or tenant/resource API receipt),
   `ActionsOutput` (the `local`/`cluster actions` verbs and the action executor receipt),
@@ -111,7 +114,7 @@ protected-process migration as one JSON object or a human confirmation.
   version and teardown counts, or the dry-run plan. It never carries the token.
 - **`cli/src/local.rs`**, **`cli/src/ops/up.rs`**, **`cli/src/ops/upgrade.rs`**, and **`cli/src/ops/verbs.rs`**, the operator verbs, one output per
   verb per tier: `LocalUpOutput`, `LocalRebuildOutput`, `LocalStatusOutput`,
-  `LocalDownOutput`; `ClusterUpOutput`, `ClusterUpgradeOutput`, `ClusterStatusOutput`, `ClusterDownOutput`,
+  `LocalDownOutput`; `ClusterUpOutput`, `ClusterUpgradeOutput`, `ClusterStatusOutput`, `ClusterAccessOutput` (`cli/src/ops/access.rs`), `ClusterDownOutput`,
   `ClusterRollbackOutput`; `LintValuesOutput` in `cli/src/ops/lint_values.rs`.
 - **`cli/src/message.rs`**: `MessageDryRunOutput` and `MessageOutcomeOutput`, the
   multi-variant outcome whose covered variant set the enum-variant walk derives (see
@@ -155,10 +158,10 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   result. This syntactic inventory does not prove that every verb returns a
   `CliOutput` or honors the one-object JSON contract.
 2. **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 85 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 87 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 86 tests in `cli/tests/json_contract.rs`.
+  against real `to_json()` output across 87 tests in `cli/tests/json_contract.rs`.
   The dark factory render receipt uses schema version 2. Its `runner_image`
   and `runner_note` fields are required and accept a string or `null`; the
   binary render tests validate the actual receipt against the committed schema.

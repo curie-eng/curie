@@ -88,6 +88,7 @@ FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"
 FAKE_DIRECTORY_CREDENTIAL = "dir." + "ZXhhbXBsZWRpcmVjdG9yeQ." + "FAKEFAKEFAKESIG0000"
 FAKE_IDENTITY_CONNECT_TOKEN = "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE000"
 FAKE_OIDC_CALLBACK_QUERY = "code=FAKECODE0000&state=FAKESTATE0000"
+FAKE_GITHUB_LINK_CALLBACK_QUERY = "code=FAKEGITHUBCODE0000&state=FAKEGITHUBSTATE0000"
 _FAKE_DISCORD_BOT_TOKEN = (
     "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
 )
@@ -131,6 +132,7 @@ SECRET_LITERALS: dict[str, str] = {
     "directory_credential": FAKE_DIRECTORY_CREDENTIAL,
     "identity_connect_token": FAKE_IDENTITY_CONNECT_TOKEN,
     "oidc_callback_query": FAKE_OIDC_CALLBACK_QUERY,
+    "github_link_callback_query": FAKE_GITHUB_LINK_CALLBACK_QUERY,
     "discord_bot_authorization": FAKE_DISCORD_BOT_AUTHORIZATION,
     "discord_bot_token_assignment": FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,
     "discord_bot_token": FAKE_SHAPED_DISCORD_BOT_TOKEN,
@@ -142,6 +144,7 @@ SECRET_LITERALS: dict[str, str] = {
 _LITERAL_CARRIERS: dict[str, str] = {
     "identity_connect_token": "/identity/connect/",
     "oidc_callback_query": "/console/oidc/callback?",
+    "github_link_callback_query": "/identity/me/github-link/callback?",
     "discord_webhook_url": FAKE_DISCORD_WEBHOOK_PREFIX,
     "secret_json_field": '{"AWS_SECRET_ACCESS_KEY": "',
     "secret_dict_field": "{'MY_PRIVATE_KEY': '",

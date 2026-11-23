@@ -362,6 +362,10 @@ pub struct Agent {
     /// as off, which is what it does.
     #[serde(default)]
     pub memory_writes: bool,
+    /// Whether the agent may propose memory rules for a person to accept
+    /// (#5796). Defaulted so a platform older than the field reads as off.
+    #[serde(default)]
+    pub memory_rule_proposals: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
     #[serde(default = "default_publication_policy")]
     pub publication_policy: String,
@@ -371,6 +375,10 @@ pub struct Agent {
     pub publication_draft: bool,
     #[serde(default)]
     pub publication_branch_prefix: Option<String>,
+    /// The Slack channel a factory run's progress posts to. `None` means no
+    /// Slack progress. Set through `<tier> factory-progress`.
+    #[serde(default)]
+    pub factory_slack_channel: Option<String>,
     /// Whether this agent's connector calls carry the verified requester (ADR
     /// 0270 decision 1). `None` means a platform older than the flag, which
     /// `approvals --requester-identity` reports instead of reading it as off.
@@ -1097,6 +1105,142 @@ pub struct MemoryEntry {
     pub version: u64,
     #[serde(default)]
     pub provenance: MemoryProvenance,
+}
+
+/// Who accepted, rejected or removed a learned rule (`MemoryRuleDecider`, #5797).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRuleDecider {
+    pub principal_id: uuid::Uuid,
+    #[serde(deserialize_with = "present_or_null")]
+    pub display_name: Option<String>,
+}
+
+/// Where a learned rule applies (`MemoryRuleOut.scope_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRuleScopeKind {
+    Agent,
+    Binding,
+    Repository,
+}
+
+/// A listed learned rule's state (`MemoryRuleOut.state`); the list never
+/// returns candidate, superseded or discarded rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRuleState {
+    Proposed,
+    Accepted,
+    Rejected,
+    Removed,
+}
+
+/// One learned rule (`MemoryRuleOut`). Clocks stay the strings the API sent.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRule {
+    pub id: uuid::Uuid,
+    pub number: i64,
+    pub label: String,
+    pub scope_kind: MemoryRuleScopeKind,
+    pub scope_key: String,
+    pub scope_label: String,
+    pub state: MemoryRuleState,
+    pub text: String,
+    pub reason: String,
+    #[serde(deserialize_with = "present_or_null")]
+    pub source_url: Option<String>,
+    pub proposed_by: String,
+    pub proposed_at: String,
+    #[serde(deserialize_with = "present_or_null")]
+    pub accepted_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub accepted_at: Option<String>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub rejected_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub rejected_at: Option<String>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub removed_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
+    pub removed_at: Option<String>,
+    pub version: i64,
+}
+
+/// One scope the rule list covers (`MemoryRuleScopeOut`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRuleScope {
+    pub scope_kind: MemoryRuleScopeKind,
+    pub scope_key: String,
+    pub scope_label: String,
+    pub in_force_count: i64,
+}
+
+/// `GET /agents/{id}/memory/rules` (`MemoryRulesOut`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRules {
+    pub rules: Vec<MemoryRule>,
+    pub scopes: Vec<MemoryRuleScope>,
+    pub in_force_limit: i64,
+}
+
+/// When a decision takes effect (`MemoryRuleDecisionOut.applies_from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum MemoryRuleAppliesFrom {
+    #[serde(rename = "next_ticket")]
+    NextTicket,
+    #[serde(rename = "next_session")]
+    NextSession,
+}
+
+/// An accept, reject or remove answer (`MemoryRuleDecisionOut`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRuleChange {
+    pub rule: MemoryRule,
+    pub applies_from: MemoryRuleAppliesFrom,
+}
+
+/// Validate a learned rule list against its API shape; a body that does not
+/// match names the first field that differs.
+pub fn parse_memory_rules(body: serde_json::Value) -> Result<MemoryRules> {
+    parse_memory_rules_body(body, "GET /agents/{id}/memory/rules", "a learned rule list")
+}
+
+/// Validate an accept, reject or remove answer against its API shape.
+pub fn parse_memory_rule_change(body: serde_json::Value) -> Result<MemoryRuleChange> {
+    parse_memory_rules_body(
+        body,
+        "POST /agents/{id}/memory/rules/{rule_id}/<action>",
+        "a learned rule change",
+    )
+}
+
+/// A field the API always sends, `null` when it has no value: `null` decodes
+/// to `None`, and a missing key is refused (serde would otherwise read it as
+/// `None`, since a custom deserializer turns off the implicit default).
+fn present_or_null<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+fn parse_memory_rules_body<T: serde::de::DeserializeOwned>(
+    body: serde_json::Value,
+    operation: &str,
+    resource: &str,
+) -> Result<T> {
+    serde_path_to_error::deserialize(body).map_err(|err| {
+        let path = err.path().to_string();
+        let inner = err.into_inner();
+        anyhow::Error::from(
+            crate::exit::CliError::failure(format!(
+                "{operation} answered with a body that is not {resource} \
+                 (at `{path}`: {inner}); the platform release may not match this CLI"
+            ))
+            .with_fix("use a CLI matching the release"),
+        )
+    })
 }
 
 /// A row from the existing state routes (`StateEntryOut`). The memory command
@@ -2470,6 +2614,85 @@ fn mint_channel_token_body(
     }
 }
 
+/// How many of an agent's bindings are Slack bindings for `channel`.
+///
+/// The API's check is "exactly one Slack binding with an adapter identity for
+/// the channel", so zero and two-or-more both draw the same 409; the count is
+/// what tells the operator which repair applies.
+fn slack_bindings_for(channels: &[ChannelBinding], channel: &str) -> usize {
+    channels
+        .iter()
+        .filter(|binding| binding.kind == "slack" && binding.address == channel)
+        .count()
+}
+
+/// The refusal for a 409 `factory_slack_channel_unbound`, or `None` when the
+/// body carries any other detail (the caller then reports the raw 409).
+///
+/// The wire shape is `{"detail": {"code": "factory_slack_channel_unbound"}}`,
+/// so the code is read from the parsed detail object, never matched as a loose
+/// substring of the body.
+///
+/// `matching` is how many of the agent's bindings are Slack bindings for
+/// `channel`, as the caller saw them when it resolved the agent. Zero says to
+/// add one, two or more says to remove the extras, and exactly one (a stale
+/// read, or a binding without an identity) says to look at the list.
+///
+/// Handlers hold only the resolved API url, not the flags that found it, so the
+/// fix ends with an instruction to reuse the same target instead of printing
+/// flags that might be wrong.
+fn factory_slack_unbound_refusal(
+    body: &str,
+    tier: &str,
+    agent: &str,
+    agent_id: &str,
+    channel: &str,
+    matching: usize,
+) -> Option<anyhow::Error> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let code = value.get("detail")?.get("code")?.as_str()?;
+    if code != "factory_slack_channel_unbound" {
+        return None;
+    }
+    // The printed commands name the agent by id: a valid stored name can begin
+    // with `-`, which the verb would read as a flag, while an id never does.
+    let quoted = crate::ops::shell_quote(agent_id);
+    let surfaces = format!("curie {tier} surfaces {quoted}");
+    let target = if tier == "local" {
+        "against the same --api-url as this command"
+    } else {
+        "against the same cluster target (the same --context, --namespace and --release, or --api-url) as this command"
+    };
+    let (message, action) = match matching {
+        0 => (
+            format!("agent {agent} has no Slack binding for channel {channel}"),
+            format!(
+                "bind the channel with `{surfaces} --add slack={channel}`, or, when another agent already holds the default Slack identity on that channel, under a free declared identity with `{surfaces} --add slack={channel} --adapter <identity>`"
+            ),
+        ),
+        1 => (
+            format!(
+                "the API found agent {agent} without exactly one Slack binding with an identity for channel {channel}"
+            ),
+            format!("list the agent's bindings with `{surfaces}` and repair the one for {channel}"),
+        ),
+        n => (
+            format!(
+                "agent {agent} has {n} Slack bindings for channel {channel} (one per identity); exactly one is required"
+            ),
+            format!(
+                "list them with `{surfaces}` and remove the extra with `{surfaces} --remove slack={channel} --adapter <identity>`"
+            ),
+        ),
+    };
+    let fix = format!("{action}, then rerun this command. Run each curie command {target}");
+    // The typed error keeps the exit class and the `--json` fix; the operator
+    // context is what the human path prints as `Fix:`.
+    let typed =
+        anyhow::Error::from(crate::exit::CliError::failure(message.clone()).with_fix(fix.clone()));
+    Some(crate::exit::operator_context(typed, message, Some(fix)))
+}
+
 /// Is this 404 a MISSING ENDPOINT rather than a missing resource?
 ///
 /// FastAPI answers an unrouted path with exactly `{"detail":"Not Found"}`,
@@ -3518,6 +3741,66 @@ impl ApiClient {
                 "PATCH /agents/{id}",
             )
             .await?;
+        Self::expect_ok(resp, "updating the agent")
+            .await?
+            .json()
+            .await
+            .context("decoding updated agent")
+    }
+
+    /// `PATCH /agents/{id}` carrying only `factory_slack_channel`: a channel
+    /// sets it, `None` sends an explicit `null` and clears it.
+    ///
+    /// A 409 whose body is `{"detail": {"code": "factory_slack_channel_unbound"}}`
+    /// becomes a failure that names the exact `surfaces` command for `tier`
+    /// that fits how many Slack bindings the agent holds for the channel. The command is only named, never run: a surface binding also
+    /// makes the agent answer in that channel and picks its Slack identity,
+    /// which is a separate decision from where factory progress posts. A 422
+    /// is a usage error carrying the API's message. Everything else falls
+    /// through to [`Self::expect_ok`].
+    pub async fn update_agent_factory_slack_channel(
+        &self,
+        agent: &Agent,
+        channel: Option<&str>,
+        tier: &str,
+    ) -> Result<Agent> {
+        let body = AgentUpdate {
+            factory_slack_channel: Some(channel.map(str::to_string)),
+            ..AgentUpdate::default()
+        };
+        let resp = self
+            .send_request(
+                self.http
+                    .patch(format!("{}/agents/{}", self.base_url, agent.id))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentUpdate>(&body),
+                "PATCH /agents/{id}",
+            )
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            let text = resp.text().await.unwrap_or_default();
+            if let Some(channel) = channel {
+                if let Some(refusal) = factory_slack_unbound_refusal(
+                    &text,
+                    tier,
+                    &agent.name,
+                    &agent.id,
+                    channel,
+                    slack_bindings_for(&agent.channels, channel),
+                ) {
+                    return Err(refusal);
+                }
+            }
+            bail!("updating the agent failed with {status}: {}", text.trim());
+        }
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(crate::exit::CliError::usage(format!(
+                "the API rejected the factory Slack channel: {}",
+                text.trim()
+            ))));
+        }
         Self::expect_ok(resp, "updating the agent")
             .await?
             .json()
@@ -4700,6 +4983,54 @@ impl ApiClient {
             .json()
             .await
             .context("decoding memory list")
+    }
+
+    /// List an agent's learned rules: `GET /agents/{id}/memory/rules`,
+    /// validated against its API shape.
+    pub async fn list_memory_rules(
+        &self,
+        agent_id: &str,
+        state: Option<&str>,
+        scope_kind: Option<&str>,
+        scope_key: Option<&str>,
+    ) -> Result<MemoryRules> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(state) = state {
+            query.push(("state", state));
+        }
+        if let Some(scope_kind) = scope_kind {
+            query.push(("scope_kind", scope_kind));
+        }
+        if let Some(scope_key) = scope_key {
+            query.push(("scope_key", scope_key));
+        }
+        let response = self
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/memory/rules", self.base_url))
+                    .query(&query)
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/memory/rules",
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = if status.is_redirection() {
+                String::new()
+            } else {
+                response.text().await.unwrap_or_default()
+            };
+            return Err(memory_rules_refusal(
+                "GET /agents/{id}/memory/rules",
+                status,
+                &body,
+            ));
+        }
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .context("decoding the learned rule list")?;
+        parse_memory_rules(body)
     }
 
     /// Append an operator-authored memory record: `POST /agents/{id}/memory`.
@@ -6418,6 +6749,73 @@ fn coding_instructions_refusal(
     .into()
 }
 
+/// A learned rule refusal. The API's `detail` carries `code`, `message` and
+/// `fix`; the error says `<code>: <message>` and its fix is the API's.
+fn memory_rules_refusal(operation: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    use crate::exit::ExitClass::{Failure, Transient};
+
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let detail = value.as_ref().and_then(|value| value.get("detail"));
+    let text = |key: &str| {
+        detail
+            .and_then(|detail| detail.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    if let Some(code) = text("code") {
+        let message = text("message").unwrap_or_else(|| format!("HTTP {status}"));
+        let fix = text("fix").unwrap_or_else(|| "check the request, then retry".to_string());
+        return crate::exit::CliError {
+            message: format!("{code}: {message}"),
+            fix: Some(fix),
+            class: if matches!(status.as_u16(), 502..=504) {
+                Transient
+            } else {
+                Failure
+            },
+        }
+        .into();
+    }
+    let (class, problem, fix) = match status.as_u16() {
+        401 => (
+            Failure,
+            "the platform refused the credential (HTTP 401)".to_string(),
+            ENROLLMENT_SESSION_FIX.to_string(),
+        ),
+        403 => (
+            Failure,
+            "the platform refused the session or request origin (HTTP 403)".to_string(),
+            ENROLLMENT_ORIGIN_FIX.to_string(),
+        ),
+        502..=504 => (
+            Transient,
+            format!("the platform API is temporarily unavailable (HTTP {status})"),
+            "retry once the platform API is available".to_string(),
+        ),
+        _ if status.is_redirection() => (
+            Failure,
+            format!("the endpoint answered {status} with a redirect, which this CLI never follows"),
+            "point --api-url at the platform API's own address".to_string(),
+        ),
+        404 if is_unrouted(status, body) => (
+            Failure,
+            "this platform release does not serve learned rules".to_string(),
+            "upgrade the release, or use a CLI matching it".to_string(),
+        ),
+        _ => (
+            Failure,
+            format!("the platform answered HTTP {status}"),
+            "check the agent, the rule id and the arguments, then retry".to_string(),
+        ),
+    };
+    crate::exit::CliError {
+        message: format!("{operation} failed: {problem}"),
+        fix: Some(fix),
+        class,
+    }
+    .into()
+}
+
 /// The `detail.code` of an owner enrollment refusal, when it is one the
 /// contract defines. Any other body is dropped, never echoed.
 fn allowlisted_enrollment_code(body: &str) -> Option<&'static str> {
@@ -6695,6 +7093,141 @@ impl OwnerApiClient {
         .await
     }
 
+    /// The agent `identifier` names (name or id), found with the session cookie.
+    pub async fn find_agent(&self, identifier: &str) -> Result<Agent> {
+        let request = self
+            .http
+            .get(format!("{}/agents", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        let agents: Vec<Agent> = self
+            .exchange(
+                request,
+                "GET /agents",
+                "an agent list",
+                memory_rules_refusal,
+            )
+            .await?;
+        match_agent(agents, identifier).map_err(anyhow::Error::new)
+    }
+
+    /// `GET /agents/{id}/memory/rules` with the session cookie.
+    pub async fn list_memory_rules(
+        &self,
+        agent_id: &str,
+        state: Option<&str>,
+        scope_kind: Option<&str>,
+        scope_key: Option<&str>,
+    ) -> Result<MemoryRules> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(state) = state {
+            query.push(("state", state));
+        }
+        if let Some(scope_kind) = scope_kind {
+            query.push(("scope_kind", scope_kind));
+        }
+        if let Some(scope_key) = scope_key {
+            query.push(("scope_key", scope_key));
+        }
+        let request = self
+            .http
+            .get(format!("{}/agents/{agent_id}/memory/rules", self.base_url))
+            .query(&query)
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        let body = self
+            .exchange::<serde_json::Value>(
+                request,
+                "GET /agents/{id}/memory/rules",
+                "the learned rule list",
+                memory_rules_refusal,
+            )
+            .await?;
+        parse_memory_rules(body)
+    }
+
+    /// `POST /agents/{id}/memory/rules/{rule_id}/accept` with the version the
+    /// caller read, the answer validated against its API shape.
+    pub async fn accept_memory_rule(
+        &self,
+        agent_id: &str,
+        rule_id: &str,
+        body: &crate::api_requests::MemoryRuleDecision,
+    ) -> Result<MemoryRuleChange> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/accept",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
+        let answer = self
+            .exchange::<serde_json::Value>(
+                request,
+                "POST /agents/{id}/memory/rules/{rule_id}/accept",
+                "a learned rule change",
+                memory_rules_refusal,
+            )
+            .await?;
+        parse_memory_rule_change(answer)
+    }
+
+    /// `POST /agents/{id}/memory/rules/{rule_id}/reject` with the version the
+    /// caller read, the answer validated against its API shape.
+    pub async fn reject_memory_rule(
+        &self,
+        agent_id: &str,
+        rule_id: &str,
+        body: &crate::api_requests::MemoryRuleDecision,
+    ) -> Result<MemoryRuleChange> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/reject",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
+        let answer = self
+            .exchange::<serde_json::Value>(
+                request,
+                "POST /agents/{id}/memory/rules/{rule_id}/reject",
+                "a learned rule change",
+                memory_rules_refusal,
+            )
+            .await?;
+        parse_memory_rule_change(answer)
+    }
+
+    /// `POST /agents/{id}/memory/rules/{rule_id}/remove` with the version the
+    /// caller read, the answer validated against its API shape.
+    pub async fn remove_memory_rule(
+        &self,
+        agent_id: &str,
+        rule_id: &str,
+        body: &crate::api_requests::MemoryRuleDecision,
+    ) -> Result<MemoryRuleChange> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/remove",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
+        let answer = self
+            .exchange::<serde_json::Value>(
+                request,
+                "POST /agents/{id}/memory/rules/{rule_id}/remove",
+                "a learned rule change",
+                memory_rules_refusal,
+            )
+            .await?;
+        parse_memory_rule_change(answer)
+    }
+
     async fn exchange<T: serde::de::DeserializeOwned>(
         &self,
         request: reqwest::RequestBuilder,
@@ -6838,6 +7371,165 @@ mod tests {
     /// A typed request body as it goes on the wire.
     fn wire<T: serde::Serialize>(body: &T) -> serde_json::Value {
         serde_json::to_value(body).expect("request bodies serialize")
+    }
+
+    const UNBOUND: &str = r#"{"detail":{"code":"factory_slack_channel_unbound"}}"#;
+    const CLUSTER_TARGET: &str = "Run each curie command against the same cluster target (the same --context, --namespace and --release, or --api-url) as this command";
+    const AGENT_ID: &str = "7d1c2a3e-0000-4000-8000-00000000a001";
+    const LOCAL_TARGET: &str = "Run each curie command against the same --api-url as this command";
+
+    fn unbound(tier: &str, agent: &str, matching: usize) -> (String, String) {
+        let error = super::factory_slack_unbound_refusal(
+            UNBOUND,
+            tier,
+            agent,
+            AGENT_ID,
+            "C0EXAMPLE1",
+            matching,
+        )
+        .expect("the unbound code is recognised");
+        let (class, fix) = crate::exit::classify(&error);
+        assert_eq!(class, crate::exit::ExitClass::Failure);
+        (format!("{error:#}"), fix.expect("a fix"))
+    }
+
+    #[test]
+    fn zero_matching_bindings_says_to_add_one() {
+        for tier in ["local", "cluster"] {
+            let (message, fix) = unbound(tier, "acme-bot", 0);
+            assert!(
+                message.contains("agent acme-bot has no Slack binding for channel C0EXAMPLE1"),
+                "{message}"
+            );
+            assert!(
+                fix.starts_with(&format!(
+                    "bind the channel with `curie {tier} surfaces {AGENT_ID} --add slack=C0EXAMPLE1`, or, when another agent already holds the default Slack identity on that channel, under a free declared identity with `curie {tier} surfaces {AGENT_ID} --add slack=C0EXAMPLE1 --adapter <identity>`, then rerun this command."
+                )),
+                "{fix}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_matching_bindings_says_to_remove_the_extra_one() {
+        for (n, tier) in [(2, "local"), (3, "cluster")] {
+            let (message, fix) = unbound(tier, "acme-bot", n);
+            assert!(
+                message.contains(&format!(
+                    "agent acme-bot has {n} Slack bindings for channel C0EXAMPLE1 (one per identity); exactly one is required"
+                )),
+                "{message}"
+            );
+            assert!(
+                fix.contains(&format!(
+                    "list them with `curie {tier} surfaces {AGENT_ID}`"
+                )),
+                "{fix}"
+            );
+            assert!(
+                fix.contains(&format!(
+                    "`curie {tier} surfaces {AGENT_ID} --remove slack=C0EXAMPLE1 --adapter <identity>`"
+                )),
+                "{fix}"
+            );
+            assert!(fix.contains("then rerun this command."), "{fix}");
+            assert!(!fix.contains("--add"), "{fix}");
+        }
+    }
+
+    #[test]
+    fn one_matching_binding_still_refused_gets_the_generic_message() {
+        let (message, fix) = unbound("cluster", "acme-bot", 1);
+        assert!(
+            message.contains(
+                "without exactly one Slack binding with an identity for channel C0EXAMPLE1"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("no Slack binding"), "{message}");
+        assert!(
+            fix.contains(&format!(
+                "list the agent's bindings with `curie cluster surfaces {AGENT_ID}`"
+            )),
+            "{fix}"
+        );
+        assert!(!fix.contains("--add") && !fix.contains("--remove"), "{fix}");
+    }
+
+    #[test]
+    fn the_fix_ends_by_naming_the_operators_target() {
+        for matching in [0, 1, 2] {
+            let (_, cluster) = unbound("cluster", "acme-bot", matching);
+            assert!(cluster.ends_with(CLUSTER_TARGET), "{cluster}");
+            let (_, local) = unbound("local", "acme-bot", matching);
+            assert!(local.ends_with(LOCAL_TARGET), "{local}");
+        }
+    }
+
+    #[test]
+    fn printed_commands_name_the_agent_by_id_never_by_name() {
+        // A valid stored name can start with `-` (read as a flag), hold a
+        // space or an apostrophe; the id never does.
+        for agent in ["--review-bot", "-x", "acme bot", "acme's bot"] {
+            for matching in [0, 1, 2] {
+                let (message, fix) = unbound("cluster", agent, matching);
+                assert!(
+                    fix.contains(&format!("curie cluster surfaces {AGENT_ID}")),
+                    "{agent:?} x{matching}: {fix}"
+                );
+                assert!(
+                    !fix.contains(agent),
+                    "{agent:?} x{matching}: no command names the agent: {fix}"
+                );
+                assert!(
+                    message.contains(agent),
+                    "{agent:?} x{matching}: the message still names it: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slack_bindings_for_counts_only_slack_bindings_on_that_address() {
+        let binding = |kind: &str, address: &str, adapter: &str| ChannelBinding {
+            kind: kind.to_string(),
+            address: address.to_string(),
+            adapter: Some(adapter.to_string()),
+            allowed_callers: None,
+            trigger_label: None,
+        };
+        let channels = [
+            binding("slack", "C0EXAMPLE1", "default"),
+            binding("slack", "C0EXAMPLE1", "other"),
+            binding("slack", "C0EXAMPLE2", "default"),
+            binding("github", "C0EXAMPLE1", "default"),
+        ];
+        assert_eq!(super::slack_bindings_for(&channels, "C0EXAMPLE1"), 2);
+        assert_eq!(super::slack_bindings_for(&channels, "C0EXAMPLE2"), 1);
+        assert_eq!(super::slack_bindings_for(&channels, "C0EXAMPLE3"), 0);
+    }
+
+    #[test]
+    fn any_other_409_body_is_not_the_unbound_refusal() {
+        for body in [
+            r#"{"detail":{"code":"something_else"}}"#,
+            r#"{"detail":"factory_slack_channel_unbound"}"#,
+            r#"{"code":"factory_slack_channel_unbound"}"#,
+            "not json factory_slack_channel_unbound",
+        ] {
+            assert!(
+                super::factory_slack_unbound_refusal(
+                    body,
+                    "local",
+                    "acme-bot",
+                    AGENT_ID,
+                    "C0EXAMPLE1",
+                    0,
+                )
+                .is_none(),
+                "{body}"
+            );
+        }
     }
 
     /// One percent-decoding pass, as the API applies to the request path and

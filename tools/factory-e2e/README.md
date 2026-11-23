@@ -1419,11 +1419,26 @@ The judge has eight criteria, each computed from recorded observations only.
    synthetic record. Provider errors from the CLI's debug stderr must agree with
    the terminal frame. Each role's observed model is recorded
    (`grant.role_models`) and printed in the judge output.
-4. `progress`: every `factory_slack_posts` row for the WorkItem was delivered
-   into the kickoff thread, read back with `conversations.replies`. The thread
-   row is origin `kickoff` at the kickoff message, no root post exists, the
-   admitted reply and the terminal post are there, and the pull request post is
-   there whenever a pull request exists.
+4. `progress`: the kickoff thread holds the progress card and one notify
+   reply, read back with `conversations.replies`, and nothing else from the
+   bot. The thread row is origin `kickoff` at the kickoff message, its
+   `card_ts` equals the dispatcher placeholder's ts (observed right after
+   admission, so the card is the placeholder edited in place) and is the first
+   reply, and no root post or retired post kind (`phase`, `pull_request`,
+   `terminal`, `card`) exists. When a pull request exists the card's final
+   message has the header `Factory run: finished`, the seven checklist steps
+   marked done, and a `View pull request #N` button whose url is the observed
+   pull request; exactly one other bot reply exists, and its text is
+   `<@SENDER> your pull request is ready for review: <url>` with a delivered
+   `ready` outbox row. A failed run can show a terminal card and a
+   `this run needs you:` notify, but it fails the successful pull request
+   check and cannot satisfy this acceptance criterion. No bot message
+   contains `Phase `, `Outcome: admitted`, `Run completed`, `PR open:` or a
+   JSON object, and every outbox row was delivered into the thread. The
+   anonymized thread dump (user ids, ts values, team ids, URLs and repository
+   names replaced by stable placeholders, block structure kept) is recorded as
+   `progress.thread_dump` and printed in the `observations` of
+   `judge --criterion progress` (and `all`), for the pull request body.
 5. `refusal`: the enrollment is disconnected through
    `curie cluster subscription disconnect`, the run waits for teardown to
    settle, and the same sender kicks off a second fixture issue. The reply in
@@ -1464,7 +1479,7 @@ through stdin. `testInstallation.enabled` is true with one driver whose
 `channel_id`, `bot_id` and `bot_user_id` come from the sender token's
 `auth.test`. The chart generates the API key, worker token and attester
 secret. The factory is on with the GitHub App as code host and tracker for the
-fixture repository only, `FACTORY_MODEL_AUTH_MODE=personal`, one worker slot
+fixture repository only, `factory.modelAuthMode=personal`, one worker slot
 and no warm pool. Poll intake watches an unused per-run label, so the kickoff
 is the only admission. The agent is deployed from a private copy of
 `examples/dark-factory` that adds only the reservation gate hook, gets a
@@ -1566,9 +1581,28 @@ uv run python3 tools/factory-e2e/personal_slack_kickoff.py --live \
   --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION" \
   --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT" --approve-live "$CEILING"
 
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py refusal-connect \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$CONNECT_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT" \
+  --namespace "$NS" --release "$RELEASE" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py judge \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$CONNECT_ID" --criterion refusal-connect
+
 uv run python3 tools/factory-e2e/personal_slack_kickoff.py judge \
   --candidate "$SHA" --state-dir "$STATE" --run-id "$RUN_ID" --criterion all
 ```
+
+`refusal-connect` takes the same installation and Slack inputs as `rehearse`,
+but takes no grant and never enrolls one. It mentions the app once with an
+unlinked sender and once with a linked sender without an enrollment, checks
+that each public thread has only the settled placeholder, and reads each
+private post acknowledgement from worker logs without recording its URL.
+It also counts the unlinked sender's live connect token and verifies that no
+WorkItem, request or runner started. `judge --criterion refusal-connect`
+requires both legs and complete cleanup, and prints anonymized thread dumps.
 
 `images` builds the api, worker, dispatcher and runner images and the
 dark-factory runner layer at the candidate through `git archive` with the OCI
@@ -1717,3 +1751,167 @@ the evidence.
 5. The hermetic tests replace `kubectl`, `docker`, `helm`, `git` and `openssl`
    with recording stubs and substitute the Slack Web API. They prove refusals,
    ordering and the judge, not the live path.
+
+## Scripted learned rules chain (#5799)
+
+`curie dev factory-e2e scripted --scenario learned-rules --transcript
+tools/model-script/transcripts/learned-rules-chain-a.json` proves the learned
+rule chain from outside on one owned kind install, with the GitHub stub, the
+scripted model server and a disposable Dex. It reuses the scripted driver's
+install and ticket A (stub issue 3815), then a reviewer with write access
+posts a review comment that mentions the factory and states a general rule on
+ticket A's pull request. The revision calls `propose_rule`, the merge turns
+the candidate into the proposed rule R1, a principal linked to a read only
+account is refused its acceptance with `memory_rules.write_access_required`
+and the writer's principal accepts it, both through the CLI with a session
+file. Ticket B (3921) is labelled by the writer, whose requester document asks
+for the opposite; its implementer prompt carries the learned rules section
+above the requester section, no reviewer prompt carries it, its pull request
+body names R1 with the work item's digest on the line before the requester
+line, and every added `assertAlmostEqual(` uses `places=6`. After the writer
+removes R1, ticket C (3922) carries none of it. The evidence JSON records one
+step per link under `learned_rules`, and `learned_rules_scenario.assert_chain`
+judges it; the command fails when it raises.
+
+Principal sessions come from a real Dex password login (users
+`writer@example.com` and `reader@example.com`), never a login code. The
+session probe runs before ticket A is labelled and before any model request:
+both sessions must be principal sessions of two distinct principals in the
+agent's tenant. Session values stay in memory, are redacted from every log,
+and reach the CLI only through mode 0600 files in the run directory.
+
+`--transcript` names the ticket A file; the B and C files sit beside it with
+the same stem, `-b.json` and `-c.json`, and the command refuses to start when
+either is missing or malformed. Replay routes each model request to its
+ticket's lane by the raw issue identity, with no fallback, so a request no
+ticket claims fails the run:
+
+```bash
+curie dev factory-e2e scripted --scenario learned-rules --build-images \
+  --transcript tools/model-script/transcripts/learned-rules-chain-a.json
+```
+
+Recording proxies every lane through a live model under the driver's existing
+caps, with the key in `CURIE_FACTORY_RECORD_KEY`. At teardown the exchanges
+are split by ticket, scrubbed of the stub's address, and written to the three
+`learned-rules-chain-*.json` files; an exchange with no ticket fails the run:
+
+```bash
+CURIE_FACTORY_RECORD_KEY=... \
+  curie dev factory-e2e scripted --scenario learned-rules --build-images --record
+```
+
+CI runs the replay as the `learned-rules` suite of the `e2e-scripted-factory`
+job and uploads its evidence as `scripted-learned-rules-evidence-<sha>`. The
+offline tests are `tests/test_learned_rules_scenario.py` (the judge, the
+session probe through `ScriptedRun.execute`, and the revision routing on the
+real stub) and the learned rules cases of `tests/test_scripted_driver.py`.
+
+## Live GitHub chain (#5808)
+
+`factory_e2e.py run --scenario live-github-chain` runs the whole GitHub
+product flow on one install built from the candidate: questions on ticket A,
+a plain answer, a submitted review that revises the pull request and becomes a
+proposed rule after the merge, a reader refused and the writer accepting the
+rule, ticket B carrying it over a conflicting personal instruction, its removal
+before ticket C, and the retired triage path. The driver is
+`live_github_chain.py`; the judge and the evidence sanitizer are
+`live_github_chain_judge.py`.
+
+### Inputs
+
+1. The usual App, fixture repository, actor token and kube context inputs of
+   this harness.
+2. `CURIE_FACTORY_READER_ACCOUNT_ID`: the numeric id of a public account other
+   than the actor, without write access to the fixture repository. Digits
+   only; a refusal never echoes the value.
+3. `CURIE_FACTORY_MODEL_API_KEY` for the full run. `--stop-after links` needs
+   none.
+4. `--live-chain-attempt N` (1 or 2) records which of the at most two attempts
+   this run is. Both chain flags are refused for any other scenario.
+
+### Before any lock or cluster call
+
+The run first installs the sanitizer for the identifiers the configuration
+names, then reads the reader id, the actor, the reader account and the fixture
+repository and installs the full sanitizer, so evidence and logs never carry
+a raw account, repository, App, namespace or context. It then checks that
+every blocker of #5808 has a closing pull request into `curie-eng/curie`'s
+`next` whose merge commit is in the candidate (the full run refuses an unready
+candidate; the stop mode records it and goes on), and it refuses a fixture
+repository with any open issue or pull request. A refused evidence file makes
+the run exit nonzero.
+
+### What `--stop-after links` proves
+
+It installs the candidate with the fake model (any model key or base URL is
+dropped first), a disposable Dex for two OIDC principals, two real logins, a
+session probe that both are principal sessions in the agent's tenant, and the
+code host links of both principals to the actor and the reader. It stops
+before any ticket exists and opens no seed issue, so it can send no model
+request.
+
+### What the full run proves
+
+The eight beats (a) to (h) of #5808 decision 7 in order. Each prerequisite is
+checked before the action that depends on it (rule proposals read on before
+ticket A, the instruction write before ticket B, the removal before ticket C),
+each beat is judged before the next beat's first side effect (beat (c) and its
+revision checks before beat (d) merges), and a model usage sample is required
+before ticket A and after every beat; a missing sample or a delta at the
+spend cap stops the run.
+
+### Teardown
+
+Teardown deletes Dex and the OIDC Secret, the session files, the code host
+links, the run's unbound label (read back as gone), closes the run's issues,
+moves the default branch back to its head before the merge (read back), and
+deletes the namespace. The verdict fails unless every step is verified.
+
+## Live one-ticket on Jira Cloud (#5793)
+
+`factory_e2e.py run --scenario one-ticket --forge jira_cloud --answer-file
+<file> [--issue-file <file>]` runs the one-ticket flow against a real Jira
+Cloud site with a real model on the preflight's `jira_cloud+github` install.
+The driver is `one_ticket_live.py`; `one-ticket` is a loop scenario fixed to
+the `jira_cloud` forge, so any other `--forge` is refused before anything is
+installed. `--issue-file` defaults to `fixtures/one-ticket-jira-issue.md`, a
+ticket that leaves its rounding mode and default precision open, and
+`fixtures/one-ticket-answer.md` answers it.
+
+### Inputs
+
+1. The usual App, fixture repository, actor token, kube context and layer
+   registry inputs, plus `CURIE_FACTORY_MODEL_API_KEY`.
+2. `CURIE_FACTORY_JIRA_ENV_FILE`, in the format of the docstring of
+   `forges/jira_cloud.py`.
+3. `--answer-file`: the labeller's plain answer. It is required, refused when
+   empty or when it mentions anyone, and refused for every other scenario.
+
+### What the run judges
+
+Each beat against its bound, counted from labelling or from the answer:
+`Investigating this ticket.` within 180 seconds of labelling, a question
+comment within 1800 seconds, the answer posted only after the issue carries
+`curie-factory:questions` with no live request in the same read, the second
+request and `Answer received.` each within 180 seconds of the answer, exactly
+one pull request within 3600 seconds of the answer that names the Jira key and
+has a line starting `Answered on the ticket by `, the merge, and
+`Pull request merged:` within 600 seconds of it. It also requires the Jira
+status id read before labelling to equal the one read after the merged notice
+(an id, not a category), at most two requests, a `Usage:` total of at most
+25 USD (`total cost unknown` and a missing line fail), and no Jira issue
+created by the factory account.
+
+### Evidence and check-clean
+
+Before any lock or cluster call the run loads every identity of its
+environment (fixture repository, actor, operator, App, installation, Jira
+site, cloud, project, labeller and bot accounts, kube context, registry,
+binary paths, home) and writes evidence and log lines only through
+`anonymize`, which replaces each value with its role name. The serializer
+refuses evidence that still names one. The outcome summary for the pull
+request body is logged and stored as `outcome_summary`.
+`python3 tools/factory-e2e/one_ticket_live.py check-clean <file>` reloads the
+same identities and prints `clean`, or exits 1 naming only the roles it found;
+an unreadable input exits 2. It needs only the standard library.

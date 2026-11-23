@@ -54,6 +54,7 @@ from test_publications import (  # noqa: E402, F401
     _factory_publication_case,
     _post_factory_publication,
     _record_factory_verification,
+    assert_single_ask_line,
 )
 
 JIRA_SUMMARY = "Widget parser drops the last field"
@@ -124,6 +125,24 @@ def test_a_github_body_that_already_closes_the_issue_keeps_its_text(
     marked = f"{body.rstrip()}\n\n{_marker(request_id)}\n\n{github_ask_line('curie')}"
     assert created.json()["body"] == marked
     assert _factory_publication_body(created.json()["id"]) == marked
+    assert not assert_single_ask_line(marked, f"{body.rstrip()}\n\n{_marker(request_id)}")
+
+
+def test_a_github_body_with_the_previous_ask_wording_ends_with_one_current_line(
+    _factory_publication_case: Case,
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    _passed(client, request_id)
+    old = "Ask the factory: mention @curie on this pull request."
+    text = f"Closes #{_issue_number(payload)}\n\nThe change updates the factory route."
+    payload = {**payload, "body": f"{text}\n\n{old}\n"}
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    stored = _factory_publication_body(created.json()["id"])
+    assert old not in stored
+    assert not assert_single_ask_line(stored, f"{text}\n\n{_marker(request_id)}")
 
 
 def test_a_github_body_without_the_closing_reference_gains_it_once(
@@ -142,6 +161,9 @@ def test_a_github_body_without_the_closing_reference_gains_it_once(
         f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}\n\n{github_ask_line('curie')}"
     )
     assert stored.count(reference) == 1
+    assert not assert_single_ask_line(
+        stored, f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}"
+    )
 
 
 # --- Jira -------------------------------------------------------------------------

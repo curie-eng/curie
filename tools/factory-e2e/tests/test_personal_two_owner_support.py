@@ -1770,12 +1770,14 @@ def test_two_owner_values_deliver_grants_per_claim_only() -> None:
     assert "personal-grant" not in json.dumps(values)
     assert values["personalClaude"] == {"grantNamespace": f"{NAMESPACE}-grants"}
     worker = values["worker"]
-    assert _env_of(worker["extraEnv"]) == {"FACTORY_MODEL_AUTH_MODE": "personal"}
+    assert "FACTORY_MODEL_AUTH_MODE" not in _env_of(worker.get("extraEnv"))
+    assert values["factory"]["modelAuthMode"] == "personal"
+    # The base install's factory block is kept beside it, not replaced.
+    assert {key: values["factory"][key] for key in base["factory"]} == base["factory"]
     assert worker["maxConcurrency"] == 3 and worker["workItemMaxTurns"] == 32
     assert values["resourceQuota"] == {"hard": {"requestsMemory": "16Gi"}}
     api = _env_of(values["api"]["extraEnv"])
     assert api == {
-        "FACTORY_MODEL_AUTH_MODE": "personal",
         "CURIE_OIDC_ISSUER": ISSUER,
         "CURIE_OIDC_AUDIENCE": pto.OIDC_CLIENT_ID,
         "CURIE_OIDC_JWKS_URL": ISSUER + "/keys",

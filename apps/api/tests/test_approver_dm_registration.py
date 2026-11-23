@@ -88,6 +88,25 @@ def _unregistered(
     assert owner_verifies(case, str(row["id"]))
 
 
+def test_card_registration_cannot_reseal_a_tampered_record(dm_case: SimpleNamespace) -> None:
+    case = dm_case
+    row, request, identity = _pending(case)
+    registration = card_body(request, row["id"], card_identity=identity)
+    audits = audit_rows(row["id"])
+    query = "UPDATE curie.approvals SET summary = :summary WHERE id = :id"
+    change = {"id": row["id"], "summary": "Synthetic changed summary"}
+    sql_rows(query, change)
+    tampered = _row(request)
+    assert tampered == {**row, "summary": change["summary"]}
+    refused_exactly(post_card(case.client, row["id"], registration), 409,
+                    "approval_provenance_conflict")
+    assert _row(request) == tampered
+    assert audit_rows(row["id"]) == audits
+    sql_rows(query, {**change, "summary": row["summary"]})
+    card_registered(post_card(case.client, row["id"], registration), registration)
+    assert len(card_audits(row["id"])) == 1
+
+
 # --- the first registration and its continuity ---------------------------------------------
 
 
@@ -354,43 +373,6 @@ def test_an_earlier_ordinary_approval_keeps_its_seal(dm_case: SimpleNamespace) -
 
 
 # --- R3: the stored record is verified before it is resealed --------------------------------
-
-
-def test_a_tampered_pending_row_is_never_resealed(dm_case: SimpleNamespace) -> None:
-    """@spec APPROVER-DM-2: registration verifies the sealed record before any mutation.
-
-    A digest-covered field (``summary``) of the pending DM row is changed
-    directly in SQL. Registration answers 409 ``approval_provenance_conflict``
-    and leaves the card channel, the sealed context and the audit log exactly
-    as they were, so the tamper is not laundered into a fresh seal. With the
-    field restored, the same registration succeeds.
-    """
-    case = dm_case
-    row, request, identity = _pending(case)
-    assert "summary" in RECORD_FIELDS
-    sql_rows(
-        "UPDATE curie.approvals SET summary = :summary WHERE id = :id",
-        {"summary": "Synthetic tampered summary", "id": uuid.UUID(str(row["id"]))},
-    )
-    tampered = _row(request)
-    audits = audit_rows(row["id"])
-
-    body = card_body(request, row["id"], card_identity=identity)
-    refused_exactly(post_card(case.client, row["id"], body), 409, "approval_provenance_conflict")
-    stored = _row(request)
-    assert stored["card_channel"] is None, stored
-    assert stored["identity_context"] == tampered["identity_context"] == row["identity_context"]
-    assert stored["summary"] == "Synthetic tampered summary"
-    assert audit_rows(row["id"]) == audits
-    assert card_audits(row["id"]) == []
-
-    sql_rows(
-        "UPDATE curie.approvals SET summary = :summary WHERE id = :id",
-        {"summary": row["summary"], "id": uuid.UUID(str(row["id"]))},
-    )
-    body = card_body(request, row["id"], card_identity=identity)
-    card_registered(post_card(case.client, row["id"], body), body)
-    assert len(card_audits(row["id"])) == 1
 
 
 # --- R4: retries are judged against the committed registration -------------------------------

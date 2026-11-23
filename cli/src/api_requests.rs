@@ -159,8 +159,8 @@ pub struct ChannelBindingWrite {
 
 /// `PATCH /agents/{id}` (`AgentUpdate`). Every field is optional: an omitted
 /// key leaves the stored value unchanged. `model`, `thinking`,
-/// `execution_deadline_seconds`, `runner_resources` and
-/// `publication_branch_prefix` are three-state because the router reads
+/// `execution_deadline_seconds`, `runner_resources`,
+/// `publication_branch_prefix` and `factory_slack_channel` are three-state because the router reads
 /// `model_fields_set` for them, so an explicit `null` clears the value.
 ///
 /// Deliberately not `Debug`: `secrets` carries connector secret values.
@@ -182,8 +182,14 @@ pub struct AgentUpdate {
     pub connector_requester_identity_expected_version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_deadline_seconds: Option<Option<u32>>,
+    /// Where a factory run's progress posts. Three-state like `model`: omitted
+    /// leaves it, explicit `null` clears it, a value sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_slack_channel: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_partitions: Option<BTreeMap<String, HookPartitionInput>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_rule_proposals: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_writes: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,4 +411,11 @@ pub struct WorkItemRetryRequest {
     pub expected_version: u64,
     pub reason: String,
     pub request_id: uuid::Uuid,
+}
+
+/// Request body of `POST /agents/{id}/memory/rules/{rule_id}/accept`, `/reject`
+/// and `/remove` (`MemoryRuleDecision`, #5797): the version the person read.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRuleDecision {
+    pub expected_version: i64,
 }

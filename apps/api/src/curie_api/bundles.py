@@ -8,6 +8,7 @@ router; this module is pure intake logic.
 
 import io
 import json
+import os
 import tarfile
 import tempfile
 import zipfile
@@ -56,7 +57,6 @@ from curie_api.e2e_connector import (
     pin_server_command,
     prepare_connectors,
 )
-from curie_api.tracker_result_declaration import declaration_issues
 
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to
@@ -137,15 +137,45 @@ def extract_and_validate(
     root = bundle_root(dest)
     result = validate_bundle(root, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
     # API-only issues on top of the frozen package: sealing key custody, then
-    # the tracker result declaration (ADR 0277, #5585). A malformed
-    # `workflow/result.json` is a validation error here, so it reports its own
-    # codes before `deploy.validate_archive` refuses a valid one.
-    extra = [*sealing_key_custody_issues(root), *declaration_issues(root)]
+    # the retired result declaration (#5804).
+    extra = [*sealing_key_custody_issues(root), *retired_result_declaration_issues(root)]
     if extra:
         result = ValidationResult(
             valid=False, errors=[*result.errors, *extra], warnings=result.warnings
         )
     return extension, content_type, result
+
+
+RETIRED_RESULT_DECLARATION_FILE = "workflow/result.json"
+RETIRED_RESULT_DECLARATION_CODE = "bundle.result_declaration_retired"
+RETIRED_RESULT_DECLARATION_DOCS_HEADING = "Before upgrading: an existing triage binding"
+RETIRED_RESULT_DECLARATION_MESSAGE = (
+    "workflow/result.json is no longer supported: the separate triage flow was removed."
+    " An agent that is already deployed with this declaration must have its binding"
+    " removed or replaced first, or it would run as an implementation agent on its old"
+    f" trigger label; see {RETIRED_RESULT_DECLARATION_DOCS_HEADING} in docs/operations.md."
+    " For a new upload, delete the file and deploy again."
+)
+
+
+def retired_result_declaration_issues(root: Path) -> list[ValidationIssue]:
+    """One issue when the bundle still carries ``workflow/result.json``, else none.
+
+    The file declared the separate triage flow, which no longer exists. A
+    bundle that still carries it is refused rather than silently deployed as an
+    implementation agent. Presence alone decides, file or directory, whatever
+    it contains; nothing is read, so the message never echoes bundle content.
+    """
+
+    if not os.path.lexists(root / RETIRED_RESULT_DECLARATION_FILE):
+        return []
+    return [
+        ValidationIssue(
+            code=RETIRED_RESULT_DECLARATION_CODE,
+            message=RETIRED_RESULT_DECLARATION_MESSAGE,
+            location=RETIRED_RESULT_DECLARATION_FILE,
+        )
+    ]
 
 
 SEALING_KEY_CODE = "secrets.sealing_key_custody"
@@ -552,8 +582,13 @@ def render_connector_manifests(
     grant_store: connector_render.GrantStore | None = None,
     gated_tools: Mapping[str, tuple[str, ...]] | None = None,
     e2e: E2EInstall | None = None,
+    service_accounts: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
+
+    ``service_accounts`` is the operator's connector-to-ServiceAccount mapping
+    for this agent; an entry for a connector the bundle does not declare is
+    ignored, since one installation-wide list serves every agent.
 
     The API renders but never applies. Rendering is a pure function, so it needs
     no cluster access, and the API's RBAC stays the deliberately read-only
@@ -580,6 +615,7 @@ def render_connector_manifests(
                 proxy=proxy,
                 gated_tools=tools,
                 grant_store=grant_store if proxy is not None else None,
+                service_account=(service_accounts or {}).get(name),
             )
         )
     if install.enabled and CONNECTOR_NAME in connectors.connectors:

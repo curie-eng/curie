@@ -1,0 +1,203 @@
+{
+  "_comment": "Real responses of GET /agents/{agent_id}/memory/rules and POST .../memory/rules/{rule_id}/accept: list and accept for repository scope rules, accept_binding for a binding scope rule (applies_from next_session) and list_binding for the list filtered to that binding scope (?scope_kind=binding&scope_key=...), recorded from the routes by apps/api/tests/test_memory_rule_routes.py::test_list_and_accept_responses_match_the_cli_vector, which fails when they drift. Ids and clocks are placeholders. Refresh: CURIE_WRITE_MEMORY_RULES_VECTOR=1 uv run pytest apps/api/tests/test_memory_rule_routes.py -k cli_vector",
+  "list": {
+    "rules": [
+      {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "number": 1,
+        "label": "R1",
+        "scope_kind": "repository",
+        "scope_key": "github:github.com:4401",
+        "scope_label": "acme-corp/acme-bot",
+        "state": "proposed",
+        "text": "Keep rule 01 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "Reviewers asked for it twice.",
+        "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+        "proposed_by": "github:6601:octocat",
+        "proposed_at": "2026-11-19T12:00:00Z",
+        "accepted_by": null,
+        "accepted_at": null,
+        "rejected_by": null,
+        "rejected_at": null,
+        "removed_by": null,
+        "removed_at": null,
+        "version": 1
+      },
+      {
+        "id": "00000000-0000-4000-8000-000000000002",
+        "number": 2,
+        "label": "R2",
+        "scope_kind": "repository",
+        "scope_key": "github:github.com:4401",
+        "scope_label": "acme-corp/acme-bot",
+        "state": "accepted",
+        "text": "Keep rule 02 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "Reviewers asked for it twice.",
+        "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+        "proposed_by": "github:6601:octocat",
+        "proposed_at": "2026-11-19T12:00:00Z",
+        "accepted_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000003",
+          "display_name": "Acme Owner"
+        },
+        "accepted_at": "2026-11-19T12:01:00Z",
+        "rejected_by": null,
+        "rejected_at": null,
+        "removed_by": null,
+        "removed_at": null,
+        "version": 1
+      },
+      {
+        "id": "00000000-0000-4000-8000-000000000004",
+        "number": 3,
+        "label": "R3",
+        "scope_kind": "repository",
+        "scope_key": "github:github.com:4401",
+        "scope_label": "acme-corp/acme-bot",
+        "state": "rejected",
+        "text": "Keep rule 03 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "Reviewers asked for it twice.",
+        "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+        "proposed_by": "github:6601:octocat",
+        "proposed_at": "2026-11-19T12:00:00Z",
+        "accepted_by": null,
+        "accepted_at": null,
+        "rejected_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000003",
+          "display_name": "Acme Owner"
+        },
+        "rejected_at": "2026-11-19T12:02:00Z",
+        "removed_by": null,
+        "removed_at": null,
+        "version": 1
+      },
+      {
+        "id": "00000000-0000-4000-8000-000000000005",
+        "number": 4,
+        "label": "R4",
+        "scope_kind": "repository",
+        "scope_key": "github:github.com:4401",
+        "scope_label": "acme-corp/acme-bot",
+        "state": "removed",
+        "text": "Keep rule 04 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "Reviewers asked for it twice.",
+        "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+        "proposed_by": "github:6601:octocat",
+        "proposed_at": "2026-11-19T12:00:00Z",
+        "accepted_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000003",
+          "display_name": "Acme Owner"
+        },
+        "accepted_at": "2026-11-19T12:03:00Z",
+        "rejected_by": null,
+        "rejected_at": null,
+        "removed_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000003",
+          "display_name": "Acme Owner"
+        },
+        "removed_at": "2026-11-19T12:04:00Z",
+        "version": 1
+      }
+    ],
+    "scopes": [
+      {
+        "scope_kind": "repository",
+        "scope_key": "github:github.com:4401",
+        "scope_label": "acme-corp/acme-bot",
+        "in_force_count": 1
+      }
+    ],
+    "in_force_limit": 16
+  },
+  "accept": {
+    "rule": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "number": 1,
+      "label": "R1",
+      "scope_kind": "repository",
+      "scope_key": "github:github.com:4401",
+      "scope_label": "acme-corp/acme-bot",
+      "state": "accepted",
+      "text": "Keep rule 01 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "reason": "Reviewers asked for it twice.",
+      "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+      "proposed_by": "github:6601:octocat",
+      "proposed_at": "2026-11-19T12:00:00Z",
+      "accepted_by": {
+        "principal_id": "00000000-0000-4000-8000-000000000006",
+        "display_name": "Acme Owner"
+      },
+      "accepted_at": "2026-11-19T12:05:00.000000Z",
+      "rejected_by": null,
+      "rejected_at": null,
+      "removed_by": null,
+      "removed_at": null,
+      "version": 2
+    },
+    "applies_from": "next_ticket"
+  },
+  "accept_binding": {
+    "rule": {
+      "id": "00000000-0000-4000-8000-000000000007",
+      "number": 1,
+      "label": "R1",
+      "scope_kind": "binding",
+      "scope_key": "slack:C0EXAMPLE1",
+      "scope_label": "slack:C0EXAMPLE1",
+      "state": "accepted",
+      "text": "Keep rule 01 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "reason": "Reviewers asked for it twice.",
+      "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+      "proposed_by": "github:6601:octocat",
+      "proposed_at": "2026-11-19T12:00:00Z",
+      "accepted_by": {
+        "principal_id": "00000000-0000-4000-8000-000000000006",
+        "display_name": "Acme Owner"
+      },
+      "accepted_at": "2026-11-19T12:06:00.000000Z",
+      "rejected_by": null,
+      "rejected_at": null,
+      "removed_by": null,
+      "removed_at": null,
+      "version": 2
+    },
+    "applies_from": "next_session"
+  },
+  "list_binding": {
+    "rules": [
+      {
+        "id": "00000000-0000-4000-8000-000000000007",
+        "number": 1,
+        "label": "R1",
+        "scope_kind": "binding",
+        "scope_key": "slack:C0EXAMPLE1",
+        "scope_label": "slack:C0EXAMPLE1",
+        "state": "accepted",
+        "text": "Keep rule 01 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "reason": "Reviewers asked for it twice.",
+        "source_url": "https://github.com/acme-corp/acme-bot/pull/12",
+        "proposed_by": "github:6601:octocat",
+        "proposed_at": "2026-11-19T12:00:00Z",
+        "accepted_by": {
+          "principal_id": "00000000-0000-4000-8000-000000000006",
+          "display_name": "Acme Owner"
+        },
+        "accepted_at": "2026-11-19T12:06:00.000000Z",
+        "rejected_by": null,
+        "rejected_at": null,
+        "removed_by": null,
+        "removed_at": null,
+        "version": 2
+      }
+    ],
+    "scopes": [
+      {
+        "scope_kind": "binding",
+        "scope_key": "slack:C0EXAMPLE1",
+        "scope_label": "slack:C0EXAMPLE1",
+        "in_force_count": 1
+      }
+    ],
+    "in_force_limit": 16
+  }
+}

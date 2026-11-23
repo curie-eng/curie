@@ -85,6 +85,15 @@ _CAUSE_TEXT = {
     ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
+    # The question ending and its round cap (#5785).
+    "questions_asked": (
+        "the run posted its questions on the ticket and ended. Answer in a plain comment on "
+        "the ticket to start the next attempt."
+    ),
+    "question_rounds_exhausted": (
+        "the ticket's three question rounds are used, so the run could not ask again. "
+        "Make the ticket buildable, then re-add the label."
+    ),
     "revision_unchanged": (
         "the existing pull request is unchanged because this revision published nothing."
     ),
@@ -152,16 +161,6 @@ _CAUSE_TEXT = {
     "pr_closed": "a person closed the pull request without merging it during the CI wait.",
     "ci_fix_unpublished": (
         "a CI fix round ended without pushing a fix. The pull request stays open."
-    ),
-    # Tracker-result (triage) runs (#5586).
-    "tracker_result": "the investigation delivered its triage result to the issue.",
-    "no_tracker_result": (
-        "the investigation ended without submitting a result, so nothing was delivered "
-        "to the issue."
-    ),
-    "tracker_result_undelivered": (
-        "the investigation submitted a result, but it was not delivered to the issue "
-        "before the run ended. Curie keeps trying until the delivery deadline."
     ),
 }
 

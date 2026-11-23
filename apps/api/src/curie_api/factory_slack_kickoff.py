@@ -49,7 +49,12 @@ a request id derived from the delivery. A refusal there answers
 enrollment answers ``enrollment_inactive``. The same transaction inserts the
 WorkItem's ``factory_slack_threads`` row with origin ``kickoff`` at this root
 and reads it back; any difference rolls the whole admission back
-(``thread_conflict``).
+(``thread_conflict``). The row also stores the sender's Slack user id as
+``requester_slack_user`` and the worker's ``placeholder_ts`` (the
+dispatcher's placeholder reply under the mention, None when it posted none)
+as ``card_ts``: the progress lane edits that placeholder into the run's card,
+or posts the card as the first reply when there is none. A replayed admission
+answers from the committed rows and writes nothing.
 
 A code host that cannot answer now raises `CodeHostUnavailable` (503), so the
 worker keeps the delivery pending. Logs carry codes and ids only, never the
@@ -96,6 +101,7 @@ from .forges.types import GITHUB, RepositoryRef, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory import lock_issue, work_item_for
 from .github_review_events import FeedbackUnavailable
+from .identity import connect
 from .identity.service import resolve_principal
 from .identity.slack import SlackEvidence
 from .models import (
@@ -103,6 +109,8 @@ from .models import (
     AgentChannel,
     ExecutionRequest,
     FactorySlackThread,
+    IdentityConnectToken,
+    IdentityNamespace,
     PersonalClaudeEnrollment,
 )
 from .personal_execution import OwnerContext
@@ -576,10 +584,42 @@ async def _decide(
         return path
     principal_id = await _principal(session, data, receiving.tenant_id, evidence)
     if isinstance(principal_id, FactorySlackKickoffOut):
+        origin = connect.personal_console_origin(settings)
+        if principal_id.reason == "no_link" and origin is not None:
+            token = await connect.issue_for_sender(
+                session,
+                tenant_id=receiving.tenant_id,
+                provider="slack",
+                channel_identity=data.channel_identity,
+                slack=evidence,
+            )
+            if token is not None:
+                row = await session.get(IdentityConnectToken, connect.hash_token(token))
+                assert row is not None
+                namespace = await session.get(IdentityNamespace, row.identity_namespace_id)
+                assert namespace is not None
+                user_id, workspace = row.provider_native_id, namespace.key
+                await session.commit()
+                await connect.capture_slack_profile(
+                    session,
+                    token=token,
+                    identity=data.channel_identity,
+                    user_id=user_id,
+                    workspace=workspace,
+                    settings=settings,
+                    client=client,
+                )
+                path = urlsplit(settings.oidc_redirect_uri).path
+                suffix = "/console/oidc/callback"
+                prefix = path[: -len(suffix)] if path.endswith(suffix) else ""
+                principal_id.connect_url = f"{origin}{prefix}/identity/connect/{token}"
+                await session.commit()
         return principal_id
     generation = await _enrolled_generation(session, receiving.tenant_id, principal_id)
     if generation is None:
-        return _refused("enrollment_inactive")
+        return FactorySlackKickoffOut(
+            outcome="enrollment_inactive", plan_url=connect.plan_url(settings)
+        )
     if await _thread_at_root(session, data) is not None:
         return _refused("thread_conflict")
     # End the read transaction: no snapshot or lock is held across provider reads.
@@ -714,7 +754,9 @@ async def _admit(
         await session.rollback()
         code = str(result.code)
         if code in _ENROLLMENT_CODES:
-            return _refused("enrollment_inactive")
+            return FactorySlackKickoffOut(
+                outcome="enrollment_inactive", plan_url=connect.plan_url(settings)
+            )
         return _refused("admission_refused", reason=code)
     request = result.request
     if request is None or request.id != request_id:
@@ -732,6 +774,10 @@ async def _admit(
             root_ts=data.root_ts,
             first_sequence=request.sequence,
             origin=_ORIGIN,
+            # The dispatcher's placeholder becomes the run's progress card, and
+            # the sender is who the card's notify replies mention (#5715).
+            card_ts=data.placeholder_ts,
+            requester_slack_user=data.author,
         )
         .on_conflict_do_nothing()
     )

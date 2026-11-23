@@ -153,14 +153,41 @@ OWNER_PRINCIPAL_LABEL = "curietech.ai/owner-principal"
 GENERATION_LABEL = "curietech.ai/enrollment-generation"
 DEFAULT_IDENTITY = "default"
 KICKOFF_ORIGIN = "kickoff"
-TERMINAL_POST = "terminal"
-PULL_REQUEST_POST = "pull_request"
+READY_POST = "ready"
+NEEDS_PERSON_POST = "needs_person"
 ROOT_POST = "root"
-ADMITTED = "admitted"
+# Outbox kinds the progress card replaced; a kickoff run no longer writes them.
+RETIRED_POST_KINDS = ("phase", "pull_request", "terminal", "card")
+CARD_HEADER_PREFIX = "Factory run: "
+CARD_FINISHED = "Factory run: finished"
+CARD_TERMINAL_HEADERS = (CARD_FINISHED, "Factory run: needs a person", "Factory run: stopped")
+CARD_STEPS = (
+    "Reading the issue",
+    "Investigating the ticket",
+    "Planning the change",
+    "Reviewing the plan",
+    "Writing the change",
+    "Reviewing the diff",
+    "Opening the pull request",
+    "Waiting for CI",
+)
+CARD_DONE_MARK = ":white_check_mark: "
+CARD_OTHER_MARKS = (
+    ":arrows_counterclockwise: ",
+    ":white_circle: ",
+    ":warning: ",
+    ":repeat: ",
+)
+CARD_CI_ENDINGS = ("CI passed.", "CI is still running.", "CI failed.")
+LOG_MARKERS = ("Phase ", "Outcome: admitted", "Run completed", "PR open:")
 ENROLLMENT_INACTIVE = "enrollment_inactive"
 TEST_MARK = "[test action]"
 RECEIPT_PATTERN = receipt_key("*")
 AUTH_TERMINAL_CAUSE = "authentication_required"
+# The rejected-plan DM (#5720). The origin is the button's host, not a live console.
+CONSOLE_ORIGIN = "https://console.example.com"
+GRANT_NOTICE_MARK = "Your Claude plan was rejected when Curie tried to use it"
+GRANT_NOTICE_BUTTON_SUFFIX = "/settings/claude-plan"
 MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 MANAGED_BY_VALUE = "curie-personal-slack-kickoff"
 RUN_ANNOTATION = "curie.dev/personal-slack-kickoff-run"
@@ -789,6 +816,37 @@ class SlackWeb:
             if error.code != "message_not_found":
                 raise
 
+    def direct_conversation(self, user_id: str) -> tuple[str, list[dict[str, Any]]]:
+        """The IM channel id with ``user_id`` and its history, or an empty channel."""
+
+        cursor = ""
+        channel_id = ""
+        for _page in range(10):
+            params = {"types": "im", "limit": "200"}
+            if cursor:
+                params["cursor"] = cursor
+            listed = self.call("conversations.list", params)
+            for channel in listed.get("channels") or []:
+                if isinstance(channel, dict) and channel.get("user") == user_id:
+                    channel_id = str(channel.get("id") or "")
+                    break
+            if channel_id:
+                break
+            meta = listed.get("response_metadata")
+            cursor = str(meta.get("next_cursor") or "") if isinstance(meta, dict) else ""
+            if not cursor:
+                return "", []
+        if not channel_id:
+            return "", []
+        history = self.call("conversations.history", {"channel": channel_id, "limit": "200"})
+        messages = [item for item in history.get("messages") or [] if isinstance(item, dict)]
+        return channel_id, messages
+
+    def direct_history(self, user_id: str) -> list[dict[str, Any]]:
+        """``conversations.history`` of the direct message with ``user_id``, or none."""
+
+        return self.direct_conversation(user_id)[1]
+
 
 def kickoff_text(curie_user: str, issue_url: str) -> str:
     """The declared driver's kickoff mention: the bot mention, the mark, the link."""
@@ -822,6 +880,114 @@ def message_text(message: Mapping[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _names_issue_key(text: str, key: str) -> bool:
+    """Whether ``key`` stands alone in ``text`` (``#7`` does not match ``#70``)."""
+
+    if not key:
+        return False
+    return re.search(rf"(?<!\S){re.escape(key)}(?!\S)", text) is not None
+
+
+def _button_blocks(message: Mapping[str, Any]) -> list[Any]:
+    blocks = message.get("blocks")
+    if isinstance(blocks, str):
+        try:
+            blocks = json.loads(blocks)
+        except json.JSONDecodeError:
+            return []
+    return blocks if isinstance(blocks, list) else []
+
+
+def grant_notice_button_url(message: Mapping[str, Any]) -> str | None:
+    """The one reconnect URL on this message's own button, or none.
+
+    A URL in the text or in another block does not count. Two button URLs do
+    not count as one.
+    """
+
+    urls: list[str] = []
+    for block in _button_blocks(message):
+        if not isinstance(block, dict) or block.get("type") != "actions":
+            continue
+        elements = block.get("elements")
+        if not isinstance(elements, list):
+            continue
+        for element in elements:
+            if not isinstance(element, dict) or element.get("type") != "button":
+                continue
+            url = element.get("url")
+            if isinstance(url, str):
+                urls.append(url)
+    if len(urls) != 1 or not urls[0].endswith(GRANT_NOTICE_BUTTON_SUFFIX):
+        return None
+    return urls[0]
+
+
+def grant_notice_facts(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    expected: Sequence[str],
+    counted: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Match each expected issue key to exactly one rejected-plan DM.
+
+    A notice that names none of ``expected`` or ``counted`` is ignored.
+    ``counted`` keys add to the count, so a late message for an earlier issue
+    is visible, but they do not have to be present for ``text_ok`` or
+    ``button_url_ok``. Each expected key must be the only key from either set
+    in its message, and that message's own button must carry the Claude plan
+    URL. Two URLs on one message do not cover a second key.
+    """
+
+    if not expected or any(not key for key in expected):
+        raise ValueError("expected issue keys are required")
+    if any(not key for key in counted) or any(key in expected for key in counted):
+        raise ValueError("counted issue keys must be nonempty and distinct from expected")
+    keys = [*expected, *counted]
+    buckets: dict[str, list[Mapping[str, Any]]] = {key: [] for key in keys}
+    for message in messages:
+        text = message_text(message)
+        if GRANT_NOTICE_MARK not in text:
+            continue
+        hits = [key for key in keys if _names_issue_key(text, key)]
+        if len(hits) != 1:
+            continue
+        buckets[hits[0]].append(message)
+    kept = "stopped. The work is kept."
+    text_ok = all(
+        len(buckets[key]) == 1 and kept in message_text(buckets[key][0]) for key in expected
+    )
+    button_url_ok = all(
+        len(buckets[key]) == 1 and grant_notice_button_url(buckets[key][0]) is not None
+        for key in expected
+    )
+    return {
+        "count": sum(len(rows) for rows in buckets.values()),
+        "text_ok": text_ok,
+        "button_url_ok": button_url_ok,
+    }
+
+
+def grant_dm_timestamps(
+    messages: Sequence[Mapping[str, Any]], *, author: str, issue_keys: Sequence[str]
+) -> list[str]:
+    """Timestamps of rejected-plan DMs ``author`` posted that name one issue key."""
+
+    found: list[str] = []
+    for message in messages:
+        if message.get("user") != author:
+            continue
+        text = message_text(message)
+        if GRANT_NOTICE_MARK not in text:
+            continue
+        if not any(_names_issue_key(text, key) for key in issue_keys):
+            continue
+        stamp = message.get("ts")
+        if isinstance(stamp, str):
+            found.append(stamp)
+    return found
+
+
 def reply_outcome(messages: Iterable[Mapping[str, Any]], *, author: str) -> str | None:
     """The outcome code the first reply by ``author`` names (``Outcome: <code>``)."""
 
@@ -852,6 +1018,19 @@ def thread_digests(messages: Iterable[Mapping[str, Any]], root_ts: str) -> list[
         ref_digest(str(message["ts"]))
         for message in messages
         if isinstance(message.get("ts"), str) and in_thread(message, root_ts)
+    )
+
+
+def thread_replies(messages: Iterable[Mapping[str, Any]], root_ts: str) -> list[Mapping[str, Any]]:
+    """The thread's messages after the root, oldest first."""
+
+    return sorted(
+        (
+            m
+            for m in messages
+            if isinstance(m.get("ts"), str) and m.get("ts") != root_ts and in_thread(m, root_ts)
+        ),
+        key=lambda m: str(m["ts"]),
     )
 
 
@@ -2444,7 +2623,10 @@ def route_url(
     path = urllib.parse.urlunsplit(("", "", parts.path, parts.query, ""))
     if parts.scheme == "http" and parts.netloc == origins.issuer_netloc:
         return f"http://127.0.0.1:{dex_local}{path}", {"Host": origins.issuer_netloc}
-    if parts.scheme == "http" and parts.netloc == origins.redirect_netloc:
+    if (
+        parts.scheme == urllib.parse.urlsplit(origins.redirect_uri).scheme
+        and parts.netloc == origins.redirect_netloc
+    ):
         return f"http://127.0.0.1:{api_local}{path}", {}
     if parts.scheme == "http" and parts.netloc == f"127.0.0.1:{api_local}":
         return url, {}
@@ -2623,11 +2805,11 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
         {"name": "CURIE_OIDC_SCOPES", "value": "openid email profile"},
         {"name": "CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "value": "false"},
     ]
-    personal = {"name": "FACTORY_MODEL_AUTH_MODE", "value": PERSONAL_MODE}
+    console_origin = {"name": "CURIE_CONSOLE_ORIGIN", "value": CONSOLE_ORIGIN}
     return {
         "api": {
             "image": image("curie-api"),
-            "extraEnv": [*oidc, personal],
+            "extraEnv": oidc,
             "githubAppId": plan.app_id,
             "githubAppExistingSecret": plan.app_secret,
             "githubRepoAllowlist": [plan.repo],
@@ -2636,7 +2818,7 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
             "image": image("curie-worker"),
             "maxConcurrency": 1,
             "workItemMaxTurns": plan.implementer_turns,
-            "extraEnv": [dict(personal)],
+            "extraEnv": [dict(console_origin)],
         },
         "dispatcher": {
             "deploy": True,
@@ -2679,6 +2861,8 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
         "factory": {
             "enabled": True,
             "intake": "poll",
+            # Rendered as FACTORY_MODEL_AUTH_MODE into both the api and the worker.
+            "modelAuthMode": PERSONAL_MODE,
             "codeHosts": [{**github, "credential": dict(credential)}],
             "trackers": [
                 {
@@ -2776,6 +2960,51 @@ def generated_secrets_ok(data: Mapping[str, str]) -> bool:
 
 CRITERIA = ("slack", "admission", "owner", "grant", "progress", "refusal", "budget", "cleanup")
 REHEARSAL_CRITERIA = ("slack", "refusal", "cleanup")
+CONNECT_REFUSAL_PUBLIC = "Not started. I sent you a private message about what to do next."
+
+
+def connect_plan_private_ack(logs: bytes, *, delivery_id: str, outcome: str) -> str | None:
+    pattern = re.compile(
+        rf"factory kickoff private post delivery={re.escape(delivery_id)} "
+        rf'outcome={re.escape(outcome)} message_ts=(\d+\.\d+)(?=["\s]|$)'
+    )
+    match = pattern.search(logs.decode("utf-8", "replace"))
+    return match[1] if match else None
+
+
+def connect_plan_public_reply(
+    messages: Sequence[Mapping[str, Any]], *, root_ts: str, author: str
+) -> bool:
+    replies = [m for m in messages if m.get("ts") != root_ts]
+    return (
+        len(replies) == 1
+        and replies[0].get("user") == author
+        and (replies[0].get("text") == CONNECT_REFUSAL_PUBLIC)
+    )
+
+
+def _judge_refusal_connect(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
+    observed = ledger.observations("refusal-connect")
+    checks: dict[str, bool] = {}
+    for code in ("sender_unverified", "enrollment_inactive"):
+        leg = observed.get(code)
+        leg = leg if isinstance(leg, dict) else {}
+        checks[f"{code}.private_post_accepted"] = bool(
+            isinstance(leg.get("message_ts"), str) and re.fullmatch(r"\d+\.\d+", leg["message_ts"])
+        )
+        checks[f"{code}.public_placeholder_only"] = leg.get("public_placeholder_only") is True
+        checks[f"{code}.nothing_started"] = leg.get("before") == leg.get("after") and (
+            isinstance(leg.get("before"), dict)
+            and all(leg["before"].get(key) == 0 for key in _COUNT_KEYS)
+        )
+    checks["one_sender_bound_live_token"] = observed.get("live_sender_tokens") == 1
+    checks["sender_display_name_captured"] = (
+        observed.get("live_sender_tokens_with_display_name") == 1
+    )
+    checks["unpaid"] = ledger.run_row()["live_starts"] == 0
+    cleanup, counts = _judge_cleanup(ledger)
+    checks.update({f"cleanup.{key}": value for key, value in cleanup.items()})
+    return checks, counts
 
 
 def _true(observed: Mapping[str, Any], key: str) -> bool:
@@ -2941,30 +3170,271 @@ def _judge_grant(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     return checks, {"runner_pods": len(pods), "sessions": len(sessions)}
 
 
+_SLACK_ID = re.compile(r"\b[UWB][A-Z0-9]{8,}\b")
+_TEAM_ID = re.compile(r"\bT[A-Z0-9]{8,}\b")
+_TS_VALUE = re.compile(r"\b\d{10}\.\d{6}\b")
+_ANY_URL = re.compile(r"https?://[^\s|>)\]\"']+")
+_REPO_PATH = re.compile(r"^(https?://[^/]+)/[^/]+/[^/]+/((?:pull|issues)/\d+)")
+_LINK_LABEL = re.compile(r"(<https?://[^|>\s]+)\|([^>]*)>")
+_BACKTICKED_REPO = re.compile(r"`[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+`")
+_DONE_TITLE = re.compile(r"(Opened pull request #\d+: ).*?(\. CI )")
+_DUMP_KEYS = ("ts", "thread_ts", "type", "subtype", "user", "text", "blocks")
+
+
+class _Anonymizer:
+    """Stable placeholders for the identifiers of one thread dump."""
+
+    def __init__(self, roles: Mapping[str, str]) -> None:
+        self.roles = dict(roles)
+        self.ids: dict[str, str] = {}
+        self.teams: dict[str, str] = {}
+        self.stamps: dict[str, str] = {}
+        self.urls: dict[str, str] = {}
+
+    def _pick(self, table: dict[str, str], key: str, label: str) -> str:
+        if key not in table:
+            table[key] = f"{label}_{len(table) + 1}"
+        return table[key]
+
+    def user(self, value: str) -> str:
+        return self.roles.get(value) or self._pick(self.ids, value, "USER")
+
+    def stamp(self, value: str) -> str:
+        return self._pick(self.stamps, value, "TS")
+
+    def url(self, value: str) -> str:
+        found = _REPO_PATH.match(value)
+        if found:
+            return f"{found.group(1)}/example-org/example-repo/{found.group(2)}"
+        return f"https://example.invalid/{self._pick(self.urls, value, 'link')}"
+
+    @staticmethod
+    def label(found: re.Match[str]) -> str:
+        number = re.match(r"#(\d+)\b", found.group(2))
+        return f"{found.group(1)}|{'#' + number.group(1) + ' TITLE' if number else 'LABEL'}>"
+
+    def text(self, value: str) -> str:
+        value = _ANY_URL.sub(lambda m: self.url(m.group(0)), value)
+        value = _LINK_LABEL.sub(self.label, value)
+        value = _BACKTICKED_REPO.sub("`example-org/example-repo`", value)
+        value = _DONE_TITLE.sub(r"\1TITLE\2", value)
+        value = _SLACK_ID.sub(lambda m: self.user(m.group(0)), value)
+        value = _TEAM_ID.sub(lambda m: self._pick(self.teams, m.group(0), "TEAM"), value)
+        return _TS_VALUE.sub(lambda m: self.stamp(m.group(0)), value)
+
+    def walk(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self.text(value)
+        if isinstance(value, dict):
+            return {key: self.walk(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.walk(item) for item in value]
+        return value
+
+
+def anonymize_thread(
+    messages: Iterable[Mapping[str, Any]], *, root_ts: str, roles: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """A ``conversations.replies`` dump safe to paste: user ids, ts values, team ids, URLs
+    and repository names become stable placeholders; block structure and text shape stay.
+
+    ``roles`` maps a user id to a fixed name, for example the sender and the bot. The
+    messages are ordered by ts and only the thread's own messages are kept. Pure.
+    """
+
+    kept = sorted(
+        (m for m in messages if in_thread(m, root_ts) and isinstance(m.get("ts"), str)),
+        key=lambda m: str(m["ts"]),
+    )
+    anon = _Anonymizer(roles)
+    for message in kept:
+        anon.stamp(str(message["ts"]))
+    dump: list[dict[str, Any]] = []
+    for message in kept:
+        item: dict[str, Any] = {k: message[k] for k in _DUMP_KEYS if k in message}
+        if "edited" in message:
+            item["edited"] = True
+        if isinstance(item.get("user"), str):
+            item["user"] = anon.user(item["user"])
+        for key in ("ts", "thread_ts"):
+            if isinstance(item.get(key), str):
+                item[key] = anon.stamp(item[key])
+        for key in ("text", "blocks"):
+            if key in item:
+                item[key] = anon.walk(item[key])
+        dump.append(item)
+    return dump
+
+
+_JSON_OBJECT = re.compile(r'\{\s*"[^"\n]*"\s*:')
+_PULL_NUMBER = re.compile(r"/pull/(\d+)(?:[/?#]|$)")
+_FINISHED_IN = re.compile(r"Finished in \d+m \d{2}s")
+
+
+# conversations.replies returns a bare URL in a message's text wrapped in
+# Slack link markup, `<https://...>`, though the post sent it bare (observed
+# on a live kickoff thread in a test Slack workspace, 2026-11-16).
+_SLACK_AUTOLINK = re.compile(r"<(https?://[^|>\s]+)>")
+
+
+def slack_plain(text: str) -> str:
+    """``text`` with Slack's autolink markup around bare URLs removed."""
+
+    return _SLACK_AUTOLINK.sub(r"\1", text)
+
+
+def ready_text(sender_user: str, pull_request_url: str) -> str:
+    return f"<@{sender_user}> your pull request is ready for review: {pull_request_url}"
+
+
+def needs_person_prefix(sender_user: str) -> str:
+    return f"<@{sender_user}> this run needs you: "
+
+
+def _blocks(message: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    blocks = message.get("blocks")
+    return [b for b in blocks if isinstance(b, dict)] if isinstance(blocks, list) else []
+
+
+def _block_text(block: Mapping[str, Any]) -> str:
+    text = block.get("text")
+    return str(text.get("text") or "") if isinstance(text, dict) else ""
+
+
+def card_header(message: Mapping[str, Any]) -> str | None:
+    """The plain text of the card's first block when it is a header block."""
+
+    blocks = _blocks(message)
+    if blocks and blocks[0].get("type") == "header":
+        return _block_text(blocks[0])
+    return None
+
+
+def _card_finished_ok(message: Mapping[str, Any], pull_request_url: str) -> bool:
+    """Decision 4's finished card: header, a done step per stage, done line, button, timing."""
+
+    blocks = _blocks(message)
+    found = _PULL_NUMBER.search(pull_request_url)
+    if card_header(message) != CARD_FINISHED or not found or len(blocks) < 4:
+        return False
+    number = found.group(1)
+    kinds = [str(block.get("type")) for block in blocks]
+    middle = kinds[1:-2]
+    if not (
+        middle
+        and all(kind == "section" for kind in middle)
+        and kinds[-2:] == ["actions", "context"]
+    ):
+        return False
+    lines = [line for block in blocks[1:-2] for line in _block_text(block).split("\n")]
+    if any(line.startswith(mark) for line in lines for mark in CARD_OTHER_MARKS):
+        return False
+    done = [line[len(CARD_DONE_MARK) :] for line in lines if line.startswith(CARD_DONE_MARK)]
+    steps_ok = len(done) == len(CARD_STEPS) and all(
+        line.lstrip("*").startswith(label) for line, label in zip(done, CARD_STEPS, strict=True)
+    )
+    summary = f":tada: *Done.* Opened pull request #{number}: "
+    summary_ok = any(line.startswith(summary) and line.endswith(CARD_CI_ENDINGS) for line in lines)
+    elements = blocks[-2].get("elements")
+    buttons = elements if isinstance(elements, list) else []
+    button_ok = (
+        len(buttons) == 1
+        and isinstance(buttons[0], dict)
+        and buttons[0].get("type") == "button"
+        and _block_text(buttons[0]) == f"View pull request #{number}"
+        and buttons[0].get("url") == pull_request_url
+    )
+    context = blocks[-1].get("elements")
+    timing_ok = (
+        isinstance(context, list)
+        and len(context) == 1
+        and isinstance(context[0], dict)
+        and _FINISHED_IN.fullmatch(str(context[0].get("text") or "")) is not None
+    )
+    return steps_ok and summary_ok and button_ok and timing_ok
+
+
 def _judge_progress(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
+    """The thread holds the card and one notify reply, and nothing else from the bot."""
+
     observed = ledger.observations("progress")
     posts = observed.get("posts")
-    posts = posts if isinstance(posts, list) else []
+    posts = [post for post in posts if isinstance(post, dict)] if isinstance(posts, list) else []
     inside = observed.get("thread_message_digests")
     inside = set(inside) if isinstance(inside, list) else set()
-    kinds = [str(post.get("kind")) for post in posts if isinstance(post, dict)]
+    replies = observed.get("thread_replies")
+    replies = [r for r in replies if isinstance(r, dict)] if isinstance(replies, list) else []
+    kinds = [str(post.get("kind")) for post in posts]
+    bot = observed.get("bot_user")
+    sender = observed.get("sender_user")
+    requester = observed.get("requester_slack_user")
+    card_ts = observed.get("card_ts")
+    url = observed.get("pull_request_url")
+    pull_request = observed.get("pull_request_exists") is True
+    url_text = url if isinstance(url, str) and url else ""
+    bot_replies = [r for r in replies if bot and r.get("user") == bot]
+    card = next((r for r in bot_replies if card_ts and r.get("ts") == card_ts), None)
+    notify = [r for r in bot_replies if r is not card]
+    mentions_sender = bool(sender) and requester == sender
+    if pull_request:
+        notify_ok = (
+            mentions_sender
+            and bool(url_text)
+            and len(notify) == 1
+            and slack_plain(str(notify[0].get("text") or "")) == ready_text(str(sender), url_text)
+        )
+        card_final = card is not None and bool(url_text) and _card_finished_ok(card, url_text)
+    else:
+        notify_ok = (
+            mentions_sender
+            and len(notify) == 1
+            and str(notify[0].get("text") or "").startswith(needs_person_prefix(str(sender)))
+        )
+        card_final = card is not None and card_header(card) in CARD_TERMINAL_HEADERS
+    texts = [message_text(r) for r in bot_replies]
     checks = {
         "thread_is_kickoff_root": isinstance(observed.get("thread"), dict)
         and observed.get("thread") == observed.get("expected_thread"),
-        "posts_owed": bool(posts),
-        "terminal_posted": TERMINAL_POST in kinds,
-        "every_post_delivered": bool(posts)
+        "card_is_placeholder": bool(card_ts) and card_ts == observed.get("placeholder_ts"),
+        "card_is_first_reply": bool(replies)
+        and bool(bot)
+        and bool(card_ts)
+        and replies[0].get("ts") == card_ts
+        and replies[0].get("user") == bot,
+        "successful_pull_request": pull_request and bool(url_text),
+        "card_finished": card_final,
+        "one_ready_reply": notify_ok,
+        "nothing_else_from_the_bot": card is not None and len(bot_replies) == 2,
+        "no_log_lines": bool(bot_replies)
+        and not any(
+            _JSON_OBJECT.search(text) or any(marker in text for marker in LOG_MARKERS)
+            for text in texts
+        ),
+        "every_post_delivered": isinstance(observed.get("posts"), list)
         and all(post.get("posted") is True and post.get("failed") is False for post in posts),
-        "every_post_in_origin_thread": bool(posts)
+        "every_post_in_origin_thread": isinstance(observed.get("posts"), list)
         and bool(inside)
         and all(post.get("ref_digest") in inside for post in posts),
         "no_generated_root": ROOT_POST not in kinds and observed.get("root_posts") == 0,
+        "no_retired_post_kinds": isinstance(observed.get("posts"), list)
+        and not any(kind in RETIRED_POST_KINDS for kind in kinds),
         "no_foreign_messages": observed.get("foreign_messages") == 0,
-        "admitted_reply_in_thread": observed.get("kickoff_reply_outcome") == ADMITTED,
-        "pull_request_posted_when_present": "pull_request_exists" in observed
-        and (observed.get("pull_request_exists") is not True or PULL_REQUEST_POST in kinds),
+        "ready_posted_when_pull_request": "pull_request_exists" in observed
+        and (
+            not pull_request
+            or any(
+                post.get("kind") == READY_POST
+                and post.get("posted") is True
+                and post.get("failed") is False
+                for post in posts
+            )
+        ),
     }
-    return checks, {"posts": len(posts), "thread_messages": len(inside)}
+    return checks, {
+        "posts": len(posts),
+        "thread_messages": len(inside),
+        "bot_replies": len(bot_replies),
+    }
 
 
 _COUNT_KEYS = ("work_items", "requests", "claims", "runner_pods", "sessions")
@@ -3439,6 +3909,10 @@ _INVENTORY = (
 )
 
 
+def closed_unmerged_pull(pull: Any) -> bool:
+    return isinstance(pull, dict) and pull.get("state") == "closed" and pull.get("merged") is False
+
+
 def _judge_cleanup(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     rows = ledger.cleanup_rows()
     steps = [row for row in rows if row["kind"].startswith("step:")]
@@ -3449,9 +3923,27 @@ def _judge_cleanup(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     }
     observed = ledger.observations("cleanup")
     scan = observed.get("token_scan")
+    pull = observed.get("pull_request_state")
+    pull_url = ledger.observations("progress").get("pull_request_url")
+    close_rechecked = (
+        closed_unmerged_pull(pull)
+        and bool(pull_url)
+        and pull.get("html_url") == pull_url
+        and inventory.get("forge_prs") == "absent"
+    )
     checks = {
         "steps_recorded": bool(steps),
-        "every_step_ok": bool(steps) and all(row["status"] == "ok" for row in steps),
+        "every_step_ok": bool(steps)
+        and all(
+            row["status"] == "ok"
+            or (
+                row["kind"] == "step:close-run-pulls"
+                and row["status"] == "failed"
+                and row["detail"] == "forge PATCH returned 422"
+                and close_rechecked
+            )
+            for row in steps
+        ),
         "inventory_complete": all(kind in inventory for kind in _INVENTORY),
         "everything_absent": bool(inventory)
         and all(status == "absent" for status in inventory.values()),
@@ -3463,7 +3955,27 @@ def _judge_cleanup(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     return checks, {"steps": len(steps), "inventory": len(inventory)}
 
 
+def _judge_grant_notice(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
+    """One DM for the first rejection, none at that generation, one more after replace."""
+
+    observed = ledger.observations("grant-notice")
+    first = observed.get("dm_count_after_first")
+    second = observed.get("dm_count_after_second")
+    third = observed.get("dm_count_after_replace")
+    checks = {
+        "first_posts_one": first == 1
+        and _true(observed, "first_text_ok")
+        and _true(observed, "first_button_ok"),
+        "same_generation_adds_none": second == first == 1 and _true(observed, "second_settled"),
+        "replace_adds_one": third == 2
+        and _true(observed, "replace_text_ok")
+        and _true(observed, "replace_button_ok"),
+    }
+    return checks, {"direct_messages": int(third) if isinstance(third, int) else 0}
+
+
 _JUDGES: dict[str, Callable[[Ledger], tuple[dict[str, bool], dict[str, int]]]] = {
+    "refusal-connect": _judge_refusal_connect,
     "slack": _judge_slack,
     "admission": _judge_admission,
     "owner": _judge_owner,
@@ -3472,17 +3984,23 @@ _JUDGES: dict[str, Callable[[Ledger], tuple[dict[str, bool], dict[str, int]]]] =
     "refusal": _judge_refusal,
     "budget": _judge_budget,
     "cleanup": _judge_cleanup,
+    "grant-notice": _judge_grant_notice,
 }
 
 
 def judge(ledger: Ledger, criterion: str) -> dict[str, Any]:
-    """A verdict from the ledger alone: booleans and counts, no identifiers."""
+    """A verdict from the ledger alone: booleans and counts, plus the anonymized thread dump."""
 
     rehearsal = ledger.live_kind() == "rehearse"
     if criterion == "all":
-        names = list(REHEARSAL_CRITERIA if rehearsal else CRITERIA)
+        names = (
+            ["refusal-connect"]
+            if ledger.live_kind() == "refusal-connect"
+            else list(REHEARSAL_CRITERIA if rehearsal else CRITERIA)
+        )
     elif criterion in _JUDGES:
-        if rehearsal and criterion not in REHEARSAL_CRITERIA:
+        # The rejected-plan leg is unpaid, so a rehearsal ledger may carry it.
+        if rehearsal and criterion not in REHEARSAL_CRITERIA and criterion != "grant-notice":
             raise Refusal("rehearsal_ledger", "--criterion")
         names = [criterion]
     else:
@@ -3499,6 +4017,14 @@ def judge(ledger: Ledger, criterion: str) -> dict[str, Any]:
     if "budget" in names:
         observations["budget.usage_exact"] = usage_exact(ledger)
         observations["budget.ceiling_enforcement_failures"] = ceiling_enforcement_failures(ledger)
+    if "progress" in names:
+        dump = ledger.observations("progress").get("thread_dump")
+        if isinstance(dump, list):
+            observations["progress.thread_dump"] = dump
+    if "refusal-connect" in names:
+        dump = ledger.observations("refusal-connect").get("thread_dump")
+        if isinstance(dump, list):
+            observations["refusal-connect.thread_dump"] = dump
     return {
         "criterion": criterion,
         "verdict": "pass" if checks and all(checks.values()) else "fail",

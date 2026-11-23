@@ -35,7 +35,7 @@ async def test_source_content_is_the_title_and_description_and_ignores_comments(
     # Neither a person's comment nor one carrying a factory marker moves it.
     target = ReplyTarget.on_issue(issue)
     harness.add_foreign_comment(target, harness.outsider, "curie-status:contract", "A comment.")
-    harness.add_foreign_comment(target, harness.writer, "curie-tracker-result:x", "Findings.")
+    harness.add_foreign_comment(target, harness.writer, "curie-example-marker:x", "Findings.")
     assert await harness.tracker.read_source_content(issue) == content
     assert harness.write_count() == writes
 

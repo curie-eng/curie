@@ -8521,6 +8521,25 @@ def test_factory_python_publication_with_only_a_rust_check_is_not_declared_for_p
     assert "In-sandbox verification was unavailable" not in body
 
 
+def assert_single_ask_line(body: str, before: str, mention: str = "curie") -> list[str]:
+    """The body has exactly one ask line, the current text, one blank line after ``before``.
+
+    ``before`` is everything that must precede it (body text, closing reference,
+    marker). Lines after it are platform annotations; returns them, none of
+    which may be an ask line, so the previous wording cannot survive.
+    """
+
+    lines = body.splitlines()
+    asks = [i for i, line in enumerate(lines) if line.startswith("Ask the factory:")]
+    assert len(asks) == 1, body
+    at = asks[0]
+    assert lines[at] == github_ask_line(mention)
+    assert "mention @" + mention + " on this pull request" not in body
+    assert lines[at - 1] == ""
+    assert "\n".join(lines[: at - 1]) == before.rstrip("\n")
+    return lines[at + 1 :]
+
+
 def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
@@ -8537,6 +8556,10 @@ def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
     assert created.json()["body"] == (
         f"{payload['body']}\n\nCloses #{number}\n\n{_factory_issue_marker(request_id)}\n\n"
         f"{github_ask_line('curie')}"
+    )
+    assert not assert_single_ask_line(
+        created.json()["body"],
+        f"{payload['body']}\n\nCloses #{number}\n\n{_factory_issue_marker(request_id)}",
     )
 
 
@@ -8800,8 +8823,74 @@ def test_github_publication_puts_the_ask_line_immediately_before_requester_prefe
     assert created.status_code == 201, created.text
     lines = created.json()["body"].splitlines()
     assert lines[-1] == ANNOTATION
-    assert lines[-3] == github_ask_line("curie")
+    # Locate the ask line by content; platform annotations may follow it.
+    ask_at = lines.index(github_ask_line("curie"))
+    trailing = assert_single_ask_line(
+        created.json()["body"],
+        "\n".join(lines[: ask_at - 1]),
+    )
+    assert trailing[-1] == ANNOTATION
+    assert all(
+        line == "" or line.startswith(("Requester preferences:", "Learned rules:"))
+        for line in trailing
+    )
+    assert all(line == "" or not line.startswith("Ask the factory:") for line in trailing)
     assert sum(line.startswith("Requester preferences:") for line in lines) == 1
+
+
+def test_github_publication_orders_ask_learned_rules_then_requester_preferences(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    import test_memory_rule_publication as learned
+    import test_requester_instruction_publication as requester
+
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="passed")
+    assert recorded.status_code == 201, recorded.text
+    learned._pin(request_id)
+    requester._pin(request_id)
+    first = learned._acknowledge(client, request_id, "applied", sha256=learned.DIGEST)
+    assert first.status_code == 200, first.text
+    second = requester._acknowledge(client, request_id, "applied", sha256=requester.DIGEST)
+    assert second.status_code == 200, second.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = created.json()["body"]
+    lines = body.splitlines()
+    ask = github_ask_line("curie")
+    assert lines.count(ask) == 1
+    assert [line for line in lines if line.startswith("Learned rules:")] == [learned.LINE]
+    assert [line for line in lines if line.startswith("Requester preferences:")] == [
+        requester.ANNOTATION
+    ]
+    ask_at = lines.index(ask)
+    assert lines[ask_at - 1] == ""
+    assert lines[ask_at + 1 :] == ["", learned.LINE, requester.ANNOTATION]
+    assert body.startswith(payload["body"])
+
+
+def test_factory_publication_replaces_the_previous_ask_wording(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id)
+    assert recorded.status_code == 201, recorded.text
+    payload["changed_paths"] = ["README.md"]
+    old = "Ask the factory: mention @curie on this pull request."
+    payload["body"] = f"{payload['body']}\n\n{old}"
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = created.json()["body"]
+    assert old not in body
+    number = payload["reply_conversation_id"].removeprefix("issue-")
+    text = payload["body"].removesuffix(f"\n\n{old}")
+    assert not assert_single_ask_line(
+        body, f"{text}\n\nCloses #{number}\n\n{_factory_issue_marker(request_id)}"
+    )
 
 
 def test_later_non_python_publication_keeps_prior_python_proof_pending(

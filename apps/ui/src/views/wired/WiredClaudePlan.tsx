@@ -16,6 +16,7 @@ import {
   type PersonalEnrollment,
 } from "../../api/client";
 import { checkEnrollmentToken, type EnrollmentTokenCheck } from "../../lib/enrollmentToken";
+import { LinkedAccounts } from "./LinkedAccounts";
 
 // The Claude plan section of Settings (#5716): self-service enrollment for the
 // person's own Claude subscription, the same owner API `curie cluster
@@ -68,7 +69,7 @@ export function describeEnrollmentError(e: unknown): string {
 }
 
 export function statusLine(e: PersonalEnrollment): string {
-  if (e.state === "active") return `Connected, generation ${e.generation ?? "unknown"}`;
+  if (e.state === "active") return "Connected";
   if (e.state === "inactive") return "Disconnected";
   return "Not connected";
 }
@@ -206,6 +207,11 @@ function ClaudePlanBody() {
       <div data-testid="claude-plan-status" data-state={current.state} style={{ fontSize: 14, color: C.text }}>
         {statusLine(current)}
       </div>
+      {current.state === "active" && current.generation != null ? (
+        <div data-testid="claude-plan-generation" style={{ ...muted, marginTop: 2 }}>
+          Generation {current.generation}
+        </div>
+      ) : null}
       {teardown ? (
         <div data-testid="claude-plan-teardown" style={{ ...muted, marginTop: 4 }}>
           {teardown}
@@ -306,7 +312,7 @@ export function WiredClaudePlan() {
   const principal = session === null || session.kind === "principal";
   return (
     <div data-testid="claude-plan-section" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {principal ? <ClaudePlanBody /> : <SignInPrompt />}
+      {principal ? <><ClaudePlanBody /><LinkedAccounts /></> : <SignInPrompt />}
     </div>
   );
 }

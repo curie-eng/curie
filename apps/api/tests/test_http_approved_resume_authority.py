@@ -8,20 +8,17 @@ synthetic TLS directory, PostgreSQL and Valkey; synthetic inputs only.
 
 from __future__ import annotations
 
-import uuid
+import ssl
 from types import SimpleNamespace
-from typing import Any
 
-import pytest
-from curie_api import agent_role_policy
+import redis
+from curie_api.identity.http_transport import HttpIdentityClient
 from curie_internal import identity_approval as wire
-from principal_adoption_support import ISSUER
-from role_policy_support import change, run
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.api.tests.test_http_approval_answers import (
     OTHER_APPROVER,
     answer,
+    approver_role,
     resolve,
     restrict_route,
 )
@@ -30,13 +27,14 @@ from apps.api.tests.test_http_approval_answers import routed_case as routed_case
 from apps.api.tests.test_http_approval_creation import creation_case as creation_case
 from apps.api.tests.test_http_approval_grants import (
     assert_grant,
-    grant_for,
+    grant_request,
     post_grant,
     resume_check,
     resume_token,
     ring,
     stored,
 )
+from apps.api.tests.test_http_invocation_membership import GROUP, SENDER
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
 from apps.api.tests.test_http_turn_authority import assert_response, post_check
 
@@ -51,92 +49,72 @@ def approved(case: SimpleNamespace) -> tuple[str, str]:
     return resume_token(case, saved)
 
 
-def narrow_approver(case: SimpleNamespace) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8: only the approver role's stored filter changes."""
-
-    async def narrow(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-8."""
-        async with factory() as session, session.begin():
-            result = await agent_role_policy.apply_role_change(session, change=change(
-                uuid.UUID(case.scope["tenant"]), uuid.UUID(case.scope["agent"]),
-                version=case.scope["role_version"], target="approver",
-                filter={"entries": [
-                    {"kind": "issuer_group",
-                     "group": {"issuer": ISSUER, "id": "SyntheticApproverOnlyGroup"}},
-                ]},
-            ))
-            case.scope["role_version"] = result.version
-
-    run(narrow)
-
-
 def purposes(case: SimpleNamespace, before: int) -> list[str]:
     """@spec HTTP-APPROVAL-CONTINUITY-8: lookups made since ``before``, by provider purpose."""
     return sorted(item["purpose"] for item in case.provider.requests[before:])
 
 
-@pytest.mark.parametrize("stage", ["prepare", "claim_or_resume", "start", "steer"])
-def test_approved_resume_continues_on_fresh_invoker_and_approver_authority(
-    answer_case: SimpleNamespace, stage: str,
+def test_approved_resume_and_grant_distinguish_current_role_route_and_provider(
+    routed_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
 ) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8 HTTP-APPROVAL-CONTINUITY-12: both subjects, each time."""
-    case = answer_case
-    token, payload = approved(case)
-    before = len(case.provider.requests)
-    request = resume_check(case, token, payload, stage=stage)
-    assert_response(
-        post_check(case.client, request), request, decision="continue",
-        reason="current_authority",
-    )
-    assert purposes(case, before) == ["approval", "invocation"]
-
-
-def test_exact_grant_continues_only_with_fresh_approver_authority(
-    answer_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: the exact submitted snapshot reaches continue."""
-    case = answer_case
-    token, payload = approved(case)
-    body: dict[str, Any] = {
-        "schema_version": 1, "check": resume_check(case, token, payload, stage="prepare"),
-        "grant": grant_for(case),
-    }
-    assert_grant(
-        post_grant(case.client, body), body, decision="continue", reason="current_authority",
-    )
-
-
-def test_approver_removed_after_resolution_refuses_the_resume_and_the_grant(
-    answer_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8: invoker authority never stands in for the approver."""
-    case = answer_case
-    token, payload = approved(case)
-    narrow_approver(case)
-    request = resume_check(case, token, payload, stage="claim_or_resume")
-    assert_response(
-        post_check(case.client, request), request, decision="refuse",
-        reason="caller_not_allowed",
-    )
-    body: dict[str, Any] = {
-        "schema_version": 1, "check": resume_check(case, token, payload, stage="prepare"),
-        "grant": grant_for(case),
-    }
-    assert_grant(
-        post_grant(case.client, body), body, decision="refuse", reason="caller_not_allowed",
-    )
-
-
-
-def test_route_exclusion_after_resolution_refuses_the_resume_definitively(
-    routed_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8/12: an explicit route denial is refuse, not unavailable."""
     case = routed_case
     token, payload = approved(case)
-    restrict_route(case, [OTHER_APPROVER])
-    request = resume_check(case, token, payload, stage="claim_or_resume")
-    assert_response(
-        post_check(case.client, request), request, decision="refuse",
-        reason="caller_not_allowed",
-    )
+    stream = valkey.xrange(runs_stream)
+    row = stored(case.approval_id)
+    grant = grant_request(case, token, payload)
+    state = case.client.app.state
+    trusted = state.http_identity_client
+
+    for stage in ("prepare", "claim_or_resume", "start", "steer"):
+        before = len(case.provider.requests)
+        check = resume_check(case, token, payload, stage=stage)
+        assert_response(post_check(case.client, check), check,
+                        decision="continue", reason="current_authority")
+        assert purposes(case, before) == ["approval", "invocation"]
+
+    for cause in ("route", "role", "provider"):
+        if cause == "route":
+            restrict_route(case, [OTHER_APPROVER])
+        elif cause == "role":
+            approver_role(case, group="SyntheticApproverOnlyGroup")
+        else:
+            state.http_identity_client = HttpIdentityClient(
+                tls_context=ssl.create_default_context(),
+            )
+        decision, reason = ("unavailable", "authority_unavailable") if cause == "provider" else (
+            "refuse", "caller_not_allowed",
+        )
+        check = resume_check(case, token, payload)
+        assert_response(post_check(case.client, check), check, decision=decision, reason=reason)
+        assert_grant(post_grant(case.client, grant), grant, decision=decision, reason=reason)
+        assert stored(case.approval_id) == row
+        assert valkey.xrange(runs_stream) == stream
+
+        if cause == "route":
+            restrict_route(case, [SENDER])
+        elif cause == "role":
+            approver_role(case, group=GROUP)
+        else:
+            state.http_identity_client = trusted
+        assert_grant(post_grant(case.client, grant), grant,
+                     decision="continue", reason="current_authority")
+
+    committed = []
+
+    def revoke_during_lookup() -> None:
+        if not committed:
+            approver_role(case, group="SyntheticApproverOnlyGroup")
+            committed.append(case.scope["role_version"])
+
+    case.provider.during_lookup = revoke_during_lookup
+    try:
+        check = resume_check(case, token, payload)
+        assert_response(post_check(case.client, check), check,
+                        decision="unavailable", reason="authority_unavailable")
+    finally:
+        case.provider.during_lookup = None
+    assert len(committed) == 1
+    assert stored(case.approval_id) == row
+    assert valkey.xrange(runs_stream) == stream
+    assert_grant(post_grant(case.client, grant), grant,
+                 decision="refuse", reason="caller_not_allowed")

@@ -9,12 +9,13 @@ from typing import Any
 
 import httpx
 from curie_telemetry.metrics import record_metric
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .code_host_trust import code_host_verify
 from .config import Settings
+from .db import SCHEMA
 from .factory_comment_text import redact_factory_comment
 from .factory_notices import body_digest, code_span, lease_available
 from .forges.errors import ForgeError
@@ -24,6 +25,7 @@ from .forges.registry import forges_registry
 from .forges.types import Credential, ReplyTarget, TrackerIssueRef
 from .github_factory_events import FactoryNotice
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
+from .identity.connect import plan_url
 from .models import FactoryIntakeNotice
 
 METRIC = "curie.factory.intake.notice.oldest_owed_age_seconds"
@@ -43,36 +45,12 @@ def observe_label(notice: FactoryNotice, event: dict[str, Any], *, app_id: str) 
         raw_login = actor.get("login") if isinstance(actor, dict) else None
         login = raw_login if isinstance(raw_login, str) else ""
         sender_id = 0
-    via = event.get("performed_via_github_app")
-    via_id = via.get("id") if isinstance(via, dict) else None
     return replace(
         notice,
         sender_id=sender_id,
         sender_login=login,
         label_event_id=identity,
         actor_refusal=reason,
-        own_app_label=(reason == "actor_bot" and type(via_id) is int and str(via_id) == app_id),
-    )
-
-
-async def delegated_output_before_label(
-    session: AsyncSession, issue: TrackerIssueRef, notice: FactoryNotice
-) -> bool:
-    """Whether a Bot label event is the factory's own label on its delegated output (#5588).
-
-    True only for a label event GitHub attributes to this installation's own
-    App, on an issue the triage handoff recorded as its delegated output, for
-    the label that handoff applies, and not earlier than the recorded
-    association (ADR 0279 row 7). Every other Bot label, a different App's
-    on the same output included, keeps its ``actor_bot`` notice.
-    """
-
-    if not notice.own_app_label or not notice.label:
-        return False
-    from .factory_triage_handoff import delegated_output_label
-
-    return await delegated_output_label(
-        session, issue, label=notice.label, event_at=notice.label_event_at
     )
 
 
@@ -125,6 +103,43 @@ async def record_notice(
         )
         .on_conflict_do_nothing(constraint="factory_intake_notices_event_key")
     )
+    url = plan_url(settings)
+    if reason in {"personal_owner_required", "enrollment_inactive"} and url is not None:
+        await session.execute(
+            text(f"""
+                INSERT INTO {SCHEMA}.factory_slack_refusal_posts
+                       (notice_id, channel_identity, channel, payload)
+                SELECT n.id, b.adapters[1], a.factory_slack_channel,
+                       jsonb_build_object(
+                           'repository_path', n.repository_path,
+                           'issue_id', n.tracker_issue_id,
+                           'issue_url', NULLIF(split_part(n.issue_url, '#', 1), ''),
+                           'reason', n.reason, 'actor_login', n.actor_login,
+                           'plan_url', CAST(:plan_url AS text))
+                  FROM {SCHEMA}.factory_intake_notices n
+                  JOIN {SCHEMA}.agents a ON a.id = n.agent_id
+                  CROSS JOIN LATERAL (
+                      SELECT array_agg(CAST(c.adapter AS text)) AS adapters
+                        FROM {SCHEMA}.agent_channels c
+                       WHERE c.agent_id = a.id AND c.kind = 'slack'
+                         AND c.address = a.factory_slack_channel AND c.adapter IS NOT NULL
+                  ) b
+                 WHERE n.tracker_host = :host AND n.tracker_scope_id = :scope
+                   AND n.tracker_issue_id = :issue AND n.label_event_id = :event
+                   AND a.factory_slack_channel IS NOT NULL
+                   AND a.factory_slack_since IS NOT NULL
+                   AND n.observed_at >= a.factory_slack_since
+                   AND cardinality(b.adapters) = 1
+                ON CONFLICT (notice_id) DO NOTHING
+            """),
+            {
+                "host": issue.host,
+                "scope": issue.scope_id,
+                "issue": issue.issue_id,
+                "event": notice.label_event_id,
+                "plan_url": url,
+            },
+        )
 
 
 def marker_for(row: FactoryIntakeNotice) -> str:
@@ -133,7 +148,7 @@ def marker_for(row: FactoryIntakeNotice) -> str:
     return f"curie-factory-intake-{row.label_event_id}-{digest} reason={row.reason}"
 
 
-def notice_body(row: FactoryIntakeNotice) -> str:
+def notice_body(row: FactoryIntakeNotice, *, settings: Settings) -> str:
     repo = code_span(" ".join(row.repository_path.splitlines()))
     login = code_span(" ".join((row.actor_login or "This person").splitlines()))
     label = code_span(" ".join(row.label.splitlines()))
@@ -186,6 +201,9 @@ def notice_body(row: FactoryIntakeNotice) -> str:
         body += "\n\nNothing was queued and nothing was spent."
     if row.publication_url:
         body += f"\n\n1. <{row.publication_url}>"
+    url = plan_url(settings)
+    if row.reason in {"personal_owner_required", "enrollment_inactive"} and url is not None:
+        body += f"\n\nConnect your Claude plan: {url}"
     return redact_factory_comment(body)
 
 
@@ -287,7 +305,7 @@ async def sync_intake_notices(
                     )
                 ),
                 marker_for(row),
-                notice_body(row),
+                notice_body(row, settings=settings),
             )
             comment_id = int(written.comment.id)
             writes += int(written.written)

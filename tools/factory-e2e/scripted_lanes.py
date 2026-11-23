@@ -2,10 +2,9 @@
 
 The scripted model keys a lane by the scrubbed first user message. A factory
 run's first user message is the platform's sender frame around the issue URL,
-and the URL scrubs to ``<v>``, so a triage session and an implementation
-session on the same install produce the same lane key. Left alone they
-collapse into one lane, and the first one to ask would take the other's
-answers.
+and the URL scrubs to ``<v>``, so two agents' sessions on the same install
+produce the same lane key. Left alone they collapse into one lane, and the
+first one to ask would take the other's answers.
 
 ``LaneRouter`` keeps one exchange list per ``(agent, issue)`` lane. The agent
 is recognised by its bundle's own ``systemPrompt`` (read from the bundle
@@ -17,7 +16,7 @@ was.
 
 A served answer may carry ``{{observed_revision}}``. It is replaced by the
 last full commit id the request's latest tool result printed, so a scripted
-triage run reports the revision its own reproduction command observed.
+run reports the revision its own command observed.
 
 ``SlackRecorder`` answers the Slack Web API methods the channel gateway calls
 and records every post, so a scenario can count the lines a thread received.
@@ -31,6 +30,7 @@ import copy
 import json
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,7 +40,6 @@ from urllib.parse import parse_qs
 
 REVISION_PLACEHOLDER = "{{observed_revision}}"
 IMPLEMENTATION = "implementation"
-TRIAGE = "triage"
 _ISSUE = re.compile(r"/issues/(\d+)\b")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
@@ -142,13 +141,29 @@ class Lane:
 class LaneRouter:
     """Route each model request to its agent's lane on its issue."""
 
-    def __init__(self, agent_markers: dict[str, str], default_agent: str = IMPLEMENTATION) -> None:
-        if not agent_markers or default_agent in agent_markers:
+    def __init__(
+        self,
+        agent_markers: dict[str, str],
+        default_agent: str = IMPLEMENTATION,
+        *,
+        issue_of: Callable[[dict[str, Any]], int | None] = request_issue,
+        normalize_key: Callable[[str], str] | None = None,
+    ) -> None:
+        # No marker at all is a router of one agent: every request is the default
+        # agent's, and the lanes tell its issues apart.
+        if default_agent in agent_markers:
             raise LaneError("name the non-default agents by their bundle system prompts")
         self.agent_markers = dict(agent_markers)
         self.default_agent = default_agent
+        self.issue_of = issue_of
+        # Applied to both lane keys before they are compared, for run-specific text
+        # the model server's scrub keeps (an address outside a URL, a branch id).
+        self.normalize_key = normalize_key
         self.lanes: dict[tuple[str, int], Lane] = {}
         self.unrouted: list[dict[str, Any]] = []
+        # One row per answered request: the lane, the answer's ordinal and the
+        # request's raw lane key, so a capture of that request can be tied to it.
+        self.served_log: list[dict[str, Any]] = []
         self.hooks: list[Callable[[Lane, int], None]] = []
         # Called for an (agent, issue) with no lane yet, for issues the platform
         # creates during the run; a resolver returns the lane or None.
@@ -171,16 +186,20 @@ class LaneRouter:
             raise LaneError("a request carries more than one agent's system prompt")
         return matches[0] if matches else self.default_agent
 
-    def install(self, script: Any, model_module: Any) -> None:
-        """Answer ``script``'s requests through the lanes; its own transcript is the fallback."""
+    def install(self, script: Any, model_module: Any, *, fallback: bool = True) -> None:
+        """Answer ``script``'s requests through the lanes.
 
-        self._fallback = script._match
+        Its own transcript is the fallback unless ``fallback`` is False, in which
+        case a request no lane claims is recorded in ``unrouted`` and refused.
+        """
+
+        self._fallback = script._match if fallback else None
         self._request_key = model_module.request_key
         self._parse = model_module._safe_json
         script._match = self.match
 
     def lane_for(self, request: dict[str, Any]) -> Lane | None:
-        issue = request_issue(request)
+        issue = self.issue_of(request)
         if issue is None:
             return None
         agent = self.agent_of(request)
@@ -199,6 +218,10 @@ class LaneRouter:
         lane = self.lane_for(request) if method == "POST" and path == "/v1/messages" else None
         if lane is None:
             if self._fallback is None:
+                if method == "POST" and path == "/v1/messages":
+                    self.unrouted.append(
+                        {"agent": self.agent_of(request), "issue": self.issue_of(request)}
+                    )
                 return None
             if self.agent_of(request) != self.default_agent:
                 # A non-default agent never borrows the default transcript.
@@ -206,8 +229,14 @@ class LaneRouter:
                 return None
             return self._fallback(method, path, body)
         wanted = self._request_key(request)
+        raw_key = wanted[0] if wanted is not None else None
+        normalize = self.normalize_key or (lambda key: key)
+        if wanted is not None:
+            wanted = (normalize(wanted[0]), wanted[1])
         for index, exchange in enumerate(lane.exchanges):
-            if index in lane.used or (exchange["lane_key"], exchange["ordinal"]) != wanted:
+            if index in lane.used:
+                continue
+            if (normalize(exchange["lane_key"]), exchange["ordinal"]) != wanted:
                 continue
             answer = copy.deepcopy(exchange)
             encoded = json.dumps(answer["message"])
@@ -220,6 +249,9 @@ class LaneRouter:
                 lane.revisions.append(revision)
             lane.used.add(index)
             lane.served.append(exchange["ordinal"])
+            self.served_log.append(
+                {"lane": lane.name, "ordinal": exchange["ordinal"], "key": raw_key}
+            )
             for hook in self.hooks:
                 hook(lane, exchange["ordinal"])
             return dict(answer)
@@ -247,6 +279,9 @@ class SlackPost:
     text: str | None
     thread_ts: str | None
     ts: str
+    # time.monotonic() when the recorder received the call, so a scenario judges
+    # a deadline by when Slack was told, not by when the scenario looked.
+    received_at: float = 0.0
 
 
 class SlackRecorder:
@@ -317,6 +352,7 @@ class SlackRecorder:
                     "text": body.get("text"),
                     "thread_ts": body.get("thread_ts"),
                     "ts": body.get("ts") if method == "chat.update" else ts,
+                    "received_at": time.monotonic(),
                 }
             )
         payload: dict[str, Any] = {"ok": True}
@@ -347,6 +383,7 @@ class SlackRecorder:
                 call["text"],
                 call["thread_ts"],
                 str(call["ts"]),
+                float(call["received_at"]),
             )
             for call in calls
             if call["method"] in {"chat.postMessage", "chat.update"}

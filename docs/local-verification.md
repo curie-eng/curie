@@ -245,6 +245,40 @@ or older worktree does not automatically acquire newer instructions; read this
 section from the updated base when resuming. Do not edit a live claimed Bonus
 Drain task or launch a second copy to apply the guidance.
 
+### Local OIDC fixture
+
+`tools/oidc-e2e/compose.local-oidc.yaml` is a ready made private override for
+an isolated stack that signs a person in through a real Dex, for checks that
+need a principal console session rather than an operator one. It keeps every
+service, the worker included, rebinds the worker, the API and the gateway to
+this project's ports and runner network, publishes the API, Postgres, Valkey,
+the object store and Dex on `127.0.0.1` only, publishes nothing for the
+full profile services, and tags every Curie image with
+`CURIE_LOCAL_IMAGE_TAG`. Dex runs in the API container's network namespace, so
+one issuer URL works from the host and from the API. It needs Compose 2.24.4
+or later. Two modes of `curie dev oidc-e2e` drive it:
+
+1. `local-env --out FILE [--project NAME]` writes a mode 0600 env file with the
+   project (default `curie-local-oidc`), every isolation variable above on free
+   loopback ports, `COMPOSE_FILE`, a Dex client secret and two channel gateway bearer tokens generated for this
+   run (the gateway listens on the host network, so the public development
+   tokens must not reach it; the overlay requires these), and the Dex config, whose one user is `approver@example.com`.
+2. `local-session --env FILE --email approver@example.com --out FILE` signs
+   that user in through Dex, writes only the session cookie value to a mode
+   0600 file, and prints only `kind`, `principal_id` and `tenant_id`. It exits
+   non zero, printing no secret, when the login fails or the session is not a
+   principal session.
+
+```bash
+curie dev oidc-e2e -- local-env --out "$ENV_FILE"
+set -a; . "$ENV_FILE"; set +a
+curie local up --build -f "$PWD/compose.dev.yaml" -f "$PWD/tools/oidc-e2e/compose.local-oidc.yaml"
+curie dev oidc-e2e -- local-session --env "$ENV_FILE" --email approver@example.com --out "$SESSION_FILE"
+curie local down -f "$PWD/compose.dev.yaml" -f "$PWD/tools/oidc-e2e/compose.local-oidc.yaml"
+```
+
+Keep both files outside the checkout and delete them after teardown.
+
 
 ## The dev stack: compose.dev.yaml
 

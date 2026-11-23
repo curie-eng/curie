@@ -51,13 +51,14 @@ from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_internal.provider_scope import ProviderScope
 from curie_internal.turn_queue import to_stream_fields
 from curie_runner import RunTracer, SideEffectClassifier
+from curie_runner.completion_contract import bind_completion_contract
 from curie_runner.fake import FakeModelSession
 from curie_runner.issue_read import resolve_issue_read
+from curie_runner.memory_rules_context import MemoryRulesContextGate
 from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
 from curie_runner.requester_context import RequesterContextGate
 from curie_runner.server import create_app as create_runner_app
 from curie_runner.session import SessionRunner
-from curie_runner.tracker_result import bind_completion_contract
 from curie_runner.verification import preflight_workspace_verification
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import FactoryWake
@@ -230,6 +231,7 @@ def _real_runner_app(
 
     session = FakeModelSession(script_factory=script)
     gate = RequesterContextGate()
+    rules_gate = MemoryRulesContextGate()
     booting = asyncio.Lock()
     app = create_runner_app(
         SessionRunner(
@@ -243,6 +245,7 @@ def _real_runner_app(
             provider_scope=provider_scope,
         ),
         requester_context=gate,
+        memory_rules_context=rules_gate,
     )
 
     @web.middleware
@@ -253,7 +256,8 @@ def _real_runner_app(
                 # The runner process boots after its claim: it reports its
                 # verification preflight when asked to, then reads its
                 # completion contract through the issue read capability in its
-                # environment and serves the requester context of that execution.
+                # environment and serves the requester context and the learned
+                # rules of that execution.
                 env = boot_env() or {}
                 if preflight is not None:
                     workspace, bundle = preflight
@@ -262,6 +266,7 @@ def _real_runner_app(
                     )
                 contract = await bind_completion_contract(resolve_issue_read(env))
                 gate.bind(contract.contract.execution)
+                rules_gate.bind(contract.contract.execution)
         response: web.StreamResponse = await handler(request)
         return response
 
@@ -488,9 +493,14 @@ class FactoryRetryCase(StartWaitCase):
         return int(found["automatic_retries_used"])
 
     async def make_due(self, request_id: uuid.UUID) -> None:
+        # A guarded row (migration 0182) is due by its guarded time and keeps
+        # its waiting deadline where an older dispatcher's claim reads.
         await self.execute(
-            "UPDATE curie.execution_requests "
-            "SET dispatch_not_before = clock_timestamp() - interval '1 second' "
+            "UPDATE curie.execution_requests SET "
+            "guarded_dispatch_not_before = CASE WHEN guarded_dispatch_not_before IS NULL "
+            "THEN NULL ELSE clock_timestamp() - interval '1 second' END, "
+            "dispatch_not_before = CASE WHEN guarded_dispatch_not_before IS NULL "
+            "THEN clock_timestamp() - interval '1 second' ELSE wait_deadline END "
             "WHERE id = :id AND status = 'waiting'",
             {"id": request_id},
             guarded=True,

@@ -771,23 +771,29 @@ print(json.dumps(graph))
         // the 0156 answer gate. The factory Slack progress loop reads the tables
         // 0157 introduces, and the code host link route writes the github_host
         // kind 0158 allows. Owner tuple reads require 0159, personal custody
-        // reads and enrollment fences require 0160, agent version reads select
-        // the 0162 result policy columns, factory CI observations require the
+        // reads and enrollment fences require 0160, factory CI observations require the
         // 0163 table, cached facts and request delivery require the 0164
         // tables. Owner coding profiles and tenant policies require 0165,
         // which stays below this floor. Slack kickoff thread origin reads
-        // require 0166, which stays below this floor. Execution request reads
-        // select the 0167 completion contract columns. Intake notices require
+        // require 0166, which stays below this floor. Intake notices require
         // 0168, which stays below this floor. Requester selection columns
         // require 0169, which stays below this floor. Refusal posts require 0170,
-        // which stays below this floor. Triage handoff storage requires 0171, which
-        // stays below this floor. Factory retry allowance columns require 0172,
+        // which stays below this floor. Factory retry allowance columns require 0172,
         // which stays below this floor. Factory resource gate columns require 0174,
         // which stays below this floor. Publication recovery requests require 0175,
         // which stays below this floor. Operator retry records require 0176.
-        // Enrollment inactive intake notices require 0177.
-        assert_eq!(candidate.schema_min, "0177");
-        assert_eq!(candidate.schema_head, "0177");
+        // Enrollment inactive intake notices require 0177, which stays below this
+        // floor. The factory Slack progress card requires 0178.
+        // GitHub account link states and display labels require 0179.
+        // Slack account display labels require 0180.
+        // Guarded automatic retry dispatch times require 0182.
+        // Grant notices require 0183.
+        // Factory question rounds require 0184.
+        // Learned memory rules require 0185.
+        // The plain feedback cap requires 0186.
+        // The triage schema removal, a contract revision, requires 0188, the floor.
+        assert_eq!(candidate.schema_min, "0188");
+        assert_eq!(candidate.schema_head, "0188");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -851,7 +857,16 @@ print(json.dumps(graph))
         assert!(!live_in_window("0174", &current));
         assert!(!live_in_window("0175", &current));
         assert!(!live_in_window("0176", &current));
-        assert!(live_in_window("0177", &current));
+        assert!(!live_in_window("0177", &current));
+        assert!(!live_in_window("0178", &current));
+        assert!(!live_in_window("0179", &current));
+        assert!(!live_in_window("0180", &current));
+        assert!(!live_in_window("0182", &current));
+        assert!(!live_in_window("0183", &current));
+        assert!(!live_in_window("0184", &current));
+        assert!(!live_in_window("0185", &current));
+        assert!(!live_in_window("0186", &current));
+        assert!(live_in_window("0188", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

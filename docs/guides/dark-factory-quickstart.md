@@ -36,9 +36,15 @@ merge requests. See the [capability status](../capabilities.md#workspaces-and-in
 - An Anthropic or OpenRouter model credential with available credit.
 - A small code repository with an initial commit and a passing baseline.
 
-For GitHub Free, use a public trial repository with no sensitive content.
-Private trials need a plan that supports private repository rulesets; otherwise
-GitHub blocks the factory's final CI check.
+A public trial repository should hold no sensitive content. A private
+repository on GitHub Free also works when a successful repository read returns
+`private: true`. The factory treats GitHub's plan-upgrade
+refusal of the branch-rules read on that private repository as no rules from
+that API, then reads classic branch protection and the checks on the head. If
+that read fails, or `private` is not boolean true, the request stays unverified
+and the comment quotes GitHub. A
+different 403, including that message on a public repository, still stops the
+CI check, and the comment quotes GitHub's message.
 
 Use interactive Bash. Keep the same terminal and trial variables through
 cleanup. Each path uses polling, so no webhook or tunnel is needed. See
@@ -113,6 +119,15 @@ user with Developer access or higher in a file outside the repository. It needs
 ## Start the factory
 
 Run **one** of these paths with the repository and cluster variables above.
+Whether quickstart creates a kind cluster or installs into an existing one, it
+installs with `cluster up --no-expose`, so the Console and Langfuse stay
+`ClusterIP` and nothing is published on the host. A release that already
+matches the target is not reinstalled and keeps the exposure it recorded; run
+`curie cluster up --context "$CURIE_CONTEXT" --no-expose` on it to change
+that. When you want to open the Console and Langfuse, run
+`curie cluster access --context "$CURIE_CONTEXT"`. It forwards them to
+`localhost` (loopback only), prints the URLs, and stops them when you press
+Ctrl-C.
 
 ### GitHub issues and GitHub PRs
 

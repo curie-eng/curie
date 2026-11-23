@@ -16,6 +16,10 @@ is listed or admitted there (#4910).
 Cursors live in ``curie.factory_poll_cursors``, keyed by tracker scope. ``since`` moves only to the
 newest timestamp on a page that was applied, because GitHub's ``since`` is
 inclusive. An ETag is stored only after that apply. A 304 creates no work.
+Two kinds of ETag key carry a comment the pass must read again instead:
+``facts-retry:<id>`` (ADR 0280) and ``answer-retry:<id>``, an answer whose
+authority or round could not be read yet (#5787); each is dropped once
+settled.
 
 The pass holds ``pg_try_advisory_lock(3745, 187)`` on one connection. A
 replica that does not get the lock makes no GitHub request.
@@ -34,14 +38,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from curie_telemetry import record_metric
-from sqlalchemy import desc, select, text
+from sqlalchemy import Text, cast, desc, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 from starlette.concurrency import run_in_threadpool
@@ -53,13 +58,19 @@ from curie_api.factory_label_reconcile import (
     tracker_work_item_repositories,
 )
 
-from . import factory_intake_notices, factory_notices, factory_rediscovery, github_factory
+from . import (
+    factory_intake_notices,
+    factory_notices,
+    factory_questions,
+    factory_rediscovery,
+    github_factory,
+)
 from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_facts import FACTS_DEADLINE_SECONDS
 from .factory_facts_exchange import FactsExchange
 from .factory_facts_schema import REQUEST_MARKER
-from .forges.errors import NotFound, Unavailable
+from .forges.errors import ForgeError, NotFound, Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
 from .forges.github.review_polling import (
@@ -95,6 +106,7 @@ from .models import (
     ExecutionRequest,
     FactoryIntakeNotice,
     FactoryPollCursor,
+    FactoryQuestionRound,
     FactoryStatusComment,
     WorkItem,
 )
@@ -110,6 +122,8 @@ _LOCK_ARGS = {"classid": 3745, "objid": 187}
 
 REPOSITORY_CONCURRENCY = 10
 ISSUE_CONCURRENCY = 10
+# The cursor key prefix of an answer comment to read again (#5787).
+ANSWER_RETRY = github_factory.ANSWER_RETRY
 LABEL_PASS_AGE = "curie.factory.intake.label_pass.age_seconds"
 
 
@@ -492,7 +506,15 @@ async def _poll_traffic(
     serves: bool,
     feedback: bool,
 ) -> None:
-    await _cancel_stale(
+    # An issue whose question is open is cancelled only after this pass has
+    # judged its comments as answers: a close or label removal found with an
+    # answer in the same pass refuses that answer as such (``ticket_closed``,
+    # ``trigger_label_absent``), as when the answer is read first (#5787
+    # criterion 4), instead of the cancellation deleting its round unseen.
+    answering = (
+        await _answering_issue_numbers(sessionmaker, tracker) if serves and feedback else set()
+    )
+    deferred = await _cancel_stale(
         sessionmaker,
         settings,
         client,
@@ -500,24 +522,38 @@ async def _poll_traffic(
         tracker,
         installation_id=installation_id,
         repository=repository,
+        defer=answering,
     )
     if not feedback:
         return
-    await _admit_mentions(
-        sessionmaker,
-        settings,
-        client,
-        cursor,
-        tracker,
-        now=now,
-        api=api,
-        token=token,
-        repo_path=repo_path,
-        installation_id=installation_id,
-        repository=repository,
-        verified=verified,
-        serves=serves,
-    )
+    try:
+        await _admit_mentions(
+            sessionmaker,
+            settings,
+            client,
+            cursor,
+            tracker,
+            now=now,
+            api=api,
+            token=token,
+            repo_path=repo_path,
+            installation_id=installation_id,
+            repository=repository,
+            verified=verified,
+            serves=serves,
+        )
+    finally:
+        if deferred:
+            await _cancel_stale(
+                sessionmaker,
+                settings,
+                client,
+                cursor,
+                tracker,
+                installation_id=installation_id,
+                repository=repository,
+                only=deferred,
+            )
     owned = await open_pulls(
         sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
     )
@@ -670,9 +706,19 @@ async def _cancel_stale(
     *,
     installation_id: int,
     repository: dict[str, Any],
-) -> None:
+    defer: set[int] | None = None,
+    only: set[int] | None = None,
+) -> set[int]:
+    """Cancel each watched WorkItem whose issue a person closed or unlabelled.
+
+    An issue in ``defer`` found closed or unlabelled is left for a later call
+    and returned; ``only`` limits the pass to those issues. Its ETag is never
+    kept, so the later call reads it in full.
+    """
+
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     registry = forges_registry(settings)
+    deferred: set[int] = set()
     async with sessionmaker() as session:
         items = list(
             await session.scalars(
@@ -692,10 +738,13 @@ async def _cancel_stale(
             if label is not None or item.id in kickoff:
                 watched[int(item.tracker_issue_id)] = label
     keys = {_etag_key(number, label) for number, label in watched.items()}
-    for key in list(cursor.etags):
-        if key.startswith("issue:") and key not in keys:
-            del cursor.etags[key]
+    if only is None:
+        for key in list(cursor.etags):
+            if key.startswith("issue:") and key not in keys:
+                del cursor.etags[key]
     for number in sorted(watched):
+        if only is not None and number not in only:
+            continue
         label = watched[number]
         key = _etag_key(number, label)
         try:
@@ -716,6 +765,9 @@ async def _cancel_stale(
             # Retry cancellation authority on every pass until it succeeds.
             # A cached issue must not hide a later permission or event repair.
             cursor.etags.pop(key, None)
+            if defer is not None and number in defer:
+                deferred.add(number)
+                continue
             events = await tracker.issue_events(number)
             event = last_event_of_kind(events, kind, label=label if kind == "unlabeled" else None)
             if event is None:
@@ -741,6 +793,7 @@ async def _cancel_stale(
             await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             logger.info("factory stale issue poll for %s issue %s deferred", repo, number)
+    return deferred
 
 
 def _etag_key(number: int, label: str | None) -> str:
@@ -767,6 +820,226 @@ async def _issue_numbers(
     return {int(number) for number in rows}
 
 
+async def _answering_issue_numbers(
+    sessionmaker: async_sessionmaker[AsyncSession], tracker: GitHubTracker
+) -> set[int]:
+    """Issues whose WorkItem has a question round a comment can answer (#5787):
+    ``outstanding``, ``answered``, or ``posting`` (its comment may already be
+    on the ticket). One query per pass."""
+
+    async with sessionmaker() as session:
+        rows = await session.scalars(
+            select(WorkItem.tracker_issue_id)
+            .join(FactoryQuestionRound, FactoryQuestionRound.work_item_id == WorkItem.id)
+            .where(
+                *_in_scope(tracker),
+                FactoryQuestionRound.state.in_(
+                    (
+                        factory_questions.POSTING,
+                        factory_questions.OUTSTANDING,
+                        factory_questions.ANSWERED,
+                    )
+                ),
+            )
+        )
+    return {int(number) for number in rows}
+
+
+def _answer_notice(
+    comment: dict[str, Any],
+    tracker: GitHubTracker,
+    *,
+    installation_id: int,
+    mention: bool,
+) -> FactoryNotice | None:
+    """The notice a listed or re-read issue comment makes for the answer
+    intake, or None when it names no issue comment. Its sender is only a
+    claim; `github_factory.admit_answer_notice` judges the comment itself."""
+
+    comment_id = comment.get("id")
+    number = trailing_id(comment.get("issue_url"))
+    if type(comment_id) is not int or comment_id <= 0 or number is None:
+        return None
+    sender_id, sender_login = human_actor({"user": comment.get("user")}) or (0, "")
+    body = comment.get("body")
+    return FactoryNotice(
+        uuid.uuid4(),
+        "issue_comment",
+        "created",
+        "mention" if mention else "comment",
+        installation_id,
+        tracker.repository_id,
+        tracker.repo_full_name,
+        number,
+        sender_id,
+        sender_login,
+        label_event_at=None,
+        comment_id=comment_id,
+        comment_body=body if isinstance(body, str) else None,
+    )
+
+
+async def _admit_answer(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    tracker: GitHubTracker,
+    notice: FactoryNotice,
+    comment: dict[str, Any],
+) -> bool:
+    """Run one comment through the shared answer intake under its issue lock.
+
+    True when it was handled as an answer (admitted, a replay, or refused),
+    False when it is not one and today's mention rules apply. Raises
+    `FeedbackUnavailable` when the answer cannot be decided yet; nothing is
+    written then.
+    """
+
+    async with sessionmaker() as session:
+        try:
+            await github_factory.lock_issue(
+                session, github_factory.notice_issue(notice, forges_registry(settings))
+            )
+            result = await github_factory.admit_answer_notice(
+                session, settings, tracker, notice, comment
+            )
+        except FeedbackUnavailable:
+            await session.rollback()
+            raise
+        except FeedbackIgnored as exc:
+            await session.rollback()
+            logger.info("factory answer ignored reason=%s comment=%s", exc.code, notice.comment_id)
+            return True
+        except BaseException:
+            await session.rollback()
+            raise
+        await session.commit()
+    return result is not None
+
+
+RetryResult = Literal["handled", "settled", "deferred"]
+
+
+async def retry_answers(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    tracker: GitHubTracker,
+    *,
+    installation_id: int,
+    comment_ids: Iterable[int],
+) -> dict[int, RetryResult]:
+    """Read each deferred answer comment again and offer it to the answer
+    intake (#5787); the one retry rule of the poll pass and of the webhook
+    mode reconciler.
+
+    ``handled``: decided as an answer (admitted, a replay or refused);
+    ``settled``: gone, or not an answer (its round ended, or its body is now a
+    facts request), so the key goes and a listing may still apply the mention
+    or facts rules to it; ``deferred``: still undecidable, the key stays.
+    """
+
+    results: dict[int, RetryResult] = {}
+    for comment_id in comment_ids:
+        try:
+            value = await tracker.issue_comment(comment_id)
+            notice = _answer_notice(value, tracker, installation_id=installation_id, mention=False)
+            handled = notice is not None and await _admit_answer(
+                sessionmaker, settings, tracker, notice, value
+            )
+        except NotFound:
+            results[comment_id] = "settled"
+        except (ForgeError, FeedbackUnavailable):
+            logger.info("factory answer deferred comment=%s", comment_id)
+            results[comment_id] = "deferred"
+        else:
+            results[comment_id] = "handled" if handled else "settled"
+    return results
+
+
+async def drain_answer_retries(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    tracker: GitHubTracker,
+    *,
+    installation_id: int,
+    serves: bool = True,
+) -> set[int]:
+    """Retry the ``answer-retry:`` keys of ``tracker``'s scope (#5787) and
+    return the comment ids decided as answers.
+
+    The poll pass calls this before its listing; in webhook mode, where the
+    webhook records the keys (a 503 GitHub never redelivers), the work item
+    reconciler does. The keys are read from the row as it is now, and each
+    settled key is removed on its own (jsonb ``-``), never by rewriting the
+    cursor, so a key a webhook adds meanwhile is kept. A repository no surface
+    serves drops its keys unread.
+    """
+
+    scope = (tracker.kind, tracker.host, str(tracker.repository_id))
+    async with sessionmaker() as session:
+        row = await session.get(FactoryPollCursor, scope)
+        etags = row.etags if row is not None and isinstance(row.etags, dict) else {}
+    keys = {
+        key: trailing_id(key.replace(":", "/")) for key in etags if key.startswith(ANSWER_RETRY)
+    }
+    results = (
+        await retry_answers(
+            sessionmaker,
+            settings,
+            tracker,
+            installation_id=installation_id,
+            comment_ids=[comment_id for comment_id in keys.values() if comment_id is not None],
+        )
+        if serves
+        else {}
+    )
+    handled = {comment_id for comment_id, result in results.items() if result == "handled"}
+    done = [
+        key
+        for key, comment_id in keys.items()
+        if comment_id is None or results.get(comment_id) != "deferred"
+    ]
+    if not done:
+        return handled
+    async with sessionmaker() as session:
+        for key in done:
+            await session.execute(
+                update(FactoryPollCursor)
+                .where(
+                    FactoryPollCursor.tracker_kind == scope[0],
+                    FactoryPollCursor.tracker_host == scope[1],
+                    FactoryPollCursor.tracker_scope_id == scope[2],
+                )
+                .values(
+                    etags=FactoryPollCursor.etags.op("-")(cast(key, Text)),
+                    updated_at=func.now(),
+                )
+            )
+        await session.commit()
+    return handled
+
+
+def _edited(comment: dict[str, Any], threshold: datetime | None) -> bool:
+    """Whether a listed comment has been edited, so it is never an answer.
+
+    The webhook refuses an edit as ``unsupported_action`` and decides a
+    comment only from its ``created`` delivery, so the poll pass refuses any
+    comment whose listing already shows an ``updated_at`` later than its
+    ``created_at``: one edited before a pass first saw it (a facts request
+    edited into plain text, say) is no more an answer than one edited after.
+    A reply posted in the threshold's own second, never edited, is new. A
+    comment created before the threshold is listed only for a newer
+    ``updated_at`` and is an edit too.
+    """
+
+    created = parse_time(comment.get("created_at"))
+    if created is None:
+        return False
+    updated = parse_time(comment.get("updated_at"))
+    if updated is not None and updated > created:
+        return True
+    return threshold is not None and created < threshold
+
+
 async def _admit_mentions(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -786,7 +1059,8 @@ async def _admit_mentions(
     """Walk issue comments since the cursor. A comment on an owned open pull
     request is review feedback, read wherever ``feedback`` is (#4910); a
     mention on a factory issue is intake, read only where a surface serves the
-    repository."""
+    repository, and so is any comment on an issue whose question is open,
+    which is offered to the answer intake first (#5787)."""
 
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     facts = FactsExchange(sessionmaker, settings, tracker.facts)
@@ -812,13 +1086,18 @@ async def _admit_mentions(
             logger.info("factory facts observation deferred reason=unreadable")
         else:
             cursor.etags.pop(key, None)
-    listed, etag = await tracker.issue_comments_since(
-        since_param(cursor.comments_since, now), cursor.etags.get("issue-comments")
+    # A comment decided as an answer here is not decided again by the listing.
+    retried |= await drain_answer_retries(
+        sessionmaker, settings, tracker, installation_id=installation_id, serves=serves
     )
+    since = since_param(cursor.comments_since, now)
+    listed, etag = await tracker.issue_comments_since(since, cursor.etags.get("issue-comments"))
+    threshold = parse_time(since)
     if listed is None:
         await facts.deliver_owed()
         return
     factory_issues = await _issue_numbers(sessionmaker, tracker) if serves else set()
+    answering = await _answering_issue_numbers(sessionmaker, tracker) if serves else set()
     owned_pulls = set(
         await open_pulls(
             sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
@@ -845,6 +1124,42 @@ async def _admit_mentions(
                     cursor.etags[f"facts-retry:{comment_id}"] = "pending"
                 logger.info("factory facts observation deferred reason=unreadable")
                 continue
+        # While a question is open on the issue, any comment, from anyone and
+        # with or without a mention, goes to the answer intake first (#5787
+        # decisions 4 and 8). So does a mention on any factory issue: one that
+        # was already decided as an answer replays its receipt and is never
+        # also a mention after the round ends. A comment on an owned pull
+        # request stays review feedback.
+        answer_on = trailing_id(comment.get("issue_url"))
+        mentioned = isinstance(body, str) and mentions_factory(body, tracker.mention, app_slug)
+        if (
+            answer_on is not None
+            and answer_on not in owned_pulls
+            and (answer_on in answering or (mentioned and answer_on in factory_issues))
+        ):
+            if answer_on in answering and _edited(comment, threshold):
+                continue
+            notice = _answer_notice(
+                comment, tracker, installation_id=installation_id, mention=mentioned
+            )
+            if notice is not None:
+                try:
+                    if await _admit_answer(sessionmaker, settings, tracker, notice, comment):
+                        continue
+                except (ForgeError, FeedbackUnavailable):
+                    assert notice.comment_id is not None
+                    async with sessionmaker() as session:
+                        await github_factory.add_answer_retry(
+                            session,
+                            kind=tracker.kind,
+                            host=tracker.host,
+                            scope_id=str(repository_id),
+                            scope_path=repo,
+                            comment_id=notice.comment_id,
+                        )
+                        await session.commit()
+                    logger.info("factory answer deferred comment=%s", notice.comment_id)
+                    continue
         if comment.get("performed_via_github_app") is not None:
             continue
         sender = human_actor({"user": comment.get("user")})
@@ -1002,7 +1317,13 @@ async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], scope: _S
         if row is None:
             return Cursor()
         raw = row.etags if isinstance(row.etags, dict) else {}
-        etags = {str(key): value for key, value in raw.items() if isinstance(value, str)}
+        # ``answer-retry:`` keys are read from the row when they are retried,
+        # never carried in the pass's cursor (#5787).
+        etags = {
+            str(key): value
+            for key, value in raw.items()
+            if isinstance(value, str) and not str(key).startswith(ANSWER_RETRY)
+        }
         return Cursor(
             comments_since=row.comments_since,
             review_comments_since=row.review_comments_since,
@@ -1014,10 +1335,19 @@ async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], scope: _S
 async def _save_cursor(
     sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope, cursor: Cursor, *, labels: bool
 ) -> None:
+    """Write the pass's share of the scope's cursor row.
+
+    The row is read FOR UPDATE, so this read-modify-write of the other keys
+    cannot interleave with another writer. ``answer-retry:`` keys belong to
+    neither half: they are kept as the row holds them now, since only the
+    atomic add (`github_factory.add_answer_retry`) and the drain's removal
+    change them (#5787).
+    """
+
     async with sessionmaker() as session:
-        row = await session.get(FactoryPollCursor, scope.key)
-        if row is None:
-            row = FactoryPollCursor(
+        await session.execute(
+            pg_insert(FactoryPollCursor)
+            .values(
                 tracker_kind=scope.kind,
                 tracker_host=scope.host,
                 tracker_scope_id=scope.scope_id,
@@ -1025,24 +1355,36 @@ async def _save_cursor(
                 comments_since=cursor.comments_since,
                 review_comments_since=cursor.review_comments_since,
                 reviews_since=cursor.reviews_since,
-                etags=dict(cursor.etags),
+                etags={},
                 updated_at=datetime.now(UTC),
             )
-            session.add(row)
-        else:
-            row.scope_path = scope.path
-            if not labels:
-                row.comments_since = cursor.comments_since
-                row.review_comments_since = cursor.review_comments_since
-                row.reviews_since = cursor.reviews_since
+            .on_conflict_do_nothing(
+                index_elements=[
+                    FactoryPollCursor.tracker_kind,
+                    FactoryPollCursor.tracker_host,
+                    FactoryPollCursor.tracker_scope_id,
+                ]
+            )
+        )
+        row = await session.get(
+            FactoryPollCursor, scope.key, with_for_update=True, populate_existing=True
+        )
+        assert row is not None
+        row.scope_path = scope.path
+        if not labels:
+            row.comments_since = cursor.comments_since
+            row.review_comments_since = cursor.review_comments_since
+            row.reviews_since = cursor.reviews_since
 
-            def owned(key: str) -> bool:
-                return (key == "issues" or key.startswith("issues:")) == labels
+        def owned(key: str) -> bool:
+            if key.startswith(ANSWER_RETRY):
+                return False
+            return (key == "issues" or key.startswith("issues:")) == labels
 
-            previous = row.etags if isinstance(row.etags, dict) else {}
-            row.etags = {
-                **{key: value for key, value in previous.items() if not owned(key)},
-                **{key: value for key, value in cursor.etags.items() if owned(key)},
-            }
-            row.updated_at = datetime.now(UTC)
+        previous = row.etags if isinstance(row.etags, dict) else {}
+        row.etags = {
+            **{key: value for key, value in previous.items() if not owned(key)},
+            **{key: value for key, value in cursor.etags.items() if owned(key)},
+        }
+        row.updated_at = datetime.now(UTC)
         await session.commit()

@@ -118,6 +118,12 @@ spec:
             - name: NODE_OPTIONS
               value: {{ .Values.langfuse.web.nodeOptions | quote }}
             {{- end }}
+            # Langfuse's server binds to HOSTNAME, and Kubernetes sets that to
+            # the pod name, so without this it listens on the pod IP only and a
+            # `kubectl port-forward` (which dials loopback inside the pod) is
+            # refused.
+            - name: HOSTNAME
+              value: "0.0.0.0"
             - name: NEXTAUTH_URL
               value: {{ .Values.langfuse.nextauthUrl | quote }}
             - name: NEXTAUTH_SECRET

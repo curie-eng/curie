@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import html
 import ipaddress
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import sqlite3
@@ -19,11 +23,14 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 REPOSITORY = "acme-corp/acme-bot"
 HUMAN = {"id": 6601, "login": "octocat", "type": "User"}
 READER = {"id": 6602, "login": "reader", "type": "User"}
+# A person who may accept a learned rule, and one who may not.
+RULE_WRITER = {"id": 6630, "login": "rule-writer", "type": "User"}
+RULE_READER = {"id": 6631, "login": "rule-reader", "type": "User"}
 BOT = {"id": 51, "login": "example-app[bot]", "type": "Bot"}
 # Collaborator permission levels the REST answer may carry.
 # https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
@@ -98,6 +105,10 @@ class GithubStub:
                     ) from None
         self.root = root.resolve()
         self.recording = recording
+        self.oauth_client_id = os.environ.get("CURIE_GITHUB_STUB_OAUTH_CLIENT_ID", "Iv1.example")
+        self.oauth_client_secret = os.environ.get(
+            "CURIE_GITHUB_STUB_OAUTH_CLIENT_SECRET", "EXAMPLE-github-client-secret-sentinel"
+        )
         self.host = host
         self.bind = bind_address
         self.port = port
@@ -107,6 +118,11 @@ class GithubStub:
         self._thread: threading.Thread | None = None
         self._real_start: float | None = None
         self._closed = False
+        # When set, GET rules/branches answers the plan-gated 403 GitHub Free
+        # returns for a private repository, and the repository row is private.
+        # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+        # https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
+        self.plan_gated_branch_rules = False
         self._git_root = self.root / "repositories"
         self._repository = self._git_root / f"{REPOSITORY}.git"
 
@@ -203,6 +219,10 @@ class GithubStub:
                 " PRIMARY KEY(kind,id)); CREATE TABLE unsupported(request TEXT);"
                 "CREATE TABLE tokens(token TEXT PRIMARY KEY, permissions TEXT);"
                 "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL);"
+                "CREATE TABLE comment_history(comment_id INTEGER NOT NULL, at TEXT NOT NULL,"
+                " body TEXT NOT NULL);"
+                "CREATE TABLE oauth_codes(code_hash TEXT PRIMARY KEY, redirect_uri TEXT NOT NULL);"
+                "CREATE TABLE oauth_tokens(token_hash TEXT PRIMARY KEY);"
                 "CREATE TABLE collaborators(login TEXT PRIMARY KEY, permission TEXT NOT NULL,"
                 " user TEXT NOT NULL);"
                 "CREATE TABLE permission_faults(login TEXT PRIMARY KEY, status INTEGER NOT NULL);"
@@ -214,6 +234,8 @@ class GithubStub:
                 [
                     (HUMAN["login"], "write", json.dumps(HUMAN)),
                     (READER["login"], "read", json.dumps(READER)),
+                    (RULE_WRITER["login"], "write", json.dumps(RULE_WRITER)),
+                    (RULE_READER["login"], "read", json.dumps(RULE_READER)),
                 ],
             )
         self._repository.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +356,35 @@ class GithubStub:
             connection.execute(
                 "INSERT OR REPLACE INTO objects VALUES(?,?,?)", (kind, identifier, json.dumps(body))
             )
+            if kind == "comment":
+                self._remember(connection, body)
+
+    @staticmethod
+    def _remember(connection: sqlite3.Connection, comment: dict[str, Any]) -> None:
+        """Keep each body a comment has held, with the instant it took it.
+
+        The stub stores only a comment's latest body, and a status comment is
+        edited in place, so a line that was visible for a while can be gone by the
+        time a scenario looks. The history is what a scenario reads to place a
+        line in time.
+        """
+
+        connection.execute(
+            "INSERT INTO comment_history VALUES(?,?,?)",
+            (comment["id"], comment.get("updated_at") or comment["created_at"], comment["body"]),
+        )
+
+    def comment_history(self, identifier: int) -> list[dict[str, str]]:
+        """Every body the comment held, oldest first, each with the instant it took it."""
+
+        with sqlite3.connect(self._database) as connection:
+            return [
+                {"at": at, "body": body}
+                for at, body in connection.execute(
+                    "SELECT at, body FROM comment_history WHERE comment_id=? ORDER BY rowid",
+                    (identifier,),
+                )
+            ]
 
     def _insert_new(self, kind: str, build: Callable[[int], dict[str, Any]]) -> dict[str, Any]:
         """Insert one new object, allocating its id under a write lock.
@@ -358,6 +409,8 @@ class GithubStub:
                 "INSERT INTO objects(kind, id, body) VALUES(?,?,?)",
                 (kind, identifier, json.dumps(body)),
             )
+            if kind == "comment":
+                self._remember(connection, body)
             connection.commit()
             return body
         finally:
@@ -500,6 +553,7 @@ class GithubStub:
             "default_branch": "main",
             "html_url": f"{self.base_url}/{REPOSITORY}",
             "clone_url": self.clone_url,
+            **({"private": True} if self.plan_gated_branch_rules else {}),
         }
 
     def _checks(self, sha: str) -> list[dict[str, Any]]:
@@ -523,6 +577,48 @@ class GithubStub:
         handler.end_headers()
         handler.wfile.write(payload)
 
+    def _conversation_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        author: dict[str, Any],
+        app: dict[str, Any] | None,
+        author_association: str | None,
+        created: str,
+        updated: str,
+    ) -> Callable[[int], dict[str, Any]]:
+        """Build a conversation comment row, on an issue or a pull request.
+
+        A pull request's conversation is its issue comment list, and GitHub
+        links a comment on one to ``/pull/{n}``, so a number with a pull row and
+        no issue row gets that URL.
+        """
+
+        segment = (
+            "pull" if self._get("issue", number) is None and self._get("pull", number) else "issues"
+        )
+
+        def build(identifier: int) -> dict[str, Any]:
+            row = {
+                "id": identifier,
+                "body": body,
+                "issue_number": number,
+                "user": author,
+                "performed_via_github_app": app,
+                "created_at": created,
+                "updated_at": updated,
+                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
+                "html_url": (
+                    f"{self.base_url}/{REPOSITORY}/{segment}/{number}#issuecomment-{identifier}"
+                ),
+            }
+            if author_association is not None:
+                row["author_association"] = author_association
+            return row
+
+        return build
+
     def add_issue_comment(
         self,
         number: int,
@@ -530,25 +626,117 @@ class GithubStub:
         *,
         author: dict[str, Any],
         app: dict[str, Any] | None = None,
+        author_association: str | None = None,
     ) -> dict[str, Any]:
-        """Seed an authenticated-read comment with independent author and App provenance."""
+        """Seed an authenticated-read comment with independent author and App provenance.
 
-        def build(identifier: int) -> dict[str, Any]:
-            return {
-                "id": identifier,
-                "body": body,
-                "issue_number": number,
-                "user": author,
-                "performed_via_github_app": app,
-                "created_at": _utc(),
-                "updated_at": _utc(),
-                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
-                "html_url": (
-                    f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
-                ),
-            }
+        ``number`` is an issue or a pull request number. ``author_association``
+        is GitHub's ``OWNER``, ``MEMBER``, ``COLLABORATOR`` and the like, carried
+        only when given.
+        """
 
-        return self._insert_new("comment", build)
+        return self._insert_new(
+            "comment",
+            self._conversation_comment(
+                number,
+                body,
+                author=author,
+                app=app,
+                author_association=author_association,
+                created=_utc(),
+                updated=_utc(),
+            ),
+        )
+
+    def append_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        author: dict[str, Any],
+        app: dict[str, Any] | None = None,
+        author_association: str | None = None,
+    ) -> dict[str, Any]:
+        """Append a never-edited comment the way a person posts one, as ``_label_event``
+        appends an event.
+
+        Unlike ``add_issue_comment`` the row takes one instant for both
+        timestamps: the factory's poll pass treats a comment whose ``updated_at``
+        is later than its ``created_at`` as edited and never reads it as an answer.
+        ``number`` is an issue or a pull request number.
+        """
+
+        if self._get("issue", number) is None and self._get("pull", number) is None:
+            raise ValueError(f"issue or pull request {number} does not exist")
+        instant = _utc()
+        return self._insert_new(
+            "comment",
+            self._conversation_comment(
+                number,
+                body,
+                author=author,
+                app=app,
+                author_association=author_association,
+                created=instant,
+                updated=instant,
+            ),
+        )
+
+    def merge_pull(self, number: int) -> dict[str, Any]:
+        """Merge an open pull request the way a fast-forward merge does.
+
+        Moves ``main`` to the pull request head and marks the row closed and
+        merged. A head that is not a descendant of ``main`` is refused.
+        """
+
+        row = self._get("pull", number)
+        if row is None:
+            raise ValueError(f"pull request {number} does not exist")
+        if row["state"] != "open":
+            raise ValueError(f"pull request {number} is not open")
+        head = self._ref(row["head"]["ref"])
+        base = self._ref(row["base"]["ref"])
+        ancestor = subprocess.run(
+            (
+                "git",
+                "--git-dir",
+                str(self._repository),
+                "merge-base",
+                "--is-ancestor",
+                base,
+                head,
+            ),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if ancestor.returncode != 0:
+            raise ValueError(f"pull request {number} is not a fast-forward of {row['base']['ref']}")
+        self._run(
+            "git",
+            "--git-dir",
+            str(self._repository),
+            "update-ref",
+            f"refs/heads/{row['base']['ref']}",
+            head,
+            base,
+        )
+        instant = _utc()
+        row.update(
+            state="closed",
+            merged=True,
+            merged_at=instant,
+            merge_commit_sha=head,
+            updated_at=instant,
+        )
+        self._put("pull", number, row)
+        return self._fresh_pull(row)
+
+    def add_user(self, user: dict[str, Any], permission: str) -> dict[str, Any]:
+        """Add a repository collaborator with ``permission``; returns the user."""
+
+        self.set_permission(str(user["login"]), permission, user=user)
+        return user
 
     # Runtime controls. The scripted driver holds this object in process, so a
     # control is a method call, like ``advance`` and ``add_issue_comment``. Each
@@ -697,6 +885,13 @@ class GithubStub:
         if path.startswith("/api/v3/"):
             path = path.removeprefix("/api/v3")
         body = handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+        if path in {
+            "/login/oauth/authorize",
+            "/login/oauth/access_token",
+            "/user",
+        } or path.startswith("/applications/"):
+            self._github_link_request(handler, path, parse_qs(parsed.query), body)
+            return
         if path.startswith(f"/{REPOSITORY}.git/"):
             if handler.command not in {"GET", "POST"} or not (
                 path.endswith("/info/refs")
@@ -712,7 +907,12 @@ class GithubStub:
             return
         try:
             payload = json.loads(body) if body else {}
-            result = self._rest(handler.command, path, parse_qs(parsed.query), payload)
+            actor = (
+                HUMAN
+                if handler.headers.get("Authorization") == "Bearer example-human-token"
+                else BOT
+            )
+            result = self._rest(handler.command, path, parse_qs(parsed.query), payload, actor=actor)
         except (ValueError, KeyError, subprocess.CalledProcessError) as exc:
             self._json(handler, 422, {"message": str(exc)})
             return
@@ -723,6 +923,120 @@ class GithubStub:
             self._raw(handler, result[0], result[2])
         else:
             self._json(handler, *result)
+
+    def _github_link_request(
+        self, handler: BaseHTTPRequestHandler, path: str, query: dict[str, list[str]], raw: bytes
+    ) -> None:
+        # GitHub App user flow and token revoke shapes:
+        # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app
+        # https://docs.github.com/en/rest/apps/oauth-applications#delete-an-app-token
+        method = handler.command
+        if method == "GET" and path == "/login/oauth/authorize":
+            if (
+                query.get("client_id") != [self.oauth_client_id]
+                or not query.get("state")
+                or not query.get("redirect_uri")
+            ):
+                self._json(handler, 400, {"error": "invalid_request"})
+                return
+            raw_redirect = query["redirect_uri"][0]
+            redirect = raw_redirect.replace("\r", "").replace("\n", "")
+            state = re.fullmatch(r"[^\x00-\x1f\x7f-\x9f]+", query["state"][0])
+            if (
+                redirect != raw_redirect
+                or re.search(r"[\x00-\x1f\x7f-\x9f]", redirect)
+                or state is None
+            ):
+                self._json(handler, 400, {"error": "invalid_request"})
+                return
+            if urlsplit(redirect).scheme != "https":
+                self._json(handler, 400, {"error": "invalid_redirect"})
+                return
+            if query.get("approved") == ["1"]:
+                code = secrets.token_urlsafe(32)
+                with sqlite3.connect(self._database) as connection:
+                    connection.execute(
+                        "INSERT INTO oauth_codes VALUES(?,?)",
+                        (hashlib.sha256(code.encode()).hexdigest(), redirect),
+                    )
+                handler.send_response(302)
+                handler.send_header(
+                    "Location",
+                    redirect + "?" + urlencode({"code": code, "state": state[0]}),
+                )
+                handler.send_header("Cache-Control", "no-store")
+                handler.end_headers()
+                return
+            fields = "".join(
+                f'<input type="hidden" name="{html.escape(name)}" '
+                f'value="{html.escape(query[name][0], quote=True)}">'
+                for name in ("client_id", "state", "redirect_uri")
+            )
+            page = (
+                '<form action="/login/oauth/authorize" method="get">'
+                + fields
+                + '<input type="hidden" name="approved" value="1"><p>Authorize octocat</p>'
+                "<button>Authorize GitHub link</button></form>"
+            ).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html")
+            handler.send_header("Content-Length", str(len(page)))
+            handler.end_headers()
+            handler.wfile.write(page)
+            return
+        if method == "POST" and path == "/login/oauth/access_token":
+            form = parse_qs(raw.decode())
+            if form.get("client_id") != [self.oauth_client_id] or form.get("client_secret") != [
+                self.oauth_client_secret
+            ]:
+                self._json(handler, 401, {"error": "incorrect_client_credentials"})
+                return
+            code = form.get("code", [""])[0]
+            with sqlite3.connect(self._database) as connection:
+                row = connection.execute(
+                    "DELETE FROM oauth_codes WHERE code_hash=? RETURNING redirect_uri",
+                    (hashlib.sha256(code.encode()).hexdigest(),),
+                ).fetchone()
+                if row is None or form.get("redirect_uri") != [row[0]]:
+                    self._json(handler, 200, {"error": "bad_verification_code"})
+                    return
+                token = "ghu_" + secrets.token_urlsafe(32)
+                connection.execute(
+                    "INSERT INTO oauth_tokens VALUES(?)",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                )
+            self._json(handler, 200, {"access_token": token, "token_type": "bearer", "scope": ""})
+            return
+        token = handler.headers.get("Authorization", "").removeprefix("Bearer ")
+        if method == "GET" and path == "/user":
+            with sqlite3.connect(self._database) as connection:
+                found = connection.execute(
+                    "SELECT 1 FROM oauth_tokens WHERE token_hash=?",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                ).fetchone()
+            self._json(
+                handler, 200 if found else 401, HUMAN if found else {"message": "Bad credentials"}
+            )
+            return
+        if method == "DELETE" and path == f"/applications/{self.oauth_client_id}/token":
+            expected = (
+                "Basic "
+                + base64.b64encode(
+                    f"{self.oauth_client_id}:{self.oauth_client_secret}".encode()
+                ).decode()
+            )
+            if handler.headers.get("Authorization") != expected:
+                self._json(handler, 401, {"message": "Bad credentials"})
+                return
+            token = json.loads(raw).get("access_token", "")
+            with sqlite3.connect(self._database) as connection:
+                connection.execute(
+                    "DELETE FROM oauth_tokens WHERE token_hash=?",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                )
+            self._json(handler, 204, {})
+            return
+        self._json(handler, 404, {"message": "Not Found"})
 
     def _raw(self, handler: BaseHTTPRequestHandler, status: int, payload: bytes) -> None:
         handler.send_response(status)
@@ -786,7 +1100,13 @@ class GithubStub:
         handler.wfile.write(content)
 
     def _rest(
-        self, method: str, path: str, query: dict[str, list[str]], body: Any
+        self,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: Any,
+        *,
+        actor: dict[str, Any] = BOT,
     ) -> tuple[int, Any] | tuple[int, Any, bytes] | None:
         if method == "GET" and path == "/app":
             # The authenticated App; its bot user, ``<slug>[bot]``, authors what
@@ -806,6 +1126,16 @@ class GithubStub:
                 "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 "permissions": PERMISSIONS,
             }
+        account = re.fullmatch(r"/user/(\d+)", path)
+        if method == "GET" and account:
+            # https://docs.github.com/en/rest/users/users#get-a-user-using-their-id
+            with sqlite3.connect(self._database) as connection:
+                rows = [
+                    json.loads(row[0])
+                    for row in connection.execute("SELECT user FROM collaborators")
+                ]
+            found = next((user for user in rows if str(user["id"]) == account[1]), None)
+            return (200, found) if found is not None else (404, {"message": "Not Found"})
         prefix = f"/repos/{REPOSITORY}"
         # GitHub serves /repositories/{id}/... as the same resource tree.
         by_id = f"/repositories/{self._repository_row()['id']}"
@@ -838,8 +1168,19 @@ class GithubStub:
                 return 404, {"message": "Not Found"}
             return 200, {"permission": row[0], "role_name": row[0], "user": json.loads(row[1])}
         if method == "GET" and tail.startswith("rules/branches/"):
-            # No ruleset on this fixture. HTTP 404 contributes no required names.
             # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+            if self.plan_gated_branch_rules:
+                # The message GitHub returns when rulesets are outside the plan.
+                return 403, {
+                    "message": (
+                        "Upgrade to GitHub Pro or make this repository public "
+                        "to enable this feature"
+                    ),
+                    "documentation_url": (
+                        "https://docs.github.com/rest/repos/rules#get-rules-for-a-branch"
+                    ),
+                }
+            # No ruleset on this fixture. HTTP 404 contributes no required names.
             return 404, {"message": "Not Found"}
         if method == "GET" and tail.startswith("branches/"):
             branch = tail.removeprefix("branches/")
@@ -952,10 +1293,18 @@ class GithubStub:
             parts = tail.split("/")
             number = int(parts[1])
             existing_issue = self._get("issue", number)
-            if existing_issue is None:
-                return 404, {"message": "Not Found"}
-            issue = existing_issue
             suffix = "/".join(parts[2:])
+            # A pull request's conversation is its issue comment list, though
+            # no issue row backs the number.
+            # https://docs.github.com/en/rest/issues/comments#list-issue-comments
+            on_pull = (
+                existing_issue is None
+                and suffix == "comments"
+                and self._get("pull", number) is not None
+            )
+            if existing_issue is None and not on_pull:
+                return 404, {"message": "Not Found"}
+            issue = existing_issue or {}
             if not suffix and method in {"GET", "PATCH"}:
                 if method == "PATCH":
                     issue.update(
@@ -984,9 +1333,9 @@ class GithubStub:
                     self._put("issue", number, issue)
                     current = {label["name"] for label in issue["labels"]}
                     for label in sorted(current - previous):
-                        self._label_event(number, label, "labeled", BOT)
+                        self._label_event(number, label, "labeled", actor)
                     for label in sorted(previous - current):
-                        self._label_event(number, label, "unlabeled", BOT)
+                        self._label_event(number, label, "unlabeled", actor)
                 return 200, issue["labels"]
             if suffix.startswith("labels/") and method == "DELETE":
                 removed = suffix.removeprefix("labels/")
@@ -1011,6 +1360,8 @@ class GithubStub:
                     if fault is not None and fault[0] == "refuse":
                         return fault[1], {"message": "Server Error"}
 
+                    kind = "issues" if existing_issue else "pull"
+
                     def build(identifier: int) -> dict[str, Any]:
                         return {
                             "id": identifier,
@@ -1022,8 +1373,8 @@ class GithubStub:
                             "updated_at": _utc(),
                             "issue_url": f"{self.base_url}{prefix}/issues/{number}",
                             "html_url": (
-                                f"{self.base_url}/{REPOSITORY}/issues/{number}"
-                                f"#issuecomment-{identifier}"
+                                f"{self.base_url}/{REPOSITORY}/{kind}"
+                                f"/{number}#issuecomment-{identifier}"
                             ),
                         }
 
@@ -1061,6 +1412,9 @@ class GithubStub:
                         "number": number,
                         "state": "open",
                         "merged": False,
+                        "merged_at": None,
+                        "draft": False,
+                        "updated_at": _utc(),
                         "title": body["title"],
                         "body": body.get("body", ""),
                         "user": BOT,
@@ -1105,6 +1459,7 @@ class GithubStub:
                             for key, value in body.items()
                             if key in {"title", "body", "state"}
                         }
+                        | {"updated_at": _utc()}
                     )
                     self._put("pull", number, pull)
                 return 200, self._fresh_pull(pull)

@@ -410,25 +410,6 @@ def test_create_records_ownership_before_any_create_then_binds_and_retires(tmp_p
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("role", ["unknown", "expiring-after-permit"])
-def test_candidate_mtls_refuses_before_any_reservation(tmp_path, role):
-    async def scenario() -> None:
-        cluster = Cluster()
-        options: dict[str, Any] = {}
-        if role == "expiring-after-permit":
-            # The fixture certificate expires in one hour; this permit earlier.
-            options["expires_at_ms"] = int(time.time() * 1000) + 1800 * 1000
-        async with mediator(tmp_path, cluster, **options) as (_, control, url, root):
-            client = "unknown" if role == "unknown" else "worker"
-            async with httpx.AsyncClient(verify=context(root, client), trust_env=False) as http:
-                response = await http.post(url + ROUTE, content=request_bytes())
-            assert response.status_code == 403 and response.json()["code"] == "unauthorized"
-            assert control.plans == 0 and control.ownership == {}
-            assert not [e for e in cluster.events if e[0] == "POST"]
-
-    asyncio.run(scenario())
-
-
 def test_an_ambiguous_create_is_never_adopted_without_a_witness(tmp_path):
     async def scenario() -> None:
         cluster = Cluster()

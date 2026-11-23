@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live Slack kickoff acceptance driver for personal factory runs (#5380, ADR 0268 row 13).
 
-Six subcommands share one private SQLite ledger under ``--state-dir``:
+Seven subcommands share one private SQLite ledger under ``--state-dir``:
 
 1. ``images`` (unpaid) starts a loopback ``registry:2.8.3`` through the caller's
    Docker endpoint, builds the candidate's api, worker, dispatcher and runner
@@ -20,9 +20,12 @@ Six subcommands share one private SQLite ledger under ``--state-dir``:
    runs the disconnected control, then the full finalizer. ``rehearse --kickoff``
    also runs the kickoff and read-back on that never-issued token (no grant
    probe), so the paid path's diagnostics are captured with nothing to spend.
+   ``rehearse --grant-notice`` posts three unpaid kickoffs on that token and
+   records the rejected-plan direct messages for ``judge --criterion grant-notice``.
 5. ``run`` (also reachable as ``--live``) performs exactly one paid kickoff and
    the disconnected control, then finalizes every owned resource.
-6. ``judge --criterion X`` reads the ledger only and prints a verdict.
+6. ``refusal-connect`` (unpaid, no grant) proves the two private plan refusals.
+7. ``judge --criterion X`` reads the ledger only and prints a verdict.
 
 No held secret (the grant, the three Slack tokens, the App key and token, the
 API key, the worker token, the OIDC client secret or the console session) is
@@ -71,7 +74,7 @@ import personal_slack_kickoff_support as sks  # noqa: E402
 REPO_ROOT = HERE.parents[1]
 FIXTURE_ISSUE = HERE / "fixtures" / "personal-slack-kickoff-issue.md"
 OIDC_HARNESS = REPO_ROOT / "tools" / "oidc-e2e" / "oidc_e2e.py"
-SUBCOMMANDS = ("images", "slack-probe", "preflight", "rehearse", "run", "judge")
+SUBCOMMANDS = ("images", "slack-probe", "preflight", "rehearse", "refusal-connect", "run", "judge")
 DOCKERFILES = {
     "curie-api": "apps/api/Dockerfile",
     "curie-worker": "apps/worker/Dockerfile",
@@ -131,7 +134,13 @@ STARTUP_SECONDS = 600.0
 RECEIPT_SECONDS = 90.0
 ADMISSION_SECONDS = 180.0
 REPLY_SECONDS = 240.0
-TERMINAL_POST_SECONDS = 600.0
+NOTIFY_POST_SECONDS = 600.0
+# A rejected grant ends after the runner starts. The DM follows on the progress pass.
+GRANT_NOTICE_TERMINAL_SECONDS = STARTUP_SECONDS
+GRANT_NOTICE_DM_SECONDS = 180.0
+GRANT_NOTICE_QUIET_SECONDS = 30.0
+CARD_SETTLE_SECONDS = 120.0
+PLACEHOLDER_SECONDS = 30.0
 CONTROL_QUIET_SECONDS = 30.0
 TEARDOWN_SECONDS = 600.0
 IDENTITY_SECONDS = 300.0
@@ -491,15 +500,15 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--candidate", default="")
         sub.add_argument("--state-dir", default="")
         sub.add_argument("--run-id", default="")
-        if name in {"images", "rehearse", "run"}:
+        if name in {"images", "rehearse", "refusal-connect", "run"}:
             for flag in ("--context", "--docker-context", "--registry-port", "--kubeconfig"):
                 sub.add_argument(flag, default="")
-        if name in {"rehearse", "run"}:
+        if name in {"rehearse", "refusal-connect", "run"}:
             for flag in ("--namespace", "--release", "--priority-classes"):
                 sub.add_argument(flag, default="")
-        if name in {"preflight", "rehearse", "run"}:
+        if name in {"preflight", "rehearse", "refusal-connect", "run"}:
             sub.add_argument("--app-dir", default="")
-        if name in {"slack-probe", "preflight", "rehearse", "run"}:
+        if name in {"slack-probe", "preflight", "rehearse", "refusal-connect", "run"}:
             for flag in (*SLACK_FLAGS.values(), "--channel-file", "--isolation-file"):
                 sub.add_argument(flag, default="")
         if name in {"preflight", "rehearse", "run"}:
@@ -513,13 +522,19 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "rehearse":
             # The kickoff and read-back on the rehearsal's own never-issued token.
             sub.add_argument("--kickoff", action="store_true")
+            # Three unpaid kickoffs: one DM, none more, then one more after replace.
+            sub.add_argument("--grant-notice", action="store_true")
         if name == "run":
             # The item's ledger across attempts: its cap and what earlier attempts were
             # charged, both from the caller's approval.
             sub.add_argument("--item-cap", type=int, required=True)
             sub.add_argument("--item-charged-before", type=int, required=True)
         if name == "judge":
-            sub.add_argument("--criterion", required=True, choices=[*sks.CRITERIA, "all"])
+            sub.add_argument(
+                "--criterion",
+                required=True,
+                choices=[*sks.CRITERIA, "grant-notice", "refusal-connect", "all"],
+            )
     return parser
 
 
@@ -1555,6 +1570,18 @@ def live_inputs(inputs: Inputs, args: argparse.Namespace) -> Inputs:
     return with_slack(with_app(with_install(with_cluster(inputs, args), args), args), args)
 
 
+def cmd_refusal_connect(args: argparse.Namespace, runtime: Runtime) -> int:
+    inputs = live_inputs(base_inputs(args), args)
+    ledger = sks.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
+    try:
+        ledger.ensure_run(inputs.candidate, phase="refusal-connect")
+        ledger.mark_live_kind("refusal-connect")
+    except sks.Refusal:
+        ledger.close()
+        raise
+    return RefusalConnectRun(inputs=inputs, runtime=runtime, ledger=ledger, ceiling=None).execute()
+
+
 def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
     inputs = base_inputs(args)
     ceiling = sks.parse_ceiling(args.approve_live)
@@ -1580,9 +1607,12 @@ def cmd_rehearse(args: argparse.Namespace, runtime: Runtime) -> int:
     ``--kickoff`` adds the kickoff and read-back, enrolled with the rehearsal's own
     never-issued token so nothing can be spent: the ceiling is ``--approve-live``
     and the live window ends at ``--grant-expires-at``, both required with it and
-    refused without it. ``--grant-file`` is refused either way.
+    refused without it. ``--grant-file`` is refused either way. ``--grant-notice``
+    is the unpaid rejected-plan leg and takes neither the ceiling nor a grant file.
     """
 
+    if args.kickoff and args.grant_notice:
+        raise sks.Refusal("arguments_invalid", "rehearse takes one of --kickoff or --grant-notice")
     supplied = [
         flag
         for flag, value, allowed in (
@@ -1620,6 +1650,7 @@ def cmd_rehearse(args: argparse.Namespace, runtime: Runtime) -> int:
         ledger=ledger,
         ceiling=ceiling,
         kickoff_diagnostic=ceiling is not None,
+        grant_notice=args.grant_notice,
     ).execute()
 
 
@@ -1659,6 +1690,10 @@ class RunnerPod:
 class LiveRun:
     """Explicit phases; a LIFO finalizer registered before each resource is created."""
 
+    # object.__new__ skips __init__, and the unpaid refusal run is built that way.
+    # The default keeps phases() defined and leaves that leg off the grant path.
+    grant_notice = False
+
     def __init__(
         self,
         *,
@@ -1669,6 +1704,7 @@ class LiveRun:
         shell: Shell | None = None,
         resolver: Callable[[str], list[str]] | None = None,
         kickoff_diagnostic: bool = False,
+        grant_notice: bool = False,
     ) -> None:
         self.inputs = inputs
         self.runtime = runtime
@@ -1676,6 +1712,7 @@ class LiveRun:
         self.ceiling = ceiling
         # ``rehearse --kickoff``: the run path's kickoff on the rehearsal's invalid token.
         self.kickoff_diagnostic = kickoff_diagnostic
+        self.grant_notice = grant_notice
         self.rehearsal = ceiling is None or kickoff_diagnostic
         self.command = "rehearse" if self.rehearsal else "run"
         self.clock = runtime.clock
@@ -1744,11 +1781,10 @@ class LiveRun:
         self.deadline_fired: set[str] = set()
         self.deadline_processes: list[subprocess.Popen[bytes]] = []
         # The claim-pod follower's thread. ``follow_lock`` guards ``pods``, ``processes``
-        # appends from stream threads, ``present_pods`` and ``terminations``.
+        # appends from stream threads and ``terminations``.
         self.follow_lock = threading.Lock()
         self.follow_stop = threading.Event()
         self.follow_thread: threading.Thread | None = None
-        self.present_pods: set[str] = set()
         self.terminations: dict[tuple[str, str, str], dict[str, Any]] = {}
         # Branch to this run's published head; an empty head means ownership is unproved.
         self.publication_branches: dict[str, str] = {}
@@ -1776,7 +1812,9 @@ class LiveRun:
             ("enroll", self.phase_enroll),
             ("fixtures", self.phase_fixtures),
         ]
-        if not self.rehearsal or self.kickoff_diagnostic:
+        if self.grant_notice:
+            phases.append(("grant-notice", self.phase_grant_notice))
+        elif not self.rehearsal or self.kickoff_diagnostic:
             phases += [("kickoff", self.phase_kickoff), ("read-back", self.phase_read_back)]
         phases.append(("control", self.phase_control))
         if self.rehearsal:
@@ -2466,10 +2504,7 @@ class LiveRun:
             timeout=900,
         )
         self.curie.run("surfaces", self.agent, "--add", f"github={repo}")
-        self.finalizer.register("close-run-pulls", self.close_run_pulls)
-        self.finalizer.register("delete-run-branches", self.delete_run_branches)
-        # Registered last so it runs first, while the api and database are still up.
-        self.finalizer.register("recover-publications", self.recover_publications)
+        self.register_publication_cleanup()
         self.policy_set = True
         self.configure_agent()
         agents = self.sql(f"SELECT id, tenant_id FROM curie.agents WHERE name = '{self.agent}'")
@@ -2601,7 +2636,7 @@ class LiveRun:
         return sks.sql_uuid(found["id"])
 
     def seed_slack_link(self, namespace_id: str, sender_user: str, principal_id: str) -> None:
-        """Setup, not the proved path: no API creates a Slack link, so it is seeded by SQL.
+        """Seed the sender link for setup; account confirmation is proved separately.
 
         The sender bot user is mapped ``admin_mapped`` to the OIDC principal, the
         way #5375 seeds its principal; every value is validated before it is
@@ -2891,6 +2926,7 @@ class LiveRun:
         self.ledger.record("progress", "expected_thread", expected_thread)
         self.wait_until(self.admitted, seconds=ADMISSION_SECONDS, what="the kickoff admission")
         self.record_admission()
+        self.record_placeholder(kit, ts)
 
     def run_grant_probe(self) -> None:
         """Right before the first reservation, recorded under grant_probe before it runs."""
@@ -2977,6 +3013,33 @@ class LiveRun:
         self.ledger.record("admission", "thread", thread)
         self.ledger.record("owner", "work_item_owner", sks.owner_tuple(items[0] if items else None))
         self.ledger.record("owner", "request_owners", [sks.owner_tuple(row) for row in requests])
+
+    def record_placeholder(self, kit: SlackKit, root_ts: str) -> None:
+        """The dispatcher's placeholder: the first reply by Curie under the kickoff mention.
+
+        The progress card edits this message in place, so its ts is the card's ts.
+        Read before the run progresses; None when the dispatcher posted none.
+        """
+
+        found: dict[str, str | None] = {"ts": None}
+
+        def placeholder_seen() -> bool:
+            for message in sks.thread_replies(kit.sender.replies(kit.channel, root_ts), root_ts):
+                if message.get("user") == kit.curie_auth.user_id:
+                    found["ts"] = str(message["ts"])
+                    return True
+            return False
+
+        with contextlib.suppress(StepFailed):
+            self.wait_until(placeholder_seen, seconds=PLACEHOLDER_SECONDS, what="the placeholder")
+        self.ledger.record("progress", "placeholder_ts", found["ts"])
+
+    def card_row(self) -> dict[str, Any]:
+        rows = self.sql(
+            "SELECT card_ts, requester_slack_user FROM curie.factory_slack_threads "
+            f"WHERE work_item_id = '{self.work_item_id}'"
+        )
+        return rows[0] if len(rows) == 1 else {}
 
     def slack_thread(self) -> dict[str, Any] | None:
         rows = self.sql(
@@ -3327,8 +3390,8 @@ class LiveRun:
         """Read one stream into a runner container, respawning it while it exits silently.
 
         A ``kubectl exec`` or ``logs -f`` started before the container runs exits
-        with nothing on stdout. While the pod still exists (in the follower's
-        latest listing) the command is respawned every STREAM_RETRY_SECONDS, for
+        with nothing on stdout. While a fresh API listing contains the same pod UID,
+        the command is respawned every STREAM_RETRY_SECONDS, for
         at most STREAM_RETRY_LIMIT, so an early stream still connects and a
         container that already terminated still returns its logs. A stream that
         produced output is not respawned, and none is once the follower stops.
@@ -3336,7 +3399,7 @@ class LiveRun:
         """
 
         until = self.clock.monotonic() + STREAM_RETRY_LIMIT
-        while True:
+        while not self.follow_stop.is_set() and self.clock.monotonic() < until:
             try:
                 process = self.shell.spawn(argv)
             except Exception:  # noqa: BLE001 - the main-thread watchdog still bounds the attempt
@@ -3356,18 +3419,20 @@ class LiveRun:
             for line in process.stdout if process.stdout is not None else ():
                 produced = True
                 on_line(line)
-            if (
-                produced
-                or self.follow_stop.is_set()
-                or self.clock.monotonic() >= until
-                or not self.pod_present(observed.uid)
-            ):
+            if produced or self.follow_stop.is_set() or self.clock.monotonic() >= until:
                 return
+            try:
+                if not self.pod_present(observed.uid):
+                    return
+            except (StepFailed, OSError, subprocess.SubprocessError):
+                pass
             self.clock.wait(STREAM_RETRY_SECONDS)
 
     def pod_present(self, uid: str) -> bool:
-        with self.follow_lock:
-            return uid in self.present_pods
+        listing = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL, timeout=FOLLOW_GET_SECONDS)
+        return any(
+            (pod.get("metadata") or {}).get("uid") == uid for pod in listing.get("items") or []
+        )
 
     # -- the claim-pod follower ---------------------------------------------------------
 
@@ -3400,8 +3465,6 @@ class LiveRun:
 
         listing = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL, timeout=FOLLOW_GET_SECONDS)
         items = [pod for pod in (listing or {}).get("items") or [] if isinstance(pod, dict)]
-        with self.follow_lock:
-            self.present_pods = {str((pod.get("metadata") or {}).get("uid") or "") for pod in items}
         for pod in items:
             if self.follow_stop.is_set():
                 return
@@ -3815,15 +3878,26 @@ class LiveRun:
     def phase_read_back(self) -> None:
         kit = self.require_kit()
 
-        def terminal_settled() -> bool:
+        def notify_settled() -> bool:
             rows = self.post_rows()
-            return any(row.get("kind") == sks.TERMINAL_POST for row in rows) and all(
-                row.get("posted") or row.get("failed") for row in rows
-            )
+            return any(
+                row.get("kind") in (sks.READY_POST, sks.NEEDS_PERSON_POST) for row in rows
+            ) and all(row.get("posted") or row.get("failed") for row in rows)
+
+        def card_settled() -> bool:
+            card_ts = self.card_row().get("card_ts")
+            for message in kit.sender.replies(kit.channel, self.kickoff_ts):
+                if card_ts and message.get("ts") == card_ts:
+                    return sks.card_header(message) in sks.CARD_TERMINAL_HEADERS
+            return False
 
         with contextlib.suppress(StepFailed):
             self.wait_until(
-                terminal_settled, seconds=TERMINAL_POST_SECONDS, what="the terminal post", every=5
+                notify_settled, seconds=NOTIFY_POST_SECONDS, what="the notify reply", every=5
+            )
+        with contextlib.suppress(StepFailed):
+            self.wait_until(
+                card_settled, seconds=CARD_SETTLE_SECONDS, what="the finished card", every=5
             )
         rows = self.post_rows()
         messages = kit.sender.replies(kit.channel, self.kickoff_ts)
@@ -3832,10 +3906,15 @@ class LiveRun:
             f"p.execution_request_id = r.id WHERE r.work_item_id = '{self.work_item_id}'"
         )
         pull_request = False
+        pull_request_url: str | None = None
         for row in publications:
             record = self.publication(sks.sql_uuid(row.get("id")))
             self.track_publication(record)
             pull_request = pull_request or bool(record.get("pr_number") or record.get("pr_url"))
+            if pull_request_url is None and record.get("pr_url"):
+                pull_request_url = str(record["pr_url"])
+        card = self.card_row()
+        bot_user, sender_user = kit.curie_auth.user_id, kit.sender_auth.user_id
         self.ledger.record("progress", "thread", self.slack_thread())
         self.ledger.record(
             "progress",
@@ -3859,16 +3938,203 @@ class LiveRun:
         self.ledger.record(
             "progress", "root_posts", sum(1 for row in rows if row.get("kind") == sks.ROOT_POST)
         )
+        self.ledger.record("progress", "card_ts", card.get("card_ts"))
+        self.ledger.record("progress", "requester_slack_user", card.get("requester_slack_user"))
+        self.ledger.record("progress", "bot_user", bot_user)
+        self.ledger.record("progress", "sender_user", sender_user)
         self.ledger.record(
             "progress",
-            "kickoff_reply_outcome",
-            sks.reply_outcome(messages, author=kit.curie_auth.user_id),
+            "thread_replies",
+            [
+                {
+                    "ts": message.get("ts"),
+                    "user": message.get("user"),
+                    "text": message.get("text"),
+                    "blocks": message.get("blocks"),
+                }
+                for message in sks.thread_replies(messages, self.kickoff_ts)
+            ],
         )
+        self.ledger.record("progress", "pull_request_url", pull_request_url)
         self.ledger.record("progress", "pull_request_exists", pull_request)
+        # The judge prints this dump (`judge --criterion progress`) for the PR body.
+        self.ledger.record(
+            "progress",
+            "thread_dump",
+            sks.anonymize_thread(
+                messages,
+                root_ts=self.kickoff_ts,
+                roles={sender_user: "SENDER", bot_user: "CURIE"},
+            ),
+        )
 
     def publication(self, publication_id: str) -> dict[str, Any]:
         value = self.require_api().get(f"/publications/{publication_id}")
         return value if isinstance(value, dict) else {}
+
+    # -- phase: rejected-plan direct message (#5720) ----------------------------------------
+
+    def phase_grant_notice(self) -> None:
+        """Three unpaid kickoffs on a never-issued token.
+
+        The first rejection posts one DM. A second kickoff at the same generation
+        posts none. ``subscription replace`` with another never-issued token, then
+        a third kickoff, posts exactly one more. The button URL ends at the
+        Claude plan page.
+        """
+
+        kit = self.require_kit()
+        first = self.issues["a"]
+        second = self._open_grant_issue("grant-same")
+        first_key = self._grant_issue_key(first)
+        second_key = self._grant_issue_key(second)
+        self._post_grant_kickoff(kit, first)
+        self._wait_rejected_grant(int(first["number"]))
+        opened = self._wait_grant_dms(kit, 1, [first_key])
+        self.ledger.record("grant-notice", "dm_count_after_first", opened["count"])
+        self.ledger.record("grant-notice", "first_text_ok", opened["text_ok"])
+        self.ledger.record("grant-notice", "first_button_ok", opened["button_url_ok"])
+
+        self._post_grant_kickoff(kit, second)
+        self._wait_rejected_grant(int(second["number"]))
+        held = self._hold_grant_dm_count(kit, int(opened["count"]), [first_key, second_key])
+        self.ledger.record("grant-notice", "dm_count_after_second", held["count"])
+        self.ledger.record("grant-notice", "second_settled", held["count"] == opened["count"])
+
+        generation = self.owner.get("generation")
+        token_file = self._never_issued_token("grant-notice-replace")
+        code, _body = self.subscription("replace", "--token-file", str(token_file))
+        _status_code, status = self.subscription("status")
+        replaced = status.get("generation")
+        if code != 0 or type(replaced) is not int or replaced == generation:
+            raise StepFailed("subscription replace did not move the generation")
+        third = self._open_grant_issue("grant-replaced")
+        third_key = self._grant_issue_key(third)
+        self._post_grant_kickoff(kit, third)
+        self._wait_rejected_grant(int(third["number"]))
+        again = self._wait_grant_dms(
+            kit, int(opened["count"]) + 1, [first_key, third_key], counted=[second_key]
+        )
+        self.ledger.record("grant-notice", "dm_count_after_replace", again["count"])
+        self.ledger.record("grant-notice", "replace_text_ok", again["text_ok"])
+        self.ledger.record("grant-notice", "replace_button_ok", again["button_url_ok"])
+
+    def _open_grant_issue(self, label: str) -> dict[str, Any]:
+        forge = self.require_forge()
+        body = FIXTURE_ISSUE.read_text().replace("{nonce}", f"{self.nonce}-{label}")
+        title_match = _ISSUE_TITLE.match(body.splitlines()[0])
+        title = f"{title_match.group(1) if title_match else 'Fixture'} ({label})"
+        issue = forge.call(
+            "POST", forge.repo_path("/issues"), {"title": title, "body": body}, ok=(201,)
+        )
+        number = issue.get("number") if isinstance(issue, dict) else None
+        url = issue.get("html_url") if isinstance(issue, dict) else None
+        if not isinstance(number, int) or not isinstance(url, str):
+            raise StepFailed("a grant-notice issue was not created")
+        planted = {"number": number, "url": url}
+        self.issues[label] = planted
+        return planted
+
+    def _post_grant_kickoff(self, kit: SlackKit, issue: Mapping[str, Any]) -> str:
+        url = issue.get("url")
+        if not isinstance(url, str):
+            raise StepFailed("a grant-notice issue has no url")
+        ts = kit.sender.post(kit.channel, sks.kickoff_text(kit.curie_auth.user_id, url))
+        self.roots.append(ts)
+        return ts
+
+    def _wait_rejected_grant(self, number: int) -> None:
+        wanted = str(number)
+
+        def rejected() -> bool:
+            for item in self.work_item_rows():
+                if str(item.get("tracker_issue_id")) != wanted:
+                    continue
+                self.work_item_id = str(item.get("id") or "")
+                rows = self.request_rows()
+                if not rows:
+                    return False
+                latest = rows[-1]
+                return (
+                    latest.get("terminal") is True
+                    and latest.get("terminal_cause") == sks.AUTH_TERMINAL_CAUSE
+                )
+            return False
+
+        self.wait_until(
+            rejected,
+            seconds=GRANT_NOTICE_TERMINAL_SECONDS + ADMISSION_SECONDS,
+            what=f"issue {number} rejected the grant",
+            every=5,
+        )
+
+    def _grant_issue_key(self, issue: Mapping[str, Any]) -> str:
+        number = issue.get("number")
+        if not isinstance(number, int):
+            raise StepFailed("a grant-notice issue has no number")
+        return f"#{number}"
+
+    def _grant_issue_keys(self) -> list[str]:
+        keys: list[str] = []
+        for issue in self.issues.values():
+            number = issue.get("number") if isinstance(issue, dict) else None
+            if isinstance(number, int):
+                keys.append(f"#{number}")
+        return keys
+
+    def _grant_dm_facts(
+        self, kit: SlackKit, expected: Sequence[str], *, counted: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        messages = kit.curie.direct_history(kit.sender_auth.user_id)
+        return sks.grant_notice_facts(messages, expected=expected, counted=counted)
+
+    def _wait_grant_dms(
+        self,
+        kit: SlackKit,
+        minimum: int,
+        expected: Sequence[str],
+        *,
+        counted: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        found: dict[str, Any] = {}
+
+        def ready() -> bool:
+            found.update(self._grant_dm_facts(kit, expected, counted=counted))
+            return (
+                int(found.get("count") or 0) >= minimum
+                and found.get("text_ok") is True
+                and found.get("button_url_ok") is True
+            )
+
+        self.wait_until(
+            ready,
+            seconds=GRANT_NOTICE_DM_SECONDS,
+            what="the rejected-plan direct message",
+            every=5,
+        )
+        return found
+
+    def _hold_grant_dm_count(
+        self, kit: SlackKit, expected_count: int, expected: Sequence[str]
+    ) -> dict[str, Any]:
+        deadline = self.clock.monotonic() + GRANT_NOTICE_QUIET_SECONDS
+        last: dict[str, Any] = {}
+        while True:
+            last = self._grant_dm_facts(kit, expected)
+            if int(last.get("count") or 0) != expected_count:
+                raise StepFailed("a same-generation kickoff posted another grant notice")
+            if self.clock.monotonic() >= deadline:
+                return last
+            self.clock.wait(5)
+
+    def _never_issued_token(self, name: str) -> Path:
+        """A well-formed token that was never issued. The value stays in the file."""
+
+        invalid = self.scrubber.hold(sks.HeldSecret("sk-ant-oat01-" + secrets.token_urlsafe(72)))
+        path = self.inputs.work_dir / name
+        write_private(path, invalid.reveal().encode() + b"\n")
+        self.finalizer.register(f"remove-{name}", lambda: path.unlink(True))
+        return path
 
     # -- phase: the disconnected control ----------------------------------------------------
 
@@ -3903,14 +4169,16 @@ class LiveRun:
             kit.channel, sks.kickoff_text(kit.curie_auth.user_id, self.issues["b"]["url"])
         )
         self.roots.append(ts)
-        self.observe_delivery("control", ts)
+        receipt = self.observe_delivery("control", ts)
         outcome: dict[str, str | None] = {"code": None}
 
         def replied() -> bool:
-            outcome["code"] = sks.reply_outcome(
-                kit.sender.replies(kit.channel, ts), author=kit.curie_auth.user_id
+            public = sks.connect_plan_public_reply(
+                kit.sender.replies(kit.channel, ts), root_ts=ts, author=kit.curie_auth.user_id
             )
-            return outcome["code"] is not None
+            ack = self.private_refusal_ack(receipt, sks.ENROLLMENT_INACTIVE)
+            outcome["code"] = sks.ENROLLMENT_INACTIVE if public and ack else None
+            return public and bool(ack)
 
         with contextlib.suppress(StepFailed):
             self.wait_until(replied, seconds=REPLY_SECONDS, what="the control reply", every=3)
@@ -3930,6 +4198,24 @@ class LiveRun:
             )
         self.ledger.record("refusal", "after", after)
         self.ledger.record("refusal", "control_native_sessions", new_pods)
+
+    def private_refusal_ack(
+        self, receipt: sks.SlackMentionReceipt | None, outcome: str
+    ) -> str | None:
+        if receipt is None:
+            return None
+        result = self.kube.ctl(
+            "logs",
+            "-l",
+            self.worker_selector,
+            "--tail=5000",
+            "--prefix=false",
+            "--all-containers=true",
+            timeout=60,
+        )
+        return sks.connect_plan_private_ack(
+            result.stdout, delivery_id=receipt.delivery_id, outcome=outcome
+        )
 
     def phase_fence_rehearsal(self) -> None:
         self.fence_paid_starts()
@@ -3981,6 +4267,11 @@ class LiveRun:
 
     # -- cleanup steps ------------------------------------------------------------------------
 
+    def register_publication_cleanup(self) -> None:
+        self.finalizer.register("delete-run-branches", self.delete_run_branches)
+        self.finalizer.register("close-run-pulls", self.close_run_pulls)
+        self.finalizer.register("recover-publications", self.recover_publications)
+
     def close_run_pulls(self) -> None:
         """Close an open pull request only while its head is this run's published commit."""
 
@@ -4004,9 +4295,14 @@ class LiveRun:
                 if str((pull.get("head") or {}).get("sha")) != head:
                     skipped += 1
                     continue
-                forge.call(
-                    "PATCH", forge.repo_path(f"/pulls/{pull.get('number')}"), {"state": "closed"}
-                )
+                path = forge.repo_path(f"/pulls/{pull.get('number')}")
+                status, _ = forge.request("PATCH", path, {"state": "closed"})
+                if status == 422:
+                    current = forge.call("GET", path)
+                    if sks.closed_unmerged_pull(current):
+                        continue
+                if status != 200:
+                    raise StepFailed(f"forge PATCH returned {status}")
         if skipped:
             raise StepFailed(
                 "an open run pull request is not provably at this run's commit; left open"
@@ -4060,10 +4356,35 @@ class LiveRun:
                 else:
                     foreign += 1
             kit.sender.delete(kit.channel, root)
+        self._delete_grant_dms(kit)
         if foreign:
             raise StepFailed("a thread holds a message the run did not post; left in place")
         if not self.slack_messages_absent():
             raise StepFailed("a run message is still present")
+
+    def _delete_grant_dms(self, kit: SlackKit) -> None:
+        """Delete the rejected-plan DMs this run posted. The bot can delete its own."""
+
+        keys = self._grant_issue_keys()
+        if not keys:
+            return
+        channel_id, messages = kit.curie.direct_conversation(kit.sender_auth.user_id)
+        if not channel_id:
+            return
+        for stamp in sks.grant_dm_timestamps(
+            messages, author=kit.curie_auth.user_id, issue_keys=keys
+        ):
+            kit.curie.delete(channel_id, stamp)
+
+    def _grant_dms_absent(self) -> bool:
+        kit = self.kit
+        if kit is None:
+            return True
+        keys = self._grant_issue_keys()
+        if not keys:
+            return True
+        _channel, messages = kit.curie.direct_conversation(kit.sender_auth.user_id)
+        return not sks.grant_dm_timestamps(messages, author=kit.curie_auth.user_id, issue_keys=keys)
 
     def slack_messages_absent(self) -> bool:
         kit = self.require_kit()
@@ -4078,7 +4399,7 @@ class LiveRun:
                 raise
             if any(message.get("ts") != root for message in messages):
                 return False
-        return True
+        return self._grant_dms_absent()
 
     # -- finalizer inventory ------------------------------------------------------------------
 
@@ -4168,6 +4489,101 @@ class LiveRun:
         return True
 
 
+class RefusalConnectRun(LiveRun):
+    """Both private refusal legs on a fresh install, without enrolling a grant."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.command = "refusal-connect"
+        self.origins = dataclasses.replace(
+            self.origins, redirect_uri=self.origins.redirect_uri.replace("http://", "https://", 1)
+        )
+
+    def phases(self) -> list[tuple[str, Callable[[], None]]]:
+        phases = super().phases()
+        return [
+            pair
+            for pair in phases
+            if pair[0]
+            in {
+                "refusals",
+                "registry",
+                "images",
+                "namespaces",
+                "dex",
+                "install",
+                "setup",
+                "fixtures",
+            }
+        ] + [("refusal-connect", self.phase_refusal_connect)]
+
+    def phase_refusal_connect(self) -> None:
+        kit = self.require_kit()
+        namespace_id = self.await_slack_namespace(kit.curie_auth.team_id)
+        user = sks.require_slack_id(kit.sender_auth.user_id, "user")
+        self.sql_write(
+            "UPDATE curie.identity_links SET revoked_at=now() "
+            f"WHERE identity_namespace_id='{namespace_id}' AND provider_native_id='{user}' "
+            "AND revoked_at IS NULL;"
+        )
+        dumps: list[dict[str, Any]] = []
+        for code, issue in (("sender_unverified", "a"), ("enrollment_inactive", "b")):
+            before = self.counts()
+            ts = kit.sender.post(
+                kit.channel, sks.kickoff_text(kit.curie_auth.user_id, self.issues[issue]["url"])
+            )
+            self.roots.append(ts)
+            receipt = self.observe_delivery(code, ts)
+            observed: dict[str, Any] = {}
+
+            def settled(
+                ts: str = ts,
+                receipt: sks.SlackMentionReceipt | None = receipt,
+                code: str = code,
+                observed: dict[str, Any] = observed,
+            ) -> bool:
+                messages = kit.sender.replies(kit.channel, ts)
+                ack = self.private_refusal_ack(receipt, code)
+                public = sks.connect_plan_public_reply(
+                    messages, root_ts=ts, author=kit.curie_auth.user_id
+                )
+                observed.update(message_ts=ack, public_placeholder_only=public)
+                return public and bool(ack)
+
+            self.wait_until(
+                settled, seconds=REPLY_SECONDS, what="the private plan refusal", every=3
+            )
+            observed.update(before=before, after=self.counts())
+            self.ledger.record("refusal-connect", code, observed)
+            dumps.append(
+                {
+                    "outcome": code,
+                    "messages": sks.anonymize_thread(
+                        kit.sender.replies(kit.channel, ts),
+                        root_ts=ts,
+                        roles={kit.sender_auth.user_id: "SENDER", kit.curie_auth.user_id: "CURIE"},
+                    ),
+                }
+            )
+            if code == "sender_unverified":
+                rows = self.sql(
+                    "SELECT count(*) AS n, count(slack_display_name) AS named "
+                    "FROM curie.identity_connect_tokens "
+                    f"WHERE identity_namespace_id='{namespace_id}' AND provider_native_id='{user}' "
+                    "AND consumed_at IS NULL AND expires_at > now()"
+                )
+                self.ledger.record(
+                    "refusal-connect", "live_sender_tokens", rows[0].get("n") if rows else None
+                )
+                self.ledger.record(
+                    "refusal-connect",
+                    "live_sender_tokens_with_display_name",
+                    rows[0].get("named") if rows else None,
+                )
+                self.seed_slack_link(namespace_id, user, str(self.owner["principal_id"]))
+        self.ledger.record("refusal-connect", "thread_dump", dumps)
+
+
 # Sent into the runner container at a fence: SIGINT to each native CLI process,
 # the same interrupt a terminal gives it, before the pod is deleted.
 INTERRUPT_PROGRAM = r"""
@@ -4198,6 +4614,7 @@ COMMANDS: dict[str, Callable[[argparse.Namespace, Runtime], int]] = {
     "slack-probe": cmd_slack_probe,
     "preflight": cmd_preflight,
     "rehearse": cmd_rehearse,
+    "refusal-connect": cmd_refusal_connect,
     "run": cmd_run,
     "judge": cmd_judge,
 }

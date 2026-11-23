@@ -3652,6 +3652,71 @@ export const commandManifest = {
           "name": "publication-policy"
         },
         {
+          "about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Post progress to this Slack channel id (public C..., private G...)",
+              "id": "slack_channel",
+              "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the configured progress channel",
+              "id": "no_slack_channel",
+              "long": "no-slack-channel",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie local surfaces <agent> --add slack=<CHANNEL_ID>` (when another agent already holds the default Slack identity on that channel, add it under a free declared identity with `--adapter <identity>`), or, when the channel is bound under several identities, remove the extra with `curie local surfaces <agent> --remove slack=<CHANNEL_ID> --adapter <identity>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears the configured progress channel: the progress lane stops rooting runs there and stops replying and editing cards in the threads it already rooted. A thread that a Slack kickoff started keeps its own progress either way.",
+          "name": "factory-progress"
+        },
+        {
           "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",
           "args": [
             {
@@ -5671,6 +5736,64 @@ export const commandManifest = {
           "name": "status"
         },
         {
+          "about": "Open loopback port-forwards to the Console and Langfuse of a release whose services are ClusterIP (`cluster up --no-expose`, and what `factory quickstart` installs). Runs in the foreground; the forwards exist only while it runs. Press Ctrl-C to stop them",
+          "args": [
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Local port for the Console. Default: derived from the service port the way `cluster status` names it (18080 for the default UI port)",
+              "id": "ui_port",
+              "long": "ui-port",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Local port for Langfuse. Default: 23000, the port the chart's Langfuse sign-in URL (`langfuse.nextauthUrl`) names",
+              "id": "langfuse_port",
+              "long": "langfuse-port",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the commands that would run and exit without executing",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "access"
+        },
+        {
           "about": "Show the release's observability surfaces (Curie Console + Langfuse traces/cost + API base)",
           "args": [
             {
@@ -6105,6 +6228,18 @@ export const commandManifest = {
               "possible_values": [
                 "poll",
                 "webhook"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Select the installation's model auth mode (factory.modelAuthMode): service or personal. Personal needs the Kubernetes sandbox substrate. Given alone, it writes only the mode and leaves intake as recorded. Omit to keep the recorded mode",
+              "id": "model_auth_mode",
+              "long": "model-auth-mode",
+              "positional": false,
+              "possible_values": [
+                "service",
+                "personal"
               ],
               "required": false
             },
@@ -7145,6 +7280,18 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Let the agent propose memory rules on or off (`memory_rule_proposals`, #5796, #5801). A factory run reads it at its next request's completion contract; any other agent at its next session in a channel, where it also needs --memory-writes on. A person still accepts any proposed rule; the agent never activates one itself",
+              "id": "memory_rule_proposals",
+              "long": "memory-rule-proposals",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -7325,6 +7472,94 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "Read or set one agent's publication policy (`PATCH /agents/{id}`).\n\nWith no change flags this inspects. `approve` is the default and keeps the human gate. `auto` lets the platform resolve that same approval.",
           "name": "publication-policy"
+        },
+        {
+          "about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Post progress to this Slack channel id (public C..., private G...)",
+              "id": "slack_channel",
+              "long": "slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the configured progress channel",
+              "id": "no_slack_channel",
+              "long": "no-slack-channel",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>` (when another agent already holds the default Slack identity on that channel, add it under a free declared identity with `--adapter <identity>`), or, when the channel is bound under several identities, remove the extra with `curie cluster surfaces <agent> --remove slack=<CHANNEL_ID> --adapter <identity>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears the configured progress channel: the progress lane stops rooting runs there and stops replying and editing cards in the threads it already rooted. A thread that a Slack kickoff started keeps its own progress either way.",
+          "name": "factory-progress"
         },
         {
           "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",
@@ -9086,6 +9321,86 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "List learned rules (`GET /agents/{id}/memory/rules`)",
+              "id": "rules",
+              "long": "rules",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "With --rules, show only rules in this state: proposed, accepted, rejected or removed",
+              "id": "rule_state",
+              "long": "rule-state",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "With --rules, show only rules of this exact scope key",
+              "id": "scope_key",
+              "long": "scope-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "With --rules, show only the agent scope rules (not a channel's or a repository's). `--channel KIND=ADDRESS` with --rules selects one bound channel instead",
+              "id": "agent_scope",
+              "long": "agent-scope",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Accept this proposed rule. With --channel KIND=ADDRESS or --agent-scope the rule must be in that scope or nothing is sent. Needs --expected-version and --session-file",
+              "id": "accept",
+              "long": "accept",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Reject this proposed rule. Needs --expected-version and --session-file",
+              "id": "reject",
+              "long": "reject",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove this accepted rule. Needs --expected-version and --session-file",
+              "id": "remove",
+              "long": "remove",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Version of the rule to change, as `--rules` reports it",
+              "id": "expected_version",
+              "long": "expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session. Used by --accept, --reject and --remove, which never send the platform key. With --rules it lists with the session instead of the platform key",
+              "id": "session_file",
+              "long": "session-file",
+              "positional": false,
               "required": false
             }
           ],
@@ -11172,35 +11487,6 @@ export const commandManifest = {
                   "help": "Directory to write the bundle into. Must not exist or be empty",
                   "id": "out",
                   "long": "out",
-                  "positional": false,
-                  "required": true
-                }
-              ],
-              "hidden": false,
-              "name": "render"
-            }
-          ]
-        },
-        {
-          "about": "Work with the factory-triage example bundle",
-          "hidden": false,
-          "name": "factory-triage",
-          "subcommands": [
-            {
-              "about": "Render an offline investigation bundle into a new or empty directory",
-              "args": [
-                {
-                  "global": false,
-                  "id": "out",
-                  "long": "out",
-                  "positional": false,
-                  "required": true
-                },
-                {
-                  "global": false,
-                  "help": "Another agent's implementation trigger label on the same repository",
-                  "id": "implementation_label",
-                  "long": "implementation-label",
                   "positional": false,
                   "required": true
                 }

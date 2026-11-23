@@ -83,6 +83,7 @@ def test_exactly_one_skill_without_allowed_tools() -> None:
 
 PHASES = [
     "read_issue",
+    "investigate",
     "pin_criteria",
     "plan",
     "plan_review",
@@ -109,12 +110,42 @@ def test_progress_declaration_defines_ordered_phases_labels_loops_and_stages() -
         {"start": "implement", "review": "wait_ci", "cap": 3},
     ]
     assert declared["stages"] == [
-        {"id": "plan", "label": "Plan", "phases": ["read_issue", "pin_criteria", "plan"]},
-        {"id": "plan_review", "label": "Plan review", "phases": ["plan_review"]},
-        {"id": "implement", "label": "Implement", "phases": ["failing_test", "implement"]},
-        {"id": "review_diff", "label": "Review diff", "phases": ["review_diff", "publish"]},
-        {"id": "wait_ci", "label": "Wait for CI", "phases": ["wait_ci"]},
+        {"id": "read_issue", "label": "Reading the issue", "phases": ["read_issue"]},
+        {"id": "investigate", "label": "Investigating the ticket", "phases": ["investigate"]},
+        {"id": "plan", "label": "Planning the change", "phases": ["pin_criteria", "plan"]},
+        {"id": "plan_review", "label": "Reviewing the plan", "phases": ["plan_review"]},
+        {"id": "implement", "label": "Writing the change", "phases": ["failing_test", "implement"]},
+        {"id": "review_diff", "label": "Reviewing the diff", "phases": ["review_diff"]},
+        {"id": "publish", "label": "Opening the pull request", "phases": ["publish"]},
+        {"id": "wait_ci", "label": "Waiting for CI", "phases": ["wait_ci"]},
     ]
+
+
+def test_the_skill_walks_the_declared_phases_with_investigate_after_read_issue() -> None:
+    """The skill names ten phases in the declared order, each reported on entry."""
+    declared = [phase["id"] for phase in _phase_declaration()["phases"]]
+    assert declared == PHASES
+    assert len(declared) == 10
+    assert declared[: declared.index("pin_criteria")] == ["read_issue", "investigate"]
+    _, body = _skill_parts()
+    flat = _flat(body)
+    phases_section = flat.split("## Phases", 1)[1].split("Call `mcp__curie__report_progress`", 1)[0]
+    assert "walks ten phases" in phases_section
+    assert re.findall(r"`([a-z_]+)`", phases_section)[: len(PHASES)] == PHASES
+    headings = re.findall(r"^## \d+\. .*\(phase `([a-z_]+)`", body, re.MULTILINE)
+    assert headings == PHASES
+    for phase in PHASES:
+        if phase == "wait_ci":
+            continue
+        assert f"Call report_progress with phase `{phase}`" in flat or (
+            f"Call `mcp__curie__report_progress` with phase `{phase}`" in flat
+        ), phase
+    (stage,) = [s for s in _phase_declaration()["stages"] if s["id"] == "investigate"]
+    assert stage == {
+        "id": "investigate",
+        "label": "Investigating the ticket",
+        "phases": ["investigate"],
+    }
 
 
 def test_evals_are_falsifiable() -> None:

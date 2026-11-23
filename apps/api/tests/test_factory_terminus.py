@@ -43,12 +43,10 @@ from curie_api.factory_notices import (
     STATE_LABELS,
     cause_text,
     result_section,
-    status_body,
 )
 from curie_api.forges.registry import forges_registry
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_api.workitem_reconciler import WorkItemReconciler
-from curie_internal.factory_triage import HandoffOutcome, TriageResult, status_comment_text
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from forge_fakes import factory_wake
 from forge_fakes.github import INSTALLATION_ID, LABEL, REPO, REPO_ID, GitHubAPI, _issue_event, _post
@@ -124,121 +122,11 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "merge_conflict",
         "pr_closed",
         "ci_fix_unpublished",
-        "tracker_result",
-        "no_tracker_result",
-        "tracker_result_undelivered",
     ],
 )
 def test_every_terminus_cause_has_its_own_plain_sentence(cause: str) -> None:
     assert cause_text(cause) != cause_text("not-a-cause")
     assert cause not in cause_text(cause)
-
-
-def test_tracker_result_causes_have_distinct_sentences_without_em_dashes() -> None:
-    sentences = [
-        cause_text(cause)
-        for cause in ("tracker_result", "no_tracker_result", "tracker_result_undelivered")
-    ]
-    assert len(set(sentences)) == 3
-    assert all("\u2014" not in sentence for sentence in sentences)
-    body = result_section("tracker_result_undelivered", pr_url=None)
-    assert body.splitlines()[0] == f"Could not complete: {sentences[2]}"
-    assert "Cause: tracker_result_undelivered" in body
-
-
-# --- #5586 decision 12: the seven triage endings in the status comment ------------
-
-_TRIAGE_REVISION = "0123456789abcdef0123456789abcdef01234567"
-_TICKET_URL = f"https://github.com/{REPO}/issues/9302"
-_RESULT_COMMENT_URL = f"https://github.com/{REPO}/issues/9301#issuecomment-4401"
-_RUN_URL = f"https://github.com/{REPO}/issues/9302#issuecomment-4402"
-
-
-def _ticket_result() -> TriageResult:
-    return TriageResult("ticket", None, _TRIAGE_REVISION, _TICKET_URL, _RESULT_COMMENT_URL)
-
-
-def _findings_result(reason: str) -> TriageResult:
-    return TriageResult("findings", reason, _TRIAGE_REVISION, None, _RESULT_COMMENT_URL)
-
-
-_ENDINGS = [
-    pytest.param(
-        _ticket_result(),
-        HandoffOutcome(admitted=True, implementation_status_url=_RUN_URL, refusal_reason=None),
-        [f"Ticket published: {_TICKET_URL}.", f"Implementation admitted: {_RUN_URL}"],
-        id="1-ticket-implementation-admitted",
-    ),
-    pytest.param(
-        _ticket_result(),
-        HandoffOutcome(
-            admitted=False,
-            implementation_status_url=None,
-            refusal_reason="the implementation agent has no capacity",
-        ),
-        [
-            f"Ticket published: {_TICKET_URL}.",
-            "Implementation not started: the implementation agent has no capacity.",
-        ],
-        id="2-ticket-implementation-refused",
-    ),
-    pytest.param(
-        _ticket_result(),
-        None,
-        [f"Ticket published: {_TICKET_URL}."],
-        id="ticket-without-handoff",
-    ),
-    pytest.param(
-        _findings_result("not_reproduced"), None, ["not reproduced"], id="3-not-reproduced"
-    ),
-    pytest.param(_findings_result("already_fixed"), None, ["already fixed"], id="4-already-fixed"),
-    pytest.param(
-        _findings_result("product_decision_needed"),
-        None,
-        ["product decision needed"],
-        id="5-product-decision-needed",
-    ),
-    pytest.param(
-        _findings_result("capability_unavailable"),
-        None,
-        ["capability unavailable"],
-        id="6-capability-unavailable",
-    ),
-    pytest.param(
-        _findings_result("budget_exhausted"),
-        None,
-        ["Investigation stopped: budget exhausted; findings delivered."],
-        id="7-budget-exhausted",
-    ),
-]
-
-
-@pytest.mark.parametrize(("result", "handoff", "expected"), _ENDINGS)
-def test_each_triage_ending_renders_its_status_comment(
-    result: TriageResult, handoff: HandoffOutcome | None, expected: list[str]
-) -> None:
-    request_id = uuid.uuid4()
-    body = status_body(
-        request_id=request_id,
-        card_url=None,
-        pill_label="COMPLETED",
-        phase_view=None,
-        result=status_comment_text(result, handoff),
-        base_line=None,
-    )
-    for line in expected:
-        assert line in body, body
-    assert _TRIAGE_REVISION in body
-    # The marked result comment carries the command, observed result, tried and missing.
-    assert _RESULT_COMMENT_URL in body
-    assert FINAL_MARKER in body and marker_for(request_id) in body
-    assert "\u2014" not in body
-    if result.result_kind == "ticket":
-        assert _TICKET_URL in body
-    if handoff is None:
-        assert "Implementation" not in body
-    if result.reason == "budget_exhausted":
-        assert "reproduc" not in body.lower()
 
 
 _MODEL_UNREACHABLE_SENTENCE = (
@@ -1703,7 +1591,12 @@ def _work_item_row(work_item_id: uuid.UUID) -> dict[str, Any]:
 
 
 def _revision_reply(pr: int, fragment: str) -> dict[str, str | None]:
-    """The typed reply target admission stores for this feedback (#3831)."""
+    """The typed reply target admission stores for this feedback (#3831).
+
+    Since #5794 admission stores a review thread target only for a mention in
+    an approved or dismissed review; every other review is answered in the
+    pull request conversation. The reply side is the same for both.
+    """
 
     url = f"https://github.com/{REPO}/pull/{pr}#{fragment}"
     thread = fragment.removeprefix("discussion_r") if fragment.startswith("discussion_r") else None
@@ -2227,7 +2120,9 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
             try:
                 async with engine.begin() as conn:
                     assignment = {
-                        "merged": "status = 'merged'",
+                        # The merge write stamps updated_at, as
+                        # mark_publication_lineage_terminal does.
+                        "merged": "status = 'merged', updated_at = now()",
                         "closed": "status = 'closed'",
                         "missing_pr_url": (
                             "pr_number = NULL, pr_url = NULL, code_host_kind = NULL, "
@@ -2338,7 +2233,9 @@ def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, ca
         detail = "Could not complete: the requested change needs a design decision."
     statement = {
         "merged": (
-            "UPDATE curie.thread_publication_lineages SET status = 'merged' WHERE id = "
+            # The merge write stamps updated_at, as mark_publication_lineage_terminal does.
+            "UPDATE curie.thread_publication_lineages SET status = 'merged', updated_at = now() "
+            "WHERE id = "
             "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
         ),
         "closed": (
@@ -2539,6 +2436,7 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(
                     retry_safety=None,
                     retry_condition=None,
                     exhausted_volume=None,
+                    finisher="worker",
                 )
                 assert isinstance(result, WorkItemConflict), result
                 assert result.code == "stale_version"

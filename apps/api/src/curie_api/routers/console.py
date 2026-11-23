@@ -73,14 +73,16 @@ from ..auth import (
 from ..config import get_settings
 from ..deps import SessionDep
 from ..identity import connect as identity_connect
-from ..models import Principal
+from ..models import Principal, TenantIdentityProvider
 from ..principal_authority import PrincipalAuthorityRefusal
 from ..rate_limit import require_rate_limit
 from .identity_connect import (
     CONNECT_COOKIE,
     clear_connect_cookies,
     connect_path,
+    refusal_page,
     set_browser_proof_cookie,
+    wants_html,
 )
 
 logger = logging.getLogger(__name__)
@@ -190,9 +192,7 @@ async def current_session(
             headers={"Cache-Control": "no-store"},
         )
     if row.principal_id is not None:
-        principal = await authorized_console_principal(
-            session, console_session or "", live_row=row
-        )
+        principal = await authorized_console_principal(session, console_session or "", live_row=row)
         if principal is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -359,6 +359,23 @@ def _refuse_callback(reason: str) -> JSONResponse:
     return response
 
 
+def _refuse_callback_for(request: Request, reason: str) -> Response:
+    """The callback refusal; a browser mid account-connect gets the refusal page.
+
+    Same status, generic JSON detail and cookie handling as `_refuse_callback`.
+    When the browser carries a live connect cookie (it came from a connect link)
+    and Accept names text/html, the body is the link-refusal page instead of raw
+    JSON, whatever stopped the sign-in: a cancelled consent, a lapsed link or a
+    refused identity. The reason still goes to logs only.
+    """
+    if not (request.cookies.get(CONNECT_COOKIE) and wants_html(request)):
+        return _refuse_callback(reason)
+    logger.warning("oidc callback refused: %s", reason)
+    response = refusal_page(status.HTTP_401_UNAUTHORIZED, _NO_STORE, page=400)
+    _clear_state_cookie(response)
+    return response
+
+
 @router.get("/oidc/login", status_code=status.HTTP_302_FOUND, response_class=RedirectResponse)
 async def oidc_login(
     request: Request, session: SessionDep, return_to: str | None = None
@@ -480,19 +497,19 @@ async def oidc_callback(
         or not state_cookie
         or not hmac.compare_digest(state.encode("utf-8"), state_cookie.encode("utf-8"))
     ):
-        return _refuse_callback("state does not match the state cookie")
+        return _refuse_callback_for(request, "state does not match the state cookie")
     attempt = await crud_console.consume_oidc_login_attempt(session, state)
     if attempt is None:
-        return _refuse_callback("unknown, consumed or expired login attempt")
+        return _refuse_callback_for(request, "unknown, consumed or expired login attempt")
     if error is not None:
-        return _refuse_callback("the IdP returned an error")
+        return _refuse_callback_for(request, "the IdP returned an error")
     if not code:
-        return _refuse_callback("no authorization code")
+        return _refuse_callback_for(request, "no authorization code")
     try:
         id_token = await oidc.exchange_code(code, attempt.code_verifier)
         claims = await oidc.validate_id_token(id_token, nonce=attempt.nonce)
     except oidc.OidcError as exc:
-        return _refuse_callback(str(exc))
+        return _refuse_callback_for(request, str(exc))
     response: Response
     connect_token = request.cookies.get(CONNECT_COOKIE)
     connect_row = None
@@ -500,19 +517,23 @@ async def oidc_callback(
         try:
             connect_row = await identity_connect.live_token(session, connect_token, lock=True)
         except identity_connect.ConnectRefused:
-            response = _refuse_callback("invalid account connection")
+            response = _refuse_callback_for(request, "invalid account connection")
             clear_connect_cookies(response)
             return response
         if claims.issuer != connect_row.idp_issuer:
-            response = _refuse_callback("account connection issuer mismatch")
+            response = _refuse_callback_for(request, "account connection issuer mismatch")
             clear_connect_cookies(response)
             return response
-    # Ordinary account connection authenticates a person, never an admin.
-    # Console sign-in retains its existing administrator admission policy.
-    if not connect_token and not oidc.meets_required_claims(
-        claims, get_settings().oidc_required_claims
-    ):
-        return _refuse_callback("ID token lacks a required claim")
+    # live_token locks the tenant and only accepts the fallback when there is
+    # no directory configuration. Both paths can use the same issuer URL.
+    if (
+        connect_row is None
+        or await session.get(TenantIdentityProvider, connect_row.tenant_id) is None
+    ) and not oidc.meets_required_claims(claims, get_settings().oidc_required_claims):
+        response = _refuse_callback_for(request, "ID token lacks a required claim")
+        if connect_row is not None:
+            clear_connect_cookies(response)
+        return response
     # @spec HTTP-PRINCIPAL-ADOPTION-V1-10, HTTP-PRINCIPAL-ADOPTION-V1-11.
     try:
         principal = await crud_console.resolve_principal(
@@ -520,14 +541,14 @@ async def oidc_callback(
         )
     except PrincipalAuthorityRefusal:
         await session.rollback()
-        response = _refuse_callback("principal authority refused login")
+        response = _refuse_callback_for(request, "principal authority refused login")
         if connect_token:
             clear_connect_cookies(response)
         return response
     if not await crud_console.principal_is_active(session, principal):
         # Undo the attribute refresh: a refused login changes nothing.
         await session.rollback()
-        response = _refuse_callback("principal or tenant is not active")
+        response = _refuse_callback_for(request, "principal or tenant is not active")
         if connect_token:
             clear_connect_cookies(response)
         return response
@@ -538,7 +559,7 @@ async def oidc_callback(
             )
         except identity_connect.ConnectRefused:
             await session.rollback()
-            response = _refuse_callback("account connection no longer valid")
+            response = _refuse_callback_for(request, "account connection no longer valid")
             clear_connect_cookies(response)
             return response
     if connect_token:
@@ -555,7 +576,7 @@ async def oidc_callback(
             token, _ = await crud_console.create_principal_console_session(session, principal)
         except PrincipalAuthorityRefusal:
             await session.rollback()
-            return _refuse_callback("principal authority refused login")
+            return _refuse_callback_for(request, "principal authority refused login")
         returned = _accepted_return_to(request.cookies.get(OIDC_RETURN_COOKIE))
         if returned == _RETURN_CLAUDE_PLAN:
             destination = _RETURN_CLAUDE_PLAN

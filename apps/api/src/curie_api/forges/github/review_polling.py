@@ -126,6 +126,8 @@ async def admit_one_feedback(
             payload,
             str(uuid.uuid4()),
             github_html_base=settings.github_html_base,
+            # A review is admitted whole; its inline comments may carry it.
+            allow_empty_review=True,
         )
     except FeedbackIgnored:
         return

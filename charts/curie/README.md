@@ -93,6 +93,16 @@ and 60 seconds for scheduling and Helm operations. Raising
 `worker.deliveryBudgetSeconds` raises both the effective drain wait and worker
 grace automatically, so the Helm timeout must rise too.
 
+**Upgrading a personal mode release.** A release that selected personal
+subscription mode by setting `FACTORY_MODEL_AUTH_MODE` in `api.extraEnv` and
+`worker.extraEnv` fails its next render with this chart: the variable is now
+chart-owned and comes from `factory.modelAuthMode`. Retained values keep the
+old entries (`--reuse-values` and `--reset-then-reuse-values` both replay
+them), and Helm replaces a list whole, so give both lists again without the
+variable, with `[]` for a list that becomes empty, and set the value, in the
+same upgrade. See [Factory model auth mode](#factory-model-auth-mode) for the
+values file and command.
+
 **Upgrade drain and claim state.** Before each upgrade, a hook pauses new worker
 claims and waits for accepted deliveries to finish. The chart stores an
 installation identity in its managed Secret and reuses it across upgrades. A
@@ -2439,6 +2449,18 @@ bounds each Slack call. That caller can only read a user's email. Restart the
 gateway after rotating the Secret. See the
 [http identity operator guide](../../docs/http-identity-operator.md).
 
+`channelGateway.lookupIdentities` (default `[]`) gives directory reads their
+own provider credentials, so no agent's app needs a directory scope. Each
+entry is `{name, kind, existingSecret, key}`: `name` follows the Slack
+identity name pattern and must not be `default` or a declared Slack identity,
+`kind` is `slack` (a bot-token-only app with `users:read` and
+`users:read.email`), and `existingSecret` names a Secret whose `key` (default
+`token`) holds the credential. The chart renders
+`CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES` and one
+`CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__<index>` per entry into the gateway alone,
+and only its user email read uses them. The provider sets
+`CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` to the entry's name.
+
 An external gateway uses `channelGateway.url`; configure separate
 `channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,
 `channelGateway.tlsSecret` supplies `ca.crt` to callers. For a chart-deployed
@@ -2593,6 +2615,38 @@ starts, so a running proxy keeps the old password and cannot spend grants until
 it restarts. The same restart applies after any later rotation of the Valkey
 password.
 
+### A connector's own ServiceAccount
+
+`connectorServiceAccounts` (default `[]`) names the ServiceAccount one
+agent's hosted connector runs as. Without an entry the connector pod runs as
+the namespace's `default` ServiceAccount. Use it for a connector that
+authenticates to a cloud provider through workload identity federation, so
+the cloud identity bound to its ServiceAccount token is not shared with every
+other pod running as `default`:
+
+```yaml
+connectorServiceAccounts:
+  - agent: acme-bot
+    connector: storage
+    serviceAccountName: acme-bot-storage
+```
+
+The API receives the list as JSON in `CURIE_CONNECTOR_SERVICE_ACCOUNTS` and
+sets `serviceAccountName` on that connector's Deployment pod template; no
+other object changes, and a connector without an entry renders exactly as
+before. The mapping is install configuration rather than a `connectors.yaml`
+field, so a bundle cannot name another agent's ServiceAccount or a Curie
+component's own. The chart does not create the ServiceAccount and grants the
+worker nothing new: create it in the release namespace, with its cloud
+federation, before deploying the agent. A missing ServiceAccount leaves the
+connector's Deployment unable to create a pod. The pod template leaves
+`automountServiceAccountToken` unset, so the ServiceAccount's own setting
+decides whether its token is mounted. The schema and the API both refuse a
+name that is not a DNS-1123 subdomain, an entry with a missing, empty or
+unknown key, and the API also refuses one agent and connector named twice.
+The contract is in
+[the connector host interface](../../docs/interfaces/connector-host/INTERFACE.md).
+
 ### HTTP identity operator files
 
 HTTP identity (ADR 0246,
@@ -2659,6 +2713,41 @@ otherwise. When set, the API gets Secret create, get, list and delete there
 release namespace, and both Deployments receive
 `CURIE_PERSONAL_GRANT_NAMESPACE`. Changing it requires every user to
 reconnect. See `docs/operations.md`, "Personal Claude enrollment".
+
+### Factory model auth mode
+
+`factory.modelAuthMode` (default `service`) selects the installation's model
+auth mode for new work: in `service` new WorkItems are admitted to run on the
+installation's model credential, and in `personal` each new one is admitted to
+run on its owner's enrolled personal Claude subscription. An execution request
+already created keeps the mode it recorded, so changing the value does not
+move existing work. `curie cluster factory --model-auth-mode personal` writes
+it. The chart renders it as `FACTORY_MODEL_AUTH_MODE` into both the API and the
+worker from one helper, so the two cannot disagree. Any other value fails the
+render, and so does setting `FACTORY_MODEL_AUTH_MODE` through `api.extraEnv` or
+`worker.extraEnv`, even with an equal value. Personal mode needs the Kubernetes
+sandbox substrate: a personal render whose `worker.extraEnv` sets
+`CURIE_SANDBOX_SUBSTRATE` to anything but `kubernetes` fails, because the
+worker would refuse to start. The literal is compared as the worker reads it,
+with surrounding whitespace trimmed and case ignored, so ` Kubernetes `
+passes. Only a literal value is accepted there: a
+`valueFrom` entry cannot be verified before the worker starts, and an empty
+value is a worker startup error, so both are refused in personal mode. The API
+and the worker read their settings case-insensitively, so an `extraEnv` entry
+named `factory_model_auth_mode` (any case variant) fails the render too.
+`ci/factory-model-auth-mode-assertions.sh` pins this.
+
+A release that selected personal mode through `FACTORY_MODEL_AUTH_MODE` in
+`api.extraEnv` and `worker.extraEnv` must drop those entries and set the value
+in one upgrade, because the new chart refuses the retained entries and
+`curie cluster factory --model-auth-mode` writes only `factory.modelAuthMode`.
+Setting only `factory.modelAuthMode` while the old entries are retained still
+fails the render. When revision 0188 (the triage schema drop) is pending in
+the same upgrade, `--forward-only` is also required, or the schema check
+refuses it. The values file and the exact `curie cluster upgrade` command for
+both are in
+[Upgrade with retained model auth entries and 0188 pending](../../docs/operations.md#upgrade-with-retained-model-auth-entries-and-0188-pending).
+Later mode changes need only `curie cluster factory --model-auth-mode <mode>`.
 
 ### Reserved environment variables
 

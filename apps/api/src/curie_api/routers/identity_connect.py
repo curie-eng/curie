@@ -1,38 +1,106 @@
 """Private browser confirmation for a sender-bound account-connect capability."""
 
 import hmac
+import re
 import secrets
-from collections.abc import Callable, Coroutine
-from html import escape
+from collections.abc import Callable, Coroutine, Mapping
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Form, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..approval_auth import enforce_console_cookie_origin
 from ..config import get_settings
 from ..deps import SessionDep
 from ..identity import connect
 from ..models import IdentityNamespace
+from .identity_connect_pages import (
+    REFUSALS,
+    STYLE_SRC,
+    ConfirmForm,
+    SignIn,
+    SlackLabels,
+    render_connect_page,
+    render_connected_page,
+    render_refusal_page,
+)
 
 CONNECT_COOKIE = "__Host-curie_identity_connect"
 CSRF_COOKIE = "__Host-curie_identity_connect_csrf"
 PROOF_COOKIE = "__Host-curie_identity_connect_proof"
 PRIVATE_HEADERS = {
     "Cache-Control": "private, no-store",
-    "Referrer-Policy": "no-referrer",
+    # Fetch sets a non-GET Origin to the value null under no-referrer, which
+    # the console origin check rejects. strict-origin keeps the real Origin on
+    # a same-scheme POST and sends only the origin, never the token path, as Referer.
+    # https://fetch.spec.whatwg.org/#append-a-request-origin-header
+    "Referrer-Policy": "strict-origin",
     "Content-Security-Policy": (
-        "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        # The one inline stylesheet is allowed by its hash, nothing else.
+        f"default-src 'none'; style-src {STYLE_SRC}; form-action 'self'; "
+        "frame-ancestors 'none'; base-uri 'none'"
     ),
     "X-Content-Type-Options": "nosniff",
 }
 
 
+# A comma or semicolon splits only outside a quoted string, so a quoted
+# parameter value cannot smuggle in a media range of its own.
+_OUTSIDE_QUOTES = r'{sep}(?=(?:[^"]*"[^"]*")*[^"]*$)'
+_QVALUE = re.compile(r"0(\.\d{0,3})?|1(\.0{0,3})?")
+
+
+def wants_html(request: Request) -> bool:
+    """True when Accept names the text/html media range itself with a valid nonzero q.
+
+    `*/*`, a parameter that merely contains the text, and a malformed or zero
+    weight do not count: only a browser that asks for a page gets one.
+    """
+    accept = request.headers.get("accept", "")
+    for part in re.split(_OUTSIDE_QUOTES.format(sep=","), accept):
+        media, *params = (
+            piece.strip() for piece in re.split(_OUTSIDE_QUOTES.format(sep=";"), part)
+        )
+        if media.lower() != "text/html":
+            continue
+        quality = "1"
+        for param in params:
+            name, _, value = param.partition("=")
+            if name.strip().lower() == "q":
+                quality = value.strip()
+        if _QVALUE.fullmatch(quality) and float(quality or "0") > 0:
+            return True
+    return False
+
+
+def refusal_page(
+    status: int, headers: Mapping[str, str] | None = None, *, page: int | None = None
+) -> HTMLResponse:
+    """A refusal page; `page` picks the wording when it differs from the HTTP status."""
+    return HTMLResponse(
+        render_refusal_page(page or status),
+        status_code=status,
+        headers={**(headers or {}), **PRIVATE_HEADERS},
+    )
+
+
+def private_refusal(request: Request, status: int, detail: str) -> Response:
+    """The connect route's refusal for code that runs before the route (the writer fence)."""
+    if status in REFUSALS and wants_html(request):
+        return refusal_page(status)
+    return JSONResponse({"detail": detail}, status_code=status, headers=PRIVATE_HEADERS)
+
+
 class PrivateConnectRoute(APIRoute):
-    """Keep validation/parser errors private as well as successful pages."""
+    """Keep validation/parser errors private as well as successful pages.
+
+    A browser (Accept includes text/html) gets a 400, 401 or 403 as a styled
+    page; every other client keeps the JSON detail.
+    """
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         handler = super().get_route_handler()
@@ -41,12 +109,18 @@ class PrivateConnectRoute(APIRoute):
             try:
                 response = await handler(request)
             except RequestValidationError:
+                if wants_html(request):
+                    return refusal_page(400)
                 return JSONResponse(
                     {"detail": "invalid account confirmation"},
                     status_code=400,
                     headers=PRIVATE_HEADERS,
                 )
-            except HTTPException as exc:
+            except StarletteHTTPException as exc:
+                # The base class: a malformed multipart body raises Starlette's,
+                # not FastAPI's subclass, and must stay private too.
+                if exc.status_code in REFUSALS and wants_html(request):
+                    return refusal_page(exc.status_code, exc.headers)
                 exc.headers = {**(exc.headers or {}), **PRIVATE_HEADERS}
                 raise
             response.headers.update(PRIVATE_HEADERS)
@@ -98,7 +172,12 @@ async def connect_page(token: str, request: Request, session: SessionDep) -> HTM
         raise refused() from None
     namespace = await session.get(IdentityNamespace, row.identity_namespace_id)
     assert namespace is not None  # live_token checked it
-    account = f"{namespace.provider} user {row.provider_native_id} in workspace {namespace.key}"
+    personal = get_settings().factory_model_auth_mode == "personal"
+    slack = (
+        SlackLabels(row.slack_display_name, row.slack_handle, row.slack_workspace_name)
+        if personal and namespace.provider == "slack"
+        else None
+    )
     principal = await connect.browser_principal(
         session, token=token, proof=request.cookies.get(PROOF_COOKIE, "")
     )
@@ -107,22 +186,23 @@ async def connect_page(token: str, request: Request, session: SessionDep) -> HTM
     ):
         raise refused()
     csrf = secrets.token_urlsafe(32)
+    action: SignIn | ConfirmForm
     if principal is None:
-        login = escape(public_path(request, "/console/oidc/login"), quote=True)
-        action = f'<p><a href="{login}">Sign in with your organization</a></p>'
+        action = SignIn(public_path(request, "/console/oidc/login"))
     else:
-        who = escape(principal.display_name or principal.idp_subject)
-        target = escape(connect_path(request, token), quote=True)
-        action = (
-            f"<p>Connect this account to {who}?</p>"
-            f'<form method="post" action="{target}/confirm">'
-            f'<input type="hidden" name="csrf" value="{csrf}">'
-            '<button type="submit">Confirm account connection</button></form>'
+        action = ConfirmForm(
+            who=principal.display_name or principal.idp_subject,
+            target=connect_path(request, token),
+            csrf=csrf,
         )
     response = HTMLResponse(
-        '<!doctype html><html lang="en"><meta charset="utf-8"><title>Connect account</title>'
-        f"<h1>Connect account</h1><p>{escape(account)}</p>{action}"
-        "<p>Your original request will not run. After connecting, send it again.</p></html>",
+        render_connect_page(
+            provider=namespace.provider,
+            user_id=row.provider_native_id,
+            workspace_id=namespace.key,
+            slack=slack,
+            action=action,
+        ),
         headers=PRIVATE_HEADERS,
     )
     for name, value in ((CONNECT_COOKIE, token), (CSRF_COOKIE, csrf)):
@@ -138,7 +218,7 @@ async def confirm_connection(
     request: Request,
     session: SessionDep,
     csrf: Annotated[str, Form(min_length=43, max_length=43)],
-) -> HTMLResponse:
+) -> Response:
     enforce_console_cookie_origin(request)
     bound = request.cookies.get(CONNECT_COOKIE, "")
     expected = request.cookies.get(CSRF_COOKIE, "")
@@ -160,10 +240,12 @@ async def confirm_connection(
     except connect.ConnectRefused:
         await session.rollback()
         raise refused() from None
-    response = HTMLResponse(
-        '<!doctype html><html lang="en"><meta charset="utf-8"><title>Account connected</title>'
-        "<h1>Account connected</h1><p>Return to your chat and send your request again.</p></html>",
-        headers=PRIVATE_HEADERS,
-    )
+    response: Response
+    if get_settings().factory_model_auth_mode == "personal":
+        response = RedirectResponse(
+            "/settings/claude-plan", status_code=303, headers=PRIVATE_HEADERS
+        )
+    else:
+        response = HTMLResponse(render_connected_page(), headers=PRIVATE_HEADERS)
     clear_connect_cookies(response)
     return response

@@ -13,9 +13,14 @@ here. The command reference is
 Your operator has to finish these steps first. The links are the configuration.
 This page does not repeat it.
 
-1. The installation is Kubernetes, with `FACTORY_MODEL_AUTH_MODE=personal` and
-   `CURIE_SANDBOX_SUBSTRATE=kubernetes`. There is no chart switch for the mode.
-   See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue).
+1. The installation is Kubernetes, in personal mode on the Kubernetes sandbox
+   substrate. The operator selects the mode with
+   `curie cluster factory --model-auth-mode personal`, which sets the chart
+   value `factory.modelAuthMode`; `curie cluster status` shows it as
+   `factory model auth mode: personal`. An installation that set
+   `FACTORY_MODEL_AUTH_MODE` through `api.extraEnv` and `worker.extraEnv`
+   must remove those entries and set `factory.modelAuthMode` in the same
+   upgrade; [the combined upgrade recipe](../operations.md#upgrade-with-retained-model-auth-entries-and-0188-pending) shows how. See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue).
 2. `personalClaude.grantNamespace` names an existing namespace used only for
    personal grant custody. An empty value makes enrollment answer
    `custody_unconfigured`. See
@@ -55,8 +60,9 @@ Sign in to the Console with your organization, then open
 plan. A login-code session cannot use it; the page says so and links to
 organization sign-in.
 
-1. The page shows one status line: "Not connected", "Connected, generation N",
-   or "Disconnected". While a disconnect is still finishing, a second line
+1. The page shows one status line: "Not connected", "Connected", or
+   "Disconnected". When connected, a muted line under it names the enrollment
+   generation ("Generation N"). While a disconnect is still finishing, a line
    names the runs and stored tokens left to clean up, and the page refreshes
    every 5 seconds until both are zero.
 2. Paste the token that `claude setup-token` printed into the box and choose
@@ -181,25 +187,34 @@ Your Slack identity selects your principal. That principal's active enrollment
 selects the grant and the generation the run is bound to. The installation's
 GitHub App reads the issue. A linked GitHub account is not required to start.
 
-If you have no active enrollment, the thread answers before any model work:
+If your Slack account is unlinked or your enrollment is inactive, Curie sends
+you a private message with a **Connect your Claude plan** button before any
+model work. The public placeholder becomes:
 
 ```text
-You have no active personal subscription enrolled.
-Any earlier attempt of this message is unconfirmed here; this thread shows the run if one started.
-Outcome: enrollment_inactive
+Not started. I sent you a private message about what to do next.
 ```
 
-If the run is admitted, the same thread answers:
+For an unlinked account, the button opens the existing account confirmation
+page. It shows your Slack display name, @handle, user id and workspace name
+and id when Slack supplied the names. Confirm only your own account: anyone
+using it can start runs on your Claude plan. Sign in, confirm, then connect
+your plan on the Console's `/settings/claude-plan` page and mention the app
+again. An already linked account opens that plan page directly. When secure
+Console OIDC is unavailable or the token issuance limit is reached, the private
+message has no button and directs you to the operator.
+
+If the run is admitted, the app's first reply in that thread becomes the run's
+progress card. It names the issue and that you started it, lists the run's
+steps as they are done, and is edited in place until the run finishes or stops.
+When the pull request is open, or when the run needs you, the thread also gets
+one short reply that mentions you:
 
 ```text
-Factory run started for this issue.
-Issue: https://github.com/acme-corp/acme-fixture/issues/7
-Progress for this run is posted in this thread.
-Outcome: admitted
+@you your pull request is ready for review: https://github.com/acme-corp/acme-fixture/pull/12
 ```
 
-Later posts in that thread are phase reports, the pull request link, and the
-final outcome. The thread does not need `factory_slack_channel`. See
+The thread does not need `factory_slack_channel`. See
 [Factory Slack progress](../operations.md#factory-slack-progress).
 
 To ask for a change after the run has started, mention the app in that run's
@@ -221,13 +236,16 @@ a declared test driver on a test installation, are in
 
 ## Other ways in
 
-1. Adding the factory label with `FACTORY_MODEL_AUTH_MODE=personal` admits a
+1. Adding the factory label with `factory.modelAuthMode` set to `personal` admits a
    WorkItem when the labeller is linked to a principal whose personal Claude
    enrollment is active. The WorkItem owner is that principal at the
    enrollment's generation. An unlinked labeller is refused
    `personal_owner_required`. A linked labeller with no active enrollment is
    refused `enrollment_inactive`. Each refusal is answered by an issue comment
-   and, when a factory Slack channel is configured, one channel post.
+   and, when a factory Slack channel is configured, one channel post. When
+   the secure Console origin is configured, the comment links to the Claude
+   plan page and the channel post has a **Connect your Claude plan** button.
+   These public links contain no account-connect token.
    Mentioning the app on an issue that has no WorkItem is refused
    `not_admitted`. Review feedback with no WorkItem is ignored. A WorkItem
    admitted as service before the switch refuses its tracker mentions, review
@@ -300,8 +318,14 @@ variable, or run on a cluster with `curie cluster up`.
 `personal`. A different case or surrounding spaces does not select the mode.
 Other `skill` and `local` commands are not refused by this check.
 
-A worker with `FACTORY_MODEL_AUTH_MODE=personal` refuses to start unless the
-substrate is Kubernetes. That error is
+On a cluster, `factory.modelAuthMode` is the only switch. The chart renders it
+as `FACTORY_MODEL_AUTH_MODE` into both the API and the worker, and refuses the
+variable in `api.extraEnv` or `worker.extraEnv`. A personal release whose
+`worker.extraEnv` sets `CURIE_SANDBOX_SUBSTRATE` to anything but the literal
+`kubernetes`, compared with whitespace trimmed and case ignored (a `valueFrom`
+entry or an empty value included), is refused by `curie cluster factory --model-auth-mode personal` and by the
+chart render, before anything is applied. A worker started in personal mode
+on another substrate anyway refuses to start with
 `personal_mode_requires_kubernetes: FACTORY_MODEL_AUTH_MODE=personal needs CURIE_SANDBOX_SUBSTRATE=kubernetes`.
 
 ## Known limitations
@@ -315,3 +339,22 @@ substrate is Kubernetes. That error is
    enrolled subscription.
    [Issue 5640](https://github.com/curie-eng/curie/issues/5640) tracks that
    limit.
+3. Curie does not warn before a Claude plan expires. Expiry is not knowable.
+   Enrollment checks only that the token is 1 to 4096 printable characters,
+   and it stores no expiry. When a run fails because the plan was rejected,
+   and the enrollment is still active at that run's generation, Curie sends
+   one Slack direct message for that generation. The message has a button to
+   the Claude plan page. It does not send another for the same generation,
+   and it sends none after you disconnect or replace the enrollment.
+
+## Link your GitHub account
+
+Open **Settings > Claude plan > Linked accounts** in the Console and choose
+**Link GitHub**. Authorize the factory GitHub App with the account you use to
+apply factory labels. If the button is absent, ask the operator to configure
+the GitHub App OAuth client. An account already linked to someone else must be
+unlinked there before it can be linked to you.
+
+The same section lists your Slack and GitHub accounts. Choose **Unlink** and
+confirm to stop new runs through an account. Runs already admitted keep their
+owner; disconnect your Claude plan when those runs must also stop.

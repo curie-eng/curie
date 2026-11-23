@@ -1881,13 +1881,14 @@ true
 {{- $cap | int64 -}}
 {{- end -}}
 
-{{/* Publication candidates (#5428): the API and worker share these checks. */}}
+{{/* Publication candidates (#5428). On when the value is true and workspaces are on.
+     Workspaces off renders the switch off instead of failing: other dependent
+     switches fail an explicit true, but a default of true would then refuse
+     every install that turns workspaces off. */}}
 {{- define "curie.publicationCandidatesEnabled" -}}
 {{- $candidates := dig "workspace" "publicationCandidates" dict (.Values.worker | default dict) -}}
-{{- if get $candidates "enabled" -}}
-{{- if not (dig "runner" "workspace" "enabled" false (.Values.agentSandbox | default dict)) -}}
-{{- fail "worker.workspace.publicationCandidates.enabled needs agentSandbox.runner.workspace.enabled (#5428)" -}}
-{{- end -}}
+{{- $workspaces := dig "runner" "workspace" "enabled" false (.Values.agentSandbox | default dict) -}}
+{{- if and (get $candidates "enabled") $workspaces -}}
 {{- $_ := include "curie.publicationCandidateMaxBytes" . -}}
 true
 {{- else -}}false{{- end -}}
@@ -1946,6 +1947,50 @@ true
 {{/* The factory (#4397): factory.* is read through `get`, so a release
      without the block renders. */}}
 {{- define "curie.factory.mount" -}}/etc/curie/forges{{- end -}}
+
+{{/* The installation's model auth mode (ADR 0268), rendered as
+     FACTORY_MODEL_AUTH_MODE into BOTH the api and the worker from this one
+     helper so the two cannot drift. Absent or null means service. The schema
+     enum refuses other values; this guard also covers renders that skip the
+     schema. The api reads its settings case-insensitively, so an extraEnv
+     entry whose name differs only in case would still override the chart
+     value: refuse every case variant in api.extraEnv and worker.extraEnv
+     (curie.extraEnv already refuses the exact name). Personal mode needs the
+     Kubernetes substrate: the worker refuses to start
+     (personal_mode_requires_kubernetes) unless CURIE_SANDBOX_SUBSTRATE,
+     stripped and lower-cased, is kubernetes, and an empty value is a startup
+     error. A worker.extraEnv entry for it must therefore be the literal
+     kubernetes; a valueFrom entry resolves only at runtime and is refused. */}}
+{{- define "curie.factory.modelAuthMode" -}}
+{{- $mode := get (.Values.factory | default dict) "modelAuthMode" | default "service" | toString -}}
+{{- if not (has $mode (list "service" "personal")) -}}
+{{- fail (printf "factory.modelAuthMode must be service or personal, got %q." $mode) -}}
+{{- end -}}
+{{- range $workload := list "api" "worker" -}}
+{{- range (get (get $.Values $workload | default dict) "extraEnv" | default list) -}}
+{{- if and (eq (upper (toString .name)) "FACTORY_MODEL_AUTH_MODE") (ne (toString .name) "FACTORY_MODEL_AUTH_MODE") -}}
+{{- fail (printf "%s.extraEnv sets %s, which the %s reads as FACTORY_MODEL_AUTH_MODE; remove it from extraEnv and configure factory.modelAuthMode instead." $workload (toString .name) $workload) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $mode "personal" -}}
+{{- range (.Values.worker.extraEnv | default list) -}}
+{{- if eq (toString .name) "CURIE_SANDBOX_SUBSTRATE" -}}
+{{- if or (hasKey . "valueFrom") (not (hasKey . "value")) -}}
+{{- fail "factory.modelAuthMode=personal needs the Kubernetes sandbox substrate, but worker.extraEnv sets CURIE_SANDBOX_SUBSTRATE from valueFrom, which cannot be verified before the worker starts; remove that entry (kubernetes is the default) or give it the literal value kubernetes." -}}
+{{- end -}}
+{{- $substrate := .value | toString | trim | lower -}}
+{{- if eq $substrate "" -}}
+{{- fail "factory.modelAuthMode=personal needs the Kubernetes sandbox substrate, but worker.extraEnv sets CURIE_SANDBOX_SUBSTRATE to an empty value, which the worker refuses at startup; remove that entry (kubernetes is the default) or set it to kubernetes." -}}
+{{- end -}}
+{{- if ne $substrate "kubernetes" -}}
+{{- fail (printf "factory.modelAuthMode=personal needs the Kubernetes sandbox substrate, but worker.extraEnv sets CURIE_SANDBOX_SUBSTRATE=%s; remove that entry (kubernetes is the default) or set factory.modelAuthMode=service." (toString .value)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $mode -}}
+{{- end -}}
 
 {{/* A number as a plain string, never in exponent form. */}}
 {{- define "curie.factory.str" -}}

@@ -8,6 +8,7 @@ forge_fakes.github_comments. Postgres, Valkey and production wiring are real.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -66,23 +67,35 @@ def _snapshot(request_id: Any) -> str:
     )
 
 
-def _execution_at_0163(request_id: Any) -> str:
-    """Compare only execution columns already present in revision 0163."""
+def _execution_at_0163(request_id: Any) -> dict[str, Any]:
+    """Execution columns already present in revision 0163, as one JSON object.
 
-    return str(
-        _rows(
-            "SELECT (to_jsonb(r) - 'completion_contract' - 'result_policy_digest' "
-            "- 'model_session_reserved_at' - 'coding_instructions_selection_id' "
-            "- 'coding_instructions_evidence' - 'retry_of_request_id' "
-            "- 'retry_origin_request_id' - 'blocked_on' - 'retry_safety' "
-            "- 'retry_condition_reason' - 'retry_condition_retry_at' "
-            "- 'retry_condition_scope_key' - 'delivered_limits' - 'resource_gate' "
-            "- 'execution_kind' - 'recovery_candidate_id' - 'recovery_candidate_sha256')::text "
-            "AS bytes "
-            "FROM curie.execution_requests r WHERE id = :id",
-            {"id": request_id},
-        )[0]["bytes"]
+    A downgrade that stops partway can bring back columns a later revision
+    dropped, so callers compare on the keys of the row read at head.
+    """
+
+    return dict(
+        json.loads(
+            _rows(
+                "SELECT (to_jsonb(r) - 'coding_instructions_selection_id' "
+                "- 'coding_instructions_evidence' - 'retry_of_request_id' "
+                "- 'retry_origin_request_id' - 'blocked_on' - 'retry_safety' "
+                "- 'retry_condition_reason' - 'retry_condition_retry_at' "
+                "- 'retry_condition_scope_key' - 'delivered_limits' - 'resource_gate' "
+                "- 'execution_kind' - 'recovery_candidate_id' - 'recovery_candidate_sha256' "
+                "- 'guarded_dispatch_not_before' - 'memory_rules_evidence')::text "
+                "AS bytes "
+                "FROM curie.execution_requests r WHERE id = :id",
+                {"id": request_id},
+            )[0]["bytes"]
+        )
     )
+
+
+def _assert_execution_kept(request_id: Any, before: dict[str, Any]) -> None:
+    after = _execution_at_0163(request_id)
+    assert before.keys() <= after.keys()
+    assert {key: after[key] for key in before} == before
 
 
 def _view(client: Any, item_id: Any) -> dict[str, Any]:
@@ -494,7 +507,14 @@ def migration_admitted(isolated_migration_db: Any, request: pytest.FixtureReques
     query = "SELECT * FROM curie.agents WHERE id = :id"
     before = _rows(query, {"id": agent_id})
     command.upgrade(alembic_config(), "head")
-    assert _rows(query, {"id": agent_id}) == before
+    # Columns later revisions added to ``agents`` read their defaults; the columns the
+    # row already had must come through unchanged.
+    after = _rows(query, {"id": agent_id})
+    assert len(after) == len(before)
+    kept = [
+        {name: row[name] for name in old_row} for old_row, row in zip(before, after, strict=True)
+    ]
+    assert kept == before
     return request.getfixturevalue("admitted")
 
 
@@ -507,7 +527,7 @@ def test_additive_migration_preserves_existing_failed_execution(migration_admitt
     config = alembic_config()
     with pytest.raises(RuntimeError, match="requester_instruction_selections_present"):
         command.downgrade(config, "0162")
-    assert _execution_at_0163(published["id"]) == before
+    _assert_execution_kept(published["id"], before)
     _execute(
         "UPDATE curie.work_items SET coding_instructions_absence_reason = 'historical' "
         "WHERE id = :id",
@@ -515,14 +535,14 @@ def test_additive_migration_preserves_existing_failed_execution(migration_admitt
     )
     with pytest.raises(RuntimeError, match="factory_ci_observation_records_present"):
         command.downgrade(config, "0162")
-    assert _execution_at_0163(published["id"]) == before
+    _assert_execution_kept(published["id"], before)
     _execute(
         "DELETE FROM curie.factory_ci_observations WHERE request_id = :id", {"id": published["id"]}
     )
     command.downgrade(config, "0162")
-    assert _execution_at_0163(published["id"]) == before
+    _assert_execution_kept(published["id"], before)
     command.upgrade(config, "head")
-    assert _execution_at_0163(published["id"]) == before
+    _assert_execution_kept(published["id"], before)
     assert _rows("SELECT request_id FROM curie.factory_ci_observations") == []
 
 

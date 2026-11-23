@@ -175,12 +175,13 @@ def publication_failure_summary(
 
 
 class AdmittedKind(sk.ScriptedRun):
-    # The pytest body drives its own multi-tracker scenario on this install,
-    # so the triage scenario and the channel gateway it needs stay off.
-    TRIAGE_TO_PR = False
+    # Its tests drive their own agents and tickets on the shared install.
+    runs_one_ticket = False
+    # Nor is the Slack progress card: its install runs no channel gateway.
+    SLACK_PROGRESS = False
 
     def __init__(self, root: Path, binary: Path) -> None:
-        super().__init__(fe.parse_args(["scripted"]))
+        super().__init__(fe.parse_args(["scripted", "--scenario", "publication"]))
         # ScriptedRun defaults its context. This fixture retains the caller's
         # configured engine exactly, including an absent DOCKER_CONTEXT.
         if "DOCKER_CONTEXT" in os.environ:

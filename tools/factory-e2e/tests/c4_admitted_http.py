@@ -191,7 +191,15 @@ def tracker_stub_type(github_module: Any, *, redact: Callable[[str], str]) -> ty
             handler.end_headers()
             handler.wfile.write(response.content)
 
-        def _rest(self, method: str, path: str, query: Any, body: Any) -> Any:
+        def _rest(
+            self,
+            method: str,
+            path: str,
+            query: Any,
+            body: Any,
+            *,
+            actor: dict[str, Any] = github_module.BOT,
+        ) -> Any:
             # GitHub's base commit has green CI. Every new published head stays
             # pending until mark_ci supplies its explicit red or green verdict.
             # Check-run fields and the total_count/check_runs envelope:
@@ -225,7 +233,7 @@ def tracker_stub_type(github_module: Any, *, redact: Callable[[str], str]) -> ty
                     if path.endswith("statuses")
                     else (200, {"state": "success", "statuses": [], "total_count": 0})
                 )
-            return super()._rest(method, path, query, body)
+            return super()._rest(method, path, query, body, actor=actor)
 
     return Trackers
 

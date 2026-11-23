@@ -57,44 +57,31 @@ LOOKUPS: dict[str, Callable[[SimpleNamespace], None]] = {
 }
 
 
-def raw_enrolled(case: SimpleNamespace) -> None:
-    """Admit the sender through the raw-account exception, then register the pair."""
+def test_ticket_creation_requires_a_fresh_canonical_requester(
+    ticket_case: SimpleNamespace,
+) -> None:
+    case = ticket_case
     admit_raw_sender(case.scope)
     enroll(case)
-
-
-@pytest.mark.parametrize("lookup", sorted(LOOKUPS))
-def test_a_ticket_needs_the_original_requester_freshly_resolved(
-    ticket_case: SimpleNamespace, lookup: str,
-) -> None:
-    """@spec REQUEST-APPROVAL-4: the raw-account exception never admits a ticket.
-
-    The ordinary approval from the same capsule and lookup is admitted, so the
-    refusal belongs to the ticket rule, not to admission.
-    """
-    case = ticket_case
-    raw_enrolled(case)
     agent = case.scope["agent"]
-    LOOKUPS[lookup](case.provider)
+    for change in LOOKUPS.values():
+        change(case.provider)
+        selected = dynamic_request(case, carried(case, PLAIN))
+        exactly(create(case.client, selected), 403, "caller_not_allowed")
+        assert approval_rows(agent) == []
+        case.provider.outcomes.clear()
+        case.provider.subjects.clear()
 
-    request = dynamic_request(case, carried(case, PLAIN))
-    exactly(create(case.client, request), 403, "caller_not_allowed")
-    assert approval_rows(agent) == []
-
+    LOOKUPS["unresolved"](case.provider)
     ordinary = dynamic_request(
         case, {}, route=OTHER_ROUTE, tool="synthetic_read", gate_kind="permission",
     )
     accepted(create(case.client, ordinary), ordinary)
     assert [row["selection_mode"] for row in approval_rows(agent)] == ["ordinary"]
-
     case.provider.outcomes.clear()
-    case.provider.subjects.clear()
-    owning = ingress(case)
-    current = dynamic_request(owning, carried(case, PLAIN))
-    receipt(create(case.client, current), current)
-    assert sorted(row["selection_mode"] for row in approval_rows(agent)) == [
-        "dynamic", "ordinary",
-    ]
+    selected = dynamic_request(ingress(case), carried(case, PLAIN))
+    receipt(create(case.client, selected), selected)
+    assert sorted(row["selection_mode"] for row in approval_rows(agent)) == ["dynamic", "ordinary"]
 
 
 def test_a_requester_disabled_before_the_writer_refuses_there(

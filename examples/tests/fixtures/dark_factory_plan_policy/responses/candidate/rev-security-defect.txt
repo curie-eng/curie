@@ -1,8 +1,8 @@
 REVIEWER: plan-reviewer
 VERDICT: CHANGES
-- Plan step 1 (AC1), blocking: building the SQL with an f-string around `request.args['q']` opens a SQL injection hole, and any `q` that contains a quote (for example `o'ring`) breaks the query. Use the DB-API parameter binding from widgets/db.py instead, e.g. `cursor.execute("SELECT id, name FROM widgets WHERE name LIKE ?", (f"%{q}%",))` with the placeholder style the driver uses, and escape `%`, `_` and the escape character in `q` so the match is a literal "contains".
-- Plan step 3 (AC1), blocking: the only test uses `q=gear`, so it would pass against the injectable query and does not check the fix. Add cases to tests/test_search.py showing that a `q` with a single quote returns the matching widget and no error, and that an injection payload such as `' OR '1'='1` returns no rows.
+- AC1 / plan step 1: the query interpolates request.args['q'] into the SQL string with an f-string, which is SQL injection on a user-controlled parameter (for example q=' OR '1'='1 returns every widget, and stacked or UNION payloads can read other tables). Change step 1 to a parameterized query, cursor.execute("SELECT id, name FROM widgets WHERE name LIKE ?", (f"%{q}%",)), using the placeholder style of the DB-API driver in widgets/db.py (for example %s for psycopg2 or MySQL drivers, ? for sqlite3), and escape or accept the LIKE wildcards (% and _) in q as a literal match.
+- Verification table, AC1: the only test seeds two widgets and checks q=gear, so it passes with the injectable code and never exercises the defect. Add a test case to tests/test_search.py that sends a hostile q (for example q=' OR '1'='1 and a q containing a single quote) and asserts it returns no rows or only literal matches and does not raise, so the parameterized query is actually verified.
 OPEN QUESTIONS:
 - none
 VERIFICATION:
-- AC1: sandbox python -m pytest tests/test_search.py
+- AC1: sandbox python -m pytest tests/test_search.py, with the added injection-payload test

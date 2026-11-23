@@ -102,7 +102,7 @@ async def test_a_token_for_another_account_is_refused_after_a_warm_cache_and_rec
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fake.app)) as client:
         # Warm the connection's identity cache with the configured bot's token.
-        warm = await _tracker(registry, client).poll_marked(None, running=())
+        warm = await _tracker(registry, client).poll_marked(None, running=(), answering=())
         assert len(warm.notices) == 1
         assert fake.requests_of("myself")
 
@@ -112,7 +112,7 @@ async def test_a_token_for_another_account_is_refused_after_a_warm_cache_and_rec
         writes = fake.writes
 
         with pytest.raises(Unauthorized) as polled:
-            await _tracker(registry, client).poll_marked(None, running=())
+            await _tracker(registry, client).poll_marked(None, running=(), answering=())
         assert "bot account mismatch" in str(polled.value)
         with pytest.raises(Unauthorized):
             await _tracker(registry, client).set_state_label(
@@ -133,7 +133,7 @@ async def test_a_token_for_another_account_is_refused_after_a_warm_cache_and_rec
         # Restoring the configured bot's token recovers both the poll and the write.
         volume.publish(f"{bot_token}\n")
         mark = len(fake.requests)
-        page = await _tracker(registry, client).poll_marked(None, running=())
+        page = await _tracker(registry, client).poll_marked(None, running=(), answering=())
         assert len(page.notices) == 1
         await _tracker(registry, client).set_state_label(
             ref, add="curie-factory:working", remove=()

@@ -51,6 +51,7 @@ from curie_runner.adapter import (
     build_structured_resume,
     model_message_to_conversation,
 )
+from curie_runner.completion_contract import CONTRACT_BLOCKED_EXPLANATION
 from curie_runner.fake import FakeModelSession
 from curie_runner.final_answer import FINAL_ANSWER_HEADER
 from curie_runner.harness.claude.requester_guard import build_subagent_guard
@@ -81,7 +82,6 @@ from curie_runner.requester_context import (
     subagent_prompt_refusal,
 )
 from curie_runner.session import SessionRunner
-from curie_runner.tracker_result import CONTRACT_BLOCKED_EXPLANATION
 from personal_auth_support import requires_cli
 
 from .test_personal_claude_reviewers import _FACTORY, _git, _plugin_name, _ReviewGate
@@ -928,8 +928,6 @@ def _contract_api(refused: bool = False) -> web.Application:
         return web.json_response(
             {
                 "completion_contract": "implementation",
-                "result_kinds": [],
-                "session_usd_allowance": None,
                 "execution": {
                     "tenant_id": TENANT,
                     "work_item_id": WORK_ITEM,
@@ -961,6 +959,9 @@ def _boot_config(tmp_path: Path, extra: dict[str, str] | None = None) -> RunnerC
             **(extra or {}),
         }
     )
+
+
+_NO_LEARNED_RULES = _raw(_envelope({"kind": "absent", "reason": "no_rules"}))
 
 
 @dataclass
@@ -1036,6 +1037,15 @@ def _boot_run(
                     delivered = await client.post(CONTEXT_PATH, data=raw, headers=BEARER)
                     assert delivered.status == delivered_status
                     ack: dict[str, Any] = await delivered.json()
+                    # #5798: the session also waits for the learned rules
+                    # acknowledgment; this repository has none. A refused
+                    # requester envelope already blocked the start, so the
+                    # learned rules envelope is answered preflight blocked.
+                    rules = await client.post(
+                        "/v1/memory-rules-context", data=_NO_LEARNED_RULES, headers=BEARER
+                    )
+                    refused = ack.get("acknowledgment", {}).get("outcome") == "failed"
+                    assert rules.status == (409 if refused else delivered_status)
                     turn = await client.post(
                         "/v1/event",
                         json={

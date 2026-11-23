@@ -8,7 +8,7 @@ import hmac
 import json
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlsplit
 
@@ -22,6 +22,7 @@ from .group_models import UserGroupLookupError, UserGroupMembership
 from .http_reply import GATEWAY_DELIVERY_TIMEOUT_S
 from .ports.groups import GroupMembershipSource
 from .ports.reads import (
+    AccountProfiles,
     CanvasReader,
     ChannelReader,
     FileSource,
@@ -83,6 +84,7 @@ _API_OPERATIONS = frozenset(
         "list",
         "document",
         "replace_cell",
+        "account_profile",
     }
 )
 _WORKER_OPERATIONS = frozenset({"identity_of", "fetch", "reply"})
@@ -191,6 +193,7 @@ class GatewayProviders:
     canvas: CanvasReader[BindingRoute, CanvasFile, CanvasPage, CanvasDocument] | None = None
     senders: SenderIdentities | None = None
     emails: UserEmailSource | None = None
+    profiles: AccountProfiles | None = None
 
 
 def gateway_application(
@@ -358,6 +361,18 @@ def gateway_application(
                 return web.Response(body=membership_body, content_type="application/json")
             if operation == "user_email":
                 return await user_email(identity, params)
+            if operation == "account_profile":
+                if (
+                    params.model_fields_set != {"user_id", "workspace"}
+                    or not params.user_id
+                    or not params.workspace
+                    or ports.profiles is None
+                ):
+                    raise ValueError
+                profile = await ports.profiles.profile_of(
+                    identity=identity, user_id=params.user_id, workspace=params.workspace
+                )
+                return web.json_response(asdict(profile))
             if operation == "identity_of":
                 if set(arguments) != {"author"} or params.author is None:
                     raise ValueError

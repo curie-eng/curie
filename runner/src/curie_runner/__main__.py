@@ -42,6 +42,7 @@ from .approval import (
     APPROVAL_SERVER_NAME,
     ApprovalGate,
     ApprovalPolicyError,
+    PublicationLedger,
     assert_gates_not_shadowed,
     build_approval_gate,
     include_generic_policy_pager,
@@ -63,6 +64,21 @@ from .attachments import (
     parse_manifest,
     read_status,
     reconcile,
+)
+from .channel_memory_rules import (
+    ChannelRules,
+    is_work_item_run,
+    load_channel_rules,
+    rules_url,
+)
+from .completion_contract import (
+    CONTRACT_BLOCKED_EXPLANATION,
+    IMPLEMENTATION,
+    PUBLICATION_RECOVERY_EXPLANATION,
+    REASON_INTERNAL_ERROR,
+    BoundContract,
+    ContractUnavailable,
+    bind_completion_contract,
 )
 from .config import (
     ALLOW_TOKENLESS_ENV,
@@ -91,8 +107,12 @@ from .harness.claude.approval import (
 from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
-from .harness.claude.requester_guard import build_subagent_guard
-from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
+from .harness.claude.propose_rule_tool import (
+    wrap_channel_propose_rule_handler,
+    wrap_propose_rule_handler,
+)
+from .harness.claude.question_tool import wrap_questions_handler
+from .harness.claude.requester_guard import build_learned_rules_guard, build_subagent_guard
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
@@ -136,6 +156,9 @@ from .memory_facts import (
     format_facts_preamble,
     resolve_facts_store,
 )
+from .memory_rules_context import Failed as RulesFailed
+from .memory_rules_context import MemoryRulesContextGate, blocked_explanation
+from .memory_rules_context import attach_gate as attach_rules_gate
 from .otel import RunTracer, build_tracer_provider
 from .platform_slack.capability import ChannelReadTurn, url_origin
 from .plugin import (
@@ -153,6 +176,7 @@ from .progress import (
     factory_progress_requested,
     resolve_progress,
 )
+from .propose_rule import channel_propose_rule_handler
 from .publication_precheck import PublicationPrecheck
 from .redact import collect_held_secrets, install_stdout_redaction, register_held_secrets
 from .requester_context import BLOCKED_EXPLANATION as REQUESTER_BLOCKED_EXPLANATION
@@ -183,18 +207,6 @@ from .state import (
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
 from .tool_names import STATE_SERVER_NAME, platform_slack_tool_names
-from .tracker_result import (
-    CONTRACT_BLOCKED_EXPLANATION,
-    IMPLEMENTATION,
-    PUBLICATION_RECOVERY_EXPLANATION,
-    REASON_INTERNAL_ERROR,
-    SECOND_SESSION_EXPLANATION,
-    BoundContract,
-    ContractUnavailable,
-    SingleModelSession,
-    bind_completion_contract,
-    session_limits,
-)
 from .turn_progress import (
     PROGRESS_PREAMBLE,
     TurnProgress,
@@ -683,6 +695,7 @@ def _compose_system_prompt(
     progress_preamble: str | None = None,
     facts_preamble: str | None = None,
     guidance_preamble: str | None = None,
+    rules_preamble: str | None = None,
     requester_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
@@ -708,6 +721,10 @@ def _compose_system_prompt(
     The requester's pinned coding instructions (ADR 0278) follow the stable
     bundle prefix and model identity, between their two delimiter lines. Absent,
     the prompt is byte-identical to what it was before the section existed.
+
+    The accepted learned rules for the repository (#5798) sit between the model
+    identity and the requester section, so the order on the page is the order
+    of authority both sections state. Absent, the prompt is byte-identical too.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
@@ -723,6 +740,7 @@ def _compose_system_prompt(
             progress_preamble,
             base,
             model_preamble,
+            rules_preamble,
             requester_preamble,
             attachment_preamble,
         )
@@ -807,6 +825,7 @@ def build_runner(
     memory_facts_preamble: str | None = None,
     memory_guidance: str | None = None,
     scope: ProviderScope | None = None,
+    channel_rules: ChannelRules | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -825,6 +844,11 @@ def build_runner(
 
     ``scope`` is the boot credential's provider scope (#5426), derived before
     the harness rewrote the env; None in fake model mode.
+
+    ``channel_rules`` is the session start read of the accepted standing rules
+    for a run with no work item (#5801); None when boot did not read them. A
+    run holding the ``wir`` capability ignores it: its rules are pinned at
+    admission and its ``propose_rule`` is the factory's.
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -963,8 +987,17 @@ def build_runner(
                 else format_attachment_preamble(attachment_view)
             ),
             progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
+            rules_preamble=(
+                rules_gate.applied.section()
+                if rules_gate.applied is not None
+                else channel_rules_in_force.section
+                if channel_rules_in_force is not None
+                else None
+            ),
             requester_preamble=(
-                requester_gate.applied.section() if requester_gate.applied is not None else None
+                requester_gate.applied.section(learned_rules=rules_gate.applied is not None)
+                if requester_gate.applied is not None
+                else None
             ),
             facts_preamble=memory_facts_preamble,
             guidance_preamble=(
@@ -1089,6 +1122,40 @@ def build_runner(
     # The GitHub factory issue read (ADR 0187) is present only for an execution
     # with a WorkItem whose worker injected the route and capability.
     issue_read = resolve_issue_read(os.environ)
+    # ADR 0286 decision 11 (#5785): a factory execution may mount
+    # ``ask_questions``, and a posted round ends its turn through the approval
+    # hooks. A factory boot with no policy gate (no workspace, approval tools or
+    # tool policy) still needs those hooks, so it gets a gate that gates
+    # nothing and only carries the halt. It is never the session's approval
+    # gate: permissions and the pager are unchanged. The session reads it as
+    # its question gate and resets it at each turn start.
+    question_halt_gate = (
+        approval_gate
+        if approval_gate is not None
+        else ApprovalGate()
+        if issue_read is not None
+        else None
+    )
+    # With no approval gate, the publish body and the session share this to
+    # know the body ran (#2294); a gated session keeps that on its gate.
+    publication_ledger = PublicationLedger() if approval_gate is None else None
+    # The accepted standing rules of a run with no work item (#5801). A factory
+    # run (``wir`` or the work-item progress URL, which survives a failed
+    # issue-read mint) never uses them: its rules and its ``propose_rule`` come
+    # from the completion contract and the admission pin.
+    channel_rules_in_force = channel_rules if not is_work_item_run(os.environ) else None
+    # The channel ``propose_rule`` mounts beside the memory tools only, and only
+    # when the session start read offered it. It writes with the turn's own
+    # credential, so with no turn credential it refuses without a request.
+    channel_rules_url = rules_url(config.session.memory_ref)
+    channel_rule_handler = (
+        channel_propose_rule_handler(channel_rules_url, turn_write_token)
+        if memory_tools_mounted
+        and channel_rules_in_force is not None
+        and channel_rules_in_force.proposals_enabled
+        and channel_rules_url is not None
+        else None
+    )
     progress_activity = ProgressActivity()
     progress_activity.model = config.model
     # Per-model token usage for the run's cost line (#3223): reported whenever
@@ -1215,6 +1282,8 @@ def build_runner(
     bound_contract = BoundContract(IMPLEMENTATION)
     # ADR 0278 (#5592): the worker's requester context envelope, decided once.
     requester_gate = RequesterContextGate()
+    # #5798: the worker's learned rules envelope, decided once, beside it.
+    rules_gate = MemoryRulesContextGate()
     observed_readonly_tools: frozenset[str] = frozenset()
 
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
@@ -1302,7 +1371,11 @@ def build_runner(
         session_hooks = front_pre_tool_use_hooks(
             _merge_pre_tool_use_hooks(
                 build_gated_pre_tool_use_hooks(
-                    build_approval_hook(approval_gate) if approval_gate is not None else None,
+                    (
+                        build_approval_hook(question_halt_gate)
+                        if question_halt_gate is not None
+                        else None
+                    ),
                     connector_availability,
                 ),
                 bundle_hooks,
@@ -1311,7 +1384,7 @@ def build_runner(
                     # Only a boot that can bind an execution can apply a
                     # requester section (ADR 0278); any other boot is unchanged.
                     build_subagent_guard(requester_gate) if issue_read is not None else None,
-                    None,
+                    build_learned_rules_guard(rules_gate) if issue_read is not None else None,
                 ),
             ),
             tool_access,
@@ -1351,11 +1424,13 @@ def build_runner(
         # the platform supplies one. The generic pager is independently omitted
         # when the observed surface has no actionable tools.
         def curie_server(
-            tracker_result_tool: SdkMcpTool[Any] | None = None,
+            question_tool: SdkMcpTool[Any] | None = None,
+            propose_rule_tool: SdkMcpTool[Any] | None = None,
         ) -> McpSdkServerConfig:
             return build_approval_server(
                 approval_gate,
                 managed_workspace=mounted_workspace is not None,
+                publication_ledger=publication_ledger,
                 include_request_approval=carries_request_approval,
                 progress_tool=(
                     build_progress_tool(progress[1], progress[0], progress_activity)
@@ -1387,7 +1462,17 @@ def build_runner(
                     build_attachment_tools(attachment_access)
                     if attachment_access is not None else ()
                 ),
-                tracker_result_tool=tracker_result_tool,
+                question_tool=question_tool,
+                # The factory's tool when the contract offered it; otherwise the
+                # channel one (#5801). The two never coexist: the channel one
+                # exists only without the ``wir`` capability.
+                propose_rule_tool=(
+                    propose_rule_tool
+                    if propose_rule_tool is not None
+                    else wrap_channel_propose_rule_handler(channel_rule_handler)
+                    if channel_rule_handler is not None
+                    else None
+                ),
             )
 
         platform_servers: dict[str, Any] = {
@@ -1410,21 +1495,26 @@ def build_runner(
 
         def options_for(system_prompt: str | None, bound: BoundContract) -> ClaudeAgentOptions:
             # Built by ``initialize`` once the preflight has shaped the prompt
-            # and the API has answered the completion contract. A tracker
-            # result contract mounts ``submit_tracker_result`` on the ``curie``
-            # server, denies Task and Agent and spends at most its allowance.
-            limits = session_limits(
-                bound.contract,
-                disallowed_tools=config.catalogue_disallowed_tools,
-                max_budget_usd=config.max_usd_per_day,
-            )
+            # and the API has answered the completion contract. An
+            # implementation contract mounts ``ask_questions`` (#5785) on the
+            # ``curie`` server, and ``propose_rule`` (ADR 0287, #5796) when the
+            # API offered it; the binding never sets it for the fake.
             session_platform_servers = (
                 platform_servers
-                if bound.result_handler is None
+                if bound.question_handler is None and bound.rule_handler is None
                 else {
                     **platform_servers,
                     APPROVAL_SERVER_NAME: curie_server(
-                        wrap_tracker_result_handler(bound.result_handler)
+                        (
+                            wrap_questions_handler(bound.question_handler)
+                            if bound.question_handler is not None
+                            else None
+                        ),
+                        (
+                            wrap_propose_rule_handler(bound.rule_handler)
+                            if bound.rule_handler is not None
+                            else None
+                        ),
                     ),
                 }
             )
@@ -1441,7 +1531,7 @@ def build_runner(
                 reviewer_model=config.reviewer_model,
                 system_prompt=system_prompt,
                 max_turns=config.max_turns,
-                max_budget_usd=limits.max_budget_usd,
+                max_budget_usd=config.max_usd_per_day,
                 # Curie's durable contract is ordered role/content messages. The
                 # Claude adapter prefers its optional opaque checkpoint to preserve
                 # native cache shape, and otherwise materializes a deterministic
@@ -1487,7 +1577,7 @@ def build_runner(
                 cwd=workspace_cwd,
                 web_search_enabled=web_search_enabled,
                 policy_disallowed_tools=policy_hidden_tools,
-                disallowed_tools=limits.disallowed_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
                 hidden_restore_tools=hidden_restore_tools(
                     derived_mcp_servers,
                     capability.observed_tools,
@@ -1512,6 +1602,8 @@ def build_runner(
             # Answers a delivery still waiting when the start never bound one.
             if not requester_gate.bound:
                 requester_gate.bind(None)
+            if not rules_gate.bound:
+                rules_gate.bind(None)
 
     async def _initialize() -> None:
         # Runs in the runner's shared start task after the listener binds
@@ -1543,12 +1635,21 @@ def build_runner(
         if preflight_block is None:
             # The completion contract (ADR 0277, #5586), only when the worker
             # injected the issue read capability: no capability (local, eval,
-            # fake) makes no call. For a tracker result this call reserves the
-            # request's one model session, so it runs after the preflight,
-            # which could still block the model. Any failure blocks the model.
+            # fake) makes no call. It runs after the preflight, which could
+            # still block the model. Any failure blocks the model.
             reason: str | None = None
             try:
-                bound_contract = await bind_completion_contract(issue_read)
+                bound_contract = await bind_completion_contract(
+                    issue_read,
+                    fake_model=fake_model,
+                    # ADR 0286 decision 11: a posted round ends the turn
+                    # through the approval halt.
+                    on_questions_posted=(
+                        question_halt_gate.halt_for_questions
+                        if question_halt_gate is not None
+                        else None
+                    ),
+                )
             except ContractUnavailable as exc:
                 reason = exc.reason
             except Exception:  # noqa: BLE001 - the contract gate fails closed
@@ -1567,19 +1668,18 @@ def build_runner(
                 # context, and any turn sent to it answers offline.
                 logger.info("completion contract publication_recovery; the model will not start")
                 preflight_block = PUBLICATION_RECOVERY_EXPLANATION
-            elif bound_contract.contract.tracker_result:
-                logger.info(
-                    "completion contract tracker_result result_kinds=%s",
-                    ",".join(bound_contract.contract.result_kinds),
-                )
+            if reason is None and bound_contract.rule_handler is not None:
+                logger.info("completion contract offers propose_rule")
         if preflight_block is not None:
             # Blocked before any model session: the start answers offline with
             # its explanation, and the worker leaves the request's evidence.
             requester_gate.block()
+            rules_gate.block()
             execution = None
         else:
             execution = bound_contract.contract.execution
             requester_gate.bind(execution)
+            rules_gate.bind(execution)
         if issue_read is None:
             await initialize_session()
 
@@ -1589,21 +1689,22 @@ def build_runner(
             outcome = await requester_gate.wait()
             if isinstance(outcome, RequesterFailed):
                 preflight_block = REQUESTER_BLOCKED_EXPLANATION
+                # Blocked before any model session: a learned rules envelope
+                # still to come is answered as such, never acknowledged.
+                rules_gate.block()
+            elif isinstance(rules_outcome := await rules_gate.wait(), RulesFailed):
+                # The session waits for both acknowledgments (#5798).
+                preflight_block = blocked_explanation(rules_outcome.reason)
         if build_real_options is not None:
             real_options = build_real_options(compose_system_prompt(verification), bound_contract)
 
     sdk_generation = 0
-    single_session = SingleModelSession()
 
     def factory() -> ModelSession:
         # Every session the runner asks for passes here: boot, ``reset`` and
-        # the session replacement alike. A blocked boot answers offline, and a
-        # tracker result process gets exactly one model session (#5586).
+        # the session replacement alike. A blocked boot answers offline.
         if preflight_block is not None:
             return PreflightBlockedSession(preflight_block, model=config.model)
-        if bound_contract.contract.tracker_result and not single_session.admit():
-            logger.warning("tracker result session already used; the model will not start")
-            return PreflightBlockedSession(SECOND_SESSION_EXPLANATION, model=config.model)
         return model_session()
 
     def model_session() -> ModelSession:
@@ -1624,12 +1725,9 @@ def build_runner(
                 # Share the same gate so a scripted request_approval resolves its
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
+                publication_ledger=publication_ledger,
                 replay_messages=conversation_replay.messages,
-                disallowed_tools=session_limits(
-                    bound_contract.contract,
-                    disallowed_tools=config.catalogue_disallowed_tools,
-                    max_budget_usd=None,
-                ).disallowed_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
                 # The same holder the SDK tool closes over, so the scripted
                 # progress demo runs the real handler (ADR 0130).
                 turn_progress=turn_progress,
@@ -1698,6 +1796,8 @@ def build_runner(
             memory_store=memory_store,
             history_store=history_store,
             approval_gate=approval_gate,
+            question_gate=question_halt_gate,
+            publication_ledger=publication_ledger,
             approval_resumed_kind=config.approval_resumed_kind,
             approval_decision=config.approval_decision,
             false_completion_check=config.false_completion_check,
@@ -1729,6 +1829,7 @@ def build_runner(
         cwd=workspace_cwd,
     )
     attach_gate(runner, requester_gate)
+    attach_rules_gate(runner, rules_gate)
     return runner
 
 
@@ -1957,6 +2058,24 @@ class _BootFetches:
     # build_runner parameters they feed.
     memory_facts_preamble: str | None = None
     memory_guidance: str | None = None
+    # The accepted standing rules of a run with no work item (#5801).
+    channel_rules: ChannelRules | None = None
+
+
+def _channel_rules_source(config: RunnerConfig, fake_model: bool) -> tuple[str, str] | None:
+    """The ``state/_rules`` URL and boot memory token to read, or None.
+
+    Read only on the real model path, with a memory ref and the boot memory
+    token, and never on a WorkItem run: ``wir`` capability or progress URL (#5801).
+    """
+
+    if fake_model or is_work_item_run(os.environ):
+        return None
+    url = rules_url(config.session.memory_ref)
+    token = os.environ.get(MEMORY_TOKEN_ENV) or None
+    if url is None or token is None:
+        return None
+    return url, token
 
 
 async def _load_boot_fetches(
@@ -1973,6 +2092,8 @@ async def _load_boot_fetches(
     history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
     facts: tuple[str | None, str | None] = (None, None)
     capability: McpToolCapabilityProbe | None = None
+    channel_rules: ChannelRules | None = None
+    channel_rules_source = _channel_rules_source(config, fake_model)
     derived = derive_mcp_servers(
         config.session.plugin_dir,
         release=config.connector_release,
@@ -2000,6 +2121,11 @@ async def _load_boot_fetches(
         nonlocal facts
         facts = await _load_memory_facts(config)
 
+    async def load_rules() -> None:
+        nonlocal channel_rules
+        if channel_rules_source is not None:
+            channel_rules = await load_channel_rules(*channel_rules_source)
+
     async def probe() -> None:
         nonlocal capability
         capability = await probe_mcp_tool_capability(
@@ -2012,6 +2138,7 @@ async def _load_boot_fetches(
         tg.start_soon(load_memory)
         tg.start_soon(load_history)
         tg.start_soon(load_facts)
+        tg.start_soon(load_rules)
         if not fake_model:
             tg.start_soon(probe)
 
@@ -2030,6 +2157,7 @@ async def _load_boot_fetches(
         history_capacity_exceeded=history[2],
         memory_facts_preamble=facts[0],
         memory_guidance=facts[1],
+        channel_rules=channel_rules,
     )
 
 
@@ -2203,6 +2331,7 @@ def _serve() -> None:
         memory_facts_preamble=fetches.memory_facts_preamble,
         memory_guidance=fetches.memory_guidance,
         scope=boot_scope,
+        channel_rules=fetches.channel_rules,
     )
 
     def publication_proposal() -> tuple[str | None, str | None]:

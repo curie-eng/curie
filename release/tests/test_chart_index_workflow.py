@@ -340,7 +340,7 @@ class TestChartIndexWorkflowContract:
         consumer_script = run_script(steps[consumer])
 
         assert steps[helm_setup]["uses"] == (
-            "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
+            "azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e"
         )
         assert publication < helm_setup < consumer
         assert "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/gh-pages" in consumer_script

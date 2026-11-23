@@ -42,19 +42,9 @@ from . import (
     factory_review_feedback,
     factory_tracker_intake,
 )
-from . import factory_tracker_result_runtime as tracker_result_runtime
 from .code_host_trust import code_host_verify
 from .config import Settings
-from .factory_tracker_result_delivery import (
-    TrackerResultStorageError,
-    deliver,
-    due_deliveries,
-    expire_overdue,
-)
-from .factory_triage_handoff import abandon_attempt, due_handoffs, hand_off
-from .forges.errors import ForgeError
-from .forges.ports import Tracker
-from .models import ExecutionRequest, FactoryTrackerResultDelivery, WorkItem
+from .models import ExecutionRequest, WorkItem
 from .workitem_dispatch import (
     claim_due,
     claim_terminate_publishes,
@@ -64,9 +54,6 @@ from .workitem_dispatch import (
 )
 
 logger = logging.getLogger(__name__)
-
-# One reconciler delivery attempt; the attempt lease (120 s) outlives it.
-_TRACKER_RESULT_ATTEMPT_SECONDS = 55.0
 
 
 # Set the round's enqueue marker NX and append the turn atomically, so no crash
@@ -173,17 +160,15 @@ class WorkItemReconciler:
             # worker was told to tear down before the settle pass.
             ("publish_terminate_wakes", self._publish_terminate_wakes),
             ("settle_overdue_cancellations", self._settle_overdue_cancellations),
+            # A question round an older API replica settled past during a
+            # rolling upgrade (#5785), before readmission and promotion.
+            ("redrive_question_rounds", self._redrive_question_rounds),
             ("readmit_pending", self._readmit_pending),
+            ("drain_answer_retries", self._drain_answer_retries),
             ("reconcile_missed_labels", self._reconcile_missed_labels),
             ("poll_trackers", self._poll_trackers),
             ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
             ("reconcile_base_transitions", self._reconcile_base_transitions),
-            # Tracker results (ADR 0277, #5586): settle overdue deliveries, then
-            # attempt the due ones, a run's submission and platform findings alike.
-            ("expire_tracker_results", self._expire_tracker_results),
-            ("deliver_tracker_results", self._deliver_tracker_results),
-            # A delivered triage ticket's implementation handoff (#5588).
-            ("hand_off_triage_tickets", self._hand_off_triage_tickets),
             ("publish_execute_wakes", self._publish_execute_wakes),
         ):
             attributes = {"service.name": "curie-api", "step": name}
@@ -202,93 +187,6 @@ class WorkItemReconciler:
                 self._step_consecutive_failures[name],
                 attributes=attributes,
             )
-
-    async def _expire_tracker_results(self) -> None:
-        await expire_overdue(self._sessionmaker, limit=self._settings.work_item_batch_limit)
-
-    async def _deliver_tracker_results(self) -> None:
-        """One attempt for each due tracker result delivery, through the
-        WorkItem's own tracker, under this reconciler's attempt owner."""
-
-        async with self._sessionmaker() as session:
-            due = await due_deliveries(session, limit=self._settings.work_item_batch_limit)
-            if not due:
-                return
-            rows = (
-                await session.execute(
-                    select(FactoryTrackerResultDelivery.id, WorkItem)
-                    .join(
-                        ExecutionRequest,
-                        ExecutionRequest.id == FactoryTrackerResultDelivery.execution_request_id,
-                    )
-                    .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
-                    .where(FactoryTrackerResultDelivery.id.in_(due))
-                )
-            ).all()
-            client = httpx.AsyncClient(
-                timeout=self._settings.github_app_timeout_seconds,
-                verify=code_host_verify(self._settings),
-            )
-            # Built here, while the rows are attached; building makes no request.
-            targets: list[tuple[uuid.UUID, Tracker]] = []
-            for delivery_id, work_item in rows:
-                try:
-                    tracker = tracker_result_runtime.work_item_tracker(
-                        self._settings, client, work_item
-                    )
-                except ForgeError:
-                    logger.warning(
-                        "tracker result delivery %s has no tracker configured", delivery_id
-                    )
-                    continue
-                targets.append((delivery_id, tracker))
-            await session.rollback()
-        try:
-            for delivery_id, tracker in targets:
-                try:
-                    async with asyncio.timeout(_TRACKER_RESULT_ATTEMPT_SECONDS):
-                        await deliver(
-                            self._sessionmaker,
-                            delivery_id,
-                            tracker=tracker,
-                            settings=self._settings,
-                            owner=self._owner,
-                        )
-                except (TrackerResultStorageError, TimeoutError):
-                    logger.warning("tracker result delivery %s attempt did not finish", delivery_id)
-        finally:
-            await client.aclose()
-
-    async def _hand_off_triage_tickets(self) -> None:
-        """One attempt for each due triage handoff, under this reconciler's owner."""
-
-        async with self._sessionmaker() as session:
-            due = await due_handoffs(session, limit=self._settings.work_item_batch_limit)
-            await session.rollback()
-        if not due:
-            return
-        async with httpx.AsyncClient(
-            timeout=self._settings.github_app_timeout_seconds,
-            verify=code_host_verify(self._settings),
-        ) as client:
-            for handoff_id in due:
-                try:
-                    async with asyncio.timeout(_TRACKER_RESULT_ATTEMPT_SECONDS):
-                        await hand_off(
-                            self._sessionmaker,
-                            handoff_id,
-                            settings=self._settings,
-                            client=client,
-                            owner=self._owner,
-                        )
-                except TimeoutError:
-                    logger.warning("triage handoff %s attempt did not finish", handoff_id)
-                    await abandon_attempt(
-                        self._sessionmaker,
-                        handoff_id,
-                        owner=self._owner,
-                        settings=self._settings,
-                    )
 
     async def _redispatch_lapsed_acquisitions(self) -> None:
         async with self._sessionmaker() as session:
@@ -537,6 +435,16 @@ class WorkItemReconciler:
                     settle_seconds,
                 )
 
+    async def _redrive_question_rounds(self) -> None:
+        async with self._sessionmaker() as session:
+            ids = await lifecycle.question_rounds_to_redrive(
+                session, limit=self._settings.work_item_batch_limit
+            )
+        for work_item_id in ids:
+            async with self._sessionmaker() as session:
+                await lifecycle.redrive_question_round(session, work_item_id=work_item_id)
+                await session.commit()
+
     async def _readmit_pending(self) -> None:
         async with self._sessionmaker() as session:
             ids = (
@@ -710,6 +618,24 @@ class WorkItemReconciler:
         )
         # Already-enqueued counts as published: the round has its turn.
         return True
+
+    async def _drain_answer_retries(self) -> None:
+        """Read again the answers a webhook deferred (#5787), on every tick.
+
+        Not gated on ``factory_reconcile_interval_s``: GitHub never redelivers
+        the deferral, so this is the only reader in webhook mode. Poll mode's
+        pass drains them itself.
+        """
+
+        settings = self._settings
+        if not settings.factory_enabled or settings.factory_intake == "poll":
+            return
+        async with httpx.AsyncClient(
+            timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+        ) as client:
+            await factory_label_reconcile.drain_webhook_answer_retries(
+                self._sessionmaker, settings, client
+            )
 
     async def _reconcile_missed_labels(self) -> None:
         """Admit labeled issues whose delivery GitHub never retried (#3081)."""

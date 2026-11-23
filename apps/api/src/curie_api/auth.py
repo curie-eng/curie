@@ -206,6 +206,7 @@ async def require_internal_adapter_secret(
 
 async def require_principal_session(
     session: SessionDep,
+    request: Request,
     console_session: Annotated[str | None, Cookie(alias=CONSOLE_SESSION_COOKIE)] = None,
 ) -> Principal:
     """Authenticate a person by their OIDC console session; return the principal.
@@ -234,4 +235,5 @@ async def require_principal_session(
             detail="missing, invalid, or expired principal session",
             headers={"Cache-Control": "no-store"},
         )
+    request.state.principal_session_token = console_session
     return principal

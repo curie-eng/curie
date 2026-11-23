@@ -198,6 +198,7 @@ CHART_SHARED_INPUTS = (
     ".github/workflows/ci.yaml",
     ".github/e2e-selection.yaml",
     ".github/actions/load-ci-images",
+    ".github/scripts",
     "tools/runtime-assertion-gate/run.sh",
     "cli/scripts/configure-docker-hub-mirror.sh",
     "cli/scripts/ensure-kind-registry.sh",
@@ -302,7 +303,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "pyproject.toml",
             "uv.lock",
         ],
-        "leg": "workload",
+        "leg": "workload-2",
     },
     "connector-secret-rotation": {
         "step": "Hosted connector credential rotation rolls only that connector",
@@ -316,7 +317,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "pyproject.toml",
             "uv.lock",
         ],
-        "leg": "workload",
+        "leg": "workload-2",
     },
     "runner-template-admission": {
         "step": "Runner template admission refuses host escapes, token mounts, and unlisted images",
@@ -344,7 +345,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
             *CHART_IMAGE_INPUTS,
         ],
-        "leg": "workload",
+        "leg": "workload-1",
     },
     "factory-resource-profile": {
         "step": "Factory resource profile runtime (#4889)",
@@ -358,13 +359,13 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "charts/curie/templates/_helpers.tpl",
             *CHART_IMAGE_INPUTS,
         ],
-        "leg": "workload",
+        "leg": "workload-1",
     },
 }
 CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
 
-CHART_LEGS = ("chart", "upgrade", "workload")
+CHART_LEGS = ("chart", "upgrade", "workload-1", "workload-2")
 WORKLOAD_SCENARIOS = frozenset(
     {
         "quota-progress",
@@ -3465,7 +3466,9 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     assert evidence["with"]["name"] == "upgrade-matrix-evidence-${{ matrix.shard }}"
     assert evidence["with"]["path"] == ".projects/2590-evidence"
     teardown = named_steps["Tear down the owned upgrade matrix cluster"]
-    assert teardown["if"] == "always()"
+    assert teardown["if"] == (
+        "always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-matrix'"
+    )
     assert "kind delete cluster --name curie-upgrade-matrix" in teardown["run"]
     assert "kind delete cluster --name curie-upgrade " not in teardown["run"]
 
@@ -3636,13 +3639,21 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     disk_name = "Free disk for the disposable released upgrade cluster"
     for shared in (
         "Install Helm",
-        "Install Calico so NetworkPolicy is enforced",
         "Download and verify the exact public v0.8.2 chart",
         "Write the legacy retained values fixture",
         "Write the managed attester verifier",
         disk_name,
     ):
         assert negative_steps[shared] == named_steps[shared], shared
+    setup_name = "Install Calico so NetworkPolicy is enforced"
+    for owner_steps, cluster in (
+        (named_steps, "curie-upgrade"),
+        (negative_steps, "curie-upgrade-negative"),
+    ):
+        config = f"kind-{cluster.removeprefix('curie-')}-config.yaml"
+        assert owner_steps[setup_name]["run"] == (
+            f"bash .github/scripts/prepare-kind.sh {cluster} {config}"
+        )
     matrix_disk = next(
         step["run"]
         for step in jobs["e2e-cluster-upgrade-matrix"]["steps"]
@@ -4555,7 +4566,7 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
 
 
 CHART_CANDIDATE_STAGING_IF = (
-    "${{ (matrix.leg == 'workload' && "
+    "${{ (startsWith(matrix.leg, 'workload-') && "
     "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') "
@@ -5095,6 +5106,37 @@ def test_static_token_rotation_inputs_select_the_factory_runtime(tmp_path: Path,
     assert _outputs_of(output)["factory"] == "true"
 
 
+JIRA_ONE_TICKET_INPUTS = (
+    "tools/jira-stub/jira_stub.py",
+    "tools/jira-stub/tests/test_jira_stub.py",
+    "apps/api/tests/forge_fakes/jira.py",
+)
+
+
+@pytest.mark.parametrize("path", JIRA_ONE_TICKET_INPUTS)
+def test_jira_one_ticket_inputs_select_the_factory_runtime(tmp_path: Path, path: str) -> None:
+    """An edit confined to the Jira stub or its fake must run the jira-one-ticket leg."""
+
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["factory"] == "true"
+
+
+@pytest.mark.parametrize("path", JIRA_ONE_TICKET_INPUTS)
+def test_jira_one_ticket_inputs_select_nothing_without_their_prefixes(path: str) -> None:
+    """Negative control: with the entries removed these paths select no factory leg."""
+
+    selector = _load_selector_module()
+    kept = tuple(
+        prefix
+        for prefix in selector.FACTORY_PREFIXES
+        if prefix not in {"tools/jira-stub", "apps/api/tests/forge_fakes/jira.py"}
+    )
+    assert len(kept) == len(selector.FACTORY_PREFIXES) - 2
+    assert not selector._matches_scenario(path, kept)
+    assert selector._matches_scenario(path, selector.FACTORY_PREFIXES)
+
+
 @pytest.mark.parametrize(
     "path",
     (
@@ -5111,8 +5153,19 @@ def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, pat
 
 
 FRESH_INSTALL_TEST = "test_fresh_cluster_up_converges_without_rerun"
+SCRIPTED_PUBLICATION_COMMAND = (
+    "python3 tools/factory-e2e/factory_e2e.py scripted --scenario publication"
+)
+SCRIPTED_JIRA_COMMAND = (
+    "python3 tools/factory-e2e/factory_e2e.py scripted --scenario jira-one-ticket"
+)
+SCRIPTED_LEARNED_RULES_COMMAND = (
+    "python3 tools/factory-e2e/factory_e2e.py scripted --scenario learned-rules"
+    " --transcript tools/model-script/transcripts/learned-rules-chain-a.json"
+)
 SCRIPTED_FACTORY_LEGS = (
-    ("scenario", lambda run: run == "python3 tools/factory-e2e/factory_e2e.py scripted"),
+    ("scenario", lambda run: run == SCRIPTED_PUBLICATION_COMMAND),
+    ("jira-one-ticket", lambda run: run == SCRIPTED_JIRA_COMMAND),
     *(
         (f"initial-binding-{index}",
          lambda run, index=index: (
@@ -5130,8 +5183,16 @@ SCRIPTED_FACTORY_LEGS = (
         "fresh-install",
         lambda run: run == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
     ),
+    ("learned-rules", lambda run: run == SCRIPTED_LEARNED_RULES_COMMAND),
 )
 SCRIPTED_FACTORY_EVIDENCE_STEP = "Upload scripted factory evidence"
+SCRIPTED_JIRA_EVIDENCE_STEP = "Upload scripted Jira one-ticket evidence"
+# Each evidence upload runs in its own leg only, even when that leg failed.
+SCRIPTED_FACTORY_EVIDENCE = {
+    SCRIPTED_FACTORY_EVIDENCE_STEP: "always() && matrix.suite == 'scenario'",
+    SCRIPTED_JIRA_EVIDENCE_STEP: "always() && matrix.suite == 'jira-one-ticket'",
+    "Upload scripted learned rules evidence": "always() && matrix.suite == 'learned-rules'",
+}
 
 
 def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
@@ -5156,14 +5217,12 @@ def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
     for step in steps:
         if "matrix.suite" not in json.dumps(step) or any(step is owner for owner in claimed):
             continue
-        if not (
-            step.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP
-            and step.get("if") == "always() && matrix.suite == 'scenario'"
-        ):
+        if SCRIPTED_FACTORY_EVIDENCE.get(step.get("name", "")) != step.get("if"):
             raise AssertionError(f"unexpected matrix.suite use in step {step.get('name')!r}")
-    evidence = [s for s in steps if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP]
-    if len(evidence) != 1 or evidence[0].get("if") != "always() && matrix.suite == 'scenario'":
-        raise AssertionError("evidence upload must run only in the scenario leg")
+    for name, condition in SCRIPTED_FACTORY_EVIDENCE.items():
+        evidence = [s for s in steps if s.get("name") == name]
+        if len(evidence) != 1 or evidence[0].get("if") != condition:
+            raise AssertionError(f"{name!r} must run only under {condition!r}")
 
 
 def _scripted_factory_step(job: dict[str, Any], leg: str) -> dict[str, Any]:
@@ -5182,13 +5241,54 @@ def _misdirect_step_if(job: dict[str, Any]) -> None:
     _scripted_factory_step(job, "scenario")["if"] = "matrix.suite == 'initial-binding'"
 
 
+def _select_facts_in_factory_ci(job: dict[str, Any]) -> None:
+    step = _scripted_factory_step(job, "scenario")
+    step["run"] = step["run"].replace("--scenario publication", "--scenario facts")
+
+
 def _enable_fail_fast(job: dict[str, Any]) -> None:
     job["strategy"]["fail-fast"] = True
 
 
 def _unguard_evidence(job: dict[str, Any]) -> None:
-    evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP)
+    evidence = next(s for s in job["steps"] if s.get("name") == "Upload scripted factory evidence")
     evidence["if"] = "always()"
+
+
+def _drop_jira_leg(job: dict[str, Any]) -> None:
+    job["strategy"]["matrix"]["suite"].remove("jira-one-ticket")
+
+
+def _run_publication_in_jira_leg(job: dict[str, Any]) -> None:
+    _scripted_factory_step(job, "jira-one-ticket")["run"] = SCRIPTED_PUBLICATION_COMMAND
+
+
+def _upload_jira_evidence_only_on_success(job: dict[str, Any]) -> None:
+    evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_JIRA_EVIDENCE_STEP)
+    evidence["if"] = "matrix.suite == 'jira-one-ticket'"
+
+
+def _drop_learned_rules_leg(job: dict[str, Any]) -> None:
+    job["strategy"]["matrix"]["suite"].remove("learned-rules")
+
+
+def _unguard_learned_rules_evidence(job: dict[str, Any]) -> None:
+    evidence = next(
+        s for s in job["steps"] if s.get("name") == "Upload scripted learned rules evidence"
+    )
+    evidence["if"] = "always()"
+
+
+def _misdirect_learned_rules_evidence(job: dict[str, Any]) -> None:
+    evidence = next(
+        s for s in job["steps"] if s.get("name") == "Upload scripted learned rules evidence"
+    )
+    evidence["if"] = "always() && matrix.suite == 'scenario'"
+
+
+def _select_publication_in_learned_rules(job: dict[str, Any]) -> None:
+    step = _scripted_factory_step(job, "learned-rules")
+    step["run"] = step["run"].replace("--scenario learned-rules", "--scenario publication")
 
 
 def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
@@ -5198,7 +5298,21 @@ def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
 
 @pytest.mark.parametrize(
     "mutate",
-    (_drop_leg, _drop_step_if, _misdirect_step_if, _enable_fail_fast, _unguard_evidence),
+    (
+        _drop_leg,
+        _drop_step_if,
+        _misdirect_step_if,
+        _select_facts_in_factory_ci,
+        _enable_fail_fast,
+        _unguard_evidence,
+        _drop_jira_leg,
+        _run_publication_in_jira_leg,
+        _upload_jira_evidence_only_on_success,
+        _drop_learned_rules_leg,
+        _unguard_learned_rules_evidence,
+        _misdirect_learned_rules_evidence,
+        _select_publication_in_learned_rules,
+    ),
 )
 def test_scripted_factory_leg_mapping_rejects_skippable_shapes(
     mutate: Callable[[dict[str, Any]], None],
@@ -5221,17 +5335,14 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
     assert job["needs"] == ["rust-build", "changes", "ci-images"]
     assert SCRIPTED_FACTORY_JOB in jobs["e2e-required"]["needs"]
 
-    scenario = [
-        step
-        for step in job["steps"]
-        if step.get("run") == "python3 tools/factory-e2e/factory_e2e.py scripted"
-    ]
-    assert len(scenario) == 1
-    assert scenario[0]["env"] == {
-        "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
-        "BUILDX_BUILDER": "default",
-    }
-    assert "continue-on-error" not in scenario[0]
+    for command in (SCRIPTED_PUBLICATION_COMMAND, SCRIPTED_JIRA_COMMAND):
+        scenario = [step for step in job["steps"] if step.get("run") == command]
+        assert len(scenario) == 1
+        assert scenario[0]["env"] == {
+            "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
+            "BUILDX_BUILDER": "default",
+        }
+        assert "continue-on-error" not in scenario[0]
 
     steps = job["steps"]
     registrations = [step for step in steps if INITIAL_BINDING_MODULE in step.get("run", "")]
@@ -5794,7 +5905,7 @@ def test_platform_runner_upgrade_script_selects_the_upgrade_leg(tmp_path: Path) 
     ]
     legs = json.loads(selected["chart_legs"])
     assert "upgrade" in legs
-    assert "workload" not in legs
+    assert not any(leg.startswith("workload-") for leg in legs)
 
 
 def test_template_change_selects_upgrade_and_workload_with_the_main_scenario_list(
@@ -5809,7 +5920,20 @@ def test_template_change_selects_upgrade_and_workload_with_the_main_scenario_lis
     assert json.loads(selected["chart_scenarios"]) == MAIN_TEMPLATE_CHART_SCENARIOS
     legs = json.loads(selected["chart_legs"])
     assert "upgrade" in legs
-    assert "workload" in legs
+    assert {"workload-1", "workload-2"} <= set(legs)
+
+
+@pytest.mark.parametrize("name", ["prepare-kind.sh", "pull-image.sh"])
+def test_setup_helper_changes_select_every_chart_leg_and_released_upgrade(
+    tmp_path: Path, name: str
+) -> None:
+    completed, output = _invoke_selector(tmp_path, f".github/scripts/{name}")
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs_of(output)
+    assert selected["released_upgrade"] == "true"
+    assert selected["approval_resume"] == "true"
+    assert json.loads(selected["chart_scenarios"]) == list(CHART_IDS)
+    assert json.loads(selected["chart_legs"]) == list(CHART_LEGS)
 
 
 @pytest.mark.parametrize(
@@ -5973,7 +6097,9 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
     for scenario, entry in scenarios.items():
         assert isinstance(entry.get("leg"), str), scenario
         assert entry["leg"] in CHART_LEGS, scenario
-    workload = {scenario for scenario, entry in scenarios.items() if entry["leg"] == "workload"}
+    workload = {
+        scenario for scenario, entry in scenarios.items() if entry["leg"].startswith("workload-")
+    }
     upgrade = {scenario for scenario, entry in scenarios.items() if entry["leg"] == "upgrade"}
     assert workload == WORKLOAD_SCENARIOS
     assert upgrade == UPGRADE_SCENARIOS
@@ -5990,7 +6116,7 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
             ("charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",),
             False,
             ["failed-first-install-retry", "quota-progress"],
-            ["upgrade", "workload"],
+            ["upgrade", "workload-1"],
         ),
         (
             ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
@@ -5998,7 +6124,7 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
             ["connector-readiness", "failed-first-install-retry"],
             ["chart", "upgrade"],
         ),
-        ((), True, list(CHART_IDS), ["chart", "upgrade", "workload"]),
+        ((), True, list(CHART_IDS), ["chart", "upgrade", "workload-1", "workload-2"]),
         (("docs/adr/AGENTS.md",), False, [], []),
     ],
     ids=("quota-only", "chart-only", "push", "docs"),
@@ -6076,7 +6202,10 @@ def test_chart_job_runs_one_leg_per_runner_from_the_selected_legs() -> None:
             continue
         legs = {CHART_SCENARIOS[scenario]["leg"] for scenario in named}
         if name in WORKLOAD_STAGING_STEPS:
-            assert legs == {"upgrade", "workload"}, name
+            assert legs == {"upgrade", "workload-1", "workload-2"}, name
+            continue
+        if name == "Install the shared workload platform":
+            assert legs == {"workload-1", "workload-2"}, name
             continue
         assert len(legs) == 1, name
         assert condition.startswith("${{ " + _chart_leg_clause(legs.pop()) + " && "), name
@@ -6242,7 +6371,7 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
     # An unregistered step has no leg condition, so it must run in every leg.
-    assert json.loads(_outputs_of(output)["chart_legs"]) == ["chart", "upgrade", "workload"]
+    assert json.loads(_outputs_of(output)["chart_legs"]) == list(CHART_LEGS)
     docs, docs_output = _invoke_selector(tmp_path, "docs/example.md", cwd=repository)
     assert docs.returncode == 0, docs.stderr
     assert _outputs_of(docs_output)["chart_scenarios"] == "[]"
@@ -6397,7 +6526,7 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     shared = [
         step for step in steps
         if step.get("name") in scenario_names
-        and step.get("if", "").startswith("${{ matrix.leg == 'workload' && ")
+        and step.get("if", "").startswith("${{ matrix.leg == 'workload-")
     ]
     chart = [
         step for step in steps
@@ -6432,7 +6561,7 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
         assert "get pods -A -o wide" in diagnostics["run"]
         assert "get events -A --sort-by=.lastTimestamp" in diagnostics["run"]
     cleanup = steps[remove]
-    assert cleanup["if"] == "${{ always() && matrix.leg == 'workload' }}"
+    assert cleanup["if"] == "${{ always() && startsWith(matrix.leg, 'workload-') }}"
     assert "steps." not in cleanup["if"]
     assert shlex.split(cleanup["run"]) == CHART_SETUP_FIXTURES[cleanup["name"]]
     setup = steps[install]

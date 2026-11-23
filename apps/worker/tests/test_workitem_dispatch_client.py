@@ -296,6 +296,62 @@ def test_running_sends_the_wake_and_preserves_persisted_execution_facts(
     assert found.lease_held_to_deadline is lease_held_to_deadline
 
 
+# An API older than the single-path dispatch body may still send a completion
+# field. The worker reads none: every grant is an implementation or a
+# publication recovery run by its execution kind alone, and a stale value, of
+# any spelling, neither fails the body nor changes the run.
+_STALE_COMPLETION_VALUES = ["implementation", "an-unknown-contract", 7]
+
+
+@pytest.mark.parametrize("stale", _STALE_COMPLETION_VALUES)
+def test_a_stale_completion_field_in_the_dispatch_body_is_ignored(stale: object) -> None:
+    stale_body = {"completion_contract": stale}
+    acquired = _acquire({**BASE, **stale_body})
+    assert acquired == _acquire(BASE)
+    assert {field.name for field in dataclasses.fields(acquired)} == {
+        "generation",
+        "work_item_id",
+        "conversation_id",
+        "wait_deadline",
+        "repository_path",
+        "context",
+        "execution_kind",
+        "recovery_candidate_id",
+        "resource_gate",
+        "predecessor_claim_name",
+    }
+
+    found = _run(
+        lambda _request: httpx.Response(200, json={**_running_body(), **stale_body}),
+        lambda client: client.running_for_conversation("thread", wake=WAKE),
+    )
+    assert isinstance(found, WorkItemRunning)
+    assert found == _run(
+        lambda _request: httpx.Response(200, json=_running_body()),
+        lambda client: client.running_for_conversation("thread", wake=WAKE),
+    )
+
+    start_body = {
+        "runtime_epoch": 1,
+        "execution_deadline": "2099-01-01T00:00:00+00:00",
+        "remaining_s": 600,
+        "heartbeat_interval_s": 1000,
+    }
+    started = _run(
+        lambda _request: httpx.Response(200, json={**start_body, **stale_body}),
+        lambda client: client.start(
+            REQUEST_ID,
+            owner="worker-1",
+            generation=1,
+            claim_name="acme-claim",
+            sandbox_name="acme-sandbox",
+            context=CONTEXT,
+            delivered_limits=UNOBSERVED_LIMITS,
+        ),
+    )
+    assert {field.name for field in dataclasses.fields(started)} == set(start_body)
+
+
 @pytest.mark.parametrize("field", list(_running_body()))
 def test_running_refuses_missing_required_facts(field: str) -> None:
     body = _running_body()
@@ -1306,3 +1362,107 @@ def test_start_and_finish_send_delivered_limits_and_exhausted_volume() -> None:
         "max_turns": 1000,
     }
     assert finish["exhausted_volume"] == "workspace"
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["beat_answers_first", "finish_answers_first", "finish_refused_stale", "no_finish"],
+)
+def test_a_stale_beat_is_only_a_lost_epoch_when_this_runs_finish_did_not_commit(
+    order: str,
+) -> None:
+    """A beat in flight when this run's own finish commits is not a stale owner (#5840).
+
+    The API refuses a heartbeat for any row that is no longer running, so the
+    beat that crosses a committed finish comes back ``stale_owner`` whichever
+    answer arrives first. Abandoning on it skips the failed run's recovery
+    capture. A finish the API refuses as ``stale_owner`` (a stolen epoch), or no
+    finish at all, still abandons.
+    """
+
+    async def go() -> None:
+        finish_committed = asyncio.Event()
+        beat_answered = asyncio.Event()
+        finish_returned = asyncio.Event()
+        beat_sent = asyncio.Event()
+        beats: list[str] = []
+        stale: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            verb = request.url.path.rsplit("/", 1)[-1]
+            if verb == "heartbeat":
+                beats.append(order)
+                beat_sent.set()
+                if order == "finish_answers_first":
+                    await finish_returned.wait()
+                elif order != "no_finish":
+                    await finish_committed.wait()
+                beat_answered.set()
+                # The internal heartbeat route's 409 for a row no longer running.
+                return httpx.Response(409, json={"detail": {"code": "stale_owner"}})
+            assert verb == "finish"
+            if order == "finish_refused_stale":
+                finish_committed.set()
+                await beat_answered.wait()
+                return httpx.Response(409, json={"detail": {"code": "stale_owner"}})
+            finish_committed.set()
+            if order == "beat_answers_first":
+                await beat_answered.wait()
+                # Let the heartbeat task act on its answer before this one lands.
+                for _ in range(50):
+                    await asyncio.sleep(0)
+            return httpx.Response(200, json={})
+
+        async def on_stop(_thread: str, _run: WorkItemRun) -> None:
+            raise AssertionError("no cancellation was requested")
+
+        async def on_stale(_thread: str, run: WorkItemRun) -> None:
+            stale.append(order)
+            run.abandoned = True
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            run = WorkItemRun(
+                client=WorkItemDispatchClient(
+                    api_base_url="http://api.example", worker_token="example-token", client=http
+                ),
+                request_id=REQUEST_ID,
+                owner="worker-1",
+                grant=_grant(),
+                wake=WAKE,
+                event_id="event",
+                thread_key="slack:C1:thread",
+                on_stop=on_stop,
+                on_stale=on_stale,
+            )
+            run.started = True
+            run.runtime_epoch = 1
+            beat = asyncio.create_task(run._heartbeat_loop(0.01))
+            run._heartbeat_task = beat
+            try:
+                if order != "no_finish":
+                    await asyncio.wait_for(beat_sent.wait(), 5)
+                    try:
+                        await run.finish(
+                            outcome="failed",
+                            cause="runner_failed",
+                            detail=None,
+                            ci_fix_round=None,
+                            retry_safety="uncertain",
+                            retry_condition=None,
+                            exhausted_volume=None,
+                        )
+                    except WorkItemConflict as exc:
+                        assert order == "finish_refused_stale"
+                        assert exc.code == "stale_owner"
+                    finish_returned.set()
+                await asyncio.wait_for(asyncio.shield(beat), 5)
+            finally:
+                await run.close()
+
+        committed = order in {"beat_answers_first", "finish_answers_first"}
+        assert beats == [order]
+        assert stale == ([] if committed else [order])
+        assert run.abandoned is (not committed)
+        assert run.finished is committed
+
+    asyncio.run(go())

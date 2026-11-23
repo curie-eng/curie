@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect } from "react";
@@ -477,6 +477,91 @@ describe("WiredAgentDetail — model edit (#254)", () => {
     await user.click(screen.getByTestId("model-save"));
 
     await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("a1", { model: null }));
+  });
+});
+
+describe("WiredAgentDetail — factory progress channel", () => {
+  it("shows the agent's Slack progress channel beside the model field", async () => {
+    vi.mocked(getAgents).mockResolvedValue([{ ...AGENT, factory_slack_channel: "C0EXAMPLE1" }]);
+    renderDetail();
+
+    const input = await screen.findByTestId("factory-progress-input");
+    await waitFor(() => expect(input).toHaveValue("C0EXAMPLE1"));
+    expect(screen.getByTestId("factory-progress-current")).toHaveTextContent("Posting progress to C0EXAMPLE1");
+    expect(screen.getByTestId("model-input")).toBeInTheDocument();
+  });
+
+  it("passes the agent's Slack bindings so a duplicate-identity 409 says to remove one", async () => {
+    const user = userEvent.setup();
+    // A fresh Response per call: only the progress PATCH gets the real 409 body.
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
+      init?.method === "PATCH"
+        ? new Response(JSON.stringify({ detail: { code: "factory_slack_channel_unbound" } }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          })
+        : new Response("{}", { status: 404, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      vi.mocked(getAgents).mockResolvedValue([
+        {
+          ...AGENT,
+          channels: [
+            { kind: "slack", address: "C0EXAMPLE1", adapter: "default" },
+            { kind: "slack", address: "C0EXAMPLE1", adapter: "second" },
+          ],
+        },
+      ]);
+      renderDetail();
+
+      const input = await screen.findByTestId("factory-progress-input");
+      await user.type(input, "C0EXAMPLE1");
+      await user.click(screen.getByTestId("factory-progress-save"));
+
+      expect(await screen.findByTestId("factory-progress-error")).toHaveTextContent(
+        "This agent has 2 Slack bindings for C0EXAMPLE1",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("WiredAgentDetail — factory progress hints use the agent id", () => {
+  it("never puts the agent name in a copyable command, so an apostrophe cannot break the shell", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
+      init?.method === "PATCH"
+        ? new Response(JSON.stringify({ detail: { code: "factory_slack_channel_unbound" } }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          })
+        : new Response("{}", { status: 404, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      vi.mocked(getAgents).mockResolvedValue([{ ...AGENT, name: "acme's-bot", channels: [] }]);
+      renderDetail();
+
+      const input = await screen.findByTestId("factory-progress-input");
+      await user.type(input, "C0EXAMPLE1");
+      await user.click(screen.getByTestId("factory-progress-save"));
+      await screen.findByTestId("factory-progress-error");
+
+      const root = input.parentElement!.parentElement!;
+      const hints = within(root)
+        .getAllByRole("button", { name: /^Copy command:/ })
+        .map((b) => b.getAttribute("aria-label") ?? "");
+      // Two set commands, the two add-surface commands and the two named-identity ones.
+      expect(hints).toHaveLength(6);
+      for (const hint of hints) {
+        expect(hint).not.toContain("acme");
+        expect(hint).toContain(" a1");
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

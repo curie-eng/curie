@@ -46,7 +46,7 @@ OVERLAP = timedelta(seconds=120)
 # A project or group access token's user: GitLab marks it ``bot: true``.
 TOKEN_BOT = Actor(id="950", login="project_4242_bot_0a1b2c")
 MARKER = "curie-factory-status:00000000-0000-4000-8000-000000000042"
-TRAILER = "_Later comments were not read._"
+EARLIER = "_Earlier comments were not read._"
 
 
 @pytest.fixture
@@ -77,7 +77,7 @@ async def test_the_first_poll_lists_open_issues_with_the_trigger_label(fake: Git
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
 
-    await gitlab_tracker(fake).poll_marked(None, running=())
+    await gitlab_tracker(fake).poll_marked(None, running=(), answering=())
 
     (params,) = _listing_params(fake)
     assert (params.get("labels"), params.get("state")) == (LABEL, "opened")
@@ -91,11 +91,11 @@ async def test_a_cursor_poll_lists_by_updated_after_with_the_overlap_and_no_filt
     tracker = gitlab_tracker(fake)
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
-    first = await tracker.poll_marked(None, running=())
+    first = await tracker.poll_marked(None, running=(), answering=())
     seen = fake.issues[iid].updated_at
     fake.requests.clear()
 
-    await tracker.poll_marked(first.cursor, running=())
+    await tracker.poll_marked(first.cursor, running=(), answering=())
 
     (params,) = _listing_params(fake)
     assert parse_iso(params["updated_after"]) == seen - OVERLAP
@@ -107,18 +107,18 @@ async def test_a_cursor_poll_lists_by_updated_after_with_the_overlap_and_no_filt
 @pytest.mark.anyio
 async def test_the_cursor_is_the_largest_updated_at_seen(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     older = fake.add_issue("Older", author=WRITER)
     newer = fake.add_issue("Newer", author=WRITER)
     fake.label(older, LABEL, WRITER)
     fake.label(newer, LABEL, WRITER)
     latest = fake.issues[newer].updated_at
 
-    page = await tracker.poll_marked(start.cursor, running=())
+    page = await tracker.poll_marked(start.cursor, running=(), answering=())
     fake.requests.clear()
-    again = await tracker.poll_marked(page.cursor, running=())
+    again = await tracker.poll_marked(page.cursor, running=(), answering=())
     fake.requests.clear()
-    await tracker.poll_marked(again.cursor, running=())
+    await tracker.poll_marked(again.cursor, running=(), answering=())
 
     # With nothing new, the window does not move.
     (params,) = _listing_params(fake)
@@ -132,13 +132,13 @@ async def test_an_issue_committed_late_inside_the_overlap_is_still_admitted(
     tracker = gitlab_tracker(fake)
     first_issue = fake.add_issue("First", author=WRITER)
     fake.label(first_issue, LABEL, WRITER)
-    page = await tracker.poll_marked(None, running=())
+    page = await tracker.poll_marked(None, running=(), answering=())
     cursor_time = fake.issues[first_issue].updated_at
     # Updated 60 seconds before the cursor, but listed only now.
     late = fake.add_issue("Late", author=WRITER, at=cursor_time - timedelta(seconds=60))
     fake.label(late, LABEL, WRITER, at=cursor_time - timedelta(seconds=60))
 
-    later = await tracker.poll_marked(page.cursor, running=())
+    later = await tracker.poll_marked(page.cursor, running=(), answering=())
 
     admits = [n for n in later.notices if n.disposition is Disposition.ADMIT]
     assert [n.issue for n in admits] == [fake.issue_ref(late)]
@@ -152,7 +152,7 @@ async def test_label_events_by_a_person_admit_and_cancel_with_namespaced_ids(
     fake: GitLabAPI,
 ) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     iid = fake.add_issue("Ticket", author=WRITER)
     added = fake.label(iid, LABEL, WRITER)
     note = fake.issue_note(iid, WRITER, f"@{BOT.login} please look")
@@ -160,7 +160,7 @@ async def test_label_events_by_a_person_admit_and_cancel_with_namespaced_ids(
     # Label events and notes are separate sequences that share numbers.
     assert added == note
 
-    page = await tracker.poll_marked(start.cursor, running=())
+    page = await tracker.poll_marked(start.cursor, running=(), answering=())
 
     issue = fake.issue_ref(iid)
     assert {(n.disposition, n.event_id, n.actor) for n in page.notices} == {
@@ -176,12 +176,12 @@ async def test_label_events_by_a_person_admit_and_cancel_with_namespaced_ids(
 @pytest.mark.anyio
 async def test_another_label_is_no_notice(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, "bug", WRITER)
     fake.label(iid, "curie-factory:working", WRITER)
 
-    page = await tracker.poll_marked(start.cursor, running=())
+    page = await tracker.poll_marked(start.cursor, running=(), answering=())
 
     assert page.notices == ()
 
@@ -191,7 +191,7 @@ async def test_events_by_the_token_user_or_a_bot_user_are_never_notices(
     fake: GitLabAPI,
 ) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     by_self = fake.add_issue("Self", author=WRITER)
     fake.label(by_self, LABEL, BOT)
     fake.issue_note(by_self, BOT, f"@{BOT.login} noted")
@@ -201,7 +201,7 @@ async def test_events_by_the_token_user_or_a_bot_user_are_never_notices(
     by_person = fake.add_issue("Person", author=WRITER)
     fake.label(by_person, LABEL, WRITER)
 
-    page = await tracker.poll_marked(start.cursor, running=())
+    page = await tracker.poll_marked(start.cursor, running=(), answering=())
 
     assert [(n.issue, n.actor) for n in page.notices] == [(fake.issue_ref(by_person), WRITER)]
     # The bot flag is read once per user and cached.
@@ -226,11 +226,11 @@ async def test_a_note_mentions_the_bot_only_as_a_whole_word(
     fake: GitLabAPI, body: str, mentioned: bool
 ) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     iid = fake.add_issue("Ticket", author=WRITER)
     note = fake.issue_note(iid, WRITER, body)
 
-    page = await tracker.poll_marked(start.cursor, running=())
+    page = await tracker.poll_marked(start.cursor, running=(), answering=())
 
     expected = [(Disposition.MENTION, f"note:{note}")] if mentioned else []
     assert [(n.disposition, n.event_id) for n in page.notices] == expected
@@ -239,11 +239,11 @@ async def test_a_note_mentions_the_bot_only_as_a_whole_word(
 @pytest.mark.anyio
 async def test_a_system_note_naming_the_bot_is_no_mention(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.issue_note(iid, WRITER, f"assigned to @{BOT.login}", system=True)
 
-    page = await tracker.poll_marked(start.cursor, running=())
+    page = await tracker.poll_marked(start.cursor, running=(), answering=())
 
     assert page.notices == ()
 
@@ -251,15 +251,15 @@ async def test_a_system_note_naming_the_bot_is_no_mention(fake: GitLabAPI) -> No
 @pytest.mark.anyio
 async def test_a_mention_older_than_the_window_is_not_delivered_again(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     iid = fake.add_issue("Ticket", author=WRITER)
     note = fake.issue_note(iid, WRITER, f"@{BOT.login} please look")
-    first = await tracker.poll_marked(start.cursor, running=())
+    first = await tracker.poll_marked(start.cursor, running=(), answering=())
     assert [n.event_id for n in first.notices] == [f"note:{note}"]
     # Ten minutes later a label moves the issue's updated_at again.
     added = fake.label(iid, LABEL, WRITER)
 
-    later = await tracker.poll_marked(first.cursor, running=())
+    later = await tracker.poll_marked(first.cursor, running=(), answering=())
 
     assert [n.event_id for n in later.notices] == [f"label:{added}"]
 
@@ -274,7 +274,7 @@ async def test_the_first_poll_emits_only_the_latest_add_per_issue(fake: GitLabAP
     fake.label(closed, LABEL, WRITER)
     fake.set_issue_state(closed, "closed", WRITER)
 
-    page = await gitlab_tracker(fake).poll_marked(None, running=())
+    page = await gitlab_tracker(fake).poll_marked(None, running=(), answering=())
 
     assert [(n.issue, n.disposition, n.event_id, n.actor) for n in page.notices] == [
         (fake.issue_ref(labelled), Disposition.ADMIT, f"label:{latest}", OUTSIDER)
@@ -284,13 +284,13 @@ async def test_the_first_poll_emits_only_the_latest_add_per_issue(fake: GitLabAP
 @pytest.mark.anyio
 async def test_one_cursor_polled_twice_yields_the_same_notices(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
     fake.issue_note(iid, OUTSIDER, f"@{BOT.login} go")
 
-    first = await tracker.poll_marked(start.cursor, running=())
-    again = await tracker.poll_marked(start.cursor, running=())
+    first = await tracker.poll_marked(start.cursor, running=(), answering=())
+    again = await tracker.poll_marked(start.cursor, running=(), answering=())
 
     assert len(first.notices) == 2
     assert first.notices == again.notices
@@ -306,12 +306,12 @@ async def test_a_closed_running_issue_cancels_with_its_latest_close_event(
     tracker = gitlab_tracker(fake)
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     fake.set_issue_state(iid, "closed", WRITER)
     fake.set_issue_state(iid, "reopened", WRITER)
     closed = fake.set_issue_state(iid, "closed", OUTSIDER)
 
-    page = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+    page = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),), answering=())
 
     assert [(n.disposition, n.event_id) for n in page.notices] == [
         (Disposition.CANCEL, f"state:{closed}")
@@ -333,9 +333,9 @@ async def test_a_running_issue_missing_its_label_cancels_with_the_latest_removal
     fake.tick(fake.now + timedelta(days=1))
     other = fake.add_issue("Other", author=WRITER)
     fake.label(other, LABEL, WRITER)
-    caught_up = await tracker.poll_marked(None, running=())
+    caught_up = await tracker.poll_marked(None, running=(), answering=())
 
-    page = await tracker.poll_marked(caught_up.cursor, running=(fake.issue_ref(iid),))
+    page = await tracker.poll_marked(caught_up.cursor, running=(fake.issue_ref(iid),), answering=())
 
     assert [(n.issue, n.disposition, n.event_id) for n in page.notices] == [
         (fake.issue_ref(iid), Disposition.CANCEL, f"label:{removed}")
@@ -347,10 +347,10 @@ async def test_a_running_issue_that_is_gone_yields_deleted_cancellation(fake: Gi
     tracker = gitlab_tracker(fake)
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     fake.delete_issue(iid)
 
-    page = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+    page = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),), answering=())
 
     (cancel,) = page.notices
     assert (cancel.issue, cancel.disposition, cancel.event_id) == (
@@ -367,22 +367,24 @@ async def test_a_transient_running_issue_read_defers_the_poll(fake: GitLabAPI, s
     tracker = gitlab_tracker(fake)
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     path = f"{PROJECT}/issues/{iid}"
     reads = len(fake.calls("GET", path))
     fake.script(status, path=path, method="GET", headers={"Retry-After": "30"})
 
     with pytest.raises(Unavailable):
-        await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+        await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),), answering=())
 
     assert len(fake.calls("GET", path)) == reads + 1
     if status == 429:
         requests = len(fake.requests)
         with pytest.raises(Unavailable):
-            await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+            await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),), answering=())
         assert len(fake.requests) == requests
         return
-    resumed = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+    resumed = await tracker.poll_marked(
+        admitted.cursor, running=(fake.issue_ref(iid),), answering=()
+    )
     assert resumed.notices == ()
     assert len(fake.calls("GET", path)) == reads + 2
 
@@ -392,10 +394,10 @@ async def test_a_running_issue_still_labelled_and_open_yields_nothing(fake: GitL
     tracker = gitlab_tracker(fake)
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
-    admitted = await tracker.poll_marked(None, running=())
+    admitted = await tracker.poll_marked(None, running=(), answering=())
     fake.tick(fake.now + timedelta(hours=1))
 
-    page = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+    page = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),), answering=())
 
     assert page.notices == ()
     assert fake.calls("GET", f"{PROJECT}/issues/{iid}")
@@ -446,10 +448,10 @@ async def test_marking_actor_is_who_applied_the_label_now_on_the_issue(fake: Git
 @pytest.mark.anyio
 async def test_a_mention_is_current_only_while_its_note_exists(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
-    start = await tracker.poll_marked(None, running=())
+    start = await tracker.poll_marked(None, running=(), answering=())
     iid = fake.add_issue("Ticket", author=WRITER)
     note = fake.issue_note(iid, WRITER, f"@{BOT.login} please look")
-    (mention,) = (await tracker.poll_marked(start.cursor, running=())).notices
+    (mention,) = (await tracker.poll_marked(start.cursor, running=(), answering=())).notices
     assert await tracker.verify_current(mention) is True
 
     fake.delete_note(note)
@@ -476,22 +478,39 @@ async def test_read_ticket_is_title_description_then_human_notes_oldest_first(
     assert description in text
     assert text.index(description) < text.index("note-first") < text.index("note-second")
     assert "changed the description" not in text
-    assert TRAILER not in text
+    assert EARLIER not in text
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(("count", "cut"), [(100, False), (101, True)])
-async def test_read_ticket_stops_after_100_notes(fake: GitLabAPI, count: int, cut: bool) -> None:
+@pytest.mark.parametrize(("count", "cut"), [(100, False), (130, True)])
+async def test_read_ticket_keeps_the_newest_100_notes_oldest_first(
+    fake: GitLabAPI, count: int, cut: bool
+) -> None:
+    """https://docs.gitlab.com/api/notes/#list-project-issue-notes: ``sort``
+    (``asc`` or ``desc``) with ``order_by=created_at`` orders the listing, so
+    ``desc`` reads the newest first. The read keeps the newest 100 non-system
+    notes and renders them oldest first; past 100 a line after the description
+    says the earlier ones were not read (#5789 decision 7)."""
+
     iid = fake.add_issue("Ticket", "Body.", author=WRITER)
     for n in range(1, count + 1):
         fake.issue_note(iid, WRITER, f"note-{n:03d}")
+        if n % 40 == 0:
+            fake.issue_note(iid, WRITER, f"system-{n:03d}", system=True)
 
     text = await gitlab_tracker(fake).read_ticket(fake.issue_ref(iid))
 
-    assert "note-001" in text and "note-100" in text
-    assert text.index("note-001") < text.index("note-050") < text.index("note-100")
-    assert ("note-101" in text) is False
-    assert text.rstrip().endswith(TRAILER) is cut
+    first = count - 99
+    rendered = [line for line in text.splitlines() if line.startswith("note-")]
+    assert rendered == [f"note-{n:03d}" for n in range(first, count + 1)]
+    assert "system-" not in text
+    head = f"# Ticket\n\nBody.\n\n{EARLIER}\n\n" if cut else "# Ticket\n\nBody.\n\n"
+    assert text.startswith(head + "## Comment by ")
+    assert (EARLIER in text) is cut
+    listings = [fake.params(r) for r in fake.calls("GET", f"{PROJECT}/issues/{iid}/notes")]
+    assert listings and all(
+        (p.get("sort"), p.get("order_by")) == ("desc", "created_at") for p in listings
+    )
 
 
 @pytest.mark.anyio

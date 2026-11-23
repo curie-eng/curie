@@ -2623,6 +2623,7 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_CONNECTOR_PROXY_IMAGE",
     "CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY",
     "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS",
+    "CURIE_CONNECTOR_SERVICE_ACCOUNTS",
     "CURIE_CONNECTOR_RECONCILE",
     "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
     "CURIE_CREDENTIALS",
@@ -2714,7 +2715,13 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     // The factory settings arrived with #4397 as chart values, never extraEnv.
     "FACTORY_CI_WAIT_S",
     "FACTORY_ENABLED",
+    // OAuth linking settings are first-class values from introduction (#5719).
+    "FACTORY_GITHUB_APP_CLIENT_ID",
+    "FACTORY_GITHUB_APP_CLIENT_SECRET",
     "FACTORY_INTAKE",
+    // Personal mode moved from extraEnv to factory.modelAuthMode with no
+    // migration: the render refuses an extraEnv entry and names the key.
+    "FACTORY_MODEL_AUTH_MODE",
     "GITHUB_API_URL",
     "GITHUB_APP_ID",
     "GITHUB_APP_PRIVATE_KEY",

@@ -69,7 +69,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -80,12 +80,14 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         id: install_kind
         continue-on-error: true
@@ -217,6 +219,14 @@ jobs:
       - name: helm render assertions (factory forges)
         run: bash charts/curie/ci/factory-forges-assertions.sh
 
+      # Prove factory.modelAuthMode renders one FACTORY_MODEL_AUTH_MODE into
+      # both the api and the worker, and that extraEnv cannot set it.
+      - name: helm render assertions (factory model auth mode)
+        run: bash charts/curie/ci/factory-model-auth-mode-assertions.sh
+
+      - name: helm render assertions (GitHub account linking)
+        run: bash charts/curie/ci/factory-github-link-assertions.sh
+
       # Prove worker.streamRetention.minAgeSeconds reaches the worker, is
       # bounded by the schema, and defaults on a release with no such block.
       - name: helm render assertions (stream retention window)
@@ -247,6 +257,11 @@ jobs:
       # and worker when enabled with a positive cap, and refuses a bad cap.
       - name: helm render assertions (workspace recovery)
         run: bash charts/curie/ci/workspace-recovery-assertions.sh
+
+      # Prove publication candidates default on, render off when workspaces are
+      # off, and still refuse a bad byte cap while workspaces are on.
+      - name: helm render assertions (publication candidates)
+        run: bash charts/curie/ci/publication-candidates-assertions.sh
 
       # Prove the retired BYO-model LiteLLM sidecar (issue #253) is absent by
       # default and that enabling its values flag is refused by the chart
@@ -478,6 +493,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-recreate-assertions.sh
 
+      # Prove langfuse-web binds every interface (HOSTNAME=0.0.0.0) so that
+      # `kubectl port-forward`, and `curie cluster access`, can reach it.
+      - name: helm render assertions (langfuse web HOSTNAME)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-web-hostname-assertions.sh
+
   chart-assertions-2:
     name: Chart render assertions (2 of 3)
     runs-on: ubuntu-24.04
@@ -493,7 +515,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -504,7 +526,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -635,6 +657,14 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/connector-caller-key-assertions.sh
+
+      # Prove an operator-named connector ServiceAccount reaches the API alone,
+      # that the schema refuses a name the API would refuse at boot, and that
+      # naming one grants the worker nothing.
+      - name: helm render assertions (connector ServiceAccounts)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/connector-service-accounts-assertions.sh
 
       # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
       # reconciler is off, and when on, exactly {create,list,patch,delete} on
@@ -1120,7 +1150,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -1131,7 +1161,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -1202,7 +1232,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Back off before retrying Install Helm
@@ -1212,16 +1242,19 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the kind cluster
         id: create_the_kind_cluster
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
+          version: v0.24.0
           cluster_name: curie-reserved-env
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
       - name: Back off before retrying Create the kind cluster
@@ -1235,6 +1268,7 @@ jobs:
         if: steps.create_the_kind_cluster.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
+          version: v0.24.0
           cluster_name: curie-reserved-env
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
       - name: Install YAML parser
@@ -1281,7 +1315,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Back off before retrying Install Helm
@@ -1291,7 +1325,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Concurrent automatic threads stay isolated

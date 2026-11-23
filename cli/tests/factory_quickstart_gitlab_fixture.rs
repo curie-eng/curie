@@ -32,12 +32,11 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-const STATE_LABELS: [&str; 5] = [
+const STATE_LABELS: [&str; 4] = [
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
-    "curie-factory:triaged",
 ];
 
 struct Fixture {

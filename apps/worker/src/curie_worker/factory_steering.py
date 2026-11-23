@@ -41,7 +41,11 @@ has no token. The API answer ``not_factory`` (the factory is off, or no
 configured GitHub tracker serves the link's repository for this agent) makes
 an unmapped candidate None: the intent marker this attempt recorded is
 cleared first, so a later failure of the ordinary turn still gets the
-generic notice. Every other answer is the reply in the thread.
+generic notice. An ``admitted`` answer, fresh or replayed, posts no reply:
+the request carries the turn's placeholder ts (``placeholder_ts``, None when
+the dispatcher posted none), the API stores it as the run's card, and the
+progress lane renders the card into that placeholder or, with none, posts it
+as the first reply (#5715). Every other answer is the reply in the thread.
 
 The client is always built when the worker has its database engine, so no
 switch lets a mapped root fall through to ordinary chat. A transport failure,
@@ -69,6 +73,14 @@ from typing import Any, Final
 import httpx
 from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import route_identity
+from channel_protocol import (
+    MESSAGE_VERSION,
+    SCOPED_REPLY_WIRE_VERSION,
+    MessageLink,
+    OutboundMessage,
+    ReplyPost,
+    ReplyTarget,
+)
 from curie_internal.issue_links import find_issue_links
 from curie_internal.slack_mention_receipt import (
     MalformedMentionReceiptError,
@@ -85,6 +97,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from .binding import binding_adapter_for_handle
 from .kernel import constants as kernel_constants
 from .kernel.identity import CURRENT as HTTP_TURN_CARRY
+from .reply_sink import ReplySink, TargetRoute
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +162,8 @@ _EARLIER_ATTEMPTS: Final = (
     "the run thread shows any new revision."
 )
 
+# An admitted kickoff has no text: its reply is the run's progress card.
 _KICKOFF_HEADLINES: Final = {
-    ADMITTED: "Factory run started for this issue.",
     KICKOFF_EVIDENCE_MISSING: "A factory run cannot be started from this message.",
     KICKOFF_UNCONFIGURED: (
         "Starting factory runs is not configured on this worker, so it did not ask for a decision."
@@ -188,7 +201,6 @@ _KICKOFF_EARLIER_ATTEMPTS: Final = (
     "Any earlier attempt of this message is unconfirmed here; "
     "this thread shows the run if one started."
 )
-_KICKOFF_PROGRESS: Final = "Progress for this run is posted in this thread."
 
 
 UNCONFIRMED_TEXT: Final = (
@@ -225,6 +237,10 @@ class SteeringReply:
     text: str
     request_id: str | None = None
     pull_request_url: str | None = None
+    # An admitted kickoff, fresh or replayed (#5715): the turn posts no reply
+    # and leaves the placeholder alone, because the progress lane renders the
+    # run's card into it (or posts the card first when there is none).
+    progress_card: bool = False
 
     @property
     def admitted(self) -> bool:
@@ -285,27 +301,17 @@ def render_reply(
     return "\n".join(lines)
 
 
-def render_kickoff_reply(
-    outcome: str,
-    *,
-    reason: str | None = None,
-    issue_url: str | None = None,
-    replayed: bool = False,
-) -> str:
-    """The short plain kickoff reply for one outcome; it always names the outcome code.
+def render_kickoff_reply(outcome: str, *, reason: str | None = None) -> str:
+    """The short plain kickoff refusal for one outcome; it always names the outcome code.
 
-    An admitted reply names the issue and says progress posts in this thread.
+    An admitted kickoff has no reply text: the run's progress card is its answer.
     """
 
-    headline = _KICKOFF_HEADLINES.get(outcome, _KICKOFF_FALLBACK_HEADLINE)
-    if outcome == ADMITTED and replayed:
-        headline = "This factory run was already started."
-    lines = [headline]
     if outcome == ADMITTED:
-        if issue_url:
-            lines.append(f"Issue: {_plain(issue_url)}")
-        lines.append(_KICKOFF_PROGRESS)
-    elif outcome != KICKOFF_BUDGET_EXPIRED:
+        raise ValueError("an admitted kickoff is answered by its progress card, not a reply")
+    headline = _KICKOFF_HEADLINES.get(outcome, _KICKOFF_FALLBACK_HEADLINE)
+    lines = [headline]
+    if outcome != KICKOFF_BUDGET_EXPIRED:
         lines.append(_KICKOFF_EARLIER_ATTEMPTS)
     lines.append(_detail(outcome, reason))
     return "\n".join(lines)
@@ -341,6 +347,7 @@ class FactorySteeringClient:
         worker_token: str | None,
         client: httpx.AsyncClient,
         intent_key: Callable[[str], str],
+        replies: ReplySink,
     ) -> None:
         """``intent_key`` names the worker's steering-sent marker of a delivery
         (``WorkerConfig.steering_sent_key``), the key ``record_intent`` writes
@@ -363,6 +370,7 @@ class FactorySteeringClient:
         self._headers = {"X-Curie-Worker-Token": worker_token} if worker_token else None
         self._client = client
         self._intent_key = intent_key
+        self._replies = replies
 
     async def _mapping(
         self, identity: str, channel: str, root_ts: str, kickoff_request: uuid.UUID
@@ -620,12 +628,11 @@ class FactorySteeringClient:
             deadline=deadline,
             record_intent=record_intent,
             pending_text=KICKOFF_UNCONFIRMED_TEXT,
+            # Only the kickoff route takes the placeholder (the steer route's
+            # input forbids extra fields); None when the dispatcher posted none.
+            extra={"placeholder_ts": turn.handle.placeholder},
         )
-        outcome, reason, request_id, replayed = _decision(body, KICKOFF_UNCONFIRMED_TEXT)
-        try:
-            issue_url = _optional_text(body, "issue_url")
-        except SteeringUnavailable as exc:
-            raise SteeringUnavailable(str(exc), pending_text=KICKOFF_UNCONFIRMED_TEXT) from exc
+        outcome, reason, request_id, _replayed = _decision(body, KICKOFF_UNCONFIRMED_TEXT)
         if outcome == NOT_FACTORY:
             if mapped:
                 # This delivery's kickoff request is on this run, so it did
@@ -643,11 +650,71 @@ class FactorySteeringClient:
             logger.info("factory kickoff %s: not a factory turn", qevent.event_id)
             return None
         logger.info("factory kickoff %s outcome=%s", qevent.event_id, outcome)
+        if outcome == ADMITTED:
+            # The placeholder the dispatcher posted (its ts went with the
+            # request) is now the run's progress card: no reply text.
+            return SteeringReply(
+                outcome=outcome, text="", request_id=request_id, progress_card=True
+            )
+        if outcome in {"sender_unverified", "enrollment_inactive"}:
+            url = _optional_text(
+                body, "connect_url" if outcome == "sender_unverified" else "plan_url"
+            )
+            private = (
+                "Curie doesn't know your Slack account yet. Connect it to your Claude plan, "
+                "then mention me again."
+                if outcome == "sender_unverified"
+                else "You need to connect your Claude plan before Curie can start this run."
+            )
+            if url is None:
+                private = render_kickoff_reply(outcome, reason=reason)
+                private = (
+                    private.rsplit("\n", 1)[0] + " Ask the operator to help connect your account."
+                )
+            try:
+                async with asyncio.timeout_at(deadline):
+                    ack = await self._replies.emit(
+                        ReplyPost(
+                            version=SCOPED_REPLY_WIRE_VERSION,
+                            event="reply.post",
+                            target=ReplyTarget(
+                                kind=_SLACK_KIND,
+                                address=turn.handle.channel,
+                                conversation_id=turn.root_ts,
+                                reply_ref=None,
+                            ),
+                            audience_user=receipt.user_id,
+                            message=OutboundMessage(
+                                version=MESSAGE_VERSION,
+                                text=private,
+                                links=[MessageLink(label="Connect your Claude plan", url=url)]
+                                if url
+                                else [],
+                                footer=f"Code: {outcome}",
+                            ),
+                            requested_by="",
+                            delivery_id=str(
+                                uuid.uuid5(uuid.NAMESPACE_URL, f"curie-connect:{qevent.event_id}")
+                            ),
+                        ),
+                        route=TargetRoute(adapter=turn.identity),
+                        best_effort_unreachable=False,
+                    )
+            except Exception as exc:
+                raise SteeringUnavailable("private plan refusal could not be delivered") from exc
+            logger.info(
+                "factory kickoff private post delivery=%s outcome=%s message_ts=%s",
+                qevent.event_id,
+                outcome,
+                ack.ref,
+            )
+            return SteeringReply(
+                outcome=outcome,
+                text="Not started. I sent you a private message about what to do next.",
+            )
         return SteeringReply(
             outcome=outcome,
-            text=render_kickoff_reply(
-                outcome, reason=reason, issue_url=issue_url, replayed=replayed
-            ),
+            text=render_kickoff_reply(outcome, reason=reason),
             request_id=request_id,
         )
 
@@ -683,8 +750,12 @@ class FactorySteeringClient:
         deadline: float | None,
         record_intent: Callable[[], Awaitable[None]],
         pending_text: str,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Record the intent, then ask ``url``; the answer body, or raise."""
+        """Record the intent, then ask ``url``; the answer body, or raise.
+
+        ``extra`` adds route-specific fields to the request body.
+        """
 
         headers = self._headers
         if headers is None:
@@ -695,17 +766,20 @@ class FactorySteeringClient:
             raise SteeringUnavailable(
                 f"steering intent could not be recorded: {type(exc).__name__}"
             ) from exc
+        payload: dict[str, Any] = {
+            "delivery_id": turn.qevent.event_id,
+            "channel_identity": turn.identity,
+            "channel": turn.handle.channel,
+            "root_ts": turn.root_ts,
+            "author": turn.qevent.author,
+            "receipt": receipt.model_dump(mode="json"),
+        }
+        if extra:
+            payload.update(extra)
         try:
             return await self._ask(
                 url,
-                {
-                    "delivery_id": turn.qevent.event_id,
-                    "channel_identity": turn.identity,
-                    "channel": turn.handle.channel,
-                    "root_ts": turn.root_ts,
-                    "author": turn.qevent.author,
-                    "receipt": receipt.model_dump(mode="json"),
-                },
+                payload,
                 headers=headers,
                 deadline=deadline,
             )

@@ -28,7 +28,15 @@ that it holds for every bundle.
 
 ## Procedure
 
-1. Create the ADR as `Draft` with the next unused four digit number. Record the
+1. Create the ADR as `Draft` with the next unused four digit number. Before
+   claiming a number, take the union of allocations on the working tree,
+   `origin/main`, `origin/next` (when that train exists), and open pull
+   requests that add a `docs/adr/NNNN-*.md` file. Prefer the next free number
+   printed by `bash scripts/check-docs.sh` (via `curie_doclint
+   --require-remote-adr-scan`) when a collision is reported; that check fetches
+   both trains and lists open PR additions. A collision your PR adds or
+   renames into fails the gate; other remote collisions are warnings. When
+   your PR claims a new ADR file, a failed scan still fails closed. Record the
    context, decision, consequences, and rejected alternatives.
 2. Merge a Draft when publishing it for discussion is useful. Do not begin
    implementation from a merged Draft.

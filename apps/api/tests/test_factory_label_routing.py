@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import (  # noqa: E402
     INSTALLATION_ID,
+    LABEL,
     MENTION,
     REPO,
     REPO_ID,
@@ -58,6 +59,7 @@ from forge_fakes.github import (  # noqa: E402
     factory_env,
     fake_installation_tokens,
 )
+from forge_fakes.github_comments import admitted, comments  # noqa: E402, F401  (fixtures)
 from test_factory_poll_intake import (  # noqa: E402
     PollGitHub,
     _client_type,
@@ -65,11 +67,17 @@ from test_factory_poll_intake import (  # noqa: E402
     _public_review,
     _user,
 )
+from test_factory_status_comment import _admit as _admit_status  # noqa: E402
+from test_factory_status_comment import _label_writes  # noqa: E402
+from test_factory_terminus import _reconcile, _start_running  # noqa: E402
 from test_github_factory_ingress import _code, _rows  # noqa: E402
 from test_github_factory_review import _complete, _execute, _own_pull_request  # noqa: E402
 
 INSTALL = "curie-factory"
 FAST = "curie-factory-fast"
+# The state label of the retired separate triage path (#5803), the one name this
+# file gives it; every test below refers to it through this constant.
+FORMER_TRIAGE_LABEL = "curie-factory:triaged"
 INTAKES = ("webhook", "poll")
 _COMMENT_IDS = itertools.count(763000)
 _REVIEW_IDS = itertools.count(764000)
@@ -960,21 +968,69 @@ def test_label_routing_a_label_no_binding_owns_stays_unrelated(
     assert _owner(number) is None
 
 
-# --- #5586 AC7: the triaged state label is reserved -------------------------------
+@pytest.mark.parametrize("intake", INTAKES)
+def test_label_routing_the_former_triage_label_admits_and_posts_nothing(
+    factory: LabelFactory, intake: str
+) -> None:
+    """The retired triage path's label is a label no binding serves: an issue
+    opened with it admits nothing on either intake, and no pass posts on it."""
+
+    factory.two_agents()
+
+    number, response = factory.opened(intake, FORMER_TRIAGE_LABEL)
+
+    _refused(response, "unrelated_label")
+    factory.poll()
+    assert _owner(number) is None
+    assert _requests(number) == 0
+    assert factory.github.bot_comments(number) == []
 
 
-def test_label_routing_the_triaged_state_label_cannot_be_a_trigger_label(
+def test_label_routing_the_label_sync_leaves_the_former_triage_label_alone(
+    admitted: Any,  # noqa: F811
+) -> None:
+    """The label sync pass owns the factory state labels only. An issue that
+    already carries the former triage label keeps it while the pass applies
+    and moves the run's own state label."""
+
+    client, github, sink = admitted
+    number = 58690
+    request_id = _admit_status(client, github, sink, number)
+    sink.issue_labels[number].add(FORMER_TRIAGE_LABEL)
+    _reconcile()
+    assert sink.issue_labels[number] == {
+        LABEL,
+        "bug",
+        FORMER_TRIAGE_LABEL,
+        "curie-factory:queued",
+    }
+
+    _start_running(client, request_id)
+    _reconcile()
+
+    # Liveness: the pass did move its own label in the same write.
+    assert sink.issue_labels[number] == {
+        LABEL,
+        "bug",
+        FORMER_TRIAGE_LABEL,
+        "curie-factory:running",
+    }
+    assert all(not path.endswith(FORMER_TRIAGE_LABEL) for _method, path, _ in _label_writes(sink))
+
+
+def test_label_routing_any_factory_family_label_cannot_be_a_trigger_label(
     factory: LabelFactory,
 ) -> None:
-    """A binding refuses ``curie-factory:triaged`` as its trigger label, at agent
-    creation and when a surface is added; a free label still binds."""
+    """A binding refuses a label in the ``curie-factory:`` family as its
+    trigger label, at agent creation and when a surface is added; a free label
+    still binds."""
 
-    triaged = "curie-factory:triaged"
+    retired = "curie-factory:example-retired"
     agent_id = factory.agent({"kind": "slack", "address": f"C0{uuid.uuid4().hex[:8].upper()}"})
     refused = factory.client.post(
         f"/agents/{agent_id}/channels",
         headers=factory.headers(),
-        json={"kind": "github", "address": REPO, "trigger_label": triaged},
+        json={"kind": "github", "address": REPO, "trigger_label": retired},
     )
     assert refused.status_code == 422, refused.text
     assert "curie-factory:" in refused.text
@@ -986,7 +1042,7 @@ def test_label_routing_the_triaged_state_label_cannot_be_a_trigger_label(
         json={
             "name": f"acme-factory-{uuid.uuid4().hex[:8]}",
             "repo_full_name": "acme-corp/factory-home",
-            "channel": {"kind": "github", "address": REPO, "trigger_label": triaged},
+            "channel": {"kind": "github", "address": REPO, "trigger_label": retired},
         },
     )
     assert created.status_code == 422, created.text

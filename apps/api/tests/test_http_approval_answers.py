@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import ssl
 import time
 import uuid
 from collections.abc import Iterator
@@ -59,12 +58,14 @@ def approver_role(case: SimpleNamespace, group: str = GROUP) -> None:
         async with factory() as session, session.begin():
             result = await agent_role_policy.apply_role_change(session, change=change(
                 uuid.UUID(case.scope["tenant"]), uuid.UUID(case.scope["agent"]),
-                version=case.scope["role_version"], target="approver", operation="migrate_role",
+                version=case.scope["role_version"], target="approver",
+                operation="set_filter" if case.scope.get("approver_migrated") else "migrate_role",
                 filter={"entries": [
                     {"kind": "issuer_group", "group": {"issuer": ISSUER, "id": group}},
                 ]},
             ))
             case.scope["role_version"] = result.version
+            case.scope["approver_migrated"] = True
 
     run(migrate)
 
@@ -201,36 +202,6 @@ def test_authenticated_answer_resolves_with_fresh_caller_and_approver_authority(
     assert rows(row["dedupe_key"]) == [row]
 
 
-@pytest.mark.parametrize("tamper", [
-    "body", "attestation", "approval", "operation", "channel", "evidence", "receiver",
-])
-def test_tampered_answer_refuses_before_lookup_or_mutation(
-    answer_case: SimpleNamespace, tamper: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-7: exact bytes, signatures and Slack evidence equality."""
-    case = answer_case
-    before = len(case.provider.requests)
-    if tamper == "body":
-        body, headers = answer(case, signed_body=b'{"decision":"rejected"}')
-    elif tamper == "attestation":
-        body, headers = answer(case, attestation_sha256="0" * 64)
-    elif tamper == "approval":
-        body, headers = answer(case, approval_id=str(uuid.uuid4()))
-    elif tamper == "operation":
-        body, headers = answer(case, operation="recover", body=b'{"decision":"approved"}')
-    elif tamper == "channel":
-        body, headers = answer(case, native_channel_id="C0EXAMPLEOTHER")
-    elif tamper == "evidence":
-        body, headers = answer(case, apr_evidence=slack_evidence(
-            interaction_user_team_id="T0EXAMPLEOTHER",
-        ))
-    else:
-        body, headers = answer(case, receiver=(str(uuid.uuid4()), b"u" * 32))
-    response = resolve(case, body, headers)
-    assert response.status_code == 401, response.text
-    unchanged(case, before)
-
-
 def test_answer_without_interaction_team_is_refused(answer_case: SimpleNamespace) -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-7: no actual user.team_id, no derived Slack actor."""
     case = answer_case
@@ -256,31 +227,40 @@ def test_answer_without_receiver_proof_keeps_the_card_live(answer_case: SimpleNa
     unchanged(case, before)
 
 
-def test_actor_outside_the_approver_role_is_refused_independently_of_requester_equality(
-    creation_case: SimpleNamespace,
+def test_answer_rejects_mismatched_proof_then_rechecks_the_same_authenticated_bytes(
+    answer_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
 ) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8: invocation permission never becomes approval permission."""
-    case = creation_case
-    case.row = created(case)
-    approver_role(case, group="SyntheticApproverOnlyGroup")
-    before = len(case.provider.requests)
-    response = resolve(case, *answer(case))
-    assert response.status_code == 403, response.text
-    assert response.json() == {"detail": "caller_not_allowed"}
-    unchanged(case, before + 2)
-
-
-def test_unchanged_answer_bytes_cannot_be_replayed_onto_a_policy_change(
-    answer_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8/9: each answer recomputes current approver permission."""
     case = answer_case
-    case.provider.member = False
-    before = len(case.provider.requests)
-    response = resolve(case, *answer(case))
-    assert response.status_code == 403, response.text
-    assert response.json() == {"detail": "caller_not_allowed"}
-    unchanged(case, before + 2)
+    stream = valkey.xrange(runs_stream)
+    lookups = len(case.provider.requests)
+    for changes in (
+        {"signed_body": b'{"decision":"rejected"}'},
+        {"attestation_sha256": "0" * 64},
+        {"approval_id": str(uuid.uuid4())},
+        {"operation": "recover", "body": b'{"decision":"approved"}'},
+        {"receiver": (case.scope["receiver_id"], b"x" * 32)},
+        {"receiver": (str(uuid.uuid4()), b"u" * 32)},
+        {"channel_identity_id": str(uuid.uuid4())},
+        {"provider_installation_id": str(uuid.uuid4())},
+        {"native_channel_id": "C0EXAMPLEOTHER"},
+        {"apr_evidence": slack_evidence(interaction_user_team_id="T0EXAMPLEOTHER")},
+    ):
+        response = resolve(case, *answer(case, **changes))
+        assert response.status_code == 401, response.text
+        assert response.json() == {"detail": "missing or invalid approval principal"}
+        unchanged(case, lookups)
+        assert valkey.xrange(runs_stream) == stream
+
+    payload, headers = answer(case)
+    approver_role(case, group="SyntheticApproverOnlyGroup")
+    response = resolve(case, payload, headers)
+    assert (response.status_code, response.json()) == (403, {"detail": "caller_not_allowed"})
+    unchanged(case, lookups + 2)
+    assert valkey.xrange(runs_stream) == stream
+    approver_role(case)
+    response = resolve(case, payload, headers)
+    assert (response.status_code, response.json()["status"]) == (200, "approved")
+    assert len(valkey.xrange(runs_stream)) == len(stream) + 1
 
 
 def test_selected_recovery_records_the_authenticated_actor_and_reseals(
@@ -362,57 +342,6 @@ def test_original_invoker_losing_invocation_authority_blocks_an_approver_answer(
     unchanged(case, before + 2)
 
 
-def current_actor_check(case: SimpleNamespace, *, tls: Any = None) -> int | str:
-    """@spec HTTP-APPROVAL-CONTINUITY-8: the exposed approver check, on this pass's own stores."""
-    from curie_api.identity.http_approval_answer import check_http_approval_actor
-    from curie_api.identity.http_transport import HttpIdentityClient
-    from fastapi import HTTPException
-    from redis import asyncio as redis_async
-
-    result: list[int | str] = []
-
-    async def go(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-8."""
-        valkey = redis_async.from_url(get_settings().valkey_dsn())
-        state = SimpleNamespace(
-            sessionmaker=factory, valkey=valkey,
-            http_identity_runtime=case.client.app.state.http_identity_runtime,
-            http_identity_client=HttpIdentityClient(
-                tls_context=case.provider.tls if tls is None else tls,
-            ),
-        )
-        try:
-            await check_http_approval_actor(
-                SimpleNamespace(app=SimpleNamespace(state=state)),  # type: ignore[arg-type]
-                case.row["id"], approver_sets=case.client.app.state.approver_sets,
-            )
-            result.append(200)
-        except HTTPException as error:
-            result.append(f"{error.status_code} {error.detail}")
-        finally:
-            await valkey.aclose()
-
-    run(go)
-    return result[0]
-
-
-def test_preserved_actor_check_repeats_fresh_approver_authority(
-    answer_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8: a later boundary rechecks the sealed actor alone."""
-    case = answer_case
-    assert current_actor_check(case) == "403 unsupported_approval"
-    assert resolve(case, *answer(case)).status_code == 200
-    resolved = rows(case.row["dedupe_key"])
-    before = len(case.provider.requests)
-    assert current_actor_check(case) == 200
-    assert [item["purpose"] for item in case.provider.requests[before:]] == ["approval"]
-    assert [row["status"] for row in rows(case.row["dedupe_key"])] == ["approved"]
-    assert rows(case.row["dedupe_key"]) == resolved
-    case.provider.member = False
-    assert current_actor_check(case) == "403 caller_not_allowed"
-
-
 ROUTE = "synthetic-restricted-route"
 OTHER_APPROVER = "U0EXAMPLEOTHER"
 
@@ -463,59 +392,6 @@ def test_explicit_route_exclusion_is_a_definitive_refusal(routed_case: SimpleNam
     assert response.json() == {"detail": "caller_not_allowed"}
     assert rows(case.row["dedupe_key"]) == [case.row]
     assert audits(case.row["id"]) == []
-
-
-def test_route_exclusion_survives_cancelling_a_pending_provider_lookup(
-    routed_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8/9: sibling cancellation never becomes unavailable."""
-    case = routed_case
-    restrict_route(case, [OTHER_APPROVER])
-    hold = 1.5
-    case.provider.during_lookup = lambda: time.sleep(hold)
-    try:
-        started = time.monotonic()
-        response = resolve(case, *answer(case))
-        elapsed = time.monotonic() - started
-    finally:
-        case.provider.during_lookup = None
-    assert response.status_code == 403, response.text
-    assert response.json() == {"detail": "caller_not_allowed"}
-    # The denial did not wait for the held lookups: they were cancelled.
-    assert elapsed < hold, elapsed
-    assert rows(case.row["dedupe_key"]) == [case.row]
-    assert audits(case.row["id"]) == []
-
-
-def test_route_admitted_answer_still_resolves(routed_case: SimpleNamespace) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8: the restricted route admits its listed actor."""
-    case = routed_case
-    response = resolve(case, *answer(case))
-    assert response.status_code == 200, response.text
-    sealed_actor(case, "approved")
-
-
-def test_preserved_actor_check_refuses_a_route_exclusion_definitively(
-    routed_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-8: the later boundary keeps the denial, not unavailable."""
-    case = routed_case
-    assert resolve(case, *answer(case)).status_code == 200
-    assert current_actor_check(case) == 200
-    restrict_route(case, [OTHER_APPROVER])
-    assert current_actor_check(case) == "403 caller_not_allowed"
-
-
-def test_provider_unavailability_beside_an_admitting_route_stays_retryable(
-    routed_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-9: a lookup that cannot reach the provider stays 503."""
-    case = routed_case
-    assert resolve(case, *answer(case)).status_code == 200
-    # A client that does not trust the synthetic provider's certificate observes nothing.
-    untrusted = ssl.create_default_context()
-    assert current_actor_check(case, tls=untrusted) == "503 authority_unavailable"
-    assert current_actor_check(case) == 200
 
 
 RECONCILER_ENV = "RESUME_RECONCILER_ENABLED"

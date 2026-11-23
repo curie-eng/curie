@@ -669,64 +669,6 @@ def test_malformed_cached_observation_is_unknown_without_disclosing_it(
     assert "private-credential-sentinel" not in json.dumps(world.answers()) + caplog.text
 
 
-@pytest.mark.parametrize("failure", ["crash", "deadline", "unparseable", "provider_refusal"])
-def test_operator_guard_denies_failure_with_a_fixed_error(
-    facts_world: Any, monkeypatch: Any, failure: str, caplog: Any
-) -> None:
-    import httpx
-    import redis.asyncio as redis
-    from curie_api.main import create_app
-    from curie_api.routers import factory_facts as route
-    from forge_fakes.github import LABEL, REPO
-
-    world = facts_world
-    assert 0 < route.FACTS_DEADLINE_SECONDS < 60
-    monkeypatch.setattr(route, "FACTS_DEADLINE_SECONDS", 0.25)
-
-    async def broken(request: httpx.Request) -> httpx.Response:
-        if failure == "crash":
-            raise RuntimeError("private-operator-crash-sentinel")
-        if failure == "deadline":
-            await asyncio.Event().wait()
-        if failure == "provider_refusal":
-            return httpx.Response(
-                503,
-                json={"message": "private-provider-body-sentinel"},
-                headers={"X-GitHub-Request-Id": "private-provider-header-sentinel"},
-            )
-        return httpx.Response(200, content=b"{broken-json")
-
-    app = create_app()
-    app.state.sessionmaker = world.sessions
-    app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(broken))
-    app.state.valkey = redis.Redis.from_url(world.settings.valkey_dsn())
-
-    async def read() -> None:
-        try:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
-            ) as client:
-                response = await asyncio.wait_for(
-                    client.get(
-                        "/factory/facts",
-                        params={"repository": REPO, "trigger_label": LABEL},
-                        headers={"X-API-Key": world.settings.api_key},
-                    ),
-                    timeout=3,
-                )
-                assert response.status_code == 503
-                assert response.json() == {"detail": {"code": "facts_unavailable"}}
-                assert "private-operator-crash-sentinel" not in response.text + caplog.text
-                assert "private-provider-body-sentinel" not in response.text + caplog.text
-                assert "private-provider-header-sentinel" not in response.text + caplog.text
-        finally:
-            await app.state.http_client.aclose()
-            await app.state.valkey.aclose()
-
-    asyncio.run(read())
-    assert world.observation_reads == []
-
-
 def test_facts_answer_reads_model_credit_and_expires_it(facts_world: Any) -> None:
     from curie_api.models import FactoryFactObservation
     from sqlalchemy import select

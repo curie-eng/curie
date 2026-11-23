@@ -66,44 +66,74 @@ class ExecutionBindingOut(BaseModel):
 
 
 class CompletionContractOut(BaseModel):
-    """How the execution completes (ADR 0277, #5586): by a pull request
-    (``implementation``), by one delivered tracker result (``tracker_result``),
-    or by publishing a retained publication candidate with no model run
+    """How the execution completes: by a pull request (``implementation``), or
+    by publishing a retained publication candidate with no model run
     (``publication_recovery``, #5429).
 
-    ``result_kinds`` are the kinds the deployed policy allows and
-    ``session_usd_allowance`` the per-session model allowance in USD (the
-    agent's dollar limit, else 5); both empty for ``implementation`` and
-    ``publication_recovery``. A ``publication_recovery`` answer also carries
-    no ``execution``: that process runs no model, so it waits for no requester
-    context.
+    ``execution`` is the ADR 0278 binding of an ``implementation`` execution.
+    A ``publication_recovery`` answer carries none: that process runs no
+    model, so it waits for no requester context.
     """
 
-    completion_contract: Literal["implementation", "tracker_result", "publication_recovery"]
-    result_kinds: list[str]
-    session_usd_allowance: float | None
-    execution: ExecutionBindingOut | None = None
+    completion_contract: Literal["implementation", "publication_recovery"]
+    execution: ExecutionBindingOut | None
+    # Whether this execution may propose one learned rule (#5796, ADR 0287):
+    # true exactly when the request is a revision admitted from reviewer
+    # feedback, its agent has ``memory_rule_proposals`` on, its WorkItem's
+    # pull request lineage is open and the WorkItem is not cancelled, at the
+    # time of the call. Always false for ``publication_recovery``. The runner
+    # mounts ``propose_rule`` only when it is true. A permanent field: later
+    # narrowings of this answer keep it, with this meaning.
+    rule_proposal: bool
 
 
-class TrackerResultSubmission(BaseModel):
-    """The runner result tool's call: one typed proposal, validated by the API
-    (`curie_api.factory_tracker_results.parse_proposal`)."""
+class QuestionsSubmission(BaseModel):
+    """The runner question tool's call (#5785): what the investigation found and
+    the numbered questions. The API checks the bounds and composes the comment;
+    input outside them, a missing field, a field of another type or a body that
+    is not one JSON object included, is refused 409 ``invalid_questions`` with
+    nothing echoed, as is a comment that would pass 25,000 characters once
+    composed and redacted."""
 
-    proposal: Any = Field(description="A ticket or findings proposal object.")
+    summary: Any = Field(
+        default=None,
+        description="What the investigation found, 1 to 4,000 characters, including a "
+        "reproduction result when there is one.",
+    )
+    questions: Any = Field(
+        default=None,
+        description="1 to 10 questions, each 1 to 1,000 characters with no blank line.",
+    )
 
 
-class TrackerResultOut(BaseModel):
-    """The accepted result after one inline delivery attempt.
+class RuleProposalSubmission(BaseModel):
+    """The runner ``propose_rule`` tool's call (#5796): one standing rule for the
+    repository and why it is general, each one line of at most 240 UTF-8 bytes
+    with no reserved heading or section marker. Exactly these two string
+    fields; any other body is refused 422 ``invalid_body`` with nothing echoed.
+    The agent, scope, source and proposer come from the capability and the
+    stored request, never from the body."""
 
-    ``state`` ``owed`` means the platform keeps retrying until the delivery
-    deadline. ``result_comment_url`` is the source issue's marked result
-    comment and ``ticket_url`` the published ticket, each once delivered.
-    """
+    model_config = ConfigDict(extra="forbid")
 
-    result_kind: Literal["ticket", "findings"]
-    state: Literal["owed", "delivered", "failed"]
-    result_comment_url: str | None
-    ticket_url: str | None
+    rule: str = Field(description="The rule, one sentence of at most 240 UTF-8 bytes.")
+    reason: str = Field(
+        description="Why the feedback states a general rule, at most 240 UTF-8 bytes."
+    )
+
+
+class RuleProposalOut(BaseModel):
+    """A stored proposal: a hidden candidate, shown to a person only after the
+    pull request merges."""
+
+    status: Literal["candidate"]
+
+
+class QuestionsOut(BaseModel):
+    """The posted round: ``round`` of ``rounds_limit`` for the WorkItem."""
+
+    round: int
+    rounds_limit: int
 
 
 WorkItemOutcomeState = Literal[
@@ -156,6 +186,16 @@ class CodingInstructionsMetadata(BaseModel):
     format_version: Literal[1] | None = None
 
 
+class MemoryRulesMetadata(BaseModel):
+    """The learned rules pinned at admission (#5798): numbers and digest, never the text."""
+
+    state: Literal["absent", "selected"]
+    count: int = 0
+    rule_numbers: list[int] = Field(default_factory=list)
+    sha256: str | None = None
+    format_version: Literal[1] | None = None
+
+
 class WorkItemRequestOut(BaseModel):
     """Operator view of one ExecutionRequest (#2577). Built from an explicit
     allowlist dict, never from an ORM row, so no runtime-owner field leaks."""
@@ -179,6 +219,8 @@ class WorkItemRequestOut(BaseModel):
     enrollment_generation: int | None = None
     coding_instructions_selection_id: uuid.UUID | None = None
     coding_instructions_evidence: Literal["none", "pending", "applied", "failed"] = "none"
+    # Whether this request's runner loaded the WorkItem's pinned learned rules (#5798).
+    memory_rules_evidence: Literal["none", "pending", "applied", "failed"] = "none"
     # Automatic retry lineage (ADR 0269): the request this one retries, and
     # whether it was admitted after owner loss or after an ordinary failure.
     retry_of_request_id: uuid.UUID | None
@@ -191,7 +233,8 @@ class WorkItemRequestOut(BaseModel):
     # The raised limit a resource gated retry waits for; null when ungated.
     resource_gate: ResourceGateOut | None
     # The worker's side effect fact from this request's finish; null when the
-    # request did not end through a worker finish.
+    # request did not end through a worker finish or its worker sent no fact,
+    # as a worker from an earlier release does.
     retry_safety: RetrySafety | None
 
 
@@ -286,7 +329,7 @@ class WorkItemStageOut(BaseModel):
 
 
 class WorkItemProgressOut(BaseModel):
-    """The latest execution's progress, derived by ``factory_progress.phase_view``."""
+    """The latest execution's progress, derived by ``factory_phase_view.phase_view``."""
 
     current: str | None
     note: str | None
@@ -362,6 +405,7 @@ class WorkItemOutcomeOut(BaseModel):
     enrollment_generation: int | None = None
     requester_principal_id: uuid.UUID | None = None
     coding_instructions: CodingInstructionsMetadata
+    memory_rules: MemoryRulesMetadata
     # The WorkItem's lifetime automatic retry allowance (ADR 0269): slots spent
     # by owner loss and ordinary failures together, and the limit.
     automatic_retries_used: int
@@ -465,6 +509,9 @@ class FactorySlackKickoffIn(BaseModel):
     malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
     the message's own at root. ``author`` is the turn's Slack user id; the
     receipt must name the same delivery, route and sender.
+    ``placeholder_ts`` is the ts of the dispatcher's placeholder reply under
+    the mention, None when it posted none; an admission stores it as the
+    run's progress card.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -475,6 +522,7 @@ class FactorySlackKickoffIn(BaseModel):
     root_ts: str = Field(min_length=1, max_length=64)
     author: str = Field(min_length=1, max_length=64)
     receipt: dict[str, Any]
+    placeholder_ts: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class FactorySlackKickoffOut(BaseModel):
@@ -489,6 +537,8 @@ class FactorySlackKickoffOut(BaseModel):
     issue_url: str | None = None
     replayed: bool = False
     reason: str | None = None
+    connect_url: str | None = None
+    plan_url: str | None = None
 
 
 # The operator's reason for a retry, stripped before validation, hashing and storage.

@@ -16,6 +16,7 @@ import itertools
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -500,6 +501,192 @@ class GitHubAPI:
         return httpx.Response(200, json=issue)
 
 
+def github_time(moment: datetime) -> str:
+    """A GitHub REST timestamp: ISO 8601 in UTC to the whole second, ``Z``
+    suffixed, as every comment's ``created_at`` and ``updated_at`` are
+    (https://docs.github.com/en/rest/issues/comments#get-an-issue-comment)."""
+
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _at(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _since(value: str | None) -> datetime | None:
+    return _at(value) if value else None
+
+
+def _page_of(request: httpx.Request, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    params = request.url.params
+    per_page = int(params.get("per_page", "30"))
+    page = int(params.get("page", "1"))
+    return items[(page - 1) * per_page : page * per_page]
+
+
+class IssueCommentsAPI(GitHubAPI):
+    """`GitHubAPI` that keeps issue comments the way GitHub does (#5787).
+
+    Every default of `GitHubAPI` stays as it is; this subclass adds a comment
+    store the factory's question write, the answer intake and a poll pass all
+    read and write:
+
+    1. One id sequence for every comment, increasing, so a later comment has a
+       larger numeric ``id``, and ``created_at`` / ``updated_at`` in GitHub's
+       whole-second ``Z`` form from a clock the test moves (``tick``).
+    2. Create, list, read by id and edit, with each comment's ``user`` (whose
+       ``type`` is ``User`` or ``Bot``), ``performed_via_github_app`` (the App a
+       person or bot acted through, or null) and ``issue_url``:
+       https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+       https://docs.github.com/en/rest/issues/comments#list-issue-comments
+       https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
+       https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
+       A comment the installation token writes is authored by the App's bot
+       user and carries ``performed_via_github_app`` with the App's id.
+    3. The repository-wide listing a poll pass reads, filtered by ``since`` on
+       ``updated_at`` (an edit only moves ``updated_at``) and sorted by
+       creation, oldest first:
+       https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository
+    4. Permission answers per login, with the user's immutable id. GitHub's
+       legacy ``permission`` field folds ``maintain`` into ``write`` and
+       ``triage`` into ``read``; ``role_name`` keeps the role:
+       https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+    5. ``store_then_fail``: the next comment create is stored, then answered
+       with that status, as when GitHub's response is lost after the write.
+    6. ``after_listing``: a step `handle_async` runs once, after the next
+       repository-wide listing is answered and before the caller reads it, so
+       a test can make something happen in the middle of a poll pass.
+
+    Issue state and labels per issue come from `GitHubAPI.planted_issues`.
+    The repository issue and review comment listings answer empty
+    (``answer_listings``).
+    """
+
+    def __init__(self, *, api: str = GITHUB_API) -> None:
+        super().__init__()
+        self.api = api.rstrip("/")
+        self.clock = datetime.now(UTC).replace(microsecond=0)
+        self.stored: dict[int, dict[str, Any]] = {}
+        self.collaborators: dict[str, tuple[int, str]] = {}
+        self.store_then_fail: int | None = None
+        self.after_listing: Callable[[], Awaitable[None]] | None = None
+        self.answer_listings = True
+
+    def tick(self, seconds: int = 1) -> None:
+        self.clock += timedelta(seconds=seconds)
+
+    def grant(self, user: dict[str, Any], role: str) -> None:
+        """``user``'s role on the repository: admin, maintain, write, triage, read or none."""
+
+        self.collaborators[user["login"]] = (user["id"], role)
+
+    def add_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        user: dict[str, Any],
+        app: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A comment created on issue ``number`` now, by ``user`` acting
+        through ``app`` (None when not through an App)."""
+
+        comment_id = next(self._comment_ids)
+        stamp = github_time(self.clock)
+        comment = {
+            "id": comment_id,
+            "body": body,
+            "user": dict(user),
+            "performed_via_github_app": None if app is None else dict(app),
+            "issue_url": f"{self.api}/repos/{REPO}/issues/{number}",
+            "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
+            "author_association": "NONE",
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+        self.stored[comment_id] = comment
+        return comment
+
+    def edit_comment(self, comment_id: int, body: str) -> dict[str, Any]:
+        comment = self.stored[comment_id]
+        comment["body"] = body
+        comment["updated_at"] = github_time(self.clock)
+        return comment
+
+    def on_issue(self, number: int) -> list[dict[str, Any]]:
+        url = f"{self.api}/repos/{REPO}/issues/{number}"
+        return [
+            self.stored[key] for key in sorted(self.stored) if self.stored[key]["issue_url"] == url
+        ]
+
+    async def handle_async(self, request: httpx.Request) -> httpx.Response:
+        """`handle` for an async client, running ``after_listing`` once."""
+
+        response = self.handle(request)
+        step = self.after_listing
+        if (
+            step is not None
+            and request.method == "GET"
+            and request.url.path == f"/repos/{REPO}/issues/comments"
+        ):
+            self.after_listing = None
+            await step()
+        return response
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        root = re.escape(f"/repos/{REPO}")
+        if path == f"/repos/{REPO}/issues/comments" and request.method == "GET":
+            since = _since(request.url.params.get("since"))
+            listed = sorted(
+                (
+                    comment
+                    for comment in self.stored.values()
+                    if since is None or _at(comment["updated_at"]) >= since
+                ),
+                key=lambda comment: (comment["created_at"], comment["id"]),
+            )
+            return httpx.Response(200, json=_page_of(request, listed))
+        single = re.fullmatch(rf"{root}/issues/comments/(\d+)", path)
+        if single is not None:
+            found = self.stored.get(int(single.group(1)))
+            if found is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            if request.method == "PATCH":
+                found = self.edit_comment(found["id"], json.loads(request.content)["body"])
+            return httpx.Response(200, json=found)
+        thread = re.fullmatch(rf"{root}/issues/(\d+)/comments", path)
+        if thread is not None:
+            number = int(thread.group(1))
+            if request.method == "POST":
+                created = self.add_comment(
+                    number,
+                    json.loads(request.content)["body"],
+                    user=APP_BOT_USER,
+                    app={"id": int(APP_ID), "slug": APP_SLUG},
+                )
+                if self.store_then_fail is not None:
+                    status, self.store_then_fail = self.store_then_fail, None
+                    return httpx.Response(status, json={"message": "Server Error"})
+                return httpx.Response(201, json=created)
+            return httpx.Response(200, json=_page_of(request, self.on_issue(number)))
+        permission = re.fullmatch(rf"{root}/collaborators/([^/]+)/permission", path)
+        if permission is not None and unquote(permission.group(1)) in self.collaborators:
+            login = unquote(permission.group(1))
+            user_id, role = self.collaborators[login]
+            legacy = {"maintain": "write", "triage": "read"}.get(role, role)
+            self.permission_requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "permission": legacy,
+                    "role_name": role,
+                    "user": {"id": user_id, "login": login, "type": "User"},
+                },
+            )
+        return super().handle(request)
+
+
 class _Credentials:
     def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
         if repo != REPO or installation_id != INSTALLATION_ID:
@@ -538,6 +725,87 @@ def _post(
             "Content-Type": "application/json",
         },
     )
+
+
+@dataclass(frozen=True)
+class WebhookDelivery:
+    """One webhook delivery as GitHub sends it: the event name, the delivery
+    headers and the exact body bytes ``X-Hub-Signature-256`` covers.
+
+    https://docs.github.com/en/webhooks/webhook-events-and-payloads#delivery-headers
+    https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+    """
+
+    event: str
+    headers: dict[str, str]
+    body: bytes
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        decoded = json.loads(self.body)
+        assert isinstance(decoded, dict)
+        return decoded
+
+    @property
+    def delivery_id(self) -> str:
+        return self.headers["X-GitHub-Delivery"]
+
+
+def signed_delivery(
+    event: str, payload: dict[str, Any], *, delivery_id: str | None = None
+) -> WebhookDelivery:
+    """``payload`` as a delivery of ``event``, signed with the configured
+    webhook secret at this moment (a later secret change does not re-sign)."""
+
+    body = json.dumps(payload).encode()
+    headers = {
+        "X-GitHub-Delivery": delivery_id or str(uuid.uuid4()),
+        "X-GitHub-Event": event,
+        "X-Hub-Signature-256": _signature(body),
+        "Content-Type": "application/json",
+    }
+    return WebhookDelivery(event, headers, body)
+
+
+def post_delivery(client: TestClient, delivery: WebhookDelivery) -> httpx.Response:
+    """POST ``delivery`` to the webhook route unchanged: its own bytes and headers."""
+
+    return client.post("/github/webhook", content=delivery.body, headers=dict(delivery.headers))
+
+
+@dataclass(frozen=True)
+class Posted:
+    """What a person's action on `GitHubRepositoryFake` created, as the actor
+    reads it back, and the webhook deliveries GitHub sends for it (none for a
+    pending review)."""
+
+    item: dict[str, Any]
+    deliveries: tuple[WebhookDelivery, ...] = ()
+
+
+def presented_token(request: httpx.Request) -> str | None:
+    """The token an ``Authorization`` header carries: ``Bearer <token>``,
+    ``token <token>`` or Basic ``x-access-token:<token>``."""
+
+    scheme, _, credential = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() in {"bearer", "token"}:
+        return credential.strip() or None
+    if scheme.lower() == "basic":
+        try:
+            decoded = base64.b64decode(credential.strip()).decode()
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return decoded.partition(":")[2] or None
+    return None
+
+
+# REST review ``event`` -> the state a submitted review takes.
+# https://docs.github.com/en/rest/pulls/reviews#submit-a-review-for-a-pull-request
+REVIEW_EVENT_STATES = {
+    "COMMENT": "COMMENTED",
+    "REQUEST_CHANGES": "CHANGES_REQUESTED",
+    "APPROVE": "APPROVED",
+}
 
 
 def _sender(
@@ -624,16 +892,83 @@ def _comment_event(number: int, body: str, comment_id: int) -> dict[str, Any]:
 # https://docs.github.com/en/rest/git/commits#create-a-commit
 # https://docs.github.com/en/rest/git/refs#create-a-reference
 # https://docs.github.com/en/rest/issues/issues#list-repository-issues
-# https://docs.github.com/en/rest/issues/issues#create-an-issue
 # https://docs.github.com/en/rest/issues/issues#get-an-issue
 #
 # Issues follow the REST issue object: ``number``, ``title``, ``body``,
 # ``state``, ``labels`` as objects with a ``name``, ``user`` with ``id``,
 # ``login`` and ``type``, and ``html_url``. A pull request is an issue too: the
 # repository issue listing returns it with a ``pull_request`` key, and its
-# ``creator`` filter matches the opening account's login. An issue the
-# adapter's installation token creates is authored by ``bot_user`` with
-# ``performed_via_github_app``.
+# ``creator`` filter matches the opening account's login.
+#
+# Pull request reviews (#5794), as GitHub's REST and webhook documentation
+# describes them:
+# https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request
+# https://docs.github.com/en/rest/pulls/reviews#submit-a-review-for-a-pull-request
+# https://docs.github.com/en/rest/pulls/reviews#get-a-review-for-a-pull-request
+# https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request
+# https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
+# https://docs.github.com/en/rest/pulls/reviews#dismiss-a-review-for-a-pull-request
+# https://docs.github.com/en/rest/pulls/comments#list-review-comments-on-a-pull-request
+# https://docs.github.com/en/rest/pulls/comments#list-review-comments-in-a-repository
+# https://docs.github.com/en/rest/pulls/comments#get-a-review-comment-for-a-pull-request
+# https://docs.github.com/en/rest/pulls/comments#update-a-review-comment-for-a-pull-request
+# https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+# https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
+# https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request_review
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request_review_comment
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#issue_comment
+# https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+#
+#   1. Callers are told apart by the token they present (``Bearer``, ``token``
+#      or Basic ``x-access-token:<token>``): a token from ``user_token`` is
+#      that person; any other token is the App, acting as ``bot_user``.
+#   2. Create a review with ``body``, an optional ``event`` (``COMMENT``,
+#      ``REQUEST_CHANGES``, ``APPROVE``), an optional ``commit_id`` (the
+#      pull's head when omitted) and ``comments`` of ``path``, ``line`` and
+#      ``body``; 200 with the review. "To create a pending review for a pull
+#      request, leave the event parameter blank"; a pending review's state is
+#      ``PENDING`` and it does "not include the submitted_at property". A
+#      comment without ``line`` is a file-level comment (``line`` null,
+#      ``subject_type: "file"``). The docs make ``body`` mandatory for
+#      ``COMMENT`` and ``REQUEST_CHANGES``; the HTTP handler waives that only
+#      when the review carries inline comments, the body-less batch of inline
+#      comments the factory has to handle (the live run, #5808, confirms it).
+#      One pending review per person per pull request; a second is 422.
+#   3. Submit with ``event`` (required; 422 without it or on a review that is
+#      not pending): the state becomes ``COMMENTED``, ``CHANGES_REQUESTED`` or
+#      ``APPROVED``, ``submitted_at`` is the fake clock's now, and each inline
+#      comment's ``updated_at`` moves to it while ``created_at`` stays (the
+#      bump #2794 observed live). A create call with ``event`` submits at once.
+#   4. "Before you submit your review, your line comments are pending and only
+#      visible to you" (https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/reviewing-changes-in-pull-requests/reviewing-proposed-changes-in-a-pull-request):
+#      for anyone but the author a pending review and its comments answer 404
+#      when read directly and are left out of every listing.
+#   5. Review objects carry ``id``, ``node_id``, ``user``, ``body``, ``state``
+#      (uppercase in REST), ``html_url`` (``#pullrequestreview-<id>``),
+#      ``pull_request_url``, ``author_association``, ``_links``,
+#      ``commit_id`` and, once submitted, ``submitted_at``. Review comments
+#      carry the documented ``pull_request_review_id``, ``commit_id``,
+#      ``original_commit_id``, ``path``, ``line``, ``original_line``, ``side``,
+#      ``subject_type``, ``position`` (null: the fake keeps no diff),
+#      ``user``, ``body``, ``created_at``, ``updated_at``, ``html_url``
+#      (``#discussion_r<id>``), ``pull_request_url`` and
+#      ``author_association``; no ``performed_via_github_app``.
+#   6. The repository-wide comment listings honour ``since`` on
+#      ``updated_at`` ("Only show results that were last updated after the
+#      given time"); an item seeded by the older helpers, which carry no
+#      ``updated_at``, is listed whatever ``since`` says, as before. Review
+#      comments sort by ``created_at`` (``sort=updated`` by ``updated_at``),
+#      ascending unless ``direction=desc``.
+#   7. Each submission yields the signed deliveries GitHub sends: one
+#      ``pull_request_review`` ``submitted`` and one
+#      ``pull_request_review_comment`` ``created`` per inline comment. Webhook
+#      ``review.state`` is lowercase (``commented``, ``changes_requested``,
+#      ``approved``, ``dismissed``: the webhook payload schema the docs
+#      render, also published as octokit/webhooks
+#      ``payload-schemas/api.github.com/common/pull-request-review.schema.json``);
+#      ``pull_request`` is the fake's own pull read. The signature is
+#      ``X-Hub-Signature-256`` over the exact body bytes.
 #
 # The Git Data API shapes below (blobs, trees, parentless commits, and refs
 # outside refs/heads) replay what was observed against api.github.com with a
@@ -662,6 +997,8 @@ _LISTINGS = (
     re.compile(rf"^/repos/{REPO}/issues/\d+/comments$"),
     re.compile(rf"^/repos/{REPO}/pulls/\d+/comments$"),
     re.compile(rf"^/repos/{REPO}/pulls/\d+/reviews$"),
+    re.compile(rf"^/repos/{REPO}/pulls/\d+/reviews/\d+/comments$"),
+    re.compile(rf"^/repos/{REPO}/pulls/comments$"),
 )
 _RUN_STATES = {
     "success": ("completed", "success"),
@@ -771,23 +1108,10 @@ class GitHubRepositoryFake:
         self.evidence_refs: dict[str, str] = {}
         self.raw_requests: list[httpx.Request] = []
         self._write_faults: list[list[Any]] = []
-        # Writes applied whose answer is then lost: [pattern, status, count].
-        self._lost_writes: list[list[Any]] = []
         # Every request the fake answered, in order.
         self.http_requests: list[httpx.Request] = []
-        # The JSON body of every `POST /repos/{REPO}/issues`, in order.
-        self.issue_posts: list[dict[str, Any]] = []
         # Who an issue or pull request the adapter's token opens is authored by.
         self.bot_user: dict[str, Any] = dict(CONTRACT_BOT)
-        # False models a listing that ignores ``creator``, so an adapter's own
-        # owner check is all that keeps another account's issue out.
-        self.honour_creator = True
-        # Listing lag: issue numbers absent from the repository issue listing,
-        # yet readable directly, as a fresh issue is for a few seconds on
-        # GitHub. While ``hide_new_from_listing`` is set every issue the
-        # adapter creates starts hidden.
-        self.hidden_from_listing: set[int] = set()
-        self.hide_new_from_listing = False
         # Reads that answer an injected status: [pattern, status, count].
         self._read_faults: list[list[Any]] = []
         self.label_requests: list[httpx.Request] = []
@@ -798,6 +1122,25 @@ class GitHubRepositoryFake:
         self._seconds = itertools.count(1)
         self._shas = itertools.count(1)
         self._fail_countdown: int | None = None
+        # The review API (#5794, header block above). URLs GitHub derives
+        # from its API and web origins; the installation the App's webhook
+        # deliveries name.
+        self.api_url = GITHUB_API
+        self.html_base = "https://github.com"
+        self.installation_id = INSTALLATION_ID
+        # The clock review, review comment and conversation comment times come
+        # from, whole seconds in UTC, near the real now so a poll pass's
+        # ``since`` (now minus its lookback) lists them; ``tick`` moves it.
+        self.clock = datetime.now(UTC).replace(microsecond=0)
+        # A person's token -> that person (``user_token``); every other token
+        # is the App.
+        self.user_tokens: dict[str, dict[str, Any]] = {}
+        # Login -> ``author_association``; unset, a collaborator with a
+        # permission entry is ``COLLABORATOR`` and anyone else ``NONE``.
+        self.associations: dict[str, str] = {}
+        # Every webhook delivery GitHub would have sent, oldest first, until
+        # ``drain_deliveries`` takes them.
+        self.deliveries: list[WebhookDelivery] = []
         self.seed_repository()
 
     # Seeding, from outside the adapters -----------------------------------
@@ -922,6 +1265,451 @@ class GitHubRepositoryFake:
         self.reviews.append(review)
         return review
 
+    # People and the review API (#5794) ----------------------------------
+
+    def tick(self, seconds: int = 1) -> None:
+        """Move the fake clock forward."""
+
+        self.clock += timedelta(seconds=seconds)
+
+    def _now(self) -> str:
+        return github_time(self.clock)
+
+    def user_token(self, user: dict[str, Any], *, association: str | None = None) -> str:
+        """A token that identifies ``user`` (``{"id", "login", "type"}``) to the
+        fake, as a person's own token does to GitHub. ``association`` is the
+        ``author_association`` their reviews and comments carry."""
+
+        token = f"user-token-{user['id']}"
+        self.user_tokens[token] = dict(user)
+        if association is not None:
+            self.associations[user["login"]] = association
+        return token
+
+    def grant(self, user: dict[str, Any], role: str) -> None:
+        """``user``'s role on the repository, as the permission read answers it.
+
+        GitHub's legacy ``permission`` folds ``maintain`` into ``write`` and
+        ``triage`` into ``read``:
+        https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+        """
+
+        legacy = {"maintain": "write", "triage": "read"}.get(role, role)
+        self.permissions[user["login"]] = (int(user["id"]), legacy)
+
+    def client_for(self, token: str) -> httpx.Client:
+        """A client on this fake that presents ``token``, as GitHub's own
+        clients do; the caller closes it."""
+
+        return httpx.Client(
+            transport=httpx.MockTransport(self.handle),
+            base_url=self.api_url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+
+    def drain_deliveries(self) -> list[WebhookDelivery]:
+        """Every delivery not yet drained, oldest first."""
+
+        drained, self.deliveries = self.deliveries, []
+        return drained
+
+    def _caller(self, request: httpx.Request) -> dict[str, Any]:
+        return self.user_tokens.get(presented_token(request) or "") or self.bot_user
+
+    @staticmethod
+    def _sees(viewer: dict[str, Any], item: dict[str, Any]) -> bool:
+        """A pending review and its comments are their author's alone."""
+
+        author = item.get("_pending_author")
+        return author is None or author == viewer["id"]
+
+    def _association(self, user: dict[str, Any]) -> str:
+        login = user["login"]
+        if login in self.associations:
+            return self.associations[login]
+        return "COLLABORATOR" if login in self.permissions else "NONE"
+
+    def _pull_url(self, number: int) -> str:
+        return f"{self.api_url}/repos/{REPO}/pulls/{number}"
+
+    def _review_of(self, number: int, review_id: int) -> dict[str, Any]:
+        for review in self.reviews:
+            if review["_number"] == number and review["id"] == review_id:
+                return review
+        raise KeyError(review_id)
+
+    def comments_of_review(self, review_id: int) -> list[dict[str, Any]]:
+        """The stored inline comments of review ``review_id``, oldest first."""
+
+        return [c for c in self.review_comments if c.get("pull_request_review_id") == review_id]
+
+    def create_review(
+        self,
+        number: int,
+        user: dict[str, Any],
+        *,
+        body: str = "",
+        event: str | None = None,
+        comments: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        commit_id: str | None = None,
+    ) -> Posted:
+        """A review by ``user`` on pull request ``number``, as the create-review
+        call makes it: pending without ``event``, submitted at once with one.
+
+        ``comments`` are ``{"path", "line", "body"}``; a comment without
+        ``line`` is file-level. Unlike the HTTP handler this does not validate
+        its input, so a test can also make what the API refuses (a body-less
+        ``COMMENT`` review with no inline comments).
+        https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request
+        """
+
+        commit = commit_id or self._pull_payload(number)["head"]["sha"]
+        review_id = next(self._comment_ids)
+        stamp = self._now()
+        url = f"{self.html_base}/{REPO}/pull/{number}#pullrequestreview-{review_id}"
+        pull_url = self._pull_url(number)
+        self.reviews.append(
+            {
+                "id": review_id,
+                "node_id": f"PRR_fixture_{review_id}",
+                "user": dict(user),
+                "body": body,
+                "state": "PENDING",
+                "html_url": url,
+                "pull_request_url": pull_url,
+                "author_association": self._association(user),
+                "_links": {"html": {"href": url}, "pull_request": {"href": pull_url}},
+                "commit_id": commit,
+                "_number": number,
+                "_pending_author": user["id"],
+            }
+        )
+        for spec in comments:
+            self._add_review_comment(number, review_id, user, spec, commit, stamp)
+        if event is None:
+            return Posted(self._visible(self._review_of(number, review_id)))
+        return self.submit_review(number, review_id, event)
+
+    def _add_review_comment(
+        self,
+        number: int,
+        review_id: int,
+        user: dict[str, Any],
+        spec: dict[str, Any],
+        commit: str,
+        stamp: str,
+    ) -> None:
+        # https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
+        comment_id = next(self._comment_ids)
+        line = spec.get("line")
+        url = f"{self.api_url}/repos/{REPO}/pulls/comments/{comment_id}"
+        html = f"{self.html_base}/{REPO}/pull/{number}#discussion_r{comment_id}"
+        pull_url = self._pull_url(number)
+        self.review_comments.append(
+            {
+                "id": comment_id,
+                "node_id": f"PRRC_fixture_{comment_id}",
+                "url": url,
+                "pull_request_review_id": review_id,
+                "diff_hunk": "",
+                "path": spec["path"],
+                "position": None,
+                "original_position": None,
+                "commit_id": commit,
+                "original_commit_id": commit,
+                "user": dict(user),
+                "body": spec["body"],
+                "created_at": stamp,
+                "updated_at": stamp,
+                "html_url": html,
+                "pull_request_url": pull_url,
+                "author_association": self._association(user),
+                "_links": {
+                    "self": {"href": url},
+                    "html": {"href": html},
+                    "pull_request": {"href": pull_url},
+                },
+                "start_line": None,
+                "original_start_line": None,
+                "start_side": None,
+                "line": line,
+                "original_line": line,
+                "side": "RIGHT",
+                "subject_type": "file" if line is None else "line",
+                "_number": number,
+                "_pending_author": user["id"],
+            }
+        )
+
+    def submit_review(
+        self, number: int, review_id: int, event: str, *, body: str | None = None
+    ) -> Posted:
+        """Submit pending review ``review_id`` with ``event`` and return the
+        review with the deliveries GitHub sends for it (also appended to
+        ``deliveries``).
+
+        https://docs.github.com/en/rest/pulls/reviews#submit-a-review-for-a-pull-request
+        """
+
+        review = self._review_of(number, review_id)
+        if review["state"] != "PENDING":
+            raise ValueError(f"review {review_id} is not pending")
+        stamp = self._now()
+        if body is not None:
+            review["body"] = body
+        review["state"] = REVIEW_EVENT_STATES[event]
+        review["submitted_at"] = stamp
+        del review["_pending_author"]
+        comments = self.comments_of_review(review_id)
+        for comment in comments:
+            # Submission moves updated_at, never created_at (#2794).
+            comment["updated_at"] = stamp
+            comment.pop("_pending_author", None)
+        deliveries = (
+            self._review_delivery(review, "submitted"),
+            *(
+                signed_delivery(
+                    "pull_request_review_comment",
+                    self._webhook("created", number, review["user"], comment=self._visible(c)),
+                )
+                for c in comments
+            ),
+        )
+        self.deliveries.extend(deliveries)
+        return Posted(self._visible(review), deliveries)
+
+    def dismiss_review(self, number: int, review_id: int) -> Posted:
+        """Dismiss submitted review ``review_id``; GitHub sends
+        ``pull_request_review`` with action ``dismissed``.
+
+        https://docs.github.com/en/rest/pulls/reviews#dismiss-a-review-for-a-pull-request
+        """
+
+        review = self._review_of(number, review_id)
+        if review["state"] == "PENDING":
+            raise ValueError(f"review {review_id} is pending")
+        review["state"] = "DISMISSED"
+        delivery = self._review_delivery(review, "dismissed")
+        self.deliveries.append(delivery)
+        return Posted(self._visible(review), (delivery,))
+
+    def _review_delivery(self, review: dict[str, Any], action: str) -> WebhookDelivery:
+        # The webhook review object is the REST one with a lowercase state.
+        webhook_review = {**self._visible(review), "state": review["state"].lower()}
+        return signed_delivery(
+            "pull_request_review",
+            self._webhook(action, review["_number"], review["user"], review=webhook_review),
+        )
+
+    def _webhook(
+        self, action: str, number: int, sender: dict[str, Any], **objects: Any
+    ) -> dict[str, Any]:
+        # https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request_review
+        return {
+            "action": action,
+            **objects,
+            "pull_request": self._pull_payload(number),
+            "repository": {"id": self.repository_id, "full_name": REPO},
+            "installation": {"id": self.installation_id},
+            "sender": dict(sender),
+        }
+
+    def add_conversation_comment(self, number: int, user: dict[str, Any], body: str) -> Posted:
+        """A comment by ``user`` on the conversation of issue or pull request
+        ``number`` in the documented shape, with its ``issue_comment``
+        ``created`` delivery. `add_comment` keeps its older, smaller shape.
+
+        https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+        https://docs.github.com/en/webhooks/webhook-events-and-payloads#issue_comment
+        """
+
+        comment_id = next(self._comment_ids)
+        stamp = self._now()
+        kind = "pull" if number in self.pulls else "issues"
+        comment = {
+            "id": comment_id,
+            "node_id": f"IC_fixture_{comment_id}",
+            "url": f"{self.api_url}/repos/{REPO}/issues/comments/{comment_id}",
+            "html_url": f"{self.html_base}/{REPO}/{kind}/{number}#issuecomment-{comment_id}",
+            "issue_url": f"{self.api_url}/repos/{REPO}/issues/{number}",
+            "body": body,
+            "user": dict(user),
+            "performed_via_github_app": None,
+            "author_association": self._association(user),
+            "created_at": stamp,
+            "updated_at": stamp,
+            "_number": number,
+        }
+        self.comments.append(comment)
+        issue = dict(self.issues[number])
+        if number in self.pulls:
+            issue["state"] = self.pulls[number]["state"]
+        delivery = signed_delivery(
+            "issue_comment",
+            {
+                "action": "created",
+                "issue": issue,
+                "comment": self._visible(comment),
+                "repository": {"id": self.repository_id, "full_name": REPO},
+                "installation": {"id": self.installation_id},
+                "sender": dict(user),
+            },
+        )
+        self.deliveries.append(delivery)
+        return Posted(self._visible(comment), (delivery,))
+
+    def edit_comment(self, comment_id: int, body: str) -> dict[str, Any]:
+        """Edit a conversation or review comment: the body changes and
+        ``updated_at`` moves to the fake clock's now.
+
+        https://docs.github.com/en/rest/pulls/comments#update-a-review-comment-for-a-pull-request
+        https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
+        """
+
+        for comment in (*self.comments, *self.review_comments):
+            if comment["id"] == comment_id:
+                comment["body"] = body
+                comment["updated_at"] = self._now()
+                return self._visible(comment)
+        raise KeyError(comment_id)
+
+    def _review_refusal(
+        self, number: int, user: dict[str, Any], body: dict[str, Any]
+    ) -> str | None:
+        """Why the create-review call refuses ``body`` (422), or None."""
+
+        event, comments = body.get("event"), body.get("comments") or []
+        if event is not None and event not in REVIEW_EVENT_STATES:
+            return "Unprocessable Entity"
+        if not isinstance(comments, list) or not all(
+            isinstance(c, dict)
+            and isinstance(c.get("path"), str)
+            and c["path"]
+            and isinstance(c.get("body"), str)
+            and c["body"].strip()
+            and (c.get("line") is None or (type(c["line"]) is int and c["line"] > 0))
+            for c in comments
+        ):
+            return "Validation Failed"
+        text = body.get("body") or ""
+        if event in {"COMMENT", "REQUEST_CHANGES"} and not str(text).strip() and not comments:
+            return "Validation Failed"
+        if body.get("commit_id") is not None and body["commit_id"] not in self.commits:
+            return "Validation Failed"
+        if any(
+            r["_number"] == number and r.get("_pending_author") == user["id"] for r in self.reviews
+        ):
+            return "User can only have one pending review per pull request"
+        return None
+
+    def _write_reviews(
+        self, request: httpx.Request, path: str, body: dict[str, Any]
+    ) -> httpx.Response | None:
+        repo = f"/repos/{REPO}"
+        caller = self._caller(request)
+        matched = re.fullmatch(rf"{repo}/pulls/(\d+)/reviews", path)
+        if request.method == "POST" and matched:
+            number = int(matched[1])
+            if number not in self.pulls:
+                return httpx.Response(404, json={"message": "Not Found"})
+            refusal = self._review_refusal(number, caller, body)
+            if refusal is not None:
+                return httpx.Response(422, json={"message": refusal})
+            posted = self.create_review(
+                number,
+                caller,
+                body=str(body.get("body") or ""),
+                event=body.get("event"),
+                comments=list(body.get("comments") or []),
+                commit_id=body.get("commit_id"),
+            )
+            return httpx.Response(200, json=posted.item)
+        matched = re.fullmatch(rf"{repo}/pulls/(\d+)/reviews/(\d+)/(events|dismissals)", path)
+        if matched and request.method in {"POST", "PUT"}:
+            number, review_id = int(matched[1]), int(matched[2])
+            try:
+                review = self._review_of(number, review_id)
+            except KeyError:
+                review = None
+            if review is None or not self._sees(caller, review):
+                return httpx.Response(404, json={"message": "Not Found"})
+            if matched[3] == "dismissals":
+                if review["state"] == "PENDING":
+                    return httpx.Response(422, json={"message": "Can not dismiss a pending review"})
+                return httpx.Response(200, json=self.dismiss_review(number, review_id).item)
+            event = body.get("event")
+            if event not in REVIEW_EVENT_STATES or review["state"] != "PENDING":
+                return httpx.Response(422, json={"message": "Unprocessable Entity"})
+            submitted = self.submit_review(number, review_id, event, body=body.get("body"))
+            return httpx.Response(200, json=submitted.item)
+        matched = re.fullmatch(rf"{repo}/issues/(\d+)/comments", path)
+        if request.method == "POST" and matched and caller is not self.bot_user:
+            number = int(matched[1])
+            if number not in self.issues:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(
+                201, json=self.add_conversation_comment(number, caller, body["body"]).item
+            )
+        return None
+
+    def _listed_since(
+        self, request: httpx.Request, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """``items`` filtered by ``since`` on ``updated_at`` (an item without
+        one is always listed) and sorted as the review comment listing is."""
+
+        params = request.url.params
+        since = _since(params.get("since"))
+        kept = [
+            item
+            for item in items
+            if since is None or "updated_at" not in item or _at(item["updated_at"]) >= since
+        ]
+        key = "updated_at" if params.get("sort") == "updated" else "created_at"
+        return sorted(
+            kept,
+            key=lambda item: (_at(item.get(key) or item["created_at"]), item["id"]),
+            reverse=params.get("direction") == "desc",
+        )
+
+    def _read_reviews(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        """The review reads, each answered as the caller may see it."""
+
+        repo = f"/repos/{REPO}"
+        caller = self._caller(request)
+        comments = [c for c in self.review_comments if self._sees(caller, c)]
+        if path == f"{repo}/pulls/comments":
+            return self._page(request, self._listed_since(request, comments))
+        matched = re.fullmatch(rf"{repo}/pulls/comments/(\d+)", path)
+        if matched:
+            return self._found(comments, matched[1])
+        matched = re.fullmatch(rf"{repo}/pulls/(\d+)/(comments|reviews)", path)
+        if matched:
+            number = int(matched[1])
+            if number not in self.pulls:
+                return httpx.Response(404, json={"message": "Not Found"})
+            listed = comments if matched[2] == "comments" else self.reviews
+            own = [i for i in listed if i["_number"] == number and self._sees(caller, i)]
+            return self._page(request, own)
+        matched = re.fullmatch(rf"{repo}/pulls/(\d+)/reviews/(\d+)(/comments)?", path)
+        if matched:
+            number, review_id = int(matched[1]), int(matched[2])
+            found = [
+                r
+                for r in self.reviews
+                if r["_number"] == number and r["id"] == review_id and self._sees(caller, r)
+            ]
+            if number not in self.pulls or not found:
+                return httpx.Response(404, json={"message": "Not Found"})
+            if matched[3] is None:
+                return httpx.Response(200, json=self._visible(found[0]))
+            return self._page(request, self.comments_of_review(review_id))
+        return None
+
     def push_head(self, branch: str, *, tree: str | None = None, message: str | None = None) -> str:
         """A new commit on ``branch``; returns its sha.
 
@@ -979,32 +1767,11 @@ class GitHubRepositoryFake:
 
         self._write_faults.append([re.compile(pattern), status, count])
 
-    def lose_write_responses(
-        self, pattern: str, count: int = 1, *, status: int | None = 502
-    ) -> None:
-        """The next ``count`` writes whose ``"<METHOD> <path>"`` matches
-        ``pattern`` are applied, then their answer is lost: ``status`` with a
-        body that is not JSON (502 a server error, 201 an unreadable success),
-        or a transport error when ``status`` is None."""
-
-        self._lost_writes.append([re.compile(pattern), status, count])
-
     def fail_reads(self, pattern: str, status: int, count: int = 1) -> None:
         """The next ``count`` GET requests whose ``"GET <path>"`` matches
         ``pattern`` answer ``status`` (``{"message": "injected"}``)."""
 
         self._read_faults.append([re.compile(pattern), status, count])
-
-    def _lost_answer(self, request: httpx.Request, path: str) -> httpx.Response | None:
-        subject = f"{request.method} {path}"
-        for fault in self._lost_writes:
-            pattern, status, remaining = fault
-            if remaining > 0 and pattern.search(subject):
-                fault[2] = remaining - 1
-                if status is None:
-                    raise httpx.ReadError("connection lost", request=request)
-                return httpx.Response(status, content=b"<html>lost</html>")
-        return None
 
     def raw(self, commit_sha: str, path: str) -> bytes | None:
         """The bytes ``path`` names in ``commit_sha``'s tree, or None."""
@@ -1087,7 +1854,10 @@ class GitHubRepositoryFake:
 
     @staticmethod
     def _visible(item: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in item.items() if not key.startswith("_")}
+        # Underscored keys are the fake's own bookkeeping; ``_links`` is GitHub's.
+        return {
+            key: value for key, value in item.items() if not key.startswith("_") or key == "_links"
+        }
 
     def _page(self, request: httpx.Request, items: list[dict[str, Any]]) -> httpx.Response:
         per_page = int(request.url.params.get("per_page", "30"))
@@ -1149,17 +1919,18 @@ class GitHubRepositoryFake:
         path = request.url.path
         if request.url.host == "github.com":
             return self._raw(request, path)
-        # Creating an issue shares the issue listing's path but is no listing.
-        creates_issue = request.method == "POST" and path == f"/repos/{REPO}/issues"
-        if not creates_issue and self._listing_fails(path):
+        if self._listing_fails(path):
             return httpx.Response(502, json={"message": "injected"})
         if request.method != "GET":
-            answer = self._write(request, path)
-            return self._lost_answer(request, path) or answer
+            return self._write(request, path)
         injected = self._injected_read(request, path)
         if injected is not None:
             return injected
-        return self._read(request, path) or self._read_code(request, path)
+        return (
+            self._read(request, path)
+            or self._read_reviews(request, path)
+            or self._read_code(request, path)
+        )
 
     def _injected_read(self, request: httpx.Request, path: str) -> httpx.Response | None:
         subject = f"GET {path}"
@@ -1185,10 +1956,8 @@ class GitHubRepositoryFake:
             issue
             for _, issue in sorted(self.issues.items(), reverse=params.get("direction") != "asc")
             if (state == "all" or issue.get("state") == state)
-            and issue["number"] not in self.hidden_from_listing
             and (
                 creator is None
-                or not self.honour_creator
                 or issue.get("user", {}).get("login", "").casefold() == creator.casefold()
             )
         ]
@@ -1206,8 +1975,20 @@ class GitHubRepositoryFake:
         if path == f"/repos/{REPO}/issues/events":
             return self._page(request, sorted(self.events, key=lambda e: -e["id"]))
         if path == f"/repos/{REPO}/issues/comments":
+            # ``since`` filters on ``updated_at``; a comment `add_comment` seeded
+            # carries none and is always listed.
+            # https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository
             newest = request.url.params.get("direction") == "desc"
-            ordered = sorted(self.comments, key=lambda c: c["id"], reverse=newest)
+            since = _since(request.url.params.get("since"))
+            ordered = sorted(
+                (
+                    c
+                    for c in self.comments
+                    if since is None or "updated_at" not in c or _at(c["updated_at"]) >= since
+                ),
+                key=lambda c: c["id"],
+                reverse=newest,
+            )
             return self._page(request, ordered)
         matched = re.fullmatch(rf"/repos/{REPO}/issues/comments/(\d+)", path)
         if matched:
@@ -1350,8 +2131,9 @@ class GitHubRepositoryFake:
         if injected is not None:
             return injected
         body = json.loads(request.content) if request.content else {}
-        if request.method == "POST" and path == f"/repos/{REPO}/issues":
-            return self._create_issue(body)
+        reviewed = self._write_reviews(request, path, body)
+        if reviewed is not None:
+            return reviewed
         matched = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments", path)
         if request.method == "POST" and matched:
             comment = self.add_comment(int(matched[1]), CONTRACT_BOT, body["body"], app=True)
@@ -1359,10 +2141,10 @@ class GitHubRepositoryFake:
         matched = re.fullmatch(rf"/repos/{REPO}/(issues|pulls)/comments/(\d+)", path)
         if request.method == "PATCH" and matched:
             listed = self.comments if matched[1] == "issues" else self.review_comments
+            caller = self._caller(request)
             for comment in listed:
-                if comment["id"] == int(matched[2]):
-                    comment["body"] = body["body"]
-                    return httpx.Response(200, json={"id": comment["id"]})
+                if comment["id"] == int(matched[2]) and self._sees(caller, comment):
+                    return httpx.Response(200, json=self.edit_comment(comment["id"], body["body"]))
             return httpx.Response(404, json={"message": "Not Found"})
         matched = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/labels(?:/(.+))?", path)
         if matched and int(matched[1]) in self.issues:
@@ -1380,30 +2162,6 @@ class GitHubRepositoryFake:
             issue["labels"] = [{"name": name} for name in names]
             return httpx.Response(200, json=issue["labels"])
         return self._write_code(request, path, body)
-
-    def _create_issue(self, body: dict[str, Any]) -> httpx.Response:
-        """Create an issue as the installation token's bot user.
-
-        https://docs.github.com/en/rest/issues/issues#create-an-issue
-        201 with the full issue object.
-        """
-
-        self.issue_posts.append(body)
-        number = self._number()
-        issue = {
-            "number": number,
-            "title": body["title"],
-            "body": body.get("body"),
-            "state": "open",
-            "labels": [{"name": name} for name in body.get("labels", [])],
-            "user": dict(self.bot_user),
-            "html_url": f"https://github.com/{REPO}/issues/{number}",
-            "performed_via_github_app": {"id": CONTRACT_APP_ID},
-        }
-        self.issues[number] = issue
-        if self.hide_new_from_listing:
-            self.hidden_from_listing.add(number)
-        return httpx.Response(201, json=issue)
 
     def _write_code(
         self, request: httpx.Request, path: str, body: dict[str, Any]

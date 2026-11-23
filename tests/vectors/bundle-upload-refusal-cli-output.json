@@ -1,0 +1,29 @@
+{
+  "description": "A bundle upload refusal as each real producer emits it, for the live chain judge (tools/factory-e2e/live_github_chain_judge.py deploy_refusal_codes). api_body_text is the exact 422 body of PUT /agents/{agent_id}/versions/{version_id}/bundle (pinned by apps/api/tests/test_bundles.py::test_the_chain_judge_reads_the_retired_code_from_the_cli_upload_refusal). cli_stdout and cli_exit_code are what the built curie binary prints for `curie local deploy --json` when the API answers that body (pinned by cli/tests/bundle_refusal_output.rs). Each case's bundle is the valid test bundle with bundle_files written over it.",
+  "cases": {
+    "retired_declaration": {
+      "bundle_files": {
+        "workflow/result.json": "{}"
+      },
+      "api_status": 422,
+      "api_body_text": "{\"detail\":{\"detail\":\"bundle failed validation\",\"errors\":[{\"code\":\"bundle.result_declaration_retired\",\"message\":\"workflow/result.json is no longer supported: the separate triage flow was removed. An agent that is already deployed with this declaration must have its binding removed or replaced first, or it would run as an implementation agent on its old trigger label; see Before upgrading: an existing triage binding in docs/operations.md. For a new upload, delete the file and deploy again.\",\"location\":\"workflow/result.json\"}]}}",
+      "cli_exit_code": 1,
+      "cli_stdout": {
+        "error": "uploading the bundle failed with 422 Unprocessable Entity: {\"detail\":{\"detail\":\"bundle failed validation\",\"errors\":[{\"code\":\"bundle.result_declaration_retired\",\"message\":\"workflow/result.json is no longer supported: the separate triage flow was removed. An agent that is already deployed with this declaration must have its binding removed or replaced first, or it would run as an implementation agent on its old trigger label; see Before upgrading: an existing triage binding in docs/operations.md. For a new upload, delete the file and deploy again.\",\"location\":\"workflow/result.json\"}]}}",
+        "fix": null
+      }
+    },
+    "skill_without_frontmatter": {
+      "bundle_files": {
+        "skills/beta/SKILL.md": "# no frontmatter\n"
+      },
+      "api_status": 422,
+      "api_body_text": "{\"detail\":{\"detail\":\"bundle failed validation\",\"errors\":[{\"code\":\"skill.frontmatter_missing\",\"message\":\"SKILL.md has no YAML frontmatter block\",\"location\":\"skills/beta/SKILL.md\"}]}}",
+      "cli_exit_code": 1,
+      "cli_stdout": {
+        "error": "uploading the bundle failed with 422 Unprocessable Entity: {\"detail\":{\"detail\":\"bundle failed validation\",\"errors\":[{\"code\":\"skill.frontmatter_missing\",\"message\":\"SKILL.md has no YAML frontmatter block\",\"location\":\"skills/beta/SKILL.md\"}]}}",
+        "fix": null
+      }
+    }
+  }
+}

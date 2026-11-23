@@ -104,6 +104,7 @@ function mount() {
 }
 
 const status = () => screen.findByTestId("claude-plan-status");
+const generation = () => screen.getByTestId("claude-plan-generation");
 const tokenBox = () => screen.getByTestId("claude-plan-token") as HTMLInputElement;
 
 describe("claude_plan states", () => {
@@ -114,6 +115,7 @@ describe("claude_plan states", () => {
     expect(screen.getByTestId("claude-plan-write")).toHaveTextContent("Connect");
     expect(screen.queryByTestId("claude-plan-disconnect")).toBeNull();
     expect(screen.queryByTestId("claude-plan-teardown")).toBeNull();
+    expect(screen.queryByTestId("claude-plan-generation")).toBeNull();
     expect(tokenBox()).toHaveAttribute("type", "password");
     expect(tokenBox()).toHaveAttribute("autocomplete", "off");
     expect(tokenBox()).toHaveAttribute("autocorrect", "off");
@@ -124,7 +126,8 @@ describe("claude_plan states", () => {
   it("claude_plan active shows the generation, Replace and Disconnect", async () => {
     setEnrollment(() => active(2, 5));
     mount();
-    expect(await status()).toHaveTextContent("Connected, generation 2");
+    expect(await status()).toHaveTextContent(/^Connected$/);
+    expect(generation()).toHaveTextContent(/^Generation 2$/);
     expect(screen.getByTestId("claude-plan-write")).toHaveTextContent("Replace");
     expect(screen.getByTestId("claude-plan-disconnect")).toBeInTheDocument();
     expect(screen.getByText(/does not revoke the token with Anthropic/)).toBeInTheDocument();
@@ -175,7 +178,8 @@ describe("claude_plan actions", () => {
     await status();
     await paste(SENTINEL);
     await userEvent.click(screen.getByTestId("claude-plan-write"));
-    await waitFor(() => expect(screen.getByTestId("claude-plan-status")).toHaveTextContent("Connected, generation 1"));
+    await waitFor(() => expect(screen.getByTestId("claude-plan-status")).toHaveTextContent(/^Connected$/));
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 1$/));
     const [put] = calls("PUT", "/api/personal-claude/enrollment");
     expect(JSON.parse(put.body as string)).toEqual({ intent: "enroll", expected_version: null, token: SENTINEL });
     expect(put.credentials).toBe("same-origin");
@@ -188,7 +192,7 @@ describe("claude_plan actions", () => {
     await status();
     await paste(SENTINEL);
     await userEvent.click(screen.getByTestId("claude-plan-write"));
-    await waitFor(() => expect(screen.getByTestId("claude-plan-status")).toHaveTextContent("generation 2"));
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 2$/));
     expect(JSON.parse(calls("PUT", "/api/personal-claude/enrollment")[0].body as string)).toEqual({
       intent: "replace",
       expected_version: 7,
@@ -293,11 +297,11 @@ describe("claude_plan errors", () => {
     await status();
     await userEvent.type(tokenBox(), SENTINEL);
     await userEvent.click(screen.getByTestId("claude-plan-write"));
-    await waitFor(() => expect(screen.getByTestId("claude-plan-status")).toHaveTextContent("generation 2"));
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 2$/));
     routes["PUT /api/personal-claude/enrollment"] = () => json(200, active(3, 4));
     await userEvent.type(tokenBox(), SENTINEL);
     await userEvent.click(screen.getByTestId("claude-plan-write"));
-    await waitFor(() => expect(screen.getByTestId("claude-plan-status")).toHaveTextContent("generation 3"));
+    await waitFor(() => expect(generation()).toHaveTextContent(/^Generation 3$/));
     const bodies = calls("PUT", "/api/personal-claude/enrollment").map((c) => JSON.parse(c.body as string));
     expect(bodies.map((b) => b.expected_version)).toEqual([2, 3]);
   });

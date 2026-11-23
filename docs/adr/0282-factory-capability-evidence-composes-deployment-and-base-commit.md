@@ -16,6 +16,9 @@ recorded at deployment. It preserves the closed-world manifest, the existing
 verification precedence, and [ADR 0204](0204-the-factory-checks-its-environment-before-it-admits-a-ticket.md)'s
 environment-unknown disposition. It builds on [ADR 0216](0216-a-factory-repository-binding-selects-its-own-runner-image-built-from-a-tool-catalog.md)'s
 repository runner probe contract.
+It also composes with [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md),
+which leaves ADR 0199's deferred viability gate unchanged while defining how a
+run asks for a human answer on the same ticket.
 
 ## Context
 

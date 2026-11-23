@@ -49,6 +49,7 @@ from test_factory_retry import (
     _call,
     _configure,
     _db,
+    _due,
     _execute,
     _finish,
     _lose_owner,
@@ -223,7 +224,6 @@ def _assert_recovery(
     assert successor["execution_kind"] == "publication_recovery"
     assert successor["recovery_candidate_id"] == candidate["id"]
     assert successor["recovery_candidate_sha256"] == candidate["content_sha256"]
-    assert successor["completion_contract"] == "implementation"
     assert successor["owner_lost_retry"] is False
     assert successor["retry_origin_request_id"] == (
         predecessor["retry_origin_request_id"] or predecessor_id
@@ -231,7 +231,7 @@ def _assert_recovery(
     for column in ("objective", "requester", "reply_conversation_id", "reply_target_kind"):
         assert successor[column] == predecessor[column], column
     low, high = {1: (24, 36), 2: (96, 144)}[used]
-    due = successor["dispatch_not_before"] - predecessor["terminal_at"]
+    due = _due(successor) - predecessor["terminal_at"]
     assert timedelta(seconds=low) <= due <= timedelta(seconds=high + 1)
     assert _used(predecessor["work_item_id"]) == used
     assert candidate["owner_request_id"] == successor["id"]

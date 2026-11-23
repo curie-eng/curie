@@ -80,6 +80,7 @@ runner/tests/test_hooks.py
 runner/tests/test_mcp_argv.py
 runner/tests/test_personal_token_cluster.py
 runner/tests/test_preflight_blocked.py
+runner/tests/test_propose_rule_live.py
 runner/tests/test_repository_verification.py
 runner/tests/test_route_callers.py
 runner/tests/test_tool_policy_enforcement.py
@@ -160,11 +161,20 @@ tools/factory-e2e/tests/test_gitlab_acceptance.py
 tools/factory-e2e/tests/test_gitlab_driver.py
 tools/factory-e2e/tests/test_jira_driver.py
 tools/factory-e2e/tests/test_kind_images.py
+tools/factory-e2e/tests/test_learned_rules_lanes.py
+tools/factory-e2e/tests/test_learned_rules_scenario.py
+tools/factory-e2e/tests/test_live_github_chain.py
+tools/factory-e2e/tests/test_live_github_chain_driver.py
+tools/factory-e2e/tests/test_live_github_chain_pending.py
+tools/factory-e2e/tests/test_one_ticket_jira.py
+tools/factory-e2e/tests/test_one_ticket_live.py
+tools/factory-e2e/tests/test_one_ticket_scenario.py
 tools/factory-e2e/tests/test_personal_owner_enforcement.py
 tools/factory-e2e/tests/test_personal_profile.py
 tools/factory-e2e/tests/test_personal_slack_kickoff.py
 tools/factory-e2e/tests/test_personal_two_owner.py
 tools/factory-e2e/tests/test_personal_two_owner_support.py
+tools/factory-e2e/tests/test_plan_gated_branch_rules_stub.py
 tools/factory-e2e/tests/test_publication_recovery_live_support.py
 tools/factory-e2e/tests/test_recordings_hygiene.py
 tools/factory-e2e/tests/test_repo_runner.py
@@ -194,6 +204,7 @@ tools/identity-e2e/tests/test_requester_expiry_checks.py
 tools/identity-e2e/tests/test_requester_handoff_checks.py
 tools/identity-e2e/tests/test_restore_log_privacy.py
 tools/identity-e2e/tests/test_stored_card_checks.py
+tools/oidc-e2e/tests/test_local_modes.py
 tools/p0-closes-ci/tests/test_p0_closes_ci.py
 tools/preflight/tests/test_full_preflight.py
 tools/preflight/tests/test_preflight.py

@@ -6,8 +6,8 @@ console render those strings verbatim. The module reads canonical WorkItem,
 ExecutionRequest, publication-lineage, Publication, Approval, factory status
 comment and execution phase report rows; it writes nothing and adds no store.
 The title and progress strip come from the status comment rows and the phase
-reports through ``factory_progress.phase_view``, the same derivation the
-GitHub status card uses (#4102).
+reports through ``curie_internal.factory_phase_view.phase_view``, the same
+derivation the GitHub status card uses (#4102).
 
 Output is an allowlist: every view is built from explicit fields below, never
 from an ORM row, so a runtime-owner token, a reply transport address, a patch,
@@ -27,6 +27,7 @@ from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Literal, cast
 
+from curie_internal.factory_phase_view import phase_view
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,9 +52,9 @@ from curie_api.schemas.workitems import (
     WorkItemTrackerOut,
 )
 
+from . import memory_rules_admission
 from .config import Settings
 from .factory_notices import start_failed_sentence
-from .factory_progress import phase_view
 from .factory_retry_policy import RetrySafety, condition_text
 from .models import (
     Approval,
@@ -152,9 +153,9 @@ def _cause(
                     "and expiry is pending the reconciler"
                 )
             return f"{text}; waiting deadline {_iso(deadline)}"
-        if req.retry_of_request_id is not None and now < req.dispatch_not_before:
+        if req.retry_of_request_id is not None and now < req.dispatch_due:
             return (
-                f"automatic retry scheduled for {_iso(req.dispatch_not_before)}; "
+                f"automatic retry scheduled for {_iso(req.dispatch_due)}; "
                 f"waiting deadline {_iso(deadline)}"
             )
         text = "waiting for sandbox capacity"
@@ -296,8 +297,13 @@ def derive_outcome(
     *,
     issue_url: str,
     observation: FactoryCiObservation | None = None,
+    memory_rule_numbers: Sequence[int] = (),
 ) -> WorkItemOutcomeOut:
-    """Derive one operator view. Pure: no I/O. ``ci`` is left null."""
+    """Derive one operator view. Pure: no I/O. ``ci`` is left null.
+
+    ``memory_rule_numbers`` are the WorkItem's pinned learned rule numbers,
+    read from its snapshot by the caller.
+    """
 
     ordered = sorted(requests, key=lambda r: r.sequence)
     req = _current_request(ordered)
@@ -438,6 +444,7 @@ def derive_outcome(
         enrollment_generation=item.enrollment_generation,
         requester_principal_id=item.requester_principal_id,
         coding_instructions=metadata(item),
+        memory_rules=memory_rules_admission.metadata(item, memory_rule_numbers),
         automatic_retries_used=item.automatic_retries_used,
         automatic_retry_limit=AUTOMATIC_RETRY_LIMIT,
     )
@@ -486,6 +493,7 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
         enrollment_generation=req.enrollment_generation,
         coding_instructions_selection_id=req.coding_instructions_selection_id,
         coding_instructions_evidence=evidence(req.coding_instructions_evidence),
+        memory_rules_evidence=memory_rules_admission.evidence(req.memory_rules_evidence),
         retry_of_request_id=req.retry_of_request_id,
         retry_kind=(
             "owner_loss"
@@ -494,7 +502,7 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
             if req.retry_of_request_id is not None
             else None
         ),
-        dispatch_not_before=req.dispatch_not_before,
+        dispatch_not_before=req.dispatch_due,
         blocked_on=req.blocked_on,
         resource_gate=(
             None
@@ -660,6 +668,7 @@ async def _views(
             )
         ).all()
     }
+    pinned_rules = await memory_rules_admission.rule_numbers(session, ids)
     views = []
     for item in items:
         item_requests = requests.get(item.id, [])
@@ -689,6 +698,7 @@ async def _views(
             now,
             issue_url=tracker_issue_url(settings, item.tracker_issue, item.repository),
             observation=observations.get(current_request.id) if current_request else None,
+            memory_rule_numbers=pinned_rules.get(item.id, ()),
         )
         view.title = _title(comments[item.id], sequences)
         comment_row = latest_comment.get(item.id)

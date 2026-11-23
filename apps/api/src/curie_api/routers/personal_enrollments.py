@@ -85,7 +85,7 @@ class EnrollmentRoute(APIRoute):
         return redacted
 
 
-async def _session_only(request: Request) -> None:
+async def require_owner_session_only(request: Request) -> None:
     """Fail closed when any other Curie credential rides along with the cookie."""
 
     if any(name in request.headers for name in FOREIGN_CREDENTIAL_HEADERS):
@@ -104,7 +104,7 @@ router = APIRouter(
     prefix="/personal-claude",
     tags=["personal-enrollment"],
     route_class=EnrollmentRoute,
-    dependencies=[Depends(_session_only)],
+    dependencies=[Depends(require_owner_session_only)],
 )
 
 OwnerDep = Annotated[Principal, Depends(require_principal_session)]

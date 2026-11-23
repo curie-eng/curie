@@ -411,12 +411,13 @@ def _runtime_proven_gone(row: ExecutionRequest) -> bool:
 
     A normal finish, a failed finish and an expired heartbeat are not evidence:
     worker sandbox cleanup after a finish is best effort, so the sandbox may
-    outlive it. A normally finished run gets that evidence through the
-    enrollment fence (#5377): ``lifecycle.fence_enrollment_generation`` marks
-    it ``teardown_unconfirmed_at``, terminate wakes follow, and
-    ``workitem_dispatch.record_termination`` records the observation under the
-    claim's runtime epoch and request version, preserving the run's status and
-    cause and clearing the flag.
+    outlive it. A normally finished run gets that evidence through its own
+    terminal write, which marks it ``teardown_unconfirmed_at`` (#5840), or,
+    for a run that ended without that mark, through the enrollment fence
+    (#5377, ``lifecycle.fence_enrollment_generation``). Terminate wakes follow,
+    and ``workitem_dispatch.record_termination`` records the observation under
+    the claim's runtime epoch and request version, preserving the run's status
+    and cause and clearing the flag.
     """
 
     return (

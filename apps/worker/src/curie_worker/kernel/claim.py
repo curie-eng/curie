@@ -17,7 +17,7 @@ from aci_protocol import (
     TurnSource,
 )
 
-from .. import caller_token, requester_context, sweep
+from .. import caller_token, memory_rules_context, requester_context, sweep
 from ..approvals import (
     ApprovalBackendError,
     PublicationLineage,
@@ -1474,6 +1474,16 @@ async def _route_and_start(
         work_items = getattr(self, "_work_items", None)
         if run is not None and run.event_id == queued_event_id and work_items is not None:
             await requester_context.deliver(
+                work_items=work_items,
+                runner=self._runner,
+                run=run,
+                base_url=handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
+            # #5798: the pinned learned rules travel beside the requester
+            # context, never inside it, and are acknowledged before the turn.
+            await memory_rules_context.deliver(
                 work_items=work_items,
                 runner=self._runner,
                 run=run,

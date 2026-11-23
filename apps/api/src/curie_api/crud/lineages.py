@@ -15,6 +15,7 @@ from curie_api.schemas.publications import PublicationLineageAdvance, ReviewRevi
 from ..config import get_settings
 from ..forges.errors import Unavailable
 from ..forges.types import GITHUB
+from ..memory_rule_lifecycle import lock_rule_owner, settle_lineage_rule_candidates
 from ..models import (
     AgentChannel,
     Deployment,
@@ -235,6 +236,8 @@ async def retire_abandoned_headless_lineage(
     expected_agent_id = lineage.agent_id
     expected_conversation_id = lineage.conversation_id
     expected_repo_full_name = lineage.repo_full_name
+    # Agent first, as every terminal lineage writer (memory_rule_lifecycle).
+    await lock_rule_owner(session, expected_agent_id)
     locked = await session.scalar(
         select(ThreadPublicationLineage)
         .where(ThreadPublicationLineage.id == lineage.id)
@@ -279,6 +282,9 @@ async def retire_abandoned_headless_lineage(
             conversation_id=expected_conversation_id,
             repo_full_name=expected_repo_full_name,
         )
+    # Every terminal lineage write settles its rule candidates (#5796). A
+    # never-pushed lineage has no pull request, so it holds none in practice.
+    await settle_lineage_rule_candidates(session, locked.id, "closed")
     await session.commit()
     return None
 
@@ -506,6 +512,9 @@ async def mark_publication_lineage_terminal(
 
     if state not in ("merged", "closed"):
         raise ValueError("terminal publication lineage state is invalid")
+    # The agent row before the lineage row, the order agent deletion takes, so
+    # the settlement below never deadlocks with it (memory_rule_lifecycle).
+    await lock_rule_owner(session, lineage.agent_id)
     changed = await session.execute(
         update(ThreadPublicationLineage)
         .where(
@@ -540,6 +549,8 @@ async def mark_publication_lineage_terminal(
         )
     from ..factory_notices import mark_lineage_status_comment_stale
 
+    # Same transaction as the terminal write (#5796, ADR 0287 decision 5).
+    await settle_lineage_rule_candidates(session, lineage.id, state)
     await mark_lineage_status_comment_stale(session, lineage.id)
     await session.commit()
     refreshed = await session.get(ThreadPublicationLineage, lineage.id)
@@ -852,6 +863,9 @@ async def advance_publication_lineage(
         )
     from ..factory_notices import mark_lineage_status_comment_stale
 
+    if terminal_state:
+        # Same transaction as the terminal write (#5796, ADR 0287 decision 5).
+        await settle_lineage_rule_candidates(session, lineage.id, data.state)
     await mark_lineage_status_comment_stale(session, lineage.id)
     if not terminal_state:
         await _bind_running_work_item_lineage(

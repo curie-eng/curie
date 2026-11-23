@@ -38,7 +38,7 @@ from typing import Any
 
 import httpx
 from curie_internal.factory_cause import cause_text as cause_text
-from curie_internal.factory_triage import TRIAGED_LABEL, HandoffOutcome, status_comment_text
+from curie_internal.factory_phase_view import PhaseView, phase_view
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -52,17 +52,19 @@ from .factory_comment_text import (
     redact_factory_comment,
     status_marker,
 )
-from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
+from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, pill_for
+from .factory_questions import (
+    ANSWER_RECEIVED_LINE,
+    QUESTIONS_ASKED,
+    QUESTIONS_LABEL,
+    QUESTIONS_UNRECORDED_LINE,
+    ROUND_LIMIT,
+    asked_round,
+    question_unrecorded,
+)
+from .factory_questions import answer_started as _answer_started
 from .factory_reply_target import stored_reply_target
 from .factory_retry_policy import condition_text
-from .factory_triage_status import (
-    delivered_triage,
-    is_tracker_result,
-    recorded_handoff,
-    triage_delivered_sql,
-    triage_label,
-    triage_label_sql,
-)
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
 from .forges.errors import ForgeError, NotFound, Unauthorized
@@ -171,6 +173,14 @@ _USD_BUDGET_DETAIL = re.compile(
 # be a plain word. The colon form stays on ``_PROVIDER_WORKSPACE``.
 
 
+# The ``start_failed`` sentence of a request an answer started whose pull
+# request merged or closed before it could start (#5786).
+ANSWER_PULL_REQUEST_ENDED_SENTENCE = (
+    "this ticket's pull request was merged or closed before the factory could act on "
+    "the answer, so no new run started."
+)
+
+
 def start_failed_sentence(attempts: int, reason: str) -> str:
     """The ``start_failed`` sentence naming the attempt count and last reason (#4170)."""
 
@@ -269,22 +279,69 @@ async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UU
 
 
 async def mark_lineage_status_comment_stale(session: AsyncSession, lineage_id: uuid.UUID) -> None:
-    work_item_id = await session.scalar(
-        select(WorkItem.id).where(WorkItem.publication_lineage_id == lineage_id)
+    found = (
+        await session.execute(
+            select(WorkItem.id, ThreadPublicationLineage.status)
+            .join(ThreadPublicationLineage, ThreadPublicationLineage.id == lineage_id)
+            .where(WorkItem.publication_lineage_id == lineage_id)
+        )
+    ).one_or_none()
+    if found is None:
+        return
+    work_item_id, lineage_status = found
+    await mark_status_comment_stale(session, work_item_id)
+    if lineage_status == "merged":
+        await _mark_ticket_status_comment_stale(session, work_item_id)
+
+
+async def _mark_ticket_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
+    """Reopen the ticket's own status comment once its pull request merged.
+
+    A pull request revision is the newest request but answers on the pull
+    request, so the stale mark on the newest request never reaches the comment
+    on the ticket. The ticket's comment is the newest request that replies on
+    the issue; it gains the merge notice only when it completed.
+    """
+
+    ticket_request = (
+        await session.execute(
+            select(ExecutionRequest.id, ExecutionRequest.status)
+            .where(
+                ExecutionRequest.work_item_id == work_item_id,
+                ExecutionRequest.reply_target_kind == "issue",
+            )
+            .order_by(ExecutionRequest.sequence.desc())
+            .limit(1)
+        )
+    ).one_or_none()
+    if ticket_request is None or ticket_request.status != "completed":
+        return
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.execution_request_id == ticket_request.id,
+            or_(
+                FactoryStatusComment.finalized_at.is_not(None),
+                FactoryStatusComment.sync_owner.is_not(None),
+            ),
+            FactoryStatusComment.refused_at.is_(None),
+        )
+        .values(
+            finalized_at=None,
+            sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
+        )
     )
-    if work_item_id is not None:
-        await mark_status_comment_stale(session, work_item_id)
 
 
-# The state labels the pass owns (#3077, #3221; triaged since #5586). A closed
-# set, never a prefix match: human labels, including other ``curie:`` labels,
-# are never touched.
+# The state labels the pass owns (#3077, #3221; questions since #5785). A
+# closed set, never a prefix match: human labels, including other ``curie:``
+# labels, are never touched.
 STATE_LABELS = (
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
-    TRIAGED_LABEL,
+    QUESTIONS_LABEL,
 )
 LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
@@ -299,7 +356,14 @@ _DESIRED_LABEL = {
     "cancelled": "",
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
+# The label a release without question rounds gives a question ending.
+_OLDER_QUESTIONS_LABEL = _DESIRED_LABEL["completed"]
 _WAITING_FOR_PROGRESS = "_Waiting for the agent to report progress._"
+# The first line of a live implementation run's status comment on its ticket
+# (#5785 decision 13): posted at admission, before any model progress.
+INVESTIGATING_LINE = (
+    "Investigating this ticket. The factory will open a pull request or post its questions here."
+)
 _READING_PULL_REQUEST = "Reading the pull request and its Decisions"
 # A running pull request follow-up hides its checklist until a phase other than
 # these is reported. verification_preflight is the platform's own check, not
@@ -316,26 +380,24 @@ _PAUSED_FOR_UPGRADE_LINE = (
 def desired_label(
     status: str,
     *,
+    cause: str | None = None,
     pr_state: str | None = None,
-    tracker_result: bool = False,
-    result_delivered: bool = False,
     work_item_cancelled: bool = False,
 ) -> str:
     """The state label for a request status; '' means none of the state labels.
 
-    A tracker-result request shows triaged once its result is delivered and
-    never pr-open (``factory_triage_status.triage_label``); an implementation
-    request's mapping is unchanged.
+    A request that ended with the question ending (completed, cause
+    ``questions_asked``, #5785) shows questions; every other mapping is
+    unchanged.
     """
 
-    if tracker_result:
-        label = triage_label(
-            status, delivered=result_delivered, work_item_cancelled=work_item_cancelled
-        )
-        if label is not None:
-            return label
-    if status in {"failed", "expired"} and pr_state == "merged":
+    # A merged pull request ends the ticket's time with the factory, whatever
+    # the run's own status: the label is removed (ADR decision 15).
+    if status in {"completed", "failed", "expired"} and pr_state == "merged":
         return ""
+    if status == "completed" and cause == QUESTIONS_ASKED:
+        # A cancelled WorkItem takes no answer, so the ticket stops asking.
+        return "" if work_item_cancelled else QUESTIONS_LABEL
     return _DESIRED_LABEL.get(status, "")
 
 
@@ -351,6 +413,8 @@ def result_section(
     retries_used: int = 0,
     blocked_on: str | None = None,
     run_cost_usd: Decimal | None = None,
+    question_round: int | None = None,
+    work_item_cancelled: bool = False,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
@@ -361,6 +425,9 @@ def result_section(
     a failed or expired request with no successor. ``blocked_on`` is the
     condition a ``retry_condition_expired`` request was still blocked on.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
+    ``question_round`` is the round a ``questions_asked`` request posted, and
+    ``work_item_cancelled`` replaces its answer instruction once the WorkItem
+    is cancelled, since an answer then starts nothing.
     """
 
     if successor is not None:
@@ -390,6 +457,18 @@ def result_section(
                 text += f"Note: {detail.strip()}\n"
         else:
             raise ValueError("a completed issue notice requires its pull request URL")
+    elif cause == QUESTIONS_ASKED:
+        # The question ending (#5785): its own outcome, never a failure line.
+        of_rounds = (
+            f" (round {question_round} of {ROUND_LIMIT})" if question_round is not None else ""
+        )
+        if work_item_cancelled:
+            text = (
+                f"Questions asked{of_rounds}. The factory label was removed, "
+                "so an answer starts nothing.\n"
+            )
+        else:
+            text = f"Questions asked{of_rounds}. Answer in a plain comment on this ticket.\n"
     elif cause == "issue_cancelled" and superseded:
         text = (
             f"Stopped: the label was added again, so a new run replaced this one.\nCause: {cause}\n"
@@ -545,7 +624,7 @@ def retry_state_time(row: ExecutionRequest) -> datetime:
 
     if row.blocked_on is not None and row.wait_deadline is not None:
         return row.wait_deadline
-    return row.dispatch_not_before
+    return row.dispatch_due
 
 
 def _retrying_section(cause: str, successor: RetrySuccessor, *, feedback_url: str | None) -> str:
@@ -673,6 +752,7 @@ def status_body(
     waiting_line: str | None = None,
     base_line: str | None = None,
     progress_line: str | None = None,
+    lead_line: str | None = None,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
@@ -681,11 +761,15 @@ def status_body(
     agent's last message as a neutralized Markdown quote. With a card, the checklist
     and waiting placeholder are left out; without one the checklist is the
     fallback (#3125). A ``progress_line`` replaces both the card and the checklist.
+    A ``lead_line`` opens a non-final body, before the card, checklist or
+    waiting placeholder; a final body carries none.
     """
 
     parts: list[str] = []
     if result is not None:
         parts.append(result.rstrip("\n"))
+    elif lead_line:
+        parts.append(lead_line)
     if progress_line:
         parts.append(progress_line)
     elif card_url:
@@ -728,17 +812,44 @@ def completed_proof() -> Any:
     )
 
 
+def _admitted_before_merge_sql() -> Any:
+    """Whether the request was admitted before its WorkItem's pull request merged.
+
+    The merge is the lineage's last write (``mark_publication_lineage_terminal``
+    stamps ``updated_at``). A run admitted after it (the label added again)
+    keeps the lineage on its WorkItem but is a fresh run of its own, so the
+    merge notice and its label removal are not its.
+    """
+
+    return ExecutionRequest.created_at <= ThreadPublicationLineage.updated_at
+
+
 def _desired_label_sql() -> Any:
     return case(
-        *triage_label_sql(),
         (
             and_(
-                ExecutionRequest.status.in_(("failed", "expired")),
+                ExecutionRequest.status.in_(("completed", "failed", "expired")),
                 ThreadPublicationLineage.status == "merged",
+                _admitted_before_merge_sql(),
                 ThreadPublicationLineage.pr_number.is_not(None),
                 ThreadPublicationLineage.pr_url.is_not(None),
             ),
             literal(""),
+        ),
+        (
+            and_(
+                ExecutionRequest.status == "completed",
+                ExecutionRequest.terminal_cause == QUESTIONS_ASKED,
+                WorkItem.cancelled_at.is_not(None),
+            ),
+            literal(""),
+        ),
+        (
+            and_(
+                ExecutionRequest.status == "completed",
+                ExecutionRequest.terminal_cause == QUESTIONS_ASKED,
+            ),
+            literal(QUESTIONS_LABEL),
         ),
         (completed_proof(), literal("curie-factory:pr-open")),
         *[
@@ -842,9 +953,8 @@ class _StatusClaim:
     body: str
     latest: bool
     now: datetime
-    tracker_result: bool = False
-    result_delivered: bool = False
     work_item_cancelled: bool = False
+    cause: str | None = None
 
 
 async def _claim_next(
@@ -885,8 +995,8 @@ async def _claim_next(
                 ThreadPublicationLineage.pr_number,
                 ThreadPublicationLineage.status,
                 is_latest.label("is_latest"),
-                triage_delivered_sql().label("result_delivered"),
                 _desired_label_sql().label("desired_label"),
+                _admitted_before_merge_sql().label("admitted_before_merge"),
             )
             .join(WorkItem, WorkItem.id == FactoryStatusComment.work_item_id)
             .join(
@@ -921,10 +1031,33 @@ async def _claim_next(
     ).one_or_none()
     if selected is None:
         return None
-    row, work_item, request, pr_url, pr_number, pr_state, latest, result_delivered, label = selected
+    (
+        row,
+        work_item,
+        request,
+        pr_url,
+        pr_number,
+        pr_state,
+        latest,
+        label,
+        admitted_before_merge,
+    ) = selected
     if pr_number is None or not pr_url:
         pr_state = None
-    if pr_state == "merged" and request.status in {"failed", "expired"}:
+    if pr_state == "merged" and admitted_before_merge is False:
+        # A fresh run after the merge: the merged pull request is not its own.
+        pr_state = None
+    if pr_state == "merged" and request.status in {"completed", "failed", "expired"}:
+        row.finalized_at = None
+    if (
+        request.status == "completed"
+        and request.terminal_cause == QUESTIONS_ASKED
+        and row.applied_label == _OLDER_QUESTIONS_LABEL
+    ):
+        # An API replica built before the question rounds (#5785) finalized
+        # this comment during a rolling upgrade: it renders the unknown cause
+        # as a failure and labels a completed request pr-open, which this
+        # version never applies to a question ending. Write the body again.
         row.finalized_at = None
     now = await _clock(session)
     await session.execute(
@@ -981,9 +1114,8 @@ async def _claim_next(
         body=body,
         latest=bool(latest),
         now=now,
-        tracker_result=is_tracker_result(request),
-        result_delivered=bool(result_delivered),
         work_item_cancelled=work_item.cancelled_at is not None,
+        cause=request.terminal_cause,
     )
     session.expunge(row)
     return claim
@@ -1300,19 +1432,14 @@ async def _render(
     pr_url: str | None,
     pr_state: str | None = None,
     paused_for_upgrade: bool = False,
-    handoff: HandoffOutcome | None = None,
 ) -> str:
-    """The status comment body. ``handoff`` overrides the implementation
-    handoff the triage handoff recorded for a delivered ticket (#5588)."""
+    """The status comment body."""
 
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
     retrying = False
     unchanged = False
-    triage = await _terminal_triage_text(session, work_item, request, handoff)
-    if triage is not None:
-        result = triage
-    elif request.terminal_at is not None and cause:
+    if request.terminal_at is not None and cause:
         cause = cause.strip()
         if cause == "pull_request_not_adopted":
             selected_pr = (
@@ -1387,7 +1514,17 @@ async def _render(
                 retries_used=retries_used,
                 blocked_on=request.blocked_on,
                 run_cost_usd=run_cost_usd,
+                question_round=(
+                    await asked_round(session, work_item.id, request.id)
+                    if cause == QUESTIONS_ASKED
+                    else None
+                ),
+                work_item_cancelled=work_item.cancelled_at is not None,
             )
+            if cause != QUESTIONS_ASKED and await question_unrecorded(
+                session, work_item.id, request.id
+            ):
+                result += QUESTIONS_UNRECORDED_LINE
             if (
                 request.status in {"failed", "expired", "cancelled"}
                 and pr_url
@@ -1401,6 +1538,11 @@ async def _render(
             if line is not None:
                 separator = "\n\n" if result.endswith("\n\n") else "\n"
                 result = result.rstrip("\n") + separator + line + "\n"
+            if request.status == "completed" and pr_url and pr_state == "merged":
+                # The factory sends no workflow status transition; this last
+                # line is how a Jira or GitLab ticket learns the pull request
+                # merged.
+                result += f"Pull request merged: {pr_url}\n"
     publishing = (
         await session.scalar(
             select(Publication.id)
@@ -1496,6 +1638,43 @@ async def _render(
     card_url = (
         None if progress_line or not base else f"{base}/v1/factory/cards/{row.card_token}.svg"
     )
+    # A follow-up on an existing pull request cannot ask (pull_request_open),
+    # so it carries the continuing line instead of the investigating line.
+    admitted = aliased(ExecutionRequest)
+    continuing = bool(
+        request.status in {"queued", "waiting", "running", "cancellation_requested"}
+        and work_item.publication_lineage_id is not None
+        and pr_url
+        and await session.scalar(
+            select(Publication.id)
+            .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+            .join(ThreadPublicationLineage, ThreadPublicationLineage.id == Publication.lineage_id)
+            .where(
+                # A run admitted after the pull request merged is not continuing it.
+                or_(
+                    ThreadPublicationLineage.status != "merged",
+                    ThreadPublicationLineage.updated_at
+                    >= select(admitted.created_at)
+                    .where(admitted.id == request.id)
+                    .scalar_subquery(),
+                ),
+                Publication.lineage_id == work_item.publication_lineage_id,
+                ExecutionRequest.work_item_id == work_item.id,
+                ExecutionRequest.sequence < request.sequence,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+    # An answer-started request says the answer was received (#5786), first,
+    # even when it continues on an existing pull request or has already
+    # settled by its first status sync.
+    answer_started = False
+    lead_line: str | None = None
+    if target.kind == "issue" and request.execution_kind != "publication_recovery":
+        answer_started = await _answer_started(session, work_item.id, request.id)
+        if request.terminal_at is None and not continuing:
+            lead_line = ANSWER_RECEIVED_LINE if answer_started else INVESTIGATING_LINE
     body = status_body(
         request_id=row.execution_request_id,
         card_url=card_url,
@@ -1506,26 +1685,16 @@ async def _render(
         waiting_line=waiting_line,
         base_line=render_base_line(work_item, transition),
         progress_line=progress_line,
+        lead_line=lead_line,
     )
-    if (
-        request.status in {"queued", "waiting", "running", "cancellation_requested"}
-        and work_item.publication_lineage_id is not None
-        and pr_url
-        and await session.scalar(
-            select(Publication.id)
-            .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
-            .where(
-                Publication.lineage_id == work_item.publication_lineage_id,
-                ExecutionRequest.work_item_id == work_item.id,
-                ExecutionRequest.sequence < request.sequence,
-            )
-            .limit(1)
-        )
-        is not None
-    ):
-        body = redact_factory_comment(
-            f"Continuing on the existing pull request: {pr_url}\n\n{body}"
-        )
+    if continuing:
+        body = f"Continuing on the existing pull request: {pr_url}\n\n{body}"
+        if answer_started:
+            body = f"{ANSWER_RECEIVED_LINE}\n\n{body}"
+        body = redact_factory_comment(body)
+    elif answer_started and (lead_line is None or result is not None):
+        # A final body carries no lead line.
+        body = redact_factory_comment(f"{ANSWER_RECEIVED_LINE}\n\n{body}")
     observation = await session.get(FactoryCiObservation, request.id)
     if observation is not None:
         until = observation.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1546,41 +1715,6 @@ async def _render(
     if mention is not None:
         body = append_github_ask_line(body, mention)
     return body
-
-
-async def _terminal_triage_text(
-    session: AsyncSession,
-    work_item: WorkItem,
-    request: ExecutionRequest,
-    handoff: HandoffOutcome | None,
-) -> str | None:
-    """A finished tracker-result request's delivered ending, or None.
-
-    None leaves the existing terminal text: a request still live, cancelled,
-    an implementation request, or one whose result was not delivered (it
-    renders as failed or expired).
-    """
-
-    if (
-        request.terminal_at is None
-        or request.status == "cancelled"
-        or not is_tracker_result(request)
-    ):
-        return None
-    delivered = await delivered_triage(session, request.id)
-    if delivered is None:
-        return None
-    if handoff is None:
-        handoff = await recorded_handoff(session, request.id)
-    try:
-        text = status_comment_text(delivered, handoff)
-    except ValueError:
-        logger.warning("factory status comment: request %s has an unrenderable result", request.id)
-        return None
-    line = usage_line(await work_item_usage(session, work_item.id))
-    if line is not None:
-        text += line + "\n"
-    return text
 
 
 async def _superseded(
@@ -1615,9 +1749,8 @@ async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
         return 0
     desired = desired_label(
         claim.status,
+        cause=claim.cause,
         pr_state=claim.pr_state,
-        tracker_result=claim.tracker_result,
-        result_delivered=claim.result_delivered,
         work_item_cancelled=claim.work_item_cancelled,
     )
     if row.applied_label == desired:

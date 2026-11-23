@@ -48,6 +48,26 @@ from apps.api.tests.test_http_turn_authority import assert_response, post_check
 EMAIL_SENDER = email_receivers.SENDER
 PROOF_HEADER = "X-Curie-Approval-Receiver-Proof"
 ROUTE = "synthetic-email-card-route"
+SECOND_KEY = b"s" * 32
+
+
+def _second_mailbox(email: dict[str, Any]) -> dict[str, Any]:
+    other = {
+        **email, "address": "acme-second@example.com", "adapter": "acme-mail-second",
+        "receiver_id": str(uuid.uuid4()), "identity": str(uuid.uuid4()),
+        "installation": str(uuid.uuid4()), "binding": str(uuid.uuid4()),
+    }
+
+    async def persist(factory: async_sessionmaker[AsyncSession]) -> None:
+        async with factory() as session, session.begin():
+            session.add(AgentChannel(
+                id=uuid.UUID(other["binding"]), tenant_id=uuid.UUID(other["tenant"]),
+                agent_id=uuid.UUID(other["agent"]), kind="email", address=other["address"],
+                adapter=other["adapter"], endpoint="https://mail.example.com/reply",
+            ))
+
+    run(persist)
+    return other
 
 
 def _default_identity(slack: dict[str, Any]) -> None:
@@ -87,6 +107,7 @@ def _runtime(module: ModuleType, email: dict[str, Any]) -> Any:
         signing_key=("synthetic-context", 1),
         email_receivers=(
             (email_receivers._registration(module, email), email_receivers.EMAIL_KEY),
+            (email_receivers._registration(module, email["second"]), SECOND_KEY),
         ),
     )
 
@@ -99,6 +120,7 @@ def email_case(
     """@spec HTTP-INVOCATION-EXECUTION-29: one email turn queued through the actual ingress."""
     provider = synthetic_provider
     email = email_receivers._email_scope(provider.url)
+    email["second"] = _second_mailbox(email)
     slack = email["slack"]
     _default_identity(slack)
     try:
@@ -242,66 +264,62 @@ def test_email_answer_by_a_sender_outside_the_approver_group_is_refused(
     unchanged(case, before + 2)
 
 
-@pytest.mark.parametrize(
-    ("attempt", "status"),
-    [
-        ("foreign_key", 401), ("other_approval", 401), ("other_decision", 401),
-        ("other_sender", 401), ("other_binding", 401), ("invocation", 401), ("missing", 403),
-    ],
-)
-def test_forged_replayed_or_wrong_purpose_email_proof_is_refused_before_lookup(
-    email_case: SimpleNamespace, attempt: str, status: int,
+def test_email_answer_binds_the_mailbox_actor_decision_and_purpose(
+    email_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
 ) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-15: the proof binds approval, decision and sender."""
     case = email_case
     case.row = created(case)
     approver_role(case)
     before = len(case.provider.requests)
-    rejected = json.dumps({"decision": "rejected"}, separators=(",", ":")).encode()
-    submitted = {
-        "foreign_key": lambda: email_answer(case, key=b"f" * 32),
-        "other_approval": lambda: email_answer(case, approval_id=str(uuid.uuid4())),
-        "other_decision": lambda: email_answer(case, signed_body=rejected),
-        "other_sender": lambda: email_answer(case, sender=email_receivers.OTHER_SENDER),
-        "other_binding": lambda: email_answer(case, binding_id=case.scope["binding"]),
-        "invocation": lambda: email_answer(case, proof="invocation"),
-        "missing": lambda: email_answer(case, proof=None),
-    }[attempt]()
-    response = resolve(case, *submitted)
-    assert response.status_code == status, response.text
+    stream = valkey.xrange(runs_stream)
+    valid = email_answer(case)
+    second = SimpleNamespace(email=case.email["second"], row=case.row)
+    _, sibling = email_answer(second, key=SECOND_KEY, binding_id=case.email["binding"])
+    for changes in (
+        {"key": b"f" * 32}, {"approval_id": str(uuid.uuid4())},
+        {"signed_body": b'{"decision":"rejected"}'}, {"sender": email_receivers.OTHER_SENDER},
+        {"binding_id": case.scope["binding"]}, {"proof": "invocation"}, {"proof": None},
+    ):
+        response = resolve(case, *email_answer(case, **changes))
+        expected = (403, "unsupported_approval") if changes == {"proof": None} else (
+            401, "missing or invalid approval principal",
+        )
+        assert (response.status_code, response.json()) == (expected[0], {"detail": expected[1]})
+        unchanged(case, before)
+        assert valkey.xrange(runs_stream) == stream
+
+    headers = {**valid[1], PROOF_HEADER: sibling[PROOF_HEADER]}
+    response = resolve(case, valid[0], headers)
+    assert (response.status_code, response.json()) == (
+        401, {"detail": "missing or invalid approval principal"},
+    )
     unchanged(case, before)
+    assert valkey.xrange(runs_stream) == stream
 
-
-def test_provider_outage_during_an_email_answer_fails_closed(
-    email_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-15: an unreachable provider is 503, never a pass."""
-    case = email_case
-    case.row = created(case)
-    approver_role(case)
     state = case.client.app.state
     trusted = state.http_identity_client
-    # A client that does not trust the synthetic provider's certificate observes nothing.
-    state.http_identity_client = HttpIdentityClient(tls_context=ssl.create_default_context())
     try:
-        before = len(case.provider.requests)
-        response = resolve(case, *email_answer(case))
-        assert response.status_code == 503, response.text
-        assert response.json() == {"detail": "authority_unavailable"}
+        state.http_identity_client = HttpIdentityClient(tls_context=ssl.create_default_context())
+        response = resolve(case, *valid)
+        assert (response.status_code, response.json()) == (503, {"detail": "authority_unavailable"})
         unchanged(case, before)
+        assert valkey.xrange(runs_stream) == stream
     finally:
         state.http_identity_client = trusted
+    response = resolve(case, *valid)
+    assert (response.status_code, response.json()["resolved_by"]) == (200, EMAIL_SENDER)
+    added = valkey.xrange(runs_stream)[len(stream):]
+    assert len(added) == 1
+    valkey.xdel(runs_stream, added[0][0])
 
 
-def test_email_turn_with_a_fixed_slack_card_is_answered_in_slack(
+def test_email_reply_cannot_resolve_the_fixed_slack_card(
     email_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
 ) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-4/7: a fixed Slack card keeps the Slack answer."""
     case = email_case
     channel = case.scope["address"]
 
     async def route(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-4."""
         async with factory() as session, session.begin():
             agent = await session.get(Agent, uuid.UUID(case.scope["agent"]))
             assert agent is not None
@@ -315,13 +333,13 @@ def test_email_turn_with_a_fixed_slack_card_is_answered_in_slack(
     case.row = created(case)
     approver_role(case)
     stream = valkey.xrange(runs_stream)
-    # An email reply cannot answer a card shown in Slack.
-    before = len(case.provider.requests)
-    assert resolve(case, *email_answer(case)).status_code == 404
-    unchanged(case, before)
+    lookups = len(case.provider.requests)
+    response = resolve(case, *email_answer(case))
+    assert (response.status_code, response.json()) == (404, {"detail": "approval not found"})
+    unchanged(case, lookups)
+    assert valkey.xrange(runs_stream) == stream
     response = resolve(case, *answer(case))
-    assert response.status_code == 200, response.text
-    assert response.json()["resolved_by"] == SENDER
+    assert (response.status_code, response.json()["resolved_by"]) == (200, SENDER)
     added = valkey.xrange(runs_stream)[len(stream):]
     assert len(added) == 1
     resumed = QueuedTurn.model_validate_json(added[0][1]["payload"])

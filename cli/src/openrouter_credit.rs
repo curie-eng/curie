@@ -98,6 +98,45 @@ impl std::fmt::Display for OpenRouterKeyHttp {
 impl std::error::Error for OpenRouterKeyHttp {}
 
 const MODEL_CREDENTIAL_ENV: &str = "CURIE_CREDENTIALS";
+const MODEL_BASE_URL_ENV: &str = "CURIE_MODEL_BASE_URL";
+const OPENROUTER_HOST: &str = "openrouter.ai";
+
+/// Host of one model base URL, or `None` when it does not parse to a host.
+///
+/// Trim the value, parse it, strip one trailing dot, then lowercase. A
+/// subdomain is not [`OPENROUTER_HOST`]. `CURIE_OPENROUTER_API_URL` is not
+/// this value.
+fn model_base_host(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw.trim()).ok()?;
+    let host = url.host_str()?;
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// Whether `curie dev model-credit` may send `key` to the OpenRouter key API.
+///
+/// An `sk-ant-` key is never sent. With no model base URL, only an `sk-or-`
+/// key is sent. Otherwise the model base host must be exactly
+/// `openrouter.ai`. A set value that is not Unicode text cannot parse to a
+/// host, so it does not authorize a probe. The OpenRouter API URL override
+/// does not authorize a probe.
+fn model_credit_allowed(key: &str) -> bool {
+    if key.starts_with("sk-ant-") {
+        return false;
+    }
+    match std::env::var_os(MODEL_BASE_URL_ENV) {
+        None => key.starts_with("sk-or-"),
+        Some(raw) => match raw.to_str() {
+            Some(value) if value.trim().is_empty() => key.starts_with("sk-or-"),
+            Some(value) => model_base_host(value).as_deref() == Some(OPENROUTER_HOST),
+            None => false,
+        },
+    }
+}
 
 /// `curie dev model-credit` stdout. Human output is the class token. JSON is
 /// exactly `{"class":"<token>"}`.
@@ -143,6 +182,10 @@ async fn model_credit_class() -> &'static str {
     let key = std::env::var(MODEL_CREDENTIAL_ENV).unwrap_or_default();
     if key.trim().is_empty() {
         return "credential-missing";
+    }
+    // Refuse before any HTTP call. The class token carries no credential.
+    if !model_credit_allowed(&key) {
+        return "credit-not-checked";
     }
     match remaining_credit_usd(&key).await {
         Ok(Some(left)) if left < crate::factory_quickstart::RUN_CREDIT_USD => "credit-exhausted",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -45,6 +46,7 @@ from ..binding import (
 from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease
 from ..hook_runs import HookRunOutcome, HookRunReason, HookRunRecorderError, retry_expiry
+from ..memory_rules_context import MemoryRulesContextRefused
 from ..reply_sink import (
     TargetRoute,
 )
@@ -68,7 +70,6 @@ if TYPE_CHECKING:
     from .core import Kernel
 
 from . import (
-    approval,
     capacity,
     channel_read,
     claim,
@@ -80,22 +81,31 @@ from . import (
     identity,
     log,
     memory,
-    publication,
     routing,
     work_items,
     workspace,
 )
 from .log import logger
 
-# ADR 0277 (#5586): the internal bound on a tracker_result run's capability
-# mint. The mint is that run's gate, and a gate decides within a minute.
-_TRACKER_RESULT_MINT_TIMEOUT_S = 30.0
-# The coded refusal a tracker_result run's publish request finishes with; the
-# API refuses the same request at its own boundary under this code.
-_TRACKER_RESULT_PUBLICATION_REFUSAL = (
-    "publication.tracker_result_request: this run reports a tracker result "
-    "and does not publish a branch or pull request."
-)
+# The internal bound on a publication recovery run's capability mint. The mint
+# is that run's gate, and a gate decides within a minute.
+_FAIL_CLOSED_MINT_TIMEOUT_S = 30.0
+
+
+def _lease_still_held(lease: DeliveryLease | None) -> bool:
+    """Whether this owner may still speak for its delivery (ADR 0288 decision 3).
+
+    False once the lease is lost, or once a fenced lease is past its confirmed
+    ownership window: the heartbeat may not yet have noticed an expiry that a
+    long pause already caused. The window is read on the lease's own clock
+    (``time.monotonic``, as ``delivery_lease`` stamps it). A leaseless caller
+    and the unfenced sentinel carry no window to check.
+    """
+    if lease is None:
+        return True
+    if lease.lost.is_set():
+        return False
+    return not claim._is_fenced(lease) or lease.local_deadline_monotonic > time.monotonic()
 
 
 async def process_event(
@@ -154,7 +164,7 @@ async def process_event(
                 await self._process_event(qevent)
             else:
                 await self._process_event(qevent, lease=lease)
-        except identity.HttpIdentityRefused:
+        except identity.HttpIdentityRefused as refusal:
             if lease is not None:
                 lease.raise_if_lost()
             try:
@@ -167,8 +177,15 @@ async def process_event(
                 await self._markers.mark_done(qevent.event_id, marker_value="1")
                 constants._LIFECYCLE_OUTCOME.set("classified_failure")
                 logger.info("HTTP invocation refused before further execution")
-                # @spec HTTP-INVOCATION-EXECUTION-31: only the relay hears of it.
+                # @spec HTTP-INVOCATION-EXECUTION-31: the relay hears of it;
+                # ADR 0288's ticket notice below is the one other exception.
                 await self._settle_relay_after_refusal(qevent)
+                if refusal.notice is not None and _lease_still_held(lease):
+                    # ADR 0288 decision 3: a refused approval ticket. The
+                    # lease is checked again here because it may have been lost
+                    # or run out while the run closed or the marker was
+                    # written; a stale owner sends nothing.
+                    await self._notice_after_refusal(qevent, refusal.notice)
         except asyncio.CancelledError as exc:
             error = exc
             await self._close_hook_run_after_error(
@@ -354,7 +371,12 @@ async def _process_event(
                 if lease is not None:
                     lease.raise_if_lost()
                 if steered.admitted:
-                    await self._reply_for(qevent, route, steered.text)
+                    # An admitted kickoff (#5715) posts nothing and leaves the
+                    # placeholder unedited: the progress lane renders the
+                    # run's card into it. Only the reply is skipped; the turn
+                    # still settles through the same fenced completion.
+                    if not steered.progress_card:
+                        await self._reply_for(qevent, route, steered.text)
                     await self._complete(
                         qevent, route, "delivered", telemetry_outcome="done", lease=lease
                     )
@@ -1182,11 +1204,9 @@ async def _process_event(
                 and self._work_items is not None
                 and fail_closed_run is not None
             ):
-                # ADR 0277 (#5586): a tracker_result session cannot report its
-                # result without this capability, and a publication recovery
-                # runner (#5429) learns from it to construct no model session,
-                # so their mint fails closed: no sandbox, no runner, no model
-                # session.
+                # A publication recovery runner (#5429) learns from this
+                # capability to construct no model session, so its mint fails
+                # closed: no sandbox, no runner, no model session.
                 minted = await _mint_fail_closed_capability(
                     self, fail_closed_run, owned_work_item_id, event_id
                 )
@@ -1484,9 +1504,10 @@ async def _process_event(
                 return
             except failures._WorkItemDeferred:
                 return
-            except RequesterContextRefused as exc:
-                # ADR 0278 (#5592): no model work without the acknowledged
-                # requester context. The started request fails with the reason.
+            except (RequesterContextRefused, MemoryRulesContextRefused) as exc:
+                # ADR 0278 (#5592) and #5798: no model work without the
+                # acknowledged requester context and learned rules. The started
+                # request fails with the reason of the first refused delivery.
                 release_order()
                 refused_run = (
                     self._work_item_runs.get(owned_work_item_id)
@@ -1811,22 +1832,14 @@ async def _process_event(
                 # A gate fired (ADR-0010): persist the durable record, then
                 # suspend the session until a human resolves it. The event
                 # is done -- the resolution arrives as its own queued turn.
-                if publication._is_publish_provenance(
-                    outcome.approval_gate_kind, outcome.approval_granted_tool
-                ) and _tracker_result_run(self, owned_work_item_id, event_id):
-                    # ADR 0277 (#5586): a tracker_result run never publishes.
-                    # Refused here, before any API call: no publication row,
-                    # no approval, nothing pushed.
-                    pause = await _refuse_tracker_result_publication(self, qevent, route)
-                else:
-                    pause = await self._pause_for_approval(
-                        qevent,
-                        route,
-                        outcome,
-                        agent_id,
-                        approval_routes,
-                        deployment_id=workspace_deployment_id,
-                    )
+                pause = await self._pause_for_approval(
+                    qevent,
+                    route,
+                    outcome,
+                    agent_id,
+                    approval_routes,
+                    deployment_id=workspace_deployment_id,
+                )
                 if pause.abandoned:
                     # #4331: a stale owner writes no finish and posts no
                     # escalation; the API termination chain owns the lost
@@ -2009,13 +2022,6 @@ async def _process_event(
                 if dependency_retry
                 else retryable and qevent.source is not TurnSource.CRON
             )
-            if retryable and not dependency_retry:
-                tracker_run = _tracker_result_run(self, owned_work_item_id, event_id)
-                if tracker_run is not None and tracker_run.started and not tracker_run.finished:
-                    # ADR 0277 (#5586): a retry would open a second model
-                    # session. The started tracker_result run settles failed
-                    # with its classification cause instead.
-                    retryable = False
             if (
                 retryable
                 and not dependency_retry
@@ -2254,11 +2260,15 @@ async def _settle_personal_refusal(
 
 
 async def _settle_requester_refusal(
-    self: Kernel, run: WorkItemRun, exc: RequesterContextRefused, event_id: str
+    self: Kernel,
+    run: WorkItemRun,
+    exc: RequesterContextRefused | MemoryRulesContextRefused,
+    event_id: str,
 ) -> None:
-    """Fail a started request whose requester context was refused (ADR 0278)."""
+    """Fail a started request whose requester context (ADR 0278) or learned
+    rules (#5798) were refused."""
 
-    logger.info("requester context refused for %s: %s", event_id, exc.reason)
+    logger.info("%s refused for %s: %s", type(exc).__name__, event_id, exc.reason)
     try:
         await run.finish(
             outcome="failed",
@@ -2291,22 +2301,13 @@ def _release_order_entry(self: Kernel, thread_key: str, entry: delivery._LockEnt
         del self._order_locks[thread_key]
 
 
-def _tracker_result_run(
-    self: Kernel, owned_work_item_id: uuid.UUID | None, event_id: str
-) -> WorkItemRun | None:
-    """This delivery's own WorkItem run when its request is tracker_result (ADR 0277)."""
-
-    run = _fail_closed_mint_run(self, owned_work_item_id, event_id)
-    return run if run is not None and run.is_tracker_result else None
-
-
 def _fail_closed_mint_run(
     self: Kernel, owned_work_item_id: uuid.UUID | None, event_id: str
 ) -> WorkItemRun | None:
     """This delivery's own WorkItem run when its capability mint fails closed.
 
-    A tracker_result request (ADR 0277) and a publication recovery request
-    (#5429) both need the capability before their runner boots.
+    A publication recovery request (#5429) needs the capability before its
+    runner boots.
     """
 
     if owned_work_item_id is None:
@@ -2315,7 +2316,7 @@ def _fail_closed_mint_run(
     if (
         run is None
         or run.event_id != event_id
-        or not (run.is_tracker_result or run.is_publication_recovery)
+        or not run.is_publication_recovery
     ):
         return None
     return run
@@ -2324,22 +2325,20 @@ def _fail_closed_mint_run(
 async def _mint_fail_closed_capability(
     self: Kernel, run: WorkItemRun, request_id: uuid.UUID, event_id: str
 ) -> tuple[str, str] | None:
-    """Mint a tracker_result or publication recovery run's capability, failing closed.
+    """Mint a publication recovery run's capability, failing closed.
 
-    The capability is how the runner learns the completion contract: a
-    tracker_result session submits its result through it, and a publication
-    recovery runner learns from it to construct no model session. Any mint
+    The capability is how the runner learns to construct no model session. Any mint
     fault (a refusal, a transport error, a malformed answer, its
     own deadline) returns None after settling the delivery: an unstarted run
     defers its acquisition (``issue_read_unavailable``, not a capacity
     deferral) and claims no sandbox, so dispatch retries it within its waiting
-    deadline. A started run, which no tracker_result path adopts, finishes
+    deadline. A started run finishes
     failed rather than boot without it.
     """
 
     assert self._work_items is not None
     try:
-        async with asyncio.timeout(_TRACKER_RESULT_MINT_TIMEOUT_S):
+        async with asyncio.timeout(_FAIL_CLOSED_MINT_TIMEOUT_S):
             return await self._work_items.issue_read_context(
                 request_id, publication_recovery=run.is_publication_recovery
             )
@@ -2371,21 +2370,3 @@ async def _mint_fail_closed_capability(
             run.finished = True
     await self._markers.mark_done(event_id, marker_value="1")
     return None
-
-
-async def _refuse_tracker_result_publication(
-    self: Kernel, qevent: QueuedTurn, route: TargetRoute
-) -> approval._ApprovalPause:
-    """Refuse a tracker_result run's publish request before any API call."""
-
-    logger.info("publication refused for tracker_result event %s", qevent.event_id)
-    escalation_update = await self._escalate(
-        qevent,
-        route,
-        "This investigation reports its result to the tracker and does not publish; "
-        "nothing was pushed and no pull request was opened.",
-        failure_class="publication-refused",
-    )
-    return approval._ApprovalPause.refused(
-        _TRACKER_RESULT_PUBLICATION_REFUSAL, escalation_update=escalation_update
-    )

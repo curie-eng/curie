@@ -23,7 +23,8 @@ agent's instructions and tools to the same platform.
 | --- | --- |
 | [Software Factory local quickstart](docs/guides/dark-factory-quickstart.md) | Try the factory on a laptop. |
 | [Software Factory administrator guide](docs/guides/factory-admin-guide.md) | Install it for your organization's repository and tune it. |
-| [Software Factory user guide](docs/guides/factory-user-guide.md) | Use an installed factory to prepare an issue and verify its pull request or merge request. |
+| [Software Factory user guide](docs/guides/factory-user-guide.md) | Use an installed factory to prepare an issue, answer its questions on the ticket and verify its pull request or merge request. |
+| [Reviewing and revising a factory pull request](docs/guides/factory-pr-review.md) | Review the change, then request a revision with a plain comment on GitHub. |
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 

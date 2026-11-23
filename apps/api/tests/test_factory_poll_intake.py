@@ -9,6 +9,8 @@ https://docs.github.com/en/rest/issues/events#list-issue-events
 https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository
 https://docs.github.com/en/rest/pulls/comments#list-review-comments-in-a-repository
 https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request
+https://docs.github.com/en/rest/pulls/reviews#get-a-review-for-a-pull-request
+https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
 https://docs.github.com/en/rest/git/refs#get-a-reference
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
 https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
@@ -117,6 +119,12 @@ def _feedback_request_id(event: str, feedback_id: int) -> uuid.UUID:
     identity = f"{REPO_ID}:{event}:{feedback_id}"
     event_id = f"github-feedback-{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
     return uuid.uuid5(uuid.NAMESPACE_URL, event_id)
+
+
+def _review_request_id(pull: int, review_id: int) -> uuid.UUID:
+    """Every piece of one submitted review admits under its review (#5794)."""
+
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"curie-review:{REPO_ID}:{pull}:{review_id}")
 
 
 def _body_digest(payload: dict[str, Any]) -> str:
@@ -236,8 +244,20 @@ class PollGitHub:
         self.comments[comment_id] = comment
         return comment
 
-    def add_review_comment(self, pr: int, comment_id: int, body: str) -> dict[str, Any]:
+    def add_review_comment(
+        self, pr: int, comment_id: int, body: str, *, review_id: int | None = None
+    ) -> dict[str, Any]:
+        """An inline comment of submitted review ``review_id``.
+
+        GitHub creates every inline comment inside a review, which the reviews
+        listing then shows; an unknown review is submitted as COMMENTED with
+        no text of its own, as a single inline comment is.
+        """
+
         stamp = _iso(datetime.now(UTC))
+        review = review_id if review_id is not None else comment_id + 500000
+        if review not in self.reviews:
+            self.add_review(pr, review, "", state="COMMENTED")
         comment = {
             "id": comment_id,
             "body": body,
@@ -249,23 +269,26 @@ class PollGitHub:
             "commit_id": HEAD,
             "path": "src/acme/helper.py",
             "line": 12,
-            "pull_request_review_id": comment_id + 500000,
+            "pull_request_review_id": review,
             "html_url": f"https://github.com/{REPO}/pull/{pr}#discussion_r{comment_id}",
             "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/{pr}",
         }
         self.review_comments[comment_id] = comment
         return comment
 
-    def add_review(self, pr: int, review_id: int, body: str) -> dict[str, Any]:
+    def add_review(
+        self, pr: int, review_id: int, body: str, *, state: str = "CHANGES_REQUESTED"
+    ) -> dict[str, Any]:
         review = {
             "id": review_id,
             "pr": pr,
             "body": body,
             "user": _user(),
             "commit_id": HEAD,
-            "state": "CHANGES_REQUESTED",
+            "state": state,
             "submitted_at": _iso(datetime.now(UTC)),
             "html_url": f"https://github.com/{REPO}/pull/{pr}#pullrequestreview-{review_id}",
+            "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/{pr}",
             "author_association": "MEMBER",
             "performed_via_github_app": None,
         }
@@ -479,10 +502,24 @@ class PollGitHub:
                     if review.get("pr") == pr
                 ]
                 return self._page(request, "reviews", owned)
-            review_id = int(review_tail.strip("/"))
+            review_text, _, comments_tail = review_tail.strip("/").partition("/")
+            review_id = int(review_text)
             review = self.reviews.get(review_id)
             if review is None or review.get("pr") != pr:
                 return httpx.Response(404, json={"message": "missing fixture"})
+            if comments_tail == "comments":
+                # https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
+                listed = sorted(
+                    (
+                        comment
+                        for comment in self.review_comments.values()
+                        if comment.get("pull_request_review_id") == review_id
+                    ),
+                    key=lambda comment: comment["id"],
+                )
+                size = int(request.url.params.get("per_page", "30"))
+                page = int(request.url.params.get("page", "1"))
+                return httpx.Response(200, json=listed[(page - 1) * size : page * size])
             return httpx.Response(200, json=_public_review(review))
         if path.startswith(f"{root}/pulls/"):
             tail = path.rsplit("/", 1)[1]
@@ -1138,9 +1175,7 @@ def test_poll_defers_one_unreadable_issue_and_continues_other_intake(
     assert cancelled[0]["cancelled_at"] is not None
     assert cancelled[0]["terminal_cause"] == "issue_cancelled"
     assert _mention_request_id(comment_id) in {row["id"] for row in _requests(mentioned)}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in _requests(reviewed)
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in _requests(reviewed)}
     del github.failures[path]
     github.close_issue(unavailable)
 
@@ -1232,9 +1267,7 @@ def test_poll_retries_permission_failure_after_events_and_continues_other_intake
     mentioned_rows = _requests(mentioned)
     reviewed_rows = _requests(reviewed)
     assert _mention_request_id(comment_id) in {row["id"] for row in mentioned_rows}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in reviewed_rows
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in reviewed_rows}
     github.permission_failures.remove(unavailable)
 
     _run_once(github)
@@ -1309,9 +1342,7 @@ def test_poll_prunes_persisted_etags_for_cancelled_issues_and_closed_lineages(
     healthy_rows = _requests(healthy)
     assert len(healthy_rows) == 3
     assert _mention_request_id(comment_id) in {row["id"] for row in healthy_rows}
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in healthy_rows
-    }
+    assert _review_request_id(healthy_pull, review_id) in {row["id"] for row in healthy_rows}
 
 
 def test_stale_issue_conditional_read_still_cancels_after_an_issue_changes(
@@ -1517,12 +1548,12 @@ def test_tracker_poll_admits_the_app_slug_once_and_refuses_status_and_lookalike_
                 own_login=own_login,
                 page_size=10,
             )
-            first = await tracker.poll_marked(None, running=())
+            first = await tracker.poll_marked(None, running=(), answering=())
             admitted = [
                 notice for notice in first.notices if notice.disposition is Disposition.MENTION
             ]
             assert {int(notice.event_id) for notice in admitted} == {73211, 73212}
-            again = await tracker.poll_marked(first.cursor, running=())
+            again = await tracker.poll_marked(first.cursor, running=(), answering=())
             repeated = [
                 notice for notice in again.notices if notice.disposition is Disposition.MENTION
             ]
@@ -1707,8 +1738,9 @@ def test_poll_admits_review_feedback_once(
     rows = _requests(number)
     assert len(rows) == 3
     found = {row["id"] for row in rows}
-    assert _feedback_request_id("pull_request_review_comment", comment_id) in found
-    assert _feedback_request_id("pull_request_review", review_id) in found
+    # The inline comment's own review and the separate review: one request each.
+    assert _review_request_id(pull, comment_id + 500000) in found
+    assert _review_request_id(pull, review_id) in found
     assert _requests(pull) == []
 
     _run_once(github)
@@ -1907,9 +1939,7 @@ def test_webhook_of_a_polled_review_stays_one_request(
     review_id = 74111
     review = github.add_review(pull, review_id, f"@{MENTION} please rename the helper")
     _run_once(github)
-    assert _feedback_request_id("pull_request_review", review_id) in {
-        row["id"] for row in _requests(number)
-    }
+    assert _review_request_id(pull, review_id) in {row["id"] for row in _requests(number)}
     count = len(_requests(number))
     before = _delivery_ids()
     payload = {
@@ -2313,128 +2343,3 @@ def test_cadence_status_answer_terminal_refusal_and_transient_retry(
             assert etags[f"issues:{LABEL}"] == github._etags["issues"]
             assert last_clean[REPO] == instant
     assert len(_requests(number)) == 1
-
-
-def test_delegated_output_own_label_draws_no_notice_at_poll_intake(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None, valkey: object
-) -> None:
-    """#5588 AC5: the factory's own label on its delegated output is not refused.
-
-    Polling intake observes the App's label event on three outputs: one whose
-    handoff died after adding the label and before admission completed, one
-    already admitted, and one refused after the label was added (its removal
-    failed, so the label stayed). None gets an intake notice, so no Slack
-    refusal is owed. The admitted output's event is stamped after its request
-    was created (GitHub's clock ahead of the database's), so the duplicate
-    label rule does not silence it and only the delegated-output lookup does.
-    Controls: the installation's label on an unrelated issue and a different
-    App's label on a delegated output each get one ``actor_bot`` notice, and
-    with the association emptied all three outputs get one.
-    """
-
-    from test_factory_triage_handoff import (
-        DEATHS,
-        IMPL,
-        OTHER_APP_ID,
-        _Death,
-        _die_once,
-        make_due,
-        published,
-        run_hand_off,
-        triage_env,
-        work_items,
-    )
-
-    def notices(number: int) -> list[str]:
-        return [
-            row["reason"]
-            for row in _rows(
-                "SELECT reason FROM curie.factory_intake_notices "
-                "WHERE tracker_issue_id = :n ORDER BY id",
-                {"n": str(number)},
-            )
-        ]
-
-    def handoff(handoff_id: uuid.UUID | None) -> dict[str, Any]:
-        (row,) = _rows(
-            "SELECT * FROM curie.factory_triage_handoffs WHERE id = :id", {"id": handoff_id}
-        )
-        return row
-
-    def poll(github: Any) -> None:
-        github.listing_generation += 1
-        from test_factory_intake_notices import _pass
-
-        _pass(github, "poll")
-
-    with triage_env(monkeypatch, tmp_path) as env:
-        github = env.github
-        # Before admission completes: the label is on, the process died.
-        before = published(env)
-        module, name, after = DEATHS["after_label_commit"]
-        _die_once(monkeypatch, module, name, after=after)
-        with pytest.raises(_Death):
-            run_hand_off(before.handoff_id)
-        # After admission completed.
-        admitted = published(env)
-        github.label_clock_offset = timedelta(minutes=1)
-        assert run_hand_off(admitted.handoff_id) == "admitted"
-        github.label_clock_offset = timedelta(0)
-        # Refused once the label had been added; its removal failed.
-        refused = published(env)
-
-        def unreadable(number: int, label: str) -> None:
-            github.permission_unreadable = True
-
-        github.on_label_added = unreadable
-        assert run_hand_off(refused.handoff_id) is None
-        github.on_label_added = None
-        github.label_delete_status = 502
-        _exec_sql(
-            "UPDATE curie.factory_triage_handoffs SET deadline_at = clock_timestamp() "
-            "- interval '1 second' WHERE id = :id",
-            {"id": refused.handoff_id},
-        )
-        make_due(refused.handoff_id)
-        assert run_hand_off(refused.handoff_id) == "refused"
-        github.label_delete_status = None
-        github.permission_unreadable = False
-        outputs = [before.output, admitted.output, refused.output]
-        assert all(
-            number is not None and IMPL in github.outputs[number].labels for number in outputs
-        )
-        assert handoff(before.handoff_id)["outcome"] is None
-        assert handoff(admitted.handoff_id)["outcome"] == "admitted"
-        assert handoff(refused.handoff_id)["reason"] == "permission_unreadable"
-        # Control: the installation's own label on an unrelated issue.
-        unrelated = github.own_issue(9700, "Unrelated", "Not a delegated output.", set())
-        github.app_label(unrelated.number, IMPL)
-
-        poll(github)
-
-        assert [notices(number) for number in outputs] == [[], [], []]
-        assert notices(unrelated.number) == ["actor_bot"]
-        assert [len(work_items(number)) for number in outputs] == [0, 1, 0]
-        # Control: without the association every one of them is answered.
-        _exec_sql("UPDATE curie.factory_triage_handoffs SET associated_at = NULL")
-        poll(github)
-        assert [notices(number) for number in outputs] == [["actor_bot"]] * 3
-
-        # Control: a different App's label on a delegated output is answered.
-        _exec_sql("UPDATE curie.factory_triage_handoffs SET associated_at = labelled_at")
-        assert refused.output is not None
-        github.app_label(refused.output, IMPL, app_id=OTHER_APP_ID)
-        poll(github)
-        assert notices(refused.output) == ["actor_bot", "actor_bot"]
-        assert [notices(number) for number in outputs[:2]] == [["actor_bot"]] * 2
-        assert notices(unrelated.number) == ["actor_bot"]
-        # The interrupted handoff still completes into one run.
-        make_due(before.handoff_id)
-        assert run_hand_off(before.handoff_id) == "admitted"
-        assert [len(work_items(number)) for number in outputs] == [1, 1, 0]
-
-
-def _exec_sql(statement: str, params: dict[str, Any] | None = None) -> None:
-    from test_factory_intake_notices import _sql
-
-    _sql(statement, params)

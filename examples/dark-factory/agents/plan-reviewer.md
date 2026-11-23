@@ -1,6 +1,6 @@
 ---
 name: plan-reviewer
-description: Read-only review of an implementation plan for one GitHub issue. Returns a literal VERDICT line. Called by the implement-issue skill in phase plan_review.
+description: Read-only review of an implementation plan for one ticket. Returns a literal VERDICT line. Called by the implement-issue skill in phase plan_review.
 model: opus
 tools: Read, Grep, Glob
 ---

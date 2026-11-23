@@ -42,19 +42,37 @@ allowlist below records those remaining callers.
 marked and described:
 
 1. `poll_marked` returns every marking since a cursor as `MarkedNotice` values
-   (admit, cancel or mention) plus the next cursor, and re-reads the WorkItems
-   already running so a marker removed before the cursor still cancels. A
-   listing that cannot be read to its end raises `Unavailable` and yields no
-   cursor. Events by the adapter's own identity are never notices. Each notice
-   carries `occurred_at`, the event time the tracker reported, or None when it
+   (admit, cancel, mention or answer) plus the next cursor, and re-reads the
+   WorkItems already running so a marker removed before the cursor still
+   cancels. Its required `answering` argument names the issues whose WorkItem
+   has a factory question round open; on those, every new comment by a person,
+   with or without a mention, is an answer notice, including on a first poll.
+   A first poll also delivers a running issue's mentions made since its label
+   was last added, because a label whose first page held an issue polls as a
+   first poll again. The shared intake decides each mention again under the
+   WorkItem lock: any mention acts only while the issue is open and keeps the
+   WorkItem's trigger label, one on an issue whose round opened after the
+   poll began is admitted as an answer, and a comment already decided as an
+   answer starts nothing. An
+   answer that arrives while the question is still posting, or after its round
+   ended since the poll began, is held with the issue's later notices and the
+   cursor stays unsaved until a later poll can settle it; on that later poll a
+   comment on an ended round is a mention or nothing. A listing that cannot be
+   read to its end raises `Unavailable` and yields no cursor. Events by the
+   adapter's own identity are never notices. Each notice carries
+   `occurred_at`, the event time the tracker reported, or None when it
    reported none; admission treats None as unknown.
-2. `verify_current` says whether a notice still describes the issue.
+2. `verify_current` says whether a notice still describes the issue. An
+   answer is current only while the issue keeps the trigger label, is open,
+   and the comment still stands.
 3. `marking_actor` names who applied the marker that is on the issue now.
 4. `may_start` decides whether that actor may start a run. A native tracker
    checks write access to its own repository. A tracker-only kind checks the
    binding's allowlist or group.
 5. `read_ticket` returns the ticket as markdown for the sandbox. Nothing is
-   stored.
+   stored. The Jira and GitLab trackers cap the comments they read and keep
+   the newest ones, rendered oldest first after a line saying earlier comments
+   were not read, so a recent answer to the factory's questions is read.
 6. `ticket_labels` returns the issue's current labels and component names,
    which admission reads for repository routing and label conflicts. Sandbox
    acquisition and base reconciliation read them again for the current `base:`
@@ -68,36 +86,8 @@ marked and described:
    held before a move. An unreadable answer raises `Unavailable`.
 10. `issue_url` gives the issue's web URL, which work item links come from.
     It makes no request and raises `NotFound` for an issue outside the tracker.
-11. Optional: `link_pull_request`, `dependencies`, `in_group` (group start
-    authority) and `create_linked_issue`
-    ([ADR 0277](../../adr/0277-factory-triage-publishes-tickets-before-implementation-admission.md)).
-    `create_linked_issue` opens one issue in the source issue's own scope whose
-    body ends with a related-source line and a hidden marker carrying the
-    caller's output identity, with no closing keyword and no blocked-by
-    relation, and returns a `LinkedIssue` with the read-back body digest. Its
-    lookup lists the scope's issues its own identity created (never a search
-    API) and matches the one whose last non-empty line is the marker. A marker
-    in an issue anyone else created counts for nothing, and two matches raise
-    `Ambiguous` without writing. The creator-filtered listing can lag a create
-    by seconds (observed on GitHub), so neither a listing nor elapsed time
-    proves a create absent. By default the call reconciles to a match or
-    creates once. A definite refusal of the create keeps its type and created
-    nothing (`Unauthorized`, `NotFound`, `Unavailable("unprocessable")`). Any
-    failure after the create request may have reached the tracker (transport
-    error, 5xx, unreadable success, failed read-back, or a relist after an
-    uncertain answer that finds nothing or cannot be read) raises
-    `LinkedIssueUnconfirmed`, after which the caller never creates again for
-    that output identity. `reconcile_only=True` never creates: one match is
-    returned, none raises `NotFound("linked_issue")`, two raise `Ambiguous`.
-    A caller that has recorded the output issue passes it as `expected`: the
-    adapter then never lists and never creates, reads that issue directly, and
-    returns it only when it is an issue, not a pull request, its own identity
-    created it, and its last non-empty line is the marker; anything else
-    raises `NotFound("linked_issue")`, so a recorded issue whose marker was
-    removed never yields a second one. `expected` and `reconcile_only`
-    together are a ValueError. The GitHub and in-memory adapters implement
-    it; GitLab and Jira Cloud declare it unsupported and raise
-    `Unsupported`.
+11. Optional: `link_pull_request`, `dependencies` and `in_group` (group start
+    authority).
 
 ### CodeHost
 

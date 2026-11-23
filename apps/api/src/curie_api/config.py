@@ -39,8 +39,8 @@ from curie_internal.driver_declaration import (
 )
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
-from plugin_format.connector_render import ConnectorProxy, GrantStore
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from plugin_format.connector_render import ConnectorProxy, GrantStore, is_service_account_name
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
@@ -191,10 +191,11 @@ class Settings(BaseSettings):
     workspace_max_archive_bytes: int = Field(
         default=268435456, gt=0, validation_alias="CURIE_WORKSPACE_MAX_ARCHIVE_BYTES"
     )
-    # Private publication candidates (#5428): off by default. A disabled ledger
+    # Private publication candidates (#5428): on by default. A disabled ledger
     # refuses new captures and readers but still drains through collection.
+    # The chart renders this off when managed workspaces are off.
     publication_candidates_enabled: bool = Field(
-        default=False, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
+        default=True, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
     )
     publication_candidate_max_bytes: int = Field(
         default=1073741824, gt=0, validation_alias="CURIE_PUBLICATION_CANDIDATE_MAX_BYTES"
@@ -355,6 +356,8 @@ class Settings(BaseSettings):
     factory_intake: Literal["poll", "webhook"] = "poll"
     # Personal GitHub labels use the linked requester and normal owner validation.
     factory_model_auth_mode: Literal["service", "personal"] = "service"
+    factory_github_app_client_id: str = ""
+    factory_github_app_client_secret: SecretStr = SecretStr("")
     # ADR 0278 (#5592): the worker and runner deliver, validate and acknowledge
     # the pinned document, so admission selects it by default.
     requester_coding_instructions_apply: bool = Field(
@@ -374,6 +377,11 @@ class Settings(BaseSettings):
     # lineage, to record one merged or closed outside a publication (#3831).
     # Runs with the work item reconciler and factory ingress; 0 disables it.
     factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
+    # How often the API settles learned rule candidates (ADR 0287, #5796) of a
+    # pull request an older replica recorded merged or closed without settling.
+    # It runs whatever the reconciler and factory switches say, so it has no
+    # off value: no setting may strand a candidate.
+    memory_rule_settlement_interval_s: float = Field(default=60, gt=0, allow_inf_nan=False)
     # How often the API publishes optional UI evidence a worker uploaded for a
     # recorded publication, as one marked pull request comment. It reads the
     # code publication and never changes it; 0 disables it.
@@ -703,15 +711,6 @@ class Settings(BaseSettings):
             "WORK_ITEM_RESOURCE_GATE_PROBE_SECONDS",
         ),
     )
-    # How long a sealed tracker result stays owed after submission before it is
-    # recorded failed (ADR 0277, #5585). Read only by
-    # `factory_tracker_result_delivery.submit_result`; an int, so finite.
-    factory_tracker_result_delivery_deadline_seconds: int = Field(
-        default=900,
-        gt=0,
-        le=86400,
-        validation_alias=AliasChoices("CURIE_FACTORY_TRACKER_RESULT_DELIVERY_DEADLINE_SECONDS"),
-    )
     work_item_start_deferral_limit: int = Field(
         default=5,
         gt=0,
@@ -1003,6 +1002,16 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME", "connector_grant_store_secret_name"
         ),
     )
+    # The operator's ServiceAccount for one agent's hosted connector, as the
+    # JSON list the chart renders from `connectorServiceAccounts`. Contract:
+    # docs/interfaces/connector-host/INTERFACE.md, "A connector's own
+    # ServiceAccount". Validated at boot by `_validate_connector_service_accounts`.
+    connector_service_accounts: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_SERVICE_ACCOUNTS", "connector_service_accounts"
+        ),
+    )
     e2e_connector_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),
@@ -1101,6 +1110,57 @@ class Settings(BaseSettings):
                 if name.strip()
             ),
         )
+
+    def _connector_service_account_map(self) -> dict[tuple[str, str], str]:
+        """``(agent, connector) -> ServiceAccount`` from the operator's list.
+
+        Raises ``ValueError`` naming ``CURIE_CONNECTOR_SERVICE_ACCOUNTS`` on any
+        entry the renderer could not use.
+        """
+
+        env = "CURIE_CONNECTOR_SERVICE_ACCOUNTS"
+        raw = self.connector_service_accounts.strip()
+        if not raw:
+            return {}
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError:
+            raise ValueError(f"{env} is not valid JSON") from None
+        if not isinstance(entries, list):
+            raise ValueError(f"{env} must be a JSON list of entries")
+        keys = {"agent", "connector", "serviceAccountName"}
+        mapping: dict[tuple[str, str], str] = {}
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or set(entry) != keys:
+                raise ValueError(
+                    f"{env} entry {index} must be an object with exactly the keys "
+                    "agent, connector and serviceAccountName"
+                )
+            if not all(isinstance(entry[key], str) and entry[key].strip() for key in keys):
+                raise ValueError(f"{env} entry {index} has an empty or non-string value")
+            account = entry["serviceAccountName"]
+            if not is_service_account_name(account):
+                raise ValueError(
+                    f"{env} entry {index} serviceAccountName {account!r} is not a Kubernetes "
+                    "ServiceAccount name (a DNS-1123 subdomain of at most 253 characters)"
+                )
+            pair = (entry["agent"], entry["connector"])
+            if pair in mapping:
+                raise ValueError(
+                    f"{env} names agent {pair[0]!r} connector {pair[1]!r} more than once"
+                )
+            mapping[pair] = account
+        return mapping
+
+    def connector_service_accounts_for(self, agent: str) -> dict[str, str]:
+        """The operator-named ServiceAccount of each of ``agent``'s connectors
+        that has one, keyed by connector name."""
+
+        return {
+            connector: account
+            for (owner, connector), account in self._connector_service_account_map().items()
+            if owner == agent
+        }
 
     def connector_grant_store(self) -> GrantStore:
         """Where the caller proxy spends grants: a credential-free address and
@@ -1223,6 +1283,13 @@ class Settings(BaseSettings):
             self.connector_proxy()
         except ValueError as exc:
             raise ValueError(f"the connector caller proxy is misconfigured: {exc}") from None
+        return self
+
+    @model_validator(mode="after")
+    def _validate_connector_service_accounts(self) -> "Settings":
+        # At boot, not at the first render: a list the renderer cannot use
+        # would otherwise surface as a 500 on every connector deploy.
+        self._connector_service_account_map()
         return self
 
     @model_validator(mode="after")

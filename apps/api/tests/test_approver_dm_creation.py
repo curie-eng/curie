@@ -36,17 +36,14 @@ from approver_dm_support import (
     account,
     configured_dm,
     create,
-    dm_answer,
     dm_created,
     dm_request,
     dm_routes,
-    email_answer,
     expected_delivery,
     nonce_uses,
     refused_creation,
     selected,
     set_identity_status,
-    unauthenticated,
 )
 from approver_dm_support import dm_case as dm_case
 from approver_ticket_support import APPROVER_A, APPROVER_B, ROUTE, agent_state, store_routes
@@ -215,6 +212,25 @@ def test_a_recipient_account_the_directory_does_not_prove_refuses(
 # --- route, receiver and request refusals --------------------------------------------------
 
 
+def test_dm_creation_requires_an_origin_receiver_and_a_server_chosen_card(
+    dm_case: SimpleNamespace,
+) -> None:
+    case = dm_case
+    detached = case.scope["detached"]
+    configured_dm(case, identity=detached["adapter"])
+    request, payload = dm_request(case, [
+        selected(case, APPROVER_A, account(detached, NATIVE_A)),
+    ])
+    refused_creation(case, request, payload, 409, "approver_dm_receiver_missing")
+    configured_dm(case)
+    request, payload = dm_request(case)
+    for channel in (case.scope["address"], DM_CHANNEL, NATIVE_A):
+        wrong = {**request, "approval": {**request["approval"], "card_channel": channel}}
+        refused_creation(case, wrong, payload, 409, "unsupported_approval")
+    dm_created(create(case.client, request), request, expected_delivery(case.scope["main"]))
+    assert nonce_uses(case.scope["agent"], payload["nonce"]) == 1
+
+
 def test_a_route_identity_whose_receiver_is_not_current_refuses(
     dm_case: SimpleNamespace,
 ) -> None:
@@ -276,73 +292,7 @@ def test_a_dm_route_without_a_selector_registration_refuses(dm_case: SimpleNames
     refused_creation(case, request, None, 409, "approver_dm_requires_dynamic")
 
 
-def test_a_dm_request_naming_a_card_channel_refuses(dm_case: SimpleNamespace) -> None:
-    """@spec APPROVER-DM-2: the worker never chooses the DM card's channel.
-
-    The requester's reply channel, a DM-shaped channel and the approver's user
-    id each refuse with 409 ``unsupported_approval``.
-    """
-    case = dm_case
-    configured_dm(case)
-    for channel in (case.scope["address"], DM_CHANNEL, NATIVE_A):
-        request, payload = dm_request(case)
-        request["approval"]["card_channel"] = channel
-        refused_creation(case, request, payload, 409, "unsupported_approval")
-    _created(case)
-
-
-def test_a_route_identity_whose_receiver_does_not_serve_the_origin_refuses(
-    dm_case: SimpleNamespace,
-) -> None:
-    """@spec APPROVER-DM-1 (review r1 F3): the DM bot must be able to answer for the origin.
-
-    The route names ``detached``: an active bot identity on the binding's
-    installation and namespace with a registered receiver, so the route write
-    is accepted, but that receiver's ``binding_ids`` do not list the turn's
-    binding. Every click on a card it delivered would fail the answer's origin
-    check, so creation refuses before the ticket is spent: 409
-    ``approver_dm_receiver_missing`` (the existing "no usable receiver for the
-    identity" code), no row, nonce unspent. Repointed to the binding's own
-    receiver, the same agent creates.
-    """
-    case = dm_case
-    scope = case.scope
-    detached = scope["detached"]
-    assert scope["binding"] not in detached["binding_ids"]
-    configured_dm(case, identity=detached["adapter"])
-    request, payload = dm_request(case, [
-        selected(case, APPROVER_A, account(detached, NATIVE_A)),
-    ])
-    refused_creation(case, request, payload, 409, "approver_dm_receiver_missing")
-    configured_dm(case)
-    _created(case)
-
-
 # --- an unregistered DM is never answered on its origin -----------------------------------
-
-
-def test_an_unregistered_dm_approval_cannot_be_answered_on_its_origin(
-    dm_case: SimpleNamespace,
-) -> None:
-    """@spec APPROVER-DM-2: unset ``card_channel`` means every answer refuses.
-
-    The selected approver presents a receiver-signed interaction in the
-    requester's reply channel (where an ordinary routeless card lives): 401
-    with no effect. An email reply forwarded for the origin binding is refused
-    too. The row stays pending with its card unset and nothing is published.
-    """
-    case = dm_case
-    configured_dm(case)
-    body, _ = _created(case)
-    approval_id = body["id"]
-    response = dm_answer(case, approval_id, NATIVE_A, channel=case.scope["address"])
-    unauthenticated(case, approval_id, response, card_channel=None)
-    emailed = email_answer(case, approval_id)
-    assert emailed.status_code in (401, 403, 404), emailed.text
-    unauthenticated(
-        case, approval_id,
-        dm_answer(case, approval_id, NATIVE_A, channel=DM_CHANNEL), card_channel=None,
-    )
 
 
 # --- R2: the recipient captured in phase one is still current at the writer ----------------
@@ -406,6 +356,34 @@ def _other_request(case: SimpleNamespace) -> tuple[dict[str, Any], dict[str, Any
     return dm_request(case, [selected(case, APPROVER_A, account(case.scope["other"], NATIVE_A))])
 
 
+def test_dm_creation_rechecks_receiver_registration_after_recipient_lookup(
+    dm_case: SimpleNamespace,
+) -> None:
+    case = dm_case
+    other = case.scope["other"]
+    configured_dm(case, identity=other["adapter"])
+    state = case.client.app.state
+    runtime = state.http_identity_runtime
+    serving = runtime._receivers
+    remaining = MappingProxyType({
+        key: value for key, value in serving.items() if key[0] != other["receiver_id"]
+    })
+    assert len(remaining) == len(serving) - 1
+
+    def withdraw() -> None:
+        object.__setattr__(runtime, "_receivers", remaining)
+
+    request, payload = _other_request(case)
+    try:
+        response, hook = _during_recipient_lookup(case, request, withdraw)
+    finally:
+        object.__setattr__(runtime, "_receivers", serving)
+    assert hook.fired >= 1
+    _refused_unavailable(case, request, payload, response)
+    dm_created(create(case.client, request), request, expected_delivery(other))
+    assert nonce_uses(case.scope["agent"], payload["nonce"]) == 1
+
+
 def test_an_unchanged_state_during_the_recipient_lookup_creates(
     dm_case: SimpleNamespace,
 ) -> None:
@@ -421,40 +399,6 @@ def test_an_unchanged_state_during_the_recipient_lookup_creates(
     assert hook.fired >= 1, "the recipient account was never looked up"
     dm_created(response, request, expected_delivery(case.scope["other"]))
     assert nonce_uses(case.scope["agent"], payload["nonce"]) == 1
-
-
-def test_a_receiver_set_change_during_the_recipient_lookup_refuses(
-    dm_case: SimpleNamespace,
-) -> None:
-    """@spec APPROVER-DM-1: the phase-one registration object must still be registered.
-
-    While the recipient lookup is in flight the route identity's receiver
-    registration leaves the API's receiver set (the binding's own receiver,
-    which carried the invocation, stays). The writer recheck refuses 503
-    ``authority_unavailable`` with no row and the nonce unspent. With the
-    registration back, the next creation succeeds.
-    """
-    case = dm_case
-    configured_dm(case, identity=case.scope["other"]["adapter"])
-    runtime = case.client.app.state.http_identity_runtime
-    original = runtime._receivers
-    removed = case.scope["other"]["receiver_id"]
-    assert any(key[0] == removed for key in original), original
-
-    def withdraw() -> None:
-        """@spec APPROVER-DM-1: the operator registration set changes mid-creation."""
-        object.__setattr__(runtime, "_receivers", MappingProxyType({
-            key: value for key, value in original.items() if key[0] != removed
-        }))
-
-    request, payload = _other_request(case)
-    try:
-        response, hook = _during_recipient_lookup(case, request, withdraw)
-    finally:
-        object.__setattr__(runtime, "_receivers", original)
-    assert hook.fired >= 1, "the recipient account was never looked up"
-    _refused_unavailable(case, request, payload, response)
-    _created(case, receiver="other")
 
 
 def test_a_provider_configuration_change_during_the_recipient_lookup_refuses(

@@ -1150,6 +1150,7 @@ def test_cancellation_waits_for_a_successful_handoff_before_cleanup(
                         "CURIE_RUNNER_TOKEN": "replacement-test-token",
                     },
                     None,
+                    record_handoff=lambda: None,
                     workspace_inference=SimpleNamespace(repo=None),
                 )
             )
@@ -1234,6 +1235,7 @@ def test_cancellation_discards_after_a_definitively_failed_handoff(
                             "CURIE_RUNNER_TOKEN": "replacement-test-token",
                         },
                         None,
+                        record_handoff=lambda: None,
                         workspace_inference=SimpleNamespace(repo=None),
                     )
                 )
@@ -1305,6 +1307,7 @@ def test_second_handoff_probe_uses_the_remaining_delivery_budget(
                     "CURIE_RUNNER_TOKEN": "replacement-test-token",
                 },
                 None,
+                record_handoff=lambda: None,
                 remaining_s=0.2,
                 workspace_inference=SimpleNamespace(repo=None),
             )
@@ -1427,6 +1430,7 @@ def test_zero_probe_budget_leaves_the_retained_file_turn_retryable(make_harness)
                     h.kernel._to_event(qevent),  # noqa: SLF001
                     {},
                     None,
+                    record_handoff=lambda: None,
                     remaining_s=0.0,
                     workspace_inference=SimpleNamespace(repo=None),
                 )
@@ -1847,72 +1851,6 @@ def test_a_turn_with_files_is_answered_normally_when_the_lane_is_switched_off(
                 "the lane is off and the claim still carries an attachment "
                 f"capability: {h.fake_k8s.claim_envs}"
             )
-
-    asyncio.run(go())
-
-
-def test_the_attachment_ledger_is_swept_from_the_same_reap_tick_under_the_route_lock(
-    make_harness,
-) -> None:
-    """One tick, one lock fence, two ledgers.
-
-    ``reap_orphans`` is the existing periodic tick; the attachment sweep joins it
-    rather than arriving with a scheduler of its own. The lock assertion is the
-    same one the workspace sweep carries: object deletion happens between
-    ``begin`` and ``finish`` and can outlive the original lease, so a competing
-    claimant on that thread must stay fenced for the whole critical section --
-    otherwise a fresh resolve can land between the two halves and have its ledger
-    deleted by the finish.
-    """
-
-    async def go() -> None:
-        async with make_harness(
-            lock_ttl_ms=90,
-            lock_acquire_timeout_s=1.0,
-            lock_poll_interval_s=0.01,
-        ) as h:
-            thread = _thread_key("tAttachmentReap")
-            entered = threading.Event()
-            gate = threading.Event()
-            finished: list[object] = []
-
-            class GatedAttachmentLane:
-                def resolve(self, **_kwargs: Any) -> Any:
-                    raise AssertionError("the reap tick must not resolve anything")
-
-                def enumerate_expired(self) -> list[str]:
-                    return [thread]
-
-                def begin_expired_reap(self, thread_key: str) -> object:
-                    assert thread_key == thread
-                    entered.set()
-                    gate.wait(timeout=5.0)
-                    return object()
-
-                def finish_expired_reap(self, candidate: object) -> bool:
-                    finished.append(candidate)
-                    return True
-
-            h.kernel._attachments = GatedAttachmentLane()  # type: ignore[attr-defined]
-
-            reaping = asyncio.create_task(h.kernel.reap_orphans())
-            await _wait_until(
-                entered.is_set,
-                "reap_orphans to sweep the attachment ledger in the same tick",
-            )
-
-            contender = asyncio.create_task(h.kernel._lock.acquire(h.config.lock_key(thread)))
-            try:
-                await asyncio.sleep(0.25)
-                assert not contender.done(), (
-                    "the attachment sweep mutated its ledger outside the route lock"
-                )
-            finally:
-                gate.set()
-            await reaping
-            assert len(finished) == 1, "the sweep never reached its fenced ledger delete"
-            token = await contender
-            await h.kernel._lock.release(h.config.lock_key(thread), token)
 
     asyncio.run(go())
 

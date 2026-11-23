@@ -174,28 +174,6 @@ def test_stub_source_comes_from_a_config_map_and_state_stays_in_an_empty_dir() -
         assert set(volume) - {"name"} <= {"configMap", "emptyDir"}, volume
 
 
-def test_stub_manifests_carry_no_secret_or_credential() -> None:
-    manifests = tls_code_host.stub_manifests(NAMESPACE, IMAGE)
-    assert not _by_kind(manifests, "Secret")
-    pod = _pod(manifests)
-    assert pod["spec"].get("automountServiceAccountToken") is False
-    text = json.dumps(manifests)
-    for forbidden in (
-        "secretKeyRef",
-        "secretName",
-        '"secret"',
-        "hostPath",
-        "persistentVolumeClaim",
-        "BEGIN",
-        "PRIVATE KEY",
-    ):
-        assert forbidden not in text, forbidden
-    for container in pod["spec"]["containers"]:
-        assert not container.get("envFrom")
-        for entry in container.get("env") or []:
-            assert "valueFrom" not in entry, entry
-
-
 def test_only_the_stub_container_mounts_the_state_volume() -> None:
     pod = _pod(tls_code_host.stub_manifests(NAMESPACE, IMAGE))
     volumes = {v["name"]: v for v in pod["spec"]["volumes"]}

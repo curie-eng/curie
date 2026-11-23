@@ -9,6 +9,8 @@ Status: Accepted
 Adds tracker-result completion and explicitly permits the initial-release use of
 current checks while its viability evaluator remains deferred.
 
+The amendment by ADR 0277 recorded above is withdrawn by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md), which supersedes ADR 0277 in full; the withdrawal takes effect in code when its triage removal tickets land. Also partially amended by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md) (back-link added under ADR 0045): a question ending is a visible terminal outcome with no execution waiting, the ambiguity stop ends with that question ending, and `needs-human` also marks a ticket whose three question rounds are spent.
+
 **Partially amended by [ADR 0222](0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 decisions 2.5, 4.2 and 7 become the factory bundle's versioned input contract

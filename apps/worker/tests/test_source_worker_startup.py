@@ -176,6 +176,7 @@ asyncio.run(exercise())
         OTEL_SDK_DISABLED="true",
         CURIE_INTERNAL_WORKER_TOKEN="",
         CURIE_WORKSPACE_ENABLED="false",
+        CURIE_PUBLICATION_CANDIDATES_ENABLED="false",
     )
     environment[STREAM_ENV] = stream
     environment[HEARTBEAT_FILE_ENV] = str(heartbeat)

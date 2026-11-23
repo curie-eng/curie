@@ -38,6 +38,7 @@ from approval_answer_support import (
     configured,
     dynamic,
     grant_check,
+    no_wake,
     one_more_resume_refusal,
     ordinary,
     person,
@@ -79,6 +80,64 @@ REFUSE = ("refuse", "caller_not_allowed")
 EXCLUDED = "separation_requester_excluded"
 EXCLUDE = {"exclude_requester": True}
 EXEMPTED = {"exclude_requester": True, "exempt_group": EXEMPT_REF}
+
+
+def test_requester_exemption_requires_current_membership_and_selection(
+    selection_case: SimpleNamespace,
+) -> None:
+    case = selection_case
+    roster = case.provider.roster
+    roster[SENDER] = requester(EXEMPT_GROUP)
+    roster[NATIVE_ALIAS] = requester(EXEMPT_GROUP)
+    configured(case, separation=EXEMPTED)
+    first = dynamic(case, (REQUESTER, APPROVER_A))
+    allowed = answered(case, first, SENDER)
+    assert allowed[EQUALITY] is True and allowed[EXEMPTION_USED] is True
+    entry = published(case, first["id"])
+    assert turn_check(case, entry, first["id"]) == CONTINUE
+    assert grant_check(case, entry, first["id"]) == CONTINUE
+
+    roster[SENDER] = requester()
+    before = len(resume_refusals(first["id"]))
+    assert turn_check(case, entry, first["id"]) == REFUSE
+    one_more_resume_refusal(first["id"], before, SENDER, code=EXCLUDED)
+    assert grant_check(case, entry, first["id"]) == REFUSE
+    one_more_resume_refusal(first["id"], before + 1, SENDER, code=EXCLUDED)
+    assert published(case, first["id"]) == entry
+
+    next_row = dynamic(case, (REQUESTER, APPROVER_A))
+    evidence = refused(case, next_row, SENDER, code=EXCLUDED)
+    assert evidence[EQUALITY] is True and evidence[EXEMPTION_USED] is False
+    roster[SENDER] = requester(EXEMPT_GROUP)
+    roster[NATIVE_ALIAS] = person(REQUESTER, groups=None)
+    refused(case, next_row, NATIVE_ALIAS, 503)
+    no_wake(case, next_row["id"])
+    roster[NATIVE_ALIAS] = requester(EXEMPT_GROUP)
+    assert answered(case, next_row, NATIVE_ALIAS)[EXEMPTION_USED] is True
+
+    unselected = dynamic(case, (APPROVER_A,))
+    refused(case, unselected, SENDER, code="selection_actor_not_selected")
+    no_wake(case, unselected["id"])
+    answered(case, unselected, NATIVE_A)
+
+
+def test_static_requester_exclusion_applies_without_a_selector(
+    selection_case: SimpleNamespace,
+) -> None:
+    case = selection_case
+    configured(case, ticket=False, static=EXCLUDE)
+    routes = agent_state(case.scope["agent"])["approval_routes"]
+    assert all("approver_ticket" not in route for route in routes.values())
+    row = ordinary(case, OTHER_ROUTE)
+    for account in (SENDER, NATIVE_ALIAS):
+        evidence = refused(case, row, account, code=EXCLUDED)
+        assert evidence[EQUALITY] is True and evidence[EXCLUSION] is True
+    no_wake(case, row["id"])
+    selection = answered(case, row, NATIVE_A)
+    assert selection[EQUALITY] is False and selection[EXCLUSION] is True
+    plain = ordinary(case, None)
+    response = answer_as(case, plain, SENDER)
+    assert (response.status_code, response.json()["resolved_by"]) == (200, SENDER)
 
 
 # --- AC2.1: canonical equality across accounts --------------------------------------
@@ -144,52 +203,6 @@ def test_omitted_separation_excludes_and_an_audited_operator_opt_out_permits_sel
 # --- AC2.3: the exemption is current membership, and waives only inequality -----------
 
 
-def test_an_exemption_waives_only_requester_inequality_while_membership_is_current(
-    selection_case: SimpleNamespace,
-) -> None:
-    """@spec REQUEST-APPROVAL-6: membership, removal, unavailability and an unselected actor.
-
-    The requester's directory groups decide, read fresh at answer and resume.
-    """
-    case = selection_case
-    roster = case.provider.roster
-    roster[SENDER] = requester(EXEMPT_GROUP)
-    roster[NATIVE_ALIAS] = requester(EXEMPT_GROUP)
-    configured(case, separation=EXEMPTED)
-    assert agent_state(case.scope["agent"])["approval_routes"][ROUTE]["separation"] == EXEMPTED
-
-    first = dynamic(case, (REQUESTER, APPROVER_A))
-    selection = answered(case, first, SENDER)
-    assert selection[EQUALITY] is True and selection[EXEMPTION_USED] is True, selection
-    entry = published(case, first["id"])
-    assert turn_check(case, entry, first["id"]) == CONTINUE
-
-    # The requester leaves the exempt group: the resume and a new answer refuse.
-    roster[SENDER] = requester()
-    roster[NATIVE_ALIAS] = requester()
-    before = len(resume_refusals(first["id"]))
-    assert turn_check(case, entry, first["id"]) == REFUSE
-    one_more_resume_refusal(first["id"], before, SENDER, code=EXCLUDED)
-    assert grant_check(case, entry, first["id"]) == REFUSE
-    one_more_resume_refusal(first["id"], before + 1, SENDER, code=EXCLUDED)
-
-    second = dynamic(case, (REQUESTER, APPROVER_A))
-    evidence = refused(case, second, SENDER, code=EXCLUDED)
-    assert evidence[EQUALITY] is True and evidence[EXEMPTION_USED] is False, evidence
-
-    # Membership the directory cannot report refuses as unavailable, never as exempt.
-    roster[SENDER] = requester(EXEMPT_GROUP)
-    roster[NATIVE_ALIAS] = person(REQUESTER, groups=None)
-    refused(case, second, NATIVE_ALIAS, 503)
-    roster[NATIVE_ALIAS] = requester(EXEMPT_GROUP)
-    assert answered(case, second, NATIVE_ALIAS)[EXEMPTION_USED] is True
-
-    # Exempt, but not selected: the exemption selects nobody.
-    third = dynamic(case, (APPROVER_A,))
-    refused(case, third, SENDER, code="selection_actor_not_selected")
-    answered(case, third, NATIVE_A)
-
-
 def test_an_exemption_without_exclusion_is_refused_at_write(
     operator_case: SimpleNamespace,
 ) -> None:
@@ -228,34 +241,6 @@ def test_the_requester_may_reject_on_an_exclusion_route(selection_case: SimpleNa
 
 
 # --- AC2.5: exclusion on a static route --------------------------------------------
-
-
-def test_a_static_exclusion_route_excludes_the_requester_without_a_selector(
-    selection_case: SimpleNamespace,
-) -> None:
-    """@spec REQUEST-APPROVAL-6: the sealed original invoker is the requester on a static route.
-
-    No selector is registered. An ordinary approval on the static exclusion
-    route refuses the requester on either account and admits another
-    approver; an ordinary route keeps ADR 0106 self-confirmation.
-    """
-    case = selection_case
-    configured(case, ticket=False, static=EXCLUDE)
-    stored = agent_state(case.scope["agent"])["approval_routes"]
-    assert stored[OTHER_ROUTE]["separation"] == EXCLUDE
-    assert not {"approver_ticket", "separation"} & set(stored[ROUTE])
-
-    row = ordinary(case, OTHER_ROUTE)
-    for native in (SENDER, NATIVE_ALIAS):
-        evidence = refused(case, row, native, code=EXCLUDED)
-        assert evidence[EQUALITY] is True, evidence
-    selection = answered(case, row, NATIVE_A)
-    assert selection[EQUALITY] is False and selection[EXCLUSION] is True, selection
-
-    plain = ordinary(case, None)
-    response = answer_as(case, plain, SENDER)
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "approved"
 
 
 # --- AC2.6: enabling needs a selecting tenant and a registered receiver ---------------

@@ -43,7 +43,7 @@ import copy
 import itertools
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -261,6 +261,7 @@ class _Fault:
     status: int
     headers: dict[str, str]
     body: Any
+    applied: bool = False
 
 
 class JiraFake:
@@ -305,6 +306,7 @@ class JiraFake:
         self._link_ids = itertools.count(10900)
         self._keys: dict[str, itertools.count[int]] = {}
         self._faults: list[_Fault] = []
+        self._before: list[tuple[str, Callable[[], None]]] = []
         self.app = self._build_app()
 
     # Clock ---------------------------------------------------------------
@@ -501,6 +503,15 @@ class JiraFake:
         issue.updated_ms = max(issue.updated_ms, stamp)
         return str(comment.id)
 
+    def delete_comment(self, comment_id: str | int) -> None:
+        """A person deletes the comment; it is gone from every listing and read.
+
+        https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/#api-rest-api-3-issue-issueidorkey-comment-id-delete
+        """
+
+        comment = self.comment(comment_id)
+        self.issues[comment.issue_id].comments.remove(comment)
+
     def move_issue(self, ref: TrackerIssueRef | int, new_key: str) -> None:
         """Move the issue to another project: a new key, the same id."""
 
@@ -567,18 +578,32 @@ class JiraFake:
         after: int = 0,
         headers: Mapping[str, str] | None = None,
         body: Any = None,
+        applied: bool = False,
     ) -> None:
         """The request of one of ``kinds`` made after ``after`` more such
-        requests answers ``status`` once."""
+        requests answers ``status`` once.
+
+        With ``applied`` the site carries the request out first and only its
+        answer is lost (a write that landed behind a gateway error), so the
+        caller sees ``status`` while the change stands. Such a write is not
+        counted in ``writes``, which counts only the writes the caller saw
+        accepted."""
 
         wanted = frozenset({kinds} if isinstance(kinds, str) else kinds)
-        self._faults.append(_Fault(wanted, after, status, dict(headers or {}), body))
+        self._faults.append(_Fault(wanted, after, status, dict(headers or {}), body, applied))
 
     def fail_next_page(self, *, after: int = 0) -> None:
         """The listing page (search, changelog or comments) read after ``after``
         more successful listing reads fails once with a 500."""
 
         self.fail_next(LISTINGS, status=500, after=after)
+
+    def before_next(self, kind: str, action: Callable[[], None]) -> None:
+        """Run ``action`` once, just before the site serves the next request of
+        ``kind``: something a person or another process does on the site's
+        side while the caller is between two of its reads."""
+
+        self._before.append((kind, action))
 
     def _fault_for(self, kind: str) -> _Fault | None:
         for fault in self._faults:
@@ -789,8 +814,15 @@ class JiraFake:
         if caller is None and not anonymous:
             return JSONResponse(payload("error_unauthorized"), status_code=401)
         self._caller_zone = caller.time_zone if caller is not None else "UTC"
+        for pending in self._before:
+            if pending[0] == recorded.kind:
+                self._before.remove(pending)
+                pending[1]()
+                break
         fault = self._fault_for(recorded.kind)
         if fault is not None:
+            if fault.applied:
+                await handler(request, recorded, caller)
             body = fault.body if fault.body is not None else payload("error_rate_limited")
             return JSONResponse(body, status_code=fault.status, headers=fault.headers)
         return await handler(request, recorded, caller)

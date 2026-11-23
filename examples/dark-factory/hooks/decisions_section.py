@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 NONE_DECLARATION = "None: the change follows directly from the acceptance criteria."
+# A line that is exactly this ends the section, as the next `## ` heading does. The
+# platform writes it before the lines it adds after the agent's text, so those
+# lines do not join a Decisions section the agent left last.
+SECTION_END = "---"
 # The section's nonblank lines may hold at most this many characters in total.
 # The cap is checked before any entry is parsed, so a body of any size is
 # decided in time linear in its length.
@@ -13,6 +17,9 @@ _SOURCES = ("plan", "plan review", "diff review")
 _REJECTED = ". Rejected: "
 _BECAUSE = ", because "
 _EVIDENCE = ") Evidence: "
+# A line citing an answer given on the ticket. It is not a numbered decision, so it
+# does not count toward the seven, and one line records each answer relied on.
+CITATION_PREFIX = "Answered on the ticket by "
 
 
 def _source_marker(line: str, start: int) -> tuple[int, int, str] | None:
@@ -69,9 +76,10 @@ def parse_decisions_section(body: object) -> list[dict[str, Any]]:
     if len(headings) != 1:
         raise ValueError("exactly one heading line must be ## Decisions")
     section = []
+    citations = 0
     size = 0
     for line in lines[headings[0] + 1 :]:
-        if line.startswith("## "):
+        if line.startswith("## ") or line == SECTION_END:
             break
         if line.strip():
             size += len(line)
@@ -79,8 +87,13 @@ def parse_decisions_section(body: object) -> list[dict[str, Any]]:
                 raise ValueError(
                     f"the Decisions section must be at most {MAX_SECTION_CHARACTERS} characters"
                 )
-            section.append(line)
-    if section == [NONE_DECLARATION]:
+            if line.startswith(CITATION_PREFIX) and line[len(CITATION_PREFIX) :].strip():
+                citations += 1
+            else:
+                section.append(line)
+    if section == [NONE_DECLARATION] and not citations:
+        return []
+    if not section and citations:
         return []
     if not 1 <= len(section) <= 7:
         raise ValueError("record one to seven decisions, or the sole None declaration")

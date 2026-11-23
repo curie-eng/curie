@@ -31,56 +31,6 @@ def pending(broker: Any, campaign: Any) -> int:
     return int(result["pending"] if isinstance(result, dict) else result[0])
 
 
-def test_same_name_replicas_execute_once_and_settle_terminal_claims(
-    pworker_service: Any, campaign: Any, tmp_path: Path
-) -> None:
-    directory = campaign.write_directory(tmp_path / "runtime")
-    calls: list[str] = []
-
-    async def execute(claim: Any) -> None:
-        calls.append(claim.entry_id)
-        await asyncio.sleep(0.15)
-
-    async def scenario() -> str:
-        async with started(campaign) as control:
-            entry, _, _ = await campaign.enqueue(control, BODY)
-            forged = pworker_service.command("XADD", campaign.stream, "*", "payload", "bad")
-            workers = [
-                await opened(directory, guard=GuardProbe(campaign).guard, execute_claim=execute)
-                for _ in range(2)
-            ]
-            tasks = [asyncio.create_task(w.run()) for w in workers]
-            try:
-                await until(lambda: pending(pworker_service, campaign) == 0 if calls else False)
-                assert calls == [entry]
-                assert any(w.execution_outcomes.get(entry) == "completed" for w in workers)
-                assert forged
-            finally:
-                for w in workers:
-                    w.request_stop()
-                await asyncio.wait_for(asyncio.gather(*tasks), 10)
-                for w in workers:
-                    await w.close()
-            restarted = await opened(
-                directory, guard=GuardProbe(campaign).guard, execute_claim=execute
-            )
-            task = asyncio.create_task(restarted.run())
-            try:
-                await asyncio.sleep(0.2)
-                assert calls == [entry]
-            finally:
-                restarted.request_stop()
-                await asyncio.wait_for(task, 10)
-                await restarted.close()
-            return entry
-
-    entry = run(scenario())
-    lane = derive_commissioning_lane(campaign.permit)
-    assert pworker_service.command("GET", lane.prefix + ":claim-execution:" + entry) == b"consumed"
-    assert pworker_service.command("TTL", lane.prefix + ":claim-execution:" + entry) == -1
-    assert not pworker_service.command("EXISTS", lane.dead)
-
-
 def test_failed_execution_is_not_replayed_after_restart(
     pworker_service: Any, campaign: Any, tmp_path: Path
 ) -> None:

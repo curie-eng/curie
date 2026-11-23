@@ -540,27 +540,6 @@ def test_installation_changed_preserves_work_and_current_installation_liveness(
     assert _work(number) == before_work and _requests(number) == before_requests
 
 
-@pytest.mark.parametrize("path", PATHS)
-def test_delegated_output_seam(factory: Any, monkeypatch: pytest.MonkeyPatch, path: str) -> None:
-    _client, github, _agent = factory
-    github.label_actor = {"id": 99, "login": "acme[bot]", "type": "Bot"}
-    number = github.plant_issue(age=timedelta(minutes=5))
-    _observe(factory, path, number)
-    assert [r["reason"] for r in _notices(number)] == ["actor_bot"]
-    seen = []
-
-    async def delegated(session: Any, issue: Any, notice: Any) -> bool:
-        seen.append((issue.issue_id, notice.label_event_id))
-        return True
-
-    monkeypatch.setattr("curie_api.factory_intake_notices.delegated_output_before_label", delegated)
-    number = github.plant_issue(age=timedelta(minutes=5))
-    github._etags["issues"] = '"delegated-label"'
-    _observe(factory, path, number)
-    assert (str(number), github.issues[number].event_id) in seen
-    assert _notices(number) == _work(number) == []
-
-
 def test_owed_backoff_and_metric(factory: Any) -> None:
     _client, github, _agent = factory
     reader = InMemoryMetricReader()
@@ -917,6 +896,30 @@ def _visible_notice(github: NoticeGitHub, number: int) -> str:
     comments = [c for c in _comments(github, number) if "curie-factory-intake-" in c["body"]]
     assert len(comments) == 1
     return comments[0]["body"].split("<!--", 1)[0]
+
+
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize("linked", [False, True])
+def test_connect_plan_notice_links_tokenless_console_page(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, path: str, linked: bool
+) -> None:
+    from apps.api.tests.test_identity_connect import connect_plan_settings
+
+    _, github, agent = factory
+    connect_plan_settings(monkeypatch)
+    if linked:
+        _link_labeller(agent, active=None)
+    number = github.plant_issue(age=timedelta(minutes=5))
+    _observe(factory, path, number)
+    visible = _visible_notice(github, number)
+    assert visible.rstrip().endswith(
+        "Connect your Claude plan: https://console.example.com/settings/claude-plan"
+    )
+    assert "/identity/connect/" not in visible
+    assert _notices(number)[0]["reason"] == (
+        "enrollment_inactive" if linked else "personal_owner_required"
+    )
+    assert _work(number) == [] and _requests(number) == []
 
 
 @pytest.mark.parametrize("path", PATHS)

@@ -387,7 +387,7 @@ def test_every_case_renders_the_prompt_file_and_the_case(case_id: str, variant: 
     if variant == STRICT:
         assert body == STRICT_SKILL.read_bytes().decode("utf-8").rstrip("\n")
     if variant == REMOVED:
-        assert not any(line.startswith("## 7. Diff review") for line in body.splitlines())
+        assert not any(line.startswith("## 8. Diff review") for line in body.splitlines())
         assert "review_diff" not in body and "diff-reviewer" not in body
         assert any(line.startswith("## Loop cap") for line in body.splitlines())
     assert render_prompt(case_id, variant) == rendered
@@ -405,7 +405,7 @@ def test_controls_apply_to_the_implementer_only() -> None:
 def test_the_removed_approval_control_raises_when_an_anchor_is_missing() -> None:
     skill = PROMPTS["implementer"].read_bytes().decode("utf-8")
     assert removed_final_approval_control(skill) != skill
-    without_diff_heading = skill.replace("## 7. Diff review", "## 7. Something else")
+    without_diff_heading = skill.replace("## 8. Diff review", "## 8. Something else")
     with pytest.raises(ValueError):
         removed_final_approval_control(without_diff_heading)
     spec = json.loads(REMOVED_APPROVAL.read_text(encoding="utf-8"))

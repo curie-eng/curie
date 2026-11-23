@@ -22,7 +22,6 @@ from typing import Any
 from approval_answer_support import (
     NATIVE_A,
     NATIVE_B,
-    actions,
     approval_row,
     published,
     turn_check,
@@ -119,6 +118,9 @@ def test_group_membership_is_read_through_the_dm_identity_at_answer_and_at_resum
     row = _registered_on_other(case)
     clients = _groups(case, dm=_Group(NATIVE_A), reply=_Group(NATIVE_B))
 
+    rejected = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver="main")
+    unauthenticated(case, row["id"], rejected, card_channel=DM_CHANNEL)
+    assert not (clients.dm.calls or clients.reply.calls or clients.default.calls)
     response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver="other")
     assert response.status_code == 200, response.text
     assert (response.json()["status"], response.json()["resolved_by"]) == ("approved", NATIVE_A)
@@ -158,28 +160,3 @@ def test_a_dm_group_that_refuses_is_not_overridden_by_the_reply_identity(
     response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver="other")
     assert response.status_code == 200, response.text
     assert clients.reply.calls == [] and clients.default.calls == []
-
-
-def test_a_receiver_of_the_reply_identity_cannot_answer_the_dm_row(
-    dm_case: SimpleNamespace,
-) -> None:
-    """@spec APPROVER-DM-3: the requester's own bot is not the DM card's bot.
-
-    Every group client admits approver A, so only the receiving identity
-    differs: the selected approver's interaction in the registered DM, as seen
-    by the reply identity's receiver, is not proof for this card. The same
-    interaction through the DM identity then approves exactly once.
-    """
-    case = dm_case
-    row = _registered_on_other(case)
-    clients = _groups(case, dm=_Group(NATIVE_A), reply=_Group(NATIVE_A))
-
-    response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver="main")
-    unauthenticated(case, row["id"], response, card_channel=DM_CHANNEL)
-    assert clients.reply.calls == []
-
-    response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver="other")
-    assert response.status_code == 200, response.text
-    resolved = actions(row["id"], "resolved")
-    assert len(resolved) == 1 and resolved[0]["actor"] == NATIVE_A, resolved
-    assert turn_check(case, published(case, row["id"]), row["id"]) == CONTINUE

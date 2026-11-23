@@ -113,7 +113,7 @@ pull policy for every candidate image.
 The install values this driver sets over the candidate base values:
 ``agentSandbox.runner.workspace.enabled=true``,
 ``worker.workspace.publicationCandidates.enabled=true`` (candidate retention
-is off by default and needs workspaces), ``worker.publication.
+defaults on when workspaces are on), ``worker.publication.
 reconcileMaxAttempts=2``, every forge address the proxy (above), and the fake
 model. The standing directive is a write-file plus ``[fake:publish-changes]``.
 ``CURIE_FACTORY_PUBLICATION_RECOVERY_REAL_MODEL=1`` replaces that directive
@@ -200,8 +200,7 @@ class Recovery(ci.CandidateInstall):
             self.inputs.pull_policy,
             owner={owner_key: owner_value},
         )
-        listing = {"apiVersion": "v1", "kind": "List", "items": manifests}
-        self.kubectl("create", "-f", "-", input_text=json.dumps(listing))
+        self.create_fixture_manifests(manifests)
         self.kubectl(
             "-n", ns, "wait", "--for=condition=Ready", f"pod/{prl.PROXY_NAME}", "--timeout=600s"
         )

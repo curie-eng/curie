@@ -14,10 +14,11 @@ copies the locked WorkItem's tuple, whether the installation runs service or
 personal mode, and a redelivery admits it once.
 
 The boundary is ``test_factory_slack_runtime``'s steering stack: the real API
-served over HTTP, the dispatcher's Bolt app, and the worker as ``run.build``
-composes it, over real Postgres and Valkey. Only the Slack Web API, GitHub REST
-and the Kubernetes API are stand-ins. Enrollment headers are seeded with raw
-SQL, standing in for #5377's enrollment writes; the other tenant comes from
+served over HTTP and the worker as ``run.build`` composes it, over real Postgres
+and Valkey. Owner checks start with the production receipt writer and enqueue.
+The cross-tenant case also runs through the dispatcher's Bolt app. Only the Slack
+Web API, GitHub REST and the Kubernetes API are stand-ins. Enrollment headers
+are seeded with raw SQL, standing in for #5377's enrollment writes. The other tenant comes from
 ``personal_execution_support``. Every check reads the durable rows, and the
 owner each request runs as is projected through a newly constructed worker
 ``BindingResolver``. Placeholder identifiers only.
@@ -243,11 +244,11 @@ def test_each_steer_by_anyone_but_the_current_owner_is_refused_beside_the_owners
     root = run.root_ts
 
     def live(body: str = "Please also update the changelog.") -> None:
-        runtime._admitted(stack.steer(owner.slack_user, body, thread_ts=root))
+        runtime._admitted(stack.steer_queued(owner.slack_user, body, thread_ts=root))
 
     def refused(user: str, reason: str) -> None:
         runtime._api_refused(
-            stack.steer(user, "Please rename the helper.", thread_ts=root),
+            stack.steer_queued(user, "Please rename the helper.", thread_ts=root),
             "admission_refused",
             reason,
         )

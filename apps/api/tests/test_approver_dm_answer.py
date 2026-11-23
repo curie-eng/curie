@@ -110,36 +110,35 @@ def test_a_copied_card_in_another_channel_supplies_no_authority(
     _approved(case, row)
 
 
-def test_another_person_in_the_same_dm_channel_is_refused(dm_case: SimpleNamespace) -> None:
-    """@spec APPROVER-DM-3: the actor must be the one selected recipient.
-
-    An outsider, and approver B (inside the ceiling and the approver role but
-    not selected), presenting the registered DM's channel id are refused with
-    no effect.
-    """
+def test_registered_dm_refuses_other_actors_receivers_and_email(
+    dm_case: SimpleNamespace,
+) -> None:
     case = dm_case
     row = _registered(case)
-    for native in (NATIVE_OUTSIDER, NATIVE_B):
+    for native in (NATIVE_B, NATIVE_OUTSIDER):
         response = dm_answer(case, row["id"], native, channel=DM_CHANNEL)
-        assert response.status_code in (401, 403), response.text
-        no_effect(case, row["id"], card_channel=DM_CHANNEL)
+        unauthenticated(case, row["id"], response, card_channel=DM_CHANNEL)
+    for receiver in ("other", "foreign"):
+        response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver=receiver)
+        unauthenticated(case, row["id"], response, card_channel=DM_CHANNEL)
+    email = email_answer(case, row["id"])
+    assert (email.status_code, email.json()) == (404, {"detail": "approval not found"})
+    no_effect(case, row["id"], card_channel=DM_CHANNEL)
     assert actions(row["id"], "resolved") == []
     _approved(case, row)
 
 
-def test_another_bot_identity_or_installation_is_refused(dm_case: SimpleNamespace) -> None:
-    """@spec APPROVER-DM-3: the receiving bot must be the route's identity.
-
-    Both other registrations list the origin binding and every roster human, so
-    only the identity (same installation) or the installation and workspace
-    differ. Each is refused with no effect.
-    """
+def test_dm_answer_requires_committed_card_registration(dm_case: SimpleNamespace) -> None:
     case = dm_case
-    row = _registered(case)
-    for receiver in ("other", "foreign"):
-        response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver=receiver)
-        unauthenticated(case, row["id"], response, card_channel=DM_CHANNEL)
-    _approved(case, row)
+    configured_dm(case)
+    row, request = dm_row(case)
+    for channel in (case.scope["address"], DM_CHANNEL):
+        response = dm_answer(case, row["id"], NATIVE_A, channel=channel)
+        unauthenticated(case, row["id"], response, card_channel=None)
+    email = email_answer(case, row["id"])
+    assert (email.status_code, email.json()) == (404, {"detail": "approval not found"})
+    no_effect(case, row["id"], card_channel=None)
+    _approved(case, register_dm_card(case, row, request))
 
 
 def test_an_operator_principal_is_refused_even_when_the_route_lists_it(
@@ -167,17 +166,6 @@ def test_an_operator_principal_is_refused_even_when_the_route_lists_it(
     assert denied[0]["evidence"]["kind"] == OPERATOR_REFUSED, denied[0]
     assert response.json() == {"detail": denied[0]["reason"]}, response.text
     no_effect(case, row["id"], card_channel=DM_CHANNEL)
-    _approved(case, row)
-
-
-def test_an_email_reply_cannot_answer_a_dm_card(dm_case: SimpleNamespace) -> None:
-    """@spec APPROVER-DM-3: the DM is the resolution surface; email is refused."""
-    case = dm_case
-    row = _registered(case)
-    response = email_answer(case, row["id"])
-    assert response.status_code in (401, 403, 404), response.text
-    no_effect(case, row["id"], card_channel=DM_CHANNEL)
-    assert actions(row["id"], "resolved") == []
     _approved(case, row)
 
 

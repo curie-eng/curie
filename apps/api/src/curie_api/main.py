@@ -64,7 +64,7 @@ from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
-from .lineage_reconciler import start_lineage_reconciler
+from .lineage_reconciler import start_lineage_reconciler, start_rule_settlement
 from .personal_custody_reconciler import start_personal_custody_reconciler
 from .protected_reconciler import ProtectedAdmissionReconciler
 from .remediation_admission import reconcile_admissions
@@ -107,8 +107,10 @@ from .routers import (
     identity_approvals,
     identity_authority,
     identity_connect,
+    identity_me,
     identity_operator,
     memory,
+    memory_rules,
     observability,
     personal_enrollments,
     provider_installations,
@@ -169,7 +171,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The shared client reaches the code host, so it trusts the operator's
     # code host CA bundle as well as the public roots (#3831).
     http_client = httpx.AsyncClient(
-        timeout=10.0, verify=code_host_verify(settings),
+        timeout=10.0,
+        verify=code_host_verify(settings),
         mounts=gateway_http_mounts(settings.channel_gateway_url),
     )
     app.state.http_client = http_client
@@ -288,6 +291,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.lineage_reconciler_task = start_lineage_reconciler(
         app.state.sessionmaker, settings, http_client
     )
+    # ADR 0287 (#5796): runs whatever the reconciler switches say.
+    app.state.rule_settlement_task = start_rule_settlement(app.state.sessionmaker, settings)
     app.state.ui_evidence_reconciler_task = start_ui_evidence_reconciler(
         app.state.sessionmaker, settings, http_client
     )
@@ -472,13 +477,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await evidence_task
                 except asyncio.CancelledError:
                     pass
-            lineage_task = getattr(app.state, "lineage_reconciler_task", None)
-            if lineage_task is not None:
-                lineage_task.cancel()
-                try:
-                    await lineage_task
-                except asyncio.CancelledError:
-                    pass
+            for name in ("lineage_reconciler_task", "rule_settlement_task"):
+                lineage_task = getattr(app.state, name, None)
+                if lineage_task is not None:
+                    lineage_task.cancel()
+                    try:
+                        await lineage_task
+                    except asyncio.CancelledError:
+                        pass
             task = getattr(app.state, "resume_reconciler_task", None)
             if task is not None:
                 task.cancel()
@@ -657,7 +663,8 @@ class HttpTelemetryMiddleware:
 
 # @spec HTTP-INVOCATION-EXECUTION-15
 def create_app(
-    *, http_identity_runtime: HttpInvocationRuntime | None = None,
+    *,
+    http_identity_runtime: HttpInvocationRuntime | None = None,
     http_identity_client: HttpIdentityClient | None = None,
 ) -> FastAPI:
     if (
@@ -751,11 +758,15 @@ def create_app(
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
     app.include_router(hook_wake.admin_router)
+    # Before `state.router`, so `_rules` never reaches the key/value namespace routes (#5801).
+    app.include_router(state.rules_router)
     app.include_router(state.router)
     app.include_router(state.internal_router)
     app.include_router(state.released_router)
     app.include_router(thread_attachments.internal_router)
     app.include_router(memory.router)
+    app.include_router(memory_rules.router)
+    app.include_router(memory_rules.decision_router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
     app.include_router(approval_recovery.router)
@@ -803,6 +814,7 @@ def create_app(
     app.include_router(identity_approvals.router)
     app.include_router(directory.router)
     app.include_router(identity_connect.router)
+    app.include_router(identity_me.router)
     app.include_router(identity.router)
     app.include_router(teams.router)
     app.include_router(agent_access.router)
@@ -832,7 +844,8 @@ def create_configured_app() -> FastAPI:
     if tls is None:
         return create_app(http_identity_runtime=runtime)
     return create_app(
-        http_identity_runtime=runtime, http_identity_client=HttpIdentityClient(tls_context=tls),
+        http_identity_runtime=runtime,
+        http_identity_client=HttpIdentityClient(tls_context=tls),
     )
 
 

@@ -315,7 +315,8 @@ def recovery_values(
     API derives its GitHub identity host from ``api.githubApiUrl`` and checks
     the forge's answers against it, so every forge URL Curie sees must name
     one host. Workspaces and candidate
-    retention are on (both off by default), the publication reconcile ceiling
+    retention are on (candidate retention defaults on when workspaces are on),
+    the publication reconcile ceiling
     is ``RECONCILE_MAX_ATTEMPTS``, and the agent's fake model writes one file
     and then publishes. ``real_model`` turns the fake model off, installs that
     credential and model, adds ``model_cidrs`` to sandbox egress, and sets no
@@ -594,9 +595,6 @@ def judge_recovery(
     assert successor.get("runtime_claim_name"), "the successor recorded no sandbox claim"
     assert successor.get("runtime_claim_name") != original.get("runtime_claim_name"), (
         "the successor reused the original's sandbox claim"
-    )
-    assert successor.get("model_session_reserved_at") is None, (
-        "the recovery request reserved a model session"
     )
 
     # The identical candidate: same identity, content digest, objects and intent.

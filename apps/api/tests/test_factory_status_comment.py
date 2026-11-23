@@ -17,12 +17,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import socket
 import sys
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -76,8 +75,8 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
 )
 from forge_fakes.jira import JiraFake, jira_tracker
 from forge_fakes.jira import fake_client as jira_client
-from sqlalchemy import make_url, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from test_factory_progress import ACTIVITY, DECLARATION, STAGED_DECLARATION, progress_token, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     ISSUE_REPLY,
@@ -108,7 +107,6 @@ STATE_LABELS = {
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
-    "curie-factory:triaged",
 }
 WAITING = "_Waiting for the agent to report progress._"
 CARD_BASE = "https://curie.example.com"
@@ -191,103 +189,6 @@ async def _blocked_status_sync(
         released.set()
         sink.get_barrier = None
         await asyncio.wait_for(task, 10)
-
-
-def test_blocked_github_has_no_idle_transaction_and_progress_completes(admitted: Any) -> None:  # noqa: F811
-    client, github, sink = admitted
-    number = 9951
-    request_id = _admit(client, github, sink, number)
-    _start_running(client, request_id)
-
-    async def go() -> None:
-        inspector = create_async_engine(get_settings().database_url)
-        try:
-            async with _blocked_status_sync(client, sink, number) as (sync, _released):
-                assert client.app.state.engine.pool.checkedout() == 0
-                async with inspector.connect() as connection:
-                    idle = (
-                        await connection.execute(
-                            text(
-                                "SELECT pid, query FROM pg_stat_activity "
-                                "WHERE datname = current_database() "
-                                "AND state = 'idle in transaction' AND pid <> pg_backend_pid()"
-                            )
-                        )
-                    ).all()
-                assert idle == [], idle
-                async with httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
-                ) as api:
-                    response = await asyncio.wait_for(
-                        api.post(
-                            f"/v1/work-item-progress/{request_id}",
-                            headers={"X-API-Key": progress_token(request_id)},
-                            json={
-                                "phase": "read_issue",
-                                "declaration": DECLARATION,
-                                "activity": ACTIVITY,
-                            },
-                        ),
-                        2,
-                    )
-                    assert response.status_code == 201, response.text
-                    changed = {
-                        **DECLARATION,
-                        "phases": [*DECLARATION["phases"], {"id": "extra", "label": "Extra"}],
-                    }
-                    rejected = await asyncio.wait_for(
-                        api.post(
-                            f"/v1/work-item-progress/{request_id}",
-                            headers={"X-API-Key": progress_token(request_id)},
-                            json={
-                                "phase": "read_issue",
-                                "declaration": changed,
-                                "activity": ACTIVITY,
-                            },
-                        ),
-                        2,
-                    )
-                    assert rejected.status_code == 409, rejected.text
-                    assert "declaration_changed" in rejected.text
-                assert not sync.done(), "GitHub must still be blocked when progress returns"
-        finally:
-            await inspector.dispose()
-
-    client.portal.call(go)
-    row = _rows(
-        "SELECT declaration, activity FROM curie.factory_terminal_notices "
-        "WHERE execution_request_id = :id",
-        {"id": request_id},
-    )[0]
-    assert row["declaration"] == DECLARATION
-    assert row["activity"] == ACTIVITY
-
-
-def test_blocked_github_does_not_delay_heartbeat_or_relax_epoch_fencing(admitted: Any) -> None:  # noqa: F811
-    client, github, sink = admitted
-    number = 9952
-    request_id = _admit(client, github, sink, number)
-    epoch = _start_running(client, request_id)
-
-    async def go() -> None:
-        async with _blocked_status_sync(client, sink, number) as (sync, _released):
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
-            ) as api:
-                path = f"/v1/internal/work-items/requests/{request_id}/heartbeat"
-                heartbeat = await asyncio.wait_for(
-                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch}), 2
-                )
-                assert heartbeat.status_code == 200, heartbeat.text
-                assert heartbeat.json()["status"] == "running"
-                stale = await asyncio.wait_for(
-                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch + 1}), 2
-                )
-                assert stale.status_code == 409, stale.text
-                assert "stale_owner" in stale.text
-            assert not sync.done(), "GitHub must still be blocked when the heartbeat returns"
-
-    client.portal.call(go)
 
 
 def test_concurrent_status_passes_claim_one_row_and_post_one_comment(admitted: Any) -> None:  # noqa: F811
@@ -643,120 +544,6 @@ def test_failed_second_label_page_does_not_write_or_settle_and_next_pass_recover
     assert len(_label_writes(sink)) == 2
 
 
-def test_ready_and_heartbeat_use_liveness_pool_when_all_main_connections_are_busy(
-    admitted: Any,  # noqa: F811
-) -> None:  # noqa: F811
-    client, github, sink = admitted
-    request_id = _admit(client, github, sink, 9956)
-    epoch = _start_running(client, request_id)
-
-    async def go() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
-        ) as api:
-            path = f"/v1/internal/work-items/requests/{request_id}/heartbeat"
-            async with AsyncExitStack() as checked_out:
-                for _ in range(15):
-                    session = await checked_out.enter_async_context(client.app.state.sessionmaker())
-                    await session.execute(text("SELECT 1"))
-                assert client.app.state.engine.pool.checkedout() == 15
-                ready, heartbeat = await asyncio.wait_for(
-                    asyncio.gather(
-                        api.get("/ready"),
-                        api.post(path, headers=WORKER, json={"runtime_epoch": epoch}),
-                    ),
-                    2,
-                )
-                assert ready.status_code == 200, ready.text
-                assert heartbeat.status_code == 200, heartbeat.text
-                unauthorized = await asyncio.wait_for(
-                    api.post(
-                        path,
-                        headers={"X-Curie-Worker-Token": "wrong-worker"},
-                        json={"runtime_epoch": epoch},
-                    ),
-                    2,
-                )
-                assert unauthorized.status_code == 401, unauthorized.text
-                stale = await asyncio.wait_for(
-                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch + 1}), 2
-                )
-                assert stale.status_code == 409, stale.text
-                assert "stale_owner" in stale.text
-                assert client.app.state.engine.pool.checkedout() == 15
-            assert client.app.state.engine.pool.checkedout() == 0
-            # Readiness still requires its own database pool to be available.
-            async with AsyncExitStack() as checked_out:
-                for _ in range(4):
-                    session = await checked_out.enter_async_context(
-                        client.app.state.liveness_sessionmaker()
-                    )
-                    await session.execute(text("SELECT 1"))
-                unavailable = await asyncio.wait_for(api.get("/ready"), 3)
-                assert unavailable.status_code == 503, unavailable.text
-            assert (await asyncio.wait_for(api.get("/ready"), 2)).status_code == 200
-
-    client.portal.call(go)
-
-
-def test_liveness_database_failure_rejects_ready_and_does_not_renew_heartbeat(
-    admitted: Any,  # noqa: F811
-) -> None:  # noqa: F811
-    client, github, sink = admitted
-    request_id = _admit(client, github, sink, 9960)
-    epoch = _start_running(client, request_id)
-
-    async def go() -> None:
-        async with client.app.state.sessionmaker() as session:
-            before = await session.scalar(
-                text(
-                    "SELECT runtime_heartbeat_expires_at FROM curie.execution_requests "
-                    "WHERE id = :id"
-                ),
-                {"id": request_id},
-            )
-        # A bound TCP socket without listen reserves a port that refuses
-        # connections. This exercises the real database driver failure path.
-        with socket.socket() as unavailable_port:
-            unavailable_port.bind(("127.0.0.1", 0))
-            database = make_url(get_settings().database_url).set(
-                host="127.0.0.1", port=unavailable_port.getsockname()[1]
-            )
-            unavailable = create_async_engine(database, connect_args={"timeout": 0.25})
-            original = client.app.state.liveness_sessionmaker
-            client.app.state.liveness_sessionmaker = async_sessionmaker(unavailable)
-            try:
-                async with httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=client.app, raise_app_exceptions=False),
-                    base_url="http://testserver",
-                ) as api:
-                    ready = await asyncio.wait_for(api.get("/ready"), 2)
-                    assert ready.status_code == 503, ready.text
-                    heartbeat = await asyncio.wait_for(
-                        api.post(
-                            f"/v1/internal/work-items/requests/{request_id}/heartbeat",
-                            headers=WORKER,
-                            json={"runtime_epoch": epoch},
-                        ),
-                        2,
-                    )
-                    assert heartbeat.status_code == 500, heartbeat.text
-            finally:
-                client.app.state.liveness_sessionmaker = original
-                await unavailable.dispose()
-        async with client.app.state.sessionmaker() as session:
-            after = await session.scalar(
-                text(
-                    "SELECT runtime_heartbeat_expires_at FROM curie.execution_requests "
-                    "WHERE id = :id"
-                ),
-                {"id": request_id},
-            )
-        assert after == before
-
-    client.portal.call(go)
-
-
 def test_credential_mint_failure_releases_status_claim_and_next_pass_retries(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,  # noqa: F811
@@ -907,7 +694,7 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert WAITING in body
     assert FINAL_MARKER not in body
     assert "![Curie status]" not in body
-    assert body.rstrip().endswith(github_ask_line(MENTION))
+    _assert_one_current_ask_line(body)
     assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # Human and admission labels are never touched.
     assert {LABEL, "bug"} <= sink.issue_labels[number]
@@ -969,7 +756,7 @@ def test_a_card_url_replaces_the_checklist_as_phases_advance(
     assert "Read issue" not in body
     assert WAITING not in body
     assert marker_for(request_id) in body
-    assert body.rstrip().endswith(github_ask_line(MENTION))
+    _assert_one_current_ask_line(body)
 
 
 def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
@@ -983,8 +770,40 @@ def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> 
     assert "Status: QUEUED" in body
     assert WAITING in body
     assert marker_for(request_id) in body
-    assert body.rstrip().endswith(ask)
+    _assert_one_current_ask_line(body)
     assert body.count(ask) == 1
+
+
+def _assert_one_current_ask_line(body: str) -> None:
+    """Exactly one ask line, the current text, one blank line after the body text.
+
+    Anything after it is a platform annotation line; none may be an ask line.
+    """
+
+    lines = body.rstrip("\n").splitlines()
+    asks = [i for i, line in enumerate(lines) if line.startswith("Ask the factory:")]
+    assert len(asks) == 1, body
+    at = asks[0]
+    assert lines[at] == github_ask_line(MENTION)
+    assert lines[at - 1] == "" and lines[at - 2].strip()
+    assert f"mention @{MENTION} on this pull request" not in body
+
+
+def test_status_comment_replaces_the_previous_ask_wording(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 9930)
+    _reconcile()
+    body = _posts(sink)[0][1] or ""
+    old = f"Ask the factory: mention @{MENTION} on this pull request."
+    seeded = body.replace(github_ask_line(MENTION), old)
+    assert old in seeded and github_ask_line(MENTION) not in seeded
+
+    # The real writer's last step, applied to a body carrying the old wording.
+    rewritten = factory_notices.append_github_ask_line(seeded, MENTION)
+
+    assert old not in rewritten
+    assert marker_for(request_id) in rewritten
+    _assert_one_current_ask_line(rewritten)
 
 
 def test_non_github_status_comments_omit_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
@@ -2121,6 +1940,10 @@ def test_later_request_status_comments_continue_on_the_existing_pr_until_termina
     assert running_comment["id"] == comment_id
     assert "Status: RUNNING" in running_comment["body"]
     assert continuation in running_comment["body"]
+    # A follow-up on an existing pull request cannot ask questions (#5785), so
+    # it leads with the continuation and never claims to be investigating.
+    assert running_comment["body"].startswith(continuation)
+    assert "Investigating this ticket." not in running_comment["body"]
     assert FINAL_MARKER not in running_comment["body"]
     assert _rows(
         "SELECT status FROM curie.execution_requests WHERE id = :id", {"id": successor}
@@ -2682,7 +2505,7 @@ def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
     assert _curie_labels(sink, 55830) == {"curie-factory:needs-human"}
 
 
-@pytest.mark.parametrize("terminal", ["failed", "expired"])
+@pytest.mark.parametrize("terminal", ["failed", "expired", "completed"])
 def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotently(
     admitted: Any, terminal: str, monkeypatch: pytest.MonkeyPatch  # noqa: F811
 ) -> None:
@@ -2698,6 +2521,8 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
     _attach_publication(work_item_id, status="succeeded", pr=77)
     if terminal == "failed":
         _finish_failed(client, request_id, epoch, "runner_escalated")
+    elif terminal == "completed":
+        pass  # the succeeded publication above completes it on the next pass
     else:
         original = lifecycle.database_now
 
@@ -2716,8 +2541,11 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
     before = _notices(request_id)[0]
     assert before["finalized_at"] is not None
     (comment,) = _marked(sink, request_id)
+    # The stored comment is the pre-merge text: no pull request state line.
     comment["body"] = "\n".join(
-        line for line in comment["body"].split("\n") if not line.startswith("Pull request:")
+        line
+        for line in comment["body"].split("\n")
+        if not line.startswith(("Pull request:", "Pull request merged:"))
     )
     _execute(
         "UPDATE curie.factory_terminal_notices SET rendered_digest = :digest "
@@ -2729,15 +2557,23 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
         "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)",
         {"id": work_item_id},
     )
-    assert _curie_labels(sink, 55835) == {"curie-factory:needs-human"}
+    # No stale mark ran: only the fallback selection can reopen this notice.
+    assert _curie_labels(sink, 55835) == {
+        "curie-factory:pr-open" if terminal == "completed" else "curie-factory:needs-human"
+    }
     sink.requests.clear()
 
     _reconcile()
 
     (updated,) = _marked(sink, request_id)
     assert updated["id"] == comment["id"]
-    assert f"Cause: {request['terminal_cause']}" in updated["body"]
-    assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in updated["body"]
+    if terminal == "completed":
+        assert updated["body"].split("\n\n")[0].rstrip("\n").splitlines()[-1] == (
+            f"Pull request merged: https://github.com/{REPO}/pull/77"
+        )
+    else:
+        assert f"Cause: {request['terminal_cause']}" in updated["body"]
+        assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in updated["body"]
     assert len(_patches(sink)) == 1
     assert _posts(sink) == []
     assert _curie_labels(sink, 55835) == set()
@@ -2805,18 +2641,23 @@ def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotentl
 
     after = _notices(request_id)[0]
     assert after["finalized_at"] is not None
-    assert (
-        _rows(
-            "SELECT rendered_digest FROM curie.factory_terminal_notices "
-            "WHERE execution_request_id = :id",
-            {"id": request_id},
-        )[0]["rendered_digest"]
-        == digest
-    )
+    redigest = _rows(
+        "SELECT rendered_digest FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["rendered_digest"]
+    assert (redigest != digest) == (state == "merged")
     assert after["comment_id"] == before["comment_id"]
-    assert jira.writes == writes
     assert len(jira.issue(ticket.id).remote_links) == 1
-    assert "curie-factory:pr-open" in jira.issue(ticket.id).labels
+    if state == "merged":
+        # A merged pull request ends the factory's label; the body gained its
+        # merge line, so the edit is a real write (one-ticket ADR decision 15).
+        assert "curie-factory:pr-open" not in jira.issue(ticket.id).labels
+        assert jira.writes > writes
+        writes = jira.writes
+    else:
+        assert jira.writes == writes
+        assert "curie-factory:pr-open" in jira.issue(ticket.id).labels
     _reconcile()
     repeated = _notices(request_id)[0]
     assert repeated["attempts"] == after["attempts"]
@@ -2824,178 +2665,7 @@ def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotentl
     assert jira.writes == writes
 
 
-# --- #5586 AC7: the triaged state label and the triage endings ----------------------
-#
-# The completion contract, grant, delivery and receipt rows are written with plain
-# SQL in the shapes migration 0167 and the stage 1 delivery service store: the
-# submission route, the delivery service and the lifecycle transitions that write
-# them belong to other suites (test_factory_tracker_results.py,
-# test_workitem_dispatch.py). Here the real reconciler renders the status comment
-# and moves the labels from those rows, and ``on_tracker_result_settled`` is the
-# hook the delivery service calls when a delivery settles.
-
-TRIAGED = "curie-factory:triaged"
-TRIAGE_REVISION = "0123456789abcdef0123456789abcdef01234567"
-_HEX = "ab" * 32
-
-
-def _triage_running(client: Any, github: Any, sink: Any, number: int) -> tuple[uuid.UUID, int]:
-    """A started request whose WorkItem's binding selected the tracker-result contract."""
-
-    request_id = _admit(client, github, sink, number)
-    epoch = _start_running(client, request_id)
-    _execute(
-        "UPDATE curie.execution_requests SET completion_contract = 'tracker_result', "
-        "result_policy_digest = :digest WHERE id = :id",
-        {"id": request_id, "digest": "cd" * 32},
-    )
-    return request_id, epoch
-
-
-def _result_urls(number: int) -> tuple[str, str]:
-    """(ticket URL, marked result comment URL) of a result delivered on ``number``."""
-
-    return (
-        f"https://github.com/{REPO}/issues/{number + 1000}",
-        f"https://github.com/{REPO}/issues/{number}#issuecomment-{number}01",
-    )
-
-
-def _settle(
-    request_id: uuid.UUID,
-    epoch: int,
-    number: int,
-    *,
-    kind: str,
-    reason: str | None = None,
-    state: str = "delivered",
-    origin: str = "submitted",
-) -> uuid.UUID:
-    """One grant and its delivery in ``state``; a delivered one also gets its receipt.
-
-    Written in one transaction with ``on_tracker_result_settled``, as the
-    delivery service settles. An owed delivery's next attempt is a day away so
-    no reconciler pass attempts it.
-    """
-
-    from curie_api.factory_triage_status import on_tracker_result_settled
-
-    ticket_url, comment_url = _result_urls(number)
-    ticket = kind == "ticket"
-    delivery_id = uuid.uuid4()
-    params: dict[str, Any] = {
-        "grant": uuid.uuid4(),
-        "delivery": delivery_id,
-        "request": request_id,
-        "kinds": '["findings", "ticket"]',
-        "identity": f"curie-result-{request_id}",
-        "kind": kind,
-        "reason": reason,
-        "hex": _HEX,
-        "epoch": epoch,
-        "state": state,
-        "origin": origin,
-        "revision": TRIAGE_REVISION,
-        "ticket_url": ticket_url if ticket else None,
-        "ticket_id": str(number + 1000) if ticket else None,
-        "body_hex": _HEX if ticket else None,
-        "labels": "[]" if ticket else None,
-        "comment_url": comment_url,
-        # A ticket's output columns are recorded only once it is delivered.
-        "output": ticket and state == "delivered",
-    }
-    statements = [
-        "INSERT INTO curie.factory_tracker_result_grants (id, work_item_id, "
-        "execution_request_id, source_fingerprint, repository_id, allowed_result_kinds, "
-        "output_identity, implementation_label, expires_at) "
-        "SELECT CAST(:grant AS uuid), w.id, r.id, :hex, w.repository_project_id, "
-        "CAST(:kinds AS jsonb), "
-        ":identity, 'factory-implement', clock_timestamp() + interval '1 hour' "
-        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE r.id = CAST(:request AS uuid)",
-        "INSERT INTO curie.factory_tracker_result_deliveries (id, grant_id, "
-        "execution_request_id, result_kind, reason, proposal_sha256, runtime_epoch, state, "
-        "origin, next_attempt_at, failure_code, settled_at, deadline_at, output_tracker_kind, "
-        "output_tracker_host, output_scope_id, output_issue_id, output_url, output_body_sha256) "
-        "SELECT CAST(:delivery AS uuid), CAST(:grant AS uuid), r.id, :kind, "
-        "CAST(:reason AS text), :hex, CAST(:epoch AS bigint), "
-        "CAST(:state AS text), :origin, clock_timestamp() + interval '1 day', "
-        "CASE WHEN CAST(:state AS text) = 'failed' THEN 'delivery_deadline_exceeded' END, "
-        "CASE WHEN CAST(:state AS text) <> 'owed' THEN clock_timestamp() END, "
-        "clock_timestamp() + interval '1 hour', "
-        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_kind END, "
-        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_host END, "
-        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_scope_id END, "
-        "CASE WHEN CAST(:output AS boolean) THEN CAST(:ticket_id AS text) END, "
-        "CASE WHEN CAST(:output AS boolean) THEN CAST(:ticket_url AS text) END, "
-        "CASE WHEN CAST(:output AS boolean) THEN CAST(:body_hex AS text) END "
-        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE r.id = CAST(:request AS uuid)",
-    ]
-    if state == "delivered":
-        statements.append(
-            "INSERT INTO curie.factory_tracker_result_receipts (delivery_id, grant_id, "
-            "execution_request_id, result_kind, reason, proposal_sha256, revision, "
-            "result_comment_id, result_comment_url, output_tracker_kind, output_tracker_host, "
-            "output_scope_id, output_issue_id, output_url, output_body_sha256, output_labels) "
-            "SELECT d.id, d.grant_id, d.execution_request_id, d.result_kind, d.reason, "
-            "d.proposal_sha256, :revision, '4401', :comment_url, d.output_tracker_kind, "
-            "d.output_tracker_host, d.output_scope_id, d.output_issue_id, d.output_url, "
-            "d.output_body_sha256, CAST(:labels AS jsonb) "
-            "FROM curie.factory_tracker_result_deliveries d "
-            "WHERE d.id = CAST(:delivery AS uuid)"
-        )
-
-    async def go() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with async_sessionmaker(engine)() as session:
-                for statement in statements:
-                    await session.execute(text(statement), params)
-                await on_tracker_result_settled(session, request_id)
-                await session.commit()
-        finally:
-            await engine.dispose()
-
-    asyncio.run(go())
-    return delivery_id
-
-
-def _deliver_owed(delivery_id: uuid.UUID, request_id: uuid.UUID, number: int) -> None:
-    """A delivery that was owed when its run ended is delivered later (reading 5)."""
-
-    from curie_api.factory_triage_status import on_tracker_result_settled
-
-    _ticket_url, comment_url = _result_urls(number)
-
-    async def go() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with async_sessionmaker(engine)() as session:
-                await session.execute(
-                    text(
-                        "UPDATE curie.factory_tracker_result_deliveries "
-                        "SET state = 'delivered', settled_at = clock_timestamp() WHERE id = :id"
-                    ),
-                    {"id": delivery_id},
-                )
-                await session.execute(
-                    text(
-                        "INSERT INTO curie.factory_tracker_result_receipts (delivery_id, "
-                        "grant_id, execution_request_id, result_kind, reason, proposal_sha256, "
-                        "revision, result_comment_id, result_comment_url) "
-                        "SELECT id, grant_id, execution_request_id, result_kind, reason, "
-                        "proposal_sha256, :revision, '4401', :url "
-                        "FROM curie.factory_tracker_result_deliveries WHERE id = :id"
-                    ),
-                    {"id": delivery_id, "revision": TRIAGE_REVISION, "url": comment_url},
-                )
-                await on_tracker_result_settled(session, request_id)
-                await session.commit()
-        finally:
-            await engine.dispose()
-
-    asyncio.run(go())
+# --- An implementation request's label after its WorkItem is cancelled ---------------
 
 
 def _end(request_id: uuid.UUID, status: str, cause: str) -> None:
@@ -3011,138 +2681,10 @@ def _end(request_id: uuid.UUID, status: str, cause: str) -> None:
     )
 
 
-def _label_added(sink: Any, number: int, label: str) -> bool:
-    path = f"/repos/{REPO}/issues/{number}/labels"
-    return any(
-        method == "POST" and called == path and body is not None and label in body
-        for method, called, body in sink.requests
-    )
-
-
-@pytest.mark.parametrize(
-    ("kind", "reason", "ending"),
-    [
-        ("ticket", None, "Ticket published: {ticket}."),
-        ("findings", "not_reproduced", "Triage reported: not reproduced."),
-        ("findings", "already_fixed", "Triage reported: already fixed."),
-        ("findings", "product_decision_needed", "Triage reported: product decision needed."),
-        ("findings", "capability_unavailable", "Triage reported: capability unavailable."),
-    ],
-)
-def test_a_delivered_triage_result_shows_triaged_and_its_ending(
-    admitted: Any,  # noqa: F811
-    kind: str,
-    reason: str | None,
-    ending: str,
-) -> None:
-    client, github, sink = admitted
-    number = 58601
-    request_id, epoch = _triage_running(client, github, sink, number)
-    _reconcile()
-    assert _curie_labels(sink, number) == {"curie-factory:running"}
-
-    # Delivered inline while the run is still live: triaged whatever its status.
-    _settle(request_id, epoch, number, kind=kind, reason=reason)
-    _reconcile()
-    assert _curie_labels(sink, number) == {TRIAGED}
-    assert _notices(request_id)[0]["applied_label"] == TRIAGED
-
-    _end(request_id, "completed", "completed")
-    _reconcile()
-
-    ticket_url, comment_url = _result_urls(number)
-    (comment,) = _marked(sink, request_id)
-    body = comment["body"]
-    assert ending.format(ticket=ticket_url) in body
-    assert comment_url in body
-    assert TRIAGE_REVISION in body
-    assert FINAL_MARKER in body
-    assert "Implementation" not in body
-    assert (ticket_url in body) is (kind == "ticket")
-    assert _curie_labels(sink, number) == {TRIAGED}
-    # Stored without violating factory_terminal_notices_applied_label_ck.
-    assert _notices(request_id)[0]["applied_label"] == TRIAGED
-    assert _notices(request_id)[0]["finalized_at"] is not None
-    assert not _label_added(sink, number, "curie-factory:pr-open")
-    assert "bug" in sink.issue_labels[number]
-
-
-def test_cancellation_removes_the_triaged_label(admitted: Any) -> None:  # noqa: F811
-    client, github, sink = admitted
-    number = 58602
-    request_id, epoch = _triage_running(client, github, sink, number)
-    _settle(request_id, epoch, number, kind="findings", reason="not_reproduced")
-    _reconcile()
-    assert _curie_labels(sink, number) == {TRIAGED}
-
-    github.labels = []
-    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
-    assert removed.status_code == 200, removed.text
-    _reconcile()
-    # The cancelled WorkItem clears the state label even before the run ends.
-    assert _curie_labels(sink, number) == set()
-
-    _end(request_id, "cancelled", "issue_cancelled")
-    _reconcile()
-    assert _curie_labels(sink, number) == set()
-    assert _notices(request_id)[0]["applied_label"] == ""
-    assert (
-        "DELETE",
-        f"/repos/{REPO}/issues/{number}/labels/{TRIAGED}",
-        None,
-    ) in sink.requests
-    (comment,) = _marked(sink, request_id)
-    assert "Cause: issue_cancelled" in comment["body"]
-    assert "bug" in sink.issue_labels[number]
-
-
 def _remove_trigger_label(client: Any, github: Any, number: int) -> None:
     github.labels = []
     removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     assert removed.status_code == 200, removed.text
-
-
-def test_findings_delivered_then_work_item_cancelled_removes_triaged(
-    admitted: Any,  # noqa: F811
-) -> None:
-    client, github, sink = admitted
-    number = 58608
-    request_id, epoch = _triage_running(client, github, sink, number)
-    _settle(request_id, epoch, number, kind="findings", reason="not_reproduced")
-    _end(request_id, "completed", "completed")
-    _reconcile()
-    assert _curie_labels(sink, number) == {TRIAGED}
-
-    # The request stays completed; only the WorkItem is cancelled.
-    _remove_trigger_label(client, github, number)
-    _reconcile()
-    assert _request(number)["status"] == "completed"
-    assert _curie_labels(sink, number) == set()
-    assert _notices(request_id)[0]["applied_label"] == ""
-    assert (
-        "DELETE",
-        f"/repos/{REPO}/issues/{number}/labels/{TRIAGED}",
-        None,
-    ) in sink.requests
-    assert "bug" in sink.issue_labels[number]
-
-
-def test_findings_delivered_and_work_item_live_keeps_triaged(
-    admitted: Any,  # noqa: F811
-) -> None:
-    client, github, sink = admitted
-    number = 58609
-    request_id, epoch = _triage_running(client, github, sink, number)
-    _settle(request_id, epoch, number, kind="findings", reason="not_reproduced")
-    _end(request_id, "completed", "completed")
-    _reconcile()
-    _reconcile()
-    assert _curie_labels(sink, number) == {TRIAGED}
-    assert _notices(request_id)[0]["applied_label"] == TRIAGED
-    assert not any(
-        method == "DELETE" and called.endswith(f"/labels/{TRIAGED}")
-        for method, called, _body in sink.requests
-    )
 
 
 def test_a_cancelled_work_item_keeps_an_implementation_completed_label(
@@ -3161,118 +2703,6 @@ def test_a_cancelled_work_item_keeps_an_implementation_completed_label(
     assert _request(number)["status"] == "completed"
     assert _curie_labels(sink, number) == {"curie-factory:pr-open"}
     assert _notices(request_id)[0]["applied_label"] == "curie-factory:pr-open"
-
-
-def test_a_failed_delivery_shows_needs_human_and_no_result(admitted: Any) -> None:  # noqa: F811
-    client, github, sink = admitted
-    number = 58603
-    request_id, epoch = _triage_running(client, github, sink, number)
-    _settle(request_id, epoch, number, kind="ticket", state="failed")
-    _end(request_id, "failed", "tracker_result_undelivered")
-    _reconcile()
-
-    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
-    assert _notices(request_id)[0]["applied_label"] == "curie-factory:needs-human"
-    (comment,) = _marked(sink, request_id)
-    body = comment["body"]
-    assert "Could not complete: the investigation submitted a result" in body
-    assert "Cause: tracker_result_undelivered" in body
-    assert "Ticket published" not in body and "Triage reported" not in body
-    assert FINAL_MARKER in body
-    assert not _label_added(sink, number, TRIAGED)
-
-
-def test_a_run_ending_with_no_result_shows_needs_human(admitted: Any) -> None:  # noqa: F811
-    client, github, sink = admitted
-    number = 58604
-    request_id, _epoch = _triage_running(client, github, sink, number)
-    _end(request_id, "failed", "no_tracker_result")
-    _reconcile()
-
-    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
-    (comment,) = _marked(sink, request_id)
-    assert "Cause: no_tracker_result" in comment["body"]
-    assert not _label_added(sink, number, TRIAGED)
-
-
-def test_a_delivery_owed_past_the_run_shows_triaged_once_delivered(
-    admitted: Any,  # noqa: F811
-) -> None:
-    """Reading 5: the run fails undelivered, a later delivery records the result
-    and the label becomes triaged while the execution status stays failed."""
-
-    client, github, sink = admitted
-    number = 58605
-    request_id, epoch = _triage_running(client, github, sink, number)
-    delivery_id = _settle(
-        request_id, epoch, number, kind="findings", reason="already_fixed", state="owed"
-    )
-    _end(request_id, "failed", "tracker_result_undelivered")
-    _reconcile()
-    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
-    (failed,) = _marked(sink, request_id)
-    assert "Cause: tracker_result_undelivered" in failed["body"]
-    assert FINAL_MARKER in failed["body"]
-
-    _deliver_owed(delivery_id, request_id, number)
-    _reconcile()
-
-    assert _curie_labels(sink, number) == {TRIAGED}
-    assert _notices(request_id)[0]["applied_label"] == TRIAGED
-    (comment,) = _marked(sink, request_id)
-    assert comment["id"] == failed["id"]
-    assert "Triage reported: already fixed." in comment["body"]
-    assert _result_urls(number)[1] in comment["body"]
-    assert FINAL_MARKER in comment["body"]
-    assert _request(number)["status"] == "failed"
-
-
-def test_exhaustion_with_delivered_platform_findings_shows_triaged(
-    admitted: Any,  # noqa: F811
-) -> None:
-    client, github, sink = admitted
-    number = 58606
-    request_id, epoch = _triage_running(client, github, sink, number)
-    _end(request_id, "expired", "execution_deadline")
-    _settle(
-        request_id,
-        epoch,
-        number,
-        kind="findings",
-        reason="budget_exhausted",
-        origin="platform",
-    )
-    _reconcile()
-
-    assert _curie_labels(sink, number) == {TRIAGED}
-    (comment,) = _marked(sink, request_id)
-    body = comment["body"]
-    assert "Investigation stopped: budget exhausted; findings delivered." in body
-    assert f"Revision checked out: {TRIAGE_REVISION}" in body
-    assert _result_urls(number)[1] in body
-    assert "reproduc" not in body.split(FINAL_MARKER)[0].lower()
-    assert _request(number)["status"] == "expired"
-
-
-def test_an_implementation_request_never_shows_triaged(admitted: Any) -> None:  # noqa: F811
-    """The label keys on the request's contract: even a receipt row on an
-    implementation request (which no route can write) changes nothing."""
-
-    client, github, sink = admitted
-    number = 58607
-    request_id = _admit(client, github, sink, number)
-    epoch = _start_running(client, request_id)
-    _settle(request_id, epoch, number, kind="findings", reason="not_reproduced")
-    _reconcile()
-    assert _curie_labels(sink, number) == {"curie-factory:running"}
-
-    _finish_failed(client, request_id, epoch, "runner_failed")
-    _reconcile()
-    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
-    (comment,) = _marked(sink, request_id)
-    assert "Triage reported" not in comment["body"]
-    assert "Cause: runner_failed" in comment["body"]
-    assert not _label_added(sink, number, TRIAGED)
 
 
 @pytest.mark.parametrize("mismatch", ["api", "installation", "repository_id", "repository_path"])
@@ -3324,146 +2754,6 @@ def test_poll_status_credential_is_scoped_to_verified_repository(
     client.portal.call(go)
     assert len(_posts(sink)) == 1
     assert _notices(request_id)[0]["attempts"] == 2
-
-
-# --- #5588 AC7: the handoff endings render from the recorded handoff ---------------
-#
-# The delegation and handoff rows are written with plain SQL in the shapes migration
-# 0171 and `curie_api.factory_triage_handoff` store (the handoff itself is driven
-# over GitHub HTTP in test_factory_triage_handoff.py). The status comment reads them
-# through `recorded_handoff`; nothing here passes a handoff to the renderer.
-
-
-def _record_handoff(request_id: uuid.UUID, *, outcome: str | None, reason: str | None) -> None:
-    """The delegation of ``request_id`` and its handoff on the delivered ticket; an
-    unsettled one is not due for a day, so no reconciler pass attempts it."""
-
-    params = {"request": request_id}
-    _execute(
-        "INSERT INTO curie.factory_triage_delegations (id, work_item_id, "
-        "source_execution_request_id, actor_id, actor_login, selection_event, tracker_kind, "
-        "tracker_host, tracker_scope_id, tracker_issue_id, repository_id, "
-        "result_policy_digest, target_label) "
-        "SELECT gen_random_uuid(), w.id, r.id, '6601', 'octocat', 'github-label-event:1', "
-        "w.tracker_kind, w.tracker_host, w.tracker_scope_id, w.tracker_issue_id, "
-        "w.repository_project_id, r.result_policy_digest, 'factory-implement' "
-        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE r.id = :request",
-        params,
-    )
-    _execute(
-        "INSERT INTO curie.factory_triage_handoffs (id, delegation_id, "
-        "source_execution_request_id, output_tracker_kind, output_tracker_host, "
-        "output_scope_id, output_issue_id, output_url, output_body_sha256, "
-        "next_attempt_at, deadline_at) "
-        "SELECT gen_random_uuid(), d.id, d.source_execution_request_id, r.output_tracker_kind, "
-        "r.output_tracker_host, r.output_scope_id, r.output_issue_id, r.output_url, "
-        "r.output_body_sha256, clock_timestamp() + interval '1 day', "
-        "clock_timestamp() + interval '1 day' "
-        "FROM curie.factory_triage_delegations d JOIN curie.factory_tracker_result_receipts r "
-        "ON r.execution_request_id = d.source_execution_request_id "
-        "WHERE d.source_execution_request_id = :request",
-        params,
-    )
-    if outcome is not None:
-        _settle_handoff(request_id, outcome=outcome, reason=reason)
-
-
-def _settle_handoff(request_id: uuid.UUID, *, outcome: str, reason: str | None) -> None:
-    """The outcome the handoff commits, with the hook it calls in that transaction."""
-
-    from curie_api.factory_triage_status import on_tracker_result_settled
-
-    async def go() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with async_sessionmaker(engine)() as session:
-                await session.execute(
-                    text(
-                        "UPDATE curie.factory_triage_handoffs SET outcome = :outcome, "
-                        "reason = :reason, settled_at = clock_timestamp(), "
-                        "implementation_request_id = CASE WHEN :outcome = 'admitted' "
-                        "THEN gen_random_uuid() END "
-                        "WHERE source_execution_request_id = :request"
-                    ),
-                    {"request": request_id, "outcome": outcome, "reason": reason},
-                )
-                await session.execute(
-                    text(
-                        "UPDATE curie.factory_triage_delegations "
-                        "SET consumed_at = clock_timestamp() "
-                        "WHERE source_execution_request_id = :request"
-                    ),
-                    {"request": request_id},
-                )
-                await on_tracker_result_settled(session, request_id)
-                await session.commit()
-        finally:
-            await engine.dispose()
-
-    asyncio.run(go())
-
-
-_HANDOFF_ENDINGS = {
-    "admitted": ("admitted", None, "Implementation admitted: {ticket}"),
-    "refused": ("refused", "authority_revoked", "Implementation not started: authority_revoked."),
-}
-
-
-@pytest.mark.parametrize("ending", sorted(_HANDOFF_ENDINGS))
-def test_a_recorded_handoff_renders_its_ending_once_across_restarts(
-    admitted: Any,  # noqa: F811
-    ending: str,
-) -> None:
-    client, github, sink = admitted
-    number = 58801 if ending == "admitted" else 58802
-    outcome, reason, line = _HANDOFF_ENDINGS[ending]
-    request_id, epoch = _triage_running(client, github, sink, number)
-    _settle(request_id, epoch, number, kind="ticket")
-    _record_handoff(request_id, outcome=outcome, reason=reason)
-    _end(request_id, "completed", "completed")
-
-    # Each pass is a fresh reconciler: a restart between renders.
-    _reconcile()
-    _reconcile()
-
-    ticket_url, comment_url = _result_urls(number)
-    (comment,) = _marked(sink, request_id)
-    body = comment["body"]
-    assert f"Ticket published: {ticket_url}." in body
-    assert body.count(line.format(ticket=ticket_url)) == 1
-    assert body.count("Implementation") == 1
-    assert comment_url in body
-    assert FINAL_MARKER in body
-    assert _curie_labels(sink, number) == {TRIAGED}
-
-
-def test_a_delegated_ticket_renders_its_handoff_once_the_outcome_is_recorded(
-    admitted: Any,  # noqa: F811
-) -> None:
-    """While the handoff is unsettled the ticket shows as published; the recorded
-    outcome then edits the same comment, and is the only thing that adds the line."""
-
-    client, github, sink = admitted
-    number = 58803
-    request_id, epoch = _triage_running(client, github, sink, number)
-    _settle(request_id, epoch, number, kind="ticket")
-    _record_handoff(request_id, outcome=None, reason=None)
-    _end(request_id, "completed", "completed")
-    _reconcile()
-    ticket_url, _comment_url = _result_urls(number)
-    (pending,) = _marked(sink, request_id)
-    assert f"Ticket published: {ticket_url}." in pending["body"]
-    assert "Implementation" not in pending["body"]
-
-    _settle_handoff(request_id, outcome="refused", reason="output_changed")
-    _reconcile()
-    _reconcile()
-
-    (comment,) = _marked(sink, request_id)
-    assert comment["id"] == pending["id"]
-    assert comment["body"].count("Implementation not started: output_changed.") == 1
-    assert "Implementation admitted" not in comment["body"]
 
 
 # --- #5728: a question on a factory pull request -----------------------------

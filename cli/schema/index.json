@@ -94,6 +94,12 @@
       "version": "1.0"
     },
     {
+      "result": "ClusterAccessOutput",
+      "kind": "CliOutput",
+      "schema": "cluster-access.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ClusterDownOutput",
       "kind": "CliOutput",
       "schema": "cluster-down.schema.json",
@@ -109,7 +115,7 @@
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
-      "version": "1.6"
+      "version": "1.7"
     },
     {
       "result": "ClusterUpOutput",
@@ -146,12 +152,6 @@
       "kind": "CliOutput",
       "schema": "dark-factory-render.schema.json",
       "version": "2.0"
-    },
-    {
-      "result": "FactoryTriageRenderOutput",
-      "kind": "CliOutput",
-      "schema": "factory-triage-render.schema.json",
-      "version": "1.0"
     },
     {
       "result": "DeleteOutput",
@@ -199,13 +199,13 @@
       "result": "FactoryAppRegistrationOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "FactoryAppSetupOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "FactoryExplainOutput",
@@ -217,7 +217,7 @@
       "result": "FactoryIntakeOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "GithubAppOutput",
@@ -304,6 +304,12 @@
       "version": "2.2"
     },
     {
+      "result": "MemoryRulesOutput",
+      "kind": "CliOutput",
+      "schema": "memory-rules.schema.json",
+      "version": "1.1"
+    },
+    {
       "result": "MessageDryRunOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
@@ -325,7 +331,7 @@
       "result": "ModelCreditOutput",
       "kind": "CliOutput",
       "schema": "model-credit.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ObservabilityOnlyOutput",
@@ -367,7 +373,7 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "3.1"
+      "version": "4.0"
     },
     {
       "result": "PreflightOutput",
@@ -385,6 +391,12 @@
       "result": "PublicationPolicyOutput",
       "kind": "CliOutput",
       "schema": "publication-policy.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "FactoryProgressOutput",
+      "kind": "CliOutput",
+      "schema": "factory-progress.schema.json",
       "version": "1.0"
     },
     {
