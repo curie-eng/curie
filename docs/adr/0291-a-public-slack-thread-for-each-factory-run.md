@@ -14,24 +14,28 @@ neither repository access nor ownership of a personal run.
 
 ## Decision
 
-1. Use the factory agent's configured Slack progress destination. Reserve one
-   public root per WorkItem, keyed by WorkItem ID in a sibling table with its
-   own delivery state and outbox. A kickoff in the configured channel reuses
-   its thread and card. The public renderer owns every post and edit in a
-   reused thread, including replies to steering on private repositories.
-   For a kickoff elsewhere, reserve the public destination
-   during admission and keep replies already owed to the original thread at
-   that destination. An older run becomes eligible on its next request.
-   Serialize reservations and root acknowledgements so one Slack thread can
-   identify only one WorkItem.
-2. Before a public delivery, verify the destination through the app identity
-   that will post. Refuse a private, externally shared or unverifiable
-   destination and expose the reason to the operator. Render stage and outcome
-   from structured run state. Include the pull request and checks for its
-   observed head only when those details are shareable. Keep source text,
-   transcripts, free-form progress notes and restricted links out of public
-   messages and their outbox. A ready notification follows publication. A later
-   check result updates the card.
+1. An agent opts into public run threads by setting
+   `factory_public_slack_channel`. This clears its previous progress channel
+   in the same update. Refuse a new legacy destination while the public
+   destination is set. Verify exactly one Slack binding for the channel.
+   Tracker runs and off-channel kickoffs reserve their public root in a
+   separate table keyed by WorkItem, with its own delivery state and outbox.
+   Earlier workers cannot discover these roots. An in-channel kickoff reuses
+   its original thread and card, with the public renderer responsible for
+   subsequent posts and edits. Preserve deliveries owed at a different
+   origin. An older run becomes eligible on its next request. Serialize root
+   assignments across both tables so a thread identifies one WorkItem.
+2. Verify the channel is public in the posting workspace when configured and
+   before its first post. Refuse private, externally shared and unverifiable
+   destinations with an operator-visible reason. Render the root, card,
+   steering replies and refusals from structured facts suitable for the
+   audience. For a restricted repository omit its name and URLs. Include
+   the pull request and checks for its observed head only when shareable.
+   The API omits restricted pull request URLs in public threads. A worker
+   requires the API's affirmative shareability marker to print a URL there.
+   Keep source text, transcripts and free-form reports out of public messages
+   and their outbox. Notify readiness on publication. Later checks update
+   the card.
 3. Require a verified human mention in a mapped thread, a linked code-host
    account and current feedback authority for the repository. Personal work
    also requires the bound owner and current enrollment generation. Verify the
@@ -66,3 +70,9 @@ provider may accept a post before Curie records its acknowledgement, so
 redelivery may repeat a visible message even when there is a single logical
 event. Verification must inspect both the event count and the messages
 visible to each audience.
+
+Public deliveries remain owed across rollback and resume on upgrade. During
+a mixed-version deployment, an earlier API and worker together can add a
+private pull request URL to an in-channel kickoff where the sender already
+posted the issue link. A repository can also change visibility between the
+shareability check and Slack accepting a message.
