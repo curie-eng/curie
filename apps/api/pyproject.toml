@@ -17,6 +17,9 @@ dependencies = [
     "boto3>=1.43.55",
     "boto3-stubs[s3]>=1.43.57",
     "python-multipart>=0.0.18",
+    "av==19.0.2",
+    "numpy>=2.1",
+    "pywhispercpp==1.5.1",
     "kubernetes>=36.0.3",
     # GitHub App JWT signing (ADR-0092). Present transitively today; declared
     # because this package imports it directly.

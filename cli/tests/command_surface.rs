@@ -536,6 +536,24 @@ fn process_dev_help_lists_cluster_upgrade_matrix() {
 }
 
 #[test]
+fn process_regenerate_voice_fixtures_requires_a_source_checkout() {
+    let outside_checkout = tempfile::tempdir().expect("create an empty directory");
+    let output = Command::new(bin())
+        .current_dir(outside_checkout.path())
+        .env("KUBECONFIG", "/dev/null")
+        .args(["--json", "dev", "regenerate-voice-fixtures", "--check"])
+        .output()
+        .expect("run curie dev regenerate-voice-fixtures");
+    assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("usage error is a JSON object");
+    assert_eq!(
+        report["fix"],
+        "Run `curie dev regenerate-voice-fixtures` from a Curie source checkout."
+    );
+}
+
+#[test]
 fn process_dev_e2e_ci_selection_delegates_path_selection() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

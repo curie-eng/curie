@@ -9,6 +9,9 @@ pub(super) async fn run(action: DevAction) -> Result<()> {
             regenerate,
             durations,
         } => commands::dev_test_ratchets(regenerate, &durations).await,
+        DevAction::RegenerateVoiceFixtures { check } => {
+            emit(commands::dev_regenerate_voice_fixtures(check).await?)
+        }
         DevAction::TestEnv { action } => match action {
             TestEnvAction::Run { profile, command } => {
                 emit(commands::dev_test_env(&profile, &command).await?)

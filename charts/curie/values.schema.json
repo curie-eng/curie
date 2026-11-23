@@ -339,6 +339,7 @@
       "type": "object",
       "description": "Rendered as CURIE_FORGES (#4397); the api validates the entries. appId stays untyped like api.githubAppId.",
       "properties": {
+        "voiceModelClaim": {"type": "string"},
         "githubAppClientId": {"type": "string"},
         "githubAppClientSecretExistingSecret": {"type": "string"},
         "githubAppClientSecretExistingSecretKey": {"type": "string"},

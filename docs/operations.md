@@ -5232,3 +5232,36 @@ short-lived user token, and retains only the account link and display login.
 Without both client settings, the linking action is hidden and its routes
 answer 404. GitHub Enterprise Server uses the factory code host web and API
 bases. The callback requires HTTPS on the Console origin.
+
+### Factory voice drafts
+
+The API accepts voice feedback when its source adapter is configured and
+`FACTORY_VOICE_ENABLED=true`. For Helm installations, set
+`factory.voiceModelClaim` to the name of a pre-populated PVC in the release
+namespace. This mounts the claim read-only at `/var/run/curie/voice` and enables
+the API setting. An empty claim name leaves recognition off.
+
+Place `ggml-base.en.bin` in the root of the claim. The Linux API distribution
+uses the CPU build of pywhispercpp. The expected SHA-256 is
+`a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`.
+Obtain the file from the pinned model repository during provisioning and verify
+it before mounting the volume. A missing file or different digest disables
+recognition. For a standalone API, set `FACTORY_VOICE_MODEL_PATH` to the
+mounted file. [Model weights](https://huggingface.co/ggerganov/whisper.cpp/blob/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin)
+
+Budget memory for the API and its recognition child together. A one-CPU run
+of the short synthetic fixtures used 311 MiB peak child RSS. Longer recordings
+can use more. Set the API request and limit for the deployment’s observed API
+usage plus child memory.
+
+A source adapter reopens the original attachment for a pending draft and posts
+the transcript in the original conversation. Reply with `edit <code> <text>`
+to replace the displayed text, `confirm <code>` to submit it, or `reject <code>`
+to close the draft. An edit acknowledges the draft ID. The adapter then delivers
+the edited text with its new code, retrying delivery after an interruption. The
+deadline runs from intake.
+`FACTORY_VOICE_DRAFT_TTL_SECONDS` defaults to 900. Expiry and terminal decisions
+remove detailed source data and the transcript. A small receipt remains for
+deduplication indefinitely. The API checks for expired drafts every minute.
+The confirmation response reports whether steering queued the
+guidance or applied it to an execution request.

@@ -1306,8 +1306,16 @@
       ],
       "revision": "0189",
       "sha256": "5a1b78ea47b7451ad0f699efcf9f36ba6fe271e00242418ccf64e3c3ac16c500"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "0189"
+      ],
+      "revision": "0196",
+      "sha256": "cb93e8bfecb2b4c07e4bbc15717c25df76459a4f79fe662d59b215d2de6c77b4"
     }
   ],
-  "schema_head": "0189",
+  "schema_head": "0196",
   "schema_min": "0189"
 }

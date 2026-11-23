@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/regenerate-voice-fixtures/v1.json",
+  "title": "curie dev regenerate-voice-fixtures --json",
+  "description": "The fixture filenames and whether the command verified their bytes or wrote them.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "checked": {
+      "type": "boolean"
+    },
+    "fixtures": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "checked",
+    "fixtures"
+  ]
+}

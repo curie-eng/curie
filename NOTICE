@@ -11,6 +11,13 @@ crates/buzz-conformance/TRACE_SCHEMA.md. Block Buzz is licensed under the
 Apache License, Version 2.0. This is a design adaptation only; no Rust
 implementation code was copied.
 
+Factory voice feedback uses pywhispercpp and whisper.cpp (MIT), PyAV
+(BSD-3-Clause), the FFmpeg libraries distributed in PyAV's Linux wheels
+(LGPL version 3 or later), and NumPy. The Python distributions include
+their license notices. OpenAI's Whisper code and model weights are MIT
+licensed. Operators supply the model weights separately. The synthetic
+test recordings were generated with eSpeak NG (GPL-3.0-or-later).
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at

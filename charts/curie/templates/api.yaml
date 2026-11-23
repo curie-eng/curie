@@ -4,7 +4,8 @@
 {{- $connectorProxyPullSecrets = append $connectorProxyPullSecrets .name }}
 {{- end }}
 {{- if .Values.api.deploy }}
-{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity" "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) -}}
+{{- $voiceClaim := get (.Values.factory | default dict) "voiceModelClaim" | default "" -}}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FACTORY_VOICE_ENABLED" "factory.voiceModelClaim" "FORWARDED_ALLOW_IPS" "socket peer identity" "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) -}}
 {{- $checksumRefs := list
   (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseInitProjectSecretKey")
   (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.api.githubTokenExistingSecret "existingSecretKey" $.Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | fromYaml)
@@ -407,6 +408,8 @@ spec:
               value: {{ .Values.api.githubReviewIngressEnabled | quote }}
             - name: GITHUB_REVIEW_RECONCILER_INTERVAL_S
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
+            - name: FACTORY_VOICE_ENABLED
+              value: {{ ne $voiceClaim "" | quote }}
             - name: FACTORY_ENABLED
               value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
             - name: FACTORY_GITHUB_APP_CLIENT_ID
@@ -581,8 +584,13 @@ spec:
           {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
           {{- $httpIdentity := include "curie.httpIdentity.apiSecret" . }}
           {{- $providerCa := include "curie.httpIdentity.providerCaBundle" . }}
-          {{- if or $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
+          {{- if or $voiceClaim $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
           volumeMounts:
+            {{- if $voiceClaim }}
+            - name: factory-voice-model
+              mountPath: /var/run/curie/voice
+              readOnly: true
+            {{- end }}
             {{- include "curie.channelGateway.clientMount" . | nindent 12 }}
             {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
             {{- include "curie.factory.credentialMount" . | nindent 12 }}
@@ -592,8 +600,14 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
+      {{- if or $voiceClaim $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
       volumes:
+        {{- if $voiceClaim }}
+        - name: factory-voice-model
+          persistentVolumeClaim:
+            claimName: {{ $voiceClaim | quote }}
+            readOnly: true
+        {{- end }}
         {{- include "curie.channelGateway.clientVolume" . | nindent 8 }}
         {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- include "curie.factory.credentialVolume" . | nindent 8 }}
