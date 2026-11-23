@@ -433,6 +433,7 @@ _PERSONAL_RUNTIME_REFUSED_REPLY = (
 # spelling is runner/src/curie_runner/approval.py ``PROGRESS_TOOL_NAME``; the
 # worker cannot import the runner.
 _PROGRESS_TOOL_NAME = "mcp__curie__report_progress"
+_RUN_HANDOFF_TOOL_NAME = "mcp__curie__report_run_handoff"
 
 # Tools that only gather context: the runner's declared read-only set
 # (runner/src/curie_runner/side_effects.py ``CLAUDE_READONLY_TOOLS``) plus todo

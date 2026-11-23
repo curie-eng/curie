@@ -25,6 +25,7 @@ from test_factory_ci_wait import (
     _published,
     _reconcile,
     _reconcile_later,
+    _recorded_result,
     _set_base_ref,
     _set_metadata_ci,
     _terminal,
@@ -87,7 +88,9 @@ def test_superseded_cancellation_completes_without_a_repair_or_metadata_revision
     ]
     assert sink.ci_observations == [HEAD_A]
     assert sink.reruns == []
-    assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(_body(sink, published["id"])).startswith(
+        f"Completed: {published['pr_url']}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -187,7 +190,7 @@ def test_supersession_preserves_metadata_revision_freshness(
     assert _ci_turns(published["id"]) == []
     if fresh:
         assert _terminal(number) == ("completed", "completed")
-        assert _body(sink, published["id"]).startswith("Completed:")
+        assert _recorded_result(_body(sink, published["id"])).startswith("Completed:")
     else:
         assert _terminal(number) == ("running", None)
 

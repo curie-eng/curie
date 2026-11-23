@@ -584,6 +584,7 @@ _HTTP_OPERATIONS = [
     # Automated remediation nominations (AUTOMATED-REMEDIATION-6).
     "/v1/internal/remediation/nominations",
     "/v1/work-item-progress/{request_id}",
+    "/v1/work-item-progress/{request_id}/handoff",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",
     # Deliberate progress from a running turn (ADR 0130).

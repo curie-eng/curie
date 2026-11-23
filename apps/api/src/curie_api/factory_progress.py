@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.workitems.lifecycle import lock_active_request
 
+from .factory_run_handoff import RunHandoff
 from .models import ExecutionRequest, ExecutionRequestPhaseReport, FactoryStatusComment
 
 logger = logging.getLogger(__name__)
@@ -278,6 +279,39 @@ class RecordResult:
         "verification_exists",
     ]
     request_id: uuid.UUID | None = None
+
+
+async def record_run_handoff(
+    session: AsyncSession, *, token_request_id: uuid.UUID, body: RunHandoff
+) -> RecordResult:
+    """Record one optional handoff while the token's execution is still active."""
+
+    request = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.id == token_request_id).with_for_update()
+    )
+    if request is None:
+        await session.rollback()
+        return RecordResult("request_not_found")
+    if request.status not in {"running", "cancellation_requested"}:
+        await session.rollback()
+        return RecordResult("no_active_request", request.id)
+    # Legacy requests admitted before the status row existed may still report.
+    await session.execute(
+        insert(FactoryStatusComment)
+        .values(
+            execution_request_id=request.id,
+            work_item_id=request.work_item_id,
+            applied_label=None,
+        )
+        .on_conflict_do_nothing(index_elements=["execution_request_id"])
+    )
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(FactoryStatusComment.execution_request_id == request.id)
+        .values(run_handoff=body.model_dump(mode="json"), sync_invalidated=True)
+    )
+    await session.commit()
+    return RecordResult("recorded", request.id)
 
 
 async def record_report(

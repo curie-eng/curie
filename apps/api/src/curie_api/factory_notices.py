@@ -38,7 +38,7 @@ from typing import Any
 
 import httpx
 from curie_internal.factory_cause import cause_text as cause_text
-from curie_internal.factory_phase_view import PhaseView, phase_view
+from curie_internal.factory_phase_view import WAIT_CI_PHASE, PhaseView, phase_view
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -52,7 +52,11 @@ from .factory_comment_text import (
     redact_factory_comment,
     status_marker,
 )
-from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, pill_for
+from .factory_progress import (
+    VERIFICATION_PREFLIGHT_PHASE,
+    pill_for,
+    read_verification_observations,
+)
 from .factory_questions import (
     ANSWER_RECEIVED_LINE,
     QUESTIONS_ASKED,
@@ -65,6 +69,14 @@ from .factory_questions import (
 from .factory_questions import answer_started as _answer_started
 from .factory_reply_target import stored_reply_target
 from .factory_retry_policy import condition_text
+from .factory_run_handoff import (
+    RunHandoff,
+    agent_no_change_answer,
+    fallback_summary,
+    format_handoff,
+    safe_tracker_line,
+)
+from .factory_tracker_attention import live_lines
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
 from .forges.errors import ForgeError, NotFound, Unauthorized
@@ -377,6 +389,12 @@ _PAUSED_FOR_UPGRADE_LINE = (
 )
 
 
+def public_result_detail(cause: str, *, unchanged: bool, detail: str | None) -> str | None:
+    """Keep an issue's free-form agent final out of its recorded result."""
+
+    return None if cause in _AGENT_MESSAGE_CAUSES or unchanged else detail
+
+
 def desired_label(
     status: str,
     *,
@@ -551,7 +569,13 @@ def result_section(
         if retries_used > 0:
             text += f"{retries_used} of {AUTOMATIC_RETRY_LIMIT} automatic retries used.\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
-            text += _agent_message_block(detail.strip())
+            # The source is retained on the notice row, but the tracker gets
+            # only a bounded, neutralized excerpt. A model's final prose is
+            # never parsed into findings or verification facts.
+            excerpt = detail.strip()
+            if len(excerpt) > 1000:
+                excerpt = excerpt[:997].rstrip() + "..."
+            text += _agent_message_block(excerpt)
         elif cause in _PUBLICATION_REFUSAL_CAUSES and detail is not None and detail.strip():
             # The API refusal can quote caller-supplied paths (#3617): one line,
             # so it cannot add a ``Cause:`` line, and no HTML comment opener.
@@ -705,6 +729,8 @@ def _agent_message_block(message: str) -> str:
     """
 
     message = message.replace("\r\n", "\n").replace("\r", "\n")
+    if len(message) > 1000:
+        message = message[:997].rstrip() + "..."
     message = redact_factory_comment(message)
     message = message.replace("&", "&amp;")
     message = _break_html_comments(message)
@@ -752,6 +778,7 @@ def status_body(
     waiting_line: str | None = None,
     base_line: str | None = None,
     progress_line: str | None = None,
+    live_summary: str | None = None,
     lead_line: str | None = None,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
@@ -770,6 +797,8 @@ def status_body(
         parts.append(result.rstrip("\n"))
     elif lead_line:
         parts.append(lead_line)
+    if result is None and live_summary is not None:
+        parts.append(live_summary)
     if progress_line:
         parts.append(progress_line)
     elif card_url:
@@ -1506,7 +1535,13 @@ async def _render(
                 cause,
                 pr_url=pr_url,
                 feedback_url=request.reply_target_url,
-                detail=row.detail,
+                # Issue summaries use only attributed, bounded agent facts.
+                # PR replies retain their bounded, inert final-message quote.
+                detail=(
+                    public_result_detail(cause, unchanged=unchanged, detail=row.detail)
+                    if target.kind == "issue"
+                    else row.detail
+                ),
                 unchanged=unchanged,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
@@ -1564,6 +1599,7 @@ async def _render(
         row.declaration is not None
         or (result is not None and cause == "budget_exceeded")
         or follow_up_running
+        or result is None
     ):
         reports = list(
             await session.scalars(
@@ -1638,6 +1674,81 @@ async def _render(
     card_url = (
         None if progress_line or not base else f"{base}/v1/factory/cards/{row.card_token}.svg"
     )
+    live_summary: str | None = None
+    if result is None:
+        current_view = view or phase_view(
+            {"phases": [], "loops": []}, reports, request.status, cause
+        )
+        latest_live_note = next(
+            (report for report in reversed(reports) if report.note and report.note.strip()),
+            None,
+        )
+        state_line, update_line = live_lines(
+            status=request.status,
+            publishing=publishing,
+            retrying=retrying,
+            view=current_view,
+            note=latest_live_note.note if latest_live_note is not None else None,
+            note_at=latest_live_note.reported_at if latest_live_note is not None else None,
+            wait_at=(
+                next((r.reported_at for r in reversed(reports) if r.phase == WAIT_CI_PHASE), None)
+            ),
+            pr_open=bool(pr_url and pr_state == "open"),
+        )
+        live_summary = (
+            f"**{safe_tracker_line(state_line[:120])}**  \n{safe_tracker_line(update_line[:200])}"
+        )
+    ci_observation = await session.get(FactoryCiObservation, request.id)
+    if result is not None:
+        platform_checks: list[tuple[str, str | None, str, str]] = []
+        try:
+            observations = await read_verification_observations(session, request.id)
+        except ValueError:
+            observations = []
+            platform_checks.append(
+                ("Stored preflight evidence", None, "unverified", "platform observed preflight")
+            )
+        for preflight_observation in observations:
+            check = preflight_observation.check or "Declared checks"
+            if preflight_observation.delegated_to:
+                check += f" (delegated to {preflight_observation.delegated_to})"
+            state = {
+                "passed": "passed",
+                "failed": "failed",
+                "unavailable": "unverified",
+                "not_declared": "not run",
+            }[preflight_observation.outcome]
+            platform_checks.append(
+                (check, preflight_observation.command, state, "platform observed preflight")
+            )
+        if ci_observation is not None:
+            ci_state = "passed" if ci_observation.status == "completed" else "unverified"
+            platform_checks.append(("CI after the run", None, ci_state, "platform observed CI"))
+        run_handoff = None
+        if row.run_handoff is not None:
+            try:
+                run_handoff = RunHandoff.model_validate(row.run_handoff)
+            except ValueError:
+                logger.warning("invalid stored run handoff request=%s", request.id)
+        agent_answer = (
+            agent_no_change_answer(row.detail) if target.kind == "issue" and unchanged else None
+        )
+        if run_handoff is not None:
+            summary = format_handoff(
+                run_handoff,
+                no_pull_request=cause == "no_pull_request" and target.kind == "issue",
+                platform_checks=platform_checks,
+            )
+            if agent_answer is not None:
+                summary += f"**Agent-reported answer:** {agent_answer}\n"
+            result = summary + "\n### Recorded result\n" + result
+        else:
+            summary = fallback_summary(
+                platform_checks=platform_checks,
+                agent_detail=row.detail if cause in _AGENT_MESSAGE_CAUSES else None,
+                agent_answer=agent_answer,
+            )
+            result = result.rstrip("\n") + ("\n\n" + summary if summary else "")
     # A follow-up on an existing pull request cannot ask (pull_request_open),
     # so it carries the continuing line instead of the investigating line.
     admitted = aliased(ExecutionRequest)
@@ -1685,6 +1796,7 @@ async def _render(
         waiting_line=waiting_line,
         base_line=render_base_line(work_item, transition),
         progress_line=progress_line,
+        live_summary=live_summary,
         lead_line=lead_line,
     )
     if continuing:
@@ -1695,24 +1807,23 @@ async def _render(
     elif answer_started and (lead_line is None or result is not None):
         # A final body carries no lead line.
         body = redact_factory_comment(f"{ANSWER_RECEIVED_LINE}\n\n{body}")
-    observation = await session.get(FactoryCiObservation, request.id)
-    if observation is not None:
-        until = observation.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-        if observation.status == "observing":
+    if ci_observation is not None:
+        until = ci_observation.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if ci_observation.status == "observing":
             line = f"Checks are still being watched until {until}."
-        elif observation.status == "completed" and observation.observed_at is not None:
-            when = observation.observed_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        elif ci_observation.status == "completed" and ci_observation.observed_at is not None:
+            when = ci_observation.observed_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
             line = (
-                f"Checks passed on head {code_span(observation.head_sha)}, "
+                f"Checks passed on head {code_span(ci_observation.head_sha)}, "
                 f"observed at {when} after the run ended."
             )
-        elif observation.status == "expired":
+        elif ci_observation.status == "expired":
             line = "Checks were not verified within 24 hours."
         else:
-            line = f"Checks were not verified: {code_span(observation.reason or 'invalidated')}."
+            line = f"Checks were not verified: {code_span(ci_observation.reason or 'invalidated')}."
         body += f"\n\n{line}"
     mention = github_status_mention(settings, work_item.tracker_kind)
-    if mention is not None:
+    if mention is not None and target.kind in {"pull_request", "review_thread"}:
         body = append_github_ask_line(body, mention)
     return body
 

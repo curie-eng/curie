@@ -36,6 +36,7 @@ from test_github_plain_feedback import (
 from test_memory_rules_migration import _agent, _lineage
 
 REVISION = "0186"
+CURRENT_APP_REVISION = "0189"
 BELOW = "0185"
 TABLE = "thread_publication_lineages"
 COUNT_CHECK = "thread_publication_lineages_plain_feedback_revisions_ck"

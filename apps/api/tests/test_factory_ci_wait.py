@@ -371,6 +371,18 @@ def _body(sink: _CommentServer, request_id: uuid.UUID) -> str:
     return bodies[0]
 
 
+def _recorded_result(body: str) -> str:
+    """Inspect the original result on either side of the run outcome."""
+
+    if body.startswith("## Run outcome\n"):
+        marker = "### Recorded result\n"
+        assert body.count(marker) == 1
+        return body.split(marker, 1)[1]
+    marker = "\n\n## Additional run evidence\n"
+    assert body.count(marker) <= 1
+    return body.split(marker, 1)[0]
+
+
 def _terminal(number: int) -> tuple[str, str | None]:
     row = _request(number)
     return row["status"], row["terminal_cause"]
@@ -432,7 +444,7 @@ def test_pending_ci_keeps_the_request_running_until_green_completes_it(
 
     assert _terminal(number) == ("completed", "completed")
     body = _body(sink, published["id"])
-    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(body).startswith(f"Completed: {published['pr_url']}")
     assert "Note:" not in body
     assert _count_requests(number) == 1
     assert _ci_turns(published["id"]) == []
@@ -451,7 +463,7 @@ def test_green_ci_ignores_the_combined_status_pending_state(admitted: Any) -> No
     _reconcile()
 
     assert _terminal(number) == ("completed", "completed")
-    assert _body(sink, published["id"]).startswith("Completed:")
+    assert _recorded_result(_body(sink, published["id"])).startswith("Completed:")
 
 
 def test_a_failing_commit_status_is_a_failure_even_with_green_check_runs(
@@ -492,7 +504,7 @@ def test_no_checks_within_the_grace_period_completes_with_a_note(admitted: Any) 
 
     assert _terminal(number) == ("completed", "completed")
     body = _body(sink, published["id"])
-    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(body).startswith(f"Completed: {published['pr_url']}")
     assert "Note:" in body
     assert _ci_turns(published["id"]) == []
 
@@ -514,7 +526,9 @@ def test_a_dirty_pull_without_checks_fails_promptly_without_a_ci_fix(admitted: A
 
     assert _terminal(number) == ("failed", "merge_conflict")
     body = _body(sink, published["id"])
-    assert body.startswith("Could not complete: the pull request has merge conflicts")
+    assert _recorded_result(body).startswith(
+        "Could not complete: the pull request has merge conflicts"
+    )
     assert "Reason: merge_conflict" in body
     assert published["pr_url"] in body
     assert "Details:" in body
@@ -544,7 +558,9 @@ def test_a_pull_request_closed_unmerged_during_the_ci_wait_fails_as_pr_closed(
 
     assert _terminal(number) == ("failed", "pr_closed")
     body = _body(sink, published["id"])
-    assert body.startswith("Could not complete: a person closed the pull request without merging")
+    assert _recorded_result(body).startswith(
+        "Could not complete: a person closed the pull request without merging"
+    )
     assert "a person closed the pull request without merging it during the CI wait." in body
     assert "Cause: pr_closed" in body
     assert "Reason: pr_closed" in body
@@ -570,7 +586,7 @@ def test_a_pull_request_merged_during_the_ci_wait_still_completes(admitted: Any)
 
     assert _terminal(number) == ("completed", "completed")
     body = _body(sink, published["id"])
-    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(body).startswith(f"Completed: {published['pr_url']}")
     assert "pr_closed" not in body
     assert "curie-factory:needs-human" not in sink.issue_labels.get(number, set())
 
@@ -603,7 +619,7 @@ def test_null_pull_mergeability_waits_for_the_third_clean_observation(admitted: 
     assert _terminal(number) == ("completed", "completed")
     assert sink.pull_observations == [published["pr"]] * 3
     body = _body(sink, published["id"])
-    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(body).startswith(f"Completed: {published['pr_url']}")
     assert "Note: No CI checks appeared within 120 s." in body
     assert _ci_turns(published["id"]) == []
 
@@ -719,7 +735,7 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
     assert _terminal(number) == ("failed", "ci_failed")
     assert len(_ci_turns(request_id)) == 2
     body = _body(sink, request_id)
-    assert body.startswith("Could not complete:")
+    assert _recorded_result(body).startswith("Could not complete:")
     assert "Rounds: 3" in body
     assert "Fix the widget parser off-by-one" in body
     assert "Handle empty widget input" in body
@@ -833,7 +849,9 @@ def test_a_green_fix_round_completes_the_same_request(admitted: Any) -> None:
     _reconcile()
 
     assert _terminal(number) == ("completed", "completed")
-    assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(_body(sink, published["id"])).startswith(
+        f"Completed: {published['pr_url']}"
+    )
     assert len(_notices(published["id"])) == 1
     assert _count_requests(number) == 1
 
@@ -879,7 +897,9 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(
     _reconcile_later(21)
 
     assert _terminal(number) == ("completed", "completed")
-    assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(_body(sink, published["id"])).startswith(
+        f"Completed: {published['pr_url']}"
+    )
     assert _count_requests(number) == 1
 
 
@@ -911,7 +931,9 @@ def test_body_only_fix_without_a_metadata_policy_completes_from_recorded_failure
 
     assert _terminal(number) == ("completed", "completed")
     assert len(_ci_turns(published["id"])) == 1
-    assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(_body(sink, published["id"])).startswith(
+        f"Completed: {published['pr_url']}"
+    )
     assert _count_requests(number) == 1
 
 
@@ -956,8 +978,13 @@ def test_body_only_fix_without_a_usable_failing_record_ends_unverified(
     finally:
         valkey.close()
     _attach_fix(
-        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
-        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_A,
+        title="Correct the pull request description",
+        paths=[],
+        base_sha=HEAD_A,
     )
 
     _reconcile()
@@ -990,8 +1017,13 @@ def test_configured_metadata_policy_takes_precedence_over_recorded_failures(
     published = _published(client, github, sink, number)
     _reconcile()
     _attach_fix(
-        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
-        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_A,
+        title="Correct the pull request description",
+        paths=[],
+        base_sha=HEAD_A,
     )
 
     _reconcile()
@@ -1011,7 +1043,9 @@ def test_recorded_partial_metadata_rerun_reports_the_stale_failure_at_the_deadli
     number = 9796
     old_time = "2020-01-01T00:00:00Z"
     old_suite = check_run(
-        "Conversion suite", conclusion="failure", started_at=old_time,
+        "Conversion suite",
+        conclusion="failure",
+        started_at=old_time,
         summary="The unchanged commit still fails its suite.",
     )
     sink.ci_scripts = {
@@ -1031,8 +1065,13 @@ def test_recorded_partial_metadata_rerun_reports_the_stale_failure_at_the_deadli
     published = _published(client, github, sink, number)
     _reconcile()
     _attach_fix(
-        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
-        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_A,
+        title="Correct the pull request description",
+        paths=[],
+        base_sha=HEAD_A,
     )
 
     _reconcile()
@@ -1042,7 +1081,8 @@ def test_recorded_partial_metadata_rerun_reports_the_stale_failure_at_the_deadli
     _reconcile_later(3700)
     turns = _ci_turns(published["id"])
     assert [turn["event_id"] for turn in turns] == [
-        f"work-item-{published['id']}-ci-2", f"work-item-{published['id']}-ci-3",
+        f"work-item-{published['id']}-ci-2",
+        f"work-item-{published['id']}-ci-3",
     ]
     report = json.loads(turns[1]["text"].splitlines()[3])
     assert [check["name"] for check in report["failing_checks"]] == ["Conversion suite"]
@@ -1231,8 +1271,8 @@ def test_an_unpublished_fix_turn_before_the_deadline_is_terminal(admitted: Any) 
     assert _terminal(number) == ("failed", "ci_fix_unpublished")
     _reconcile()
     body = _body(sink, published["id"])
-    assert body.startswith("Could not complete:")
-    assert "without pushing a fix" in body.splitlines()[0]
+    assert _recorded_result(body).startswith("Could not complete:")
+    assert "without pushing a fix" in _recorded_result(body).splitlines()[0]
 
 
 def test_an_unpublished_fix_turn_with_a_publication_in_flight_defers(
@@ -1294,8 +1334,8 @@ def test_a_final_round_unpublished_fix_turn_after_an_earlier_fix_publication_is_
     assert _terminal(number) == ("failed", "ci_fix_unpublished")
     _reconcile()
     body = _body(sink, published["id"])
-    assert body.startswith("Could not complete:")
-    assert "without pushing a fix" in body.splitlines()[0]
+    assert _recorded_result(body).startswith("Could not complete:")
+    assert "without pushing a fix" in _recorded_result(body).splitlines()[0]
 
 
 def test_an_unpublished_fix_turn_defers_when_its_own_round_published(admitted: Any) -> None:
@@ -1676,7 +1716,7 @@ def test_unreadable_ci_ends_unverified_at_once(admitted: Any, entry: Any, reason
 
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
-    assert body.startswith("Could not complete:")
+    assert _recorded_result(body).startswith("Could not complete:")
     assert "CI could not be verified" in body
     assert f"Reason: {reason}" in body
     assert "BODYTEXT" not in body
@@ -1701,7 +1741,7 @@ def test_pending_forever_times_out_inside_the_ci_wait(admitted: Any) -> None:
 
     assert _terminal(number) == ("failed", "ci_timeout")
     body = _body(sink, published["id"])
-    assert body.startswith("Could not complete:")
+    assert _recorded_result(body).startswith("Could not complete:")
     assert "Pending checks:" in body
     assert "build" in body
 
@@ -1902,7 +1942,7 @@ def test_a_later_green_request_is_observed_while_older_ones_wait_on_ci(
 
     assert green_head in sink.ci_observations
     assert _terminal(9739) == ("completed", "completed")
-    assert _body(sink, later["id"]).startswith(f"Completed: {later['pr_url']}")
+    assert _recorded_result(_body(sink, later["id"])).startswith(f"Completed: {later['pr_url']}")
     assert all(_terminal(9730 + i) == ("running", None) for i in range(5))
 
 
@@ -2042,7 +2082,7 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
 
     assert green_head in sink.ci_observations
     assert _terminal(9759) == ("completed", "completed")
-    assert _body(sink, later["id"]).startswith(f"Completed: {later['pr_url']}")
+    assert _recorded_result(_body(sink, later["id"])).startswith(f"Completed: {later['pr_url']}")
     assert all(_terminal(9750 + i) == ("running", None) for i in range(4))
 
 
@@ -2314,9 +2354,7 @@ def test_a_refused_actions_rerun_falls_back_to_the_implementer_round(
     _client, _github, sink = admitted
     number = 9812
     job_id = 88121
-    sink.ci_script = [
-        ci_entry(_actions_failure("unit-tests", job_id, "2026-10-01T00:00:00Z"))
-    ]
+    sink.ci_script = [ci_entry(_actions_failure("unit-tests", job_id, "2026-10-01T00:00:00Z"))]
     sink.rerun_status = 403
     published = _published(_client, _github, sink, number)
     request_id = published["id"]
@@ -2915,9 +2953,8 @@ def test_a_failure_also_failing_on_the_base_completes_the_request(admitted: Any)
     assert _terminal(number) == ("completed", "completed")
     assert _ci_turns(published["id"]) == []
     body = _body(sink, published["id"])
-    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert _recorded_result(body).startswith(f"Completed: {published['pr_url']}")
     assert "Note: Also failing on the base branch, not caused by this change: pip-audit" in body
-
 
 
 def test_required_checks_missing_is_pending_then_unverified_at_the_deadline(admitted: Any) -> None:
@@ -2945,7 +2982,7 @@ def test_required_checks_missing_is_pending_then_unverified_at_the_deadline(admi
 
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
-    assert body.startswith("Could not complete:")
+    assert _recorded_result(body).startswith("Could not complete:")
     assert "label-gate" in body
     assert "for example a label" in body
     assert "Cause: ci_unverified" in body
@@ -2971,7 +3008,7 @@ def test_required_checks_green_completes_when_the_named_check_passed(admitted: A
     _reconcile()
 
     assert _terminal(number) == ("completed", "completed")
-    assert _body(sink, published["id"]).startswith("Completed:")
+    assert _recorded_result(_body(sink, published["id"])).startswith("Completed:")
 
 
 def test_required_checks_not_found_on_rules_keeps_a_green_completion(admitted: Any) -> None:
@@ -3015,7 +3052,7 @@ def test_required_checks_refused_names_the_rules_operation_and_never_completes(
 
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
-    assert body.startswith("Could not complete:")
+    assert _recorded_result(body).startswith("Could not complete:")
     assert "Reason: github_forbidden_get_branch_rules" in body
     assert "Get rules for a branch" in body
     assert 'GitHub said: "Resource not accessible by integration"' in body
@@ -3051,7 +3088,7 @@ def test_plan_gated_private_branch_rules_403_completes_like_no_rules(admitted: A
     _reconcile()
 
     assert _terminal(number) == ("completed", "completed")
-    assert _body(sink, published["id"]).startswith("Completed:")
+    assert _recorded_result(_body(sink, published["id"])).startswith("Completed:")
 
 
 def test_plan_gated_private_rules_still_require_classic_protection(admitted: Any) -> None:
@@ -3193,7 +3230,7 @@ def test_no_ci_with_a_refused_required_check_read_never_completes(admitted: Any)
     assert "Completed:" not in body
 
 
-def test_ci_fix_unpublished_terminal_notice_quotes_the_explanation(admitted: Any) -> None:
+def test_ci_fix_unpublished_terminal_notice_keeps_cause_without_agent_prose(admitted: Any) -> None:
     client, github, sink = admitted
     number = 55831
     sink.ci_script = [ci_failing()]
@@ -3216,7 +3253,8 @@ def test_ci_fix_unpublished_terminal_notice_quotes_the_explanation(admitted: Any
     assert finished.status_code == 200, finished.text
     _reconcile()
     body = _body(sink, published["id"])
-    assert "> I cannot repair this fixture." in body
+    assert "I cannot repair this fixture." not in body
+    assert "Agent's last message:" not in body
     assert [line for line in body.splitlines() if line.startswith("Cause:")] == [
         "Cause: ci_fix_unpublished"
     ]

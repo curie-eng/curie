@@ -11,7 +11,7 @@ plans or discussions produced by the developer's existing local workflow, includ
 open source or internal skills. New intent is also supported. Do not require those
 skills to be installed here or run them again to establish provenance.
 
-This is a text-only preparation skill. Use the host agent's existing capabilities;
+This is a text-first preparation skill. Use the host agent's existing capabilities;
 no specific model, provider, Python, parser package, container runtime or Curie
 deployment is required. Repository tests may need that repository's own tools.
 Missing tools are evidence gaps, not instructions to install dependencies.
@@ -103,6 +103,28 @@ corrections to earlier answers. Do not infer a decision merely because all headi
 contain prose. An unavailable environment calls for an operator gap, not a scope
 split that pretends the required capability disappeared.
 
+## Resolve start gates
+
+Before calling a specification selectable, inspect all source sections for an
+action that must happen **before implementation** and needs a person or external
+authority: architecture or security review, approval, a prerequisite merge,
+provisioning, or another sign-off. Distinguish that gate from an implementation
+choice the ticket explicitly delegates to the factory and from human evaluation
+that the developer approved for after the pull request. A developer's review of
+the ticket does not itself satisfy a separately required architecture review.
+
+For each start gate, record the exact source clause, required action, owner, and
+evidence that it has already happened. Verify a claimed completion against the
+linked review or repository state when accessible. If evidence is absent or
+unreadable, classify the ticket as **blocked for factory selection**; do not
+assume that a written design proves its required review occurred. Put the
+blocking action at the top of any published issue as
+`**Factory selection: BLOCKED — do not select for the factory.**`, followed by
+the reason and evidence needed. Keep the complete contract below it. Offer
+publish-only or a local draft, never publish-and-start, until the gate is
+resolved. Once resolved, update stale blocking prose and reassess the entire
+published issue before selection.
+
 ## Check verification feasibility
 
 Before final review, assess every acceptance criterion using the
@@ -158,10 +180,61 @@ for parallel execution or selection.
 
 ## Save and review
 
+### Tracker reading order
+
+For a new or materially revised ticket, place a short **At a glance** section
+before the full contract. Show the goal, selected base, current selection status,
+and a compact map from each acceptance-criterion number to a distinct outcome
+phrase taken from that criterion and its actual verification route. If a required
+review, approval or prerequisite remains unresolved, state the blocking action
+at the top as `**Factory selection: BLOCKED — do not select for the factory.**`.
+Use a prominent plain Markdown blockquote for the single action needed to clear
+that gate. Use a native tracker alert only when its readback preserves the same
+text. Keep status explicit; a colored bar or callout alone is insufficient.
+
+Order numbered Decisions and Acceptance criteria for review before assigning final
+numbers. Put an unresolved start gate first among Decisions, then the governing
+behavior, high-impact failure or safety decisions, upgrade behavior and supporting
+details. Put the criterion proving the central outcome first among Acceptance
+criteria, followed by important failure and safety outcomes, upgrade outcomes
+and supporting checks. Preserve explanatory dependencies when needed. This is a
+reading order; every item remains binding. Do not add a separate `Read first`
+list that repeats the priorities.
+
+Start each numbered Decision and Acceptance criterion with a short, complete,
+**bold one-line summary** of that item's decision or observable outcome. Put its
+full original description on the next visible line within the same numbered item.
+Start each numbered Precondition with a short bold topic lead-in and colon, then
+its full wording. Summaries and lead-ins must be grounded in their own item and
+add no new requirement, verdict or instruction. Keep every original detail,
+`Verified by:` field and `Runs in:` route visible. Do not use `Focus here` bullets,
+collapsed content, images, custom styling or an external console as the only
+place to read the contract. Use portable Markdown and inspect the actual rendered
+body in the target tracker; if a line break or alert changes the meaning, revise
+the Markdown and inspect it again before publication.
+
+For Markdown trackers, keep the summary and detail in one numbered item. Two
+trailing spaces after the summary create a visible line break; indent the detail
+and verification fields as continuations. Inspect the rendered list to confirm
+that summary, detail and verification fields remain one item.
+
+For an existing ticket, treat reordering as a material revision. Save the original
+source and a separate proposed final body. Move whole numbered items, keep each
+item's full description and verification fields together, renumber consecutively,
+and update every internal reference and the acceptance map. Record an old-to-new
+ID table in the local report and show that table with the complete changed body
+for developer review. If a reference cannot be remapped confidently, keep the
+revision local and flag the unresolved reference. A formatted draft does not
+establish factory readiness or authorize publication.
+Before review, compare source and draft item counts, each item's full wording,
+every verification field and route, and all numbered references. Record any
+intentional change in the local report. Formatting alone must not drop a detail.
+
 Read [references/specification.md](references/specification.md) for source-format
 preservation, the new-draft template and handoff rules. Preserve an existing issue
 or specification's structure, wording, criterion identifiers and human decisions
-when it already conveys the required substance. Propose targeted additions for
+when it already conveys the required substance, except for the reviewed
+priority-order revision described above. Propose targeted additions for
 actual gaps; do not rewrite sufficient material merely to fit the seven-section
 template. Use that template for new drafts without an established source format,
 including newly proposed child issues. Save the exact final body and a separate

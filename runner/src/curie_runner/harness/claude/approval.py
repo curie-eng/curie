@@ -129,6 +129,7 @@ def build_approval_server(
     managed_workspace: bool = False,
     include_request_approval: bool = True,
     progress_tool: SdkMcpTool[Any] | None = None,
+    run_handoff_tool: SdkMcpTool[Any] | None = None,
     turn_progress_tool: SdkMcpTool[Any] | None = None,
     memory_tools: Sequence[SdkMcpTool[Any]] = (),
     issue_tool: SdkMcpTool[Any] | None = None,
@@ -210,6 +211,8 @@ def build_approval_server(
     tools.append(publish_changes)
     if progress_tool is not None:
         tools.append(progress_tool)
+        if run_handoff_tool is not None:
+            tools.append(run_handoff_tool)
     elif turn_progress_tool is not None:
         tools.append(turn_progress_tool)
     tools.extend(memory_tools)

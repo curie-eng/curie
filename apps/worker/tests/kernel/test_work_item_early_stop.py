@@ -66,15 +66,18 @@ ISSUE_PROMPT = f"Resolve {ISSUE_URL}"
 PR_URL = f"https://github.com/{WORK_ITEM_REPO}/pull/77"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
 PROGRESS_TOOL = "mcp__curie__report_progress"
+RUN_HANDOFF_TOOL = "mcp__curie__report_run_handoff"
 # A credential shape the shared redaction policy (curie_telemetry.redact
 # ``github_pat``) replaces. Assembled so no literal token sits in the source.
 GITHUB_TOKEN = "gh" + "p_" + "A1b2C3d4" * 5
 
 
 class _Binding:
-
     async def identity_binding(
-        self, kind: str, adapter: str | None, address: str,
+        self,
+        kind: str,
+        adapter: str | None,
+        address: str,
     ) -> HttpIdentityBinding | None:
         """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
         agent_id = AGENT_ID
@@ -82,7 +85,8 @@ class _Binding:
             tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
             agent_id=agent_id,
             binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
-            binding_generation=1, http_identity_required=False,
+            binding_generation=1,
+            http_identity_required=False,
         )
 
     def _deployment(self) -> object:
@@ -270,7 +274,11 @@ class _WorkItems(AbsentRequesterContext):
         return started
 
     async def hold_for_approval(
-        self, request_id: uuid.UUID, *, runtime_epoch: int, **_: object,
+        self,
+        request_id: uuid.UUID,
+        *,
+        runtime_epoch: int,
+        **_: object,
     ) -> None:
         self.calls.append("hold_for_approval")
         assert runtime_epoch == self.starts[request_id].runtime_epoch
@@ -436,6 +444,29 @@ def test_a_zero_work_turn_is_reprompted_once_then_ends_as_early_stop(make_harnes
     asyncio.run(exercise())
 
 
+def test_a_context_only_turn_with_handoff_uses_early_stop_continuation(make_harness) -> None:
+    from curie_worker.kernel.constants import _EARLY_STOP_PROMPT
+
+    async def exercise() -> None:
+        opened, items, _ = await _run_execute(
+            make_harness,
+            [
+                [
+                    _tool("Read"),
+                    _tool(RUN_HANDOFF_TOOL),
+                    _done("Could not complete: verification was unavailable."),
+                ],
+                [_done("Could not complete: verification remains unavailable.")],
+            ],
+        )
+
+        assert len(opened) == 2
+        assert _EARLY_STOP_PROMPT in opened[1]
+        assert items.finishes[0]["cause"] == "early_stop"
+
+    asyncio.run(exercise())
+
+
 # --- W2: worked, never published -> continuation -> no_pull_request ---------------
 
 
@@ -534,6 +565,7 @@ def test_only_context_reads_end_as_early_stop(make_harness) -> None:
         (frozenset({"mcp__github__search_code", "mcp__github__read_file"}), "early_stop"),
         (frozenset({"mcp__curie__request_approval"}), "early_stop"),
         (frozenset({PROGRESS_TOOL}), "no_pull_request"),
+        (frozenset({"Read", RUN_HANDOFF_TOOL}), "early_stop"),
         (frozenset({"Bash"}), "no_pull_request"),
         (frozenset({"Edit"}), "no_pull_request"),
         (frozenset({"Write"}), "no_pull_request"),
@@ -626,8 +658,12 @@ def test_issue_4752_unpublished_revision_uses_the_recorded_pull_request(
 @pytest.mark.parametrize(
     ("tool", "prefixed"),
     [
-        ("Read", True), (PROGRESS_TOOL, True), ("Read", False),
-        (PROGRESS_TOOL, False), ("Bash", False), ("Bash", True),
+        ("Read", True),
+        (PROGRESS_TOOL, True),
+        ("Read", False),
+        (PROGRESS_TOOL, False),
+        ("Bash", False),
+        ("Bash", True),
     ],
 )
 @pytest.mark.parametrize("status", [SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT])
@@ -732,8 +768,13 @@ def test_a_missing_lineage_or_no_change_outcome_still_gets_a_continuation(
 @pytest.mark.parametrize(
     ("tool", "flagged"),
     [
-        ("Edit", False), ("Edit", True), ("Write", False), ("Write", True),
-        ("Bash", False), ("Bash", True), ("Read", True),
+        ("Edit", False),
+        ("Edit", True),
+        ("Write", False),
+        ("Write", True),
+        ("Bash", False),
+        ("Bash", True),
+        ("Read", True),
     ],
 )
 def test_a_no_change_reply_after_a_potential_write_still_gets_a_continuation(
@@ -753,6 +794,21 @@ def test_a_no_change_reply_after_a_potential_write_still_gets_a_continuation(
         assert len(opened) == 2
         assert "publish_changes" in opened[1]
         assert items.finishes[0]["detail"] == continuation
+        assert terminal
+
+    asyncio.run(exercise())
+
+
+def test_a_no_change_reply_with_handoff_telemetry_skips_continuation(make_harness) -> None:
+    async def exercise() -> None:
+        reply = "No changes needed: the existing pull request already covers this request."
+        opened, items, terminal = await _run_execute(
+            make_harness,
+            [[_tool("Read"), _tool(RUN_HANDOFF_TOOL), _done(reply)]],
+            publication_creator=_PublicationApi(_revision_lineage(PR_URL, "1700000000.000001")),
+        )
+        assert len(opened) == 1
+        assert items.finishes[0]["detail"] == reply
         assert terminal
 
     asyncio.run(exercise())
@@ -780,6 +836,7 @@ def test_an_unprefixed_reply_keeps_other_continuation_outcomes(
         assert terminal
 
     asyncio.run(exercise())
+
 
 def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
     from curie_worker.runner_client import RunnerWorkspaceSnapshot

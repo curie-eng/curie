@@ -576,7 +576,7 @@ def test_upgrade_with_triage_rows_drops_the_triage_schema_and_keeps_kept_rows(
 
     command.upgrade(alembic_config(), _head())
 
-    assert stamped_revision() == _head() == REVISION
+    assert stamped_revision() == _head()
     assert not set(TRIAGE_TABLES) & _tables()
     for table, columns in DROPPED_COLUMNS.items():
         assert not columns & column_names(table), table

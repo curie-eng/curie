@@ -582,6 +582,24 @@ The final reply is only the no pull request handoff. The first characters are
 `Could not complete:`. Copy this shape and fill the slots. The whole reply is
 under 1500 characters:
 
+Before that final reply, call `mcp__curie__report_run_handoff` when it is
+available. Name the next owner and action, any human decision needed now,
+open findings with owner and next step, and checks as passed, failed,
+unverified or not run. Put any later merge check in `later_gate`, separate
+from a decision that a person must make now. Mark every finding and check `agent_reported` in the
+tool arguments. Give each verification entry the numbered acceptance criteria
+it actually checks in `acceptance_criteria` (`AC1`, `AC2`, and so on); use
+separate entries when their states differ. Account for every numbered acceptance
+criterion in at least one entry, even when the run stopped before its check.
+Report unproved criteria as
+`unverified` or `not_run`, never as passed. In `check`, give one short line
+describing the behavior verified; in `command`, give the exact command from
+the verification table, including when it was not run. Include only public,
+bounded descriptions; do not claim a
+test passed from an intention to run it. If the tool refuses or is absent,
+continue with the normal final reply. The platform uses a conservative
+tracker summary in that case.
+
 Could not complete: <one sentence naming why the run stopped>
 Decisions needed:
 1. <one question a maintainer can answer>
@@ -607,6 +625,14 @@ platform posts that reply on the issue; you post nothing there yourself.
 ## 9. Finish (phase `publish`)
 
 Call report_progress with phase `publish`.
+Before `publish_changes`, call `mcp__curie__report_run_handoff` when available
+with the verified work still open, evidence states, next action and owner. Mark
+findings and checks `agent_reported`, map each verification entry to the
+numbered acceptance criteria it actually checks, and include the one-line
+behavior description, exact command and observed state. Account for every
+numbered acceptance criterion, including those still awaiting CI. Keep any
+later merge gate separate
+from a decision needed now. If the handoff tool fails, continue publication.
 
 In the pull request body and in your final reply, name the local ref a claim
 about a branch, the base or the remote was read from, for example "the local
@@ -655,6 +681,15 @@ is not such a case: ask on the ticket instead. Do not call
 `mcp__curie__publish_changes`. The final reply is the same no pull request
 handoff as "Loop cap". Copy that shape and nothing else. The first characters
 are `Could not complete:`. The whole reply is under 1500 characters:
+
+Before that final reply, call `mcp__curie__report_run_handoff` when available,
+including when a missing package or network route stopped work before the
+failing-test phase. Report the concrete reason in `next_action` or a finding,
+name the next owner and any human decision, and account for every numbered
+acceptance criterion with its actual command and `passed`, `failed`,
+`unverified`, or `not_run` state. If the handoff tool fails, still send the
+normal `Could not complete:` final reply; the tracker will attribute a bounded
+excerpt of that reply to the agent.
 
 Could not complete: <one sentence naming why the run stopped>
 Decisions needed:

@@ -173,6 +173,7 @@ from .progress import (
     PROGRESS_URL_ENV,
     ProgressActivity,
     build_progress_tool,
+    build_run_handoff_tool,
     factory_progress_requested,
     resolve_progress,
 )
@@ -1436,6 +1437,9 @@ def build_runner(
                     build_progress_tool(progress[1], progress[0], progress_activity)
                     if progress is not None
                     else None
+                ),
+                run_handoff_tool=(
+                    build_run_handoff_tool(progress[0]) if progress is not None else None
                 ),
                 turn_progress_tool=(
                     build_turn_progress_tool(turn_progress) if turn_progress is not None else None
