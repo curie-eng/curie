@@ -106,9 +106,20 @@ def run(body: Callable[[AsyncSession], Awaitable[None]]) -> None:
     asyncio.run(check())
 
 
-async def issue(s: AsyncSession, tenant: Tenant, evidence: SlackEvidence = EVIDENCE) -> str | None:
+async def issue(
+    s: AsyncSession,
+    tenant: Tenant,
+    evidence: SlackEvidence = EVIDENCE,
+    *,
+    allow_personal_issuer: bool = False,
+) -> str | None:
     return await connect.issue_for_sender(
-        s, tenant_id=tenant.id, provider="slack", channel_identity="example-bot", slack=evidence
+        s,
+        tenant_id=tenant.id,
+        provider="slack",
+        channel_identity="example-bot",
+        slack=evidence,
+        allow_personal_issuer=allow_personal_issuer,
     )
 
 
@@ -686,13 +697,13 @@ def test_connect_plan_personal_tokens_keep_cap_and_service_directory_rules(
         await s.delete(config)
         await s.flush()
         for _ in range(connect.MAX_ACCOUNT_TOKENS):
-            raw = await issue(s, tenant)
+            raw = await issue(s, tenant, allow_personal_issuer=True)
             assert raw
             row = await connect.live_token(s, raw)
             assert row.idp_issuer == person.idp_issuer
             row.created_at -= timedelta(minutes=2)
             await s.flush()
-        assert await issue(s, tenant) is None
+        assert await issue(s, tenant, allow_personal_issuer=True) is None
         get_settings().factory_model_auth_mode = "service"
         with pytest.raises(connect.ConnectRefused):
             await connect.live_token(s, raw)
@@ -713,7 +724,7 @@ def test_connect_plan_disabled_tenant_cannot_issue_without_directory(
         await s.delete(config)
         tenant.status = "disabled"
         await s.flush()
-        assert await issue(s, tenant) is None
+        assert await issue(s, tenant, allow_personal_issuer=True) is None
 
     run(body)
     get_settings.cache_clear()
@@ -1228,7 +1239,7 @@ def test_shared_issuer_connect_claims_depend_on_directory(
                 await session.delete(team)
                 await session.delete(person)
                 await session.flush()
-                token = await issue(session, tenant)
+                token = await issue(session, tenant, allow_personal_issuer=True)
                 assert token is not None
                 personal = await session.get(IdentityConnectToken, connect.hash_token(token))
                 directory = await session.get(
@@ -1384,6 +1395,156 @@ def test_connect_browser_proof_is_private_scoped_and_rechecks_deactivation(conne
         path + "/confirm", data={"csrf": csrf}, headers={"Origin": "https://testserver"}
     )
     assert refused.status_code == 401 and browser_links(tenant_id) == []
+
+
+DIRECTORY_ISSUER = "https://directory.example.com"
+_ADMISSION_SENDER = "U0EXAMPLE2"
+
+
+def _post_channel_admission(
+    *, drop_directory: bool, directory_issuer: str | None = None
+) -> tuple[dict, uuid.UUID]:
+    """Drive POST /channels/admission for one synthetic unlinked Slack sender."""
+    from contextlib import asynccontextmanager
+
+    from curie_api.models import Agent, AgentAccessPolicy, AgentChannel
+    from curie_api.routers import channels
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    address = "C0EXAMPLE" + uuid.uuid4().hex[:8].upper()
+
+    async def prepare() -> uuid.UUID:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                tenant, _, _, _ = await seed(session)
+                config = await session.get(TenantIdentityProvider, tenant.id)
+                assert config is not None
+                if drop_directory:
+                    await session.delete(config)
+                elif directory_issuer is not None:
+                    config.issuer = directory_issuer
+                team_id = await session.scalar(select(Team.id).where(Team.tenant_id == tenant.id))
+                assert team_id is not None
+                agent = Agent(tenant_id=tenant.id, name=f"acme-connect-scope-{uuid.uuid4().hex}")
+                session.add(agent)
+                await session.flush()
+                session.add_all(
+                    [
+                        AgentChannel(
+                            agent_id=agent.id,
+                            tenant_id=tenant.id,
+                            kind="slack",
+                            address=address,
+                            adapter="example-bot",
+                        ),
+                        AgentAccessPolicy(
+                            agent_id=agent.id,
+                            tenant_id=tenant.id,
+                            invocation_team_id=team_id,
+                        ),
+                    ]
+                )
+                await session.commit()
+                return tenant.id
+        finally:
+            await engine.dispose()
+
+    tenant_id = asyncio.run(prepare())
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        engine = create_async_engine(get_settings().database_url)
+        app.state.sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            yield
+        finally:
+            await engine.dispose()
+
+    app = FastAPI(lifespan=lifespan)
+    app.include_router(channels.router)
+    with TestClient(app, base_url="https://testserver") as client:
+        response = client.post(
+            "/channels/admission",
+            headers={"X-API-Key": get_settings().api_key},
+            json={
+                "kind": "slack",
+                "address": address,
+                "adapter": "example-bot",
+                "callers": [_ADMISSION_SENDER],
+                "slack": {
+                    "delivery": "app_mention",
+                    "user_id": _ADMISSION_SENDER,
+                    "event_user_team": "TEXAMPLE1",
+                },
+            },
+        )
+    assert response.status_code == 200, response.text
+    body: dict = response.json()
+    return body, tenant_id
+
+
+async def _token_issuers(tenant_id: uuid.UUID) -> list[str]:
+    engine = create_async_engine(get_settings().database_url)
+    try:
+        async with AsyncSession(engine) as session:
+            return list(
+                await session.scalars(
+                    select(IdentityConnectToken.idp_issuer).where(
+                        IdentityConnectToken.tenant_id == tenant_id
+                    )
+                )
+            )
+    finally:
+        await engine.dispose()
+
+
+def test_channel_admission_withholds_personal_issuer_without_a_directory(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No synced directory: admission issues nothing. The kickoff opt-in still does."""
+    connect_plan_settings(monkeypatch)
+    answer, tenant_id = _post_channel_admission(drop_directory=True)
+    assert answer == {"allowed": False, "restricted": True, "install_restricted": True}
+    assert asyncio.run(_token_issuers(tenant_id)) == []
+
+    async def opted_in() -> str | None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                raw = await connect.issue_for_sender(
+                    session,
+                    tenant_id=tenant_id,
+                    provider="slack",
+                    channel_identity="example-bot",
+                    slack=SlackEvidence(
+                        delivery="app_mention",
+                        user_id=_ADMISSION_SENDER,
+                        event_user_team="TEXAMPLE1",
+                    ),
+                    allow_personal_issuer=True,
+                )
+                await session.commit()
+                return raw
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(opted_in())
+    assert asyncio.run(_token_issuers(tenant_id)) == [ISSUER]
+
+
+def test_channel_admission_keeps_the_synced_directory_issuer(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connect_plan_settings(monkeypatch)
+    answer, tenant_id = _post_channel_admission(
+        drop_directory=False, directory_issuer=DIRECTORY_ISSUER
+    )
+    assert answer["allowed"] is False and answer["restricted"] is True
+    assert answer["connect_url"].startswith("https://console.example.com/api/identity/connect/")
+    assert asyncio.run(_token_issuers(tenant_id)) == [DIRECTORY_ISSUER]
 
 
 @pytest.mark.parametrize("connect_browser", ["/api"], indirect=True)
