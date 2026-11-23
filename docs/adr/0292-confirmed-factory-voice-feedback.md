@@ -2,7 +2,7 @@
 
 Date: 2026-11-23
 
-Status: Draft
+Status: Accepted
 
 ## Context
 
@@ -36,4 +36,6 @@ Calling a hosted transcription API would send audio outside the installation and
 
 ## Acceptance
 
-Maintainer approval is pending. On acceptance, record the maintainer, date and approval reference. The implementation lives in `apps/api/src/curie_api/factory_voice.py` (drafts and admission), `apps/api/src/curie_api/factory_voice_child.py` (offline recognition) and `charts/curie/templates/api.yaml` (model mount). [Implementation PR](https://github.com/curie-eng/curie/pull/5938)
+The maintainer accepted local transcription with author confirmation on 2026-11-23. The accepted GitHub scope covers public repositories only. [Feature issue #5945](https://github.com/curie-eng/curie/issues/5945)
+
+The implementation lives in `apps/api/src/curie_api/factory_voice.py` (drafts and admission), `apps/api/src/curie_api/factory_voice_child.py` (offline recognition) and `charts/curie/templates/api.yaml` (model mount). [Implementation PR](https://github.com/curie-eng/curie/pull/5938)
