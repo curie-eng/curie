@@ -470,7 +470,9 @@ def test_list_returns_visible_rules_with_every_field_for_key_and_session(stack: 
     assert by_key.status_code == 200, by_key.text
     assert by_key.headers["Cache-Control"] == "no-store"
     assert by_session.status_code == 200, by_session.text
-    assert by_session.json() == by_key.json()
+    # Only `can_decide` differs: the key is no person, so it is unknown there.
+    assert by_session.json()["rules"] == by_key.json()["rules"]
+    assert [s["can_decide"] for s in by_key.json()["scopes"]] == [None, None]
     found = by_key.json()
     assert set(found) == {"rules", "scopes", "in_force_limit"}
     assert found["in_force_limit"] == 16
@@ -510,9 +512,96 @@ def test_list_returns_visible_rules_with_every_field_for_key_and_session(stack: 
     assert rules[4]["removed_by"] == owner and rules[4]["accepted_by"] == owner
     assert {rule["state"] for rule in rules} == {"proposed", "accepted", "rejected", "removed"}
     assert found["scopes"] == [
-        {"scope_kind": "agent", "scope_key": "", "scope_label": "agent", "in_force_count": 0},
-        {"scope_kind": "repository", "scope_key": SCOPE, "scope_label": REPO, "in_force_count": 1},
+        {
+            "scope_kind": "agent",
+            "scope_key": "",
+            "scope_label": "agent",
+            "in_force_count": 0,
+            "can_decide": None,
+        },
+        {
+            "scope_kind": "repository",
+            "scope_key": SCOPE,
+            "scope_label": REPO,
+            "in_force_count": 1,
+            "can_decide": None,
+        },
     ]
+
+
+def _can_decide(stack: Stack, scope_kind: str = "repository") -> bool | None:
+    """The requesting principal's ``can_decide`` for the one scope of that kind."""
+
+    listed = _list(stack, headers=stack.owner.headers(origin=None))
+    assert listed.status_code == 200, listed.text
+    (scope,) = [s for s in listed.json()["scopes"] if s["scope_kind"] == scope_kind]
+    return scope["can_decide"]  # type: ignore[no-any-return]
+
+
+def test_list_can_decide_is_true_for_a_linked_account_that_can_write(stack: Stack) -> None:
+    _link(stack, stack.owner)
+    _rule(stack)
+    assert _can_decide(stack) is True
+
+
+@pytest.mark.parametrize("permission", ["read", "triage", "none"])
+def test_list_can_decide_is_false_for_an_account_without_write(
+    stack: Stack, permission: str
+) -> None:
+    _link(stack, stack.owner)
+    stack.github.permissions[SENDER] = (SENDER_ID, permission)
+    _rule(stack)
+    assert _can_decide(stack) is False
+
+
+def test_list_can_decide_is_false_without_a_linked_account(stack: Stack) -> None:
+    _rule(stack)
+    assert _can_decide(stack) is False
+    assert stack.seen == []
+
+
+def test_list_can_decide_is_null_when_it_cannot_be_known(stack: Stack) -> None:
+    _link(stack, stack.owner)
+    _rule(stack)
+
+    def unreachable(request: httpx.Request) -> httpx.Response | None:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    stack.overrides.append(unreachable)
+    assert _can_decide(stack) is None
+    stack.overrides.clear()
+    _link(stack, stack.owner, account_id=SECOND_ID)
+    # Two linked accounts on the host: the decision itself is unverifiable.
+    assert _can_decide(stack) is None
+
+
+def test_list_can_decide_for_a_channel_scope_needs_only_the_session(stack: Stack) -> None:
+    _rule(stack, scope_kind="agent", scope_label="agent")
+    assert _can_decide(stack, "agent") is True
+    assert stack.seen == []
+
+
+def test_list_can_decide_asks_the_code_host_once_per_scope(stack: Stack) -> None:
+    _link(stack, stack.owner)
+    for number in (1, 2, 3):
+        _rule(stack, number=number)
+    assert _can_decide(stack) is True
+    assert len([r for r in stack.seen if "/collaborators/" in r.url.path]) == 1
+
+
+def test_list_can_decide_agrees_with_the_decision(stack: Stack) -> None:
+    rule_id = _rule(stack)
+    assert _can_decide(stack) is False
+    _refused(
+        _decide(stack, rule_id),
+        403,
+        "memory_rules.write_access_required",
+        rule_id,
+        _snapshot(rule_id),
+    )
+    _link(stack, stack.owner)
+    assert _can_decide(stack) is True
+    _accepts(stack, rule_id)
 
 
 @pytest.mark.parametrize("state", ["candidate", "superseded", "discarded", "junk"])
@@ -537,7 +626,13 @@ def test_list_filters_and_counts_in_force_regardless_of_the_filter(stack: Stack)
 
     assert [rule["id"] for rule in found["rules"]] == [str(proposed)]
     assert found["scopes"] == [
-        {"scope_kind": "repository", "scope_key": SCOPE, "scope_label": REPO, "in_force_count": 2}
+        {
+            "scope_kind": "repository",
+            "scope_key": SCOPE,
+            "scope_label": REPO,
+            "in_force_count": 2,
+            "can_decide": None,
+        }
     ]
     assert _list(stack, scope_kind="agent").json() == {
         "rules": [],

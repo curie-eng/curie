@@ -73,6 +73,69 @@ beforeEach(() => {
   vi.mocked(listMemory).mockResolvedValue([]);
 });
 
+const withDecide = (canDecide: boolean | null): MemoryRules => ({
+  ...list(PROPOSED, ACCEPTED),
+  scopes: [
+    {
+      scope_kind: "repository",
+      scope_key: PROPOSED.scope_key,
+      scope_label: PROPOSED.scope_label,
+      in_force_count: 1,
+      can_decide: canDecide,
+    },
+  ],
+});
+
+describe("WiredMemoryPage decision rights", () => {
+  it("disables Accept, Dismiss and Remove with a visible reason when the person cannot decide", async () => {
+    vi.mocked(listMemoryRules).mockResolvedValue(withDecide(false));
+    renderPage();
+    await screen.findAllByTestId("memory-rule");
+
+    for (const name of ["Accept", "Dismiss", "Remove"]) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute("title", expect.stringContaining(`cannot merge to ${REPO}`));
+    }
+    const reasons = screen.getAllByTestId("memory-rule-blocked");
+    expect(reasons).toHaveLength(2);
+    expect(reasons[0]).toHaveTextContent(
+      `You cannot merge to ${REPO}, so you cannot decide its rules. Link your code host account if you can.`,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Accept" }));
+    await userEvent.click(screen.getByRole("button", { name: "Remove" }));
+    expect(acceptMemoryRule).not.toHaveBeenCalled();
+    expect(removeMemoryRule).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["true", true],
+    ["null (not known)", null],
+  ])("leaves the controls live when can_decide is %s", async (_label, canDecide) => {
+    vi.mocked(listMemoryRules).mockResolvedValue(withDecide(canDecide));
+    renderPage();
+    await screen.findAllByTestId("memory-rule");
+
+    for (const name of ["Accept", "Dismiss", "Remove"]) {
+      expect(screen.getByRole("button", { name })).toBeEnabled();
+    }
+    expect(screen.queryByTestId("memory-rule-blocked")).toBeNull();
+  });
+
+  it("keeps the server's refusal when an unknown right turns out to be missing", async () => {
+    vi.mocked(listMemoryRules).mockResolvedValue(withDecide(null));
+    vi.mocked(acceptMemoryRule).mockRejectedValue(refusal(403, "memory_rules.write_access_required"));
+    renderPage();
+    await screen.findAllByTestId("memory-rule");
+
+    await userEvent.click(screen.getByRole("button", { name: "Accept" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      `Only someone who can merge to ${REPO} can do this. Link your code host account if you can.`,
+    );
+  });
+});
+
 describe("WiredMemoryPage layout (#5800)", () => {
   it("opens on Learned rules with the heading, agent selector and sub-tabs", async () => {
     vi.mocked(listMemoryRules).mockResolvedValue(list(PROPOSED, ACCEPTED));

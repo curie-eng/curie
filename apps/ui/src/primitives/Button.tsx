@@ -35,7 +35,7 @@ export function Button({
   const base = VARIANTS[variant];
   const pad = size === "sm" ? "5px 10px" : "8px 14px";
   const style: CSSProperties = {
-    background: base.bg,
+    background: disabled && variant === "primary" ? C.card : base.bg,
     color: disabled ? C.disabled : base.color,
     border: "1px solid " + (disabled ? C.border : base.bd),
     padding: pad,

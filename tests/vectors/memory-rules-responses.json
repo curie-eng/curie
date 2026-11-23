@@ -104,7 +104,8 @@
         "scope_kind": "repository",
         "scope_key": "github:github.com:4401",
         "scope_label": "acme-corp/acme-bot",
-        "in_force_count": 1
+        "in_force_count": 1,
+        "can_decide": null
       }
     ],
     "in_force_limit": 16
@@ -195,7 +196,8 @@
         "scope_kind": "binding",
         "scope_key": "slack:C0EXAMPLE1",
         "scope_label": "slack:C0EXAMPLE1",
-        "in_force_count": 1
+        "in_force_count": 1,
+        "can_decide": null
       }
     ],
     "in_force_limit": 16
