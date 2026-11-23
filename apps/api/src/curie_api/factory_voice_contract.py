@@ -141,6 +141,13 @@ class Refused:
 
 
 @dataclass(frozen=True, kw_only=True)
+class EditAccepted:
+    """The updated transcript and code are queued for delivery at the source."""
+
+    draft_id: UUID
+
+
+@dataclass(frozen=True, kw_only=True)
 class Confirmed:
     admission_id: UUID
     disposition: Literal["queued", "applied"]
@@ -197,4 +204,4 @@ class VoiceDraftService(Protocol):
         audience: Audience,
         action: Action,
         feedback: VoiceFeedbackPort,
-    ) -> Draft | Confirmed | Rejected | Refused: ...
+    ) -> EditAccepted | Confirmed | Rejected | Refused: ...
