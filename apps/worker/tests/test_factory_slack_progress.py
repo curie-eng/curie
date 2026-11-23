@@ -43,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import uuid
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -117,8 +118,9 @@ def test_maintenance_messages_distinguish_published_verified_and_permitted_no_ci
 
 @pytest.mark.parametrize("destination", [False, True], ids=["no-channel", "configured"])
 def test_maintenance_history_survives_polls_and_worker_restart(
-    stack: Stack, destination: bool
+    stack: Stack, destination: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(get_settings(), "factory_maintenance_repair_enabled", False)
     if destination:
         assert stack.enable_destination().status_code == 200
     number = next(_ISSUES)
@@ -147,10 +149,21 @@ def test_maintenance_history_survives_polls_and_worker_restart(
             source = await session.get(ExecutionRequest, source_id)
             assert item is not None and source is not None
             await record_ci_settlement(session, item, source, head_sha=HEAD, green=True)
+            await record_ci_settlement(session, item, source, head_sha=HEAD, green=False)
             for outcome in ("foreign_head", "foreign_head", "evidence_unavailable", "foreign_head"):
                 await record_event(session, observation, outcome)
+                await record_event(session, replace(observation, base_sha="c3" * 20), outcome)
             await record_event(session, observation, "admitted", repair_request_id=successor_id)
+            await record_event(
+                session,
+                replace(observation, base_sha="c3" * 20),
+                "admitted",
+                repair_request_id=successor_id,
+            )
             await record_event(session, observation, "budget_exhausted")
+            await record_event(session, observation, "base_changed")
+            await record_event(session, replace(observation, base_sha="c3" * 20), "base_changed")
+            await record_event(session, replace(observation, head_sha="d4" * 20), "base_changed")
 
     _db(record)
     response = stack.client.get(
@@ -160,32 +173,71 @@ def test_maintenance_history_survives_polls_and_worker_restart(
     history = response.json()["items"][0]["maintenance_history"]
     assert [event["outcome"] for event in history] == [
         "green",
+        "no_ci",
         "foreign_head",
         "evidence_unavailable",
         "foreign_head",
         "admitted",
+        "admitted",
         "budget_exhausted",
+        "base_changed",
+        "base_changed",
+        "base_changed",
     ]
     assert history[0]["head_sha"] == HEAD
-    assert history[-2]["repair_request_id"] == str(successor_id)
-    assert history[-1]["repair_request_id"] is None
+    assert history[6]["repair_request_id"] == str(successor_id)
+    assert history[7]["repair_request_id"] is None
     stack.drain()
     stack.drain(fresh=True)
     if destination:
         (thread,) = stack.threads(item_id)
         messages = _texts(stack, thread["root_ts"])
+        assert not any(
+            "CI verified green" in message or "No CI checks applied" in message
+            for message in messages
+        )
+        assert [row["post_key"] for row in _posts(item_id) if row["kind"] == "maintenance"] == [
+            f"maintenance:{event['id']}" for event in history[2:]
+        ]
+
+    async def record_enabled(engine: AsyncEngine) -> None:
+        async with AsyncSession(engine) as session, session.begin():
+            item = await session.get(WorkItem, item_id, with_for_update=True)
+            source = await session.get(ExecutionRequest, source_id)
+            assert item is not None and source is not None
+            await record_ci_settlement(session, item, source, head_sha=HEAD, green=True)
+            await record_ci_settlement(session, item, source, head_sha=HEAD, green=False)
+
+    with monkeypatch.context() as enabled:
+        enabled.setattr(get_settings(), "factory_maintenance_repair_enabled", True)
+        _db(record_enabled)
+    stack.drain()
+    stack.drain(fresh=True)
+    response = stack.client.get(
+        "/work-items", headers=stack.platform, params={"agent_id": stack.agent_id}
+    )
+    assert response.status_code == 200, response.text
+    history = response.json()["items"][0]["maintenance_history"]
+    assert [event["outcome"] for event in history[-2:]] == ["green", "no_ci"]
+    if destination:
+        messages = _texts(stack, thread["root_ts"])
         expected = [
-            f"CI verified green on {HEAD}.",
             "Repair paused because the pull request head differs from the factory head.",
             "Curie could not verify the current repair evidence.",
             "Repair paused because the pull request head differs from the factory head.",
             "Curie queued a repair for failing CI.",
+            "Curie queued a repair for failing CI.",
             "The automatic repair allowance has been spent.",
+            "The base branch changed.",
+            "The base branch changed.",
+            "The base branch changed.",
+            f"CI verified green on {HEAD}.",
+            f"No CI checks applied to {HEAD}. Policy permits completion.",
         ]
         assert messages[-len(expected) :] == expected
         assert all("private-branch-sentinel" not in message for message in messages)
         assert [row["post_key"] for row in _posts(item_id) if row["kind"] == "maintenance"] == [
-            f"maintenance:{event['id']}" for event in history
+            f"maintenance:{event['id']}" for event in history[2:]
         ]
     else:
         assert _posts(item_id) == []
@@ -258,7 +310,12 @@ def _kickoff_run(stack: Stack) -> tuple[int, uuid.UUID, uuid.UUID, int, str]:
     return number, request_id, work_item_id, epoch, root_ts
 
 
-async def _pass_as(lease_owner: str, slack_url: str, identity: str, token: str) -> None:
+async def _pass_as(
+    lease_owner: str,
+    slack_url: str,
+    identity: str,
+    token: str,
+) -> None:
     """One production pass in a new process: a new engine, store, lease owner and loop."""
 
     engine = create_async_engine(get_settings().database_url)

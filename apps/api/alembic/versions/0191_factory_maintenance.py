@@ -111,6 +111,7 @@ def upgrade() -> None:
             base_sha text,
             reason text NOT NULL,
             outcome text NOT NULL,
+            notify_slack boolean NOT NULL DEFAULT true,
             recorded_at timestamptz NOT NULL DEFAULT clock_timestamp()
         )
         """

@@ -65,8 +65,9 @@ existing records, with no lifecycle hook:
    requester's) one active Slack link in the posting identity's workspace,
    and no one when there is none. A request a pre-card ``terminal`` or
    ``pull_request`` post already announced owes neither;
-4. one reply per maintenance outcome, in recorded order. A CI settlement
-   names the checked head and distinguishes verified green from permitted no CI.
+4. one reply per eligible maintenance outcome, in recorded order. A CI settlement
+   recorded while maintenance repair is enabled names the checked head and
+   distinguishes verified green from permitted no CI.
 
 ``phase``, ``pull_request`` and ``terminal`` rows from before the card are
 never delivered and never hold a later post back.
@@ -952,6 +953,7 @@ class PostgresFactorySlackStore:
               JOIN {self._maintenance_events} e ON e.work_item_id = t.work_item_id
               JOIN {self._requests} q
                 ON q.id = e.source_request_id AND q.sequence >= t.first_sequence
+             WHERE e.notify_slack
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
@@ -991,7 +993,11 @@ class PostgresFactorySlackStore:
             await connection.execute(cards)
             await connection.execute(needs_person)
             await connection.execute(ready)
-            await connection.execute(maintenance)
+            exists = await connection.scalar(
+                text("SELECT to_regclass(:relation)"), {"relation": self._maintenance_events}
+            )
+            if exists is not None:
+                await connection.execute(maintenance)
             await connection.execute(refusals)
             await connection.execute(self._grant_notices(), {"reconnect_url": self._reconnect_url})
 

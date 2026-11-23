@@ -53,12 +53,18 @@ def maintenance_enabled(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 async def seed_completed(
-    session: AsyncSession, *, green: bool = True, personal: support.World | None = None
+    session: AsyncSession,
+    *,
+    green: bool = True,
+    personal: support.World | None = None,
+    trigger_label: str | None = None,
 ) -> MaintenanceObservation:
     tenant_id = personal.tenant_id if personal else DEFAULT_TENANT_ID
     agent = await support._insert_agent(session, tenant_id, address=support.ADDRESS)
     facts = replace(
-        support.facts(agent, issue_number=2573), base=ResolvedBase("main", "default", BASE)
+        support.facts(agent, issue_number=2573),
+        base=ResolvedBase("main", "default", BASE),
+        trigger_label=trigger_label,
     )
     if personal:
         facts = replace(

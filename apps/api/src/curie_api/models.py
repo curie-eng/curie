@@ -2052,6 +2052,7 @@ class FactoryMaintenanceEvent(Base):
     base_sha: Mapped[str | None] = mapped_column(Text)
     reason: Mapped[str] = mapped_column(Text)
     outcome: Mapped[str] = mapped_column(Text)
+    notify_slack: Mapped[bool] = mapped_column(default=True, server_default="true")
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.clock_timestamp()
     )

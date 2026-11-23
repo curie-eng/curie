@@ -7,6 +7,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .config import get_settings
 from .factory_maintenance import MaintenanceObservation
 from .models import ExecutionRequest, FactoryMaintenanceAdmission, FactoryMaintenanceEvent, WorkItem
 
@@ -35,12 +36,15 @@ async def record_event(
     )
     if (
         previous is not None
-        and previous.source_request_id == source_request_id
         and previous.head_sha == observation.head_sha
-        and previous.base_ref == observation.base_ref
-        and previous.base_sha == observation.base_sha
         and previous.outcome == outcome
-        and previous.repair_request_id == repair_request_id
+        and (
+            outcome not in {"admitted", "base_changed"}
+            or (
+                previous.base_ref == observation.base_ref
+                and previous.base_sha == observation.base_sha
+            )
+        )
     ):
         return
     session.add(
@@ -80,5 +84,6 @@ async def record_ci_settlement(
             base_sha=item.base_commit,
             reason="ci_settlement",
             outcome="green" if green else "no_ci",
+            notify_slack=get_settings().factory_maintenance_repair_enabled,
         )
     )

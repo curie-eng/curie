@@ -1742,8 +1742,9 @@ after the first eligible successful request finished. Later revisions and
 restarts preserve both the deadline and the consumed allowance. A repair must
 publish a new head and verify its CI.
 
-WorkItem and Slack progress report verified green and allowed no-CI settlements
-even when automatic repair is disabled. Read `maintenance_history` in the
+WorkItem history retains verified green and allowed no-CI settlements even when
+automatic repair is disabled. Slack reports settlements recorded while automatic
+repair is enabled. Read `maintenance_history` in the
 WorkItem detail for the authorized head, base, reason, refusal or admitted
 successor. A matching failure on the base or missing evidence leaves the
 allowance available. A human push pauses repair with

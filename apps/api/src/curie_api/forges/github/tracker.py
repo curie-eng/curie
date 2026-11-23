@@ -728,13 +728,27 @@ class GitHubTracker:
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         """The issue's labels from one issue read; GitHub has no components."""
 
-        found = await self._issue(self._number(issue))
+        number = self._number(issue)
+        found = await self._issue(number)
         if found is None:
             raise NotFound("issue")
         names = label_names(found)
         if names is None:
             raise Unavailable("labels")
-        return TicketLabels(labels=frozenset(names))
+        returned_number = found.get("number")
+        if returned_number is not None and (
+            type(returned_number) is not int or returned_number != number
+        ):
+            raise Unavailable("issue")
+        state = found.get("state")
+        return TicketLabels(
+            labels=frozenset(names),
+            verified_open_issue=(
+                state == "open"
+                if returned_number == number and state in ("open", "closed")
+                else None
+            ),
+        )
 
     async def set_state_label(
         self, issue: TrackerIssueRef, *, add: str | None, remove: Collection[str]

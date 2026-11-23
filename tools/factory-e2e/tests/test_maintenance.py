@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import ssl
 import subprocess
 from pathlib import Path
 
 import candidate_install as ci
+import certifi
 import factory_e2e as fe
 import maintenance
 import pytest
@@ -99,7 +99,7 @@ def test_leased_human_push_and_restore_through_https_forge(fixture, tmp_path):
                 "commit",
                 original,
                 '{"human.txt":"untrusted"}',
-                ssl.get_default_verify_paths().cafile,
+                certifi.where(),
             )
         assert "certificate" in untrusted.value.stderr.lower()
         assert counts() == (1, 0) and tip() == original

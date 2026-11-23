@@ -26,7 +26,6 @@ from .factory_maintenance import (
 from .factory_maintenance_progress import record_event
 from .factory_maintenance_store import commit_observation, replay
 from .forges.errors import ForgeError
-from .forges.github.tracker import GitHubTracker
 from .forges.hosts import issue_url
 from .forges.ports import CodeHost
 from .forges.registry import forges_registry
@@ -267,21 +266,11 @@ class MaintenanceObserver:
             item.code_host_installation_id,
             label=item.trigger_label,
         )
-        if isinstance(tracker, GitHubTracker):
-            state = await tracker.issue_state(int(item.tracker_issue.issue_id))
-            if (
-                state.pull_request
-                or state.state != "open"
-                or (item.trigger_label is not None and item.trigger_label not in state.labels)
-            ):
-                return None, "work_item_cancelled"
-            labels = state.labels
-        else:
-            if not item.trigger_label:
-                return None, "evidence_unavailable"
+        marker = item.trigger_label
+        if marker is not None:
             notice = MarkedNotice(
                 item.tracker_issue,
-                item.trigger_label,
+                marker,
                 Actor("observation", "observation"),
                 "maintenance",
                 Disposition.CANCEL,
@@ -290,12 +279,18 @@ class MaintenanceObserver:
             )
             if await tracker.verify_current(notice):
                 return None, "work_item_cancelled"
-            labels = (await tracker.ticket_labels(item.tracker_issue)).labels
+        ticket = await tracker.ticket_labels(item.tracker_issue)
+        if ticket.verified_open_issue is False or (
+            marker is not None and marker not in ticket.labels
+        ):
+            return None, "work_item_cancelled"
+        if marker is None and ticket.verified_open_issue is not True:
+            return None, "evidence_unavailable"
         async with self.sessions() as session:
             if not await base_selection_unchanged(
                 session,
                 item,
-                labels=set(labels),
+                labels=set(ticket.labels),
                 default_branch=repository.default_branch,
                 settings=self.settings,
             ):

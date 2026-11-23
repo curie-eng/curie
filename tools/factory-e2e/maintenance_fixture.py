@@ -67,7 +67,7 @@ def model_response(
             "name": "Bash",
             "input": {
                 "command": (
-                    "python3 -c 'from pathlib import Path; from revision import REVISION; "
+                    "python3 -B -c 'from pathlib import Path; from revision import REVISION; "
                     'Path("revision.py").write_text(f"REVISION = {REVISION + 1}\\n")\' '
                     "&& python3 -B -m unittest discover"
                 )

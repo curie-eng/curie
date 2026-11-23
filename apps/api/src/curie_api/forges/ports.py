@@ -179,6 +179,7 @@ class Tracker(Protocol):
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         """The issue's current labels and component names; admission reads them
         for ``base:``, ``repo:`` and label conflicts (ADR 0197 identity 3).
+        When supported, the same read establishes whether this is an open issue.
         Nothing is stored."""
         ...
 
