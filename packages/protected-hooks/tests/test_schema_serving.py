@@ -184,7 +184,7 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     """
     window = shared().load_metadata().window
     assert window.schema_min == "0189"
-    assert window.schema_head == "0189"
+    assert window.schema_head == "0196"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

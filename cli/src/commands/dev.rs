@@ -1259,6 +1259,73 @@ pub(super) async fn docker_image_exists(tag: &str) -> Result<bool> {
     Ok(status.success())
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct VoiceFixturesOutput {
+    pub fixtures: Vec<String>,
+    pub checked: bool,
+}
+
+impl crate::ui::CliOutput for VoiceFixturesOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!(self)
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        let verb = if self.checked { "Verified" } else { "Wrote" };
+        ui.success(&format!(
+            "{verb} {} fixtures in tests/vectors/factory-voice.",
+            self.fixtures.len()
+        ));
+    }
+}
+
+pub async fn dev_regenerate_voice_fixtures(check: bool) -> Result<VoiceFixturesOutput> {
+    let root = find_repo_root().ok_or_else(|| {
+        crate::exit::CliError::usage("Voice fixture generation requires a Curie source checkout.")
+            .with_fix("Run `curie dev regenerate-voice-fixtures` from a Curie source checkout.")
+    })?;
+    let script = "cli/scripts/regenerate-voice-fixtures.py";
+    if !root.join(script).is_file() {
+        return Err(
+            crate::exit::CliError::usage("The checkout has no voice fixture generator.")
+                .with_fix("Update the checkout to a revision containing the generator and retry.")
+                .into(),
+        );
+    }
+    let mut command = tokio::process::Command::new("uv");
+    command
+        .args(["run", "--no-build", "--script", script])
+        .stdout(std::process::Stdio::piped())
+        .current_dir(root)
+        .stderr(std::process::Stdio::inherit());
+    if check {
+        command.arg("--check");
+    }
+    let child = command.spawn().map_err(|error| {
+        crate::exit::CliError::failure(format!(
+            "Could not start the voice fixture generator: {error}"
+        ))
+        .with_fix("Install uv and Python 3.13 and retry.")
+    })?;
+    let output = child
+        .wait_with_output()
+        .await
+        .context("Reading the voice fixture report")?;
+    if !output.status.success() {
+        let fix = if check {
+            "Inspect the generator output and rerun `curie dev regenerate-voice-fixtures` to regenerate the fixtures."
+        } else {
+            "Check the generator output and retry with the pinned synthesis and encoding wheels."
+        };
+        return Err(
+            crate::exit::CliError::failure("Voice fixture generation failed.")
+                .with_fix(fix)
+                .into(),
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("Invalid voice fixture generator report")
+}
+
 /// Run the generated test-time ratchets from the source checkout.
 pub async fn dev_test_ratchets(regenerate: bool, durations: &[PathBuf]) -> Result<()> {
     let root = find_repo_root().ok_or_else(|| {

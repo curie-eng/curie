@@ -1173,7 +1173,7 @@ use curie::commands::{
     CheckMatch, CheckReport, ConnectorBuildOutput, ConnectorBuildRecord, DeclaredServer,
     DeleteOutput, DeployOutput, KillOutput, ListAgentsOutput, LocalAgentSummary, MemoryChannel,
     MemoryFact, MemoryOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput,
-    SkillMessageOutput, SweepRow, VersionsOutput,
+    SkillMessageOutput, SweepRow, VersionsOutput, VoiceFixturesOutput,
 };
 use curie::comms::CommsOutput;
 use curie::local::{
@@ -1271,6 +1271,20 @@ fn bump_version_output_validates() {
         version: "1.2.3".to_string(),
     };
     assert_valid("bump-version.schema.json", &out.to_json());
+}
+
+#[test]
+fn regenerate_voice_fixtures_output_validates() {
+    for checked in [true, false] {
+        let out = VoiceFixturesOutput {
+            fixtures: vec!["retry-label.wav".to_string()],
+            checked,
+        };
+        let value = out.to_json();
+        assert_valid("regenerate-voice-fixtures.schema.json", &value);
+        assert_eq!(value["checked"], checked);
+        assert_eq!(value["fixtures"], serde_json::json!(["retry-label.wav"]));
+    }
 }
 
 #[test]

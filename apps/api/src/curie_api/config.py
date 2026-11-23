@@ -13,6 +13,7 @@ production deployments.
 import json
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
@@ -1631,6 +1632,10 @@ class Settings(BaseSettings):
         if self.hook_claim_lease_s is None:
             return self.delivery_budget_s
         return self.hook_claim_lease_s
+
+    factory_voice_enabled: bool = False
+    factory_voice_model_path: Path = Path("/var/run/curie/voice/ggml-base.en.bin")
+    factory_voice_draft_ttl_seconds: int = Field(default=900, gt=0)
 
 
 @lru_cache

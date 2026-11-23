@@ -508,6 +508,12 @@
       "version": "1.0"
     },
     {
+      "result": "VoiceFixturesOutput",
+      "kind": "CliOutput",
+      "schema": "regenerate-voice-fixtures.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "WakeKeyOutput",
       "kind": "CliOutput",
       "schema": "wake-key.schema.json",

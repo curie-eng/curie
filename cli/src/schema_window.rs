@@ -793,7 +793,7 @@ print(json.dumps(graph))
         // The plain feedback cap requires 0186.
         // The 0188 triage contract precedes the 0189 run-handoff schema floor.
         assert_eq!(candidate.schema_min, "0189");
-        assert_eq!(candidate.schema_head, "0189");
+        assert_eq!(candidate.schema_head, "0196");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()

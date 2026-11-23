@@ -9,7 +9,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from functools import partial
 
 import httpx
@@ -44,8 +44,10 @@ from .db import (
     create_liveness_engine,
     create_sessionmaker,
     create_source_gate_engine,
+    create_voice_retention_engine,
 )
 from .evalqueue import EvalQueue
+from .factory_voice_retention import purge_expired_drafts
 from .forges.registry import forges_registry
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
@@ -413,9 +415,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.protected_admission_reconciler = protected_reconciler
         protected_reconciler.start()
+        voice_purge = asyncio.create_task(
+            purge_expired_drafts(
+                create_voice_retention_engine(), enabled=settings.factory_voice_enabled
+            )
+        )
+        app.state.voice_retention_task = voice_purge
         try:
             yield
         finally:
+            voice_purge.cancel()
+            with suppress(asyncio.CancelledError):
+                await voice_purge
             await protected_reconciler.stop()
             notice_task = app.state.deploy_notice_reconciler_task
             if notice_task is not None:

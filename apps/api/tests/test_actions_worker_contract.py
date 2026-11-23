@@ -23,6 +23,7 @@ import pytest
 from aci_protocol import SideEffectFlag
 from curie_worker.actions import ActionClient
 from curie_worker.receipt import render_receipt
+from fastapi.testclient import TestClient
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -74,12 +75,11 @@ async def _round_trip(app: Any, result: dict[str, Any] | None = None) -> dict[st
     return body
 
 
-def test_a_recorded_call_survives_the_worker_to_api_hop(client: Any, anyio_backend: Any) -> None:
+def test_a_recorded_call_survives_the_worker_to_api_hop(client: TestClient) -> None:
     """Every field the worker sends is a field the API stores, under that name."""
 
-    import anyio
-
-    row = anyio.run(_round_trip, client.app)
+    assert client.portal is not None
+    row = client.portal.call(_round_trip, client.app)
 
     assert row["tool"] == "scale_deployment"
     assert row["call_id"] == "toolu_01"
@@ -99,7 +99,7 @@ def test_a_recorded_call_survives_the_worker_to_api_hop(client: Any, anyio_backe
 
 
 def test_a_call_that_never_reported_what_it_left_is_not_offered_as_undoable(
-    client: Any, anyio_backend: Any
+    client: TestClient,
 ) -> None:
     """Prior and target without post: the undo route refuses it, so nothing may offer it.
 
@@ -108,10 +108,9 @@ def test_a_call_that_never_reported_what_it_left_is_not_offered_as_undoable(
     have to agree with that refusal rather than promise a restore (#1861).
     """
 
-    import anyio
-
     reply = {key: value for key, value in _SNAPSHOT.items() if key != "post"}
-    row = anyio.run(_round_trip, client.app, reply)
+    assert client.portal is not None
+    row = client.portal.call(_round_trip, client.app, reply)
 
     assert row["prior_state"] is None  # @spec ACTION-EXECUTOR-9: cleartext prior not recorded
     assert row["target"] == {"kind": "Deployment", "name": "api"}

@@ -6031,3 +6031,52 @@ class FactoryFactsRequest(Base):
     state: Mapped[str] = mapped_column(Text, default="owed")
     answer_comment_id: Mapped[str | None] = mapped_column(Text, default=None)
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class FactoryVoiceDraft(Base):
+    """One recognition and confirmation receipt per original provider message."""
+
+    __tablename__ = "factory_voice_drafts"
+    __table_args__ = (
+        CheckConstraint(
+            "(admission_id IS NOT NULL) = (status = 'confirmed') "
+            "AND (disposition IS NOT NULL) = (admission_id IS NOT NULL) "
+            "AND disposition IN ('queued', 'applied')",
+            name="factory_voice_receipt_ck",
+        ),
+        CheckConstraint(
+            "status IN ('recognizing', 'delivering', 'ready') "
+            "OR (source IS NULL AND transcript IS NULL AND media_sha256 IS NULL)",
+            name="factory_voice_terminal_ck",
+        ),
+        Index("ix_factory_voice_expiry", "expires_at", postgresql_where=text("source IS NOT NULL")),
+        Index(
+            "ix_factory_voice_claim",
+            "surface",
+            "retry_at",
+            "created_at",
+            postgresql_where=text("status IN ('recognizing', 'delivering')"),
+        ),
+        {"schema": SCHEMA},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    source_key: Mapped[str] = mapped_column(String(64), unique=True)
+    code_prefix: Mapped[str] = mapped_column(String(12), unique=True)
+    tenant_hash: Mapped[str] = mapped_column(String(64))
+    actor_hash: Mapped[str] = mapped_column(String(64))
+    audience_hash: Mapped[str] = mapped_column(String(64))
+    surface: Mapped[str] = mapped_column(Text)
+    source: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    media_sha256: Mapped[str | None] = mapped_column(String(64))
+    transcript: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    disposition: Mapped[str | None] = mapped_column(Text)
+    refusal: Mapped[str | None] = mapped_column(Text)
