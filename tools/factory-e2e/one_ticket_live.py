@@ -24,10 +24,10 @@ an observation of plain numbers and booleans, each beat against its bound:
    the factory's usage total at most 25 USD (correction 3), and no Jira issue
    created by the factory account.
 
-The request and cost bounds also hold during the run: after the answer, every
-poll of every later beat reads the work item and the bot's status comments, and
-a third request or a usage total over the bound (or ``total cost unknown``)
-stops the run at once, unmerged, so teardown removes the install and the spend.
+After the answer, each poll checks the work item's request count and aggregate
+usage. A third request or an aggregate estimate over the bound stops the run
+immediately, even if the estimate is partial. The driver requires a complete
+estimate within the bound immediately before merging and again in its final read.
 
 Every value that names the caller's environment (repository, accounts, App,
 Jira site, project, cloud, kube context, registry, binary paths, home) is an
@@ -55,7 +55,7 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 # --- bounds and the factory's own words ----------------------------------------------
 
@@ -366,12 +366,18 @@ def judge(obs: Mapping[str, Any]) -> list[str]:
     if isinstance(stop, Mapping):
         stopped = True
         failures.append(_stop_message(stop))
+    pre_merge_usage = obs.get("pre_merge_usage")
+    pre_merge_failure = None
+    if pre_merge_usage is not None or obs.get("merge_ok") is True:
+        pre_merge_failure = _AggregateUsage.decode(pre_merge_usage).failure()
+        if pre_merge_failure is not None and not stopped:
+            failures.append(f"{pre_merge_failure} before the merge")
     if obs.get("answered_run_ended") is False:
         failures.append(
             f"the answered run did not end within {ENDING_SECONDS} s of the pull request; "
             "not merged"
         )
-    elif obs.get("merge_ok") is not True and not stopped:
+    elif obs.get("merge_ok") is not True and not stopped and pre_merge_failure is None:
         failures.append("the merge failed")
     notice = _after(obs.get("merged_s"), obs.get("merged_notice_s"))
     if notice is None or notice > MERGED_NOTICE_SECONDS:
@@ -389,7 +395,9 @@ def judge(obs: Mapping[str, Any]) -> list[str]:
     elif count > MAX_REQUESTS:
         failures.append(f"{count} execution requests, over the bound of {MAX_REQUESTS}")
 
-    failures.extend(_judge_usage(obs.get("usage")))
+    usage_failure = _AggregateUsage.decode(obs.get("usage")).failure()
+    if usage_failure is not None:
+        failures.append(usage_failure)
 
     created = obs.get("factory_created_issues")
     if created is None:
@@ -439,29 +447,49 @@ def _stop_message(stop: Mapping[str, Any]) -> str:
             f"{lead}the work item showed {stop.get('count')} execution requests, over the bound "
             f"of {MAX_REQUESTS}"
         )
-    if stop.get("kind") == "unknown":
-        return f"{lead}a status comment's usage line reads 'total cost unknown'"
-    at_least = "at least " if stop.get("kind") == "at_least" else ""
-    return (
-        f"{lead}a status comment's estimated cost is {at_least}${stop.get('total')}, over the "
-        f"{COST_BOUND_USD} USD bound"
-    )
+    failure = _AggregateUsage.decode(stop).failure()
+    return f"{lead}{failure or 'the aggregate usage bound was crossed'}"
 
 
-def _judge_usage(usage: Any) -> list[str]:
-    kind = usage.get("kind") if isinstance(usage, Mapping) else None
-    if kind == "unknown":
-        return ["the usage line reads 'total cost unknown'"]
-    if kind not in ("total", "at_least"):
-        return ["the merged status comment carries no usage total"]
-    try:
-        total = Decimal(str(usage.get("total")))
-    except InvalidOperation:
-        return ["the merged status comment carries no usage total"]
-    if total > COST_BOUND_USD:
-        lead = "at least " if kind == "at_least" else ""
-        return [f"the estimated cost is {lead}${total}, over the {COST_BOUND_USD} USD bound"]
-    return []
+class _AggregateUsage(NamedTuple):
+    total: Decimal | None
+    cost_complete: bool | None
+
+    @classmethod
+    def decode(cls, value: Any) -> _AggregateUsage:
+        """Read the budget fields from the usage API or recorded evidence."""
+
+        if not isinstance(value, Mapping):
+            return cls(None, None)
+        complete = value.get("cost_complete")
+        total = None
+        try:
+            amount = Decimal(str(value.get("estimated_cost_usd")))
+        except InvalidOperation:
+            pass
+        else:
+            if amount.is_finite() and amount >= 0:
+                total = amount
+        return cls(total, complete if isinstance(complete, bool) else None)
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "estimated_cost_usd": None if self.total is None else str(self.total),
+            "cost_complete": self.cost_complete,
+        }
+
+    def failure(self) -> str | None:
+        if self.total is None:
+            return "the aggregate usage total is unavailable"
+        if self.total > COST_BOUND_USD:
+            at_least = "at least " if self.cost_complete is not True else ""
+            return (
+                f"the aggregate estimated cost is {at_least}${self.total}, "
+                f"over the {COST_BOUND_USD} USD bound"
+            )
+        if self.cost_complete is not True:
+            return "the aggregate usage is incomplete"
+        return None
 
 
 # --- identities and anonymization -------------------------------------------------------
@@ -806,15 +834,11 @@ def outcome_summary(
     answer = obs.get("answer_s")
     pulls = [pr for pr in obs.get("pull_requests") or [] if isinstance(pr, Mapping)]
     first = pulls[0] if pulls else {}
-    recorded = obs.get("usage")
-    usage: Mapping[str, Any] = recorded if isinstance(recorded, Mapping) else {}
-    kind = usage.get("kind", "missing")
-    total = usage.get("total")
-    cost = {
-        "total": f"total ${total}",
-        "at_least": f"total at least ${total}",
-        "unknown": "total cost unknown",
-    }.get(str(kind), "no usage total")
+    usage = _AggregateUsage.decode(obs.get("usage"))
+    cost = "no aggregate usage total"
+    if usage.total is not None:
+        at_least = "at least " if usage.cost_complete is not True else ""
+        cost = f"total {at_least}${usage.total}"
     result = evidence.get("result") or obs.get("verdict") or "pending"
     lines = [
         f"candidate commit: {evidence.get('candidate_commit')}",
@@ -1010,12 +1034,13 @@ def new_observation() -> dict[str, Any]:
         "pull_requests": [],
         "spend_stop": None,
         "answered_run_ended": None,
+        "pre_merge_usage": None,
         "merge_ok": False,
         "merged_s": None,
         "merged_notice_s": None,
         "status_id_unchanged": None,
         "request_count": None,
-        "usage": {"kind": "missing", "total": None},
+        "usage": None,
         "factory_created_issues": None,
         "timeline": [],
     }
@@ -1070,47 +1095,38 @@ class _LiveRun:
 
     # -- the spend bound during the run --
 
-    def over_spend(
-        self, detail: Mapping[str, Any] | None, comments: Sequence[tuple[str | None, str]]
-    ) -> bool:
-        """Whether the run must stop now; the first reason is recorded in ``spend_stop``.
+    def read_usage(self) -> _AggregateUsage:
+        try:
+            value = self.p.work_item_usage(self.work_item_id)
+        except (OSError, self.fe.PreflightFailed):
+            value = None
+        return _AggregateUsage.decode(value)
 
-        A work item with more than MAX_REQUESTS requests (an automatic successor
-        would start a third, workitems/lifecycle.py ``admit_automatic_successor``),
-        or any status comment whose Usage line totals over the bound or reads
-        ``total cost unknown``. An unreadable work item skips the count only.
-        """
+    def over_spend(self, detail: Mapping[str, Any] | None, usage: _AggregateUsage) -> bool:
+        """Stop on a third request or on a known estimate above the bound."""
 
         if self.obs["spend_stop"] is not None:
             return True
-        reason: dict[str, Any] | None = None
-        count = len(requests_of(detail)) if detail is not None else 0
+        count = len(requests_of(detail))
         if count > MAX_REQUESTS:
             reason = {"reason": "requests", "count": count}
+        elif usage.total is not None and usage.total > COST_BOUND_USD:
+            reason = {"reason": "usage", **usage.evidence()}
         else:
-            for marker, text in comments:
-                if not (marker and marker.startswith(STATUS_MARKER_PREFIX)):
-                    continue
-                kind, total = usage_total(text)
-                if kind == "unknown" or (total is not None and total > COST_BOUND_USD):
-                    reason = {
-                        "reason": "usage",
-                        "kind": kind,
-                        "total": None if total is None else str(total),
-                    }
-                    break
-        if reason is None:
             return False
         self.obs["spend_stop"] = reason
         self.note("the request or cost bound was crossed; stopping the run", **reason)
         return True
 
-    def poll(self) -> tuple[Mapping[str, Any] | None, list[tuple[str | None, str]], bool]:
-        """One read of the work item and the comments after the answer, and the spend check."""
+    def poll(
+        self,
+    ) -> tuple[Mapping[str, Any] | None, list[tuple[str | None, str]], _AggregateUsage, bool]:
+        """Read the work item, comments, and aggregate cost after the answer."""
 
         detail: Mapping[str, Any] | None = self.p.work_item_detail(self.work_item_id)
         comments = self.comments()
-        return detail, comments, self.over_spend(detail, comments)
+        usage = self.read_usage()
+        return detail, comments, usage, self.over_spend(detail, usage)
 
     # -- beats --
 
@@ -1259,7 +1275,7 @@ class _LiveRun:
         """The asking request's terminal status comment, read and bounded before the answer.
 
         factory_notices.py ``_render`` writes the Usage line (``usage_line``,
-        cumulative over the WorkItem) into every terminal comment, questions
+        scoped to the execution request) into every terminal comment, questions
         asked included, and ``usage_line`` returns a line whenever a run
         started (``not reported for N runs`` when none reported). So the
         asking request's terminal comment always carries one: a missing total
@@ -1300,7 +1316,7 @@ class _LiveRun:
         assert self.answer_at is not None
         deadline = self.answer_at + max(SECOND_REQUEST_SECONDS, ANSWER_RECEIVED_SECONDS)
         while True:
-            detail, comments, stop = self.poll()
+            detail, comments, _usage, stop = self.poll()
             if stop:
                 return False
             if self.obs["second_request_s"] is None:
@@ -1337,7 +1353,7 @@ class _LiveRun:
         assert self.answer_at is not None
         deadline = self.answer_at + PULL_REQUEST_SECONDS
         while True:
-            read, _comments, stop = self.poll()
+            read, _comments, _usage, stop = self.poll()
             if stop:
                 return False
             detail = read or {}
@@ -1384,7 +1400,7 @@ class _LiveRun:
         deadline = (self.pr_recorded_at or self.clock()) + ENDING_SECONDS
         while True:
             read_at = self.clock()
-            detail, _comments, stop = self.poll()
+            detail, _comments, _usage, stop = self.poll()
             if stop:
                 return False
             # An ending read after the deadline does not count.
@@ -1411,7 +1427,13 @@ class _LiveRun:
         if len(self.obs["pull_requests"]) != 1:
             self.note("the pull requests are not exactly one after the run ended; not merging")
             return
-        if self.poll()[2]:
+        _detail, _comments, usage, stop = self.poll()
+        self.obs["pre_merge_usage"] = usage.evidence()
+        if stop:
+            return
+        failure = usage.failure()
+        if failure is not None:
+            self.note(f"{failure} before the merge; not merging")
             return
         merge = self.driver.merge(self.change)
         merged_at = self.clock()
@@ -1422,9 +1444,7 @@ class _LiveRun:
             return
         deadline = merged_at + MERGED_NOTICE_SECONDS
         while True:
-            # The notice is recorded from the same read before the spend check,
-            # so a stop on that read still keeps its usage in the evidence.
-            detail, comments = self.p.work_item_detail(self.work_item_id), self.comments()
+            _detail, comments, _usage, stop = self.poll()
             for marker, text in comments:
                 if not (marker and marker.startswith(STATUS_MARKER_PREFIX)):
                     continue
@@ -1432,14 +1452,9 @@ class _LiveRun:
                     continue
                 if has_line(text, MERGED_LINE):
                     self.obs["merged_notice_s"] = self.rel()
-                    kind, total = usage_total(text)
-                    self.obs["usage"] = {
-                        "kind": kind,
-                        "total": None if total is None else str(total),
-                    }
                     self.note("merged notice seen")
                     break
-            if self.over_spend(detail, comments) or self.obs["merged_notice_s"] is not None:
+            if stop or self.obs["merged_notice_s"] is not None:
                 return
             if self.clock() > deadline:
                 self.note("no merged notice within the bound")
@@ -1457,6 +1472,8 @@ class _LiveRun:
             )
         detail = self.p.work_item_detail(self.work_item_id) if self.work_item_id else None
         self.obs["request_count"] = None if detail is None else len(requests_of(detail))
+        if self.work_item_id:
+            self.obs["usage"] = self.read_usage().evidence()
         self.obs["factory_created_issues"] = self.driver.factory_created_issues(self.p.labelled_at)
         self.obs["model_usage_before"] = self.p.usage_before
         self.obs["model_usage_after"] = self.p.model_usage()
