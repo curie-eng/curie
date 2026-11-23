@@ -48,7 +48,7 @@ from curie_channel_gateway.reply_transport import (
     read_capped_ack,
     reply_ref_from,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .config import WorkerConfig
 
@@ -81,7 +81,7 @@ class TargetRoute(BaseModel):
 
     endpoint: str | None = None
     adapter: str | None = None
-    factory_public: bool = False
+    factory_public: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class ReplySink(ReplyEventTransport[TargetRoute], Protocol):
