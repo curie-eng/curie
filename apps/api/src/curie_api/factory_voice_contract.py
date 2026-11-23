@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Final, Literal, Protocol
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from .factory_confirmed_steering import (
+    ConfirmedText,
+    GitHubSteeringSource,
+    SlackSteeringSource,
+    SteeringDecision,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -56,12 +64,23 @@ class VoiceMedia:
 
 
 @dataclass(frozen=True, kw_only=True)
+class Pending:
+    draft_id: UUID
+    expires_at: datetime
+
+
+@dataclass(frozen=True, kw_only=True)
 class Draft:
     draft_id: UUID
     audience: Audience
     transcript: str = field(repr=False)
     version: int
     expires_at: datetime
+
+    @property
+    def code(self) -> str:
+        """The unique draft prefix and the version shown in this prompt."""
+        return f"{self.draft_id.hex[:12]}.{self.version}"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -70,6 +89,33 @@ class Edit:
 
 
 type Action = Literal["confirm", "reject"] | Edit
+
+
+@dataclass(frozen=True, kw_only=True)
+class VoiceReply:
+    code: str
+    action: Action
+
+
+_DRAFT_CODE: Final = r"[0-9a-f]{12}\.[1-9][0-9]{0,8}"
+_VOICE_REPLY = re.compile(rf"(confirm|reject|edit) ({_DRAFT_CODE})(?: (.*))?", re.DOTALL)
+
+
+def parse_voice_reply(text: str) -> VoiceReply | Refused | None:
+    """Parse the complete reply after the adapter removes its verified mention."""
+    match = _VOICE_REPLY.fullmatch(text)
+    if match is None:
+        return None
+    verb, code, body = match.groups()
+    if verb == "edit":
+        return VoiceReply(code=code, action=Edit(text=body or ""))
+    if body is not None:
+        return Refused(reason="invalid_text")
+    if verb == "confirm":
+        return VoiceReply(code=code, action="confirm")
+    return VoiceReply(code=code, action="reject")
+
+
 type Refusal = Literal[
     "disabled",
     "unavailable",
@@ -110,14 +156,17 @@ class Rejected:
 class CurrentSource:
     source: VoiceSource
     media_sha256: str
+    steering_source: SlackSteeringSource | GitHubSteeringSource
 
 
-@dataclass(frozen=True, kw_only=True)
-class ConfirmedText:
-    source: VoiceSource
-    draft_id: UUID
-    idempotency_key: UUID
-    text: str = field(repr=False)
+class VoiceDraftCallbacks(Protocol):
+    async def media(self, source: VoiceSource) -> VoiceMedia | Refused:
+        """Reopen the exact source under current provider authority."""
+        ...
+
+    async def deliver(self, source: VoiceSource, draft_id: UUID, outcome: Draft | Refused) -> None:
+        """Show the result only at its verified origin; tolerate repeated delivery."""
+        ...
 
 
 class VoiceFeedbackPort(Protocol):
@@ -125,19 +174,24 @@ class VoiceFeedbackPort(Protocol):
         """Read the canonical source, hash its current bytes and check authority."""
         ...
 
-    async def admit(self, session: AsyncSession, feedback: ConfirmedText) -> Confirmed | Refused:
+    async def admit(self, session: AsyncSession, feedback: ConfirmedText) -> SteeringDecision:
         """Apply current text steering policy inside the supplied transaction."""
         ...
 
 
 class VoiceDraftService(Protocol):
-    async def submit(self, source: VoiceSource, media: VoiceMedia) -> Draft | Refused: ...
+    async def submit(self, source: VoiceSource, media: VoiceMedia) -> Pending | Refused: ...
+
+    async def process_pending(
+        self, surface: Literal["slack", "github"], callbacks: VoiceDraftCallbacks
+    ) -> bool:
+        """Claim and process at most one pending recognition or delivery for this surface."""
+        ...
 
     async def decide(
         self,
         *,
-        draft_id: UUID,
-        version: int,
+        code: str,
         tenant_id: UUID,
         actor: Actor,
         audience: Audience,
