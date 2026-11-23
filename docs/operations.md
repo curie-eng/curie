@@ -2742,7 +2742,7 @@ identifiers and a generation only, never a credential.
 `curie <tier> work-items --json` carries the same four fields,
 and the human detail view prints one `auth` line.
 
-Each item also reports `memory_rules`, the learned rules pinned when the work item was admitted: `state`, `count`, `rule_numbers`, `sha256` and `format_version`, never the rule text. `curie <tier> work-items --json` (schema `work-items/v2.3`) prints it for the list and for one item, and the Console work item detail lists the pinned rules with their text.
+Each item also reports `memory_rules`, the learned rules pinned when the work item was admitted: `state`, `count`, `rule_numbers`, `sha256` and `format_version`, never the rule text. `curie <tier> work-items --json` (schema `work-items/v2.4`) prints it for the list and for one item, and the Console work item detail lists the pinned rules with their text.
 
 Each item also reports its automatic retry allowance:
 `automatic_retries_used` (owner loss and ordinary failures together) and

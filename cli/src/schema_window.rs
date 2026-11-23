@@ -791,9 +791,9 @@ print(json.dumps(graph))
         // Factory question rounds require 0184.
         // Learned memory rules require 0185.
         // The plain feedback cap requires 0186.
-        // The 0188 triage contract precedes the 0189 run-handoff schema floor.
-        assert_eq!(candidate.schema_min, "0189");
-        assert_eq!(candidate.schema_head, "0196");
+        // Factory maintenance settlement and progress require 0191.
+        assert_eq!(candidate.schema_min, "0191");
+        assert_eq!(candidate.schema_head, "0191");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -867,7 +867,9 @@ print(json.dumps(graph))
         assert!(!live_in_window("0185", &current));
         assert!(!live_in_window("0186", &current));
         assert!(!live_in_window("0188", &current));
-        assert!(live_in_window("0189", &current));
+        assert!(!live_in_window("0189", &current));
+        assert!(!live_in_window("0196", &current));
+        assert!(live_in_window("0191", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

@@ -1,7 +1,7 @@
 """Store one maintenance allowance per factory pull request and its history.
 
 Revision ID: 0191
-Revises: 0188
+Revises: 0196
 """
 
 from collections.abc import Sequence
@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0191"
-down_revision: str = "0188"
+down_revision: str = "0196"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
