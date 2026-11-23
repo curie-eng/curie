@@ -147,6 +147,88 @@ def test_connect_plan_kickoff_unlinked_sender_and_spacing(
     ) == [{"n": int(offered)}]
 
 
+def test_kickoff_synced_directory_keeps_its_issuer_over_the_console(
+    kickoff: SteeringStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A synced directory issuer still wins when kickoff opts into the console issuer."""
+    import asyncio
+    from datetime import UTC, datetime
+    from urllib.parse import urlsplit
+
+    from curie_api.models import Team, TenantIdentityProvider
+    from sqlalchemy import delete
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+    from apps.api.tests.test_identity_connect import ISSUER, connect_plan_settings
+
+    connect_plan_settings(monkeypatch)
+    directory_issuer = "https://directory.example.com"
+    managed_by = f"example-directory-{kickoff.tag}"
+
+    async def install() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                session.add(
+                    TenantIdentityProvider(
+                        tenant_id=DEFAULT_TENANT_ID,
+                        issuer=directory_issuer,
+                        governed_domains=["example.com"],
+                        managed_by=managed_by,
+                    )
+                )
+                session.add(
+                    Team(
+                        tenant_id=DEFAULT_TENANT_ID,
+                        source="idp_group",
+                        external_id=f"example-group-{kickoff.tag}",
+                        name="Example",
+                        managed_by=managed_by,
+                        epoch=1,
+                        member_count=0,
+                        digest="0" * 64,
+                        last_synced_at=datetime.now(UTC),
+                    )
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    async def remove() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                await session.execute(
+                    delete(Team).where(
+                        Team.tenant_id == DEFAULT_TENANT_ID, Team.managed_by == managed_by
+                    )
+                )
+                await session.execute(
+                    delete(TenantIdentityProvider).where(
+                        TenantIdentityProvider.tenant_id == DEFAULT_TENANT_ID
+                    )
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(install())
+    try:
+        user = f"U{kickoff.tag.upper()}D"
+        answer = decide(kickoff, person_mention(kickoff, user, linking(next_issue())))
+        assert answer["outcome"] == "sender_unverified", answer
+        url = urlsplit(answer["connect_url"])
+        assert url.netloc == "console.example.com"
+        rows = _rows(
+            "SELECT idp_issuer FROM curie.identity_connect_tokens WHERE provider_native_id = :user",
+            {"user": user},
+        )
+        assert rows == [{"idp_issuer": directory_issuer}]
+        assert directory_issuer != ISSUER
+    finally:
+        asyncio.run(remove())
+
+
 def test_connect_plan_kickoff_inactive_enrollment(
     kickoff: SteeringStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:

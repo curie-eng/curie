@@ -592,6 +592,7 @@ async def _decide(
                 provider="slack",
                 channel_identity=data.channel_identity,
                 slack=evidence,
+                allow_personal_issuer=True,
             )
             if token is not None:
                 row = await session.get(IdentityConnectToken, connect.hash_token(token))
