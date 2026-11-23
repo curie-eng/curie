@@ -20,6 +20,13 @@
       "sha256": null,
       "state": "absent"
     },
+    "memory_rules": {
+      "state": "absent",
+      "count": 0,
+      "rule_numbers": [],
+      "sha256": null,
+      "format_version": null
+    },
     "correctness": {
       "asserted": false,
       "owner": "bundle"
@@ -133,6 +140,13 @@
       "sha256": null,
       "state": "absent"
     },
+    "memory_rules": {
+      "state": "absent",
+      "count": 0,
+      "rule_numbers": [],
+      "sha256": null,
+      "format_version": null
+    },
     "correctness": {
       "asserted": false,
       "owner": "bundle"
@@ -216,6 +230,13 @@
           "revision": null,
           "sha256": null,
           "state": "absent"
+        },
+        "memory_rules": {
+          "state": "absent",
+          "count": 0,
+          "rule_numbers": [],
+          "sha256": null,
+          "format_version": null
         },
         "correctness": {
           "asserted": false,
@@ -324,6 +345,13 @@
           "revision": null,
           "sha256": null,
           "state": "absent"
+        },
+        "memory_rules": {
+          "state": "absent",
+          "count": 0,
+          "rule_numbers": [],
+          "sha256": null,
+          "format_version": null
         },
         "correctness": {
           "asserted": false,

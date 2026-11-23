@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/work-items/v2.2.json",
+  "$id": "https://schemas.curietech.ai/cli/work-items/v2.3.json",
   "title": "curie <tier> work-items --json",
   "description": "The agent-facing payload of `curie <tier> work-items [ID]`: the dry-run plan, the factory work item list (`items`, `limit`, `truncated`), or one work item under `item` with live CI. `state` and `actionable_cause` are the platform API's strings, never derived by the CLI.",
   "$defs": {
@@ -474,6 +474,9 @@
             "integer",
             "null"
           ]
+        },
+        "memory_rules": {
+          "$ref": "#/$defs/memoryRules"
         }
       }
     },
@@ -509,6 +512,45 @@
       "properties": {
         "item": {
           "$ref": "#/$defs/item"
+        }
+      }
+    },
+    "memoryRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The learned rules pinned at admission (#5798): rule numbers and a digest, never the rule text.",
+      "required": [
+        "state",
+        "count",
+        "rule_numbers",
+        "sha256",
+        "format_version"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "description": "absent or selected; clients must tolerate new values."
+        },
+        "count": {
+          "type": "integer"
+        },
+        "rule_numbers": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "format_version": {
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       }
     }

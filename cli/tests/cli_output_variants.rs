@@ -298,7 +298,14 @@ fn work_item_outcome() -> Box<curie::api::WorkItemOutcome> {
                     "capacity_deferrals": 0,
                     "last_deferral_reason": null
                 }
-            ]
+            ],
+            "memory_rules": {
+                "state": "absent",
+                "count": 0,
+                "rule_numbers": [],
+                "sha256": null,
+                "format_version": null
+            }
         }))
         .expect("WorkItemOutcome mirror deserializes from its own wire shape"),
     )
