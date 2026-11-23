@@ -616,6 +616,18 @@ class PostgresFactorySlackStore:
             if public_role
             else "(t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL)"
         )
+        delivery_enabled = (
+            f"""({self._live_thread} OR (
+                {{post}}.kind IN ('steering_applied', 'steering_refused') AND EXISTS (
+                    SELECT 1 FROM {self._ledger} g
+                     WHERE g.work_item_id = t.work_item_id AND {_STEERING_AT_SOURCE}
+                       AND {{post}}.kind = 'steering_' || g.state
+                       AND {{post}}.post_key = {{post}}.kind || ':' || g.steering_id)))"""
+            if public_role
+            else self._live_thread
+        )
+        self._post_delivery_enabled = delivery_enabled.format(post="p")
+        self._earlier_post_delivery_enabled = delivery_enabled.format(post="e")
         self._delivered_kinds = (
             _DELIVERED_KINDS_SQL + ", 'steering_queued', 'steering_applied', 'steering_refused'"
         )
@@ -836,16 +848,6 @@ class PostgresFactorySlackStore:
         """)
         )
 
-    def _post_delivery_enabled(self, post: str) -> str:
-        if not self.public_role:
-            return self._live_thread
-        return f"""({self._live_thread} OR (
-            {post}.kind IN ('steering_applied', 'steering_refused') AND EXISTS (
-                SELECT 1 FROM {self._ledger} g
-                 WHERE g.work_item_id = t.work_item_id AND {_STEERING_AT_SOURCE}
-                   AND {post}.kind = 'steering_' || g.state
-                   AND {post}.post_key = {post}.kind || ':' || g.steering_id)))"""
-
     @asynccontextmanager
     async def delivery_guard(self, work: FactorySlackWork) -> AsyncIterator[bool]:
         # Adoption uses this same lock. A claimed origin payload can outlive its lease.
@@ -862,7 +864,7 @@ class PostgresFactorySlackStore:
                       JOIN {self._agents} a ON a.id = t.agent_id
                      WHERE p.id = :post AND p.lease_owner = :owner AND p.failed_at IS NULL
                        AND p.posted_at IS NULL AND {self._role_eligible}
-                       AND {self._bound_thread} AND {self._post_delivery_enabled("p")})
+                       AND {self._bound_thread} AND {self._post_delivery_enabled})
             """),
                 {"post": work.post_id, "owner": self._lease_owner},
             )
@@ -1309,7 +1311,7 @@ class PostgresFactorySlackStore:
               FROM {self._posts} p
               JOIN {self._threads} t ON t.work_item_id = p.work_item_id
               JOIN {self._agents} a ON a.id = t.agent_id
-             WHERE {self._post_delivery_enabled("p")} AND {self._role_eligible}
+             WHERE {self._post_delivery_enabled} AND {self._role_eligible}
                AND p.posted_at IS NULL
                AND p.failed_at IS NULL
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
@@ -1324,7 +1326,7 @@ class PostgresFactorySlackStore:
                       AND e.posted_at IS NULL
                       AND e.failed_at IS NULL
                       AND e.kind IN ({self._delivered_kinds})
-                      AND {self._post_delivery_enabled("e")}
+                      AND {self._earlier_post_delivery_enabled}
                       AND (e.sequence, e.rank, e.ordinal, e.id)
                           < (p.sequence, p.rank, p.ordinal, p.id)
                )
