@@ -153,6 +153,11 @@
       "reason": "The isolated test environment result read from the source-owned test-env helper, unrelated to plugin_format."
     },
     {
+      "struct": "VoiceFixturesOutput",
+      "file": "cli/src/commands/dev.rs",
+      "reason": "The voice fixture generator reports the fixture names and whether it ran in check mode."
+    },
+    {
       "struct": "CheckReport",
       "file": "cli/src/commands/init.rs",
       "reason": "Mirrors the frozen curie_runner.check report contract (parse_check_report), a different local contract entirely -- unrelated to plugin_format and out of scope for #701."
