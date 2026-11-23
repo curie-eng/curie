@@ -49,6 +49,8 @@ def test_model_edits_only_for_this_turns_received_steering() -> None:
             assert status == 200
             (tool,) = answer["content"]
             assert tool["name"] == expected
+            if expected == "Agent":
+                assert tool["input"]["run_in_background"] is False
             messages += [
                 {"role": "assistant", "content": [tool]},
                 {
@@ -57,6 +59,7 @@ def test_model_edits_only_for_this_turns_received_steering() -> None:
                         {"type": "tool_result", "tool_use_id": tool["id"], "content": ANCHOR}
                     ],
                 },
+                {"role": "system", "content": [{"type": "text", "text": "Tool use completed."}]},
             ]
         assert tool["input"]["new_string"] == f"Run note {NONCE}\n{ANCHOR}"
         assert router.received == [NONCE]

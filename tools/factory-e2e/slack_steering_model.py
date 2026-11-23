@@ -34,6 +34,8 @@ def _texts(content: Any) -> list[str]:
 
 
 def _tool(name: str, **args: Any) -> dict[str, Any]:
+    if name in {"Agent", "Bash"}:
+        args["run_in_background"] = False
     return {"type": "tool_use", "name": name, "input": args}
 
 
@@ -66,9 +68,10 @@ def _review(stage: str, nonce: str) -> dict[str, Any]:
 
 
 def _last_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not messages or messages[-1].get("role") != "user":
+    latest = next((m for m in reversed(messages) if m.get("role") in {"assistant", "user"}), {})
+    if latest.get("role") != "user":
         return []
-    content = messages[-1].get("content")
+    content = latest.get("content")
     return (
         [
             block
