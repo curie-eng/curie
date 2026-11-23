@@ -21,8 +21,9 @@ same named base. Both reasons draw from one slot on the publication lineage.
 The origin is the first eligible successful settlement. Its terminal database
 timestamp starts a 24 hour window. A permitted no-CI settlement can anchor a
 conflict window. A late CI repair also requires durable evidence of a positive
-CI verdict on an authorized head. Subsequent publications, including human
-steering, cannot extend the window or replenish the allowance.
+CI verdict on the same authorized head that later turns red. Subsequent
+publications, including human steering, cannot extend the window or replenish
+the allowance.
 
 Before admission, read current tracker, pull request, base and check evidence.
 In one database transaction recheck versions, cancellation, lineage and owner
@@ -43,9 +44,11 @@ eligibility check.
 
 ## Consequences
 
-The successor must verify CI on the resulting head. It cannot acquire another
-repair turn. Active executions retain their existing CI rerun and continuation
-limits. The timeout observer can still record later green without starting a
+The successor must verify positive CI on its new head. A conflict repair on a
+repository with no applicable checks therefore settles as unverified. The
+successor cannot acquire another repair turn. Active executions retain their
+existing CI rerun and continuation limits. The timeout observer can still
+record later green without starting a
 turn. WorkItem history and progress distinguish publication, verified green
 on a named head, permitted no-CI settlement and maintenance refusals.
 

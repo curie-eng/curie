@@ -1959,6 +1959,7 @@ class FactoryMaintenanceLineage(Base):
     origin_completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     repairs_used: Mapped[int] = mapped_column(default=0, server_default="0")
+    final_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     latest_settled_request_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
     )

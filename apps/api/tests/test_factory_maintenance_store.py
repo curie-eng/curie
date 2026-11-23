@@ -387,6 +387,33 @@ def test_later_green_revision_preserves_the_original_window_and_allowance(clean_
     support.with_session(scenario)
 
 
+def test_late_red_on_a_no_ci_revision_cannot_spend_an_earlier_heads_green(clean_db: None) -> None:
+    async def scenario(session: AsyncSession) -> None:
+        origin = await seed_completed(session)
+        item = await session.get(WorkItem, origin.work_item_id)
+        assert item
+        revision = await workitem_dispatch.admit_revision(
+            session, support.facts(item.agent_id, issue_number=2573, objective="Update the README")
+        )
+        assert isinstance(revision, lifecycle.WorkItemOutcome) and revision.request
+        running = await _start(session, revision)
+        await _attach_fix_async(
+            item.id,
+            revision.request.id,
+            revision=2,
+            head_sha="2" * 40,
+            title="Revise README",
+            paths=["README.md"],
+        )
+        observed = await _settle(session, running, green=False)
+        assert await commit_observation(session, observed, objective=REPAIR, refusal=None) == (
+            MaintenanceRefusal(reason="prior_green_missing")
+        )
+        assert await _counts(session) == (2, 0, 0)
+
+    support.with_session(scenario)
+
+
 def test_postgres_refuses_rewriting_maintenance_authority(clean_db: None) -> None:
     async def scenario(session: AsyncSession) -> None:
         obs = await seed_completed(session)

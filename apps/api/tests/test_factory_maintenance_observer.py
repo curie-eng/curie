@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
@@ -22,11 +23,13 @@ from curie_api.workitems.lifecycle import database_now
 from forge_fakes import github
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from test_factory_ci_wait import _clock_offset
 from test_factory_maintenance_store import seed_completed
 
 
+@pytest.mark.parametrize("expired_state", [None, "success", "failure"])
 def test_observer_rechecks_forge_and_restored_head_before_one_successor(
-    clean_db: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    clean_db: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, expired_state: str | None
 ) -> None:
     for key, value in github.factory_env(
         tmp_path, bindings=[github.github_repository_binding(repo_id=101)]
@@ -87,7 +90,25 @@ def test_observer_rechecks_forge_and_restored_head_before_one_successor(
 
             forge.report_check(observation.head_sha, "unit", "success")
             await poll()
+            await observer.poll(lineage.id, None)
+            forge.set_pull_state(lineage.pr_number, merged=True)
+            await poll()
             assert await history() == ["green"]
+            forge.pulls[lineage.pr_number].update(state="open", merged_at=None)
+            if expired_state is not None:
+                forge.report_check(observation.head_sha, "unit", expired_state)
+                with _clock_offset(timedelta(days=1, minutes=1).total_seconds()):
+                    await poll()
+                    expected = (
+                        ["green", "window_expired"] if expired_state == "failure" else ["green"]
+                    )
+                    assert await history() == expected
+                    reads = len(forge.http_requests)
+                    restarted = MaintenanceObserver(sessions, settings, client, valkey)
+                    await restarted.poll(lineage.id, await host.read_pull_request(ref))
+                    assert len(forge.http_requests) == reads + 1
+                assert await session.scalar(select(func.count()).select_from(ExecutionRequest)) == 1
+                return
             forge.report_check(observation.head_sha, "unit", "failure")
             forge.check_runs[observation.head_sha]["unit"]["started_at"] = (
                 await database_now(session)

@@ -277,8 +277,6 @@ class LineageReconciler:
                 pull = await code_host.read_pull_request(item.pull_request)
             except ForgeError as exc:
                 result.skipped += 1
-                if self._maintenance is not None:
-                    await self._maintenance.poll(item.lineage_id, None)
                 if isinstance(exc, Unavailable) and str(exc) == RATE_LIMITED:
                     result.rate_limited = True
                     break
@@ -291,7 +289,7 @@ class LineageReconciler:
             if self._maintenance is not None:
                 try:
                     await self._maintenance.poll(item.lineage_id, pull)
-                except (ForgeError, TimeoutError) as exc:
+                except (ForgeError, TimeoutError, SQLAlchemyError) as exc:
                     if str(exc) == RATE_LIMITED:
                         result.rate_limited = True
                         break

@@ -42,6 +42,7 @@ def upgrade() -> None:
             origin_completed_at timestamptz NOT NULL,
             expires_at timestamptz NOT NULL,
             repairs_used integer NOT NULL DEFAULT 0,
+            final_poll_at timestamptz,
             latest_settled_request_id uuid NOT NULL REFERENCES curie.execution_requests
                 ON DELETE CASCADE,
             latest_settled_head_sha text NOT NULL,

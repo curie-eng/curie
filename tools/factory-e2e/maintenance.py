@@ -173,6 +173,13 @@ class MaintenanceInstall(ci.CandidateInstall):
         assert first["requests"][0]["status"] == "running"
         return subject
 
+    def api_replicas(self, replicas: int) -> None:
+        deployment = "deployment/" + self.inputs.release + "-api"
+        self.kubectl("-n", self.inputs.namespace, "scale", deployment, f"--replicas={replicas}")
+        self.kubectl("-n", self.inputs.namespace, "rollout", "status", deployment, "--timeout=600s")
+        if replicas:
+            self.port_forward()
+
     def restart(self) -> None:
         name = "deployment/" + self.inputs.release + "-api"
         self.kubectl("-n", self.inputs.namespace, "rollout", "restart", name)
@@ -595,8 +602,16 @@ def late(run: MaintenanceInstall, control: str) -> None:
         )
         run.checks((head, "success", CHECK), (base, "success", CHECK))
     elif control == "closed":
-        run.forge("PATCH", f"pulls/{pr['number']}", {"state": "closed"})
-        refusal(subject, original, "pr_closed", lambda: run.checks(red))
+
+        def close_with_failure() -> None:
+            run.api_replicas(0)
+            try:
+                run.forge("PATCH", f"pulls/{pr['number']}", {"state": "closed"})
+                run.checks(red)
+            finally:
+                run.api_replicas(1)
+
+        refusal(subject, original, "pr_closed", close_with_failure)
         assert subject.pull(original)["state"] == "closed"
     elif control == "cancelled":
         run.forge("DELETE", f"issues/{subject.issue}/labels/{LABEL}")
@@ -604,13 +619,28 @@ def late(run: MaintenanceInstall, control: str) -> None:
     elif control == "expiry":
         evidence("waiting for database deadline", expires_at=window["expires_at"])
         expiry = datetime.fromisoformat(window["expires_at"])
+
+        # Stop the observer before its final read. The late check arrives after
+        # the real deadline, while the API is offline, and survives its restart.
+        def db_time() -> datetime:
+            return datetime.fromisoformat(run.sql("SELECT to_json(clock_timestamp())"))
+
         fe._wait(
-            "real 24-hour database expiry",
+            "last five minutes of the real maintenance window",
             timedelta(hours=24, minutes=10).total_seconds(),
-            lambda: datetime.fromisoformat(run.sql("SELECT to_json(clock_timestamp())")) >= expiry,
+            lambda: db_time() >= expiry - timedelta(minutes=5),
             interval=60,
         )
-        refusal(subject, original, "window_expired", lambda: run.checks(red))
+
+        def fail_after_expiry() -> None:
+            run.api_replicas(0)
+            try:
+                fe._wait("real database expiry", 600, lambda: db_time() >= expiry, interval=5)
+                run.checks(red)
+            finally:
+                run.api_replicas(1)
+
+        refusal(subject, original, "window_expired", fail_after_expiry)
     else:
         repair(subject, original, fail=control == "failed-repair")
 

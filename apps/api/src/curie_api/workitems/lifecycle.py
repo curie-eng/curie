@@ -1024,7 +1024,7 @@ async def create_or_get_work_item(
     return await outcome(session, work_item, None, replayed=inserted_id is None)
 
 
-async def _insert_waiting_request(
+async def insert_waiting_request(
     session: AsyncSession,
     work_item: WorkItem,
     *,
@@ -1129,7 +1129,7 @@ async def create_execution_request(
         return await _conflict(session, "active_request", work_item=work_item, request=active)
 
     try:
-        allocation_changed = await _insert_waiting_request(
+        allocation_changed = await insert_waiting_request(
             session,
             work_item,
             request_id=request_id,
@@ -3585,7 +3585,7 @@ async def admit_automatic_successor(
             dispatch_not_before = wait_deadline
         else:
             dispatch_not_before = due
-    admitted = await _insert_waiting_request(
+    admitted = await insert_waiting_request(
         session,
         work_item,
         request_id=uuid.uuid4(),
@@ -3679,7 +3679,7 @@ async def _admit_publication_recovery(
     request_id = uuid.uuid4()
     try:
         async with session.begin_nested():
-            admitted = await _insert_waiting_request(
+            admitted = await insert_waiting_request(
                 session,
                 work_item,
                 request_id=request_id,

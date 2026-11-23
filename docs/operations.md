@@ -1736,14 +1736,17 @@ handoff label. Other terminal causes do not start this observation.
 
 The optional `factory.maintenanceRepairEnabled` setting (API environment
 `FACTORY_MAINTENANCE_REPAIR_ENABLED`) defaults to false. With it enabled, the
-lineage reconciler can start one same-PR repair when CI turns red after verified
-green. The window closes 24 hours after the first eligible successful request
-finished. Later revisions and restarts preserve both the deadline and the
-consumed allowance. A repair must publish a new head and verify its CI.
+lineage reconciler can start one same-PR repair when CI turns red on a head
+that previously settled with verified green CI. The window closes 24 hours
+after the first eligible successful request finished. Later revisions and
+restarts preserve both the deadline and the consumed allowance. A repair must
+publish a new head and verify its CI.
 
-Read `maintenance_history` in the WorkItem detail for the authorized head, base,
-reason, refusal or admitted successor. A matching failure on the base or missing
-evidence leaves the allowance available. A human push pauses repair with
+WorkItem and Slack progress report verified green and allowed no-CI settlements
+even when automatic repair is disabled. Read `maintenance_history` in the
+WorkItem detail for the authorized head, base, reason, refusal or admitted
+successor. A matching failure on the base or missing evidence leaves the
+allowance available. A human push pauses repair with
 `foreign_head`. Restoring the recorded head allows reevaluation. A successful
 repair leaves the pull request open for review.
 

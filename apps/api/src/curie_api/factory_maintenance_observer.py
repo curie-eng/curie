@@ -10,7 +10,7 @@ from uuid import UUID
 import httpx
 import redis.asyncio as redis
 from channel_protocol.work_item_events import CI_MAX_ROUNDS
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import factory_ci
@@ -50,7 +50,7 @@ from .models import (
     ThreadPublicationLineage,
     WorkItem,
 )
-from .workitems.lifecycle import database_now, lock_work_item
+from .workitems import lifecycle
 
 
 def pull_refusal(
@@ -110,6 +110,8 @@ class MaintenanceObserver:
     async def poll(self, lineage_id: UUID, pull: PullRequest | None) -> None:
         # The cheap open-lineage pass selects the stimulus; admission re-reads
         # authority and evidence. Ordinary green polls produce no refusal.
+        if pull is None or pull.state is PullRequestState.MERGED:
+            return
         async with self.sessions() as session:
             row = (
                 await session.execute(
@@ -128,7 +130,10 @@ class MaintenanceObserver:
                         FactoryMaintenanceLineage,
                         FactoryMaintenanceLineage.lineage_id == ThreadPublicationLineage.id,
                     )
-                    .where(ThreadPublicationLineage.id == lineage_id)
+                    .where(
+                        ThreadPublicationLineage.id == lineage_id,
+                        FactoryMaintenanceLineage.final_poll_at.is_(None),
+                    )
                     .order_by(ExecutionRequest.sequence.desc())
                     .limit(1)
                 )
@@ -148,39 +153,42 @@ class MaintenanceObserver:
                 head_sha=lineage.head_sha,
                 base_ref=lineage.base_ref,
                 base_sha=lineage.base_sha,
-                reason="base_conflict" if pull and pull.conflicted else "late_ci_red",
+                reason="base_conflict" if pull.conflicted else "late_ci_red",
             )
-            if await database_now(session) >= window.expires_at:
-                await commit_observation(
-                    session, observation, objective=None, refusal="window_expired"
-                )
-                return
-            if pull is None:
-                await commit_observation(
-                    session, observation, objective=None, refusal="evidence_unavailable"
-                )
-                return
+            now = await lifecycle.database_now(session)
+            final_poll = now >= window.expires_at
             session.expunge_all()
-        try:
-            async with asyncio.timeout(15):
-                host = self._host(item, lineage)
-                if (
-                    observation.reason == "late_ci_red"
-                    and item.cancelled_at is None
-                    and pull_refusal(lineage, pull, observation.head_sha, observation.base_ref)
-                    is None
-                    and (await host.observe_ci(item.repository, observation.head_sha)).state
-                    is not RollupState.FAILURE
-                ):
-                    return
+        async with asyncio.timeout(15):
+            host = self._host(item, lineage)
+            foreign = pull.head_sha != observation.head_sha
+            actionable = (
+                foreign
+                or pull.conflicted
+                or (await host.observe_ci(item.repository, observation.head_sha)).state
+                is RollupState.FAILURE
+            )
+            if actionable:
                 tip = await host.branch_head(item.repository, observation.base_ref)
-        except (ForgeError, TimeoutError):
+                observation = replace(observation, base_sha=tip or observation.base_sha)
+        if actionable:
+            if final_poll:
+                async with self.sessions() as session:
+                    await commit_observation(
+                        session, observation, objective=None, refusal="window_expired"
+                    )
+            else:
+                await self(observation)
+        if final_poll:
             async with self.sessions() as session:
-                await commit_observation(
-                    session, observation, objective=None, refusal="evidence_unavailable"
+                await session.execute(
+                    update(FactoryMaintenanceLineage)
+                    .where(
+                        FactoryMaintenanceLineage.lineage_id == lineage_id,
+                        FactoryMaintenanceLineage.final_poll_at.is_(None),
+                    )
+                    .values(final_poll_at=now)
                 )
-            raise
-        await self(replace(observation, base_sha=tip or observation.base_sha))
+                await session.commit()
 
     async def __call__(
         self, observation: MaintenanceObservation, /
@@ -213,7 +221,11 @@ class MaintenanceObserver:
             try:
                 async with asyncio.timeout(45):
                     objective, refusal = await self._verify(
-                        observation, facts, origin.latest_green_at if origin else None
+                        observation,
+                        facts,
+                        origin.latest_green_at
+                        if origin and origin.latest_green_head_sha == observation.head_sha
+                        else None,
                     )
             except (
                 ForgeError,
@@ -288,7 +300,7 @@ class MaintenanceObserver:
                 settings=self.settings,
             ):
                 return None, "retarget_pending"
-            now = await database_now(session)
+            now = await lifecycle.database_now(session)
         issue = issue_url(self.settings, item.tracker_issue, repository)
         verdict, view, _, _, now = await factory_ci.inspect_ci(
             self.sessions,
@@ -369,7 +381,7 @@ async def repair_refusal(
     admission, lineage, item = row
     refusal = await _current_refusal(admission, lineage, item, settings, client)
     if refusal and record:
-        await lock_work_item(session, item.id)
+        await lifecycle.lock_work_item(session, item.id)
         await record_event(
             session, admission, refusal, repair_request_id=admission.repair_request_id
         )

@@ -29,7 +29,7 @@ from .models import (
     ThreadPublicationLineage,
     WorkItem,
 )
-from .personal_execution import OwnerContext, OwnerTuple, _verify, compare_owner
+from .personal_execution import OwnerContext, OwnerTuple, compare_owner, verify_owner_context
 from .workitems import lifecycle
 
 
@@ -124,7 +124,7 @@ async def _owner_refusal(
         return "owner_changed"
     if owner.is_personal:
         assert owner.owner_principal_id is not None and owner.enrollment_generation is not None
-        refusal = await _verify(
+        refusal = await verify_owner_context(
             session,
             OwnerContext(owner.tenant_id, owner.owner_principal_id, owner.enrollment_generation),
             agent_id=item.agent_id,
@@ -224,7 +224,7 @@ async def _local_refusal(
         or window.latest_settled_head_sha != observation.head_sha
     ):
         return "source_not_completed"
-    if observation.reason == "late_ci_red" and window.latest_green_at is None:
+    if observation.reason == "late_ci_red" and window.latest_green_head_sha != observation.head_sha:
         return "prior_green_missing"
     if await lifecycle.database_now(session) >= window.expires_at:
         return "window_expired"
@@ -309,7 +309,7 @@ async def commit_observation(
         await factory_maintenance_progress.record_event(session, observation, "window_expired")
         await session.commit()
         return MaintenanceRefusal(reason="window_expired")
-    allocated = await lifecycle._insert_waiting_request(
+    allocated = await lifecycle.insert_waiting_request(
         session,
         item,
         request_id=repair_id,
