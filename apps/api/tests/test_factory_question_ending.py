@@ -382,6 +382,7 @@ def test_an_answered_round_drops_the_waiting_label(
     assert "SUCCEEDED" not in body
     assert "Status: QUESTIONS ASKED" in body
     assert "Questions asked (round 1 of 3)" in body
+    assert "Answer in a plain comment" not in body
     svg = _card_svg(job.client, job.request_id)
     assert "WAITING ON ANSWERS" not in svg
     assert "Waiting on answers" not in svg

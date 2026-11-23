@@ -112,6 +112,20 @@ def test_questions_only_status_says_waiting_on_answers() -> None:
     assert "- [x] Implement" not in body
 
 
+def test_an_answered_questions_result_does_not_ask_for_an_answer() -> None:
+    waiting = result_section(
+        "questions_asked", pr_url=None, question_round=1, waiting_on_answers=True
+    )
+    answered = result_section(
+        "questions_asked", pr_url=None, question_round=1, waiting_on_answers=False
+    )
+    assert waiting == (
+        "Questions asked (round 1 of 3). Answer in a plain comment on this ticket.\n"
+    )
+    assert answered == "Questions asked (round 1 of 3).\n"
+    assert "Answer in a plain comment" not in answered
+
+
 def test_github_issue_ask_line_says_comment_on_this_issue() -> None:
     issue = github_ask_line("curie", "issue")
     pull = github_ask_line("curie", "pull_request")

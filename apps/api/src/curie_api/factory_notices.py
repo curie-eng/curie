@@ -436,6 +436,7 @@ def result_section(
     run_cost_usd: Decimal | None = None,
     question_round: int | None = None,
     work_item_cancelled: bool = False,
+    waiting_on_answers: bool = True,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
@@ -446,9 +447,11 @@ def result_section(
     a failed or expired request with no successor. ``blocked_on`` is the
     condition a ``retry_condition_expired`` request was still blocked on.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
-    ``question_round`` is the round a ``questions_asked`` request posted, and
-    ``work_item_cancelled`` replaces its answer instruction once the WorkItem
-    is cancelled, since an answer then starts nothing.
+    ``question_round`` is the round a ``questions_asked`` request posted.
+    ``work_item_cancelled`` replaces the answer instruction once the WorkItem
+    is cancelled. ``waiting_on_answers`` keeps that instruction only while
+    this request's round is still outstanding. Once the round is answered,
+    the result names the questions and does not ask again.
     """
 
     if successor is not None:
@@ -495,8 +498,10 @@ def result_section(
                 f"Questions asked{of_rounds}. The factory label was removed, "
                 "so an answer starts nothing.\n"
             )
-        else:
+        elif waiting_on_answers:
             text = f"Questions asked{of_rounds}. Answer in a plain comment on this ticket.\n"
+        else:
+            text = f"Questions asked{of_rounds}.\n"
     elif cause == "issue_cancelled" and superseded:
         text = (
             f"Stopped: the label was added again, so a new run replaced this one.\nCause: {cause}\n"
@@ -1657,6 +1662,18 @@ async def _render(
                     else None
                 ),
                 work_item_cancelled=work_item.cancelled_at is not None,
+                waiting_on_answers=(
+                    is_waiting_on_answers(
+                        request.status,
+                        cause,
+                        work_item.cancelled_at,
+                        round_outstanding=await question_round_outstanding(
+                            session, work_item.id, request.id
+                        ),
+                    )
+                    if cause == QUESTIONS_ASKED
+                    else True
+                ),
             )
             if cause != QUESTIONS_ASKED and await question_unrecorded(
                 session, work_item.id, request.id
