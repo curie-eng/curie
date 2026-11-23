@@ -111,6 +111,29 @@ def test_plain_direct_message_signs_its_conversation_type_and_exact_turn() -> No
     rig.closed()
 
 
+def test_direct_file_share_signs_the_attachment_reference() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-26."""
+    module = api()
+    rig = HttpRig()
+    runtime = rig.runtime(module, bindings=dm_bindings(module))
+    body, event = dm_native(
+        subtype="file_share", files=[{"id": "F0EXAMPLE", "name": "example.xlsx", "size": 42}],
+    )
+    assert runtime.submit(
+        body=body, event=event, slack_identity=NAME, bot_user_id=BOT,
+    ).status == "accepted"
+    (request,) = rig.requests
+    assert json.loads(request.content)["attachments"] == [
+        {"id": "F0EXAMPLE", "name": "example.xlsx", "mime_type": None, "size_bytes": 42},
+    ]
+    ring = codec.build_identity_keyring("receiver", ((RECEIVER, 2, KEY),))
+    proof = codec.verify_receiver_proof(request.headers["X-Curie-Receiver-Proof"], ring)
+    assert isinstance(proof, codec.ReceiverProofV1)
+    assert proof.body_sha256 == hashlib.sha256(request.content).hexdigest()
+    assert proof.slack.channel_type == "im"
+    rig.closed()
+
+
 def test_threaded_direct_message_keeps_its_thread_as_the_conversation() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-19/26."""
     module = api()
@@ -155,7 +178,12 @@ DROPPED = {
     "no_channel_type": {"channel_type": _ABSENT},
     "edit": {"subtype": "message_changed"},
     "delete": {"subtype": "message_deleted"},
-    "file_share": {"subtype": "file_share"},
+    "file_share_without_files": {"subtype": "file_share"},
+    "file_share_without_usable_refs": {"subtype": "file_share", "files": [{"name": "example.xlsx"}]},
+    "file_share_from_bot": {
+        "subtype": "file_share", "bot_id": "B0EXAMPLEOTHER",
+        "files": [{"id": "F0EXAMPLE", "name": "example.xlsx"}],
+    },
     "bot_message": {"subtype": "bot_message"},
     "thread_broadcast": {"subtype": "thread_broadcast"},
     "null_subtype": {"subtype": None},
@@ -256,6 +284,24 @@ def test_direct_message_in_an_unregistered_conversation_gets_the_refusal(
     web.chat_postMessage.assert_called_once_with(
         channel="D0EXAMPLEUNBOUND", thread_ts="1700.0003", text=REFUSED_TEXT,
     )
+
+
+def test_file_share_reaches_selected_receiver_through_bolt(
+    config: DispatcherConfig, redis_client: redis.Redis,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-26."""
+    module = api()
+    rig = HttpRig()
+    body, _ = dm_native(
+        subtype="file_share", files=[{"id": "F0EXAMPLE", "name": "example.xlsx"}],
+    )
+    web = _deliver_selected(config, redis_client, rig, body, bindings=dm_bindings(module))
+    (request,) = rig.requests
+    assert json.loads(request.content)["attachments"][0]["id"] == "F0EXAMPLE"
+    web.chat_postMessage.assert_called_once_with(
+        channel=DM_CHANNEL, thread_ts="1700.0004", text=config.placeholder_text,
+    )
+    rig.closed()
 
 
 def test_accepted_direct_message_keeps_its_placeholder_and_a_redelivery_one_notice(
