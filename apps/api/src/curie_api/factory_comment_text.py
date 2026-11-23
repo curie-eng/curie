@@ -21,17 +21,13 @@ def github_ask_line(mention: str, surface: AskSurface) -> str:
     """How to ask the factory, for a GitHub tracker. Other forges do not use it.
 
     ``surface`` is the tracker object the comment is posted on. An issue says
-    to comment on this issue and mention the App, because a plain issue comment
-    starts nothing unless a question is open. A pull request, including a
+    to comment on this issue and mention the App. A pull request, including a
     review thread on that pull request, says to comment on this pull request.
     The first 10 plain revisions of a pull request need no mention.
     """
 
     if surface == "issue":
-        return (
-            f"Ask the factory: comment on this issue and mention @{mention}. "
-            "Outside an open question, a comment with no mention starts nothing."
-        )
+        return f"Ask the factory: comment on this issue and mention @{mention}."
     if surface == "pull_request":
         return (
             "Ask the factory: comment on this pull request. "

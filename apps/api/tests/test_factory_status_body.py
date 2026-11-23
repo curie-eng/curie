@@ -115,10 +115,7 @@ def test_questions_only_status_says_waiting_on_answers() -> None:
 def test_github_issue_ask_line_says_comment_on_this_issue() -> None:
     issue = github_ask_line("curie", "issue")
     pull = github_ask_line("curie", "pull_request")
-    assert issue == (
-        "Ask the factory: comment on this issue and mention @curie. "
-        "Outside an open question, a comment with no mention starts nothing."
-    )
+    assert issue == "Ask the factory: comment on this issue and mention @curie."
     assert "first 10 revisions" not in issue
     assert pull == (
         "Ask the factory: comment on this pull request. "
