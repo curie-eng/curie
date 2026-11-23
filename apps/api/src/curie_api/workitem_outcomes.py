@@ -104,16 +104,17 @@ def _previous_start_failure(req: ExecutionRequest) -> str:
     return f"; previous start failure: {detail}" if detail else ""
 
 
-# The issue close lands with the merge or in the ten minutes after it. A close
-# before the merge, or a later close, was not caused by the merge.
-_MERGE_CLOSE_TOLERANCE = timedelta(minutes=10)
+# Curie writes lineage.updated_at when it observes the merge, which can be
+# after GitHub has already closed the issue. The close counts when it is
+# within ten minutes before or after that observation.
+_OBSERVED_MERGE_CLOSE_TOLERANCE = timedelta(minutes=10)
 
 
 def _utc(value: datetime) -> datetime:
     """Read a stamp as UTC.
 
-    The lineage stores its merge time without a time zone. The request and
-    the issue close store a time zone. Both clocks are UTC.
+    The lineage stores the time Curie observed the merge without a time zone.
+    The request and the issue close store a time zone. Both clocks are UTC.
     """
 
     if value.tzinfo is None or value.utcoffset() is None:
@@ -121,18 +122,25 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _close_matches_merge(cancelled_at: datetime | None, merged_at: datetime | None) -> bool:
-    """Whether the close is the one the merge writes.
+def _close_matches_observed_merge(
+    cancelled_at: datetime | None, observed_at: datetime | None
+) -> bool:
+    """Whether the close is the one Curie ties to an observed merge.
 
-    The close is at or after the merge stamp, and no more than ten minutes
-    after it. A close before the merge is a cancellation.
+    ``observed_at`` is the lineage's ``updated_at``, written when Curie records
+    the merge, not GitHub's merge time. The close counts when it is within ten
+    minutes before or after that stamp.
     """
 
-    if cancelled_at is None or merged_at is None:
+    if cancelled_at is None or observed_at is None:
         return False
     cancelled = _utc(cancelled_at)
-    merged = _utc(merged_at)
-    return merged <= cancelled <= merged + _MERGE_CLOSE_TOLERANCE
+    observed = _utc(observed_at)
+    return (
+        observed - _OBSERVED_MERGE_CLOSE_TOLERANCE
+        <= cancelled
+        <= observed + _OBSERVED_MERGE_CLOSE_TOLERANCE
+    )
 
 
 def _merged_completion(
@@ -143,12 +151,12 @@ def _merged_completion(
 ) -> bool:
     """Whether this request is the run that merged its own pull request.
 
-    The merge stamp is the lineage's ``updated_at``. A request admitted after
-    that stamp, or one that finished for another cause, is a later run that
-    still points at the merged pull request. A lineage with no stamp skips the
-    admission time check. A close counts only when it is at the merge stamp
-    or in the ten minutes after it. A close before the merge, or a later
-    close, does not.
+    The stamp is the lineage's ``updated_at``, written when Curie observes the
+    merge, not when GitHub merged. A request admitted after that observation,
+    or one that finished for another cause, is a later run that still points
+    at the merged pull request. A lineage with no stamp skips the admission
+    time check. A close counts when it is within ten minutes before or after
+    the observation. A close further away does not.
     """
 
     if (
@@ -160,12 +168,12 @@ def _merged_completion(
         or lineage.pr_number is None
     ):
         return False
-    merged_at = lineage.updated_at
-    if merged_at is not None and (
-        req.created_at is None or _utc(req.created_at) > _utc(merged_at)
+    observed_at = lineage.updated_at
+    if observed_at is not None and (
+        req.created_at is None or _utc(req.created_at) > _utc(observed_at)
     ):
         return False
-    if cancelled_at is not None and not _close_matches_merge(cancelled_at, merged_at):
+    if cancelled_at is not None and not _close_matches_observed_merge(cancelled_at, observed_at):
         return False
     return True
 
