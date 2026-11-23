@@ -57,11 +57,12 @@ from typing import Any
 import httpx
 from curie_internal.slack_mention_receipt import SlackMentionReceipt
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import identity_fence, workitem_dispatch
 from .config import Settings
+from .factory_confirmed_steering import RefusedSteering
 from .factory_follow_up import with_pull_request_follow_up_marker
 from .forges import types
 from .forges.authority import feedback_allowlist, may_act_on_feedback
@@ -85,17 +86,19 @@ from .identity.slack import SlackEvidence
 from .models import (
     DEFAULT_TENANT_ID,
     Agent,
+    ChannelIdentity,
     ExecutionRequest,
     FactorySlackThread,
     IdentityLink,
     IdentityNamespace,
     PersonalClaudeEnrollment,
     Principal,
+    ProviderInstallation,
     Tenant,
     ThreadPublicationLineage,
     WorkItem,
 )
-from .personal_execution import ModelAuthMode, OwnerContext
+from .personal_execution import ModelAuthMode, OwnerContext, OwnerTuple
 from .schemas.workitems import (
     FactorySlackSteerIn,
     FactorySlackSteerOut,
@@ -138,6 +141,49 @@ class _Run:
     branch: str
     pr_number: int
     pr_url: str
+
+
+@dataclass(frozen=True, kw_only=True, repr=False)
+class _VoiceSource:
+    delivery_id: str
+    channel_identity: str
+    team_id: str
+    api_app_id: str
+    channel: str
+    root_ts: str
+    message_ts: str
+    file_id: str
+    content_sha256: str
+    author: str
+    evidence_json: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class _VoiceRun:
+    agent_id: uuid.UUID
+    owner: OwnerTuple
+    installation_mode: ModelAuthMode
+    tracker_issue: TrackerIssueRef
+    repository: RepositoryRef
+    installation_id: int | None
+    lineage_id: uuid.UUID | None
+    branch: str | None
+    pr_number: int | None
+    pr_url: str | None
+    implementation_request_id: uuid.UUID | None
+
+
+@dataclass(frozen=True, kw_only=True, repr=False)
+class SlackVoiceAuthorization:
+    """Facts established before fetching a clip or locking its draft."""
+
+    work_item_id: uuid.UUID
+    principal_id: uuid.UUID
+    source: _VoiceSource
+    resolution: Resolution
+    link: _Link
+    login: str
+    run: _VoiceRun
 
 
 def steering_request_id(channel_identity: str, delivery_id: str) -> uuid.UUID:
@@ -197,6 +243,47 @@ def _receipt(data: FactorySlackSteerIn) -> tuple[SlackMentionReceipt, SlackEvide
     if receipt.version != 1 or receipt.message_ts == receipt.root_ts:
         return None
     return receipt, evidence
+
+
+def _voice_source(data: FactorySlackSteerIn, evidence: SlackEvidence) -> _VoiceSource | None:
+    """Bind the adapter's verified file receipt to this delivery and its sender evidence."""
+
+    receipt = data.receipt
+    try:
+        sender = SlackEvidence.model_validate(receipt.get("evidence"))
+    except ValidationError:
+        return None
+    if (
+        receipt.get("version") != 3
+        or receipt.get("driver_bot_id") is not None
+        or receipt.get("body") != ""
+        or receipt.get("delivery_id") != data.delivery_id
+        or receipt.get("channel_identity") != data.channel_identity
+        or receipt.get("channel") != data.channel
+        or receipt.get("root_ts") != data.root_ts
+        or receipt.get("message_ts") == data.root_ts
+        or receipt.get("user_id") != data.author
+        or sender.user_id != data.author
+        or sender.delivery != "app_mention"
+        or sender != evidence
+    ):
+        return None
+    fields = ("message_ts", "voice_file_id", "content_sha256", "api_app_id", "team_id")
+    if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in fields):
+        return None
+    return _VoiceSource(
+        delivery_id=data.delivery_id,
+        channel_identity=data.channel_identity,
+        channel=data.channel,
+        root_ts=data.root_ts,
+        author=data.author,
+        message_ts=receipt["message_ts"],
+        file_id=receipt["voice_file_id"],
+        content_sha256=receipt["content_sha256"],
+        api_app_id=receipt["api_app_id"],
+        team_id=receipt["team_id"],
+        evidence_json=sender.model_dump_json(),
+    )
 
 
 async def _resolve(
@@ -316,10 +403,43 @@ def _allowlist(
     return feedback_allowlist(binding, repo)
 
 
+async def _linked_code_host(
+    session: AsyncSession,
+    registry: ForgeRegistry,
+    client: httpx.AsyncClient,
+    principal_id: uuid.UUID,
+    run: _Run | _VoiceRun,
+) -> tuple[CodeHost, _Link] | FactorySlackSteerOut:
+    code_host = _code_host(registry, client, run.repository, run.installation_id)
+    if isinstance(code_host, FactorySlackSteerOut):
+        return code_host
+    if not supports(code_host.capabilities, Operation.ACCOUNT_LOGIN):
+        return _refused("code_host_identity_unsupported")
+    links = await _links(session, principal_id, run.repository)
+    if not links:
+        return _refused("code_host_identity_missing")
+    if len(links) != 1:
+        return _refused("code_host_identity_ambiguous")
+    return code_host, links[0]
+
+
+async def _mapped_work_item_id(
+    session: AsyncSession, data: FactorySlackSteerIn
+) -> uuid.UUID | None:
+    work_item_id: uuid.UUID | None = await session.scalar(
+        select(FactorySlackThread.work_item_id).where(
+            FactorySlackThread.channel_identity == data.channel_identity,
+            FactorySlackThread.channel == data.channel,
+            FactorySlackThread.root_ts == data.root_ts,
+        )
+    )
+    return work_item_id
+
+
 async def _read_run(
-    session: AsyncSession, thread: FactorySlackThread
+    session: AsyncSession, work_item_id: uuid.UUID
 ) -> _Run | FactorySlackSteerOut:
-    item = await session.get(WorkItem, thread.work_item_id)
+    item = await session.get(WorkItem, work_item_id)
     if item is None:
         return _refused("not_mapped")
     if item.cancelled_at is not None:
@@ -346,9 +466,176 @@ async def _read_run(
     )
 
 
+async def _voice_owner_refusal(
+    session: AsyncSession, item: WorkItem, principal_id: uuid.UUID, installation_mode: ModelAuthMode
+) -> RefusedSteering | None:
+    if item.tenant_id is not None and item.tenant_id != DEFAULT_TENANT_ID:
+        return RefusedSteering(reason="owner_tenant_mismatch")
+    tenant_status = await session.scalar(
+        select(Tenant.status)
+        .join(Agent, Agent.tenant_id == Tenant.id)
+        .where(Agent.id == item.agent_id, Tenant.id == DEFAULT_TENANT_ID)
+    )
+    if tenant_status is None:
+        return RefusedSteering(reason="owner_tenant_mismatch")
+    if tenant_status != "active":
+        return RefusedSteering(reason="owner_tenant_inactive")
+    if item.model_auth_mode != "personal":
+        if installation_mode == "personal":
+            return RefusedSteering(reason="personal_owner_required")
+        return None
+    if principal_id != item.owner_principal_id:
+        return RefusedSteering(reason="owner_mismatch")
+    enrollment = (
+        await session.execute(
+            select(PersonalClaudeEnrollment.active, PersonalClaudeEnrollment.generation).where(
+                PersonalClaudeEnrollment.tenant_id == item.tenant_id,
+                PersonalClaudeEnrollment.principal_id == principal_id,
+            )
+        )
+    ).one_or_none()
+    if enrollment is None or not enrollment.active:
+        return RefusedSteering(reason="enrollment_inactive")
+    if enrollment.generation != item.enrollment_generation:
+        return RefusedSteering(reason="enrollment_generation_mismatch")
+    return None
+
+
+async def _read_voice_run(
+    session: AsyncSession, item: WorkItem, installation_mode: ModelAuthMode
+) -> _VoiceRun | RefusedSteering:
+    lineage = None
+    if item.publication_lineage_id is not None:
+        lineage = await session.get(ThreadPublicationLineage, item.publication_lineage_id)
+        if lineage is None or lineage.status != "open":
+            return RefusedSteering(reason="lineage_closed")
+        if lineage.repository is not None and lineage.repository != item.repository:
+            return RefusedSteering(reason="repository_mismatch")
+        if (lineage.pr_number is None) != (lineage.pr_url is None):
+            return RefusedSteering(reason="no_pull_request")
+        if lineage.pr_number is not None and lineage.repository is None:
+            return RefusedSteering(reason="repository_mismatch")
+    implementation_id = None
+    if lineage is None or lineage.pr_number is None:
+        implementation_id = await session.scalar(
+            select(ExecutionRequest.id)
+            .where(
+                ExecutionRequest.work_item_id == item.id,
+                ExecutionRequest.execution_kind == "implementation",
+                or_(
+                    and_(
+                        ExecutionRequest.status == "waiting",
+                        ExecutionRequest.wait_deadline > func.clock_timestamp(),
+                    ),
+                    and_(
+                        ExecutionRequest.status == "running",
+                        ExecutionRequest.execution_deadline > func.clock_timestamp(),
+                    ),
+                ),
+            )
+        )
+        if implementation_id is None:
+            return RefusedSteering(reason="no_pull_request")
+    return _VoiceRun(
+        agent_id=item.agent_id,
+        owner=OwnerTuple.of(item),
+        installation_mode=installation_mode,
+        tracker_issue=item.tracker_issue,
+        repository=item.repository,
+        installation_id=item.code_host_installation_id,
+        lineage_id=item.publication_lineage_id,
+        branch=lineage.branch if lineage is not None else None,
+        pr_number=lineage.pr_number if lineage is not None else None,
+        pr_url=lineage.pr_url if lineage is not None else None,
+        implementation_request_id=implementation_id,
+    )
+
+
+async def authorize_voice_source(
+    session: AsyncSession,
+    data: FactorySlackSteerIn,
+    evidence: SlackEvidence,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> SlackVoiceAuthorization | RefusedSteering:
+    """Check a verified original clip before media retrieval and again before draft locking."""
+
+    source = _voice_source(data, evidence)
+    if source is None:
+        return RefusedSteering(reason="receipt_mismatch")
+    async with AsyncSession(bind=session.bind) as reader:
+        work_item_id = await _mapped_work_item_id(reader, data)
+        if work_item_id is None:
+            return RefusedSteering(reason="not_mapped")
+        item = await reader.get(WorkItem, work_item_id)
+        if item is None:
+            return RefusedSteering(reason="not_mapped")
+        if item.cancelled_at is not None:
+            return RefusedSteering(reason="work_item_cancelled")
+        resolution = await _resolve(reader, data, evidence)
+        if resolution.status != "resolved" or resolution.principal_id is None:
+            return RefusedSteering(reason="sender_unverified")
+        principal_id = resolution.principal_id
+        team = await reader.scalar(
+            select(ProviderInstallation.external_account_id)
+            .join(
+                ChannelIdentity,
+                ChannelIdentity.provider_installation_id == ProviderInstallation.id,
+            )
+            .where(ChannelIdentity.id == resolution.channel_identity_id)
+        )
+        if team != source.team_id:
+            return RefusedSteering(reason="receipt_mismatch")
+        mode = settings.factory_model_auth_mode
+        owner_refusal = await _voice_owner_refusal(reader, item, principal_id, mode)
+        if owner_refusal is not None:
+            return owner_refusal
+        run = await _read_voice_run(reader, item, mode)
+        if isinstance(run, RefusedSteering):
+            return run
+        registry = forges_registry(settings)
+        linked = await _linked_code_host(reader, registry, client, principal_id, run)
+        if isinstance(linked, FactorySlackSteerOut):
+            return RefusedSteering(reason=linked.outcome)
+        code_host, link = linked
+        allowlist = _allowlist(registry, run.tracker_issue, run.repository)
+    refusal, login = await _provider_refusal(code_host, run, link.account_id, allowlist)
+    if refusal is not None:
+        return RefusedSteering(reason=refusal)
+    assert login is not None
+    return SlackVoiceAuthorization(
+        work_item_id=work_item_id,
+        principal_id=principal_id,
+        source=source,
+        resolution=resolution,
+        link=link,
+        login=login,
+        run=run,
+    )
+
+
+async def _pull_refusal(
+    code_host: CodeHost, repository: RepositoryRef, number: int, branch: str | None
+) -> FactorySlackSteerOutcome | None:
+    try:
+        pull = await code_host.read_pull_request(PullRequestRef(repository, str(number)))
+    except NotFound:
+        return "pull_request_not_open"
+    except Unavailable as exc:
+        if exc.args == ("pull_request_mismatch",):
+            return "repository_mismatch"
+        raise
+    if pull.state is not PullRequestState.OPEN or pull.ref.number != str(number):
+        return "pull_request_not_open"
+    if pull.head_ref != branch:
+        return "pull_request_branch_mismatch"
+    return None
+
+
 async def _provider_refusal(
     code_host: CodeHost,
-    run: _Run,
+    run: _Run | _VoiceRun,
     account_id: str,
     allowlist: frozenset[str],
 ) -> tuple[FactorySlackSteerOutcome | None, str | None]:
@@ -361,20 +648,10 @@ async def _provider_refusal(
         except NotFound:
             # A moved or replaced repository, or one that no longer exists.
             return "repository_mismatch", None
-        try:
-            pull = await code_host.read_pull_request(PullRequestRef(repository, str(run.pr_number)))
-        except NotFound:
-            return "pull_request_not_open", None
-        except Unavailable as exc:
-            # The adapter refuses a pull request whose repository name or
-            # immutable id is not the resolved repository's.
-            if exc.args == ("pull_request_mismatch",):
-                return "repository_mismatch", None
-            raise
-        if pull.state is not PullRequestState.OPEN or pull.ref.number != str(run.pr_number):
-            return "pull_request_not_open", None
-        if pull.head_ref != run.branch:
-            return "pull_request_branch_mismatch", None
+        if run.pr_number is not None:
+            refusal = await _pull_refusal(code_host, repository, run.pr_number, run.branch)
+            if refusal is not None:
+                return refusal, None
         login = await code_host.account_login(repository, account_id)
         if login is None:
             return "code_host_identity_missing", None
@@ -422,34 +699,21 @@ async def _decide(
     if checked is None:
         return _refused("receipt_mismatch")
     receipt, evidence = checked
-    thread = await session.scalar(
-        select(FactorySlackThread).where(
-            FactorySlackThread.channel_identity == data.channel_identity,
-            FactorySlackThread.channel == data.channel,
-            FactorySlackThread.root_ts == data.root_ts,
-        )
-    )
-    if thread is None:
+    work_item_id = await _mapped_work_item_id(session, data)
+    if work_item_id is None:
         return _refused("not_mapped")
     resolution = await _resolve(session, data, evidence)
     if resolution.status != "resolved" or resolution.principal_id is None:
         return _refused("sender_unverified", reason=resolution.reason)
     principal_id = resolution.principal_id
-    run = await _read_run(session, thread)
+    run = await _read_run(session, work_item_id)
     if isinstance(run, FactorySlackSteerOut):
         return run
     registry = forges_registry(settings)
-    code_host = _code_host(registry, client, run.repository, run.installation_id)
-    if isinstance(code_host, FactorySlackSteerOut):
-        return code_host
-    if not supports(code_host.capabilities, Operation.ACCOUNT_LOGIN):
-        return _refused("code_host_identity_unsupported")
-    links = await _links(session, principal_id, run.repository)
-    if not links:
-        return _refused("code_host_identity_missing")
-    if len(links) > 1:
-        return _refused("code_host_identity_ambiguous")
-    (link,) = links
+    linked = await _linked_code_host(session, registry, client, principal_id, run)
+    if isinstance(linked, FactorySlackSteerOut):
+        return linked
+    code_host, link = linked
     allowlist = _allowlist(registry, run.tracker_issue, run.repository)
     # End the read transaction: no snapshot or lock is held across provider reads.
     await session.rollback()
