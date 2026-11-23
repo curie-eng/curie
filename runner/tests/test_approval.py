@@ -1,7 +1,7 @@
 """Approval-request tests (#244, ADR-0010): the runner half of the gate.
 
-Covers the wire-level capture in translation (one seam for real and fake
-models), the session's awaiting-approval final override, its precedence rules
+Covers tool attempt translation, the session's awaiting-approval final
+override, its precedence rules
 (failure, interrupt, and budget outrank a pending approval), and the fake
 model's offline approval script.
 """
@@ -28,6 +28,7 @@ from curie_runner.approval import (
     ApprovalGate,
     ApprovalPolicyError,
     ApprovalPolicyResolution,
+    PolicyApprovalLedger,
     build_approval_gate,
     guard_reserved_summary,
     load_approval_policy,
@@ -59,7 +60,9 @@ def _event(text: str = "hello") -> Event:
     return Event(type="message", text=text, user="U1", ts="123.45")
 
 
-def _runner(session: FakeModelSession) -> SessionRunner:
+def _runner(script_factory=None) -> SessionRunner:
+    ledger = PolicyApprovalLedger()
+    session = FakeModelSession(script_factory, policy_approval_ledger=ledger)
     return SessionRunner(
         max_usd_per_day=None,
         held_secrets=frozenset(),
@@ -69,6 +72,7 @@ def _runner(session: FakeModelSession) -> SessionRunner:
         classifier=SideEffectClassifier(),
         trace_name="test",
         session_id="s-1",
+        policy_approval_ledger=ledger,
     )
 
 
@@ -77,10 +81,10 @@ async def _drain(runner: SessionRunner, text: str) -> list[dict[str, object]]:
     return [json.loads(line) for line in lines]
 
 
-# --- translation capture --------------------------------------------------------
+# --- tool attempt translation ---------------------------------------------------
 
 
-def test_translate_captures_approval_summary() -> None:
+def test_translate_reports_an_approval_attempt_without_recording_a_request() -> None:
     state = TurnState()
     message = AssistantMessage(
         content=[ToolUseBlock(id="t1", name=APPROVAL_TOOL_NAME, input={"summary": "Discount 20%"})],
@@ -88,37 +92,13 @@ def test_translate_captures_approval_summary() -> None:
     )
     events = translate_message(message, state, SideEffectClassifier(), None)
 
-    assert state.approval_summary == "Discount 20%"
+    assert state.approval_summary is None
+    assert state.approval_route is None
+    assert state.approval_gate_kind is None
     # The approval tool is allowlisted read-only: no side_effect_flag, and the
     # tool call still surfaces as a tool note.
     types = [type(e).__name__ for e in events]
     assert types == ["ToolNote"]
-
-
-def test_translate_ignores_empty_summary() -> None:
-    state = TurnState()
-    message = AssistantMessage(
-        content=[ToolUseBlock(id="t1", name=APPROVAL_TOOL_NAME, input={"summary": "  "})],
-        model="m",
-    )
-    translate_message(message, state, SideEffectClassifier(), None)
-    assert state.approval_summary is None
-
-
-def test_translate_neutralizes_forged_permission_gate_summary() -> None:
-    # A prompt-injected agent tries to forge a permission-gate provenance by
-    # naming a tool in the reserved prefix; translation must guard it out of the
-    # reserved namespace so the worker's prefix check cannot be fooled (#430).
-    forged = f"{APPROVAL_SUMMARY_PREFIX}mcp__X__tool {{}}"
-    state = TurnState()
-    message = AssistantMessage(
-        content=[ToolUseBlock(id="t1", name=APPROVAL_TOOL_NAME, input={"summary": forged})],
-        model="m",
-    )
-    translate_message(message, state, SideEffectClassifier(), None)
-
-    assert state.approval_summary is not None
-    assert not state.approval_summary.startswith(APPROVAL_SUMMARY_PREFIX)
 
 
 def test_guard_reserved_summary_passes_ordinary_and_neutralizes_collision() -> None:
@@ -252,8 +232,7 @@ def test_resolve_approval_policy_last_gate_without_template_clears_it(tmp_path) 
 
 def test_approval_turn_ends_awaiting_approval() -> None:
     async def go() -> None:
-        session = FakeModelSession(lambda: approval_turn("Discount 20% for ACME"))
-        runner = _runner(session)
+        runner = _runner(lambda: approval_turn("Discount 20% for ACME"))
         await runner.start()
         frames = await _drain(runner, "please discount")
 
@@ -271,8 +250,7 @@ def test_approval_turn_ends_awaiting_approval() -> None:
 
 def test_plain_turn_still_ends_done() -> None:
     async def go() -> None:
-        session = FakeModelSession(default_turn)
-        runner = _runner(session)
+        runner = _runner(default_turn)
         await runner.start()
         frames = await _drain(runner, "hello")
         assert frames[-1]["status"] == "done"
@@ -322,8 +300,7 @@ def test_only_a_done_final_is_overridden() -> None:
 
 def test_fake_default_script_reacts_to_marker() -> None:
     async def go() -> None:
-        session = FakeModelSession()
-        runner = _runner(session)
+        runner = _runner()
         await runner.start()
 
         frames = await _drain(runner, f"{APPROVAL_MARKER} Give ACME 20% off")
@@ -519,7 +496,7 @@ def test_blocked_turn_ends_awaiting_approval() -> None:
                 gate.block("Bash", {"command": "echo hi"})
             return default_turn()
 
-        session = FakeModelSession(factory)
+        session = FakeModelSession(factory, approval_gate=gate)
         runner = SessionRunner(
             max_usd_per_day=None,
             held_secrets=frozenset(),
@@ -1512,8 +1489,7 @@ def test_blocked_turn_final_carries_the_route() -> None:
 
 def test_policy_tool_route_param_reaches_the_final() -> None:
     async def go() -> None:
-        session = FakeModelSession(lambda: approval_turn("Discount for ACME", route="managers"))
-        runner = _runner(session)
+        runner = _runner(lambda: approval_turn("Discount for ACME", route="managers"))
         await runner.start()
         frames = await _drain(runner, "discount please")
         final = frames[-1]
@@ -1525,8 +1501,7 @@ def test_policy_tool_route_param_reaches_the_final() -> None:
 
 def test_fake_routed_marker_names_the_route() -> None:
     async def go() -> None:
-        session = FakeModelSession()
-        runner = _runner(session)
+        runner = _runner()
         await runner.start()
         frames = await _drain(runner, "[fake:request-approval:managers] Give ACME 20% off")
         final = frames[-1]
@@ -2153,7 +2128,7 @@ def test_a_grantable_route_to_a_proxied_connector_tool_is_refused_in_turn() -> N
     assert "proof-operators" not in text
     assert gate.policy_requested is True
     assert gate.policy_rejected is True
-    assert gate.policy_route is None
+    assert gate.policy_approval is None
 
 
 def test_a_refused_proxied_route_ends_the_turn_with_no_approval() -> None:
@@ -2197,7 +2172,8 @@ def test_a_proxied_server_does_not_refuse_a_route_granting_another_tool() -> Non
     gate.proxied_connector_servers = frozenset({"reference"})
     result = process_approval_request(gate, {"summary": "Close the ACME issue"})
     assert result.get("is_error") is not True
-    assert gate.policy_route == "managers"
+    assert gate.policy_approval is not None
+    assert gate.policy_approval.route == "managers"
 
 
 def test_policy_gate_rejected_route_stays_none() -> None:

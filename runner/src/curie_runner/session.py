@@ -65,7 +65,13 @@ from .adapter import (
     StreamedToolUseBoundary,
     model_message_to_conversation,
 )
-from .approval import ApprovalGate, PublicationLedger, is_mcp_tool, platform_tool_names
+from .approval import (
+    ApprovalGate,
+    PolicyApprovalLedger,
+    PublicationLedger,
+    is_mcp_tool,
+    platform_tool_names,
+)
 from .attachment_access import LAZY_ATTACHMENT_NOTICE, AttachmentAccessTurn
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .final_answer import (
@@ -424,6 +430,7 @@ class SessionRunner:
         approval_gate: ApprovalGate | None = None,
         question_gate: ApprovalGate | None = None,
         publication_ledger: PublicationLedger | None = None,
+        policy_approval_ledger: PolicyApprovalLedger | None = None,
         approval_resumed_kind: str | None = None,
         approval_decision: str | None = None,
         false_completion_check: bool = False,
@@ -537,6 +544,7 @@ class SessionRunner:
         # Where the publish body notes that it ran when there is no approval
         # gate (#2294); the same object the body closes over.
         self._publication_ledger = publication_ledger
+        self._policy_approval_ledger = policy_approval_ledger
         # The SDK's init catalog is the evidence a CLI unknown-tool result
         # needs before it can be separated from a connector's own error text.
         # None means no trustworthy catalog has arrived; fail closed to error.
@@ -1527,6 +1535,8 @@ class SessionRunner:
                 self._question_gate.reset()
             if self._publication_ledger is not None:
                 self._publication_ledger.reset()
+            if self._policy_approval_ledger is not None:
+                self._policy_approval_ledger.reset()
             tracker = BudgetTracker(ceiling=self._ceiling)
             metric_outcome = "interrupted"
             metric_attributes = {
@@ -2682,34 +2692,21 @@ class SessionRunner:
         return []
 
     def _merge_gate_block(self, state: TurnState) -> None:
-        """Fold the gate's recorded outcome (#245/#544) into the turn state.
+        """Fold recorded approvals into the turn state.
 
-        Two reconciliations happen here at turn end:
+        The policy tool body records an accepted request after PreToolUse. A
+        gated session carries the manifest-resolved route (#544, Decision B).
 
-        - **Policy route (#544, Decision B):** the request_approval tool
-          validated the model's ``route`` against the manifest. A refusal means
-          no approval was created, so any summary translate.py captured off the
-          raw block is dropped; an acceptance carries the RESOLVED route (the
-          bound sole route or the named valid one) rather than the raw argument.
-        - **Permission block (#245):** the can_use_tool callback records a
-          blocked call on the shared gate. A non-publication permission block
-          is the card even when the model also called request_approval (#2657):
-          the grantless policy summary must not drop ``pending_granted_tool``,
-          or resume has nothing to spend and PreToolUse raises a second card.
-          A publication request riding with a standing policy summary still
-          loses the slot (the model must ask to publish again). Policy-only
-          remains when there is no non-publish permission block.
-        - **Approval halt (#1852):** a gated deny now asks the CLI to stop the
-          turn, so the gate's ``pending_halt`` marker is carried onto the turn
-          state for ``_apply_approval_override`` -- but only when the operator
-          did not also interrupt. A human pressing stop is an intentional stop,
-          not an approval request; reporting it as awaiting-approval would
-          suspend the thread behind a decision nobody asked for.
+        A non-publication permission block takes priority so the resumed turn
+        can spend the corresponding grant (#2657). A policy request takes
+        priority over a publication request and the model can ask to publish
+        again on resume.
+
+        The override uses the gate's ``pending_halt`` marker to recognize an
+        approval stop (#1852). An operator interrupt or timeout takes priority.
         """
 
         gate = self._approval_gate
-        if gate is None:
-            return
         if self._questions_posted():
             # ADR 0286 decisions 2 and 11 (#5785): the turn ended because its
             # question round was posted, so it is the question ending and never
@@ -2722,40 +2719,30 @@ class SessionRunner:
             state.approval_granted_arguments = None
             return
 
-        permission_is_actionable_tool = (
-            gate.pending_summary is not None
-            and gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME
-        )
-        if permission_is_actionable_tool:
-            # A gated tool call is the card. Copy it even when translate.py
-            # already captured a grantless policy summary from request_approval
-            # (#2657). Publication stays behind a standing policy request: that
-            # is a second intent and must not steal the business-decision card.
-            state.approval_summary = gate.pending_summary
-            state.approval_display = gate.pending_display
-            state.approval_route = gate.pending_route
-            state.approval_gate_kind = gate.pending_gate_kind
-            state.approval_granted_tool = gate.pending_granted_tool
-            state.approval_granted_arguments = gate.pending_granted_arguments
-        elif gate.policy_requested:
-            if gate.policy_rejected:
-                # The route could not be resolved: no approval exists, so the
-                # turn must not end awaiting-approval on it.
-                state.approval_summary = None
-                state.approval_display = None
-                state.approval_route = None
-                state.approval_gate_kind = None
-                state.approval_granted_arguments = None
-            else:
-                state.approval_route = gate.policy_route
-                # #558: an operator-opted grantable gate mints the one-shot grant; the tool
-                # comes from the manifest (never the model's summary/route args). A
-                # non-grantable route resolves to None -> no grant, preserving #544's default.
-                # gate_kind stays 'policy' (stamped in translate.py).
-                state.approval_granted_tool = gate.grantable_tool_for_route(gate.policy_route)
-                state.approval_granted_arguments = None
+        ledger = self._policy_approval_ledger
+        policy = gate.policy_approval if gate is not None else ledger.request if ledger else None
+        if policy is not None and state.tool_access is None:
+            state.approval_summary = policy.summary
+            state.approval_display = None
+            state.approval_route = policy.route
+            state.approval_gate_kind = policy.gate_kind
+            state.approval_granted_tool = (
+                gate.grantable_tool_for_route(policy.route) if gate is not None else None
+            )
+            state.approval_granted_arguments = None
+        elif gate is not None and gate.policy_rejected:
+            state.approval_summary = None
+            state.approval_display = None
+            state.approval_route = None
+            state.approval_gate_kind = None
+            state.approval_granted_tool = None
+            state.approval_granted_arguments = None
+        if gate is None:
+            return
 
-        if gate.pending_summary and not state.approval_summary:
+        if gate.pending_summary is not None and (
+            gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME or not state.approval_summary
+        ):
             state.approval_summary = gate.pending_summary
             state.approval_display = gate.pending_display
             state.approval_route = gate.pending_route
@@ -2763,8 +2750,6 @@ class SessionRunner:
             state.approval_granted_tool = gate.pending_granted_tool
             state.approval_granted_arguments = gate.pending_granted_arguments
 
-        # See the "Approval halt" bullet above: an operator interrupt outranks a
-        # runner-requested one, so the marker is copied only in its absence.
         if gate.pending_halt and not self._interrupt_requested and not self._timeout_requested:
             state.approval_halt_requested = True
 
