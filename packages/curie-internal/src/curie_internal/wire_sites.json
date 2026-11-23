@@ -122,6 +122,10 @@
       "value": "curie:deploy-notice",
       "reason": "Deployment notice deterministic identity namespace, not a Valkey key"
     },
+    "apps/api/src/curie_api/factory_confirmed_steering.py:ConfirmedText.steering_id:1": {
+      "value": "f'curie:factory:confirmed-text:{self.draft_id}'",
+      "reason": "UUIDv5 name that gives every confirmation of the same voice draft one steering ID"
+    },
     "apps/api/src/curie_api/factory_notices.py:module:1": {
       "value": "curie:queued",
       "reason": "Accepted legacy factory state label, not a Valkey key"
