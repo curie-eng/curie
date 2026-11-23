@@ -81,13 +81,28 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
-    location ^~ /api/identity/me/github-link {
+    # The POST is an exact match. The callback keeps the trailing slash so a
+    # sibling path such as /api/identity/me/github-link-extra stays on the
+    # normal /api/ location and is logged.
+    location = /api/identity/me/github-link {
         access_log off;
         error_log /dev/null;
         add_header Cache-Control "private, no-store" always;
         add_header Referrer-Policy "no-referrer" always;
         gzip off;
         proxy_pass ${CURIE_API_TARGET}/identity/me/github-link;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location ^~ /api/identity/me/github-link/ {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/identity/me/github-link/;
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
