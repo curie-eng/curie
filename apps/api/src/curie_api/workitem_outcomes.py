@@ -109,16 +109,26 @@ def _previous_start_failure(req: ExecutionRequest) -> str:
 _MERGE_CLOSE_TOLERANCE = timedelta(minutes=10)
 
 
+def _utc(value: datetime) -> datetime:
+    """Read a stamp as UTC.
+
+    The lineage stores its merge time without a time zone. The request and
+    the issue close store a time zone. Both clocks are UTC.
+    """
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _close_matches_merge(cancelled_at: datetime | None, merged_at: datetime | None) -> bool:
     """Whether ``cancelled_at`` is the close GitHub writes when the merge lands."""
 
     if cancelled_at is None or merged_at is None:
         return False
-    return (
-        merged_at - _MERGE_CLOSE_TOLERANCE
-        <= cancelled_at
-        <= merged_at + _MERGE_CLOSE_TOLERANCE
-    )
+    cancelled = _utc(cancelled_at)
+    merged = _utc(merged_at)
+    return merged - _MERGE_CLOSE_TOLERANCE <= cancelled <= merged + _MERGE_CLOSE_TOLERANCE
 
 
 def _merged_completion(
@@ -146,7 +156,9 @@ def _merged_completion(
     ):
         return False
     merged_at = lineage.updated_at
-    if merged_at is not None and (req.created_at is None or req.created_at > merged_at):
+    if merged_at is not None and (
+        req.created_at is None or _utc(req.created_at) > _utc(merged_at)
+    ):
         return False
     if cancelled_at is not None and not _close_matches_merge(cancelled_at, merged_at):
         return False

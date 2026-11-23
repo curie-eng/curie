@@ -1778,6 +1778,44 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
     )
     assert outside_the_window.state == "cancelled"
     assert not outside_the_window.actionable_cause.startswith("completed:")
+    # The lineage clock has no time zone. The request and the close do.
+    naive_merge = now.replace(tzinfo=None)
+    open_on_naive_clock = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=False,
+        admitted_at=now - timedelta(hours=1),
+        merged_at=naive_merge,
+    )
+    assert open_on_naive_clock.state == "published"
+    assert open_on_naive_clock.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged"
+    )
+    closed_on_naive_clock = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        merged_at=naive_merge,
+    )
+    assert closed_on_naive_clock.state == "published"
+    assert closed_on_naive_clock.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    closed_late_on_naive_clock = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        merged_at=(now - timedelta(minutes=30)).replace(tzinfo=None),
+    )
+    assert closed_late_on_naive_clock.state == "cancelled"
+    assert not closed_late_on_naive_clock.actionable_cause.startswith("completed:")
 
 
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:

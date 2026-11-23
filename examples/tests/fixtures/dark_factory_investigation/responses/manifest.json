@@ -2,7 +2,7 @@
   "responses": {
     "candidate/not-reproduced": {
       "file": "candidate/not-reproduced.json",
-      "prompt_sha256": "66ce4c0ed98d072d3a1a14a73ce7b39b372839ed096c1b67cc7430262de8f338",
+      "prompt_sha256": "d7a668fcab2ac153f9c7bc665c773cf2b55252375b287821ada5d80ac1cd3205",
       "reply_sha256": "1575e84b845a561ef8d836fcd70ecf3002e445405429c17a7ecf31e46177963c",
       "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
@@ -13,7 +13,7 @@
     },
     "candidate/unresolved-intent": {
       "file": "candidate/unresolved-intent.json",
-      "prompt_sha256": "86f2234adc904e4b840e84f36fd6f3c223769af4124e44a381e398410ab3228b",
+      "prompt_sha256": "1d93af955e75ae920de289194761c066411270e34518b8926c7ec79cf69857a7",
       "reply_sha256": "71664277b901b7e8ca029db22a923a94c089e069950f278705fbbf45db79a60a",
       "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
@@ -24,7 +24,7 @@
     },
     "candidate/reproduced": {
       "file": "candidate/reproduced.json",
-      "prompt_sha256": "2cf8775e933e6073ef60c59cda00b6d3ba3ec6f819189c05fc5f5ad0085ee3f0",
+      "prompt_sha256": "1e127107ee31a119ee2de10330c5b958ad0590424be15df7cac8d9779b1a03ce",
       "reply_sha256": "c25f53683c628313293ba7202269505cfc9113e3bd522c87f609f7b151f38b2f",
       "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
@@ -35,7 +35,7 @@
     },
     "candidate/injected-report": {
       "file": "candidate/injected-report.json",
-      "prompt_sha256": "6fb599b41f15522bd1f61f50253548ec66de77c9a3a38f88b7a1d802d8f30488",
+      "prompt_sha256": "cd68772e59aec5bc50f5904a37081b9e65cce4b5d9a4ded5fb1f25fe7a83200d",
       "reply_sha256": "7a40de63385f80aa4795b20633945eebe4efd4632a8b41938e82d571e5d291b1",
       "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
@@ -46,7 +46,7 @@
     },
     "candidate/already-fixed": {
       "file": "candidate/already-fixed.json",
-      "prompt_sha256": "ad2bb774849066a499fe25cd0fe84506c19f0417af35c4469ddb4b0b05ed5965",
+      "prompt_sha256": "eb18299232391d9bdd3095444e85326b128af2e7379531915dc2afc376daa03d",
       "reply_sha256": "770dc0f303c1dd7ec2d645064a74831c03838f1f33fa2643fee7ff8370a6da71",
       "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
