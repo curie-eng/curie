@@ -774,7 +774,9 @@ def test_a_questions_only_card_says_waiting_on_answers() -> None:
         )
     )
     assert "WAITING ON ANSWERS" in svg
+    assert "Waiting on answers" in svg
     assert "SUCCEEDED" not in svg
+    assert "Completed" not in svg
     assert "#0969da" in svg
     root = ET.fromstring(svg)
     states = {

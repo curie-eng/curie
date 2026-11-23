@@ -285,6 +285,8 @@ def render_card(card: CardInput) -> str:
     )
     if card.no_pull_request:
         state_line = "No pull request published"
+    if card.waiting_on_answers:
+        state_line = "Waiting on answers"
     if reviewer:
         review_text = f"reviewer {reviewer}"
     if cap is not None and card.phase_view.staged:

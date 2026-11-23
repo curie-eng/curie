@@ -176,8 +176,8 @@ _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
 _BLOCK_OPENER = re.compile(r"#{1,6}(?=[ \t]|$)|>|[-+*](?=[ \t]|$)|<|\|")
 # A thematic break or a setext underline.
 _RULE_LINE = re.compile(r"(?:[-*_][ \t]*){3,}|=+[ \t]*|-+[ \t]*")
-# An ordered list marker; the summary must not open or continue a list that
-# merges with the numbered questions.
+# An ordered list marker. A question line must not open or continue a list
+# that merges with the numbered questions.
 _ORDERED_MARKER = re.compile(r"^([ \t]*\d{1,9})([.)])(?=[ \t]|$)", re.MULTILINE)
 
 
@@ -188,8 +188,8 @@ def _inert(text: str) -> str:
     (hiding what follows or imitating a platform marker) or mention anyone,
     exactly like the tracker result (``publishable_model_text``). A run of
     three or more backticks or tildes gets a U+200B between its characters, so
-    an unclosed code fence in the summary cannot swallow the numbered
-    questions or the answer line below it.
+    an unclosed code fence in a question cannot swallow the answer line
+    below it.
     """
 
     return _FENCE_RUN.sub(lambda run: "\u200b".join(run.group(0)), publishable_model_text(text))

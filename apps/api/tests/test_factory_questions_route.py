@@ -85,6 +85,20 @@ def test_questions_comment_keeps_questions_and_drops_the_summary() -> None:
     assert body.rstrip().endswith(ANSWER_LINE)
 
 
+def test_a_posted_question_is_redacted_and_a_fence_cannot_swallow_the_answer() -> None:
+    secret = "ghp_" + "A1b2C3d4E5" * 3 + "F6g7H8"
+    summary = f"Ran it with {secret} and saw:\n```\ntraceback, never closed"
+    questions = [f"Should @someone own this?\nToken {secret}\n```\nnever closed"]
+    body = factory_questions.compose_body(1, summary, questions)
+    assert secret not in body
+    assert "[REDACTED" in body
+    assert "traceback, never closed" not in body
+    assert "@someone" not in body and "@\u200bsomeone" in body
+    assert not any(line.lstrip().startswith(("```", "~~~")) for line in body.splitlines())
+    assert "\n1. Should @\u200bsomeone own this?\n" in body
+    assert body.rstrip().endswith(ANSWER_LINE)
+
+
 def _ask(job: tr._Run | _JiraCase, summary: Any = SUMMARY, questions: Any = None) -> Any:
     return job.client.post(
         QUESTIONS_URL,
@@ -183,12 +197,13 @@ def test_model_text_is_redacted_mention_free_and_cannot_hold_the_frame_in_a_fenc
     response = _ask(
         job,
         summary=f"Ran it with {secret} and saw:\n```\ntraceback, never closed",
-        questions=["Should @someone own this?"],
+        questions=[f"Should @someone own this?\nToken {secret}\n```\nnever closed"],
     )
     assert response.status_code == 200, response.text
     (body,) = _marked(job)
     assert secret not in body
     assert "[REDACTED" in body
+    assert "traceback, never closed" not in body
     assert "@someone" not in body and "@\u200bsomeone" in body
     # No line of the composed comment opens a fence, so the numbered questions
     # and the answer line render as the frame, not as code.
