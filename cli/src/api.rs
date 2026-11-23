@@ -3498,13 +3498,15 @@ impl ApiClient {
     ///
     /// `reply_ref` is a UUID rather than an arbitrary string so caller input can
     /// never become a path segment. A valid but not-yet-written bucket is a
-    /// normal race between enqueue and the worker's first reply event, exposed
-    /// as `None`; every other non-success remains a real API failure.
+    /// normal race between enqueue and the worker's first reply event. A missing
+    /// bucket or transient read returns `None` so polling resumes at the same cursor.
     pub(crate) async fn cluster_message_replies(
         &self,
         reply_ref: &uuid::Uuid,
         after: usize,
     ) -> Result<Option<ClusterMessageReplyPage>> {
+        use std::error::Error as _;
+
         let resp = match self
             .http
             .get(format!(
@@ -3520,6 +3522,14 @@ impl ApiClient {
             Ok(resp) => resp,
             Err(err) if err.is_connect() || err.is_timeout() => return Ok(None),
             Err(err) => {
+                // Reqwest wraps Hyper's pre-header EOF without a typed EOF accessor.
+                if err.is_request()
+                    && std::iter::successors(err.source(), |&cause| cause.source()).any(|cause| {
+                        cause.to_string() == "connection closed before message completed"
+                    })
+                {
+                    return Ok(None);
+                }
                 return Err(err).context("GET /cluster-message-replies/{reply_ref}");
             }
         };

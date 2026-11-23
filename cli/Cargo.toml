@@ -14,6 +14,12 @@ path = "src/main.rs"
 name = "integration"
 path = "tests/integration.rs"
 
+# The integration crate is the default runner and Fix pin entry point.
+[[test]]
+name = "cluster_stub_trust"
+path = "tests/standalone/cluster_stub_trust.rs"
+test = false
+
 [[test]]
 name = "factory_explain"
 path = "tests/factory_explain.rs"
