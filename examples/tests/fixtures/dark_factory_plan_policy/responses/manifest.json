@@ -3,13 +3,13 @@
     "candidate/impl-advisory-progress": {
       "case": "impl-advisory-progress",
       "variant": "candidate",
-      "prompt_sha256": "30aa52066f0de75eab4e3b602861da75cc83a9f519cdc601a5a1c1211424b5d5",
+      "prompt_sha256": "12c478eac88951f70744eb3940017ca9fff773e6be84c2601ee08fcc447b96a5",
       "recorded": "2026-11-20"
     },
     "candidate/impl-publication": {
       "case": "impl-publication",
       "variant": "candidate",
-      "prompt_sha256": "2a0ebdfc2f484907a6fb0e942a4b413d17b89cd27bee0761e542ded18c76b0a3",
+      "prompt_sha256": "4f41fafcc935c73125fb5b420014709953c2da26fd78b999e354cd74a842574a",
       "recorded": "2026-11-20"
     },
     "candidate/rev-missing-criterion": {
@@ -33,7 +33,7 @@
     "removed-final-approval-control/impl-publication": {
       "case": "impl-publication",
       "variant": "removed-final-approval-control",
-      "prompt_sha256": "af017aa8acf7e7c96a3028d095a40db610457e1dcb2119d1e005815db37c92a6",
+      "prompt_sha256": "9d6384281593b7a834db7c68438f7ba5b420b72ebc233d84b8c9b316a01bff1f",
       "recorded": "2026-11-20"
     },
     "strict-plan-control/impl-advisory-progress": {
