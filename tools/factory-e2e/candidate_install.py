@@ -322,7 +322,7 @@ class CandidateInstall:
             script,
             input_text=query,
         )
-        return json.loads(out.strip().splitlines()[-1])
+        return json.loads(out)
 
     def api(self, method: str, path: str, body: Any = None, *, expected: int = 200) -> Any:
         headers = {"X-API-Key": self.api_key}

@@ -134,7 +134,7 @@ class MaintenanceInstall(ci.CandidateInstall):
         self.api(
             "POST",
             f"/agents/{self.agent_id}/channels",
-            {"kind": "slack", "address": channel, "adapter": "example"},
+            {"kind": "slack", "address": channel},
             expected=201,
         )
         self.api("PATCH", f"/agents/{self.agent_id}", {"factory_slack_channel": channel})
@@ -255,7 +255,10 @@ class Subject:
                 event = matching[0]
                 post = state["posts"].get("maintenance:" + str(event["id"]))
                 if post is not None:
-                    assert post == {k: event[k] for k in ("head_sha", "reason", "outcome")}
+                    expected = {"reason": event["reason"], "outcome": outcome}
+                    if outcome in {"green", "no_ci"}:
+                        expected["head_sha"] = head
+                    assert post == expected
                     return state
             return None
 
@@ -322,6 +325,19 @@ def refusal(
         counts = subject.run.fixture("counts", head)
     stimulus()
     after = subject.event(outcome, head)
+    if outcome == "window_expired":
+
+        def final_read() -> Any:
+            snapshot = subject.snapshot()
+            return snapshot if snapshot["window"]["final_poll_at"] else None
+
+        after = wait("final CI observation persisted", final_read)
+        final_poll_at = after["window"]["final_poll_at"]
+        assert before["window"]["final_poll_at"] is None
+        assert datetime.fromisoformat(final_poll_at) >= datetime.fromisoformat(
+            before["window"]["expires_at"]
+        )
+        before = {**before, "window": {**before["window"], "final_poll_at": final_poll_at}}
     later = subject.run.fixture("counts", head)
     unchanged(before, after, counts, later, human_pushes)
     evidence(
@@ -607,11 +623,15 @@ def late(run: MaintenanceInstall, control: str) -> None:
             run.api_replicas(0)
             try:
                 run.forge("PATCH", f"pulls/{pr['number']}", {"state": "closed"})
+                # Only the driver can issue this PR write while the API is down.
+                counts["pr_write"] += 1
+                assert run.fixture("counts", head)["pr_write"] == counts["pr_write"]
                 run.checks(red)
             finally:
                 run.api_replicas(1)
 
-        refusal(subject, original, "pr_closed", close_with_failure)
+        counts = run.fixture("counts", head)
+        refusal(subject, original, "pr_closed", close_with_failure, counts=counts)
         assert subject.pull(original)["state"] == "closed"
     elif control == "cancelled":
         run.forge("DELETE", f"issues/{subject.issue}/labels/{LABEL}")
