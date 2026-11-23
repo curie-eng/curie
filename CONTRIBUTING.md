@@ -11,6 +11,7 @@ each area's own `CLAUDE.md` carries the rules specific to that directory.
 ## Table of contents
 
 - [Scope of contributions](#scope-of-contributions)
+- [Build on Curie](#build-on-curie)
 - [Labeling issues, PRs, and discussions](#labeling-issues-prs-and-discussions)
 - [Before you start](#before-you-start)
 - [Development setup](#development-setup)
@@ -29,6 +30,15 @@ work. Before starting anything larger than a bug fix or a docs tweak, please
 open a GitHub issue describing the change so a maintainer can confirm it fits
 the project's direction. This is especially important for anything that touches
 a cross-component seam or a frozen contract (see below).
+
+## Build on Curie
+
+The [extension and contribution guide](docs/guides/extending-curie.md) maps
+common goals to the supported configuration path or the platform code they
+would require. It covers bringing existing skills and tools, preparing a factory
+repository runner, and proposing another sandbox runtime. Use it before opening
+an issue or changing an interface. A documented internal seam does not by
+itself promise a supported integration for downstream deployments.
 
 ## Labeling issues, PRs, and discussions
 
