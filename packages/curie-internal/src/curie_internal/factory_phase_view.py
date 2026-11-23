@@ -79,11 +79,12 @@ def phase_view(
 ) -> PhaseView:
     """Derive every declared phase's state and every loop's round from reports.
 
-    ``terminal_cause`` is accepted for the caller's symmetry with the status
-    row; the view depends only on ``status`` among the terminal facts.
+    A completed run marks every declared step done, except a questions-only
+    ending (``terminal_cause`` ``questions_asked``). That ending ticks a phase
+    only when a report recorded it, and a stage only when every phase in it
+    was reported. Unreported steps stay pending, and none is current.
     """
 
-    del terminal_cause
     phases = [(str(p["id"]), str(p["label"])) for p in declaration.get("phases", [])]
     ids = [phase_id for phase_id, _label in phases]
     declared_stages = declaration.get("stages")
@@ -100,9 +101,10 @@ def phase_view(
         phase_id: stage_id for stage_id, _label, phase_ids in stage_specs for phase_id in phase_ids
     }
     ordered = sorted(reports, key=lambda report: report.id or 0)
-    completed = status == "completed"
+    questions_only = status == "completed" and terminal_cause == "questions_asked"
+    completed = status == "completed" and not questions_only
     current: str | None = None
-    if not completed:
+    if not completed and not questions_only:
         for report in ordered:
             if report.phase not in ids:
                 continue
@@ -202,8 +204,10 @@ def phase_view(
     slots: list[PhaseSlot] = []
     for index, (phase_id, label) in enumerate(phases):
         state: PhaseState
-        if completed:
+        if completed or (questions_only and phase_id in reported):
             state = "done"
+        elif questions_only:
+            state = "pending"
         elif phase_id == current:
             state = "current"
         elif phase_id in redo:
@@ -227,8 +231,10 @@ def phase_view(
     stages: list[StageSlot] = []
     for index, (stage_id, label, phase_ids) in enumerate(stage_specs):
         stage_state: PhaseState
-        if completed:
+        if completed or (questions_only and all(phase_id in reported for phase_id in phase_ids)):
             stage_state = "done"
+        elif questions_only:
+            stage_state = "pending"
         elif stage_id == current_stage:
             stage_state = "blocked" if status in ("failed", "expired") else "current"
         elif stage_id in approved_ci_return_stages:

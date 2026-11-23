@@ -63,11 +63,26 @@ ANSWER_LINE = (
 
 
 def _frame(round_number: int, summary: str, questions: list[str]) -> str:
+    del summary
     items = "\n".join(f"{n}. {q}" for n, q in enumerate(questions, start=1))
     return (
-        f"### Questions from the factory (round {round_number} of 3)\n\n{summary}\n\n"
-        f"{items}\n\n{ANSWER_LINE}\n"
+        f"### Questions from the factory (round {round_number} of 3)\n\n{items}\n\n{ANSWER_LINE}\n"
     )
+
+
+def test_questions_comment_keeps_questions_and_drops_the_summary() -> None:
+    summary = "Steps tried:\n1. run the export and compare the row counts."
+    questions = [
+        "Should the trailing empty row be kept?",
+        "Which delimiter do callers expect?",
+    ]
+    body = factory_questions.compose_body(1, summary, questions)
+    assert body == _frame(1, summary, questions)
+    assert summary not in body
+    assert "### Questions from the factory (round 1 of 3)" in body
+    assert "1. Should the trailing empty row be kept?" in body
+    assert "2. Which delimiter do callers expect?" in body
+    assert body.rstrip().endswith(ANSWER_LINE)
 
 
 def _ask(job: tr._Run | _JiraCase, summary: Any = SUMMARY, questions: Any = None) -> Any:
@@ -454,8 +469,8 @@ def test_refused_input_that_redaction_grows_past_the_bound_writes_nothing(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Each ``token=x`` (7 characters) is redacted to a 33 character
-    # placeholder assignment, so input inside decision 2's bounds composes to
-    # about 61,000 characters, past Jira's 30,000 character cut.
+    # placeholder assignment. The summary is not posted, and the ten questions
+    # alone still compose past Jira's 30,000 character cut.
     summary = ("token=x " * 500).strip()
     questions = [("token=x " * 125).strip()] * 10
     assert len(summary) <= 4000 and all(len(question) <= 1000 for question in questions)

@@ -70,6 +70,28 @@ def _round_labels(view: PhaseView) -> dict[str, str | None]:
     return {slot.id: slot.round_label for slot in view.stages}
 
 
+def test_questions_only_run_ticks_only_reported_phases() -> None:
+    reported = ("read_issue", "investigate", "pin_criteria", "plan")
+    reports = [Report(index + 1, phase, None) for index, phase in enumerate(reported)]
+    view = phase_view(_declaration(), reports, "completed", "questions_asked")
+
+    states = {slot.id: slot.state for slot in view.phases}
+    for phase in reported:
+        assert states[phase] == "done"
+    for phase in ("plan_review", "failing_test", "implement", "review_diff", "publish", "wait_ci"):
+        assert states[phase] == "pending"
+    assert view.current is None
+    stages = _stages(view)
+    assert stages["read_issue"] == "done"
+    assert stages["investigate"] == "done"
+    assert stages["plan"] == "done"
+    assert stages["implement"] == "pending"
+    assert stages["publish"] == "pending"
+    assert stages["wait_ci"] == "pending"
+    ordinary = _view("completed", *reported)
+    assert {slot.state for slot in ordinary.phases} == {"done"}
+
+
 def test_phase_view_declares_the_eight_bundle_stages_in_order() -> None:
     view = _view("running")
 

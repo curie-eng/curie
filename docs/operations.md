@@ -2692,8 +2692,10 @@ request, a `state` and an `actionable_cause`. The states:
 - `running`: started, bounded by the agent's execution deadline (default 1800 s).
 - `cancellation_requested`: termination requested (`issue_cancelled`,
   `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
-- `cancelled`: the issue label was removed or the issue was closed. A pull
-  request already opened is kept.
+- `cancelled`: the issue label was removed or the issue was closed, other
+  than by merging the factory's own pull request. A pull request already
+  opened is kept. A completed run whose pull request merged stays
+  `published`, and its cause says the work completed.
 - `expired`: `capacity_wait_expired`, `retry_condition_expired` or
   `execution_deadline`. A capacity wait that expires after a failed start
   still names the previous start failure. A `retry_condition_expired` cause
@@ -2706,7 +2708,9 @@ request, a `state` and an `actionable_cause`. The states:
 - `awaiting_approval`: a publication approval or a tool approval on the same
   conversation is pending.
 - `publishing`: the publication is approved and in flight.
-- `published`: a pull request is open for the work.
+- `published`: a pull request is open for the work, or the factory's pull
+  request merged after the run completed. A merged completion says the work
+  completed.
 - `completed_unpublished`: the run completed with no publication, or its
   publication was denied, expired or failed.
 

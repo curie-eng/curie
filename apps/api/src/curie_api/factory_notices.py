@@ -424,6 +424,7 @@ def result_section(
     *,
     pr_url: str | None,
     feedback_url: str | None = None,
+    commit_sha: str | None = None,
     detail: str | None = None,
     unchanged: bool = False,
     superseded: bool = False,
@@ -465,7 +466,14 @@ def result_section(
             if detail is not None and detail.strip():
                 text += _agent_message_block(detail.strip())
         elif feedback_url is not None:
-            text = "The requested revision is pushed to this pull request.\n"
+            sha = commit_sha.strip() if isinstance(commit_sha, str) else ""
+            if sha:
+                text = (
+                    "The requested revision is pushed to this pull request as "
+                    f"{code_span(sha[:7])} ({sha}).\n"
+                )
+            else:
+                text = "The requested revision is pushed to this pull request.\n"
             if detail is not None and detail.strip():
                 text += f"Note: {detail.strip()}\n"
         elif isinstance(pr_url, str) and pr_url.strip():
@@ -1531,10 +1539,18 @@ async def _render(
                 ),
                 None,
             )
+            commit_sha = None
+            if request.reply_target_url and work_item.publication_lineage_id is not None:
+                commit_sha = await session.scalar(
+                    select(ThreadPublicationLineage.head_sha).where(
+                        ThreadPublicationLineage.id == work_item.publication_lineage_id
+                    )
+                )
             result = result_section(
                 cause,
                 pr_url=pr_url,
                 feedback_url=request.reply_target_url,
+                commit_sha=commit_sha,
                 # Issue summaries use only attributed, bounded agent facts.
                 # PR replies retain their bounded, inert final-message quote.
                 detail=(
@@ -1638,8 +1654,17 @@ async def _render(
         report.phase not in _EARLY_FOLLOW_UP_PHASES for report in reports
     ):
         progress_line = _READING_PULL_REQUEST
+    waiting_on_answers = (
+        cause == QUESTIONS_ASKED
+        and request.status == "completed"
+        and work_item.cancelled_at is None
+    )
     pill_label, _color, _live = pill_for(
-        request.status, publishing, retrying=retrying, answered=answered
+        request.status,
+        publishing,
+        retrying=retrying,
+        answered=answered,
+        waiting_on_answers=waiting_on_answers,
     )
     pending_count = await session.scalar(
         select(func.count(ExecutionRequest.id)).where(
@@ -1823,8 +1848,10 @@ async def _render(
             line = f"Checks were not verified: {code_span(ci_observation.reason or 'invalidated')}."
         body += f"\n\n{line}"
     mention = github_status_mention(settings, work_item.tracker_kind)
-    if mention is not None and target.kind in {"pull_request", "review_thread"}:
-        body = append_github_ask_line(body, mention)
+    if mention is not None and target.kind == "issue":
+        body = append_github_ask_line(body, mention, "issue")
+    elif mention is not None and target.kind in {"pull_request", "review_thread"}:
+        body = append_github_ask_line(body, mention, "pull_request")
     return body
 
 

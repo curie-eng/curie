@@ -1620,6 +1620,95 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
     assert "no sandbox capacity" not in outcome.actionable_cause
 
 
+def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -> None:
+    now = datetime.now(UTC)
+    work_item_id = uuid.uuid4()
+
+    def outcome(
+        status: str, cause: str, lineage_status: str, *, cancelled: bool
+    ) -> workitem_outcomes.WorkItemOutcomeOut:
+        item = WorkItem(
+            id=work_item_id,
+            agent_id=uuid.uuid4(),
+            tracker_kind="github",
+            tracker_host="github.com",
+            tracker_scope_id="101",
+            tracker_issue_id="5296",
+            code_host_kind="github",
+            code_host_host="github.com",
+            repository_project_id="101",
+            repository_path=REPO,
+            cancelled_at=now if cancelled else None,
+            created_at=now,
+            updated_at=now,
+            model_auth_mode="service",
+            coding_instructions_state="absent",
+            memory_rules_state="absent",
+            memory_rules_count=0,
+            coding_instructions_absence_reason="historical",
+            automatic_retries_used=0,
+        )
+        request = ExecutionRequest(
+            id=uuid.uuid4(),
+            work_item_id=work_item_id,
+            sequence=1,
+            status=status,
+            wait_deadline=None,
+            started_at=now,
+            execution_deadline=now,
+            terminal_at=now,
+            terminal_cause=cause,
+            termination_observation=None,
+            created_at=now,
+            capacity_deferrals=0,
+            last_deferral_reason=None,
+            last_start_failure_detail=None,
+            objective=OBJECTIVE,
+            requester=REQUESTER,
+            model_auth_mode="service",
+            coding_instructions_evidence="none",
+            memory_rules_evidence="none",
+            dispatch_not_before=now,
+            owner_lost_retry=False,
+        )
+        lineage = SimpleNamespace(
+            id=uuid.uuid4(),
+            pr_number=PR_NUMBER,
+            pr_url=PR_URL,
+            status=lineage_status,
+            head_sha="a" * 40,
+        )
+        return derive_outcome(
+            item,
+            [request],
+            lineage=lineage,  # type: ignore[arg-type]
+            publication=None,
+            approval=None,
+            pending_turn_approval=False,
+            now=now,
+            issue_url="https://github.com/curie-eng/curie/issues/5296",
+        )
+
+    merged = outcome("completed", "completed", "merged", cancelled=True)
+    assert merged.state == "published"
+    assert merged.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    recorded = outcome("completed", "completed", "merged", cancelled=False)
+    assert recorded.state == "published"
+    assert recorded.actionable_cause == f"completed: pull request #{PR_NUMBER} merged"
+    closed = outcome("completed", "completed", "closed", cancelled=True)
+    assert closed.state == "cancelled"
+    assert closed.actionable_cause == (
+        "cancelled: the issue label was removed or the issue was closed; "
+        f"pull request #{PR_NUMBER} is retained"
+    )
+    later = outcome("cancelled", "issue_cancelled", "merged", cancelled=True)
+    assert later.state == "cancelled"
+    assert later.actionable_cause.startswith("cancelled:")
+    assert "completed:" not in later.actionable_cause
+
+
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
     now = datetime.now(UTC)
     work_item_id = uuid.uuid4()

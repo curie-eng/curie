@@ -179,7 +179,6 @@ _RULE_LINE = re.compile(r"(?:[-*_][ \t]*){3,}|=+[ \t]*|-+[ \t]*")
 # An ordered list marker; the summary must not open or continue a list that
 # merges with the numbered questions.
 _ORDERED_MARKER = re.compile(r"^([ \t]*\d{1,9})([.)])(?=[ \t]|$)", re.MULTILINE)
-_HTML_OPENER = re.compile(r"^([ \t]*)<", re.MULTILINE)
 
 
 def _inert(text: str) -> str:
@@ -199,23 +198,22 @@ def _inert(text: str) -> str:
 def compose_body(round_number: int, summary: str, questions: list[str]) -> str:
     """The comment the platform writes for one round (decision 4).
 
-    The model supplies only the summary and the questions; the heading, the
-    numbering and the answer line are fixed, so the wording is identical on
-    every tracker. Each question stays one list item: its continuation lines
-    are indented to the item's content column and none of its lines can open
-    a block. The summary cannot open an ordered list or an HTML block, so the
-    questions are the comment's only ordered list and nothing above them can
-    swallow them.
+    The model supplies the summary and the questions. ``input_valid`` still
+    checks the summary, and it is not posted: it repeated the investigation
+    above questions that are already required to be self-contained. The
+    heading, the numbering and the answer line are fixed, so the wording is
+    identical on every tracker. Each question stays one list item: its
+    continuation lines are indented to the item's content column and none of
+    its lines can open a block. The marker a tracker adds around this body is
+    separate and is not part of the composed text.
     """
 
+    del summary
     numbered = "\n".join(
         _list_item(index, question) for index, question in enumerate(questions, start=1)
     )
-    prose = _ORDERED_MARKER.sub(r"\1\\\2", _visible(summary))
-    prose = _HTML_OPENER.sub(r"\1\\<", prose)
     return (
         f"### Questions from the factory (round {round_number} of {ROUND_LIMIT})\n\n"
-        f"{prose}\n\n"
         f"{numbered}\n\n"
         f"{ANSWER_LINE}\n"
     )

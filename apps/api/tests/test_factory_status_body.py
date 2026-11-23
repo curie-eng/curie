@@ -8,12 +8,14 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from curie_api.factory_card import HEIGHT, CardInput, render_card
-from curie_api.factory_comment_text import marker_for
+from curie_api.factory_comment_text import github_ask_line, marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
+from curie_api.factory_progress import pill_for
 from curie_api.factory_reply_target import is_issue_follow_up, is_relabel_objective
 from curie_api.forges.github.comments import GitHubMarkedComments, static_token
 from curie_api.forges.github.marked_comments import (
@@ -71,6 +73,71 @@ def _view(round_label: str | None = "round 1 of 3") -> PhaseView:
         reviewer_model=None,
         staged=False,
     )
+
+
+def test_questions_only_status_says_waiting_on_answers() -> None:
+    label, color, live = pill_for("completed", False, waiting_on_answers=True)
+    assert (label, color, live) == ("WAITING ON ANSWERS", "#0969da", False)
+    assert pill_for("completed", False)[0] == "SUCCEEDED"
+    declaration = {
+        "phases": [
+            {"id": "investigate", "label": "Investigate"},
+            {"id": "implement", "label": "Implement"},
+            {"id": "publish", "label": "Publish PR"},
+            {"id": "wait_ci", "label": "Wait for CI"},
+        ],
+        "loops": [],
+    }
+    view = phase_view(
+        declaration,
+        [SimpleNamespace(id=1, phase="investigate", loop_round=None)],
+        "completed",
+        "questions_asked",
+    )
+    body = status_body(
+        request_id=REQUEST,
+        card_url=None,
+        pill_label=label,
+        phase_view=view,
+        result="Questions asked (round 1 of 3). Answer in a plain comment on this ticket.\n",
+    )
+    assert "Status: WAITING ON ANSWERS" in body
+    assert "Status: SUCCEEDED" not in body
+    assert "- [x] Investigate" in body
+    assert "- [ ] Implement" in body
+    assert "- [ ] Publish PR" in body
+    assert "- [ ] Wait for CI" in body
+    assert "- [x] Implement" not in body
+
+
+def test_github_issue_ask_line_says_comment_on_this_issue() -> None:
+    issue = github_ask_line("curie", "issue")
+    pull = github_ask_line("curie", "pull_request")
+    assert issue == (
+        "Ask the factory: comment on this issue. "
+        "The first 10 revisions need no mention; after that, mention @curie."
+    )
+    assert pull == (
+        "Ask the factory: comment on this pull request. "
+        "The first 10 revisions need no mention; after that, mention @curie."
+    )
+    assert "pull request" not in issue
+
+
+def test_revision_result_names_the_short_commit_sha() -> None:
+    full = "c281fb1f" + "ab" * 16
+    feedback = "https://github.com/acme-corp/acme-bot/pull/77#issuecomment-88121"
+    body = result_section(
+        "completed",
+        pr_url="https://github.com/acme-corp/acme-bot/pull/77",
+        feedback_url=feedback,
+        commit_sha=full,
+    )
+    assert body.startswith(
+        f"The requested revision is pushed to this pull request as `c281fb1` ({full}).\n"
+    )
+    assert full in body
+    assert f"In response to {feedback}\n" in body
 
 
 def test_a_card_url_emits_no_checklist_while_running() -> None:
@@ -677,6 +744,48 @@ def _bundle_card(status: str, phases: tuple[str, ...]) -> tuple[PhaseView, str]:
         )
     )
     return view, svg
+
+
+def test_a_questions_only_card_says_waiting_on_answers() -> None:
+    declaration = json.loads(BUNDLE_PHASES.read_text())
+    reports = [
+        ExecutionRequestPhaseReport(
+            id=1, execution_request_id=REQUEST, phase="investigate", loop_round=None
+        )
+    ]
+    view = phase_view(declaration, reports, "completed", "questions_asked")
+    now = datetime(2026, 11, 16, 12, 30, 5, tzinfo=UTC)
+    svg = render_card(
+        CardInput(
+            repo="acme-corp/acme-bot",
+            issue_number=42,
+            title="Add Kelvin to the unit converter",
+            revision_pr=None,
+            status="completed",
+            publishing=False,
+            started_at=now - timedelta(minutes=12),
+            terminal_at=now,
+            now=now,
+            activity=None,
+            note=None,
+            phase_view=view,
+            cause_text=None,
+            waiting_on_answers=True,
+        )
+    )
+    assert "WAITING ON ANSWERS" in svg
+    assert "SUCCEEDED" not in svg
+    assert "#0969da" in svg
+    root = ET.fromstring(svg)
+    states = {
+        group.get("data-stage"): (group.get("class") or "").split()[-1]
+        for group in root.iter(f"{SVG_NS}g")
+        if group.get("data-stage")
+    }
+    assert states["investigate"] == "done"
+    assert states["implement"] == "pending"
+    assert states["publish"] == "pending"
+    assert states["wait_ci"] == "pending"
 
 
 @pytest.mark.parametrize(

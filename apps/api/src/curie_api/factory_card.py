@@ -104,6 +104,7 @@ class CardInput:
     cause_text: str | None
     # This failed request's settlement admitted an automatic successor (ADR 0269).
     retrying: bool = False
+    waiting_on_answers: bool = False
     note_at: datetime | None = None
     wait_at: datetime | None = None
     no_pull_request: bool = False
@@ -246,7 +247,12 @@ def _arcs(view: PhaseView) -> list[str]:
 def render_card(card: CardInput) -> str:
     """Render the WIDTH x HEIGHT status card as a standalone SVG document."""
 
-    label, color, live = pill_for(card.status, card.publishing, retrying=card.retrying)
+    label, color, live = pill_for(
+        card.status,
+        card.publishing,
+        retrying=card.retrying,
+        waiting_on_answers=card.waiting_on_answers,
+    )
     subject = f"{card.repo} #{card.issue_number}"
     if card.revision_pr is not None:
         subject += f" (PR #{card.revision_pr})"

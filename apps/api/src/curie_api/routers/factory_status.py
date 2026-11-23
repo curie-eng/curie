@@ -37,6 +37,7 @@ from ..factory_progress import (
     record_run_handoff,
     record_verification,
 )
+from ..factory_questions import QUESTIONS_ASKED
 from ..factory_run_handoff import RunHandoff
 from ..factory_usage import PriceBook, UsageReport, get_price_book, record_usage
 from ..models import (
@@ -227,6 +228,11 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             status=request.status,
             publishing=publishing,
             retrying=retrying,
+            waiting_on_answers=(
+                request.status == "completed"
+                and terminal == QUESTIONS_ASKED
+                and work_item.cancelled_at is None
+            ),
             started_at=request.started_at,
             terminal_at=request.terminal_at,
             now=datetime.now(UTC),

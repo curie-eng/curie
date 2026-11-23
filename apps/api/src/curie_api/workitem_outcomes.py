@@ -111,6 +111,8 @@ def _cause(
     publication: Publication | None,
     approval: Approval | None,
     now: datetime,
+    *,
+    issue_closed: bool,
 ) -> str:
     if req is None:
         if state == "cancelled":
@@ -253,10 +255,10 @@ def _cause(
         )
     if state == "published":
         assert lineage is not None
-        return (
-            f"pull request #{lineage.pr_number} opened; CI and review are the "
-            "next signals"
-        )
+        if lineage.status == "merged" and req is not None and req.status == "completed":
+            closed = " and closed the issue" if issue_closed else ""
+            return f"completed: pull request #{lineage.pr_number} merged{closed}"
+        return f"pull request #{lineage.pr_number} opened; CI and review are the next signals"
     # completed_unpublished
     if publication is None:
         return "execution completed without a publication"
@@ -336,7 +338,15 @@ def derive_outcome(
         state = "completed_unpublished"
     elif req.status == "running":
         state = "running"
-    elif req.status == "cancelled" or item.cancelled_at is not None:
+    elif req.status == "cancelled" or (
+        item.cancelled_at is not None
+        and not (
+            req.status == "completed"
+            and lineage is not None
+            and lineage.status == "merged"
+            and lineage.pr_number is not None
+        )
+    ):
         state = "cancelled"
     elif req.status == "expired":
         state = "expired"
@@ -406,7 +416,15 @@ def derive_outcome(
         actionable_cause=(
             "ci_observed_after_run"
             if observed_completion
-            else _cause(state, req, lineage, publication, approval, now)
+            else _cause(
+                state,
+                req,
+                lineage,
+                publication,
+                approval,
+                now,
+                issue_closed=item.cancelled_at is not None,
+            )
         ),
         objective=objective[:OBJECTIVE_LIMIT] if objective is not None else None,
         objective_truncated=truncated,

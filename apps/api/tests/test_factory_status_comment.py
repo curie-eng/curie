@@ -693,7 +693,8 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert WAITING in body
     assert FINAL_MARKER not in body
     assert "![Curie status]" not in body
-    assert "Ask the factory:" not in body
+    assert github_ask_line(MENTION, "issue") in body
+    assert "comment on this pull request." not in body
     assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # Human and admission labels are never touched.
     assert {LABEL, "bug"} <= sink.issue_labels[number]
@@ -755,22 +756,22 @@ def test_a_card_url_replaces_the_checklist_as_phases_advance(
     assert "Read issue" not in body
     assert WAITING not in body
     assert marker_for(request_id) in body
-    assert "Ask the factory:" not in body
+    assert github_ask_line(MENTION, "issue") in body
+    assert "comment on this pull request." not in body
 
 
-def test_github_issue_status_comment_omits_pull_request_ask_line(admitted: Any) -> None:  # noqa: F811
+def test_github_issue_status_comment_says_comment_on_this_issue(admitted: Any) -> None:  # noqa: F811
     client, github, sink = admitted
     number = 9929
     request_id = _admit(client, github, sink, number)
     _reconcile()
 
     body = _posts(sink)[0][1] or ""
-    ask = github_ask_line(MENTION)
     assert "Status: QUEUED" in body
     assert WAITING in body
     assert marker_for(request_id) in body
-    assert ask not in body
-    assert "Ask the factory:" not in body
+    assert github_ask_line(MENTION, "issue") in body
+    assert "comment on this pull request." not in body
 
 
 def _assert_one_current_ask_line(body: str) -> None:
@@ -783,7 +784,7 @@ def _assert_one_current_ask_line(body: str) -> None:
     asks = [i for i, line in enumerate(lines) if line.startswith("Ask the factory:")]
     assert len(asks) == 1, body
     at = asks[0]
-    assert lines[at] == github_ask_line(MENTION)
+    assert lines[at] == github_ask_line(MENTION, "pull_request")
     assert lines[at - 1] == "" and lines[at - 2].strip()
     assert f"mention @{MENTION} on this pull request" not in body
 
@@ -795,11 +796,11 @@ def test_pull_request_follow_up_replaces_the_previous_ask_wording(admitted: Any)
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
     old = f"Ask the factory: mention @{MENTION} on this pull request."
-    seeded = body.replace(github_ask_line(MENTION), old)
-    assert old in seeded and github_ask_line(MENTION) not in seeded
+    seeded = body.replace(github_ask_line(MENTION, "pull_request"), old)
+    assert old in seeded and github_ask_line(MENTION, "pull_request") not in seeded
 
     # The real writer's last step, applied to a body carrying the old wording.
-    rewritten = factory_notices.append_github_ask_line(seeded, MENTION)
+    rewritten = factory_notices.append_github_ask_line(seeded, MENTION, "pull_request")
 
     assert old not in rewritten
     assert marker_for(request_id) in rewritten
@@ -886,7 +887,7 @@ def test_gitlab_and_bitbucket_status_comments_omit_the_ask_line(
     assert WAITING in body
     assert marker_for(request_id) in body
     assert "Ask the factory" not in body
-    assert github_ask_line(MENTION) not in body
+    assert github_ask_line(MENTION, "pull_request") not in body
 
 
 # --- 2: edited in place as phases advance --------------------------------------------
@@ -2131,7 +2132,8 @@ def test_a_review_thread_revision_replies_then_edits_the_review_comment(
     assert {path for path, _ in _patches(sink)} == {f"/repos/{REPO}/pulls/comments/{reply_id}"}
     (comment,) = _marked(sink, revision)
     assert FINAL_MARKER in comment["body"]
-    assert "The requested revision is pushed to this pull request." in comment["body"]
+    assert "The requested revision is pushed to this pull request as `b2b2b2b`" in comment["body"]
+    assert "b2" * 20 in comment["body"]
     assert _curie_labels(sink, pr) == set()
     assert _curie_labels(sink, number) == {"curie-factory:pr-open"}
 
@@ -2823,7 +2825,7 @@ def test_a_running_pull_request_follow_up_hides_the_checklist_until_a_later_phas
     assert _READING in comment["body"]
     assert "Status: RUNNING" in comment["body"]
     assert _checklist_lines(comment["body"]) == []
-    assert comment["body"].rstrip().endswith(github_ask_line(MENTION))
+    assert comment["body"].rstrip().endswith(github_ask_line(MENTION, "pull_request"))
 
     assert report(client, revision, "read_issue").status_code == 201
     _execute(
