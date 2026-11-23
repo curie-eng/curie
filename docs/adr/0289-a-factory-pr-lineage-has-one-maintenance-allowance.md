@@ -51,7 +51,18 @@ on a named head, permitted no-CI settlement and maintenance refusals.
 
 The admission port is in `apps/api/src/curie_api/factory_maintenance.py` and
 the reason hooks are in `apps/api/src/curie_api/factory_maintenance_reasons.py`.
-The database, dispatch and end to end proof are pending.
+The admission transaction in `factory_maintenance_store.commit_observation`
+creates the waiting execution, charges the lineage and records the admission.
+The dispatch and publication paths call `factory_maintenance_observer.repair_refusal`
+to verify the stored head and base against the forge. The CI gate verifies
+the result of the successor publication. Full installation proof is pending.
+
+Prepared status paragraph for use after explicit acceptance:
+
+> Status: Accepted. The maintainer approved this decision on [date and reference].
+> The admission transaction in `factory_maintenance_store.commit_observation`
+> creates the bounded successor. The publisher checks its stored pins in
+> `factory_maintenance_observer.repair_refusal`.
 
 ## Alternatives considered
 

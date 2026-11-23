@@ -535,6 +535,8 @@ def test_a_dirty_pull_without_checks_fails_promptly_without_a_ci_fix(admitted: A
     assert "Provider message:" not in body
     assert "Cause: merge_conflict" in body
     assert _ci_turns(published["id"]) == []
+    assert _count_requests(number) == 1
+    assert _rows("SELECT repair_request_id FROM curie.factory_maintenance_admissions") == []
     assert sink.reruns == []
 
 

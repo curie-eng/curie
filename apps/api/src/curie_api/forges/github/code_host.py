@@ -1041,6 +1041,7 @@ class GitHubCodeHost:
             draft=payload.get("draft") is True,
             conflicted=conflicted(payload),
             updated_at=_timestamp(payload.get("updated_at")),
+            node_id=payload["node_id"] if isinstance(payload.get("node_id"), str) else None,
         )
 
     async def _own_login(self, repository: RepositoryRef) -> tuple[str, str]:

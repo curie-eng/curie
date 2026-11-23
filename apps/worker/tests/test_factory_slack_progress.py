@@ -47,17 +47,21 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
+from curie_api.factory_maintenance import MaintenanceObservation
+from curie_api.factory_maintenance_progress import record_ci_settlement, record_event
+from curie_api.models import ExecutionRequest, WorkItem
 from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_internal.factory_cause import cause_text
 from curie_worker.factory_slack_progress import (
     FactorySlackProgressError,
     FactorySlackProgressLoop,
     PostgresFactorySlackStore,
+    render_post,
     render_refusal,
 )
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from apps.api.tests.conftest import _disposable_db as _disposable_db
 from apps.api.tests.conftest import clean_db as clean_db
@@ -68,16 +72,19 @@ from apps.api.tests.test_factory_slack_runtime import (
     CARD_POST,
     CHANNEL,
     DEFAULT_TOKEN,
+    HEAD,
     NEEDS_YOU,
     OTHER_CHANNEL,
     READY,
     REPO,
     Stack,
+    _admit_revision_directly,
     _age_card,
     _card_edits,
     _card_ts,
     _channel_posts,
     _chat_since,
+    _db,
     _kickoff_thread,
     _last_card,
     _post_kinds,
@@ -88,6 +95,101 @@ from apps.api.tests.test_factory_slack_runtime import stack as stack
 
 _ISSUES = itertools.count(8401)
 _PULLS = itertools.count(9401)
+
+
+def test_maintenance_messages_distinguish_published_verified_and_permitted_no_ci() -> None:
+    head = "a1" * 20
+    payload = {"head_sha": head, "reason": "ci_settlement", "objective": "<!channel>"}
+    assert render_post("maintenance", {**payload, "outcome": "green"}) == (
+        f"CI verified green on {head}."
+    )
+    assert render_post("maintenance", {**payload, "outcome": "no_ci"}) == (
+        f"No CI checks applied to {head}. Policy permits completion."
+    )
+    assert "green" not in render_post("ready", {"url": "https://example.com/pull/1"})
+    assert render_post("maintenance", {**payload, "outcome": "foreign_head"}) == (
+        "Repair paused because the pull request head differs from the factory head."
+    )
+    assert "<!channel>" not in render_post(
+        "maintenance", {"head_sha": "<!channel>", "outcome": "green"}
+    )
+
+
+@pytest.mark.parametrize("destination", [False, True], ids=["no-channel", "configured"])
+def test_maintenance_history_survives_polls_and_worker_restart(
+    stack: Stack, destination: bool
+) -> None:
+    if destination:
+        assert stack.enable_destination().status_code == 200
+    number = next(_ISSUES)
+    source_id, item_id = stack.admit(number)
+    epoch = stack.start(source_id)
+    lineage_id, _branch = stack.own_pull_request(item_id, next(_PULLS))
+    stack.finish(source_id, epoch, published=True)
+    successor_id = uuid.uuid4()
+    _admit_revision_directly(stack, number, successor_id)
+    observation = MaintenanceObservation(
+        work_item_id=item_id,
+        request_id=source_id,
+        lineage_id=lineage_id,
+        work_item_version=1,
+        request_version=1,
+        lineage_version=1,
+        head_sha=HEAD,
+        base_ref="private-branch-sentinel",
+        base_sha="b2" * 20,
+        reason="late_ci_red",
+    )
+
+    async def record(engine: AsyncEngine) -> None:
+        async with AsyncSession(engine) as session, session.begin():
+            item = await session.get(WorkItem, item_id, with_for_update=True)
+            source = await session.get(ExecutionRequest, source_id)
+            assert item is not None and source is not None
+            await record_ci_settlement(session, item, source, head_sha=HEAD, green=True)
+            for outcome in ("foreign_head", "foreign_head", "evidence_unavailable", "foreign_head"):
+                await record_event(session, observation, outcome)
+            await record_event(session, observation, "admitted", repair_request_id=successor_id)
+            await record_event(session, observation, "budget_exhausted")
+
+    _db(record)
+    response = stack.client.get(
+        "/work-items", headers=stack.platform, params={"agent_id": stack.agent_id}
+    )
+    assert response.status_code == 200, response.text
+    history = response.json()["items"][0]["maintenance_history"]
+    assert [event["outcome"] for event in history] == [
+        "green",
+        "foreign_head",
+        "evidence_unavailable",
+        "foreign_head",
+        "admitted",
+        "budget_exhausted",
+    ]
+    assert history[0]["head_sha"] == HEAD
+    assert history[-2]["repair_request_id"] == str(successor_id)
+    assert history[-1]["repair_request_id"] is None
+    stack.drain()
+    stack.drain(fresh=True)
+    if destination:
+        (thread,) = stack.threads(item_id)
+        messages = _texts(stack, thread["root_ts"])
+        expected = [
+            f"CI verified green on {HEAD}.",
+            "Repair paused because the pull request head differs from the factory head.",
+            "Curie could not verify the current repair evidence.",
+            "Repair paused because the pull request head differs from the factory head.",
+            "Curie queued a repair for failing CI.",
+            "The automatic repair allowance has been spent.",
+        ]
+        assert messages[-len(expected) :] == expected
+        assert all("private-branch-sentinel" not in message for message in messages)
+        assert [row["post_key"] for row in _posts(item_id) if row["kind"] == "maintenance"] == [
+            f"maintenance:{event['id']}" for event in history
+        ]
+    else:
+        assert _posts(item_id) == []
+        assert stack.slack.delivered_posts(stack.factory_token) == []
 
 
 # --- fixture state and views ---------------------------------------------------------

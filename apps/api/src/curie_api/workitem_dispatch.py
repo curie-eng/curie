@@ -1177,6 +1177,7 @@ async def acquire(
     client: httpx.AsyncClient,
 ) -> AcquireGrant | DispatchConflict:
     from .factory_base_reconcile import resolve_for_acquire
+    from .factory_maintenance_observer import repair_refusal
 
     request = await session.get(ExecutionRequest, request_id, populate_existing=True)
     if request is None:
@@ -1219,6 +1220,8 @@ async def acquire(
             return await _defer_factory_refusal(
                 session, work_item, request, owner=owner, generation=generation, refusal=refusal
             )
+    if await repair_refusal(session, request_id, get_settings(), client, record=True) is not None:
+        return await _refuse(session, "not_dispatchable", request_id=request_id)
     await session.commit()
     session.expire_all()
     ready = await resolve_for_acquire(

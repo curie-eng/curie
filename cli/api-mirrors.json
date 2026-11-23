@@ -129,6 +129,11 @@
       "omissions": []
     },
     {
+      "struct": "WorkItemMaintenanceEvent",
+      "schema": "WorkItemMaintenanceEventOut",
+      "omissions": []
+    },
+    {
       "struct": "WorkItemRequest",
       "schema": "WorkItemRequestOut",
       "omissions": [

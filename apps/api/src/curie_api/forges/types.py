@@ -150,6 +150,8 @@ class PullRequest:
     # when the payload carried no usable time. A metadata-only revision records
     # it so CI freshness is judged after the edit.
     updated_at: datetime | None = None
+    # GitHub binds a lineage to the node ID as well as the repository and number.
+    node_id: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
