@@ -3500,6 +3500,10 @@ show its pull request and checks for the observed head. The app omits issue
 titles, private links, source messages and steering text. Tracker runs and
 kickoffs in another channel get a separate public thread. A kickoff in the
 public channel keeps its original thread. Retries and revisions reuse it.
+Clearing the destination pauses card, ready and failure updates in public
+threads, including kickoffs that reused their original thread. An already
+accepted steering command can still receive its final acknowledgement at
+its source while the app can verify that binding and its public visibility.
 
 An authorized engineer can mention the app in a mapped thread while
 implementation is waiting or running. Queued guidance expires in 24 hours.
@@ -3509,6 +3513,10 @@ resumes after a rollback followed by an upgrade. During a rolling upgrade
 or after a rollback to an earlier release, a thread started in the public
 channel from a private repository's issue link can receive that pull
 request's URL from an older API and worker pair.
+
+A worker from an earlier release cannot attest which guidance it received.
+A current API defers a guided execution until a current worker takes it or
+its waiting deadline expires.
 
 ### Factory Slack steering
 

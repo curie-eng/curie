@@ -33,7 +33,10 @@ from apps.api.tests.test_factory_slack_runtime import (
 
 @pytest.mark.parametrize("public_channel", [CHANNEL, OTHER_CHANNEL])
 def test_native_public_and_private_kickoffs_keep_one_public_card(
-    kickoff: SteeringStack, monkeypatch: pytest.MonkeyPatch, public_channel: str
+    kickoff: SteeringStack,
+    monkeypatch: pytest.MonkeyPatch,
+    public_channel: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     shared = public_channel == CHANNEL
     if not shared:
@@ -47,7 +50,7 @@ def test_native_public_and_private_kickoffs_keep_one_public_card(
     assert configured.is_success, configured.text
     assert (CHANNEL in kickoff.slack.public_channels) == shared
     kickoff.github.public_repository = False
-    person = enrolled(kickoff)
+    person = enrolled(kickoff, github=True)
     number = next_issue()
     plant_issue(kickoff, number)
     source_marker = "restricted kickoff explanation"
@@ -118,6 +121,22 @@ def test_native_public_and_private_kickoffs_keep_one_public_card(
         expected.insert(0, {"root_ts": source_root, "destination_role": "origin"})
     assert roles == expected
 
+    other = enrolled(kickoff, github=True)
+    address = {"thread_ts": public["root_ts"], "channel": public_channel}
+    refused = kickoff.steer(other.slack_user, "Request a revision.", **address)
+    assert refused.reply is not None and refused.reply["reason"] == "owner_mismatch"
+    assert refused.new_requests == []
+    accepted = kickoff.steer(person.slack_user, "Keep the original timeout.", **address)
+    assert accepted.reply is not None and accepted.reply["outcome"] == "queued"
+    assert "pull_request_url" not in accepted.reply
+    (revision,) = accepted.new_requests
+    assert revision["work_item_id"] == item and revision["reply_target_pr_number"] == str(pr)
+    drain_public(kickoff)
+    assert _rows(
+        "SELECT root_ts, card_ts FROM curie.factory_slack_public_threads WHERE work_item_id=:item",
+        {"item": item},
+    ) == [{"root_ts": public["root_ts"], "card_ts": public["card_ts"]}]
+
     public_writes = [
         call
         for call in kickoff.slack.calls
@@ -129,6 +148,7 @@ def test_native_public_and_private_kickoffs_keep_one_public_card(
         assert all(
             value not in call.haystack for value in (source_marker, report_marker, REPO, "/pull/")
         )
+    assert source_marker not in caplog.text and report_marker not in caplog.text
     ready = [
         call
         for call in public_writes
@@ -314,15 +334,7 @@ def test_clearing_public_mode_preserves_only_the_bound_source_settlement(
         json={"factory_public_slack_channel": None},
     )
     assert cleared.is_success, cleared.text
-    _rows(
-        """
-        UPDATE curie.factory_steering_ledger SET created_at = now() - interval '2 days'
-        WHERE steering_id = :key
-    """,
-        {"key": key},
-    )
-
-    async def expire(engine: AsyncEngine) -> None:
+    async def settle_failure(engine: AsyncEngine) -> None:
         async with async_sessionmaker(engine)() as session:
             await factory_steering_execution.redrive(
                 session,
@@ -332,11 +344,11 @@ def test_clearing_public_mode_preserves_only_the_bound_source_settlement(
                 client=kickoff.client.app.state.http_client,
             )
 
-    _db(expire)
+    _db(settle_failure)
     assert _rows(
         "SELECT refusal_code FROM curie.factory_steering_ledger WHERE steering_id = :key",
         {"key": key},
-    ) == [{"refusal_code": "guidance_expired"}]
+    ) == [{"refusal_code": "no_pull_request"}]
     before = len(kickoff.slack.calls)
     channels = f"/agents/{kickoff.agent_id}/channels"
     binding = {"kind": "slack", "address": CHANNEL, "adapter": kickoff.identity}
@@ -373,7 +385,7 @@ def test_clearing_public_mode_preserves_only_the_bound_source_settlement(
     drain_public(kickoff)
     (settlement,) = [c for c in kickoff.slack.calls[before:] if c.method.startswith("chat.")]
     assert settlement.params["channel"] == CHANNEL and settlement.params["thread_ts"] == root
-    assert settlement.text == "Guidance closed without being applied (guidance_expired)."
+    assert settlement.text == "Guidance closed without being applied (no_pull_request)."
     assert marker not in settlement.haystack
     resumed = configure_public(kickoff, monkeypatch, CHANNEL)
     assert resumed.is_success, resumed.text

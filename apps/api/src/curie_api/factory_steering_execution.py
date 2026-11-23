@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-from collections.abc import Sequence
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -14,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from . import factory_steering_ledger as ledger
 from .config import Settings
 from .models import Agent, ExecutionRequest, ThreadPublicationLineage, WorkItem
-from .workitems.lifecycle import database_now, lock_work_item
 
 _GUIDANCE_HEADER = "\n\nAdditional guidance:\n"
 _EXPIRY = timedelta(hours=24)
@@ -22,26 +19,37 @@ _MAX_ENTRIES = 8
 _MAX_INPUT = 65_536
 
 
-def compose(objective: str, entries: Sequence[ledger.SteeringEntry]) -> str:
+async def selected_input(
+    session: AsyncSession, request: ExecutionRequest
+) -> tuple[str | None, list[ledger.SteeringEntry]]:
+    if request.objective is None or request.execution_kind != "implementation":
+        return request.objective, []
+    entries = await ledger.selection(session, request)
+    if not entries:
+        return request.objective, []
+    if any(entry.objective_embedded and entry.state == "refused" for entry in entries):
+        # The revision's original objective contains the refused command itself.
+        return None, entries
+    objective = request.objective
+    if request.retry_origin_request_id is not None:
+        origin = await session.get(ExecutionRequest, request.retry_origin_request_id)
+        assert origin is not None and origin.work_item_id == request.work_item_id
+        assert origin.objective is not None
+        objective = origin.objective
     return objective + "".join(
-        _GUIDANCE_HEADER + entry.accepted_text for entry in entries if not entry.objective_embedded
-    )
-
-
-def matches_input(
-    objective: str, entries: Sequence[ledger.SteeringEntry], digest: str | None
-) -> bool:
-    return digest == hashlib.sha256(compose(objective, entries).encode("utf-8")).hexdigest()
+        _GUIDANCE_HEADER + entry.accepted_text
+        for entry in entries
+        if not entry.objective_embedded and entry.state != "refused"
+    ), entries
 
 
 async def execute_text(session: AsyncSession, request: ExecutionRequest) -> str | None:
-    if request.objective is None or request.execution_kind != "implementation":
-        return request.objective
-    return compose(request.objective, await ledger.assigned(session, request.id))
+    objective, _ = await selected_input(session, request)
+    return objective
 
 
 async def _select_pending(
-    session: AsyncSession, item: WorkItem, request: ExecutionRequest, now: datetime
+    session: AsyncSession, item: WorkItem, request: ExecutionRequest, now: datetime, length: int
 ) -> list[UUID]:
     entries = await ledger.pending(session, item.id)
     if not entries:
@@ -56,8 +64,6 @@ async def _select_pending(
         .with_for_update(read=True)
     ):
         return []
-    assert request.objective is not None
-    length = len(request.objective)
     selected: list[UUID] = []
     for entry in entries[:_MAX_ENTRIES]:
         if entry.created_at + _EXPIRY <= now:
@@ -88,13 +94,19 @@ async def requires_redispatch(
 ) -> bool:
     if request.execution_kind != "implementation" or request.objective is None:
         return False
-    assigned = await ledger.assigned(session, request.id)
+    objective, assigned = await selected_input(session, request)
     selected: list[UUID] = []
     if request.steering_sealed_at is None:
         request.steering_sealed_at = now
-        if not already_acquired and not assigned:
-            selected = await _select_pending(session, item, request, now)
-    if not selected and (not assigned or matches_input(request.objective, assigned, digest)):
+        if (
+            objective is not None
+            and not already_acquired
+            and not any(entry.execution_request_id == request.id for entry in assigned)
+        ):
+            selected = await _select_pending(session, item, request, now, len(objective))
+    if not selected and (
+        not assigned or (objective is not None and ledger.digest(objective) == digest)
+    ):
         return False
     due = min(
         now if selected else now + timedelta(seconds=backoff_seconds),
@@ -130,9 +142,18 @@ async def requires_redispatch(
     return True
 
 
+_LIVE_RETRY = """
+    SELECT FROM curie.execution_requests retry
+    WHERE retry.work_item_id = assigned.work_item_id AND retry.sequence > assigned.sequence
+      AND retry.retry_origin_request_id = COALESCE(assigned.retry_origin_request_id, assigned.id)
+      AND retry.execution_kind = 'implementation'
+      AND retry.status IN ('queued', 'waiting', 'running', 'cancellation_requested')
+"""
+
+
 async def due(session: AsyncSession, *, limit: int, after: UUID) -> list[tuple[UUID, UUID]]:
     rows = await session.execute(
-        text("""
+        text(f"""
             SELECT entry.work_item_id, entry.steering_id
             FROM curie.factory_steering_ledger entry
             JOIN curie.work_items item ON item.id = entry.work_item_id
@@ -141,7 +162,8 @@ async def due(session: AsyncSession, *, limit: int, after: UUID) -> list[tuple[U
                 ON lineage.id = item.publication_lineage_id
             WHERE entry.state = 'queued' AND (
                 item.cancelled_at IS NOT NULL OR lineage.status IN ('closed', 'merged')
-                OR assigned.status IN ('completed', 'failed', 'expired', 'cancelled')
+                OR (assigned.status IN ('completed', 'failed', 'expired', 'cancelled')
+                    AND NOT EXISTS ({_LIVE_RETRY}))
                 OR (entry.execution_request_id IS NULL AND (
                     entry.created_at <= clock_timestamp() - interval '24 hours'
                     OR (item.readmit_request_id IS NULL AND NOT EXISTS (
@@ -170,6 +192,7 @@ async def redrive(
     client: httpx.AsyncClient,
 ) -> None:
     from . import factory_slack
+    from .workitems.lifecycle import database_now, lock_work_item
 
     item = await lock_work_item(session, work_item_id)
     entry = await ledger.get(session, steering_id)
@@ -186,12 +209,14 @@ async def redrive(
     elif lineage is not None and lineage.status != "open":
         reason = "lineage_closed"
     elif entry.execution_request_id is not None:
-        assigned = await session.get(ExecutionRequest, entry.execution_request_id)
-        if assigned is not None and assigned.status in (
-            "queued",
-            "waiting",
-            "running",
-            "cancellation_requested",
+        if await session.scalar(
+            text(f"""
+                SELECT assigned.status IN ('queued', 'waiting', 'running', 'cancellation_requested')
+                       OR EXISTS ({_LIVE_RETRY})
+                FROM curie.execution_requests assigned
+                WHERE assigned.id = :request AND assigned.work_item_id = :item
+            """),
+            {"request": entry.execution_request_id, "item": work_item_id},
         ):
             return
         reason = "execution_ended"

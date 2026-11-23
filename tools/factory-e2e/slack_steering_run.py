@@ -143,7 +143,8 @@ class SlackSteeringRun(sk.ScriptedRun):
     def ledger(self, item: str) -> list[dict[str, Any]]:
         return self.sql(
             "SELECT coalesce(json_agg(json_build_object('ts', source_facts->>'message_ts',"
-            "'state',state,'request',execution_request_id) ORDER BY created_at),'[]') "
+            "'state',state,'request',coalesce(applied_request_id,execution_request_id)) "
+            "ORDER BY created_at),'[]') "
             f"FROM curie.factory_steering_ledger WHERE work_item_id='{uuid.UUID(item)}'"
         )
 

@@ -1805,11 +1805,14 @@ async def start(
         )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
-    entries = await factory_steering_ledger.assigned(session, request.id)
+    objective, entries = await factory_steering_execution.selected_input(session, request)
     if entries and (
-        request.objective is None
-        or any(entry.state != "queued" for entry in entries)
-        or not factory_steering_execution.matches_input(request.objective, entries, input_sha256)
+        objective is None
+        or any(
+            entry.state == "refused" and entry.execution_request_id == request.id
+            for entry in entries
+        )
+        or factory_steering_ledger.digest(objective) != input_sha256
     ):
         return await _refuse(
             session, "not_dispatchable", work_item_id=work_item.id, request_id=request_id
@@ -1854,7 +1857,9 @@ async def start(
     if entries:
         if isinstance(result, WorkItemOutcome):
             await factory_steering_ledger.apply(
-                session, work_item.id, request_id, [entry.steering_id for entry in entries]
+                session,
+                request,
+                [entry.steering_id for entry in entries if entry.state == "queued"],
             )
         await session.commit()
     if isinstance(result, WorkItemConflict):

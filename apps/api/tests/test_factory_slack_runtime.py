@@ -2148,7 +2148,10 @@ class GitHubTruth(GitHubAPI):
                      "conclusion": self.check_conclusion}
             return httpx.Response(200, json={"total_count": 1, "check_runs": [check]})
         if path == f"/repos/{REPO}/commits/{HEAD}/status":
-            return httpx.Response(200, json={"sha": HEAD, "state": "pending", "statuses": []})
+            # https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
+            return httpx.Response(
+                200, json={"sha": HEAD, "state": "pending", "statuses": [], "total_count": 0}
+            )
         if request.method == "GET" and path.startswith("/user/"):
             account = self.accounts.get(int(path.removeprefix("/user/")))
             if account is None:
@@ -3027,6 +3030,7 @@ class SteeringStack(Stack):
         text_: str,
         *,
         thread_ts: str,
+        channel: str = CHANNEL,
         team: str = TEAM,
         bot_id: str | None = None,
         event_id: str | None = None,
@@ -3047,7 +3051,7 @@ class SteeringStack(Stack):
         message_ts = message_ts or f"1800000500.{next(self._ts):06d}"
         event: dict[str, Any] = {
             "type": "app_mention",
-            "channel": CHANNEL,
+            "channel": channel,
             "text": text_ if raw else f"<@{FACTORY_BOT_USER}> {text_}",
             "ts": message_ts,
             "thread_ts": thread_ts,

@@ -910,7 +910,7 @@ class PostgresFactorySlackStore:
                 detail = (
                     await connection.execute(
                         text(f"""
-                    SELECT g.execution_request_id, g.refusal_code,
+                    SELECT g.applied_request_id, g.refusal_code,
                            {_STEERING_AT_SOURCE} AS at_source
                       FROM {self._ledger} g JOIN {self._threads} t USING (work_item_id)
                      WHERE g.work_item_id = :item AND g.steering_id = :steer
@@ -922,7 +922,7 @@ class PostgresFactorySlackStore:
                     )
                 ).one()
             if work.kind == "steering_applied":
-                return f"Guidance applied to execution {detail.execution_request_id}."
+                return f"Guidance applied to execution {detail.applied_request_id}."
             if detail.at_source and (
                 not self.public_role
                 or detail.refusal_code

@@ -23,7 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from .. import factory_questions, factory_retry_policy, memory_rules_admission, transcripts
+from .. import (
+    factory_questions,
+    factory_retry_policy,
+    factory_steering_execution,
+    memory_rules_admission,
+    transcripts,
+)
 from ..config import get_settings
 from ..factory_no_change import no_change_marker_line
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
@@ -3616,6 +3622,9 @@ async def admit_automatic_successor(
             dispatch_not_before = wait_deadline
         else:
             dispatch_not_before = due
+    objective = await factory_steering_execution.execute_text(session, predecessor)
+    if objective is None and predecessor.objective is not None:
+        return False
     admitted = await insert_waiting_request(
         session,
         work_item,
@@ -3625,7 +3634,7 @@ async def admit_automatic_successor(
         reserve_automatic_retry=True,
         columns={
             "owner_lost_retry": origin == "owner_loss",
-            "objective": predecessor.objective,
+            "objective": objective,
             "requester": predecessor.requester,
             "reply_kind": predecessor.reply_kind,
             "reply_address": predecessor.reply_address,

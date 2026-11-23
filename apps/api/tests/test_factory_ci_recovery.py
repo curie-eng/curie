@@ -83,7 +83,8 @@ def _execution_at_0163(request_id: Any) -> dict[str, Any]:
                 "- 'retry_condition_reason' - 'retry_condition_retry_at' "
                 "- 'retry_condition_scope_key' - 'delivered_limits' - 'resource_gate' "
                 "- 'execution_kind' - 'recovery_candidate_id' - 'recovery_candidate_sha256' "
-                "- 'guarded_dispatch_not_before' - 'memory_rules_evidence')::text "
+                "- 'guarded_dispatch_not_before' - 'memory_rules_evidence' "
+                "- 'steering_sealed_at')::text "
                 "AS bytes "
                 "FROM curie.execution_requests r WHERE id = :id",
                 {"id": request_id},

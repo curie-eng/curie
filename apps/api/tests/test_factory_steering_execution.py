@@ -14,12 +14,15 @@ from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
 from curie_api import factory_steering_ledger as ledger
 from curie_api import workitem_dispatch as dispatch
 from curie_api.config import get_settings
+from curie_api.factory_confirmed_steering import AppliedSteering
 from curie_api.models import ExecutionRequest
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_api.workitems import lifecycle
 from curie_api.workitems.lifecycle import WorkItemOutcome
+from curie_worker.factory_slack_progress import PostgresFactorySlackStore
 from forge_fakes import factory_wake, no_external_calls
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from test_github_factory_base import (
     _execute,
     _execution,
@@ -321,6 +324,145 @@ def test_selected_guidance_republishes_and_only_the_matching_start_applies(
     _run(steps, runs_stream)
 
 
+@pytest.mark.parametrize("first_consumer", [0, 1, None], ids=["original", "retry", "unconsumed"])
+def test_scheduled_retries_preserve_the_sealed_input_and_first_consuming_execution(
+    clean_db: None,
+    allowlisted: None,  # noqa: F811
+    runs_stream: str,
+    valkey: redis.Redis,
+    first_consumer: int | None,
+) -> None:
+    async def steps(
+        maker: async_sessionmaker[AsyncSession], loop: WorkItemReconciler, _bus: aioredis.Redis
+    ) -> None:
+        expected = OBJECTIVE + "\n\nAdditional guidance:\n" + GUIDANCE
+        async with maker() as session:
+            item, original = await _admit(session)
+            key = await _record(session, item, GUIDANCE)
+            selected = await _acquire(session, original, 1, OBJECTIVE)
+            assert (
+                isinstance(selected, dispatch.DispatchConflict) and selected.code == "not_published"
+            )
+            request_id = original
+            consumer = None
+            applied_at = None
+            later_key = None
+            revision = "Also check the second line."
+            for attempt in range(lifecycle.AUTOMATIC_RETRY_LIMIT + 1):
+                request = await lifecycle.reload_request(session, request_id)
+                generation = request.dispatch_generation
+                if attempt:
+                    assert request.objective == expected
+                    if attempt == 1:
+                        later_key = await _record(session, item, revision)
+                    # The first retry can select the command that arrived after admission.
+                    stale = await _acquire(
+                        session, request_id, generation, expected if attempt == 1 else OBJECTIVE
+                    )
+                    assert (
+                        isinstance(stale, dispatch.DispatchConflict)
+                        and stale.code == "not_published"
+                    )
+                    generation += 1
+                    if attempt == 1:
+                        expected += "\n\nAdditional guidance:\n" + revision
+                wake = await loop._execute_turn(request_id, generation)
+                assert wake is not None and wake.text == expected
+                if first_consumer is not None and attempt >= first_consumer:
+                    grant = await _acquire(session, request_id, generation, wake.text)
+                    assert isinstance(grant, dispatch.AcquireGrant)
+                    stale_start = await _start(session, request_id, grant, received=OBJECTIVE)
+                    assert isinstance(stale_start, dispatch.DispatchConflict)
+                    assert (await _state(session, key)).applied_at == applied_at
+                    started = await _start(session, request_id, grant, received=wake.text)
+                    assert isinstance(started, dispatch.StartResult)
+                    epoch = started.runtime_epoch
+                    entry = await _state(session, key)
+                    if attempt == first_consumer:
+                        consumer, applied_at = request_id, entry.applied_at
+                    assert consumer is not None
+                    assert entry.execution_request_id == original
+                    assert entry.applied_at == applied_at and applied_at is not None
+                    assert entry.decision(replayed=True) == AppliedSteering(
+                        steering_id=key, execution_request_id=consumer, replayed=True
+                    )
+                    if later_key is not None:
+                        later = await _state(session, later_key)
+                        assert (
+                            later.state == "applied"
+                            and later.applied_request_id == later.execution_request_id
+                        )
+                else:
+                    # An earlier API can start without recording its received input.
+                    item_row = await lifecycle.reload_work_item(session, item)
+                    request = await lifecycle.reload_request(session, request_id)
+                    prior_start = await lifecycle.start_execution(
+                        session,
+                        work_item_id=item,
+                        request_id=request_id,
+                        expected_work_item_version=item_row.version,
+                        expected_request_version=request.version,
+                    )
+                    assert isinstance(prior_start, WorkItemOutcome)
+                    epoch = 0
+                finished = await dispatch.finish(
+                    session,
+                    request_id,
+                    runtime_epoch=epoch,
+                    outcome="failed",
+                    cause="model_error",
+                    detail=None,
+                    ci_fix_round=None,
+                    retry_safety="no_effects",
+                    retry_condition=None,
+                    exhausted_volume=None,
+                )
+                assert isinstance(finished, WorkItemOutcome)
+                successor = await lifecycle.automatic_successor_of(
+                    session, await lifecycle.reload_request(session, request_id)
+                )
+                await loop._redrive_steering()
+                entry = await _state(session, key)
+                if attempt < lifecycle.AUTOMATIC_RETRY_LIMIT:
+                    assert successor is not None and successor.retry_of_request_id == request_id
+                    assert entry.state == ("queued" if consumer is None else "applied")
+                    request_id = successor.id
+                else:
+                    assert successor is None
+                    if consumer is None:
+                        assert entry.refusal_code == "execution_ended" and entry.applied_at is None
+                        assert later_key is not None
+                        assert (await _state(session, later_key)).refusal_code == "execution_ended"
+                    else:
+                        assert (
+                            entry.applied_request_id == consumer and entry.applied_at == applied_at
+                        )
+            assert (await lifecycle.reload_work_item(session, item)).automatic_retries_used == 2
+            assert isinstance(session.bind, AsyncEngine)
+            store = PostgresFactorySlackStore(
+                session.bind,
+                schema=get_settings().db_schema,
+                lease_owner="progress",
+                public_role=True,
+            )
+            await store.materialize()
+            settlement = []
+            while post := await store.claim_next():
+                if post.post_key in {f"steering_applied:{key}", f"steering_refused:{key}"}:
+                    settlement.append(await store.post_text(post))
+                ts = (
+                    "1700000000.000001" if post.kind == "root" else f"1700000001.{post.post_id:06d}"
+                )
+                await store.mark_posted(post, ts)
+            assert settlement == [
+                f"Guidance applied to execution {consumer}."
+                if consumer is not None
+                else "Guidance closed without being applied (execution_ended)."
+            ]
+
+    _run(steps, runs_stream)
+
+
 @pytest.mark.parametrize("embedded", [True, False])
 def test_cancel_settles_unconsumed_guidance_even_after_an_empty_selection(
     clean_db: None,
@@ -367,6 +509,8 @@ def test_cancel_settles_unconsumed_guidance_even_after_an_empty_selection(
         async with maker() as session:
             settled = await _state(session, key)
             assert settled.refusal_code == "work_item_cancelled" and settled.applied_at is None
+            if embedded:
+                assert await loop._execute_turn(request, 2) is None
         await loop._redrive_steering()
         async with maker() as session:
             assert (await _state(session, key)).refused_at == settled.refused_at

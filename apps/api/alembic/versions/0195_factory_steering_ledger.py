@@ -33,6 +33,7 @@ def upgrade() -> None:
             accepted_text text NOT NULL CHECK (length(accepted_text) BETWEEN 1 AND 65536),
             state text NOT NULL DEFAULT 'queued',
             execution_request_id uuid,
+            applied_request_id uuid,
             objective_embedded boolean NOT NULL DEFAULT false,
             created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
             applied_at timestamptz,
@@ -40,6 +41,9 @@ def upgrade() -> None:
             refusal_code text CHECK (refusal_code ~ '^[a-z][a-z0-9_]{0,95}$'),
             FOREIGN KEY (work_item_id, execution_request_id)
                 REFERENCES curie.execution_requests (work_item_id, id),
+            FOREIGN KEY (work_item_id, applied_request_id)
+                REFERENCES curie.execution_requests (work_item_id, id),
+            CHECK ((applied_request_id IS NOT NULL) = (state = 'applied')),
             CHECK (NOT objective_embedded OR execution_request_id IS NOT NULL),
             CHECK ((state = 'queued' AND applied_at IS NULL AND refused_at IS NULL
                     AND refusal_code IS NULL)

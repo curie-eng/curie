@@ -19,6 +19,7 @@ from .factory_confirmed_steering import (
     RefusedSteering,
     SteeringDecision,
 )
+from .models import ExecutionRequest
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -35,6 +36,7 @@ class SteeringEntry:
     accepted_text: str = field(repr=False)
     state: str
     execution_request_id: UUID | None
+    applied_request_id: UUID | None
     objective_embedded: bool
     created_at: datetime
     applied_at: datetime | None
@@ -46,10 +48,10 @@ class SteeringEntry:
             assert self.refusal_code is not None
             return RefusedSteering(reason=self.refusal_code)
         if self.state == "applied":
-            assert self.execution_request_id is not None
+            assert self.applied_request_id is not None
             return AppliedSteering(
                 steering_id=self.steering_id,
-                execution_request_id=self.execution_request_id,
+                execution_request_id=self.applied_request_id,
                 replayed=replayed,
             )
         return QueuedSteering(
@@ -140,6 +142,26 @@ async def assigned(session: AsyncSession, request_id: UUID) -> list[SteeringEntr
     return [SteeringEntry(**row) for row in result.mappings()]
 
 
+async def selection(session: AsyncSession, request: ExecutionRequest) -> list[SteeringEntry]:
+    if request.retry_origin_request_id is None:
+        return await assigned(session, request.id)
+    result = await session.execute(
+        text("""
+        SELECT entry.* FROM curie.execution_requests owner
+        JOIN curie.factory_steering_ledger entry ON entry.execution_request_id = owner.id
+        WHERE owner.work_item_id = :item AND owner.sequence <= :sequence
+          AND (owner.id = :origin OR owner.retry_origin_request_id = :origin)
+        ORDER BY owner.sequence, entry.created_at, entry.steering_id
+    """),
+        {
+            "item": request.work_item_id,
+            "sequence": request.sequence,
+            "origin": request.retry_origin_request_id,
+        },
+    )
+    return [SteeringEntry(**row) for row in result.mappings()]
+
+
 async def assign(
     session: AsyncSession,
     work_item_id: UUID,
@@ -167,21 +189,25 @@ async def assign(
         raise ValueError("steering_assignment_changed")
 
 
-async def apply(
-    session: AsyncSession, work_item_id: UUID, request_id: UUID, ids: Sequence[UUID]
-) -> None:
-    entries = await assigned(session, request_id)
-    if set(ids) != {entry.steering_id for entry in entries} or any(
-        entry.work_item_id != work_item_id or entry.state == "refused" for entry in entries
-    ):
-        raise ValueError("steering_selection_changed")
-    await session.execute(
+async def apply(session: AsyncSession, request: ExecutionRequest, ids: Sequence[UUID]) -> None:
+    if not ids:
+        return
+    changed = await session.scalars(
         text("""
-        UPDATE curie.factory_steering_ledger SET state = 'applied', applied_at = clock_timestamp()
-        WHERE work_item_id = :item AND execution_request_id = :request AND state = 'queued'
+        UPDATE curie.factory_steering_ledger
+        SET state = 'applied', applied_at = clock_timestamp(), applied_request_id = :consumer
+        WHERE work_item_id = :item AND state = 'queued'
+          AND steering_id = ANY(CAST(:ids AS uuid[]))
+        RETURNING steering_id
     """),
-        {"item": work_item_id, "request": request_id},
+        {
+            "item": request.work_item_id,
+            "consumer": request.id,
+            "ids": list(ids),
+        },
     )
+    if set(changed) != set(ids):
+        raise ValueError("steering_selection_changed")
 
 
 async def refuse(
