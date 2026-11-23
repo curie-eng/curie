@@ -2,7 +2,13 @@
 
 Date: 2026-11-23
 
-Status: Draft
+Status: Accepted
+
+The maintainer accepted the 24-hour maintenance window and the shared repair
+allowance on 2026-11-23. The admission transaction in
+`factory_maintenance_store.commit_observation` creates the bounded successor.
+The publisher checks its stored pins in `factory_maintenance_observer.repair_refusal`.
+[Feature issue #5943](https://github.com/curie-eng/curie/issues/5943)
 
 ## Context
 
@@ -48,8 +54,8 @@ The successor must verify positive CI on its new head. A conflict repair on a
 repository with no applicable checks therefore settles as unverified. The
 successor cannot acquire another repair turn. Active executions retain their
 existing CI rerun and continuation limits. The timeout observer can still
-record later green without starting a
-turn. WorkItem history and progress distinguish publication, verified green
+record later green without starting a turn. WorkItem history and progress
+distinguish publication, verified green
 on a named head, permitted no-CI settlement and maintenance refusals.
 
 The admission port is in `apps/api/src/curie_api/factory_maintenance.py` and
@@ -59,13 +65,6 @@ creates the waiting execution, charges the lineage and records the admission.
 The dispatch and publication paths call `factory_maintenance_observer.repair_refusal`
 to verify the stored head and base against the forge. The CI gate verifies
 the result of the successor publication. Full installation proof is pending.
-
-Prepared status paragraph for use after explicit acceptance:
-
-> Status: Accepted. The maintainer approved this decision on [date and reference].
-> The admission transaction in `factory_maintenance_store.commit_observation`
-> creates the bounded successor. The publisher checks its stored pins in
-> `factory_maintenance_observer.repair_refusal`.
 
 ## Alternatives considered
 
