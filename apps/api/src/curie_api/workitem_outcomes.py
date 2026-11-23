@@ -104,8 +104,8 @@ def _previous_start_failure(req: ExecutionRequest) -> str:
     return f"; previous start failure: {detail}" if detail else ""
 
 
-# The merge write and the issue-close write land a few minutes apart. A close
-# outside this window was not caused by the merge.
+# The issue close lands with the merge or in the ten minutes after it. A close
+# before the merge, or a later close, was not caused by the merge.
 _MERGE_CLOSE_TOLERANCE = timedelta(minutes=10)
 
 
@@ -122,13 +122,17 @@ def _utc(value: datetime) -> datetime:
 
 
 def _close_matches_merge(cancelled_at: datetime | None, merged_at: datetime | None) -> bool:
-    """Whether ``cancelled_at`` is the close GitHub writes when the merge lands."""
+    """Whether the close is the one the merge writes.
+
+    The close is at or after the merge stamp, and no more than ten minutes
+    after it. A close before the merge is a cancellation.
+    """
 
     if cancelled_at is None or merged_at is None:
         return False
     cancelled = _utc(cancelled_at)
     merged = _utc(merged_at)
-    return merged - _MERGE_CLOSE_TOLERANCE <= cancelled <= merged + _MERGE_CLOSE_TOLERANCE
+    return merged <= cancelled <= merged + _MERGE_CLOSE_TOLERANCE
 
 
 def _merged_completion(
@@ -142,8 +146,9 @@ def _merged_completion(
     The merge stamp is the lineage's ``updated_at``. A request admitted after
     that stamp, or one that finished for another cause, is a later run that
     still points at the merged pull request. A lineage with no stamp skips the
-    admission time check. A close counts only when it lands in the merge's
-    window. A close before the merge, or a much later close, does not.
+    admission time check. A close counts only when it is at the merge stamp
+    or in the ten minutes after it. A close before the merge, or a later
+    close, does not.
     """
 
     if (

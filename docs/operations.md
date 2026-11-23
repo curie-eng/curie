@@ -2696,8 +2696,8 @@ request, a `state` and an `actionable_cause`. The states:
   than by merging the factory's own pull request. A pull request already
   opened is kept. A completed run whose pull request merged stays
   `published` when the issue is still open, or when the issue was closed
-  at that merge. A close before the merge, or a close the merge did not
-  cause, reads `cancelled`.
+  at that merge or in the ten minutes after it. A close before the merge,
+  or a close the merge did not cause, reads `cancelled`.
 - `expired`: `capacity_wait_expired`, `retry_condition_expired` or
   `execution_deadline`. A capacity wait that expires after a failed start
   still names the previous start failure. A `retry_condition_expired` cause

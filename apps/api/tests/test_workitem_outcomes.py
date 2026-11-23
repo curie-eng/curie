@@ -1763,10 +1763,43 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
         admitted_at=now - timedelta(hours=1),
         merged_at=now,
     )
-    assert at_the_window.state == "published"
-    assert at_the_window.actionable_cause == (
+    assert at_the_window.state == "cancelled"
+    assert not at_the_window.actionable_cause.startswith("completed:")
+    one_second_before = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now - timedelta(seconds=1),
+        admitted_at=now - timedelta(hours=1),
+        merged_at=now,
+    )
+    assert one_second_before.state == "cancelled"
+    assert not one_second_before.actionable_cause.startswith("completed:")
+    exactly_ten_minutes_after = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        merged_at=now - timedelta(minutes=10),
+    )
+    assert exactly_ten_minutes_after.state == "published"
+    assert exactly_ten_minutes_after.actionable_cause == (
         f"completed: pull request #{PR_NUMBER} merged and closed the issue"
     )
+    ten_minutes_one_second_after = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        merged_at=now - timedelta(minutes=10, seconds=1),
+    )
+    assert ten_minutes_one_second_after.state == "cancelled"
+    assert not ten_minutes_one_second_after.actionable_cause.startswith("completed:")
     outside_the_window = outcome(
         "completed",
         "completed",
