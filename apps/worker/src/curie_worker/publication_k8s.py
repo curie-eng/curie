@@ -185,6 +185,9 @@ class PublicationPayload:
     # proof instead of pushing (#5429); empty for an ordinary publication.
     adoptable_revision_ids: tuple[uuid.UUID, ...]
     branch_prefix: str | None = None
+    publication_mode: Literal["base_conflict_merge"] | None = None
+    lineage_base_sha: str | None = None
+    expected_merge_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -220,8 +223,10 @@ def deterministic_publication_branch(publication_id: uuid.UUID) -> str:
     return f"curie/publication-{publication_id.hex}"
 
 
-def publication_resource_names(publication_id: uuid.UUID) -> PublicationResourceNames:
-    suffix = publication_id.hex[:20]
+def publication_resource_names(
+    publication_id: uuid.UUID, *, prepare_merge: bool = False
+) -> PublicationResourceNames:
+    suffix = publication_id.hex[:20] + ("-verify" if prepare_merge else "")
     return PublicationResourceNames(
         config_map=f"curie-publication-{suffix}",
         secret=f"curie-publication-{suffix}",
@@ -229,7 +234,7 @@ def publication_resource_names(publication_id: uuid.UUID) -> PublicationResource
     )
 
 
-_PUBLISH_SCRIPT = r"""#!/bin/bash
+_PUBLISH_SETUP = r"""#!/bin/bash
 set -euo pipefail
 umask 077
 if [[ -n "${PUBLICATION_BRANCH_PREFIX:-}" && "$BRANCH" != "${PUBLICATION_BRANCH_PREFIX}"* ]]; then
@@ -320,18 +325,24 @@ chmod 0700 /tmp/curie-askpass
 export GIT_ASKPASS=/tmp/curie-askpass
 export GIT_TERMINAL_PROMPT=0
 
-if [[ ! -s "$patch_path" ]]; then
+"""
+
+_REQUIRE_PATCH = r"""if [[ ! -s "$patch_path" ]]; then
   echo "publication Job requires a non-empty patch" >&2
   exit 1
 fi
 
-mkdir -p "$work_dir"
+"""
+
+_CLONE = r"""mkdir -p "$work_dir"
 cd "$work_dir"
 git_with_timeout clone "$CLEAN_CLONE_URL" repo 2> >(redact >&2)
 cd repo
 git_with_timeout remote set-url origin "$CLEAN_CLONE_URL"
 git_with_timeout config --get remote.origin.url | grep -Fx "$CLEAN_CLONE_URL" >/dev/null
-if ! git_with_timeout cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+"""
+
+_PUSH_PATCH = r"""if ! git_with_timeout cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
   git_with_timeout fetch --depth=1 origin "$BASE_SHA" 2> >(redact >&2)
 fi
 git_with_timeout checkout --detach "$BASE_SHA" 2> >(redact >&2)
@@ -458,6 +469,95 @@ echo "CURIE_COMMIT_SHA=$commit_sha"
 """
 
 
+_PUBLISH_SCRIPT = _PUBLISH_SETUP + _REQUIRE_PATCH + _CLONE + _PUSH_PATCH
+
+# The commit must be reproducible after the Job, its logs, or the push response
+# is lost. The immutable first parent's committer date fixes both Git dates.
+# Only the publisher writes markers. Prefix Git diagnostics, including remote
+# text, before they enter the same pod log stream as the publisher's stdout.
+_CONFLICT_LOGS = """exec 3>&1
+exec > >(sed -u 's/^/git: /' >&2) 2>&1
+"""
+_CONFLICT_CANDIDATE = (
+    _PUBLISH_SETUP
+    + _CONFLICT_LOGS
+    + _REQUIRE_PATCH
+    + _CLONE
+    + r"""
+[[ "$PUBLICATION_MODE" == "base_conflict_merge" ]]
+[[ "$EXPECTED_REMOTE_HEAD" == "$EXPECTED_PRIOR_HEAD" ]]
+git_with_timeout read-tree "$BASE_SHA"
+git_with_timeout apply --cached --binary "$patch_path"
+tree=$(git_with_timeout write-tree)
+if [[ "$tree" == "$(git_with_timeout rev-parse --verify "${BASE_SHA}^{tree}")" ]]; then
+  echo "conflict publication patch produced no changes" >&2
+  exit 1
+fi
+date=$(git_with_timeout show --no-patch --format=%cI "$EXPECTED_PRIOR_HEAD")
+export GIT_AUTHOR_DATE="$date" GIT_COMMITTER_DATE="$date"
+
+remote_branch_head() {
+  git_with_timeout ls-remote --exit-code origin "refs/heads/$BRANCH" 2> >(redact >&2) |
+    awk '{print $1}'
+}
+
+commit_sha=$(git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" \
+  commit-tree "$tree" -p "$EXPECTED_PRIOR_HEAD" -p "$BASE_SHA" \
+  -m "$COMMIT_TITLE" -m "Curie-Revision: $REVISION_ID")
+markers=$(git_with_timeout show --no-patch --format=%B "$commit_sha" | grep '^Curie-Revision:')
+if [[ "$markers" != "Curie-Revision: $REVISION_ID" ]]; then
+  echo "conflict publication requires exactly one revision marker" >&2
+  exit 1
+fi
+git_with_timeout fetch --no-tags origin "refs/heads/$BASE_BRANCH" 2> >(redact >&2)
+base_tip=$(git_with_timeout rev-parse --verify 'FETCH_HEAD^{commit}')
+if ! git_with_timeout merge-base --is-ancestor "$LINEAGE_BASE_SHA" "$BASE_SHA" || \
+   ! git_with_timeout merge-base --is-ancestor "$BASE_SHA" "$base_tip"; then
+  echo "admitted publication base is no longer on the stored base branch history" >&2
+  exit 1
+fi
+if git_with_timeout merge-base --is-ancestor "$BASE_SHA" "$EXPECTED_PRIOR_HEAD"; then
+  echo "publication head already contains the admitted base" >&2
+  exit 1
+elif [[ "$?" != 1 ]]; then
+  echo "publication head ancestry could not be verified" >&2
+  exit 1
+fi
+remote_head=$(remote_branch_head)
+"""
+)
+_CONFLICT_PREPARE_SCRIPT = (
+    _CONFLICT_CANDIDATE
+    + r"""if [[ "$remote_head" != "$EXPECTED_PRIOR_HEAD" ]]; then
+  echo "publication branch head conflict" >&2
+  exit 1
+fi
+echo "CURIE_PREPARED_MERGE_SHA=$commit_sha" >&3
+"""
+)
+_CONFLICT_PUBLISH_SCRIPT = (
+    _CONFLICT_CANDIDATE
+    + r"""if [[ "$commit_sha" != "$EXPECTED_MERGE_SHA" ]]; then
+  echo "prepared merge SHA does not match the reconstructed commit" >&2
+  exit 1
+fi
+if [[ "$remote_head" == "$EXPECTED_MERGE_SHA" ]]; then
+  echo "CURIE_COMMIT_SHA=$commit_sha" >&3
+  exit 0
+fi
+if [[ "$remote_head" != "$EXPECTED_REMOTE_HEAD" ]]; then
+  echo "publication branch head conflict" >&2
+  exit 1
+fi
+if ! git_with_timeout push --force-with-lease="refs/heads/$BRANCH:$EXPECTED_REMOTE_HEAD" \
+    origin "$commit_sha:refs/heads/$BRANCH" 2> >(redact >&2); then
+  [[ "$(remote_branch_head)" == "$commit_sha" ]] || exit 1
+fi
+echo "CURIE_COMMIT_SHA=$commit_sha" >&3
+"""
+)
+
+
 def _owner_reference(settings: PublicationJobSettings, owner_uid: str) -> list[dict[str, Any]]:
     return [
         {
@@ -572,11 +672,20 @@ def build_publication_resources(
     *,
     credential: str,
     settings: PublicationJobSettings,
+    prepare_merge: bool = False,
 ) -> PublicationResources:
     if len(payload.patch) > MAX_PATCH_BYTES:
         raise PublicationResourceError(
             f"publication patch exceeds the {MAX_PATCH_BYTES} raw-byte limit"
         )
+    if payload.publication_mode not in (None, "base_conflict_merge"):
+        raise PublicationResourceError("publication mode is unknown")
+    conflict = payload.publication_mode == "base_conflict_merge"
+    script = _CONFLICT_PUBLISH_SCRIPT if conflict else _PUBLISH_SCRIPT
+    if prepare_merge:
+        if not conflict:
+            raise PublicationResourceError("only a conflict merge can be prepared")
+        script = _CONFLICT_PREPARE_SCRIPT
     if not payload.patch:
         # A metadata-only revision has nothing to push; the API applies it.
         raise PublicationResourceError("the publication Job only pushes a non-empty patch")
@@ -592,7 +701,21 @@ def build_publication_resources(
         raise PublicationResourceError(
             "publication expected prior head must be 40-64 lowercase hexadecimal characters"
         )
-    if payload.base_sha != payload.expected_prior_head:
+    if conflict:
+        if payload.adoptable_revision_ids:
+            raise PublicationResourceError(
+                "conflict publication cannot adopt predecessor revisions"
+            )
+        if (
+            payload.expected_remote_head != payload.expected_prior_head
+            or payload.base_sha == payload.expected_prior_head
+            or payload.lineage_base_sha is None
+            or re.fullmatch(r"[0-9a-f]{40,64}", payload.lineage_base_sha) is None
+        ):
+            raise PublicationResourceError("conflict publication has invalid merge parents or base")
+        if any(line.startswith("Curie-Revision:") for line in payload.title.splitlines()):
+            raise PublicationResourceError("publication title contains a revision marker")
+    elif payload.base_sha != payload.expected_prior_head:
         raise PublicationResourceError("publication base SHA does not match expected prior head")
     if payload.expected_remote_head is not None and (
         re.fullmatch(r"[0-9a-f]{40,64}", payload.expected_remote_head) is None
@@ -605,9 +728,18 @@ def build_publication_resources(
         set(payload.adoptable_revision_ids)
     ) != len(payload.adoptable_revision_ids):
         raise PublicationResourceError("publication adoptable revisions are invalid")
+    if conflict and not prepare_merge:
+        if (
+            payload.expected_merge_sha is None
+            or re.fullmatch(r"[0-9a-f]{40,64}", payload.expected_merge_sha) is None
+            or payload.expected_merge_sha in (payload.expected_prior_head, payload.base_sha)
+        ):
+            raise PublicationResourceError("the conflict push requires a recorded merge SHA")
+    elif payload.expected_merge_sha is not None:
+        raise PublicationResourceError("only the conflict push accepts a recorded merge SHA")
     ca_mount = _check_transport(payload, settings)
     ca_pem = _read_ca_bundle(settings) if ca_mount is not None else None
-    config_map_bytes = len(payload.patch) + len(_PUBLISH_SCRIPT.encode())
+    config_map_bytes = len(payload.patch) + len(script.encode())
     if ca_pem is not None:
         config_map_bytes += len(ca_pem.encode())
     if config_map_bytes > _CONFIG_MAP_MAX_BYTES:
@@ -618,7 +750,7 @@ def build_publication_resources(
         raise PublicationResourceError("publication credential is empty")
     if min(settings.active_deadline_seconds, settings.git_timeout_seconds) <= 0:
         raise PublicationResourceError("publication timeouts must be positive")
-    names = publication_resource_names(payload.publication_id)
+    names = publication_resource_names(payload.publication_id, prepare_merge=prepare_merge)
     owner_uid = settings.owner_uid or str(
         uuid.uuid5(uuid.NAMESPACE_URL, f"curie:{settings.namespace}:{settings.owner_name}")
     )
@@ -653,6 +785,13 @@ def build_publication_resources(
         "active_deadline_seconds": settings.active_deadline_seconds,
         "git_timeout_seconds": settings.git_timeout_seconds,
     }
+    if payload.expected_merge_sha is not None:
+        contract["expected_merge_sha"] = payload.expected_merge_sha
+    if prepare_merge:
+        contract["prepare_merge"] = True
+    if conflict:
+        contract["publication_mode"] = payload.publication_mode
+        contract["lineage_base_sha"] = payload.lineage_base_sha
     if ca_pem is not None:
         contract["ca_bundle_sha256"] = hashlib.sha256(ca_pem.encode()).hexdigest()
     adoptable = " ".join(str(revision) for revision in payload.adoptable_revision_ids)
@@ -679,7 +818,7 @@ def build_publication_resources(
         "binaryData": {
             "changes.patch": base64.b64encode(payload.patch).decode("ascii"),
         },
-        "data": {"publish.sh": _PUBLISH_SCRIPT},
+        "data": {"publish.sh": script},
     }
     if ca_pem is not None:
         config_map["data"][_CA_CONFIG_MAP_KEY] = ca_pem
@@ -709,6 +848,12 @@ def build_publication_resources(
         {"name": "GIT_USER_EMAIL", "value": settings.git_user_email},
         {"name": "GIT_TIMEOUT_SECONDS", "value": str(settings.git_timeout_seconds)},
     ]
+    if payload.expected_merge_sha is not None:
+        env.append({"name": "EXPECTED_MERGE_SHA", "value": payload.expected_merge_sha})
+    if conflict:
+        env.append({"name": "PUBLICATION_MODE", "value": "base_conflict_merge"})
+        assert payload.lineage_base_sha is not None
+        env.append({"name": "LINEAGE_BASE_SHA", "value": payload.lineage_base_sha})
     if adoptable:
         env.append({"name": "ADOPTABLE_REVISION_IDS", "value": adoptable})
     volume_mounts: list[dict[str, Any]] = [

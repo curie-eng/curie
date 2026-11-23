@@ -27,6 +27,7 @@ from channel_protocol.work_item_events import (
 
 from .api_retry import DEFAULT_BUDGET_S, post_with_retry
 from .binding import FactoryContext, FactoryWake
+from .workspace import ConflictWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,8 @@ class WorkItemAcquireGrant:
     # before this request claims. None on every other request.
     resource_gate: ResourceGate | None
     predecessor_claim_name: str | None
+    conflict_workspace: ConflictWorkspace | None = None
+
     @property
     def agent_id(self) -> uuid.UUID:
         return self.context.agent_id
@@ -162,6 +165,7 @@ class WorkItemRunning:
     execution_deadline: datetime
     context: FactoryContext | None
     refusal: str | None
+    conflict_workspace: ConflictWorkspace | None = None
 
 
 @dataclass(frozen=True)
@@ -339,6 +343,14 @@ def _optional_name(value: object) -> str | None:
     return None if value is None else _required_string(value)
 
 
+def _conflict_workspace(body: dict[str, Any]) -> ConflictWorkspace | None:
+    head = body.get("conflict_head_sha")
+    base = body.get("conflict_base_sha")
+    if head is None and base is None:
+        return None
+    return ConflictWorkspace(_required_string(head), _required_string(base))
+
+
 def _execution_kind(body: dict[str, Any]) -> tuple[ExecutionKind, uuid.UUID | None]:
     """The request's execution kind and recovery candidate, read strictly.
 
@@ -403,6 +415,9 @@ class WorkItemDispatchClient:
         )
         try:
             execution_kind, recovery_candidate_id = _execution_kind(body)
+            conflict = _conflict_workspace(body)
+            if conflict is not None and execution_kind != EXECUTION_IMPLEMENTATION:
+                raise ValueError("conflict workspace requires an implementation request")
             return WorkItemAcquireGrant(
                 generation=_required_positive_int(body["generation"]),
                 work_item_id=uuid.UUID(str(body["work_item_id"])),
@@ -414,6 +429,7 @@ class WorkItemDispatchClient:
                 recovery_candidate_id=recovery_candidate_id,
                 resource_gate=_resource_gate(body["resource_gate"]),
                 predecessor_claim_name=_optional_name(body["predecessor_claim_name"]),
+                conflict_workspace=conflict,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -573,6 +589,7 @@ class WorkItemDispatchClient:
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
                 context=context,
                 refusal=refusal,
+                conflict_workspace=_conflict_workspace(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -922,6 +939,7 @@ class WorkItemRun:
         self.conversation_id = grant.conversation_id
         self.wait_deadline = grant.wait_deadline
         self.context = grant.context
+        self.conflict_workspace = grant.conflict_workspace
         # Fixed at admission and learned only at acquire (#5429). A run adopted
         # from its running row is a continuation (an approval resume or a CI
         # round), never the execute wake a recovery runs on, so it has none.

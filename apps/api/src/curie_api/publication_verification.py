@@ -35,6 +35,7 @@ class VerifiedPublicationCommit:
     parent_sha: str
     base_branch: str
     first_publication: bool
+    second_parent_sha: str | None = None
 
 
 def forge_failure(exc: ForgeError) -> HTTPException:
@@ -182,6 +183,7 @@ async def verify_publication_commit(
         raise PullRequestRefused("lineage_stale", "stored publication lineage is incomplete")
     first_publication = lineage.head_sha is None and lineage.pr_number is None
     expected_prior_head = publication.expected_prior_head
+    conflict_repair = publication.publication_mode == "base_conflict_merge"
     if (
         _COMMIT_SHA.fullmatch(commit_sha) is None
         or expected_prior_head is None
@@ -198,6 +200,16 @@ async def verify_publication_commit(
         or lineage.base_sha != publication.base_sha
     ):
         raise PullRequestRefused("revision_mismatch", "first publication authority is not current")
+    if conflict_repair and (
+        first_publication
+        or commit_sha != publication.expected_merge_sha
+        or lineage.status != "open"
+        or lineage.head_sha != expected_prior_head
+        or lineage.base_ref != base_branch
+        or expected_prior_head == publication.base_sha
+        or revision_ids != {publication.id}
+    ):
+        raise PullRequestRefused("revision_mismatch", "conflict repair authority is not current")
     snapshot = (
         publication.id,
         publication.version,
@@ -207,7 +219,7 @@ async def verify_publication_commit(
         expected_prior_head,
     )
     commit = await code_host.read_commit(repository, commit_sha)
-    if not _valid_commit(commit, commit_sha) or len(commit.parents) != 1:
+    if not _valid_commit(commit, commit_sha) or not commit.parents:
         raise PullRequestRefused("revision_mismatch", "remote revision commit is invalid")
     parent_sha = commit.parents[0]
     refusal = revision_refusal(
@@ -215,18 +227,27 @@ async def verify_publication_commit(
         commit_sha=commit_sha,
         revision_ids=revision_ids,
         expected_parent=parent_sha if first_publication else expected_prior_head,
+        expected_second_parent=publication.base_sha if conflict_repair else None,
     )
     if refusal is not None:
         raise PullRequestRefused("revision_mismatch", refusal)
-    if first_publication:
+    if first_publication or conflict_repair:
         # One forge answer per relation; the HTTP client timeouts bound each.
         try:
             tip = await code_host.branch_head(repository, base_branch)
             if not isinstance(tip, str) or _COMMIT_SHA.fullmatch(tip) is None:
                 raise Unavailable("publication_ancestry_unproved")
-            on_base = await code_host.is_ancestor(
-                repository, expected_prior_head, parent_sha
-            ) and await code_host.is_ancestor(repository, parent_sha, tip)
+            if conflict_repair:
+                target = publication.base_sha
+                on_base = (
+                    await code_host.is_ancestor(repository, lineage.base_sha, target)
+                    and await code_host.is_ancestor(repository, target, tip)
+                    and not await code_host.is_ancestor(repository, target, expected_prior_head)
+                )
+            else:
+                on_base = await code_host.is_ancestor(
+                    repository, expected_prior_head, parent_sha
+                ) and await code_host.is_ancestor(repository, parent_sha, tip)
         except (ForgeError, TimeoutError):
             raise Unavailable("publication_ancestry_unproved") from None
         if not on_base:
@@ -240,4 +261,5 @@ async def verify_publication_commit(
         parent_sha=parent_sha,
         base_branch=base_branch,
         first_publication=first_publication,
+        second_parent_sha=publication.base_sha if conflict_repair else None,
     )

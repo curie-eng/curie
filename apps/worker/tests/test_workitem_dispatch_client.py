@@ -127,6 +127,31 @@ def test_acquire_grant_carries_the_publication_recovery_candidate() -> None:
     assert (plain.execution_kind, plain.recovery_candidate_id) == ("implementation", None)
 
 
+@pytest.mark.parametrize("running", [False, True])
+def test_conflict_workspace_pins_are_a_pair_on_the_authenticated_request(running: bool) -> None:
+    def read(fields: dict[str, object]) -> WorkItemAcquireGrant | WorkItemRunning:
+        if running:
+            return _run(
+                lambda _: httpx.Response(200, json={**_running_body(), **fields}),
+                lambda client: client.running_for_conversation("thread", wake=WAKE),
+            )
+        return _acquire({**BASE, **fields})
+
+    head, base = "a" * 40, "b" * 40
+    pins = read({"conflict_head_sha": head, "conflict_base_sha": base}).conflict_workspace
+    assert pins is not None and (pins.head_sha, pins.base_sha) == (head, base)
+    assert read({}).conflict_workspace is None
+    for fields in (
+        {"conflict_head_sha": head},
+        {"conflict_base_sha": base},
+        {"conflict_head_sha": head, "conflict_base_sha": head},
+        {"conflict_head_sha": "main", "conflict_base_sha": base},
+        {"conflict_head_sha": head, "conflict_base_sha": "release"},
+    ):
+        with pytest.raises(WorkItemTransportError):
+            read(fields)
+
+
 @pytest.mark.parametrize(
     ("kind", "candidate"),
     [
@@ -348,6 +373,7 @@ def test_a_stale_completion_field_in_the_dispatch_body_is_ignored(stale: object)
         "recovery_candidate_id",
         "resource_gate",
         "predecessor_claim_name",
+        "conflict_workspace",
     }
 
     found = _run(

@@ -179,6 +179,13 @@ class WorkspaceDependencyUnavailable(WorkspacePreparationError):
     """A workspace API dependency cannot currently give a decision."""
 
 
+class ConflictAncestryRefused(WorkspacePreparationError):
+    """The two immutable commits cannot support a conflict repair in bounded history."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__("conflict-ancestry", detail)
+
+
 class GitCommandError(WorkspacePreparationError):
     """A git subprocess exited non-zero. Holds a redacted diagnostic, never raw stderr."""
 
@@ -673,6 +680,24 @@ def _opt_str(payload: dict[str, Any], key: str) -> str | None:
 
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
+_CONFLICT_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+CONFLICT_HEAD_REF = "refs/curie/conflict-head"
+_CONFLICT_HISTORY_LIMIT = 256
+
+
+@dataclass(frozen=True)
+class ConflictWorkspace:
+    head_sha: str
+    base_sha: str
+
+    def __post_init__(self) -> None:
+        if (
+            not _CONFLICT_SHA.fullmatch(self.head_sha)
+            or not _CONFLICT_SHA.fullmatch(self.base_sha)
+            or len(self.head_sha) != len(self.base_sha)
+            or self.head_sha == self.base_sha
+        ):
+            raise ValueError("conflict workspace requires distinct full commit IDs")
 
 
 def _is_full_sha(value: str | None) -> bool:
@@ -1242,6 +1267,7 @@ class WorkspacePreparer:
         branch: str | None = None,
         expected_head: str | None = None,
         detached_head: str | None = None,
+        conflict: ConflictWorkspace | None = None,
     ) -> PreparedWorkspace:
         started = self.clock()
         real_started = time.monotonic()
@@ -1285,80 +1311,15 @@ class WorkspacePreparer:
                     clone_env["GIT_CONFIG_KEY_2"] = "http.sslCAInfo"
                     clone_env["GIT_CONFIG_VALUE_2"] = credential.ca_bundle_ref
                 try:
-                    clone_argv = [
-                        "git",
-                        "clone",
-                        "--depth=1",
-                        "--single-branch",
-                        "--no-tags",
-                    ]
-                    if branch is not None:
-                        clone_argv.extend(["--branch", branch])
-                    elif detached_head is None and credential.base_branch:
-                        clone_argv.extend(["--branch", credential.base_branch])
-                    clone_argv.extend([credential.clone_url, str(checkout)])
-                    self.commands.run(
-                        clone_argv,
-                        env=clone_env,
-                        timeout_seconds=min(
-                            self.limits.clone_timeout_seconds,
-                            self._real_remaining(real_started),
-                        ),
-                    )
-                    pin = detached_head
-                    if pin is None and branch is None and _is_full_sha(credential.base_commit):
-                        pin = credential.base_commit
-                    if pin is None and _is_full_sha(credential.revision):
-                        pin = credential.revision
-                    if pin is not None:
-                        self.commands.run(
-                            [
-                                "git",
-                                "fetch",
-                                "--depth=1",
-                                "--no-tags",
-                                "origin",
-                                pin,
-                            ],
-                            cwd=checkout,
-                            env=clone_env,
-                            timeout_seconds=min(
-                                self.limits.clone_timeout_seconds,
-                                self._real_remaining(real_started),
-                            ),
+                    if conflict is None:
+                        self._checkout_repository(
+                            checkout, credential, branch, detached_head, clone_env, real_started
                         )
-                        self.commands.run(
-                            ["git", "checkout", "--detach", pin],
-                            cwd=checkout,
-                            timeout_seconds=min(
-                                self.limits.clone_timeout_seconds,
-                                self._real_remaining(real_started),
-                            ),
+                    else:
+                        self._checkout_conflict(
+                            checkout, credential, conflict, clone_env, real_started
                         )
-                    # A review revision clones the pull request branch at depth 1,
-                    # which omits the parent. Fetch the recorded base commit into
-                    # the object store without checking it out or unshallowing.
-                    base_pin = (
-                        credential.base_commit if _is_full_sha(credential.base_commit) else None
-                    )
-                    if base_pin is not None and base_pin != pin:
-                        self.commands.run(
-                            [
-                                "git",
-                                "fetch",
-                                "--depth=1",
-                                "--no-tags",
-                                "origin",
-                                base_pin,
-                            ],
-                            cwd=checkout,
-                            env=clone_env,
-                            timeout_seconds=min(
-                                self.limits.clone_timeout_seconds,
-                                self._real_remaining(real_started),
-                            ),
-                        )
-                except WorkspaceStageTimeout:
+                except (ConflictAncestryRefused, WorkspaceStageTimeout):
                     raise
                 except TimeoutError as exc:
                     raise WorkspaceStageTimeout("clone", self.limits.clone_timeout_seconds) from exc
@@ -1516,6 +1477,157 @@ class WorkspacePreparer:
             branch=branch,
             expected_head=expected_head,
         )
+
+    def _checkout_repository(
+        self,
+        checkout: Path,
+        credential: WorkspaceCredential,
+        branch: str | None,
+        detached_head: str | None,
+        clone_env: dict[str, str],
+        real_started: float,
+    ) -> None:
+        clone_argv = [
+            "git",
+            "clone",
+            "--depth=1",
+            "--single-branch",
+            "--no-tags",
+        ]
+        if branch is not None:
+            clone_argv.extend(["--branch", branch])
+        elif detached_head is None and credential.base_branch:
+            clone_argv.extend(["--branch", credential.base_branch])
+        clone_argv.extend([credential.clone_url, str(checkout)])
+        self.commands.run(
+            clone_argv,
+            env=clone_env,
+            timeout_seconds=min(
+                self.limits.clone_timeout_seconds,
+                self._real_remaining(real_started),
+            ),
+        )
+        pin = detached_head
+        if pin is None and branch is None and _is_full_sha(credential.base_commit):
+            pin = credential.base_commit
+        if pin is None and _is_full_sha(credential.revision):
+            pin = credential.revision
+        if pin is not None:
+            self.commands.run(
+                [
+                    "git",
+                    "fetch",
+                    "--depth=1",
+                    "--no-tags",
+                    "origin",
+                    pin,
+                ],
+                cwd=checkout,
+                env=clone_env,
+                timeout_seconds=min(
+                    self.limits.clone_timeout_seconds,
+                    self._real_remaining(real_started),
+                ),
+            )
+            self.commands.run(
+                ["git", "checkout", "--detach", pin],
+                cwd=checkout,
+                timeout_seconds=min(
+                    self.limits.clone_timeout_seconds,
+                    self._real_remaining(real_started),
+                ),
+            )
+        # A review revision clones the pull request branch at depth 1,
+        # which omits the parent. Fetch the recorded base commit into
+        # the object store without checking it out or unshallowing.
+        base_pin = credential.base_commit if _is_full_sha(credential.base_commit) else None
+        if base_pin is not None and base_pin != pin:
+            self.commands.run(
+                [
+                    "git",
+                    "fetch",
+                    "--depth=1",
+                    "--no-tags",
+                    "origin",
+                    base_pin,
+                ],
+                cwd=checkout,
+                env=clone_env,
+                timeout_seconds=min(
+                    self.limits.clone_timeout_seconds,
+                    self._real_remaining(real_started),
+                ),
+            )
+
+    def _checkout_conflict(
+        self,
+        checkout: Path,
+        credential: WorkspaceCredential,
+        pins: ConflictWorkspace,
+        clone_env: dict[str, str],
+        started: float,
+    ) -> None:
+        def git(*args: str, fetch: bool = False) -> str:
+            return self.commands.run(
+                ["git", *args],
+                cwd=checkout,
+                env=clone_env if fetch else None,
+                timeout_seconds=min(
+                    self.limits.clone_timeout_seconds, self._real_remaining(started)
+                ),
+            ).stdout.strip()
+
+        checkout.mkdir(mode=0o700)
+        object_format = "sha1" if len(pins.head_sha) == 40 else "sha256"
+        git("init", "--quiet", "--template=", f"--object-format={object_format}")
+        git("config", "remote.origin.url", credential.clone_url)
+        if not credential.base_branch:
+            raise ConflictAncestryRefused("the admitted base branch is unavailable")
+        base_ref = f"refs/heads/{credential.base_branch}"
+        git("check-ref-format", base_ref)
+        git(
+            "fetch",
+            "--no-tags",
+            "--no-recurse-submodules",
+            f"--depth={_CONFLICT_HISTORY_LIMIT}",
+            "origin",
+            base_ref,
+            f"{pins.head_sha}:{CONFLICT_HEAD_REF}",
+            fetch=True,
+        )
+        if git("rev-parse", f"{CONFLICT_HEAD_REF}^{{commit}}") != pins.head_sha:
+            raise ConflictAncestryRefused("the admitted head is not a commit")
+        try:
+            git("merge-base", "--is-ancestor", pins.base_sha, "FETCH_HEAD")
+        except GitCommandError as exc:
+            raise ConflictAncestryRefused(
+                "the admitted base is outside the fetched branch history"
+            ) from exc
+        try:
+            merge_base = git("merge-base", "--all", pins.head_sha, pins.base_sha)
+        except GitCommandError as exc:
+            if exc.exit_status != 1:
+                raise
+            raise ConflictAncestryRefused("no common ancestor within the history limit") from None
+        if not _CONFLICT_SHA.fullmatch(merge_base) or merge_base in (pins.head_sha, pins.base_sha):
+            raise ConflictAncestryRefused("the admitted commits lack one distinct merge base")
+        boundary = checkout / ".git" / "shallow"
+        if boundary.exists():
+            # A cut inside either side can hide another common ancestor.
+            sides = git(
+                "rev-list",
+                f"--max-count={_CONFLICT_HISTORY_LIMIT + 1}",
+                pins.head_sha,
+                pins.base_sha,
+                f"^{merge_base}",
+            ).splitlines()
+            if len(sides) > _CONFLICT_HISTORY_LIMIT or set(sides).intersection(
+                boundary.read_text(encoding="ascii").splitlines()
+            ):
+                raise ConflictAncestryRefused(
+                    "the history limit prevents proving complete ancestry"
+                )
+        git("checkout", "--detach", pins.base_sha)
 
     def prepare_lineage_base(
         self,
@@ -1771,6 +1883,7 @@ class WorkspaceClaimCoordinator:
         lineage_branch: str | None = None,
         lineage_head: str | None = None,
         lineage_base_sha: str | None = None,
+        conflict_workspace: ConflictWorkspace | None = None,
         publication_visible_outcome_revision: int = 0,
         fresh_only: bool = False,
         caller_run: str | None = None,
@@ -1805,7 +1918,17 @@ class WorkspaceClaimCoordinator:
             raise WorkspacePreparationError(
                 "lineage-checkout", "lineage head and base are mutually exclusive"
             )
-        if lineage_branch is not None and lineage_head is not None:
+        if conflict_workspace is not None:
+            if lineage_head != conflict_workspace.head_sha:
+                raise WorkspacePreparationError("lineage-checkout", "the admitted PR head changed")
+            prepared = self.preparer.prepare(
+                deployment_id=deployment_id,
+                thread_key=thread_key,
+                generation=generation,
+                expected_head=conflict_workspace.base_sha,
+                conflict=conflict_workspace,
+            )
+        elif lineage_branch is not None and lineage_head is not None:
             prepared = self.preparer.prepare_lineage(
                 deployment_id=deployment_id,
                 thread_key=thread_key,

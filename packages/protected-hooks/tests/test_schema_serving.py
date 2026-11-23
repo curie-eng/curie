@@ -133,7 +133,8 @@ def graph_payload() -> dict[str, Any]:
         ("0196", False),
         ("0191", False),
         ("0194", False),
-        ("0195", True),
+        ("0195", False),
+        ("0193", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -185,10 +186,11 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     Learned memory rules require 0185.
     The plain feedback cap requires 0186.
     Reading sealed execution input requires schema revision 0195.
+    Conflict repair publication reads require 0193.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0195"
-    assert window.schema_head == "0195"
+    assert window.schema_min == "0193"
+    assert window.schema_head == "0193"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

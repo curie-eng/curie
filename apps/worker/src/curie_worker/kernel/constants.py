@@ -312,6 +312,7 @@ _ESCALATION_CAUSES = {
     "runner-timeout-unconfirmed": "runner_timeout",
     "sandbox-terminated": "sandbox_terminated",
     "workspace-error": "workspace_error",
+    "conflict-ancestry-refused": "workspace_error",
     "pull-request-not-adopted": "pull_request_not_adopted",
     "publication-unrecorded": "publication_unrecorded",
     "history-persistence-error": "history_capacity",

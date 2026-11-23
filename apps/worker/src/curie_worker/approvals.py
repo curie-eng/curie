@@ -397,6 +397,11 @@ class SettledApproval:
     # When the decision was recorded, aware UTC; None when the record omits it.
     resolved_at: datetime | None = None
     expires_at: datetime | None = None
+    id: str | None = None
+    dedupe_key: str | None = None
+    agent_id: str | None = None
+    conversation_id: str | None = None
+    reply_channel: str | None = None
 
 
 class ApprovalMissing(Exception):
@@ -948,6 +953,11 @@ class ApprovalClient:
                 resolution_note=body.get("resolution_note"),
                 resolved_at=parse_decision_time(body.get("resolved_at")),
                 expires_at=parse_decision_time(body.get("expires_at")),
+                id=body.get("id"),
+                dedupe_key=body.get("dedupe_key"),
+                agent_id=body.get("agent_id"),
+                conversation_id=body.get("conversation_id"),
+                reply_channel=body.get("reply_channel"),
             )
         except (ValueError, KeyError) as exc:
             logger.warning("approval read returned an unusable body for %s: %s", approval_id, exc)

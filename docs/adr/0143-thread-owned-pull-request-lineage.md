@@ -4,6 +4,8 @@ Date: 2026-09-03
 
 Status: Accepted
 
+[ADR 0290](0290-publish-conflict-repairs-with-two-approved-parents.md) partially amends the expected-parent rule for an admitted conflict repair.
+
 Brian's explicit implementation request on 2026-09-03 authorizes this ADR to
 land Accepted alongside its realizing implementation under
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).

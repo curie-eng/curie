@@ -681,6 +681,7 @@ class _NoBranchCodeHost:
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
+        expected_second_parent: str | None,
     ) -> PublicationRevisionCommit:
         raise AssertionError("a failed Job has no revision commit to verify")
 

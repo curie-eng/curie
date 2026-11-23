@@ -11,7 +11,7 @@ from typing import Literal
 
 import personal_execution_support as support
 import pytest
-from curie_api import workitem_dispatch
+from curie_api import factory_maintenance_reasons, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.factory_base import ResolvedBase
 from curie_api.factory_maintenance import (
@@ -215,7 +215,7 @@ def test_failure_to_persist_event_rolls_back_request_and_allowance(clean_db: Non
         ("base", "base_changed"),
         ("no_ci", "prior_green_missing"),
         ("expired", "window_expired"),
-        ("conflict", "reason_unavailable"),
+        ("unregistered_conflict", "reason_unavailable"),
         ("provider", "failure_not_attributable"),
         ("superseded", "superseded"),
         ("reserved", "superseded"),
@@ -253,7 +253,8 @@ def test_refusal_records_outcome_without_spending(
                 return (await db.scalars(select(FactoryMaintenanceLineage.expires_at))).one()
 
             monkeypatch.setattr(lifecycle, "database_now", at_expiry)
-        if change == "conflict":
+        if change == "unregistered_conflict":
+            monkeypatch.delitem(factory_maintenance_reasons._REASON_HOOKS, "base_conflict")
             obs = replace(obs, reason="base_conflict")
         if change == "reserved":
             session.add(

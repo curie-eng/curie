@@ -11485,6 +11485,8 @@ export interface components {
             pr_number: number | null;
             /** Pr Url */
             pr_url: string | null;
+            /** Publication Mode */
+            publication_mode?: "base_conflict_merge" | null;
             /** Reply Adapter */
             reply_adapter: string | null;
             /** Reply Channel */
@@ -11585,6 +11587,8 @@ export interface components {
             commit_sha: string;
             /** Parent Sha */
             parent_sha: string;
+            /** Second Parent Sha */
+            second_parent_sha?: string | null;
         };
         /**
          * PublicationRevisionVerify
@@ -11598,6 +11602,8 @@ export interface components {
             commit_sha: string;
             /** Expected Parent */
             expected_parent: string;
+            /** Expected Second Parent */
+            expected_second_parent?: string | null;
             /**
              * Revision Id
              * Format: uuid
@@ -13058,6 +13064,10 @@ export interface components {
              * Format: uuid
              */
             agent_id: string;
+            /** Conflict Base Sha */
+            conflict_base_sha?: string | null;
+            /** Conflict Head Sha */
+            conflict_head_sha?: string | null;
             context: components["schemas"]["FactoryContext"] | null;
             /** Conversation Id */
             conversation_id: string;

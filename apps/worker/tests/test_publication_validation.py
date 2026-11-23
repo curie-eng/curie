@@ -248,6 +248,31 @@ def _cached_patch(repo: Path) -> bytes:
     ).stdout
 
 
+@pytest.mark.parametrize("marker", ["<<<<<<< HEAD", "=======", ">>>>>>> feature"])
+def test_conflict_resolution_rejects_a_staged_marker(tmp_path: Path, marker: str) -> None:
+    validation = importlib.import_module("curie_worker.publication_validation")
+    repo = _prepared_repo(tmp_path)
+    coordinator = _coordinator(_archive_readme(repo))
+    path = repo / "README.md"
+
+    def validate(contents: str, *, conflict: bool) -> None:
+        path.write_text(contents)
+        validation.validate_snapshot_against_base(
+            coordinator,
+            thread_key="example-thread",
+            snapshot=_snapshot(("README.md",), _cached_patch(repo)),
+            scratch_root=tmp_path,
+            protected_paths=(),
+            allow_dependency_additions=False,
+            reject_conflict_markers=conflict,
+        )
+
+    validate(f"base\n{marker}\n", conflict=False)
+    with pytest.raises(validation.PublicationValidationRefused, match="conflict marker"):
+        validate(f"base\n{marker}\n", conflict=True)
+    validate(f"base\ninline {marker}\n", conflict=True)
+
+
 def test_publication_refuses_github_actions_and_codeowners(tmp_path: Path) -> None:
     validation = importlib.import_module("curie_worker.publication_validation")
     repo = _prepared_repo(tmp_path)

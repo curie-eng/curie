@@ -485,3 +485,244 @@ def test_disk_limit_refuses_before_push_and_a_bounded_valid_replay_progresses(
         asyncio.run(prepare_rebase(graph.snapshot(), graph.credential())).head_sha != graph.source
     )
     graph.assert_clean()
+
+
+@pytest.fixture
+def same_base_conflict(graph: GitGraph) -> GitGraph:
+    source = graph.commit("shared.txt", "factory edit\n", "Factory edits shared line")
+    git(graph.writer, "push", "origin", BRANCH)
+    git(graph.writer, "checkout", "main")
+    target = graph.commit("shared.txt", "upstream edit\n", "Base edits shared line")
+    git(graph.writer, "push", "origin", "main")
+    return replace(graph, source=source, target=target)
+
+
+def test_inspect_same_base_conflict_reports_only_conflicted_paths_without_push(
+    same_base_conflict: GitGraph, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api.factory_rebase import inspect_same_base_conflicts
+
+    graph = same_base_conflict
+    before = git(graph.origin, "show-ref")
+    real_git = shutil.which("git")
+    assert real_git
+    commands = graph.root / "commands.jsonl"
+    tools = graph.root / "observed-tools"
+    tools.mkdir()
+    wrapper = tools / "git"
+    wrapper.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        f"with open({str(commands)!r}, 'a') as out:\n"
+        "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
+
+    paths = asyncio.run(
+        inspect_same_base_conflicts(graph.snapshot(target_ref="main"), graph.credential())
+    )
+
+    assert paths == ("shared.txt",)
+    commands_seen = [json.loads(line) for line in commands.read_text().splitlines()]
+    assert any("fetch" in argv for argv in commands_seen)
+    assert all("push" not in argv for argv in commands_seen)
+    assert git(graph.origin, "show-ref") == before
+    graph.assert_clean()
+
+
+@pytest.mark.parametrize(
+    ("ref", "deleted"), [(BRANCH, True), ("main", True), (BRANCH, False), ("main", False)]
+)
+def test_inspect_same_base_conflict_refuses_changed_remote_refs(
+    same_base_conflict: GitGraph, ref: str, deleted: bool
+) -> None:
+    from curie_api.factory_rebase import RebaseRefused, inspect_same_base_conflicts
+
+    graph = same_base_conflict
+    if deleted:
+        git(graph.origin, "update-ref", "-d", f"refs/heads/{ref}")
+    elif ref == "main":
+        git(graph.origin, "update-ref", "refs/heads/main", graph.old_base)
+    else:
+        git(graph.writer, "checkout", ref)
+        graph.commit("concurrent.txt", "other work\n", "Concurrent change")
+        git(graph.writer, "push", "origin", ref)
+    before = git(graph.origin, "show-ref")
+
+    with pytest.raises(RebaseRefused) as refused:
+        asyncio.run(
+            inspect_same_base_conflicts(graph.snapshot(target_ref="main"), graph.credential())
+        )
+
+    assert refused.value.code == ("head_changed" if ref == BRANCH else "target_changed")
+    assert git(graph.origin, "show-ref") == before
+    graph.assert_clean()
+
+
+def test_inspect_conflict_uses_its_admitted_tip_after_a_base_fast_forward(
+    same_base_conflict: GitGraph,
+) -> None:
+    from curie_api.factory_rebase import inspect_same_base_conflicts
+
+    graph = same_base_conflict
+    snapshot = graph.snapshot(target_ref="main")
+    git(graph.writer, "checkout", "main")
+    graph.commit("concurrent.txt", "other work\n", "Advance main again")
+    git(graph.writer, "push", "origin", "main")
+    before = git(graph.origin, "show-ref")
+    assert asyncio.run(inspect_same_base_conflicts(snapshot, graph.credential())) == ("shared.txt",)
+    assert git(graph.origin, "show-ref") == before
+    graph.assert_clean()
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ("none", None),
+        ("human", "foreign_head"),
+        ("rewind", "base_changed"),
+        ("same-base", "no_current_conflict"),
+    ],
+)
+def test_admission_refusal_from_the_observed_git_graph(
+    same_base_conflict: GitGraph, change: str, expected: str | None
+) -> None:
+    from curie_api.factory_conflict import conflict_graph_refusal
+    from curie_api.factory_maintenance import MaintenanceObservation
+    from curie_api.models import ThreadPublicationLineage
+
+    graph = same_base_conflict
+    lineage = ThreadPublicationLineage(
+        id=uuid.uuid4(),
+        base_ref="main",
+        base_sha=graph.old_base,
+        branch=BRANCH,
+        repo_full_name="acme-corp/acme-bot",
+        code_host_kind="gitlab",
+        code_host_host="gitlab.example.com",
+        repository_project_id="41",
+    )
+    observation = MaintenanceObservation(
+        work_item_id=uuid.uuid4(),
+        request_id=uuid.uuid4(),
+        lineage_id=lineage.id,
+        work_item_version=1,
+        request_version=1,
+        lineage_version=1,
+        head_sha=graph.source,
+        base_ref="main",
+        base_sha=graph.old_base if change == "same-base" else graph.target,
+        reason="base_conflict",
+    )
+    if change == "human":
+        git(graph.origin, "update-ref", f"refs/heads/{BRANCH}", graph.first)
+    elif change == "rewind":
+        git(graph.origin, "update-ref", "refs/heads/main", graph.old_base)
+    before = git(graph.origin, "show-ref")
+    assert (
+        asyncio.run(conflict_graph_refusal(observation, lineage, graph.credential(), COMMIT_TIME))
+        == expected
+    )
+    assert git(graph.origin, "show-ref") == before
+
+
+@pytest.mark.parametrize(
+    ("target_ref", "expected"),
+    [
+        ("main", "invalid_ancestry"),
+        ("next", "invalid_ancestry"),
+        ("unrelated", "invalid_ancestry"),
+        ("fast-forward", "invalid_ancestry"),
+        ("clean", "no_conflict"),
+    ],
+)
+def test_inspect_same_base_conflict_requires_divergence_and_an_actual_conflict(
+    graph: GitGraph, target_ref: str, expected: str
+) -> None:
+    from curie_api.factory_rebase import RebaseRefused, inspect_same_base_conflicts
+
+    if target_ref == "unrelated":
+        git(graph.writer, "checkout", "--orphan", target_ref)
+        git(graph.writer, "commit", "-m", "Independent root")
+        git(graph.writer, "push", "origin", target_ref)
+    elif target_ref in {"fast-forward", "clean"}:
+        parent = graph.source if target_ref == "fast-forward" else graph.old_base
+        git(graph.writer, "checkout", "-b", target_ref, parent)
+        graph.commit("upstream.txt", "more work\n", "Advance target")
+        git(graph.writer, "push", "origin", target_ref)
+    target = git(graph.origin, "rev-parse", f"refs/heads/{target_ref}")
+    before = git(graph.origin, "show-ref")
+
+    with pytest.raises(RebaseRefused) as refused:
+        asyncio.run(
+            inspect_same_base_conflicts(
+                graph.snapshot(target_ref=target_ref, target_sha=target), graph.credential()
+            )
+        )
+
+    assert refused.value.code == expected
+    assert git(graph.origin, "show-ref") == before
+    graph.assert_clean()
+
+
+def test_inspect_same_base_conflict_uses_target_merge_attributes(
+    same_base_conflict: GitGraph,
+) -> None:
+    from curie_api.factory_rebase import RebaseRefused, inspect_same_base_conflicts
+
+    graph = same_base_conflict
+    target = graph.commit(".gitattributes", "shared.txt merge=union\n", "Use union merge")
+    git(graph.writer, "push", "origin", "main")
+
+    with pytest.raises(RebaseRefused) as refused:
+        asyncio.run(
+            inspect_same_base_conflicts(
+                graph.snapshot(target_ref="main", target_sha=target), graph.credential()
+            )
+        )
+
+    assert refused.value.code == "no_conflict"
+    assert graph.head() == graph.source
+    graph.assert_clean()
+
+
+@pytest.mark.parametrize("shape", ["binary", "directory-file", "rename-delete", "add-add"])
+def test_inspect_same_base_conflict_refuses_unsupported_shapes(graph: GitGraph, shape: str) -> None:
+    from curie_api.factory_rebase import RebaseRefused, inspect_same_base_conflicts
+
+    for ref in (BRANCH, "main"):
+        git(graph.writer, "checkout", ref)
+        shared = graph.writer / "shared.txt"
+        if shape == "binary":
+            shared.write_bytes(b"\0" + ref.encode())
+        elif shape == "directory-file":
+            if ref == BRANCH:
+                (graph.writer / "collision").write_text("file\n")
+            else:
+                (graph.writer / "collision").mkdir()
+                (graph.writer / "collision" / "child.txt").write_text("child\n")
+        elif shape == "rename-delete":
+            if ref == BRANCH:
+                shared.rename(graph.writer / "renamed.txt")
+            else:
+                shared.unlink()
+        else:
+            (graph.writer / "new.txt").write_text(ref + "\n")
+        git(graph.writer, "add", "-A")
+        git(graph.writer, "commit", "-m", "Change conflict fixture")
+        git(graph.writer, "push", "origin", ref)
+    before = git(graph.origin, "show-ref")
+    target = git(graph.origin, "rev-parse", "refs/heads/main")
+
+    with pytest.raises(RebaseRefused) as refused:
+        asyncio.run(
+            inspect_same_base_conflicts(
+                graph.snapshot(target_ref="main", old_head_sha=graph.head(), target_sha=target),
+                graph.credential(),
+            )
+        )
+
+    assert refused.value.code == "unsupported_conflict"
+    assert git(graph.origin, "show-ref") == before
+    graph.assert_clean()

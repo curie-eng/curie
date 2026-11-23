@@ -1104,6 +1104,249 @@ def _assert_no_publication(remote: Path, result: subprocess.CompletedProcess[str
     assert ref.stdout == ""
 
 
+def _conflict_payload(module: Any, tmp_path: Path) -> tuple[Path, Any]:
+    remote, lineage_base = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    _repo_git(seed, "switch", "-c", LINEAGE_BRANCH)
+    (seed / "README.md").write_text("proposed\n")
+    _repo_git(seed, "commit", "-am", "Proposed change")
+    _repo_git(seed, "push", "origin", LINEAGE_BRANCH)
+    prior = _branch_head(remote)
+    _repo_git(seed, "switch", "main")
+    target = _advance_seed(seed, "README.md", "target\n")
+    patch = _approved_patch(seed)
+    payload = replace(
+        _payload(module, patch),
+        revision_number=2,
+        publication_mode="base_conflict_merge",
+        expected_remote_head=prior,
+        expected_prior_head=prior,
+        base_sha=target,
+        lineage_base_sha=lineage_base,
+    )
+    prepare = module.build_publication_resources(
+        payload, credential=BASIC_TEST_CREDENTIAL, settings=_settings(module), prepare_merge=True
+    )
+    prepared = _run_generated_publish_script(tmp_path, prepare, remote=remote, ordinal="prepare")
+    assert prepared.returncode == 0, prepared.stderr
+    markers = re.findall(r"^CURIE_PREPARED_MERGE_SHA=([0-9a-f]{40,64})$", prepared.stdout, re.M)
+    assert len(markers) == 1
+    assert _branch_head(remote) == prior
+    return remote, replace(payload, expected_merge_sha=markers[0])
+
+
+def test_conflict_job_publishes_exact_merge_and_adopts_it_after_a_lost_response(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, payload = _conflict_payload(publication_k8s, tmp_path)
+    later = _advance_seed(tmp_path / "seed", "later.txt", "not admitted\n")
+    resources = _build(publication_k8s, payload)
+    pushed = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="push")
+    assert pushed.returncode == 0, pushed.stderr
+    head = _branch_head(remote)
+    assert _repo_git(remote, "rev-list", "--parents", "-n1", head).split() == [
+        head,
+        payload.expected_prior_head,
+        payload.base_sha,
+    ]
+    assert _repo_git(
+        remote, "diff", "--binary", payload.base_sha, head
+    ) == payload.patch.decode().rstrip("\n")
+    assert _commit_message(remote, head).splitlines().count(f"Curie-Revision: {REVISION_ID}") == 1
+    assert _repo_git(remote, "rev-parse", "refs/heads/main") == later
+    updates = _record_pushes(remote)
+    retried = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="retry")
+    assert retried.returncode == 0, retried.stderr
+    assert f"CURIE_COMMIT_SHA={head}" in retried.stdout
+    assert updates.read_text() == ""
+
+
+def test_empty_conflict_patch_is_refused_before_any_push(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, payload = _conflict_payload(publication_k8s, tmp_path)
+    updates = _record_pushes(remote)
+    with pytest.raises(publication_k8s.PublicationResourceError, match="non-empty patch"):
+        _build(publication_k8s, replace(payload, patch=b""))
+
+    resources = _build(publication_k8s, payload)
+    refused = _run_publish_script(
+        tmp_path,
+        script_text=resources.config_map["data"]["publish.sh"],
+        patch_bytes=b"",
+        job_env=_job_env(resources),
+        remote=remote,
+        ordinal="empty",
+    )
+    assert refused.returncode != 0
+    assert "non-empty patch" in refused.stderr
+    assert "CURIE_COMMIT_SHA=" not in refused.stdout
+    assert _branch_head(remote) == payload.expected_prior_head
+    assert updates.read_text() == ""
+
+
+def test_conflict_push_refuses_a_recorded_sha_that_differs_from_prepare(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, payload = _conflict_payload(publication_k8s, tmp_path)
+    updates = _record_pushes(remote)
+    wrong_sha = "f" * 40
+    assert wrong_sha != payload.expected_merge_sha
+    resources = _build(publication_k8s, replace(payload, expected_merge_sha=wrong_sha))
+    result = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="mismatch")
+    assert result.returncode != 0
+    assert "prepared merge SHA does not match" in result.stderr
+    assert _branch_head(remote) == payload.expected_prior_head
+    assert updates.read_text() == ""
+    with pytest.raises(publication_k8s.PublicationResourceError, match="recorded merge SHA"):
+        _build(publication_k8s, replace(payload, expected_merge_sha=None))
+    matching = _build(publication_k8s, payload)
+    assert _job_env(matching)["EXPECTED_MERGE_SHA"] == payload.expected_merge_sha
+    with pytest.raises(publication_k8s.PublicationResourceError, match="contract mismatch"):
+        publication_k8s.validate_adopted_resource("Job", matching.job, resources.job)
+
+
+@pytest.mark.parametrize("interrupt", ["lost_response", "moved_head"])
+def test_conflict_push_handles_the_exact_lease_and_an_ambiguous_response(
+    publication_k8s: Any, tmp_path: Path, interrupt: str
+) -> None:
+    remote, payload = _conflict_payload(publication_k8s, tmp_path)
+    # Intercept the git transport boundary once. All reads, writes and
+    # lease checks still run against the bare origin.
+    wrapper_dir = tmp_path / "transport"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "git"
+    wrapper.write_text(
+        """#!/bin/bash
+set -eu
+for arg in "$@"; do
+  if [[ "$arg" == push ]]; then
+    if [[ "$TEST_INTERRUPT" == moved_head ]]; then
+      "$TEST_GIT" -C "$TEST_ORIGIN" update-ref "refs/heads/$BRANCH" "$BASE_SHA"
+    else
+      "$TEST_GIT" "$@"
+      exit 1
+    fi
+    break
+  fi
+done
+exec "$TEST_GIT" "$@"
+"""
+    )
+    wrapper.chmod(0o755)
+    updates = _record_pushes(remote)
+    result = _run_generated_publish_script(
+        tmp_path,
+        _build(publication_k8s, payload),
+        remote=remote,
+        ordinal=interrupt,
+        path_prefix=wrapper_dir,
+        extra_env={"TEST_GIT": _git(), "TEST_INTERRUPT": interrupt, "TEST_ORIGIN": str(remote)},
+    )
+    head = _branch_head(remote)
+    if interrupt == "lost_response":
+        assert result.returncode == 0, result.stderr
+        assert f"CURIE_COMMIT_SHA={head}" in result.stdout
+        assert updates.read_text().splitlines() == [
+            f"{payload.expected_prior_head} {head} refs/heads/{LINEAGE_BRANCH}"
+        ]
+    else:
+        assert result.returncode != 0
+        assert "CURIE_COMMIT_SHA=" not in result.stdout
+        assert updates.read_text() == ""
+        assert head == payload.base_sha
+
+
+def test_conflict_job_refuses_predecessor_adoption_without_pushing(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, payload = _conflict_payload(publication_k8s, tmp_path)
+    pushed = _run_generated_publish_script(
+        tmp_path, _build(publication_k8s, payload), remote=remote, ordinal="predecessor"
+    )
+    assert pushed.returncode == 0, pushed.stderr
+    head = _branch_head(remote)
+    updates = _record_pushes(remote)
+    successor = replace(
+        payload, publication_id=uuid.uuid4(), revision_id=uuid.uuid4(), revision_number=3
+    )
+    with pytest.raises(publication_k8s.PublicationResourceError, match="cannot adopt predecessor"):
+        _build(publication_k8s, replace(successor, adoptable_revision_ids=(payload.revision_id,)))
+    refused = _run_generated_publish_script(
+        tmp_path, _build(publication_k8s, successor), remote=remote, ordinal="refused"
+    )
+    assert refused.returncode != 0
+    assert "CURIE_COMMIT_SHA=" not in refused.stdout
+    assert _branch_head(remote) == head
+    assert updates.read_text() == ""
+
+
+def test_conflict_title_cannot_add_a_revision_marker_before_push(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, payload = _conflict_payload(publication_k8s, tmp_path)
+    title = f"Update repository\n\nCurie-Revision: {payload.revision_id}"
+    updates = _record_pushes(remote)
+    with pytest.raises(publication_k8s.PublicationResourceError, match="title contains"):
+        _build(publication_k8s, replace(payload, title=title))
+    refused = _run_generated_publish_script(
+        tmp_path,
+        _build(publication_k8s, payload),
+        remote=remote,
+        ordinal="duplicate-marker",
+        extra_env={"COMMIT_TITLE": title},
+    )
+    assert refused.returncode != 0
+    assert "exactly one revision marker" in refused.stderr
+    assert "CURIE_COMMIT_SHA=" not in refused.stdout
+    assert _branch_head(remote) == payload.expected_prior_head
+    assert updates.read_text() == ""
+
+
+@pytest.mark.parametrize(
+    "violation", ["foreign_tree", "wrong_parents", "lineage", "rewind", "already_contains"]
+)
+def test_conflict_job_refuses_unapproved_head_or_ancestry_without_push(
+    publication_k8s: Any, tmp_path: Path, violation: str
+) -> None:
+    remote, payload = _conflict_payload(publication_k8s, tmp_path)
+    seed = tmp_path / "seed"
+    prior = payload.expected_prior_head
+    if violation in {"foreign_tree", "wrong_parents"}:
+        parents = (
+            [prior, payload.base_sha] if violation == "foreign_tree" else [payload.base_sha, prior]
+        )
+        foreign = _repo_git(
+            seed,
+            "commit-tree",
+            f"{prior}^{{tree}}",
+            "-p",
+            parents[0],
+            "-p",
+            parents[1],
+            "-m",
+            payload.title,
+            "-m",
+            f"Curie-Revision: {REVISION_ID}",
+        )
+        _repo_git(seed, "push", "origin", f"{foreign}:refs/heads/{LINEAGE_BRANCH}")
+    elif violation == "lineage":
+        payload = replace(payload, lineage_base_sha=prior)
+    elif violation == "rewind":
+        _repo_git(remote, "update-ref", "refs/heads/main", payload.lineage_base_sha)
+    else:
+        payload = replace(payload, base_sha=payload.lineage_base_sha)
+    original = _branch_head(remote)
+    updates = _record_pushes(remote)
+    refused = _run_generated_publish_script(
+        tmp_path, _build(publication_k8s, payload), remote=remote, ordinal="refused"
+    )
+    assert refused.returncode != 0
+    assert "CURIE_COMMIT_SHA=" not in refused.stdout
+    assert _branch_head(remote) == original
+    assert updates.read_text() == ""
+
+
 def test_moved_base_first_publication_pushes_approved_patch_on_current_tip(
     publication_k8s: Any, tmp_path: Path
 ) -> None:

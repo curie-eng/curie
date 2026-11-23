@@ -14826,6 +14826,18 @@
             ],
             "title": "Pr Url"
           },
+          "publication_mode": {
+            "anyOf": [
+              {
+                "const": "base_conflict_merge",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publication Mode"
+          },
           "reply_adapter": {
             "anyOf": [
               {
@@ -15100,6 +15112,18 @@
             "pattern": "^[0-9a-f]{40,64}$",
             "title": "Parent Sha",
             "type": "string"
+          },
+          "second_parent_sha": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{40,64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Second Parent Sha"
           }
         },
         "required": [
@@ -15121,6 +15145,18 @@
             "pattern": "^[0-9a-f]{40,64}$",
             "title": "Expected Parent",
             "type": "string"
+          },
+          "expected_second_parent": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{40,64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Second Parent"
           },
           "revision_id": {
             "format": "uuid",
@@ -18101,6 +18137,28 @@
             "format": "uuid",
             "title": "Agent Id",
             "type": "string"
+          },
+          "conflict_base_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conflict Base Sha"
+          },
+          "conflict_head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conflict Head Sha"
           },
           "context": {
             "anyOf": [

@@ -1214,6 +1214,7 @@ def test_deadline_resign_keeps_the_exact_principal_and_only_shortens(
     )
     run = SimpleNamespace(
         execution_deadline=datetime.fromtimestamp(_T + deadline, UTC),
+        conflict_workspace=None,
         request_id=uuid.UUID(_REQUESTER_RUN),
         work_item_id=uuid.UUID(_REQUESTER_WORK_ITEM),
         claim_name="claim",

@@ -1751,6 +1751,19 @@ allowance available. A human push pauses repair with
 `foreign_head`. Restoring the recorded head allows reevaluation. A successful
 repair leaves the pull request open for review.
 
+#### Conflicts after the base branch advances
+
+The same maintenance setting, 24-hour window, and one-repair allowance cover
+a conflict on the existing PR target after a successful request. An active
+request keeps its existing `merge_conflict` handoff. For a completed request,
+`base_conflict` in `maintenance_history` identifies the admitted PR head and
+base tip. The successor resolves the conflict against those commits and runs
+the repository checks for both changes. Approval covers the cumulative patch
+from that base tip. Publication pushes the verified two-parent commit only
+while the branch still holds the admitted PR head. A protected path or
+conflicting intentions require human review. Fresh CI must pass on the
+published merge commit before the repair completes.
+
 Per-repository factory settings live under `factory.bindings[].repos[]`. A
 binding joins one tracker (`tracker`) to its repositories, and each `repos`
 entry names a `codeHost`, a `projectId`, a `path` (`owner/name`) and an `alias`.

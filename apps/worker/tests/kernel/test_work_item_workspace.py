@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -32,6 +34,7 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol.reply import ReplyAck, ReplyEvent
+from curie_worker import workspace as managed_workspace
 from curie_worker.approvals import (
     ApprovalBackendError,
     ApprovalClient,
@@ -73,6 +76,7 @@ from redis.exceptions import ResponseError
 
 from apps.worker.tests.queue_fixtures import factory_context, factory_conversation, wait_until
 from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
+from apps.worker.tests.test_workspace import _conflict_preparer, _git
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -212,7 +216,10 @@ class _TerminationLease:
 class _WorkItems(AbsentRequesterContext):
     """Dispatch double: the acquire grant carries the WorkItem repository."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, conflict_workspace: managed_workspace.ConflictWorkspace | None = None
+    ) -> None:
+        self.conflict_workspace = conflict_workspace
         self.calls: list[str] = []
         self.after_finish: Callable[[], Awaitable[None]] | None = None
         self.finishes: list[dict[str, object]] = []
@@ -251,6 +258,7 @@ class _WorkItems(AbsentRequesterContext):
             context=factory_context(AGENT_ID, wake),
             resource_gate=None,
             predecessor_claim_name=None,
+            conflict_workspace=self.conflict_workspace,
         )
         self.acquisitions[request_id] = grant
         return grant
@@ -292,6 +300,7 @@ class _WorkItems(AbsentRequesterContext):
             lease_held_to_deadline=request_id in self.deadline_holds,
             context=grant.context,
             refusal=None,
+            conflict_workspace=grant.conflict_workspace,
         )
 
     async def start(
@@ -575,71 +584,104 @@ def test_work_item_execution_checks_out_the_work_item_repository(make_harness) -
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("mint_mode", ["context", "absent", "error"])
-def test_factory_turn_receives_only_authoritative_publication_context(
-    make_harness, mint_mode: str
-) -> None:
-    async def exercise() -> None:
-        request_id = uuid.uuid4()
-        expected = PublicationContext(
-            agent_id=AGENT_ID,
+def _execution_publication_context(request_id: uuid.UUID, head: str) -> PublicationContext:
+    return PublicationContext(
+        agent_id=AGENT_ID,
+        deployment_id=DEPLOYMENT_ID,
+        work_item_id=request_id,
+        execution_request_id=request_id,
+        runtime_epoch=1,
+        conversation_id=f"work-item-{request_id}",
+        lineage_id=uuid.uuid4(),
+        lineage_version=2,
+        expected_head=head,
+        queued_event_id=f"work-item-{request_id}-execute-1",
+        precheck_url="https://api.example.com/publications/precheck",
+        capability="ppc.example.signature",
+        observed_title="Existing pull request",
+        observed_body_sha256="b" * 64,
+        observed_at=datetime.now(UTC),
+    )
+
+
+class _TurnPublicationApi:
+    def __init__(self, expected: PublicationContext, mint_mode: str) -> None:
+        self.expected = expected
+        self.mint_mode = mint_mode
+        self.mint_calls: list[dict[str, object]] = []
+
+    async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
+        if self.mint_mode == "absent":
+            return None
+        return PublicationLineage(
+            id=self.expected.lineage_id,
             deployment_id=DEPLOYMENT_ID,
-            work_item_id=request_id,
-            execution_request_id=request_id,
-            runtime_epoch=1,
-            conversation_id=f"work-item-{request_id}",
-            lineage_id=uuid.uuid4(),
-            lineage_version=2,
-            expected_head="a" * 40,
-            queued_event_id=f"work-item-{request_id}-execute-1",
-            precheck_url="https://api.example.com/publications/precheck",
-            capability="ppc.example.signature",
-            observed_title="Existing pull request",
-            observed_body_sha256="b" * 64,
-            observed_at=datetime.now(UTC),
+            conversation_id=self.expected.conversation_id,
+            repo_full_name=WORK_ITEM_REPO,
+            base_sha="c" * 40,
+            branch="curie/thread-example",
+            pr_number=7,
+            pr_url=f"https://github.com/{WORK_ITEM_REPO}/pull/7",
+            head_sha=self.expected.expected_head,
+            state="open",
+            version=2,
+            latest_revision=1,
+            has_pending_revision=False,
+            has_pending_outcome=False,
+            visible_outcome_revision=1,
         )
 
-        class PublicationApi:
-            def __init__(self) -> None:
-                self.mint_calls: list[dict[str, object]] = []
+    async def get_publication_precheck_context(self, **kwargs: object) -> PublicationContext | None:
+        self.mint_calls.append(kwargs)
+        if self.mint_mode == "error":
+            raise RuntimeError("publication context mint unavailable")
+        if self.mint_mode == "conflict_stale":
+            return self.expected.model_copy(update={"expected_head": "c" * 40})
+        return (
+            None
+            if self.mint_mode == "absent"
+            else self.expected.model_copy(update={"queued_event_id": kwargs["queued_event_id"]})
+        )
 
-            async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
-                if mint_mode == "absent":
-                    return None
-                return PublicationLineage(
-                    id=expected.lineage_id,
-                    deployment_id=DEPLOYMENT_ID,
-                    conversation_id=expected.conversation_id,
-                    repo_full_name=WORK_ITEM_REPO,
-                    base_sha="c" * 40,
-                    branch="curie/thread-example",
-                    pr_number=7,
-                    pr_url=f"https://github.com/{WORK_ITEM_REPO}/pull/7",
-                    head_sha=expected.expected_head,
-                    state="open",
-                    version=2,
-                    latest_revision=1,
-                    has_pending_revision=False,
-                    has_pending_outcome=False,
-                    visible_outcome_revision=1,
-                )
 
-            async def get_publication_precheck_context(
-                self, **kwargs: object
-            ) -> PublicationContext | None:
-                self.mint_calls.append(kwargs)
-                if mint_mode == "error":
-                    raise RuntimeError("publication context mint unavailable")
-                return expected if mint_mode == "context" else None
+def _conflict_workspace_factory(
+    preparer: managed_workspace.WorkspacePreparer,
+) -> Callable[[Any], managed_workspace.WorkspaceClaimCoordinator]:
+    def factory(substrate: Any) -> managed_workspace.WorkspaceClaimCoordinator:
+        return managed_workspace.WorkspaceClaimCoordinator(
+            preparer=preparer, substrate=substrate, suspended_error=SuspendedThreadError
+        )
 
-        publication_api = PublicationApi()
+    return factory
+
+
+@pytest.mark.parametrize("mint_mode", ["context", "absent", "error", "conflict", "conflict_stale"])
+def test_factory_turn_receives_only_authoritative_publication_context(
+    make_harness,
+    mint_mode: str,
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        head = "a" * 40
+        pins = None
+        workspace_factory: Callable[[Any], Any] = _Workspace
+        if mint_mode.startswith("conflict"):
+            preparer, _, _, head, base = _conflict_preparer(
+                managed_workspace, tmp_path, WORK_ITEM_REPO
+            )
+            pins = managed_workspace.ConflictWorkspace(head, base)
+            workspace_factory = _conflict_workspace_factory(preparer)
+
+        request_id = uuid.uuid4()
+        expected = _execution_publication_context(request_id, head)
+        publication_api = _TurnPublicationApi(expected, mint_mode)
         async with make_harness(
             binding=_Binding(),
-            workspace_factory=_Workspace,
+            workspace_factory=workspace_factory,
             publication_creator=publication_api,
             runner_api_base_url="http://runner-api.example.com:8000",
         ) as h:
-            h.kernel._work_items = _WorkItems()
+            h.kernel._work_items = _WorkItems(pins)
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             captured: list[Event] = []
             start_turn = h.kernel._runner.start_turn
@@ -655,10 +697,10 @@ def test_factory_turn_receives_only_authoritative_publication_context(
                 )
 
             assert publication_api.mint_calls
-            if mint_mode == "error":
+            if mint_mode in ("error", "conflict_stale"):
                 assert captured == []
             else:
-                assert len(captured) == 2
+                assert len(captured) == (1 if pins is not None else 2)
                 assert len(publication_api.mint_calls) == len(captured)
                 for turn in captured:
                     assert turn.publication_context == (
@@ -1172,6 +1214,61 @@ class _DeferRecordingWorkItems(_WorkItems):
         self.calls.append("defer")
         self.defers.append((request_id, kwargs))
         return None
+
+
+@pytest.mark.parametrize("ancestry", ["unrelated", "ambiguous", "base-rewritten"])
+def test_conflict_ancestry_refusal_reaches_the_request_before_start(
+    make_harness, tmp_path: Path, caplog: pytest.LogCaptureFixture, ancestry: str
+) -> None:
+    preparer, source, _, head, base = _conflict_preparer(
+        managed_workspace, tmp_path, WORK_ITEM_REPO
+    )
+    tree = _git(source, "rev-parse", "HEAD^{tree}").strip()
+    if ancestry in ("unrelated", "base-rewritten"):
+        base = _git(source, "commit-tree", tree, "-m", "Independent history").strip()
+        reason = (
+            "no common ancestor within the history limit"
+            if ancestry == "unrelated"
+            else "the admitted base is outside the fetched branch history"
+        )
+    else:
+        left, right = head, base
+        head = _git(
+            source, "commit-tree", tree, "-p", left, "-p", right, "-m", "First merge"
+        ).strip()
+        base = _git(
+            source, "commit-tree", tree, "-p", right, "-p", left, "-m", "Second merge"
+        ).strip()
+        reason = "the admitted commits lack one distinct merge base"
+    _git(source, "branch", "candidate", head)
+    if ancestry != "base-rewritten":
+        _git(source, "update-ref", "refs/heads/main", base)
+
+    async def exercise() -> None:
+        request_id = uuid.uuid4()
+        expected = _execution_publication_context(request_id, head)
+        items = _DeferRecordingWorkItems()
+        items.conflict_workspace = managed_workspace.ConflictWorkspace(head, base)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_conflict_workspace_factory(preparer),
+            publication_creator=_TurnPublicationApi(expected, "conflict"),
+            work_items=items,
+            max_attempts=3,
+        ) as h:
+            await h.kernel.process_event(_turn(expected.queued_event_id, ISSUE_URL))
+            assert h.runner.opened == []
+            assert "start" not in items.calls
+            assert not preparer.objects.put_inputs
+            [(deferred, data)] = items.defers
+            assert deferred == request_id and data["capacity"] is False
+            assert data["start_failure_detail"] == f"workspace conflict-ancestry failed: {reason}"
+            assert (
+                sum("workspace start failed" in line and reason in line for line in caplog.messages)
+                == 1
+            )
+
+    asyncio.run(exercise())
 
 
 def test_pre_start_archive_fault_defers_with_its_redacted_bounded_stage_and_reason(
@@ -2415,6 +2512,124 @@ async def _park_factory_request(
     assert held.held and held.started and not held.finished
     assert held.claim_name is not None and held.sandbox_name is not None
     return held
+
+
+@pytest.mark.parametrize("resolution", [b"feature rule", b"<<<<<<< HEAD"])
+def test_conflict_permission_resume_publishes_only_for_its_original_execution(
+    make_harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolution: bytes
+) -> None:
+    preparer, _, _, head, base = _conflict_preparer(managed_workspace, tmp_path, WORK_ITEM_REPO)
+    request_id = uuid.uuid4()
+    expected = _execution_publication_context(request_id, head)
+    rows: dict[str, dict[str, Any]] = {}
+    publications: list[dict[str, Any]] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET":
+            row = rows.get(path.rsplit("/", 1)[-1])
+            if row is None:
+                return httpx.Response(404, json={"detail": "approval not found"})
+            return httpx.Response(200, json=row)
+        data = json.loads(request.content)
+        if path.endswith("/publications"):
+            publications.append(data)
+            return httpx.Response(
+                201,
+                json={
+                    "id": str(uuid.uuid4()),
+                    "approval_id": str(uuid.uuid4()),
+                    "status": "pending",
+                },
+            )
+        assert path.endswith("/approvals")
+        approval_id = str(uuid.uuid4())
+        rows[approval_id] = dict(data, id=approval_id, status="pending")
+        return httpx.Response(201, json=rows[approval_id])
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as http:
+            client = ApprovalClient(
+                api_base_url="http://api.example.test",
+                api_key="example-platform-key",
+                worker_token="example-worker-token",
+                client=http,
+                read_timeout_s=5,
+            )
+
+            class PublicationApi(_TurnPublicationApi):
+                create_publication = staticmethod(client.create_publication)
+
+            items = _WorkItems(managed_workspace.ConflictWorkspace(head, base))
+            async with make_harness(
+                binding=_Binding(),
+                approvals=client,
+                approval_reader=client,
+                workspace_factory=_conflict_workspace_factory(preparer),
+                workspace_scratch_root=str(tmp_path),
+                publication_creator=PublicationApi(expected, "conflict"),
+                work_items=items,
+            ) as h:
+                held = await _park_factory_request(h, request_id)
+                [own] = rows.values()
+                own["status"] = "approved"
+                del h.kernel._held_work_items[held.thread_key]
+                for source in (
+                    f"work-item-{uuid.uuid4()}-execute-1",
+                    f"work-item-{request_id}-execute-2",
+                ):
+                    stale_id = str(uuid.uuid4())
+                    rows[stale_id] = dict(own, id=stale_id, dedupe_key=source)
+                    stale = _turn(f"approval-{stale_id}-resolved", "Resolved stale request")
+                    await h.kernel.process_event(stale)
+                    assert await h.kernel._markers.is_terminal(stale.event_id)
+                stale_ci = _turn(f"work-item-{request_id}-ci-2", "Repair a failed check")
+                await h.kernel.process_event(stale_ci)
+                assert await h.kernel._markers.is_terminal(stale_ci.event_id)
+                assert h.runner.opened == [ISSUE_URL] and not publications and not items.finishes
+
+                first = _turn(f"approval-{own['id']}-resolved", "[approval resolved] approved")
+                await h.kernel.process_event(first)
+                [nested] = [row for row in rows.values() if row["dedupe_key"] == first.event_id]
+                nested["status"] = "approved"
+
+                async def snapshot(
+                    *args: object, base_sha: str, **kwargs: object
+                ) -> RunnerWorkspaceSnapshot:
+                    assert base_sha == base
+                    return RunnerWorkspaceSnapshot(
+                        repo_full_name=WORK_ITEM_REPO,
+                        base_sha=base,
+                        patch=(
+                            b"diff --git a/rules.txt b/rules.txt\n"
+                            b"--- a/rules.txt\n+++ b/rules.txt\n"
+                            b"@@ -1 +1,2 @@\n base rule\n+" + resolution + b"\n"
+                        ),
+                        changed_paths=("rules.txt",),
+                        contains_workflow_files=False,
+                        publication_title="Resolve rules",
+                        publication_body="Keep both rules.",
+                    )
+
+                monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+                h.runner.default_script = _PUBLISH_TURN
+                second = _turn(f"approval-{nested['id']}-resolved", "[approval resolved] approved")
+                await h.kernel.process_event(second)
+                assert h.runner.opened == [ISSUE_URL, first.text, second.text]
+                if resolution == b"<<<<<<< HEAD":
+                    assert publications == []
+                    [refusal] = items.finishes
+                    assert refusal["cause"] == "publication_refused"
+                    assert "conflict marker" in refusal["detail"]
+                    return
+                [published] = publications
+                assert published["dedupe_key"] == second.event_id
+                assert published["work_item_request_id"] == str(request_id)
+                assert published["work_item_runtime_epoch"] == held.runtime_epoch
+                assert published["base_sha"] == base
+                assert items.finishes == []
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("continuation", ["ci", "approval"])

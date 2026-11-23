@@ -445,6 +445,17 @@ def _validate_changed_paths(paths: tuple[str, ...], protected_paths: tuple[str, 
             raise PublicationValidationRefused("publication-validation", reason)
 
 
+def _refuse_conflict_markers(checkout: Path, file_modes: dict[str, tuple[str, str]]) -> None:
+    for path, (_, new_mode) in file_modes.items():
+        if new_mode == "000000":
+            continue
+        with (checkout / path).open("rb") as resolved:
+            if any(line.startswith((b"<<<<<<<", b"=======", b">>>>>>>")) for line in resolved):
+                raise PublicationValidationRefused(
+                    "publication-validation", "resolution contains a conflict marker"
+                )
+
+
 def validate_snapshot_against_base(
     coordinator: WorkspaceClaimCoordinator,
     *,
@@ -455,6 +466,7 @@ def validate_snapshot_against_base(
     git_timeout_seconds: int = 30,
     protected_paths: tuple[str, ...],
     allow_dependency_additions: bool,
+    reject_conflict_markers: bool = False,
 ) -> None:
     """Rehash the private base and prove the binary patch applies to it."""
 
@@ -631,6 +643,8 @@ def validate_snapshot_against_base(
                         "patch contains a symlink, submodule, or unsafe file mode",
                     )
                 file_modes[raw_diff[index + 1]] = (old_mode, new_mode)
+            if reject_conflict_markers:
+                _refuse_conflict_markers(checkout, file_modes)
             if not allow_dependency_additions:
                 _validate_dependency_additions(
                     checkout, base_tree, file_modes, git_env, git_timeout_seconds

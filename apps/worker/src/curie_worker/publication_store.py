@@ -97,6 +97,7 @@ class PublicationCleanupWork:
 
     publication_id: uuid.UUID
     version: int
+    conflict_merge: bool
 
 
 class PostgresPublicationStore:
@@ -389,12 +390,13 @@ class PostgresPublicationStore:
             f"""
             SELECT p.id, p.approval_id, p.repo_full_name, p.status, p.version,
                    p.lineage_id, p.revision_number, p.expected_prior_head,
-                   p.adoptable_revision_ids, p.base_sha, p.patch_bytes,
+                   p.adoptable_revision_ids, p.publication_mode, p.expected_merge_sha,
+                   p.base_sha, p.patch_bytes,
                    p.changed_paths, p.title, p.body,
                    p.reply_kind, p.reply_channel, p.reply_placeholder,
                    p.reply_endpoint, p.reply_adapter,
                    l.version AS lineage_version, l.branch, l.pr_number,
-                   l.pr_url, l.head_sha,
+                   l.pr_url, l.head_sha, l.base_sha AS lineage_base_sha,
                    a.conversation_id,
                    (
                      p.execution_request_id IS NULL
@@ -500,6 +502,9 @@ class PostgresPublicationStore:
                 else None
             ),
             base_sha=str(row["base_sha"]),
+            publication_mode=row["publication_mode"],
+            expected_merge_sha=row["expected_merge_sha"],
+            lineage_base_sha=row["lineage_base_sha"],
             patch=patch,
             changed_paths=tuple(str(path) for path in paths),
             title=str(row["title"]),
@@ -522,6 +527,38 @@ class PostgresPublicationStore:
             owner_running=bool(row["owner_running"]),
             branch_prefix=(str(row["branch_prefix"]) if row["branch_prefix"] is not None else None),
         )
+
+    async def record_expected_merge_sha(
+        self, publication_id: uuid.UUID, *, version: int, commit_sha: str
+    ) -> None:
+        """Commit the prepared SHA and release this lease before any push can start."""
+
+        if re.fullmatch(r"[0-9a-f]{40,64}", commit_sha) is None:
+            raise PublicationStoreError("prepared merge SHA is invalid")
+        async with self._engine.begin() as connection:
+            recorded = await connection.scalar(
+                text(
+                    f"""
+                    UPDATE {self._table}
+                       SET expected_merge_sha = :sha, version = version + 1,
+                           lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+                     WHERE id = :id AND version = :version AND lease_owner = :owner
+                       AND lease_expires_at > now() AND status IN ('launching', 'running')
+                       AND publication_mode = 'base_conflict_merge' AND expected_merge_sha IS NULL
+                       AND :sha <> base_sha AND :sha <> expected_prior_head
+                 RETURNING version
+                    """
+                ),
+                {
+                    "id": publication_id,
+                    "version": version,
+                    "owner": self._lease_owner,
+                    "sha": commit_sha,
+                },
+            )
+        if recorded is None:
+            raise PublicationStoreError("prepared merge publication CAS was lost")
+        self._versions.pop(publication_id, None)
 
     async def is_terminal(self, publication_id: uuid.UUID) -> bool:
         async with self._engine.connect() as connection:
@@ -562,6 +599,7 @@ class PostgresPublicationStore:
         expected_publication_version: int,
         lease_owner: str,
         first_parent_sha: str | None,
+        second_parent_sha: str | None = None,
     ) -> None:
         """Persist exact terminal GitHub facts, accepting an identical replay."""
 
@@ -610,6 +648,7 @@ class PostgresPublicationStore:
             "expected_publication_version": expected_publication_version,
             "lease_owner": lease_owner,
             "first_parent_sha": first_parent_sha,
+            "second_parent_sha": second_parent_sha,
         }
         async with self._engine.begin() as connection:
             # The owning agent row first, the order agent deletion takes, so the
@@ -637,6 +676,19 @@ class PostgresPublicationStore:
                            AND lease_owner = :lease_owner
                            AND lease_expires_at > now()
                            AND status IN ('approved', 'launching', 'running')
+                           AND (
+                             (publication_mode IS NULL AND CAST(:second_parent_sha AS text) IS NULL)
+                             OR
+                             (publication_mode = 'base_conflict_merge'
+                              AND expected_prior_head = :expected_stored_head
+                              AND (
+                                (:head_sha = expected_prior_head
+                                 AND CAST(:second_parent_sha AS text) IS NULL)
+                                OR (:head_sha <> expected_prior_head
+                                    AND expected_merge_sha = :head_sha
+                                    AND base_sha = :second_parent_sha)
+                              ))
+                           )
                          FOR UPDATE
                         """
                     ),
@@ -1016,7 +1068,7 @@ class PostgresPublicationStore:
                     await connection.execute(
                         text(
                             f"""
-                        SELECT id, resource_cleanup_version
+                        SELECT id, resource_cleanup_version, publication_mode
                           FROM {self._table}
                          WHERE status IN ('succeeded', 'failed')
                            AND patch_bytes IS NULL
@@ -1065,7 +1117,11 @@ class PostgresPublicationStore:
                 raise PublicationStoreError("publication cleanup claim CAS was lost")
         version = int(updated)
         self._cleanup_versions[publication_id] = version
-        return PublicationCleanupWork(publication_id=publication_id, version=version)
+        return PublicationCleanupWork(
+            publication_id=publication_id,
+            version=version,
+            conflict_merge=row["publication_mode"] == "base_conflict_merge",
+        )
 
     async def mark_cleanup_completed(self, publication_id: uuid.UUID) -> None:
         """Acknowledge cleanup only after every deterministic resource is absent."""

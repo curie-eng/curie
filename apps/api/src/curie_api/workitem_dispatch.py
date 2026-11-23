@@ -41,6 +41,11 @@ from curie_api.workitems.lifecycle import (
 
 from . import factory_steering_execution, factory_steering_ledger
 from .config import Settings, get_settings
+from .factory_conflict_authority import (
+    ConflictAuthorityMismatch,
+    ConflictPublicationSettled,
+    conflict_publication_authority,
+)
 from .factory_notices import ANSWER_PULL_REQUEST_ENDED_SENTENCE, start_failed_sentence
 from .factory_reply_target import reply_columns
 from .factory_retry_policy import RetrySafety
@@ -212,6 +217,8 @@ class AcquireGrant:
     # The predecessor's sandbox claim a fenced automatic successor must see
     # gone before it claims its own; None when no fence applies (#5427).
     predecessor_claim_name: str | None
+    conflict_head_sha: str | None
+    conflict_base_sha: str | None
 
 
 class FactoryWake(BaseModel):
@@ -248,6 +255,8 @@ class RunningResult:
     execution_deadline: datetime
     context: FactoryContext | None
     refusal: RefusalCode | None
+    conflict_head_sha: str | None
+    conflict_base_sha: str | None
 
 
 @dataclass(frozen=True)
@@ -1440,6 +1449,11 @@ async def acquire(
             ),
         )
     )
+    try:
+        conflict = await conflict_publication_authority(session, request)
+    except ConflictAuthorityMismatch:
+        await session.rollback()
+        return await _refuse(session, "not_dispatchable", request_id=request_id)
     grant = AcquireGrant(
         generation=generation,
         work_item_id=work_item.id,
@@ -1451,6 +1465,8 @@ async def acquire(
         recovery_candidate_id=request.recovery_candidate_id,
         resource_gate=gate,
         predecessor_claim_name=await _fenced_predecessor_claim(session, request),
+        conflict_head_sha=conflict.head_sha if conflict else None,
+        conflict_base_sha=conflict.base_sha if conflict else None,
     )
     await session.commit()
     return grant
@@ -2535,6 +2551,16 @@ async def running_for_conversation(
     if not await _factory_wake_matches(session, work_item, running, wake):
         return "running", DispatchConflict(code="factory_wake_mismatch", request_id=running.id)
     current = await _factory_context(session, work_item, running)
+    try:
+        conflict = (
+            await conflict_publication_authority(session, running)
+            if isinstance(current, FactoryContext)
+            else None
+        )
+    except ConflictPublicationSettled:
+        return "ended", None
+    except ConflictAuthorityMismatch:
+        return "running", DispatchConflict(code="not_dispatchable", request_id=running.id)
     result = RunningResult(
         lease_held_to_deadline=(
             running.runtime_heartbeat_expires_at is not None
@@ -2552,6 +2578,8 @@ async def running_for_conversation(
         execution_deadline=running.execution_deadline,
         context=current if isinstance(current, FactoryContext) else None,
         refusal=current if isinstance(current, str) else None,
+        conflict_head_sha=conflict.head_sha if conflict else None,
+        conflict_base_sha=conflict.base_sha if conflict else None,
     )
     await session.commit()
     return "running", result

@@ -1,5 +1,6 @@
 """Instructions for the repair reason recorded by maintenance admission."""
 
+from .factory_conflict import conflict_instructions
 from .factory_maintenance import (
     MaintenanceAuthority,
     MaintenanceInstructions,
@@ -14,7 +15,10 @@ def _late_ci_red(
     return MaintenanceInstructions(objective=objective, publication_mode=None)
 
 
-_REASON_HOOKS: dict[MaintenanceReason, MaintenanceReasonHook] = {"late_ci_red": _late_ci_red}
+_REASON_HOOKS: dict[MaintenanceReason, MaintenanceReasonHook] = {
+    "late_ci_red": _late_ci_red,
+    "base_conflict": conflict_instructions,
+}
 
 
 def maintenance_instructions(

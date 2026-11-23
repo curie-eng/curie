@@ -200,6 +200,10 @@ def completed_base_relabel_authority() -> ColumnElement[bool]:
                     Publication.revision_number > 1,
                     Publication.base_sha == Publication.expected_prior_head,
                 ),
+                and_(
+                    Publication.revision_number > 1,
+                    Publication.publication_mode == "base_conflict_merge",
+                ),
             ),
             ~later_move,
         )

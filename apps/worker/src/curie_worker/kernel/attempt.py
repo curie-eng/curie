@@ -85,6 +85,7 @@ from ..workitem_dispatch import (
     parse_work_item_event_id,
 )
 from ..workspace import (
+    ConflictAncestryRefused,
     WorkspaceDependencyUnavailable,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
@@ -662,7 +663,11 @@ async def _attempt_turn(
         )
         return failures.TurnOutcome(
             terminal_ok=False,
-            classification="workspace-error",
+            classification=(
+                "conflict-ancestry-refused"
+                if isinstance(exc, ConflictAncestryRefused)
+                else "workspace-error"
+            ),
             workspace_stage_timeout=isinstance(exc, WorkspaceStageTimeout),
             workspace_dependency_unavailable=isinstance(exc, WorkspaceDependencyUnavailable),
             error_message=" ".join(redact_text(str(exc)).split())[
@@ -1158,6 +1163,7 @@ async def _retain_and_validate_publication_snapshot(
         git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
         protected_paths=self._config.publication_protected_paths,
         allow_dependency_additions=self._config.publication_allow_dependency_additions,
+        reject_conflict_markers=run is not None and run.conflict_workspace is not None,
     )
 
 

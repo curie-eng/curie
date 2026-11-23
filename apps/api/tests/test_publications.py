@@ -7599,9 +7599,11 @@ class _PushedPullCodeHost:
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
+        expected_second_parent: str | None,
     ) -> Any:
         from curie_worker.publication_loop import PublicationRevisionCommit
 
+        assert expected_second_parent is None
         del revision_id
         self.calls.append("verify_revision_commit")
         return PublicationRevisionCommit(commit_sha=commit_sha, parent_sha=expected_parent)

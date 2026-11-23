@@ -12,7 +12,7 @@ import httpx
 import personal_execution_support as support
 import pytest
 import redis.asyncio as redis
-from curie_api.config import get_settings
+from curie_api.config import Settings, get_settings
 from curie_api.factory_maintenance import (
     MaintenanceObservation,
     MaintenanceRefusal,
@@ -36,7 +36,7 @@ from test_factory_maintenance_store import seed_completed
 
 
 @pytest.fixture
-def github_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+def maintenance_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Settings]:
     for key, value in github.factory_env(
         tmp_path, bindings=[github.github_repository_binding(repo_id=101)]
     ).items():
@@ -46,51 +46,57 @@ def github_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Itera
     monkeypatch.setattr(github, "INSTALLATION_ID", 202)
     github.fake_installation_tokens(monkeypatch)
     get_settings.cache_clear()
-    yield
+    yield get_settings()
     get_settings.cache_clear()
+
+
+class MaintenanceForge(github.GitHubRepositoryFake):
+    def __init__(self, lineage: ThreadPublicationLineage) -> None:
+        super().__init__()
+        assert lineage.pr_number and lineage.head_sha and lineage.base_ref
+        self.branches = {lineage.base_ref: lineage.base_sha, lineage.branch: lineage.head_sha}
+        seeded = self.seed_pull(lineage.branch, lineage.base_ref)
+        self.number = lineage.pr_number
+        self.pulls[self.number] = self.pulls.pop(seeded)
+        self.issues[2573] = {"number": 2573, "state": "open", "labels": []}
+        self.mergeable: bool | None = True
+        self.node_id = lineage.code_host_pr_id
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        response = super().handle(request)
+        if response.status_code == 200 and request.url.path.endswith(f"/pulls/{self.number}"):
+            # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+            return httpx.Response(
+                200,
+                json={
+                    **response.json(),
+                    "mergeable": self.mergeable,
+                    "mergeable_state": "dirty" if self.mergeable is False else "unknown",
+                    "node_id": self.node_id,
+                },
+            )
+        return response
 
 
 @asynccontextmanager
 async def _observer(
     session: AsyncSession, observation: MaintenanceObservation
-) -> AsyncIterator[tuple[MaintenanceObserver, github.GitHubRepositoryFake]]:
+) -> AsyncIterator[tuple[MaintenanceObserver, MaintenanceForge]]:
     lineage = await session.get(ThreadPublicationLineage, observation.lineage_id)
-    assert lineage and lineage.pr_number
-    pr_number = lineage.pr_number
-    forge = github.GitHubRepositoryFake()
-    forge.branches = {"main": observation.base_sha, lineage.branch: observation.head_sha}
-    number = forge.seed_pull(lineage.branch, "main")
-    forge.pulls[pr_number] = forge.pulls.pop(number)
-    forge.pulls[pr_number]["mergeable"] = True
-    forge.issues[2573] = {"number": 2573, "state": "open", "labels": []}
-
-    # GitHub REST pull payloads carry node_id and nullable mergeability.
-    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
-    def handle(request: httpx.Request) -> httpx.Response:
-        response = forge.handle(request)
-        if request.url.path.endswith(f"/pulls/{pr_number}"):
-            return httpx.Response(
-                200,
-                json={
-                    **response.json(),
-                    "mergeable": forge.pulls[pr_number]["mergeable"],
-                    "node_id": lineage.code_host_pr_id,
-                },
-            )
-        return response
-
+    assert lineage
+    forge = MaintenanceForge(lineage)
     settings = get_settings()
     sessions = async_sessionmaker(session.bind, expire_on_commit=False)
     async with (
-        httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client,
+        httpx.AsyncClient(transport=httpx.MockTransport(forge.handle)) as client,
         redis.Redis.from_url(settings.valkey_dsn()) as valkey,
     ):
         yield MaintenanceObserver(sessions, settings, client, valkey), forge
 
 
-@pytest.mark.parametrize("expired_state", [None, "success", "failure"])
+@pytest.mark.parametrize("expired_state", [None, "success", "failure", "conflict"])
 def test_observer_rechecks_forge_and_restored_head_before_one_successor(
-    clean_db: None, github_maintenance: None, expired_state: str | None
+    clean_db: None, maintenance_settings: Settings, expired_state: str | None
 ) -> None:
     async def scenario(session: AsyncSession) -> None:
         observation = await seed_completed(session)
@@ -119,11 +125,16 @@ def test_observer_rechecks_forge_and_restored_head_before_one_successor(
             assert await history() == ["green"]
             forge.pulls[lineage.pr_number].update(state="open", merged_at=None)
             if expired_state is not None:
-                forge.report_check(observation.head_sha, "unit", expired_state)
+                if expired_state == "conflict":
+                    forge.mergeable = False
+                else:
+                    forge.report_check(observation.head_sha, "unit", expired_state)
                 with _clock_offset(timedelta(days=1, minutes=1).total_seconds()):
                     await poll()
                     expected = (
-                        ["green", "window_expired"] if expired_state == "failure" else ["green"]
+                        ["green", "window_expired"]
+                        if expired_state in {"failure", "conflict"}
+                        else ["green"]
                     )
                     assert await history() == expected
                     reads = len(forge.http_requests)
@@ -142,9 +153,9 @@ def test_observer_rechecks_forge_and_restored_head_before_one_successor(
             await poll()
             assert await history() == ["green", "failure_not_attributable"]
             forge.report_check(observation.base_sha, "unit", "success")
-            forge.pulls[lineage.pr_number]["mergeable"] = None
+            forge.mergeable = None
             assert await observer(observation) == MaintenanceRefusal(reason="evidence_unavailable")
-            forge.pulls[lineage.pr_number]["mergeable"] = True
+            forge.mergeable = True
             forge.branches[lineage.branch] = "c" * 40
             await poll()
             await poll()
@@ -211,7 +222,7 @@ def test_observer_rechecks_forge_and_restored_head_before_one_successor(
 )
 def test_observer_requires_a_current_open_tracker_issue(
     clean_db: None,
-    github_maintenance: None,
+    maintenance_settings: Settings,
     marker: str | None,
     issue_overrides: dict[str, Any] | None,
     expected: RefusalReason | Literal["admitted"],

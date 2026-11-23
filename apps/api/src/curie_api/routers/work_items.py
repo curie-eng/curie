@@ -260,6 +260,8 @@ class RunningWorkItemRequest(BaseModel):
     repository_path: str
     context: workitem_dispatch.FactoryContext | None
     refusal: workitem_dispatch.RefusalCode | None
+    conflict_head_sha: str | None = None
+    conflict_base_sha: str | None = None
 
 
 class PersonalContextRequestOut(BaseModel):
@@ -394,6 +396,8 @@ async def running_work_item_request(
         repository_path=row.repository_path,
         context=row.context,
         refusal=row.refusal,
+        conflict_head_sha=row.conflict_head_sha,
+        conflict_base_sha=row.conflict_base_sha,
     )
 
 
@@ -531,6 +535,8 @@ async def acquire_work_item_request(
         "recovery_candidate_id": result.recovery_candidate_id,
         "resource_gate": result.resource_gate,
         "predecessor_claim_name": result.predecessor_claim_name,
+        "conflict_head_sha": result.conflict_head_sha,
+        "conflict_base_sha": result.conflict_base_sha,
     }
 
 

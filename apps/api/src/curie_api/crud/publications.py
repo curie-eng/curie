@@ -14,6 +14,11 @@ from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
 from curie_api.schemas.publications import PublicationCreate
 
 from ..config import get_settings
+from ..factory_conflict_authority import (
+    ConflictAuthorityMismatch,
+    conflict_snapshot_authority,
+    is_conflict_successor,
+)
 from ..identity.http_invocation import HttpInvocationRuntime
 from ..identity.writer_selection import http_selected_scope
 from ..models import (
@@ -71,6 +76,14 @@ async def _adopt_publication_replay(
         raise PublicationReplayConflict(
             "publication dedupe key belongs to a non-publication approval"
         )
+    if (
+        data.work_item_request_id is not None
+        and data.work_item_request_id != publication.execution_request_id
+    ) or (
+        publication.publication_mode == "base_conflict_merge"
+        and (data.work_item_request_id is None or data.work_item_runtime_epoch is None)
+    ):
+        raise PublicationReplayConflict("publication replay has a different execution request")
     deployment = await get_deployment(session, data.deployment_id)
     if deployment is None:
         raise LookupError("deployment not found")
@@ -409,6 +422,14 @@ async def create_publication(
     if existing is not None:
         await session.refresh(existing, ["lineage"])
         return existing, False
+    if (
+        not patch
+        and data.work_item_request_id is not None
+        and await is_conflict_successor(session, data.work_item_request_id)
+    ):
+        raise PublicationLineageConflict(
+            "publication.conflict_patch_required", "a conflict repair requires a non-empty patch"
+        )
     await metadata_check()
     if bool(patch) != bool(data.changed_paths):
         raise PublicationLineageConflict(
@@ -467,6 +488,13 @@ async def create_publication(
         repo_full_name=thread_workspace.repo_full_name,
         for_update=True,
     )
+    try:
+        conflict = await conflict_snapshot_authority(session, owned_request, lineage, data)
+    except ConflictAuthorityMismatch as exc:
+        raise PublicationLineageConflict(
+            "publication.conflict_authority_stale",
+            "the repair no longer owns the admitted pull request and patch base",
+        ) from exc
     if not patch and (lineage is None or lineage.pr_number is None):
         raise PublicationLineageConflict(
             "publication.metadata_requires_pull",
@@ -559,7 +587,7 @@ async def create_publication(
                 "the previous publication outcome is not yet durable in thread history",
             )
         expected_prior_head = lineage.head_sha or lineage.base_sha
-        if data.base_sha != expected_prior_head:
+        if conflict is None and data.base_sha != expected_prior_head:
             raise PublicationLineageConflict(
                 "publication.lineage_stale",
                 "the managed checkout is not at the current pull request head",
@@ -663,7 +691,7 @@ async def create_publication(
             "the publication branch does not carry the operator branch prefix",
         )
 
-    expected_prior_head = lineage.head_sha or lineage.base_sha
+    expected_prior_head = conflict.head_sha if conflict else lineage.head_sha or lineage.base_sha
     expires_at = None
     if data.expires_in_seconds is not None:
         expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
@@ -691,6 +719,7 @@ async def create_publication(
         card_channel=data.card_channel or data.reply_channel,
         gate_kind="permission",
         granted_tool="mcp__curie__publish_changes",
+        granted_arguments=conflict.approval_arguments(patch) if conflict else None,
         purpose="publication",
         expires_at=expires_at,
         status=ApprovalStatus.approved if auto else ApprovalStatus.pending,
@@ -715,6 +744,7 @@ async def create_publication(
         lineage=lineage,
         revision_number=revision_number,
         expected_prior_head=expected_prior_head,
+        publication_mode=conflict.publication_mode if conflict else None,
         adoptable_revision_ids=adoptable,
         repo_full_name=thread_workspace.repo_full_name,
         status="approved" if auto else "pending",
@@ -726,7 +756,7 @@ async def create_publication(
         ),
         approval_card_reported_at=resolved_at,
         version=1,
-        base_sha=data.base_sha,
+        base_sha=conflict.base_sha if conflict else data.base_sha,
         patch_bytes=patch,
         changed_paths=data.changed_paths,
         observed_title_sha256=(
