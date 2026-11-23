@@ -1173,6 +1173,9 @@ pub struct MemoryRuleScope {
     pub scope_key: String,
     pub scope_label: String,
     pub in_force_count: i64,
+    /// Whether the requesting person could decide a rule of this scope now:
+    /// `None` when the API could not tell.
+    pub can_decide: Option<bool>,
 }
 
 /// `GET /agents/{id}/memory/rules` (`MemoryRulesOut`).

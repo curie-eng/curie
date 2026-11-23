@@ -3105,7 +3105,12 @@ The routes:
 1. `GET /agents/{agent_id}/memory/rules` lists the agent's `proposed`,
    `accepted`, `rejected` and `removed` rules, ordered by scope and number,
    with each scope's `in_force_count` (its accepted rules) and
-   `in_force_limit`. It takes the platform key or a console session, like the
+   `in_force_limit`. For a principal's console session each scope also carries
+   `can_decide`, computed by the same check a decision makes: `true`, `false`
+   (`memory_rules.write_access_required`), or `null` when it cannot be known
+   (the platform key, or a code host that cannot be reached or verified). The
+   code host is read once per repository scope, never per rule, and a decision
+   still checks again when it is made. It takes the platform key or a console session, like the
    rest of the memory API. A principal's console session sees only its own
    tenant's agents: another tenant's agent is 404 `memory_rules.not_found`,
    whatever the filter. Filter with `state`, `scope_kind` and `scope_key`;
