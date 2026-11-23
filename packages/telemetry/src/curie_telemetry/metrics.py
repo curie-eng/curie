@@ -577,6 +577,7 @@ _HTTP_OPERATIONS = [
     # Factory Slack run steering (#5414) and kickoff (#5380).
     "/v1/internal/factory-slack/steer",
     "/v1/internal/factory-slack/kickoff",
+    "/v1/internal/factory-slack/publication/{work_item_id}",
     "/v1/internal/channel-read/context",
     # The thread attachment ledger (ADR 0205).
     "/v1/internal/thread-attachments/query",
@@ -719,6 +720,7 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
         "settle_overdue_cancellations",
         "redrive_question_rounds",
         "readmit_pending",
+        "redrive_steering",
         "drain_answer_retries",
         "reconcile_missed_labels",
         "poll_trackers",

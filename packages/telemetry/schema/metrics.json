@@ -1549,6 +1549,7 @@
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
+          "/v1/internal/factory-slack/publication/{work_item_id}",
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
@@ -1841,6 +1842,7 @@
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
+          "/v1/internal/factory-slack/publication/{work_item_id}",
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
@@ -2133,6 +2135,7 @@
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
+          "/v1/internal/factory-slack/publication/{work_item_id}",
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
@@ -2398,6 +2401,7 @@
           "settle_overdue_cancellations",
           "redrive_question_rounds",
           "readmit_pending",
+          "redrive_steering",
           "drain_answer_retries",
           "reconcile_missed_labels",
           "poll_trackers",
@@ -2407,7 +2411,7 @@
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 16
+      "cardinality_bound": 17
     },
     "curie.work_item.reconciler.step.consecutive_failures": {
       "type": "gauge",
@@ -2428,6 +2432,7 @@
           "settle_overdue_cancellations",
           "redrive_question_rounds",
           "readmit_pending",
+          "redrive_steering",
           "drain_answer_retries",
           "reconcile_missed_labels",
           "poll_trackers",
@@ -2437,7 +2442,7 @@
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 16
+      "cardinality_bound": 17
     },
     "curie.eval.process": {
       "type": "counter",
