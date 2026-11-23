@@ -167,11 +167,14 @@ def test_a_retry_compares_only_its_own_usage_and_progress(
 
     if current_tokens == 1_330_000:
         assert "Curie's recorded estimate for this run is $1.33." in body
-        assert "total $101.33" in body
+        expected_usage = "total $1.33"
     else:
         assert _recorded_result(body).splitlines()[0] == USD_HEADLINE
-        expected_usage = "total at least $100.00" if current_tokens is None else "total $150.00"
-        assert expected_usage in body
+        expected_usage = (
+            "Usage: not reported for 1 run" if current_tokens is None else "total $50.00"
+        )
+    (usage,) = [line for line in body.splitlines() if line.startswith("Usage:")]
+    assert expected_usage in usage
     assert "Earlier run's note" not in body
     assert "Last progress note:" not in body
 
