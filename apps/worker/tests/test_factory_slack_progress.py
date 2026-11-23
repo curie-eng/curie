@@ -143,7 +143,21 @@ def test_maintenance_history_survives_polls_and_worker_restart(
         reason="late_ci_red",
     )
 
-    async def record(engine: AsyncEngine) -> None:
+    async def record_disabled(engine: AsyncEngine) -> None:
+        async with AsyncSession(engine) as session, session.begin():
+            item = await session.get(WorkItem, item_id, with_for_update=True)
+            source = await session.get(ExecutionRequest, source_id)
+            assert item is not None and source is not None
+            await record_ci_settlement(session, item, source, head_sha=HEAD, green=True)
+            await record_ci_settlement(session, item, source, head_sha=HEAD, green=False)
+            await record_event(session, observation, "repair_disabled")
+
+    _db(record_disabled)
+    stack.drain()
+    stack.drain(fresh=True)
+    assert [row for row in _posts(item_id) if row["kind"] == "maintenance"] == []
+
+    async def record_enabled(engine: AsyncEngine) -> None:
         async with AsyncSession(engine) as session, session.begin():
             item = await session.get(WorkItem, item_id, with_for_update=True)
             source = await session.get(ExecutionRequest, source_id)
@@ -165,13 +179,18 @@ def test_maintenance_history_survives_polls_and_worker_restart(
             await record_event(session, replace(observation, base_sha="c3" * 20), "base_changed")
             await record_event(session, replace(observation, head_sha="d4" * 20), "base_changed")
 
-    _db(record)
+    with monkeypatch.context() as enabled:
+        enabled.setattr(get_settings(), "factory_maintenance_repair_enabled", True)
+        _db(record_enabled)
+    stack.drain()
+    stack.drain(fresh=True)
     response = stack.client.get(
         "/work-items", headers=stack.platform, params={"agent_id": stack.agent_id}
     )
     assert response.status_code == 200, response.text
     history = response.json()["items"][0]["maintenance_history"]
-    assert [event["outcome"] for event in history] == [
+    assert [event["outcome"] for event in history[:3]] == ["green", "no_ci", "repair_disabled"]
+    assert [event["outcome"] for event in history[3:]] == [
         "green",
         "no_ci",
         "foreign_head",
@@ -184,44 +203,15 @@ def test_maintenance_history_survives_polls_and_worker_restart(
         "base_changed",
         "base_changed",
     ]
-    assert history[0]["head_sha"] == HEAD
-    assert history[6]["repair_request_id"] == str(successor_id)
-    assert history[7]["repair_request_id"] is None
-    stack.drain()
-    stack.drain(fresh=True)
+    assert history[3]["head_sha"] == HEAD
+    assert history[9]["repair_request_id"] == str(successor_id)
+    assert history[10]["repair_request_id"] is None
     if destination:
         (thread,) = stack.threads(item_id)
         messages = _texts(stack, thread["root_ts"])
-        assert not any(
-            "CI verified green" in message or "No CI checks applied" in message
-            for message in messages
-        )
-        assert [row["post_key"] for row in _posts(item_id) if row["kind"] == "maintenance"] == [
-            f"maintenance:{event['id']}" for event in history[2:]
-        ]
-
-    async def record_enabled(engine: AsyncEngine) -> None:
-        async with AsyncSession(engine) as session, session.begin():
-            item = await session.get(WorkItem, item_id, with_for_update=True)
-            source = await session.get(ExecutionRequest, source_id)
-            assert item is not None and source is not None
-            await record_ci_settlement(session, item, source, head_sha=HEAD, green=True)
-            await record_ci_settlement(session, item, source, head_sha=HEAD, green=False)
-
-    with monkeypatch.context() as enabled:
-        enabled.setattr(get_settings(), "factory_maintenance_repair_enabled", True)
-        _db(record_enabled)
-    stack.drain()
-    stack.drain(fresh=True)
-    response = stack.client.get(
-        "/work-items", headers=stack.platform, params={"agent_id": stack.agent_id}
-    )
-    assert response.status_code == 200, response.text
-    history = response.json()["items"][0]["maintenance_history"]
-    assert [event["outcome"] for event in history[-2:]] == ["green", "no_ci"]
-    if destination:
-        messages = _texts(stack, thread["root_ts"])
         expected = [
+            f"CI verified green on {HEAD}.",
+            f"No CI checks applied to {HEAD}. Policy permits completion.",
             "Repair paused because the pull request head differs from the factory head.",
             "Curie could not verify the current repair evidence.",
             "Repair paused because the pull request head differs from the factory head.",
@@ -231,13 +221,11 @@ def test_maintenance_history_survives_polls_and_worker_restart(
             "The base branch changed.",
             "The base branch changed.",
             "The base branch changed.",
-            f"CI verified green on {HEAD}.",
-            f"No CI checks applied to {HEAD}. Policy permits completion.",
         ]
         assert messages[-len(expected) :] == expected
         assert all("private-branch-sentinel" not in message for message in messages)
         assert [row["post_key"] for row in _posts(item_id) if row["kind"] == "maintenance"] == [
-            f"maintenance:{event['id']}" for event in history[2:]
+            f"maintenance:{event['id']}" for event in history[3:]
         ]
     else:
         assert _posts(item_id) == []

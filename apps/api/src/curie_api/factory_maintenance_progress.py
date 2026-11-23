@@ -58,6 +58,7 @@ async def record_event(
             reason=observation.reason,
             outcome=outcome,
             repair_request_id=repair_request_id,
+            notify_slack=get_settings().factory_maintenance_repair_enabled,
         )
     )
     await session.flush()

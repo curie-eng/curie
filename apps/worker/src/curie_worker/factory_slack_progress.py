@@ -993,11 +993,7 @@ class PostgresFactorySlackStore:
             await connection.execute(cards)
             await connection.execute(needs_person)
             await connection.execute(ready)
-            exists = await connection.scalar(
-                text("SELECT to_regclass(:relation)"), {"relation": self._maintenance_events}
-            )
-            if exists is not None:
-                await connection.execute(maintenance)
+            await connection.execute(maintenance)
             await connection.execute(refusals)
             await connection.execute(self._grant_notices(), {"reconnect_url": self._reconnect_url})
 
