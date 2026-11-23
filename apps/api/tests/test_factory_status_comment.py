@@ -766,16 +766,20 @@ def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> 
     _reconcile()
 
     body = _posts(sink)[0][1] or ""
-    ask = github_ask_line(MENTION)
+    # Literal, so reversing the product still posts the old pull request sentence
+    # and this assertion fails. The helper below calls the new signature.
+    ask = "Ask the factory: comment on this issue and mention @curie."
     assert "Status: QUEUED" in body
     assert WAITING in body
     assert marker_for(request_id) in body
-    _assert_one_current_ask_line(body)
+    assert body.rstrip("\n").splitlines()[-1] == ask
     assert body.count(ask) == 1
+    assert "comment on this pull request" not in body
+    assert "first 10 revisions" not in body
 
 
 def _assert_one_current_ask_line(body: str) -> None:
-    """Exactly one ask line, the current text, one blank line after the body text.
+    """Exactly one ask line, the current issue text, one blank line after the body.
 
     Anything after it is a platform annotation line; none may be an ask line.
     """
@@ -784,9 +788,11 @@ def _assert_one_current_ask_line(body: str) -> None:
     asks = [i for i, line in enumerate(lines) if line.startswith("Ask the factory:")]
     assert len(asks) == 1, body
     at = asks[0]
-    assert lines[at] == github_ask_line(MENTION)
+    assert lines[at] == "Ask the factory: comment on this issue and mention @curie."
+    assert lines[at] == github_ask_line(MENTION, "issue")
     assert lines[at - 1] == "" and lines[at - 2].strip()
-    assert f"mention @{MENTION} on this pull request" not in body
+    assert "comment on this pull request" not in body
+    assert "first 10 revisions" not in body
 
 
 def test_status_comment_replaces_the_previous_ask_wording(admitted: Any) -> None:  # noqa: F811
@@ -795,11 +801,11 @@ def test_status_comment_replaces_the_previous_ask_wording(admitted: Any) -> None
     _reconcile()
     body = _posts(sink)[0][1] or ""
     old = f"Ask the factory: mention @{MENTION} on this pull request."
-    seeded = body.replace(github_ask_line(MENTION), old)
-    assert old in seeded and github_ask_line(MENTION) not in seeded
+    seeded = body.replace(github_ask_line(MENTION, "issue"), old)
+    assert old in seeded and github_ask_line(MENTION, "issue") not in seeded
 
     # The real writer's last step, applied to a body carrying the old wording.
-    rewritten = factory_notices.append_github_ask_line(seeded, MENTION)
+    rewritten = factory_notices.append_github_ask_line(seeded, MENTION, "issue")
 
     assert old not in rewritten
     assert marker_for(request_id) in rewritten
@@ -886,7 +892,8 @@ def test_gitlab_and_bitbucket_status_comments_omit_the_ask_line(
     assert WAITING in body
     assert marker_for(request_id) in body
     assert "Ask the factory" not in body
-    assert github_ask_line(MENTION) not in body
+    assert github_ask_line(MENTION, "issue") not in body
+    assert github_ask_line(MENTION, "pull_request") not in body
 
 
 # --- 2: edited in place as phases advance --------------------------------------------
@@ -2814,6 +2821,15 @@ def test_a_running_pull_request_follow_up_hides_the_checklist_until_a_later_phas
     assert _READING in comment["body"]
     assert "Status: RUNNING" in comment["body"]
     assert _checklist_lines(comment["body"]) == []
+    assert (
+        comment["body"]
+        .rstrip()
+        .endswith(
+            "Ask the factory: comment on this pull request. "
+            "The first 10 revisions need no mention; after that, mention @curie."
+        )
+    )
+    assert "comment on this issue" not in comment["body"]
 
     assert report(client, revision, "read_issue").status_code == 201
     _execute(

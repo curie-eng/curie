@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 from curie_api.factory_card import HEIGHT, CardInput, render_card
-from curie_api.factory_comment_text import marker_for
+from curie_api.factory_comment_text import github_ask_line, marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
 from curie_api.factory_reply_target import is_issue_follow_up, is_relabel_objective
 from curie_api.forges.github.comments import GitHubMarkedComments, static_token
@@ -34,6 +34,18 @@ from curie_internal.factory_phase_view import PhaseSlot, PhaseView, StageSlot, p
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")
 CARD = "https://curie.example.com/v1/factory/cards/abc.svg"
 WAITING = "_Waiting for the agent to report progress._"
+
+
+def test_github_issue_ask_line_says_comment_on_this_issue() -> None:
+    issue = github_ask_line("curie", "issue")
+    pull = github_ask_line("curie", "pull_request")
+    assert issue == "Ask the factory: comment on this issue and mention @curie."
+    assert "first 10 revisions" not in issue
+    assert pull == (
+        "Ask the factory: comment on this pull request. "
+        "The first 10 revisions need no mention; after that, mention @curie."
+    )
+    assert "pull request" not in issue
 
 
 def _view(round_label: str | None = "round 1 of 3") -> PhaseView:

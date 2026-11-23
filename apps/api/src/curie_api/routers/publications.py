@@ -655,7 +655,7 @@ async def create_publication(
         # stays last. With no applied selection the ask line is last. GitHub only.
         mention = await _github_publication_mention(request, session, work_item_request_id)
         if mention is not None:
-            asked = append_github_ask_line(data.body or "", mention)
+            asked = append_github_ask_line(data.body or "", mention, "pull_request")
             if asked != (data.body or ""):
                 data = data.model_copy(update={"body": asked})
         # Last, from the acknowledged execution record (ADR 0278 section 6), and

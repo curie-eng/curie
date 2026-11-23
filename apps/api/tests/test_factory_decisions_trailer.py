@@ -86,23 +86,25 @@ CITED_BESIDE_NONE = f"{SUMMARY}## Decisions\n\n{NONE}\n{CITED_ONE}\n"
 
 def _producer_cases() -> list[dict[str, Any]]:
     """Bodies the platform text helpers publish, from agent text it never saw."""
-    once = append_github_ask_line(LAST, MENTION)
+    once = append_github_ask_line(LAST, MENTION, "pull_request")
     return [
         {"id": "ask-line-after-decisions-last", "agent_body": LAST, "published_body": once},
         {
             "id": "none-declaration-last",
             "agent_body": f"{SUMMARY}## Decisions\n\n{NONE}",
-            "published_body": append_github_ask_line(f"{SUMMARY}## Decisions\n\n{NONE}", MENTION),
+            "published_body": append_github_ask_line(
+                f"{SUMMARY}## Decisions\n\n{NONE}", MENTION, "pull_request"
+            ),
         },
         {
             "id": "reappended-published-body",
             "agent_body": LAST,
-            "published_body": append_github_ask_line(once, MENTION),
+            "published_body": append_github_ask_line(once, MENTION, "pull_request"),
         },
         {
             "id": "decisions-before-a-heading-is-untouched",
             "agent_body": BEFORE_HEADING,
-            "published_body": append_github_ask_line(BEFORE_HEADING, MENTION),
+            "published_body": append_github_ask_line(BEFORE_HEADING, MENTION, "pull_request"),
         },
         {
             # Named counterexample: a really malformed Decisions section stays
@@ -110,64 +112,66 @@ def _producer_cases() -> list[dict[str, Any]]:
             # launder it.
             "id": "malformed-decisions-last",
             "agent_body": MALFORMED,
-            "published_body": append_github_ask_line(MALFORMED, MENTION),
+            "published_body": append_github_ask_line(MALFORMED, MENTION, "pull_request"),
         },
         {
             "id": "near-break-line-last-stays-malformed",
             "agent_body": NEAR_BREAK,
-            "published_body": append_github_ask_line(NEAR_BREAK, MENTION),
+            "published_body": append_github_ask_line(NEAR_BREAK, MENTION, "pull_request"),
         },
         {
             # Named counterexample: dropping the agent's own ask-like line must not
             # turn this malformed section into a valid `None` declaration.
             "id": "ask-line-inside-decisions-stays-malformed",
             "agent_body": ASK_INSIDE,
-            "published_body": append_github_ask_line(ASK_INSIDE, MENTION),
+            "published_body": append_github_ask_line(ASK_INSIDE, MENTION, "pull_request"),
         },
         {
             "id": "existing-break-keeps-the-trailing-space-line",
             "agent_body": EXISTING_BREAK_LAST,
-            "published_body": append_github_ask_line(EXISTING_BREAK_LAST, MENTION),
+            "published_body": append_github_ask_line(EXISTING_BREAK_LAST, MENTION, "pull_request"),
         },
         {
             "id": "reviews-last-keeps-the-trailing-space-line",
             "agent_body": REVIEWS_LAST,
-            "published_body": append_github_ask_line(REVIEWS_LAST, MENTION),
+            "published_body": append_github_ask_line(REVIEWS_LAST, MENTION, "pull_request"),
         },
         {
             "id": "answered-citations-beside-entries",
             "agent_body": ANSWERED,
-            "published_body": append_github_ask_line(ANSWERED, MENTION),
+            "published_body": append_github_ask_line(ANSWERED, MENTION, "pull_request"),
         },
         {
             "id": "answered-citation-only",
             "agent_body": ANSWERED_ONLY,
-            "published_body": append_github_ask_line(ANSWERED_ONLY, MENTION),
+            "published_body": append_github_ask_line(ANSWERED_ONLY, MENTION, "pull_request"),
         },
         {
             "id": "citation-below-break-line-is-not-in-the-section",
             "agent_body": CITED_BELOW_BREAK,
-            "published_body": append_github_ask_line(CITED_BELOW_BREAK, MENTION),
+            "published_body": append_github_ask_line(CITED_BELOW_BREAK, MENTION, "pull_request"),
         },
         {
             "id": "citation-with-no-author-stays-malformed",
             "agent_body": CITED_NO_AUTHOR,
-            "published_body": append_github_ask_line(CITED_NO_AUTHOR, MENTION),
+            "published_body": append_github_ask_line(CITED_NO_AUTHOR, MENTION, "pull_request"),
         },
         {
             "id": "citation-with-blank-author-stays-malformed",
             "agent_body": CITED_NO_AUTHOR_BLANK,
-            "published_body": append_github_ask_line(CITED_NO_AUTHOR_BLANK, MENTION),
+            "published_body": append_github_ask_line(
+                CITED_NO_AUTHOR_BLANK, MENTION, "pull_request"
+            ),
         },
         {
             "id": "citation-prefix-without-its-space-stays-malformed",
             "agent_body": CITED_NO_SPACE,
-            "published_body": append_github_ask_line(CITED_NO_SPACE, MENTION),
+            "published_body": append_github_ask_line(CITED_NO_SPACE, MENTION, "pull_request"),
         },
         {
             "id": "citation-beside-none-declaration-stays-malformed",
             "agent_body": CITED_BESIDE_NONE,
-            "published_body": append_github_ask_line(CITED_BESIDE_NONE, MENTION),
+            "published_body": append_github_ask_line(CITED_BESIDE_NONE, MENTION, "pull_request"),
         },
     ]
 
@@ -250,21 +254,22 @@ def test_published_body_keeps_the_entries_the_agent_wrote(case: dict[str, Any]) 
             parse_decisions_section(published)
         return
     assert parse_decisions_section(published) == before
-    assert published.splitlines().count(github_ask_line(MENTION)) == 1
+    assert published.splitlines().count(github_ask_line(MENTION, "pull_request")) == 1
 
 
 def test_a_trailing_section_is_closed_by_exactly_the_text_all_readers_use() -> None:
     assert DECISIONS_SECTION_END == decisions_section.SECTION_END == "---"
     assert reproduction_gate.DECISIONS_END == DECISIONS_SECTION_END
-    assert append_github_ask_line("## Decisions\n\n" + TWO, MENTION).splitlines()[-3:] == [
+    closed = append_github_ask_line("## Decisions\n\n" + TWO, MENTION, "pull_request")
+    assert closed.splitlines()[-3:] == [
         "---",
         "",
-        github_ask_line(MENTION),
+        github_ask_line(MENTION, "pull_request"),
     ]
 
 
 def test_the_ask_line_alone_never_extends_a_section_that_is_not_last() -> None:
-    published = append_github_ask_line(BEFORE_HEADING, MENTION)
+    published = append_github_ask_line(BEFORE_HEADING, MENTION, "pull_request")
     assert DECISIONS_SECTION_END not in published.splitlines()
 
 
@@ -282,7 +287,7 @@ def test_a_citation_below_the_break_line_is_not_in_the_section() -> None:
     ids=["existing", "none"],
 )
 def test_the_agents_last_line_keeps_its_trailing_space(agent_body: str, breaks: int) -> None:
-    published = append_github_ask_line(agent_body, MENTION)
+    published = append_github_ask_line(agent_body, MENTION, "pull_request")
     lines = published.splitlines()
     assert "--- " in lines
     assert lines.count(DECISIONS_SECTION_END) == breaks
@@ -290,10 +295,10 @@ def test_the_agents_last_line_keeps_its_trailing_space(agent_body: str, breaks: 
 
 @pytest.mark.parametrize("case", _producer_cases(), ids=lambda case: case["id"])
 def test_reappending_is_idempotent(case: dict[str, Any]) -> None:
-    once = append_github_ask_line(case["published_body"], MENTION)
-    twice = append_github_ask_line(once, MENTION)
+    once = append_github_ask_line(case["published_body"], MENTION, "pull_request")
+    twice = append_github_ask_line(once, MENTION, "pull_request")
     assert twice == once
-    assert once.splitlines().count(github_ask_line(MENTION)) == 1
+    assert once.splitlines().count(github_ask_line(MENTION, "pull_request")) == 1
     assert once.splitlines().count(DECISIONS_SECTION_END) <= 1
 
 
@@ -317,7 +322,7 @@ def test_the_route_publishes_the_fixture_body_byte_for_byte(
     # The published body holds the closing reference, issue marker and ask line.
     assert f"Closes #{issue}" in lines
     assert marker in lines
-    assert github_ask_line("curie") in lines
+    assert github_ask_line("curie", "pull_request") in lines
     if case_id in ROUTE_BREAKS:
         assert lines.count(DECISIONS_SECTION_END) == ROUTE_BREAKS[case_id]
         # The agent's last line keeps its trailing space.
