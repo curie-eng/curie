@@ -841,7 +841,7 @@ install of Curie on the same cluster (which normally means two releases
 sharing the default name `curie` in different namespaces), tearing one down
 never touches the other's namespaces.
 
-The sweep waits at most 300 seconds. If an owned namespace is still present,
+The sweep waits at most 300s, plus up to 300s more while only namespace-controller objects (events, endpoints, endpoint slices, kube-root-ca.crt) remain. If an owned namespace is still present,
 the command exits 3 and names the namespace, its phase, its conditions, and
 the remaining objects. It does not remove finalizers or finalize the
 namespace. Rerunning is safe.
@@ -2729,6 +2729,8 @@ identifiers and a generation only, never a credential.
 `curie <tier> work-items --json` carries the same four fields,
 and the human detail view prints one `auth` line.
 
+Each item also reports `memory_rules`, the learned rules pinned when the work item was admitted: `state`, `count`, `rule_numbers`, `sha256` and `format_version`, never the rule text. `curie <tier> work-items --json` (schema `work-items/v2.3`) prints it for the list and for one item, and the Console work item detail lists the pinned rules with their text.
+
 Each item also reports its automatic retry allowance:
 `automatic_retries_used` (owner loss and ordinary failures together) and
 `automatic_retry_limit` (2). Each request reports its retry facts:
@@ -3111,7 +3113,12 @@ The routes:
 1. `GET /agents/{agent_id}/memory/rules` lists the agent's `proposed`,
    `accepted`, `rejected` and `removed` rules, ordered by scope and number,
    with each scope's `in_force_count` (its accepted rules) and
-   `in_force_limit`. It takes the platform key or a console session, like the
+   `in_force_limit`. For a principal's console session each scope also carries
+   `can_decide`, computed by the same check a decision makes: `true`, `false`
+   (`memory_rules.write_access_required`), or `null` when it cannot be known
+   (the platform key, or a code host that cannot be reached or verified). The
+   code host is read once per repository scope, never per rule, and a decision
+   still checks again when it is made. It takes the platform key or a console session, like the
    rest of the memory API. A principal's console session sees only its own
    tenant's agents: another tenant's agent is 404 `memory_rules.not_found`,
    whatever the filter. Filter with `state`, `scope_kind` and `scope_key`;

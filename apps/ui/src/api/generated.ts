@@ -10525,6 +10525,11 @@ export interface components {
         };
         /** MemoryRuleScopeOut */
         MemoryRuleScopeOut: {
+            /**
+             * Can Decide
+             * @description Whether the requesting person could accept, dismiss or remove a rule of this scope right now, by the same check a decision makes. `false`: the check refused with `memory_rules.write_access_required`. `null`: not known (a request that is not a principal's console session, a code host that cannot be reached or verified). The decision routes still check at click time.
+             */
+            can_decide: boolean | null;
             /** In Force Count */
             in_force_count: number;
             /** Scope Key */

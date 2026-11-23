@@ -98,6 +98,12 @@ export function refusalText(
   return error instanceof Error ? error.message : String(error);
 }
 
+// The reason shown beside controls the API says this person cannot use. The
+// decision routes still check at click time and keep their own refusal text.
+export function cannotDecideReason(repository: string): string {
+  return `You cannot merge to ${repository}, so you cannot decide its rules. Link your code host account if you can.`;
+}
+
 function repositoryScopes(rules: readonly MemoryRule[]): RepositoryScope[] {
   const seen = new Map<string, RepositoryScope>();
   for (const r of rules) {
@@ -244,6 +250,13 @@ function MemoryBody({
 
   const scopes = useMemo(() => repositoryScopes(data?.rules ?? []), [data]);
   const scope = scopes.find((s) => s.key === scopeKey) ?? scopes[0];
+  // Only an explicit `false` disables the controls; `true` and `null` (not known)
+  // leave them live, and the server still checks when one is clicked.
+  const blockedReason =
+    scope &&
+    data?.scopes?.find((s) => s.scope_kind === "repository" && s.scope_key === scope.key)?.can_decide === false
+      ? cannotDecideReason(scope.label)
+      : null;
   const inScope = (data?.rules ?? []).filter(
     (r) => r.scope_kind === "repository" && r.scope_key === scope?.key,
   );
@@ -385,15 +398,18 @@ function MemoryBody({
                         label="Accept"
                         variant="primary"
                         size="sm"
-                        disabled={busy.has(rule.id)}
+                        disabled={busy.has(rule.id) || blockedReason !== null}
+                        title={blockedReason ?? undefined}
                         onClick={() => void act("accept", rule)}
                       />
                       <Button
                         label="Dismiss"
                         size="sm"
-                        disabled={busy.has(rule.id)}
+                        disabled={busy.has(rule.id) || blockedReason !== null}
+                        title={blockedReason ?? undefined}
                         onClick={() => void act("reject", rule)}
                       />
+                      <BlockedReason reason={blockedReason} />
                     </div>
                   </RuleCard>
                 ))}
@@ -411,9 +427,11 @@ function MemoryBody({
                         label="Remove"
                         variant="danger"
                         size="sm"
-                        disabled={busy.has(rule.id)}
+                        disabled={busy.has(rule.id) || blockedReason !== null}
+                        title={blockedReason ?? undefined}
                         onClick={() => void act("remove", rule)}
                       />
+                      <BlockedReason reason={blockedReason} />
                     </div>
                   </RuleCard>
                 ))}
@@ -425,6 +443,14 @@ function MemoryBody({
       )}
     </>
   );
+}
+
+function BlockedReason({ reason }: { reason: string | null }) {
+  return reason ? (
+    <span data-testid="memory-rule-blocked" style={meta}>
+      {reason}
+    </span>
+  ) : null;
 }
 
 function RuleSection({

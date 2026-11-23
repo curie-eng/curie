@@ -51,6 +51,7 @@ from curie_runner.usage_report import UsageReporter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from curie_api import factory_usage
 from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER
 from curie_api.factory_usage import OpenRouterPriceBook, Price, get_price_book, match_price
@@ -428,6 +429,54 @@ def test_the_terminal_comment_states_the_split_above_the_final_marker(priced: An
     assert cause == ["Cause: runner_escalated"]
 
 
+def test_terminal_comments_report_only_their_execution_request_usage(priced: Any) -> None:
+    client, github, sink, _book = priced
+    first = _admit(client, github, sink, 9639)
+    work_item_id = _request(9639)["work_item_id"]
+    _reconcile()
+    first_epoch = _start_running(client, first)
+    assert _usage(client, first, STANDARD).status_code == 201
+    _finish_failed(client, first, first_epoch, "ci_failed")
+    _reconcile()
+
+    (first_comment,) = _marked(sink, first)
+    assert [line for line in first_comment["body"].splitlines() if line.startswith("Usage:")] == [
+        USAGE_LINE
+    ]
+
+    second = _second_request(work_item_id, first)
+    second_epoch = _start_running(client, second)
+    assert _usage(client, second, [_entry(IMPLEMENTER, 20_000, 5_000)]).status_code == 201
+    _finish_failed(client, second, second_epoch, "runner_escalated")
+    _reconcile()
+
+    (second_comment,) = _marked(sink, second)
+    (usage,) = [line for line in second_comment["body"].splitlines() if line.startswith("Usage:")]
+    assert usage == (
+        "Usage: implementer 25,000 tokens ($0.03), "
+        f"total $0.03 (estimated from {SOURCE} prices as of 2026-09-01)"
+    )
+
+    async def check_first_request_usage() -> None:
+        async with client.app.state.sessionmaker() as session:
+            first_usage = await factory_usage.request_usage(session, first)
+        assert {name: role.tokens for name, role in first_usage.roles.items()} == {
+            "implementer": 1_500_000,
+            "reviewer": 300_000,
+        }
+
+    client.portal.call(check_first_request_usage)
+
+    headers = {"X-API-Key": get_settings().api_key}
+    response = client.get(f"/work-items/{work_item_id}/usage", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total_tokens"] == 1_825_000
+    assert body["roles"]["implementer"]["tokens"] == 1_525_000
+    assert body["roles"]["reviewer"]["tokens"] == 300_000
+    assert _money(body["estimated_cost_usd"]) == Decimal("2.43")
+
+
 def test_an_unpriced_role_says_cost_unknown(priced: Any) -> None:
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9612)
@@ -523,11 +572,8 @@ def test_one_model_in_two_roles_is_stored_twice_and_aggregated_by_role(priced: A
 #
 # Pinned: GET /work-items/{id}/usage returns ``requests_without_usage``, the count
 # of the work item's requests with ``started_at`` set and no usage rows;
-# ``cost_complete`` is false when it is > 0. The terminal Usage line then ends
-# with ", usage not reported for N run" (N == 1) / "runs" (N > 1), placed after
-# the price source parenthetical.
-
-MISSING_SUFFIX = ", usage not reported for 1 run"
+# ``cost_complete`` is false when it is > 0. Each terminal Usage line counts
+# only its own request.
 
 
 def test_a_started_request_with_no_usage_is_not_a_complete_zero(priced: Any) -> None:
@@ -570,10 +616,11 @@ def test_the_terminal_line_names_runs_that_reported_no_usage(priced: Any) -> Non
 
     _finish_failed(client, second, epoch2, "runner_escalated")
     _reconcile()
+    (first_comment,) = _marked(sink, first)
+    assert "Usage: not reported for 1 run" in first_comment["body"].splitlines()
     (comment,) = _marked(sink, second)
     (usage,) = [line for line in comment["body"].splitlines() if line.startswith("Usage:")]
-    assert usage.endswith(MISSING_SUFFIX), usage
-    assert "total at least $2.40" in usage
+    assert usage == USAGE_LINE
 
 
 @pytest.mark.parametrize("include_reviewer_totals", [True, False])

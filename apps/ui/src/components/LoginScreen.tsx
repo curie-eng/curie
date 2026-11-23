@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { C, R } from "../tokens";
 import { Button, Card, CliHint, cliCommand } from "../primitives";
 import { API_PREFIX } from "../api/config";
@@ -57,6 +57,18 @@ export function organizationSignInHref(pathname: string): string {
   return href;
 }
 
+// The CLI mints codes with Python's `secrets.token_urlsafe`, so a real code is
+// only URL-safe base64 characters. Anything else (an email address, a URL, a
+// sentence, a key with punctuation) was pasted by someone who took the box for
+// a different sign-in and is told so before any request is sent.
+const LOGIN_CODE_FORMAT = /^[A-Za-z0-9_-]+$/;
+
+function notACodeMessage(orgSignIn: boolean): string {
+  return orgSignIn
+    ? 'That is not a sign-in code. A one-time sign-in code from the Curie CLI was expected. To sign in with your account, use "Sign in with your organization" above.'
+    : "That is not a sign-in code. A one-time sign-in code from the Curie CLI was expected.";
+}
+
 function describeFailure(e: unknown): string {
   if (e instanceof ApiError) {
     if (e.status === 401) return e.message;
@@ -78,6 +90,19 @@ export function LoginScreen({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [oidc, setOidc] = useState(false);
+  const orgLink = useRef<HTMLAnchorElement>(null);
+  const codeInput = useRef<HTMLInputElement>(null);
+
+  // Organization sign-in is the primary action when it is configured, so it
+  // takes focus from the code box once the methods answer, unless the person
+  // has already started typing a code.
+  useEffect(() => {
+    if (!oidc) return;
+    const active = document.activeElement;
+    if (active === document.body || (active === codeInput.current && !codeInput.current?.value)) {
+      orgLink.current?.focus();
+    }
+  }, [oidc]);
 
   useEffect(() => {
     let live = true;
@@ -97,6 +122,10 @@ export function LoginScreen({
     const trimmed = code.trim();
     if (!trimmed) {
       setError("Enter a login code minted by the Curie CLI.");
+      return;
+    }
+    if (!LOGIN_CODE_FORMAT.test(trimmed)) {
+      setError(notACodeMessage(oidc));
       return;
     }
     setBusy(true);
@@ -124,8 +153,9 @@ export function LoginScreen({
       <Card>
         <h1 style={{ fontSize: 19, fontWeight: 500, color: C.text, margin: "0 0 6px" }}>Sign in to Curie Console</h1>
         <p style={{ fontSize: 13, color: C.muted, margin: "0 0 16px", lineHeight: 1.5 }}>
-          The console never handles the platform key. Mint a single-use login code with the Curie CLI and paste it
-          below.
+          {oidc
+            ? "Sign in with your organization account. The console never handles the platform key."
+            : "The console never handles the platform key. Mint a single-use login code with the Curie CLI and paste it below."}
         </p>
 
         {notice ? (
@@ -145,6 +175,40 @@ export function LoginScreen({
           </div>
         ) : null}
 
+        {oidc ? (
+          <a
+            ref={orgLink}
+            href={organizationSignInHref(window.location.pathname)}
+            data-testid="console-oidc-sign-in"
+            style={{
+              display: "block",
+              boxSizing: "border-box",
+              width: "100%",
+              textAlign: "center",
+              marginBottom: 18,
+              padding: "9px 14px",
+              borderRadius: 7,
+              background: C.brand,
+              border: "1px solid " + C.brand,
+              color: "#08120c",
+              fontSize: 13.5,
+              fontWeight: 600,
+              textDecoration: "none",
+            }}
+          >
+            Sign in with your organization
+          </a>
+        ) : null}
+
+        {oidc ? (
+          <p
+            data-testid="console-login-code-heading"
+            style={{ fontSize: 12.5, color: C.muted, margin: "0 0 10px", lineHeight: 1.5 }}
+          >
+            Or use a one-time code from the Curie CLI.
+          </p>
+        ) : null}
+
         <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 16 }}>
           <HintRow label="Local stack" command={cliCommand("local.console.login", { subject: EXAMPLE_SUBJECT })}>
             <CliHint command={cliCommand("local.console.login", { subject: EXAMPLE_SUBJECT })} />
@@ -154,22 +218,6 @@ export function LoginScreen({
           </HintRow>
         </div>
 
-        {oidc ? (
-          <a
-            href={organizationSignInHref(window.location.pathname)}
-            data-testid="console-oidc-sign-in"
-            style={{
-              display: "block",
-              marginBottom: 14,
-              color: C.link,
-              fontSize: 13.5,
-              fontWeight: 500,
-            }}
-          >
-            Sign in with your organization
-          </a>
-        ) : null}
-
         <form onSubmit={onSubmit} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <input
             aria-label="login code"
@@ -178,7 +226,8 @@ export function LoginScreen({
             placeholder="Login code"
             autoComplete="one-time-code"
             spellCheck={false}
-            autoFocus
+            ref={codeInput}
+            autoFocus={!oidc}
             style={{
               background: C.input,
               border: "1px solid " + C.borderStrong,
@@ -198,7 +247,7 @@ export function LoginScreen({
           ) : null}
           <Button
             label={busy ? "Signing in…" : "Sign in"}
-            variant="primary"
+            variant={oidc ? "secondary" : "primary"}
             full
             testId="console-login-submit"
             disabled={busy}

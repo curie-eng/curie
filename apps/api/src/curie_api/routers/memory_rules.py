@@ -349,8 +349,39 @@ def _session_principal(actor: AdministrativeActor) -> uuid.UUID | None:
     return uuid.UUID(value) if kind == "principal" else None
 
 
+async def _can_decide(
+    session: AsyncSession,
+    client: httpx.AsyncClient,
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID | None,
+    scope: tuple[str, str],
+    label: str,
+) -> bool | None:
+    """Whether the requesting principal could decide a rule of this scope now.
+
+    Computed by the decision's own check (:func:`_check_scope`): True when it
+    passes, False when the refusal is ``write_access_required``, and None when
+    it cannot be known: the platform key or a session bound to no principal,
+    a code host that cannot be reached or verified, or a rule store error.
+    """
+
+    if principal_id is None:
+        return None
+    try:
+        await _check_scope(session, client, tenant_id, principal_id, scope[0], scope[1], label)
+    except HTTPException as refusal:
+        detail = refusal.detail
+        code = detail.get("code") if isinstance(detail, dict) else None
+        return False if code == "memory_rules.write_access_required" else None
+    except DBAPIError:
+        await session.rollback()
+        return None
+    return True
+
+
 @router.get("/{agent_id}/memory/rules", response_model=MemoryRulesOut, responses=_LIST_RESPONSES)
 async def list_rules(
+    request: Request,
     agent_id: uuid.UUID,
     session: SessionDep,
     actor: AdministratorDep,
@@ -390,6 +421,13 @@ async def list_rules(
     except DBAPIError:
         await session.rollback()
         raise _refusal("unavailable") from None
+    client: httpx.AsyncClient = request.app.state.http_client
+    # Once per scope, never per rule. Run after the reads above: a repository
+    # scope's check reads the code host and ends the transaction.
+    can_decide = {
+        scope: await _can_decide(session, client, agent_tenant, principal_id, scope, label)
+        for scope, label in labels.items()
+    }
     return MemoryRulesOut(
         rules=rules,
         scopes=[
@@ -398,6 +436,7 @@ async def list_rules(
                 scope_key=key,
                 scope_label=label,
                 in_force_count=counts.get((kind, key), 0),
+                can_decide=can_decide[(kind, key)],
             )
             for (kind, key), label in labels.items()
         ],
@@ -553,6 +592,25 @@ async def _check(
     if found is None:
         raise _refusal("not_found")
     scope_kind, scope_key, scope_label = found
+    return await _check_scope(
+        session, client, tenant_id, principal_id, scope_kind, scope_key, scope_label
+    )
+
+
+async def _check_scope(
+    session: AsyncSession,
+    client: httpx.AsyncClient,
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    scope_kind: str,
+    scope_key: str,
+    scope_label: str,
+) -> _Checked:
+    """The decision check of one scope: nothing for an agent or binding scope,
+    and for a repository scope the principal's linked account and the code host's
+    answer on write access. Raises the refusal a decision would answer. The one
+    check behind both a decision and the list's ``can_decide``."""
+
     if scope_kind != "repository":
         await session.rollback()
         return _Checked(tenant_id, principal_id, scope_kind, scope_key, None, None)

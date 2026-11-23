@@ -262,4 +262,79 @@ describe("LoginScreen (#1047)", () => {
     });
     expect(screen.queryByTestId("console-oidc-sign-in")).not.toBeInTheDocument();
   });
+
+  describe("which sign-in leads", () => {
+    const ORG_NOT_CODE =
+      'That is not a sign-in code. A one-time sign-in code from the Curie CLI was expected. To sign in with your account, use "Sign in with your organization" above.';
+
+    it("focuses the code box and shows no organization link when oidc is off", async () => {
+      respond(() => ok());
+      renderLogin();
+      expect(screen.getByLabelText("login code")).toHaveFocus();
+      expect(screen.getByTestId("console-login-submit")).toHaveStyle({ background: "#3ecf8e" });
+      expect(screen.queryByTestId("console-oidc-sign-in")).not.toBeInTheDocument();
+    });
+
+    it("moves focus to organization sign-in, which precedes the code form, once oidc is on", async () => {
+      fetchMock.mockResolvedValue(json(200, { oidc: true }));
+      renderLogin();
+      const link = await screen.findByTestId("console-oidc-sign-in");
+      await waitFor(() => expect(link).toHaveFocus());
+      expect(screen.getByLabelText("login code")).not.toHaveFocus();
+      expect(link.compareDocumentPosition(screen.getByLabelText("login code")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(screen.getByTestId("console-login-code-heading")).toHaveTextContent("Or use a one-time code");
+    });
+
+    it("does not steal focus from a code the person already started typing", async () => {
+      let answer!: (r: Response) => void;
+      fetchMock.mockImplementation(
+        () =>
+          new Promise<Response>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      renderLogin();
+      await userEvent.type(screen.getByLabelText("login code"), "abc");
+      answer(json(200, { oidc: true }));
+      await screen.findByTestId("console-oidc-sign-in");
+      expect(screen.getByLabelText("login code")).toHaveFocus();
+    });
+
+    it("keeps the code exchange working beside organization sign-in", async () => {
+      fetchMock.mockImplementation((input: string) =>
+        Promise.resolve(input === "/api/console/sign-in-methods" ? json(200, { oidc: true }) : ok()),
+      );
+      const { onSignedIn } = renderLogin();
+      await screen.findByTestId("console-oidc-sign-in");
+      await submitCode("one-time-example-code");
+      await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1));
+      expect(postedCodes()).toEqual(["one-time-example-code"]);
+    });
+
+    it.each([
+      ["an email address", "someone@example.com"],
+      ["a URL", "https://idp.example.com/authorize?code=1"],
+      ["a sentence", "my sign in code"],
+    ])("says a sign-in code was expected and points to organization sign-in when %s is pasted", async (_l, pasted) => {
+      fetchMock.mockImplementation((input: string) =>
+        Promise.resolve(input === "/api/console/sign-in-methods" ? json(200, { oidc: true }) : badCode()),
+      );
+      const { onSignedIn } = renderLogin();
+      await screen.findByTestId("console-oidc-sign-in");
+      await submitCode(pasted);
+      expect(await screen.findByTestId("console-login-error")).toHaveTextContent(ORG_NOT_CODE);
+      expect(postedCodes()).toEqual([]);
+      expect(onSignedIn).not.toHaveBeenCalled();
+    });
+
+    it("does not point to organization sign-in when none is configured", async () => {
+      respond(() => badCode());
+      renderLogin();
+      await submitCode("someone@example.com");
+      const error = await screen.findByTestId("console-login-error");
+      expect(error).toHaveTextContent("That is not a sign-in code. A one-time sign-in code from the Curie CLI was expected.");
+      expect(error).not.toHaveTextContent("organization");
+      expect(postedCodes()).toEqual([]);
+    });
+  });
 });

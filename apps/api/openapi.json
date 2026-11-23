@@ -12438,6 +12438,18 @@
       },
       "MemoryRuleScopeOut": {
         "properties": {
+          "can_decide": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the requesting person could accept, dismiss or remove a rule of this scope right now, by the same check a decision makes. `false`: the check refused with `memory_rules.write_access_required`. `null`: not known (a request that is not a principal's console session, a code host that cannot be reached or verified). The decision routes still check at click time.",
+            "title": "Can Decide"
+          },
           "in_force_count": {
             "title": "In Force Count",
             "type": "integer"
@@ -12464,7 +12476,8 @@
           "scope_kind",
           "scope_key",
           "scope_label",
-          "in_force_count"
+          "in_force_count",
+          "can_decide"
         ],
         "title": "MemoryRuleScopeOut",
         "type": "object"
