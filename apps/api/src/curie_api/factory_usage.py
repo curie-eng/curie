@@ -5,8 +5,8 @@ The runner reports each model's tokens at turn end over the request-bound
 an estimate priced from a public model price list when one matches. A model
 with no price keeps its tokens and no estimate, so the cost is never a guess.
 
-Reads sum every request of a WorkItem (retries and CI-fix rounds are requests
-on it) for the operator route and the terminal status comment's usage line.
+The operator route sums every request of a WorkItem, including retries and
+CI-fix rounds. A terminal status comment sums only its own execution request.
 
 Prices: OpenRouter's public model list, https://openrouter.ai/docs/api-reference/list-available-models
 (per-token USD strings under ``pricing``).
@@ -19,6 +19,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -330,6 +331,43 @@ async def work_item_usage(session: AsyncSession, work_item_id: uuid.UUID) -> Wor
             .order_by(ExecutionRequest.sequence, ExecutionRequestModelUsage.id)
         )
     )
+    # A started run with no usage row reported nothing.
+    reported = select(ExecutionRequestModelUsage.execution_request_id).distinct()
+    missing = (
+        await session.scalar(
+            select(func.count())
+            .select_from(ExecutionRequest)
+            .where(
+                ExecutionRequest.work_item_id == work_item_id,
+                ExecutionRequest.started_at.is_not(None),
+                ExecutionRequest.id.not_in(reported),
+            )
+        )
+        or 0
+    )
+    return _rollup_usage(work_item_id, rows, missing)
+
+
+async def request_usage(session: AsyncSession, request_id: uuid.UUID) -> WorkItemUsageOut:
+    """Usage summed over all reported turns of one execution request."""
+
+    request = await session.get_one(ExecutionRequest, request_id)
+    rows = (
+        await session.scalars(
+            select(ExecutionRequestModelUsage)
+            .where(ExecutionRequestModelUsage.execution_request_id == request_id)
+            .order_by(ExecutionRequestModelUsage.id)
+        )
+    ).all()
+    missing = int(request.started_at is not None and not rows)
+    return _rollup_usage(request.work_item_id, rows, missing)
+
+
+def _rollup_usage(
+    work_item_id: uuid.UUID,
+    rows: Iterable[ExecutionRequestModelUsage],
+    requests_without_usage: int,
+) -> WorkItemUsageOut:
     roles: dict[str, WorkItemUsageRole] = {}
     models: dict[tuple[str, str], WorkItemUsageModel] = {}
     requests: dict[uuid.UUID, WorkItemUsageRequest] = {}
@@ -367,26 +405,12 @@ async def work_item_usage(session: AsyncSession, work_item_id: uuid.UUID) -> Wor
             seen = sources.get(row.price_source)
             if seen is None or row.price_as_of > seen:
                 sources[row.price_source] = row.price_as_of
-    # A started run with no usage row reported nothing: not a zero.
-    reported = select(ExecutionRequestModelUsage.execution_request_id).distinct()
-    missing = (
-        await session.scalar(
-            select(func.count())
-            .select_from(ExecutionRequest)
-            .where(
-                ExecutionRequest.work_item_id == work_item_id,
-                ExecutionRequest.started_at.is_not(None),
-                ExecutionRequest.id.not_in(reported),
-            )
-        )
-        or 0
-    )
     return WorkItemUsageOut(
         work_item_id=work_item_id,
         total_tokens=sum(role.tokens for role in roles.values()),
         estimated_cost_usd=total,
-        cost_complete=complete and missing == 0,
-        requests_without_usage=missing,
+        cost_complete=complete and requests_without_usage == 0,
+        requests_without_usage=requests_without_usage,
         roles=roles,
         models=list(models.values()),
         requests=list(requests.values()),

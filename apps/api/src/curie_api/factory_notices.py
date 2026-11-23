@@ -77,7 +77,7 @@ from .factory_run_handoff import (
     safe_tracker_line,
 )
 from .factory_tracker_attention import live_lines
-from .factory_usage import format_usd, usage_line, work_item_usage
+from .factory_usage import format_usd, request_usage, usage_line
 from .forges.capabilities import Operation, Support
 from .forges.errors import ForgeError, NotFound, Unauthorized
 from .forges.github.comments import static_token
@@ -1522,15 +1522,7 @@ async def _render(
                 )
                 is None
             )
-            usage = await work_item_usage(session, work_item.id)
-            run_cost_usd = next(
-                (
-                    entry.estimated_cost_usd
-                    for entry in usage.requests
-                    if entry.request_id == request.id
-                ),
-                None,
-            )
+            usage = await request_usage(session, request.id)
             result = result_section(
                 cause,
                 pr_url=pr_url,
@@ -1548,7 +1540,7 @@ async def _render(
                 successor=successor,
                 retries_used=retries_used,
                 blocked_on=request.blocked_on,
-                run_cost_usd=run_cost_usd,
+                run_cost_usd=usage.estimated_cost_usd,
                 question_round=(
                     await asked_round(session, work_item.id, request.id)
                     if cause == QUESTIONS_ASKED
@@ -1567,8 +1559,7 @@ async def _render(
             ):
                 state = "closed without merging" if pr_state == "closed" else pr_state
                 result += f"Pull request: {pr_url} ({state})\n"
-            # Tokens and estimated cost over every round of the work item
-            # (#3223), after the Cause line so its parse is unchanged.
+            # This request's usage follows the Cause line.
             line = usage_line(usage)
             if line is not None:
                 separator = "\n\n" if result.endswith("\n\n") else "\n"
