@@ -104,6 +104,32 @@ def _previous_start_failure(req: ExecutionRequest) -> str:
     return f"; previous start failure: {detail}" if detail else ""
 
 
+def _merged_completion(
+    req: ExecutionRequest | None, lineage: ThreadPublicationLineage | None
+) -> bool:
+    """Whether this request is the run that merged its own pull request.
+
+    The merge stamp is the lineage's ``updated_at``. A request admitted after
+    that stamp, or one that finished for another cause, is a later run that
+    still points at the merged pull request. A lineage with no stamp skips the
+    time check.
+    """
+
+    if (
+        req is None
+        or lineage is None
+        or req.status != "completed"
+        or req.terminal_cause != "completed"
+        or lineage.status != "merged"
+        or lineage.pr_number is None
+    ):
+        return False
+    merged_at = lineage.updated_at
+    if merged_at is not None and (req.created_at is None or req.created_at > merged_at):
+        return False
+    return True
+
+
 def _cause(
     state: WorkItemOutcomeState,
     req: ExecutionRequest | None,
@@ -255,7 +281,7 @@ def _cause(
         )
     if state == "published":
         assert lineage is not None
-        if lineage.status == "merged" and req is not None and req.status == "completed":
+        if _merged_completion(req, lineage):
             closed = " and closed the issue" if issue_closed else ""
             return f"completed: pull request #{lineage.pr_number} merged{closed}"
         return f"pull request #{lineage.pr_number} opened; CI and review are the next signals"
@@ -339,13 +365,7 @@ def derive_outcome(
     elif req.status == "running":
         state = "running"
     elif req.status == "cancelled" or (
-        item.cancelled_at is not None
-        and not (
-            req.status == "completed"
-            and lineage is not None
-            and lineage.status == "merged"
-            and lineage.pr_number is not None
-        )
+        item.cancelled_at is not None and not _merged_completion(req, lineage)
     ):
         state = "cancelled"
     elif req.status == "expired":

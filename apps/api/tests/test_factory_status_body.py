@@ -114,9 +114,10 @@ def test_github_issue_ask_line_says_comment_on_this_issue() -> None:
     issue = github_ask_line("curie", "issue")
     pull = github_ask_line("curie", "pull_request")
     assert issue == (
-        "Ask the factory: comment on this issue. "
-        "The first 10 revisions need no mention; after that, mention @curie."
+        "Ask the factory: comment on this issue and mention @curie. "
+        "Outside an open question, a comment with no mention starts nothing."
     )
+    assert "first 10 revisions" not in issue
     assert pull == (
         "Ask the factory: comment on this pull request. "
         "The first 10 revisions need no mention; after that, mention @curie."

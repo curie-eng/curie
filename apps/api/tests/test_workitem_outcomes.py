@@ -1625,7 +1625,13 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
     work_item_id = uuid.uuid4()
 
     def outcome(
-        status: str, cause: str, lineage_status: str, *, cancelled: bool
+        status: str,
+        cause: str,
+        lineage_status: str,
+        *,
+        cancelled: bool,
+        admitted_at: datetime | None = None,
+        merged_at: datetime | None = None,
     ) -> workitem_outcomes.WorkItemOutcomeOut:
         item = WorkItem(
             id=work_item_id,
@@ -1659,7 +1665,7 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
             terminal_at=now,
             terminal_cause=cause,
             termination_observation=None,
-            created_at=now,
+            created_at=now if admitted_at is None else admitted_at,
             capacity_deferrals=0,
             last_deferral_reason=None,
             last_start_failure_detail=None,
@@ -1677,6 +1683,7 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
             pr_url=PR_URL,
             status=lineage_status,
             head_sha="a" * 40,
+            updated_at=merged_at,
         )
         return derive_outcome(
             item,
@@ -1689,12 +1696,12 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
             issue_url="https://github.com/curie-eng/curie/issues/5296",
         )
 
-    merged = outcome("completed", "completed", "merged", cancelled=True)
+    merged = outcome("completed", "completed", "merged", cancelled=True, merged_at=now)
     assert merged.state == "published"
     assert merged.actionable_cause == (
         f"completed: pull request #{PR_NUMBER} merged and closed the issue"
     )
-    recorded = outcome("completed", "completed", "merged", cancelled=False)
+    recorded = outcome("completed", "completed", "merged", cancelled=False, merged_at=now)
     assert recorded.state == "published"
     assert recorded.actionable_cause == f"completed: pull request #{PR_NUMBER} merged"
     closed = outcome("completed", "completed", "closed", cancelled=True)
@@ -1707,6 +1714,22 @@ def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -
     assert later.state == "cancelled"
     assert later.actionable_cause.startswith("cancelled:")
     assert "completed:" not in later.actionable_cause
+    asked = outcome("completed", "questions_asked", "merged", cancelled=True, merged_at=now)
+    assert asked.state == "cancelled"
+    assert not asked.actionable_cause.startswith("completed:")
+    still_open = outcome("completed", "questions_asked", "merged", cancelled=False, merged_at=now)
+    assert still_open.state == "published"
+    assert not still_open.actionable_cause.startswith("completed:")
+    after_merge = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        admitted_at=now,
+        merged_at=now - timedelta(seconds=1),
+    )
+    assert after_merge.state == "cancelled"
+    assert not after_merge.actionable_cause.startswith("completed:")
 
 
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:

@@ -849,6 +849,14 @@ def completed_proof() -> Any:
     )
 
 
+def is_waiting_on_answers(
+    status: str, terminal_cause: str | None, cancelled_at: datetime | None
+) -> bool:
+    """A finished questions run whose issue is still open."""
+
+    return status == "completed" and terminal_cause == QUESTIONS_ASKED and cancelled_at is None
+
+
 def _admitted_before_merge_sql() -> Any:
     """Whether the request was admitted before its WorkItem's pull request merged.
 
@@ -1654,11 +1662,7 @@ async def _render(
         report.phase not in _EARLY_FOLLOW_UP_PHASES for report in reports
     ):
         progress_line = _READING_PULL_REQUEST
-    waiting_on_answers = (
-        cause == QUESTIONS_ASKED
-        and request.status == "completed"
-        and work_item.cancelled_at is None
-    )
+    waiting_on_answers = is_waiting_on_answers(request.status, cause, work_item.cancelled_at)
     pill_label, _color, _live = pill_for(
         request.status,
         publishing,

@@ -28,7 +28,7 @@ from sqlalchemy import select
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card
-from ..factory_notices import cause_text, retry_successor
+from ..factory_notices import cause_text, is_waiting_on_answers, retry_successor
 from ..factory_progress import (
     PROGRESS_SCOPE,
     ProgressReport,
@@ -37,7 +37,6 @@ from ..factory_progress import (
     record_run_handoff,
     record_verification,
 )
-from ..factory_questions import QUESTIONS_ASKED
 from ..factory_run_handoff import RunHandoff
 from ..factory_usage import PriceBook, UsageReport, get_price_book, record_usage
 from ..models import (
@@ -228,10 +227,8 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             status=request.status,
             publishing=publishing,
             retrying=retrying,
-            waiting_on_answers=(
-                request.status == "completed"
-                and terminal == QUESTIONS_ASKED
-                and work_item.cancelled_at is None
+            waiting_on_answers=is_waiting_on_answers(
+                request.status, terminal, work_item.cancelled_at
             ),
             started_at=request.started_at,
             terminal_at=request.terminal_at,

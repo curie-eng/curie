@@ -228,6 +228,17 @@ def _status_body(sink: Any, request_id: uuid.UUID) -> str:
     return str(comment["body"])
 
 
+def _card_svg(client: Any, request_id: uuid.UUID) -> str:
+    rows = _rows(
+        "SELECT card_token FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
+        {"id": request_id},
+    )
+    token = rows[0]["card_token"]
+    response = client.get(f"/v1/factory/cards/{token}.svg")
+    assert response.status_code == 200, response.text
+    return response.text
+
+
 def _state_labels(sink: Any, number: int) -> set[str]:
     return sink.issue_labels.get(number, set()) & STATE_LABELS
 
@@ -343,9 +354,14 @@ def test_status_comment_names_the_round_and_carries_the_questions_label(
 
     body = _status_body(sink, job.request_id)
     assert "Questions asked (round 1 of 3). Answer in a plain comment on this ticket." in body
+    assert "Status: WAITING ON ANSWERS" in body
     assert "Status: NEEDS HUMAN" not in body
     assert "Could not complete" not in body
     assert _state_labels(sink, 921) == {QUESTIONS_LABEL}
+    svg = _card_svg(job.client, job.request_id)
+    assert "WAITING ON ANSWERS" in svg
+    assert "Waiting on answers" in svg
+    assert "SUCCEEDED" not in svg
 
 
 # Criterion 8: the investigating line ---------------------------------------------------
@@ -700,7 +716,11 @@ def test_a_question_comment_rendered_after_cancel_does_not_ask_for_an_answer(
     body = _status_body(sink, job.request_id)
     assert "Answer in a plain comment" not in body
     assert "Questions asked (round 1 of 3). The factory label was removed" in body
+    assert "Status: WAITING ON ANSWERS" not in body
     assert _state_labels(sink, 957) == set()
+    svg = _card_svg(job.client, job.request_id)
+    assert "WAITING ON ANSWERS" not in svg
+    assert "Waiting on answers" not in svg
 
 
 async def _cancel_now(job: tr._Run) -> Any:
