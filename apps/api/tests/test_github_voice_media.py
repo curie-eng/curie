@@ -38,17 +38,18 @@ def _wave_bytes() -> bytes:
 class Replay:
     # GitHub documents issue_url, user, body and timestamps at
     # https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
-    def __init__(self, kind):
+    def __init__(self, kind, canonical_repo=REPO):
         self.audience = GitHubConversation(
             host="github.com", installation_id=11, repository_id=21, kind=kind, number=17
         )
-        self.issue = {"number": 17, "state": "open", "url": ISSUE}
+        issue_url = f"{API}/repos/{canonical_repo}/issues/17"
+        self.issue = {"number": 17, "state": "open", "url": issue_url}
         if kind == "pull_request":
-            self.issue["pull_request"] = {"url": f"{API}/repos/{REPO}/pulls/17"}
+            self.issue["pull_request"] = {"url": f"{API}/repos/{canonical_repo}/pulls/17"}
         self.user = {"id": 41, "type": "User", "login": "example-reviewer"}
         self.comment = {
             "id": 71,
-            "issue_url": ISSUE,
+            "issue_url": issue_url,
             "body": BODY,
             "user": self.user,
             "created_at": "2026-01-01T00:00:00Z",
@@ -56,7 +57,7 @@ class Replay:
             "performed_via_github_app": None,
             "author_association": "MEMBER",
         }
-        self.repository = {"id": 21, "full_name": REPO, "visibility": "public"}
+        self.repository = {"id": 21, "full_name": canonical_repo, "visibility": "public"}
         self.permission = "write"
         self.status = 200
         self.location = CDN
@@ -66,11 +67,17 @@ class Replay:
 
     def api(self, request):
         assert request.headers["authorization"] == "Bearer fixture"
-        if str(request.url) == ISSUE:
+        # GitHub accepts either spelling on requests and returns the repository's canonical URLs.
+        # https://docs.github.com/en/rest/issues/issues#get-an-issue
+        prefix, owner, repository, *resource = request.url.path.strip("/").split("/")
+        assert prefix == "repos"
+        assert f"{owner}/{repository}".casefold() == self.repository["full_name"].casefold()
+        path = "/".join(resource)
+        if path == "issues/17":
             return httpx.Response(200, json=self.issue)
-        if request.url.path == f"/repos/{REPO}/issues/comments/71":
+        if path == "issues/comments/71":
             return httpx.Response(self.status, json=self.comment)
-        assert request.url.path == f"/repos/{REPO}/collaborators/example-reviewer/permission"
+        assert path == "collaborators/example-reviewer/permission"
         return httpx.Response(200, json={"user": self.user, "permission": self.permission})
 
     def media(self, request):
@@ -117,6 +124,16 @@ async def test_canonical_comment_selects_public_wave(kind):
     assert source.attachment_id == hashlib.sha256(UPLOAD.encode()).hexdigest()
     assert media.declared_type == "audio/wav"
     assert b"".join([chunk async for chunk in media.chunks]) == replay.audio
+
+
+async def test_bound_repository_case_preserves_canonical_comment_urls():
+    replay = Replay("issue", canonical_repo="Acme-Corp/Acme-Bot")
+    result = await replay.read()
+    assert not isinstance(result, Refused)
+    source, media = result
+    assert source.audience == replay.audience
+    assert b"".join([chunk async for chunk in media.chunks]) == replay.audio
+    assert replay.media_requests == [UPLOAD, CDN]
 
 
 @pytest.mark.parametrize(

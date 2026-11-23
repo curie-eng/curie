@@ -397,6 +397,17 @@ def spoken_factory(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPat
 
 
 def _displayed_code(factory: Factory, number: int, version: int) -> str:
+    wait_until(
+        lambda: bool(
+            _rows(
+                "SELECT id FROM curie.factory_voice_drafts "
+                "WHERE status='ready' AND version=:version",
+                {"version": version},
+            )
+        ),
+        12,
+        "the API to post and acknowledge this transcript version",
+    )
     expression = re.compile(rf"`confirm ([0-9a-f]{{12}}\.{version})`")
     matches = [
         match[1]
@@ -412,13 +423,9 @@ def _submit_recording(factory: Factory, number: int):
     posted = factory.github.add_conversation_comment(number, REVIEWER, BODY)
     response = factory.post(posted.deliveries[0])
     assert response.json()["status"] == "voice_pending"
-    wait_until(
-        lambda: bool(_rows("SELECT id FROM curie.factory_voice_drafts WHERE status='ready'")),
-        12,
-        "the API voice processor to publish the transcript",
-    )
+    code = _displayed_code(factory, number, 1)
     assert _all_requests() == 1
-    return posted, _displayed_code(factory, number, 1)
+    return posted, code
 
 
 @pytest.mark.parametrize("on_issue", [True, False], ids=["issue", "pr"])
@@ -435,7 +442,7 @@ def test_signed_confirmation_admits_one_edited_revision_on_the_same_work_item(
     assert "Change the button label to Retry." in prompt[0]["body"]
     text = "Change the button label to Retry. Keep the existing timeout."
     edit = factory.github.add_conversation_comment(number, REVIEWER, f"edit {code} {text}")
-    assert factory.post(edit.deliveries[0]).json()["status"] == "voice_drafted"
+    assert factory.post(edit.deliveries[0]).json()["status"] == "voice_edit_accepted"
     current = _displayed_code(factory, number, 2)
     assert current != code and current.partition(".")[0] == code.partition(".")[0]
     old = factory.github.add_conversation_comment(number, REVIEWER, f"confirm {code}")
@@ -518,7 +525,7 @@ def test_signed_confirmation_refusals_create_zero_revisions(
         edit = factory.github.add_conversation_comment(
             number, REVIEWER, f"edit {code} fix issue #9999"
         )
-        assert factory.post(edit.deliveries[0]).json()["status"] == "voice_drafted"
+        assert factory.post(edit.deliveries[0]).json()["status"] == "voice_edit_accepted"
         code = _displayed_code(factory, number, 2)
     actor = SECOND if change == "wrong_actor" else REVIEWER
     decision = factory.github.add_conversation_comment(number, actor, f"confirm {code}")

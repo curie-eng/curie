@@ -95,7 +95,7 @@ async def read_voice_comment(
         )
     ):
         return Refused(reason="forbidden")
-    path = f"/repos/{repo_url_path(repo_name)}"
+    path = f"/repos/{repo_url_path(verified.repository['full_name'])}"
     issue_path = f"{path}/issues/{audience.number}"
     try:
         issue = await get_github_json(

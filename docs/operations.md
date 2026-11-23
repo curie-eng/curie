@@ -2426,11 +2426,16 @@ file. A changed comment or an ambiguous attachment is refused. The webhook
 reports `voice_private_repository` for a private or internal repository.
 Media downloads carry no GitHub credentials.
 
-Voice is off by default. With voice enabled, the issue must already have an
-open factory pull request. The author reviews the transcript in the same
-conversation and replies with `confirm <code>`, `edit <code> <replacement>`
-or `reject <code>`. An edit displays a new code. Only confirmation of the
-displayed version can queue a revision, subject to the plain-feedback cap.
+GitHub.com voice feedback requires a signed `issue_comment` webhook delivery.
+Voice is off by default. Even when it is off, factory intake reserves
+standalone recording attachments and replies carrying a voice decision code.
+With voice enabled, the issue must already have an open factory pull request.
+The author reviews the transcript in the same conversation and replies with
+`confirm <code>`, `edit <code> <replacement>` or `reject <code>`. An edit
+displays a new code. Only confirmation of the displayed version can queue a
+revision, subject to the plain-feedback cap. Immediate refusal codes appear
+only in the webhook response. To retry a transient confirmation failure,
+post a new comment with the same confirmation code.
 
 In local replay the CPU model transcribed “Retry” as “reach right”. The author
 corrected the label before confirming. Both conversation types produced one

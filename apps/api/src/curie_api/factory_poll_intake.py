@@ -948,8 +948,11 @@ async def retry_answers(
         try:
             value = await tracker.issue_comment(comment_id)
             notice = _answer_notice(
-                value, tracker, installation_id=installation_id,
-                mention=False, app_slug=await tracker.app_slug(),
+                value,
+                tracker,
+                installation_id=installation_id,
+                mention=False,
+                app_slug=await tracker.app_slug(),
             )
             handled = notice is not None and await _admit_answer(
                 sessionmaker, settings, tracker, notice, value
@@ -1149,8 +1152,11 @@ async def _admit_mentions(
             if answer_on in answering and _edited(comment, threshold):
                 continue
             notice = _answer_notice(
-                comment, tracker, installation_id=installation_id,
-                mention=mentioned, app_slug=app_slug,
+                comment,
+                tracker,
+                installation_id=installation_id,
+                mention=mentioned,
+                app_slug=app_slug,
             )
             if notice is not None:
                 try:

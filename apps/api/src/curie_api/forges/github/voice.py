@@ -31,6 +31,7 @@ from curie_api.factory_voice_contract import (
     Confirmed,
     CurrentSource,
     Draft,
+    EditAccepted,
     GitHubConversation,
     Pending,
     Refused,
@@ -320,7 +321,7 @@ class GitHubVoice:
         if reply is None:
             media = await self.read_media(target, verified, comment_id, sender, digest)
             if isinstance(media, Refused):
-                outcome: Pending | Draft | Refused | Confirmed | Rejected = media
+                outcome: Pending | EditAccepted | Refused | Confirmed | Rejected = media
             else:
                 source, audio = media
                 outcome = await self.service.submit(source, audio)
@@ -365,9 +366,8 @@ class GitHubVoice:
             return ignored(f"voice_{outcome.reason}")
         if isinstance(outcome, Pending):
             return WebhookResult(status="voice_pending")
-        if isinstance(outcome, Draft):
-            await self.show(target, outcome)
-            return WebhookResult(status="voice_drafted")
+        if isinstance(outcome, EditAccepted):
+            return WebhookResult(status="voice_edit_accepted")
         if isinstance(outcome, Confirmed):
             return WebhookResult(
                 status="factory_duplicate" if outcome.replayed else "voice_confirmed"
