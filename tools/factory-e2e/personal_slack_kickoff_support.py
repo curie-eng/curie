@@ -817,7 +817,11 @@ class SlackWeb:
                 raise
 
     def direct_conversation(self, user_id: str) -> tuple[str, list[dict[str, Any]]]:
-        """The IM channel id with ``user_id`` and its history, or an empty channel."""
+        """The IM channel id with ``user_id`` and its history, or an empty channel.
+
+        History pages the same way ``replies`` does: ``limit`` 200, follow
+        ``response_metadata.next_cursor``, and stop after 20 pages.
+        """
 
         cursor = ""
         channel_id = ""
@@ -838,8 +842,18 @@ class SlackWeb:
                 return "", []
         if not channel_id:
             return "", []
-        history = self.call("conversations.history", {"channel": channel_id, "limit": "200"})
-        messages = [item for item in history.get("messages") or [] if isinstance(item, dict)]
+        messages: list[dict[str, Any]] = []
+        cursor = ""
+        for _page in range(20):
+            params = {"channel": channel_id, "limit": "200"}
+            if cursor:
+                params["cursor"] = cursor
+            history = self.call("conversations.history", params)
+            messages += [item for item in history.get("messages") or [] if isinstance(item, dict)]
+            meta = history.get("response_metadata")
+            cursor = str(meta.get("next_cursor") or "") if isinstance(meta, dict) else ""
+            if not cursor:
+                break
         return channel_id, messages
 
     def direct_history(self, user_id: str) -> list[dict[str, Any]]:

@@ -5635,3 +5635,232 @@ def test_this_module_has_no_sleeps_or_provisioning_literals() -> None:
         "kind" + " create",
     ):
         assert banned not in source, banned
+
+
+# --------------------------------------------------------------------------
+# History paging for grant-DM teardown and the absence check
+# --------------------------------------------------------------------------
+#
+# conversations.history and conversations.replies both return
+# response_metadata.next_cursor when another page exists, and an empty cursor
+# on the last page. limit 200 is the page size this driver requests.
+# https://docs.slack.dev/reference/methods/conversations.history
+# https://docs.slack.dev/reference/methods/conversations.replies
+# https://docs.slack.dev/reference/methods/conversations.list
+# https://docs.slack.dev/reference/methods/chat.delete
+
+_DM_CHANNEL = "D0EXAMPLE1"
+_GRANT_DM_TS = "1800004200.000007"
+
+
+def _history_filler(index: int) -> dict[str, Any]:
+    """One non-grant message. Timestamps stay inside the driver's ts shape."""
+
+    return {
+        "type": "message",
+        "user": SENDER_USER,
+        "text": f"unrelated note {index}",
+        "ts": f"{1800000000 + index}.000000",
+    }
+
+
+def _full_history_page(start: int) -> list[dict[str, Any]]:
+    return [_history_filler(start + offset) for offset in range(200)]
+
+
+def _paged_grant_dm() -> dict[str, Any]:
+    """The rejected-plan DM teardown looks for, shaped like a history message."""
+
+    message = _grant_dm("#7")
+    message["type"] = "message"
+    message["user"] = CURIE_USER
+    message["ts"] = _GRANT_DM_TS
+    return message
+
+
+class _PagedSlack:
+    """Synthetic pages for one Web API method, plus IM list and chat.delete.
+
+    Page 1 is the answer with no cursor. The answer for page N carries
+    ``next_cursor`` ``page-(N+1)`` while another page remains. chat.delete
+    removes that timestamp from every page.
+    """
+
+    def __init__(self, method: str, pages: list[list[dict[str, Any]]]) -> None:
+        self.method = method
+        self.pages = pages
+        self.calls: list[dict[str, str]] = []
+        self.deleted: list[tuple[str, str]] = []
+
+    def holds(self, ts: str) -> bool:
+        return any(item.get("ts") == ts for page in self.pages for item in page)
+
+    def __call__(
+        self, path: str, headers: Mapping[str, str], body: bytes
+    ) -> tuple[int, Mapping[str, str], bytes]:
+        del headers
+        method = path.removeprefix("/api/")
+        params = dict(urllib.parse.parse_qsl(body.decode()))
+        if method == "conversations.list":
+            answer: dict[str, Any] = {
+                "ok": True,
+                "channels": [{"id": _DM_CHANNEL, "user": SENDER_USER, "is_im": True}],
+                "response_metadata": {"next_cursor": ""},
+            }
+        elif method == "chat.delete":
+            stamp = params.get("ts", "")
+            channel = params.get("channel", "")
+            removed = False
+            for page in self.pages:
+                kept = [item for item in page if item.get("ts") != stamp]
+                removed = removed or len(kept) != len(page)
+                page[:] = kept
+            if not removed:
+                answer = {"ok": False, "error": "message_not_found"}
+            else:
+                self.deleted.append((channel, stamp))
+                answer = {"ok": True, "channel": channel, "ts": stamp}
+        elif method == self.method:
+            self.calls.append(dict(params))
+            cursor = params.get("cursor", "")
+            index = 0 if not cursor else int(cursor.removeprefix("page-")) - 1
+            if index < 0 or index >= len(self.pages):
+                answer = {"ok": False, "error": "invalid_cursor"}
+            else:
+                nxt = f"page-{index + 2}" if index + 1 < len(self.pages) else ""
+                answer = {
+                    "ok": True,
+                    "messages": list(self.pages[index]),
+                    "has_more": bool(nxt),
+                    "response_metadata": {"next_cursor": nxt},
+                }
+        else:
+            answer = {"ok": False, "error": "unknown_method"}
+        return 200, {"content-type": "application/json"}, json.dumps(answer).encode()
+
+
+def _history_reads(calls: Sequence[Mapping[str, str]]) -> list[list[Mapping[str, str]]]:
+    """Split a call log into reads. Each read starts at the call with no cursor."""
+
+    reads: list[list[Mapping[str, str]]] = []
+    current: list[Mapping[str, str]] = []
+    for call in calls:
+        if not call.get("cursor"):
+            if current:
+                reads.append(current)
+            current = [call]
+        else:
+            current.append(call)
+    if current:
+        reads.append(current)
+    return reads
+
+
+def _read_follows_cursor(calls: Sequence[Mapping[str, str]], pages: int) -> bool:
+    if len(calls) != pages or any(call.get("limit") != "200" for call in calls):
+        return False
+    if calls[0].get("cursor"):
+        return False
+    expected = [f"page-{index}" for index in range(2, pages + 1)]
+    return [call.get("cursor") for call in calls[1:]] == expected
+
+
+def _grant_dm_run(tmp_path: Path, pages: list[list[dict[str, Any]]]) -> tuple[Live, _PagedSlack]:
+    """A live run whose Curie client reads ``pages`` as the sender DM history."""
+
+    live = _live_run(tmp_path)
+    fixture = _PagedSlack("conversations.history", pages)
+    token = live.run.scrubber.hold(sks.HeldSecret(CURIE_BOT_MARKER))
+    web = sks.SlackWeb(fixture, token, live.run.scan, wait=live.clock.wait)
+    live.run.kit = psk.SlackKit(
+        curie=web,
+        app=web,
+        sender=web,
+        channel=CHANNEL,
+        curie_auth=sks.SlackAuth(TEAM, CURIE_USER, CURIE_BOT),
+        sender_auth=sks.SlackAuth(TEAM, SENDER_USER, SENDER_BOT),
+    )
+    live.run.issues = {"grant": {"number": 7}}
+    live.run.roots = []
+    return live, fixture
+
+
+def test_teardown_deletes_grant_dm_on_history_page_two(tmp_path: Path) -> None:
+    """The absence check reports a page-two grant DM, and teardown deletes it."""
+
+    dm = _paged_grant_dm()
+    live, fixture = _grant_dm_run(tmp_path, [_full_history_page(0), [dm]])
+    try:
+        assert live.run.slack_messages_absent() is False
+        reads = _history_reads(fixture.calls)
+        assert len(reads) == 1
+        assert _read_follows_cursor(reads[0], 2)
+        assert all(call.get("channel") == _DM_CHANNEL for call in reads[0])
+        live.run.delete_slack_messages()
+        assert fixture.deleted == [(_DM_CHANNEL, _GRANT_DM_TS)]
+        assert fixture.holds(_GRANT_DM_TS) is False
+        assert live.run.slack_messages_absent() is True
+        assert all(call.get("cursor") != "page-3" for call in fixture.calls)
+    finally:
+        live.ledger.close()
+
+
+def test_direct_history_stops_after_twenty_pages(tmp_path: Path) -> None:
+    """Twenty full pages plus a further cursor issue 20 history calls and no 21st.
+
+    The grant DM is only on that unread page. The absence check does not report
+    it, and teardown does not delete it.
+    """
+
+    dm = _paged_grant_dm()
+    pages = [_full_history_page(page * 200) for page in range(20)]
+    pages.append([dm])
+    live, fixture = _grant_dm_run(tmp_path, pages)
+    try:
+        assert live.run.slack_messages_absent() is True
+        reads = _history_reads(fixture.calls)
+        assert len(reads) == 1
+        assert _read_follows_cursor(reads[0], 20)
+        assert fixture.holds(_GRANT_DM_TS) is True
+        assert all(call.get("cursor") != "page-21" for call in fixture.calls)
+        live.run.delete_slack_messages()
+        assert fixture.deleted == []
+        assert fixture.holds(_GRANT_DM_TS) is True
+        assert all(len(read) == 20 for read in _history_reads(fixture.calls))
+        assert all(call.get("cursor") != "page-21" for call in fixture.calls)
+    finally:
+        live.ledger.close()
+
+
+def test_replies_paging_follows_cursor_and_stops_at_twenty(tmp_path: Path) -> None:
+    """conversations.replies still walks next_cursor and still stops at 20 pages."""
+
+    live = _live_run(tmp_path)
+    try:
+        token = live.run.scrubber.hold(sks.HeldSecret(CURIE_BOT_MARKER))
+        short_pages = [[_history_filler(1)], [_history_filler(2)]]
+        short = _PagedSlack("conversations.replies", short_pages)
+        web = sks.SlackWeb(short, token, live.run.scan, wait=live.clock.wait)
+        found = web.replies(CHANNEL, "1800000001.000001")
+        assert [item["ts"] for item in found] == [
+            _history_filler(1)["ts"],
+            _history_filler(2)["ts"],
+        ]
+        assert _read_follows_cursor(short.calls, 2)
+        assert all(
+            call.get("channel") == CHANNEL and call.get("ts") == "1800000001.000001"
+            for call in short.calls
+        )
+
+        tail = _history_filler(9000)
+        long_pages = [[_history_filler(index)] for index in range(20)]
+        long_pages.append([tail])
+        long = _PagedSlack("conversations.replies", long_pages)
+        web = sks.SlackWeb(long, token, live.run.scan, wait=live.clock.wait)
+        found = web.replies(CHANNEL, "1800000001.000001")
+        assert len(long.calls) == 20
+        assert _read_follows_cursor(long.calls, 20)
+        assert tail["ts"] not in {item["ts"] for item in found}
+        assert len(found) == 20
+    finally:
+        live.ledger.close()
