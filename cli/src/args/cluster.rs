@@ -463,8 +463,10 @@ pub(crate) enum ClusterAction {
     /// release name and install namespace, so another release's namespaces
     /// on the same cluster are never touched. Pre-existing namespaces and
     /// the agents.x-k8s.io CRDs are left in place. The sweep waits at most
-    /// 300s. If owned namespaces remain, the command exits 3 and does not
-    /// remove finalizers.
+    /// 300s, plus up to 300s more while only namespace-controller objects
+    /// (events, endpoints, endpoint slices, kube-root-ca.crt) remain. If
+    /// owned namespaces remain, the command exits 3 and does not remove
+    /// finalizers.
     Down {
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
