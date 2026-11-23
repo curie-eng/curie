@@ -5,8 +5,29 @@
       "id": "walkthrough-and-guided-tests",
       "setup": "PR changes a request handler calling a normalizer and an existing store. Add a success test and invalid-input test, retain an existing store regression test. CI reports green on head A; no local test has run. Checkout contains an unrelated human edit.",
       "user_turns": ["Use review-pr to explain PR 7 and its tests.", "Go deeper into the normalizer.", "Help me test it manually, one step at a time."],
-      "expected": ["Preserves human edit and pins isolated checkout to A", "Explains components with actual files and calls", "Identifies new assertions and existing regression scope separately", "Reports CI as CI evidence, not local execution", "Gives first runnable manual step and waits for result"],
-      "forbidden": ["Remote writes", "Claiming instructed manual tests passed", "Resetting dirty checkout"]
+      "expected": ["Preserves human edit and pins isolated checkout to A", "Classifies the PR and explains its purpose in one line", "Explains components with actual files and calls", "Says no automated end to end test was added when the tests only exercise the handler and normalizer", "Orders added test scenarios as success then invalid input, each with a one line behavior summary, linked location and actual assertion", "Identifies existing regression scope separately", "Reports no persistent model or migration change", "Reports CI as CI evidence, not local execution", "Presents findings after purpose, architecture, behavior and tests", "Gives first runnable manual step and waits for result"],
+      "forbidden": ["Remote writes", "Dumping test function names without behavior summaries", "Claiming instructed manual tests passed", "Resetting dirty checkout"]
+    },
+    {
+      "id": "architecture-default-exposure-and-migration",
+      "setup": "PR adds a default loopback host port mapping for a local cluster, changes a service from ClusterIP to NodePort on both local and production paths, and adds a nullable database column with a backfill migration. The description reports a manual local connection test; the only added automated test asserts the generated plan text. Current CI is green on head A. Provide the preexisting production service configuration and old reader path in the fixture.",
+      "user_turns": ["Use review-pr to explain PR 9 for an architecture decision."],
+      "expected": ["Classifies the PR and states its intended outcome before the detailed review", "Explains the local and production exposure separately, including listener lifetime and permissions", "Identifies the plan assertion as integration evidence rather than automated end to end proof", "Distinguishes the author reported manual run from CI", "Shows the changed flow and fallback in a compact sequence diagram", "Shows the schema delta in a before and after table with type, nullability, purpose and affected reader", "Explains numbered migration and backfill steps, old reader compatibility and rollback risk", "Links substantive claims to current diff or preexisting source"],
+      "forbidden": ["Calling green CI proof of host reachability", "Calling loopback an authentication boundary", "Describing a new column without its before and after contract", "Assuming the migration is reversible without inspecting it", "Remote writes"]
+    },
+    {
+      "id": "new-table-and-api-inventory",
+      "setup": "PR 11 adds a run_events table with id UUID primary key, request_id UUID non-null foreign key to requests(id), kind TEXT non-null, payload JSONB nullable, and created_at TIMESTAMPTZ non-null with a now() default; it adds an index on (request_id, created_at). A new authenticated GET /v1/requests/{request_id}/events endpoint accepts a required UUID path parameter and optional integer limit, returns 200 with an array of event objects, 400 for an invalid limit, 403 for a request outside the caller's tenant, and 404 for an unknown request. Its consumer is the run-history page. The diff includes the migration, route, response schema and contract test; no backfill is specified.",
+      "user_turns": ["Use review-pr to explain PR 11, including its new table and API."],
+      "expected": ["Inventories run_events as a new table and lists all five columns with type, nullability, default, keys or constraints and purpose", "Lists the composite index, foreign key relationship, writers and readers with links to the defining diff", "Explains the table's purpose and the numbered migration and compatibility steps without inventing a backfill", "Inventories GET /v1/requests/{request_id}/events with typed path and query inputs, 200 response shape, 400/403/404 outcomes, authentication, tenant authorization and run-history consumer", "Links the route, response schema and contract test to current diff lines", "Keeps the API and table inventories readable in a terminal client"],
+      "forbidden": ["Only naming the new table or listing selected columns", "Only naming the endpoint without its request, response and access contract", "Inventing a backfill", "Calling an internal helper a new public API", "Remote writes"]
+    },
+    {
+      "id": "aligned-inline-swimlane",
+      "setup": "Review PR 10 in Claude Code's terminal at a width of 110 columns. Its changed flow starts an access command, opens two loopback port forwards, and stops both when interrupted. Mermaid code fences appear as source text rather than rendered diagrams in this client.",
+      "user_turns": ["Use review-pr to explain the changed runtime scenarios."],
+      "expected": ["Recognizes that this client's Mermaid fences do not render as diagrams", "Shows a wide monospaced swimlane inline with fixed actor columns, aligned lifelines and arrowheads, and numbered common calls", "Labels ALT A and ALT B outside the lanes with branch conditions and suffixed step numbers", "States below the diagram that both forwards remain active after the URL step on ALT A and stop after cleanup on either branch", "Explains the observable change and links the flow to verified current diff lines"],
+      "forbidden": ["Mermaid source as the only diagram", "HTML file or browser handoff", "Colors or emoji in the swimlane", "Ambiguous state text between lifelines", "Claiming the forwards survive command exit", "Remote writes"]
     },
     {
       "id": "failed-human-observation",
