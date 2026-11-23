@@ -3505,9 +3505,10 @@ An authorized engineer can mention the app in a mapped thread while
 implementation is waiting or running. Queued guidance expires in 24 hours.
 The thread shows when an execution takes it. After publication, eligible
 guidance requests a revision of the same pull request. Public delivery
-resumes after a rollback followed by an upgrade. An older API and worker
-can expose a private PR URL in an in-channel kickoff during a mixed-version
-deployment if the sender posted its issue link there.
+resumes after a rollback followed by an upgrade. During a rolling upgrade
+or after a rollback to an earlier release, a thread started in the public
+channel from a private repository's issue link can receive that pull
+request's URL from an older API and worker pair.
 
 ### Factory Slack steering
 

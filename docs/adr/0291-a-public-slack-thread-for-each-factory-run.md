@@ -2,7 +2,11 @@
 
 Date: 2026-11-23
 
-Status: Draft
+Status: Accepted
+
+The maintainer accepted this decision on 2026-11-23. The API reserves the
+public thread and admits guidance. The worker publishes progress and checks
+the execution input before reporting application. [Feature issue #5946](https://github.com/curie-eng/curie/issues/5946)
 
 ## Context
 
