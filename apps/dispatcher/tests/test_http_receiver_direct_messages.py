@@ -131,6 +131,9 @@ def test_direct_file_share_signs_the_attachment_reference() -> None:
     assert isinstance(proof, codec.ReceiverProofV1)
     assert proof.body_sha256 == hashlib.sha256(request.content).hexdigest()
     assert proof.slack.channel_type == "im"
+    assert proof.slack.user_id == SENDER
+    assert proof.native_channel_id == DM_CHANNEL
+    assert proof.binding_id == DM_BINDING
     rig.closed()
 
 
@@ -179,7 +182,9 @@ DROPPED = {
     "edit": {"subtype": "message_changed"},
     "delete": {"subtype": "message_deleted"},
     "file_share_without_files": {"subtype": "file_share"},
-    "file_share_without_usable_refs": {"subtype": "file_share", "files": [{"name": "example.xlsx"}]},
+    "file_share_without_usable_refs": {
+        "subtype": "file_share", "files": [{"name": "example.xlsx"}],
+    },
     "file_share_from_bot": {
         "subtype": "file_share", "bot_id": "B0EXAMPLEOTHER",
         "files": [{"id": "F0EXAMPLE", "name": "example.xlsx"}],

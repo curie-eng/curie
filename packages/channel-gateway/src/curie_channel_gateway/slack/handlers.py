@@ -109,8 +109,8 @@ from .http_receiver import (
     ReceiverTurn,
     SelectedApprovalAnswers,
     SlackTurnSubmission,
-    is_plain_direct_message,
     is_reply_slot,
+    is_supported_direct_message,
 )
 from .identities import delivery_key, minted_adapter
 from .identity import (
@@ -389,7 +389,7 @@ class _SelectedNotices:
             return
         text = SELECTED_REFUSED_TEXT if status == "refused" else SELECTED_UNAVAILABLE_TEXT
         try:
-            if channel.startswith("D") or is_plain_direct_message(event):
+            if channel.startswith("D") or is_supported_direct_message(event):
                 # A direct message has no audience to hide the notice from.
                 # @spec HTTP-INVOCATION-EXECUTION-19/26.
                 self._web.chat_postMessage(channel=channel, thread_ts=thread_ts or ts, text=text)
@@ -1349,7 +1349,7 @@ def register_handlers(
         assert selected_notices is not None
         channel = str(event.get("channel"))
         if result.status == "refused" and delivery.placeholder is not None:
-            if channel.startswith("D") or is_plain_direct_message(event):
+            if channel.startswith("D") or is_supported_direct_message(event):
                 # @spec HTTP-INVOCATION-EXECUTION-26/27: only the sender is in a
                 # direct message, so its placeholder becomes the notice.
                 selected_notices.replace(
@@ -1401,7 +1401,7 @@ def register_handlers(
     def _on_message(body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]) -> None:
         # @spec HTTP-INVOCATION-EXECUTION-19/26.
         if http_receiver is not None:
-            if not is_plain_direct_message(event):
+            if not is_supported_direct_message(event):
                 # Every other message event stays silent.
                 drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="", lane="im")
                 return

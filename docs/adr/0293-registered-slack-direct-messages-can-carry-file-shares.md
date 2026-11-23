@@ -1,4 +1,4 @@
-# 289. Registered Slack direct messages can carry file shares
+# 293. Registered Slack direct messages can carry file shares
 
 Date: 2026-11-23
 
