@@ -45,7 +45,6 @@ from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 from curie_internal.provider_scope import ProviderScope
 from curie_telemetry.redact import redact_text
 
-from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
 from .final_answer import (
     FINAL_ANSWER_CLASSIFICATION,
     FinalAnswerValidation,
@@ -258,9 +257,7 @@ class TurnState:
     # above (usage outranks credit). Re-emitted by ``_restore_provider_error``
     # so the last error frame of the turn still carries it.
     retry_condition: RetryCondition | None = None
-    # The summary passed to the approval-request tool (ADR-0010), captured off
-    # the ToolUseBlock so the session can end the turn awaiting-approval. None
-    # when no approval was requested this turn.
+    # The session copies the recorded approval into the turn's final state.
     approval_summary: str | None = None
     # The approval route the request named (#247): a manifest-declared route
     # the platform binds to a channel per deployment. None routes to the
@@ -503,35 +500,13 @@ def _translate_assistant(
             if activity is not None:
                 activity.observe_tool(block.name)
             # Every tool call is evidence for the false-completion check (#517),
-            # including the approval-request tool below and read-only tools.
+            # including the approval-request tool and read-only tools.
             state.tool_call_count += 1
             state.open_tool_calls[block.id] = block.name
             if gen is not None:
                 # The SDK block says only that a tool interval should be
                 # inferred. It is not proof this runner executed the tool.
                 gen.tool_use(block.id, block.name)
-            # @spec RUNNER-TOOL-ACCESS-3: a read-only turn captures no request.
-            if block.name == APPROVAL_TOOL_NAME and state.tool_access is None:
-                # A policy gate fired (ADR-0010). Capture the summary (and the
-                # optional route, #247) at the wire level so the real path
-                # (executed in-process tool) and the fake path (scripted
-                # ToolUseBlock) exercise one seam.
-                payload = block.input if isinstance(block.input, dict) else {}
-                summary = str(payload.get("summary") or "").strip()
-                if summary:
-                    # The summary is the model's own argument (attacker-
-                    # influenced). Guard it out of the reserved permission-gate
-                    # namespace so it can never masquerade as a genuine
-                    # can_use_tool denial the worker would grant a bypass for
-                    # (#430, ADR-0035).
-                    state.approval_summary = guard_reserved_summary(summary)
-                    route = str(payload.get("route") or "").strip()
-                    state.approval_route = route or None
-                    # A policy gate authorizes a business decision, never a tool
-                    # (#544, Decision A): stamp the provenance and leave
-                    # approval_granted_tool None so the worker can never mint a
-                    # bypass grant from a model-authored request (#430).
-                    state.approval_gate_kind = "policy"
             if classifier.is_side_effecting(block.name):
                 # One frame per CALL, not per turn. The cap was once-per-turn
                 # because the only consumer was a boolean, so a turn that called

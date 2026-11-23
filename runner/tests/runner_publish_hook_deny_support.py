@@ -1,4 +1,4 @@
-"""The real-CLI publish turn with a bundle hook on publish_changes, shared by tests.
+"""Real-CLI turns with bundle hooks on publication and approval tools.
 
 The runner's real-CLI cases (runner/tests/test_publish_hook_deny_real_cli.py)
 and the worker's handoff test (apps/worker/tests/kernel/
@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shlex
 import subprocess
 import sys
 import time
@@ -30,7 +32,12 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.adapter import ClaudeAgentSession, build_options
-from curie_runner.approval import APPROVAL_SERVER_NAME, ApprovalGate, build_approval_gate
+from curie_runner.approval import (
+    APPROVAL_SERVER_NAME,
+    APPROVAL_TOOL_NAME,
+    ApprovalGate,
+    build_approval_gate,
+)
 from curie_runner.harness.claude.approval import (
     build_approval_hook,
     build_approval_server,
@@ -65,10 +72,17 @@ CORRECTED_BODY = (
 )
 # The scripted hook denies any body carrying this marker, with this reason.
 SCRIPTED_REFUSAL = "bundle gate: this publication body is refused"
+APPROVAL_REFUSAL = "bundle gate: this approval request is refused"
+REFUSED_SUMMARY = "Approve the first proposal"
+REFUSED_REQUEST = {"summary": REFUSED_SUMMARY, "route": "ops"}
+SECOND_SUMMARY = "Approve the second proposal"
+APPROVED_SUMMARY = "Approve the second proposal after review"
 
 _BODIES = web.AppKey("bodies", list[dict[str, Any]])
 _EMITTED = web.AppKey("emitted", list[tuple[str, dict[str, Any]]])
-_SCRIPT = web.AppKey("script", list[str])
+_SCRIPT = web.AppKey("script", list[dict[str, Any]])
+_TOOL_NAME = web.AppKey("tool_name", str)
+_FINAL_TEXT = web.AppKey("final_text", str)
 
 Block = list[tuple[str, dict[str, Any]]]
 
@@ -122,7 +136,7 @@ def _text_block(text: str) -> Block:
     ]
 
 
-def _tool_block(call_id: str, arguments: dict[str, Any]) -> Block:
+def _tool_block(tool_name: str, call_id: str, arguments: dict[str, Any]) -> Block:
     return [
         (
             "content_block_start",
@@ -131,7 +145,7 @@ def _tool_block(call_id: str, arguments: dict[str, Any]) -> Block:
                 "content_block": {
                     "type": "tool_use",
                     "id": call_id,
-                    "name": PLATFORM_PUBLISH_TOOL_NAME,
+                    "name": tool_name,
                     "input": {},
                 },
             },
@@ -179,10 +193,7 @@ def call_id(index: int) -> str:
 
 
 async def _messages(request: web.Request) -> web.StreamResponse:
-    """The model: one publish call per scripted body, each after the last's result.
-
-    When every scripted call has its result back, the model gives up in text.
-    """
+    """Emit each scripted call after the preceding call's result."""
 
     body = await request.json()
     request.app[_BODIES].append(body)
@@ -198,19 +209,18 @@ async def _messages(request: web.Request) -> web.StreamResponse:
     script = request.app[_SCRIPT]
     index = sum(1 for n in range(len(script)) if call_id(n) in answered)
     if index >= len(script):
-        return await _stream(request, body, [_text_block(GIVE_UP_TEXT)], "end_turn")
-    arguments = {"title": TITLE, "body": script[index]}
+        return await _stream(request, body, [_text_block(request.app[_FINAL_TEXT])], "end_turn")
+    arguments = script[index]
     request.app[_EMITTED].append((call_id(index), arguments))
-    return await _stream(request, body, [_tool_block(call_id(index), arguments)], "tool_use")
+    tool = _tool_block(request.app[_TOOL_NAME], call_id(index), arguments)
+    return await _stream(request, body, [tool], "tool_use")
 
 
 async def _anything_else(_request: web.Request) -> web.Response:
     return web.json_response({"input_tokens": 1})
 
 
-def _plugin(root: Path, command: str) -> Path:
-    """A local bundle whose hooks.json runs ``command`` before publish_changes."""
-
+def _plugin(root: Path, command: str, matcher: str) -> Path:
     plugin = root / "bundle"
     (plugin / ".claude-plugin").mkdir(parents=True)
     (plugin / ".claude-plugin" / "plugin.json").write_text(
@@ -223,7 +233,7 @@ def _plugin(root: Path, command: str) -> Path:
                 "hooks": {
                     "PreToolUse": [
                         {
-                            "matcher": ".*publish_changes",
+                            "matcher": matcher,
                             "hooks": [{"type": "command", "command": command, "timeout": 10}],
                         }
                     ]
@@ -349,18 +359,87 @@ def run_publish_turn(
     """Run one turn on the real CLI. ``publish_route`` binds the bundle's
     approval route to ``publish_changes``, as an approval-gated bundle does."""
 
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     routes = {} if publish_route is None else {PLATFORM_PUBLISH_TOOL_NAME: publish_route}
     gate = build_approval_gate(operator_tools=None, policy_routes=routes, managed_workspace=True)
     assert gate is not None
     assert PLATFORM_PUBLISH_TOOL_NAME in gate.required
-    plugin = _plugin(tmp_path, hook_command)
+    return _run_tool_turn(
+        tmp_path,
+        monkeypatch,
+        workspace=workspace,
+        hook_command=hook_command,
+        tool_name=PLATFORM_PUBLISH_TOOL_NAME,
+        script=[{"title": TITLE, "body": body} for body in script],
+        gate=gate,
+        final_text=GIVE_UP_TEXT,
+        prompt="Publish the changes.",
+        extra_env=extra_env,
+    )
+
+
+def run_approval_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, allow_second: bool
+) -> PublishTurn:
+    script = tmp_path / "approval_gate.py"
+    script.write_text(
+        "import json, sys\n"
+        "arguments = json.load(sys.stdin)['tool_input']\n"
+        f"if arguments['summary'] == {REFUSED_SUMMARY!r}:\n"
+        "    decision = {'permissionDecision': 'deny', "
+        f"'permissionDecisionReason': {APPROVAL_REFUSAL!r}}}\n"
+        "else:\n"
+        "    decision = {'permissionDecision': 'allow', "
+        f"'updatedInput': {{'summary': {APPROVED_SUMMARY!r}}}}}\n"
+        "decision['hookEventName'] = 'PreToolUse'\n"
+        "print(json.dumps({'hookSpecificOutput': decision}))\n",
+        encoding="utf-8",
+    )
+    gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
+    assert gate is not None
+    second = {"summary": SECOND_SUMMARY} if allow_second else REFUSED_REQUEST
+    return _run_tool_turn(
+        tmp_path,
+        monkeypatch,
+        workspace=tmp_path,
+        hook_command=shlex.join([sys.executable, str(script)]),
+        tool_name=APPROVAL_TOOL_NAME,
+        script=[REFUSED_REQUEST, second],
+        gate=gate,
+        final_text="I finished reviewing the proposals.",
+        prompt="Carry out the review.",
+    )
+
+
+def _run_tool_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workspace: Path,
+    hook_command: str,
+    tool_name: str,
+    script: list[dict[str, Any]],
+    gate: ApprovalGate,
+    final_text: str,
+    prompt: str,
+    extra_env: dict[str, str] | None = None,
+) -> PublishTurn:
+    for name in list(os.environ):
+        if name.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_")) or name in {
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CURIE_CREDENTIALS",
+            "CURIE_MODEL_ENV_KEY",
+            "CURIE_MODEL_AUTH_MODE",
+        }:
+            monkeypatch.delenv(name)
+    plugin = _plugin(tmp_path, hook_command, f".*{tool_name.rsplit('__', 1)[-1]}")
 
     async def scenario() -> PublishTurn:
         app = web.Application()
         app[_BODIES] = []
         app[_EMITTED] = []
-        app[_SCRIPT] = list(script)
+        app[_SCRIPT] = script
+        app[_TOOL_NAME] = tool_name
+        app[_FINAL_TEXT] = final_text
         app.router.add_post("/v1/messages", _messages)
         app.router.add_route("*", "/{tail:.*}", _anything_else)
         async with TestServer(app, host="127.0.0.1") as server:
@@ -405,9 +484,7 @@ def run_publish_turn(
             try:
                 with anyio.fail_after(_TURN_TIMEOUT_S):
                     async for line in runner.run_turn(
-                        Event(
-                            type="message", text="Publish the changes.", user="U0EXAMPLE1", ts="1"
-                        ),
+                        Event(type="message", text=prompt, user="U0EXAMPLE1", ts="1"),
                     ):
                         lines.append(line)
             finally:

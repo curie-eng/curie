@@ -367,7 +367,7 @@ def _approval_state(gate: Any) -> tuple[Any, ...]:
         gate.pending_granted_tool,
         gate.policy_requested,
         gate.policy_rejected,
-        gate.policy_route,
+        gate.policy_approval,
         gate.grant_tool,
         tuple(sorted(gate.grantable_by_route.items())),
         gate.publication_title,
