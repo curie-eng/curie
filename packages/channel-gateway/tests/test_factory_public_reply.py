@@ -16,22 +16,25 @@ from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 
 
 @pytest.mark.parametrize(
-    "changed",
+    "changed,allowed",
     [
-        {},
-        {"is_private": True},
-        {"is_shared": True},
-        {"is_ext_shared": True},
-        {"is_group": True},
-        {"is_archived": True},
-        {"is_channel": None},
-        {"context_team_id": "T0EXAMPLE2"},
-        {"id": "C0EXAMPLE2"},
-        {"lookup_error": True},
-        {"fallback_private": True},
+        ({}, True),
+        ({"is_shared": True, "is_org_shared": True}, True),
+        ({"is_private": True}, False),
+        ({"is_shared": True}, False),
+        ({"is_ext_shared": True}, False),
+        ({"is_shared": True, "is_org_shared": True, "is_ext_shared": True}, False),
+        ({"is_org_shared": True, "is_ext_shared": None}, False),
+        ({"is_group": True}, False),
+        ({"is_archived": True}, False),
+        ({"is_channel": None}, False),
+        ({"context_team_id": "T0EXAMPLE2"}, False),
+        ({"id": "C0EXAMPLE2"}, False),
+        ({"lookup_error": True}, False),
+        ({"fallback_private": True}, False),
     ],
 )
-def test_signed_public_post_checks_speaking_workspace(tmp_path, changed):
+def test_signed_public_post_checks_speaking_workspace(tmp_path, changed, allowed):
     async def scenario():
         writes = []
         inspected = []
@@ -58,7 +61,7 @@ def test_signed_public_post_checks_speaking_workspace(tmp_path, changed):
         }
 
         async def slack(request):
-            operation = request.match_info["operation"]
+            operation = request.path.rsplit("/", 1)[-1]
             if operation == "auth.test":
                 return web.json_response({"ok": True, "team_id": "T0EXAMPLE1"})
             if operation == "conversations.info":
@@ -83,6 +86,7 @@ def test_signed_public_post_checks_speaking_workspace(tmp_path, changed):
 
         provider = web.Application()
         provider.router.add_post("/{site}/{operation}", slack)
+        provider.router.add_get("/{site}/conversations.info", slack)
         async with TestServer(provider) as slack_server:
             adapter = SlackReplyAdapter("test-token", base_url=str(slack_server.make_url("/api/")))
             app = gateway_application(
@@ -114,7 +118,7 @@ def test_signed_public_post_checks_speaking_workspace(tmp_path, changed):
                     else None,
                 )
                 try:
-                    if changed:
+                    if not allowed:
                         with pytest.raises(PublicChannelUnverifiedError):
                             await sink.emit(event, route=route)
                         assert writes == []

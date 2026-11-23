@@ -157,6 +157,10 @@ def upgrade() -> None:
             item_id uuid, start_sequence integer, shared_kickoff_only boolean
         ) RETURNS void LANGUAGE plpgsql AS $$
         BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM curie.work_items w JOIN curie.agents a ON a.id = w.agent_id
+             WHERE w.id = item_id AND a.factory_public_slack_channel IS NOT NULL
+          ) THEN RETURN; END IF;
           PERFORM pg_advisory_xact_lock(hashtextextended(item_id::text, 194));
           INSERT INTO curie.factory_slack_public_threads
                 (work_item_id, agent_id, channel_identity, channel, first_sequence)

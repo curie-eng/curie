@@ -626,7 +626,7 @@ class FactorySteeringClient:
         )
         outcome, reason, request_id, replayed = _decision(body, UNCONFIRMED_TEXT)
         url = None
-        if outcome == ADMITTED and (not public or body.get("pull_request_shareable") is True):
+        if outcome == ADMITTED and not public:
             url = _optional_text(body, "pull_request_url")
         if outcome == NOT_MAPPED:
             # The local read said mapped. A disagreement is never ordinary chat.

@@ -562,7 +562,6 @@ def test_public_guidance_settles_the_placeholder_and_publishes_one_queued_status
     marker = "Only the execution should see my guidance."
     result = stack.steer_queued(writer.slack_user, marker, thread_ts=root)
     assert result.reply and result.reply["outcome"] == "queued"
-    assert result.reply["pull_request_shareable"] is False
     assert "pull_request_url" not in result.reply
     assert result.delivery.placeholder is not None
     assert [edit.text for edit in result.edits] == ["Received."]

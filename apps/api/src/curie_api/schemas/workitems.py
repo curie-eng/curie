@@ -485,7 +485,6 @@ class FactorySlackSteerIn(BaseModel):
 
 class FactorySlackSteerOut(BaseModel):
     outcome: FactorySlackSteerOutcome
-    pull_request_shareable: bool = False
     request_id: str | None = None
     request_status: str | None = None
     replayed: bool = False

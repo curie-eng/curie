@@ -8,6 +8,7 @@ from curie_api import factory_steering_execution
 from curie_api.config import get_settings
 from curie_internal.slack_mention_receipt import receipt_key
 from curie_worker.factory_slack_progress import PostgresFactorySlackStore
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from apps.api.tests.factory_slack_kickoff_harness import (
@@ -29,6 +30,28 @@ from apps.api.tests.test_factory_slack_runtime import (
     _db,
     _rows,
 )
+
+
+def test_only_public_reservations_contend_with_delivery(
+    kickoff: SteeringStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, item = kickoff.admit(next_issue())
+
+    async def delivery_can_lock(engine: AsyncEngine) -> bool:
+        async with engine.begin() as admission, engine.begin() as delivery:
+            await admission.execute(
+                text("SELECT curie.reserve_factory_slack_public_root(:item, 1, false)"),
+                {"item": item},
+            )
+            available = await delivery.scalar(
+                text("SELECT pg_try_advisory_xact_lock(hashtextextended(:item, 194))"),
+                {"item": str(item)},
+            )
+            return bool(available)
+
+    assert _db(delivery_can_lock)
+    assert configure_public(kickoff, monkeypatch, CHANNEL).is_success
+    assert not _db(delivery_can_lock)
 
 
 @pytest.mark.parametrize("public_channel", [CHANNEL, OTHER_CHANNEL])

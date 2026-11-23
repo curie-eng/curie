@@ -9615,11 +9615,6 @@ export interface components {
              * @enum {string}
              */
             outcome: "admitted" | "queued" | "applied" | "source_changed" | "target_mismatch" | "guidance_queue_full" | "guidance_expired" | "invalid_text" | "not_mapped" | "receipt_mismatch" | "sender_unverified" | "code_host_identity_missing" | "code_host_identity_ambiguous" | "code_host_identity_unsupported" | "code_host_mismatch" | "repository_mismatch" | "not_authorized" | "work_item_cancelled" | "lineage_closed" | "no_pull_request" | "pull_request_not_open" | "pull_request_branch_mismatch" | "authority_changed" | "objective_too_large" | "admission_refused";
-            /**
-             * Pull Request Shareable
-             * @default false
-             */
-            pull_request_shareable?: boolean;
             /** Pull Request Url */
             pull_request_url?: string | null;
             /** Reason */

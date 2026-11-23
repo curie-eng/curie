@@ -1381,7 +1381,7 @@ def test_progress_card_admitted_kickoff_has_no_rendered_reply() -> None:
         steering_module.render_kickoff_reply("admitted")
 
 
-@pytest.mark.parametrize("marker", [None, False, "true", 1])
+@pytest.mark.parametrize("marker", [None, False, "true", 1, True])
 def test_public_steering_does_not_render_a_legacy_apis_private_pull_request(
     monkeypatch: pytest.MonkeyPatch,
     marker: object,

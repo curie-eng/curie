@@ -10396,11 +10396,6 @@
             "title": "Outcome",
             "type": "string"
           },
-          "pull_request_shareable": {
-            "default": false,
-            "title": "Pull Request Shareable",
-            "type": "boolean"
-          },
           "pull_request_url": {
             "anyOf": [
               {
