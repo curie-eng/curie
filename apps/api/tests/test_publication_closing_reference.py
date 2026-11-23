@@ -122,7 +122,8 @@ def test_a_github_body_that_already_closes_the_issue_keeps_its_text(
     created = _post_factory_publication(client, payload)
 
     assert created.status_code == 201, created.text
-    marked = f"{body.rstrip()}\n\n{_marker(request_id)}\n\n{github_ask_line('curie')}"
+    ask = github_ask_line("curie", "pull_request")
+    marked = f"{body.rstrip()}\n\n{_marker(request_id)}\n\n{ask}"
     assert created.json()["body"] == marked
     assert _factory_publication_body(created.json()["id"]) == marked
     assert not assert_single_ask_line(marked, f"{body.rstrip()}\n\n{_marker(request_id)}")
@@ -158,7 +159,8 @@ def test_a_github_body_without_the_closing_reference_gains_it_once(
     assert created.status_code == 201, created.text
     stored = _factory_publication_body(created.json()["id"])
     assert stored == (
-        f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}\n\n{github_ask_line('curie')}"
+        f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}\n\n"
+        f"{github_ask_line('curie', 'pull_request')}"
     )
     assert stored.count(reference) == 1
     assert not assert_single_ask_line(

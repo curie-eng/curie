@@ -2692,8 +2692,14 @@ request, a `state` and an `actionable_cause`. The states:
 - `running`: started, bounded by the agent's execution deadline (default 1800 s).
 - `cancellation_requested`: termination requested (`issue_cancelled`,
   `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
-- `cancelled`: the issue label was removed or the issue was closed. A pull
-  request already opened is kept.
+- `cancelled`: the issue label was removed or the issue was closed, other
+  than by merging the factory's own pull request. A pull request already
+  opened is kept. A completed run whose pull request merged stays
+  `published` when the issue is still open, or when the issue was closed
+  within ten minutes before or after the time Curie observed the merge.
+  That stamp is when Curie recorded the merge, not when GitHub merged.
+  A close more than ten minutes before or after that observation reads
+  `cancelled`.
 - `expired`: `capacity_wait_expired`, `retry_condition_expired` or
   `execution_deadline`. A capacity wait that expires after a failed start
   still names the previous start failure. A `retry_condition_expired` cause
@@ -2706,7 +2712,9 @@ request, a `state` and an `actionable_cause`. The states:
 - `awaiting_approval`: a publication approval or a tool approval on the same
   conversation is pending.
 - `publishing`: the publication is approved and in flight.
-- `published`: a pull request is open for the work.
+- `published`: a pull request is open for the work, or the factory's pull
+  request merged after the run completed. A merged completion says the work
+  completed.
 - `completed_unpublished`: the run completed with no publication, or its
   publication was denied, expired or failed.
 
@@ -3398,11 +3406,11 @@ The worker's progress lane derives what is owed from existing run records on eac
 
 A configured thread's root is one line, `Factory run: <repository> <issue key> <issue title>`, with the issue URL. Every thread then has one progress card as its first reply, edited in place for the WorkItem's whole life. The card always shows the latest implementation run of the WorkItem, so a steering revision or an automatic retry changes the card and never adds a second one. It reads, top to bottom:
 
-1. A header, `Factory run: <state>`, where the state is `starting`, `working`, `needs a person`, `finished` (the run's own pull request is open) or `stopped` (cancelled).
+1. A header, `Factory run: <state>`, where the state is `starting`, `working`, `needs a person`, `finished` (the run's own pull request is open), `waiting on answers` (a questions run whose issue is still open) or `stopped` (cancelled, including a questions run whose factory label was removed).
 2. The issue as a link, then the repository and `Started by <name>`: the Slack sender for a kickoff, the requester's GitHub login for a label.
 3. One line per declared step of the bundle's progress declaration, the same steps the GitHub status comment shows, with a mark for done, in progress, pending, blocked or redo, and the latest progress note for that step. A review loop that ran more than once adds its round.
-4. When finished, `Done.` with the pull request number and title and whether CI passed, failed or is still running, and a `View pull request` button. When it needs a person, the cause sentence and a `View issue` button.
-5. The elapsed time: `Running for <n> min` while live, then `Finished in` or `Stopped after`.
+4. When finished, `Done.` with the pull request number and title and whether CI passed, failed or is still running, and a `View pull request` button. When it needs a person, the cause sentence and a `View issue` button. When it is waiting on answers, it says to reply on the ticket. When a questions run was stopped because the label was removed, it says an answer starts nothing.
+5. The elapsed time: `Running for <n> min` while live, then `Finished in`, `Waiting on answers after`, or `Stopped after`.
 
 The card's message text is the same content without the buttons. A kickoff's card is the dispatcher's placeholder reply under the mention; when there was none, and in a configured thread, the lane posts the card as a reply and edits it from then on. Each pass re-renders the card and edits it only when the render changed, at most once every 30 seconds while the run is live; a final state is edited at once. Edits never notify anyone, so two events also post one short reply each, once per run: `<mention> this run needs you: <cause>` when a run ends failed or expired with no automatic retry admitted, and `<mention> your pull request is ready for review: <url>` when the run's own publication opens or updates the pull request. The mention is the kickoff sender, or in a configured thread the WorkItem owner's (else the requester's) one active Slack identity link in the posting app's workspace; with none the reply mentions no one. A failed run whose automatic retry was admitted with it posts nothing; its card moves on to the retry. A refused trigger label posts once in the channel, outside any thread, with no card, from its intake notice (`factory_slack_refusal_posts`).
 

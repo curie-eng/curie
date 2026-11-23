@@ -497,6 +497,7 @@ def _render(row: RowMapping, reports: Sequence[RowMapping]) -> CardRender:
         pr_title=_str(row["pr_title"]) if published else None,
         plan_still_connected=row["plan_still_connected"] is True,
         personal=row["personal"] is True,
+        work_item_cancelled=row["work_item_cancelled"] is True,
     )
     return render_card(subject, request, now=row["now"])
 
@@ -1065,6 +1066,16 @@ class PostgresFactorySlackStore:
                    q.terminal_at IS NULL
                    OR t.card_edited_at IS NULL
                    OR t.card_edited_at <= q.terminal_at
+                   OR (
+                       q.terminal_cause = 'questions_asked'
+                       AND EXISTS (
+                           SELECT 1
+                             FROM {self._work_items} w
+                            WHERE w.id = t.work_item_id
+                              AND w.cancelled_at IS NOT NULL
+                              AND t.card_edited_at < w.cancelled_at
+                       )
+                   )
                )
                AND (
                    t.card_edited_at IS NULL
@@ -1154,6 +1165,7 @@ class PostgresFactorySlackStore:
                        AS requester_login,
                    {self._issue_url} AS ticket_url,
                    q.id AS request_id, q.sequence, q.status, q.terminal_cause,
+                   (w.cancelled_at IS NOT NULL) AS work_item_cancelled,
                    (w.model_auth_mode = 'personal') AS personal,
                    EXISTS (
                        SELECT 1

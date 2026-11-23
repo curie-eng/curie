@@ -25743,7 +25743,7 @@ export interface operations {
                     questions?: unknown;
                     /**
                      * Summary
-                     * @description What the investigation found, 1 to 4,000 characters, including a reproduction result when there is one.
+                     * @description What the investigation found, 1 to 600 characters, including a reproduction result when there is one.
                      */
                     summary?: unknown;
                 };

@@ -1087,8 +1087,14 @@ _EXPECTED_USES = {
     # a status body; an older pass renders the same request without it. The
     # questions-unrecorded line reads a round an asker cleared before it was
     # recorded; an older pass renders the same status without that line.
+    # The status pass also reads whether this request's round is still
+    # outstanding, and reopens a finalized questions comment once that round
+    # is no longer outstanding. It writes no round state. An older pass
+    # leaves the finalized waiting label in place.
     "curie_api/factory_notices.py": {
         "ANSWER_RECEIVED_LINE",
+        "FactoryQuestionRound",
+        "OUTSTANDING",
         "QUESTIONS_ASKED",
         "QUESTIONS_LABEL",
         "QUESTIONS_UNRECORDED_LINE",

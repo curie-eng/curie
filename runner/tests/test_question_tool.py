@@ -181,7 +181,7 @@ _LONG_QUESTION = "q" * 1_001
 VIOLATIONS: list[tuple[str, dict[str, Any]]] = [
     ("empty summary", {"summary": "", "questions": ["Which one?"]}),
     ("whitespace summary", {"summary": " \t\n ", "questions": ["Which one?"]}),
-    ("long summary", {"summary": "s" * 4_001, "questions": ["Which one?"]}),
+    ("long summary", {"summary": "s" * 601, "questions": ["Which one?"]}),
     ("no questions", {"summary": "found it", "questions": []}),
     ("eleven questions", {"summary": "found it", "questions": ["Which?"] * 11}),
     ("empty question", {"summary": "found it", "questions": [""]}),
@@ -219,7 +219,7 @@ def test_input_outside_the_bounds_is_refused_without_a_request(
 
 
 EDGES: list[tuple[str, dict[str, Any]]] = [
-    ("summary at the limit", {"summary": "s" * 4_000, "questions": ["Which?"]}),
+    ("summary at the limit", {"summary": "s" * 600, "questions": ["Which?"]}),
     ("ten questions", {"summary": "found it", "questions": [f"Question {n}?" for n in range(10)]}),
     ("question at the limit", {"summary": "found it", "questions": ["q" * 1_000]}),
     ("single line break", {"summary": "found it", "questions": ["One\nTwo", "Three\r\nFour"]}),

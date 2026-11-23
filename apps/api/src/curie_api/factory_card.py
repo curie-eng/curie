@@ -104,11 +104,14 @@ class CardInput:
     cause_text: str | None
     # This failed request's settlement admitted an automatic successor (ADR 0269).
     retrying: bool = False
+    waiting_on_answers: bool = False
     note_at: datetime | None = None
     wait_at: datetime | None = None
     no_pull_request: bool = False
     pr_open: bool = False
     next_owner: str | None = None
+    # A questions_asked completion that is not waiting on an outstanding round.
+    questions_asked: bool = False
 
 
 def _text(value: object, limit: int | None = None) -> str:
@@ -246,7 +249,13 @@ def _arcs(view: PhaseView) -> list[str]:
 def render_card(card: CardInput) -> str:
     """Render the WIDTH x HEIGHT status card as a standalone SVG document."""
 
-    label, color, live = pill_for(card.status, card.publishing, retrying=card.retrying)
+    label, color, live = pill_for(
+        card.status,
+        card.publishing,
+        retrying=card.retrying,
+        waiting_on_answers=card.waiting_on_answers,
+        questions_asked=card.questions_asked,
+    )
     subject = f"{card.repo} #{card.issue_number}"
     if card.revision_pr is not None:
         subject += f" (PR #{card.revision_pr})"
@@ -279,6 +288,10 @@ def render_card(card: CardInput) -> str:
     )
     if card.no_pull_request:
         state_line = "No pull request published"
+    if card.waiting_on_answers:
+        state_line = "Waiting on answers"
+    elif card.questions_asked:
+        state_line = "Questions asked"
     if reviewer:
         review_text = f"reviewer {reviewer}"
     if cap is not None and card.phase_view.staged:

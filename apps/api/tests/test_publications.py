@@ -8533,7 +8533,7 @@ def assert_single_ask_line(body: str, before: str, mention: str = "curie") -> li
     asks = [i for i, line in enumerate(lines) if line.startswith("Ask the factory:")]
     assert len(asks) == 1, body
     at = asks[0]
-    assert lines[at] == github_ask_line(mention)
+    assert lines[at] == github_ask_line(mention, "pull_request")
     assert "mention @" + mention + " on this pull request" not in body
     assert lines[at - 1] == ""
     assert "\n".join(lines[: at - 1]) == before.rstrip("\n")
@@ -8555,7 +8555,7 @@ def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
     number = payload["reply_conversation_id"].removeprefix("issue-")
     assert created.json()["body"] == (
         f"{payload['body']}\n\nCloses #{number}\n\n{_factory_issue_marker(request_id)}\n\n"
-        f"{github_ask_line('curie')}"
+        f"{github_ask_line("curie", "pull_request")}"
     )
     assert not assert_single_ask_line(
         created.json()["body"],
@@ -8802,7 +8802,7 @@ def test_factory_non_python_publication_keeps_its_existing_body_without_python_c
     issue_number = int(payload["reply_conversation_id"].removeprefix("issue-"))
     assert created.json()["body"] == (
         f"{payload['body']}\n\nCloses #{issue_number}\n\n{_factory_issue_marker(request_id)}\n\n"
-        f"{github_ask_line('curie')}"
+        f"{github_ask_line("curie", "pull_request")}"
     )
 
 
@@ -8824,7 +8824,7 @@ def test_github_publication_puts_the_ask_line_immediately_before_requester_prefe
     lines = created.json()["body"].splitlines()
     assert lines[-1] == ANNOTATION
     # Locate the ask line by content; platform annotations may follow it.
-    ask_at = lines.index(github_ask_line("curie"))
+    ask_at = lines.index(github_ask_line("curie", "pull_request"))
     trailing = assert_single_ask_line(
         created.json()["body"],
         "\n".join(lines[: ask_at - 1]),
@@ -8859,7 +8859,7 @@ def test_github_publication_orders_ask_learned_rules_then_requester_preferences(
     assert created.status_code == 201, created.text
     body = created.json()["body"]
     lines = body.splitlines()
-    ask = github_ask_line("curie")
+    ask = github_ask_line("curie", "pull_request")
     assert lines.count(ask) == 1
     assert [line for line in lines if line.startswith("Learned rules:")] == [learned.LINE]
     assert [line for line in lines if line.startswith("Requester preferences:")] == [

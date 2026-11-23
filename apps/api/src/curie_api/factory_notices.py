@@ -59,6 +59,7 @@ from .factory_progress import (
 )
 from .factory_questions import (
     ANSWER_RECEIVED_LINE,
+    OUTSTANDING,
     QUESTIONS_ASKED,
     QUESTIONS_LABEL,
     QUESTIONS_UNRECORDED_LINE,
@@ -102,6 +103,7 @@ from .models import (
     ExecutionRequestPhaseReport,
     FactoryBaseTransition,
     FactoryCiObservation,
+    FactoryQuestionRound,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -424,6 +426,7 @@ def result_section(
     *,
     pr_url: str | None,
     feedback_url: str | None = None,
+    commit_sha: str | None = None,
     detail: str | None = None,
     unchanged: bool = False,
     superseded: bool = False,
@@ -433,6 +436,7 @@ def result_section(
     run_cost_usd: Decimal | None = None,
     question_round: int | None = None,
     work_item_cancelled: bool = False,
+    waiting_on_answers: bool = True,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
@@ -443,9 +447,11 @@ def result_section(
     a failed or expired request with no successor. ``blocked_on`` is the
     condition a ``retry_condition_expired`` request was still blocked on.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
-    ``question_round`` is the round a ``questions_asked`` request posted, and
-    ``work_item_cancelled`` replaces its answer instruction once the WorkItem
-    is cancelled, since an answer then starts nothing.
+    ``question_round`` is the round a ``questions_asked`` request posted.
+    ``work_item_cancelled`` replaces the answer instruction once the WorkItem
+    is cancelled. ``waiting_on_answers`` keeps that instruction only while
+    this request's round is still outstanding. Once the round is answered,
+    the result names the questions and does not ask again.
     """
 
     if successor is not None:
@@ -465,7 +471,14 @@ def result_section(
             if detail is not None and detail.strip():
                 text += _agent_message_block(detail.strip())
         elif feedback_url is not None:
-            text = "The requested revision is pushed to this pull request.\n"
+            sha = commit_sha.strip() if isinstance(commit_sha, str) else ""
+            if sha:
+                text = (
+                    "The requested revision is pushed to this pull request as "
+                    f"{code_span(sha[:7])} ({sha}).\n"
+                )
+            else:
+                text = "The requested revision is pushed to this pull request.\n"
             if detail is not None and detail.strip():
                 text += f"Note: {detail.strip()}\n"
         elif isinstance(pr_url, str) and pr_url.strip():
@@ -485,8 +498,10 @@ def result_section(
                 f"Questions asked{of_rounds}. The factory label was removed, "
                 "so an answer starts nothing.\n"
             )
-        else:
+        elif waiting_on_answers:
             text = f"Questions asked{of_rounds}. Answer in a plain comment on this ticket.\n"
+        else:
+            text = f"Questions asked{of_rounds}.\n"
     elif cause == "issue_cancelled" and superseded:
         text = (
             f"Stopped: the label was added again, so a new run replaced this one.\nCause: {cause}\n"
@@ -841,6 +856,84 @@ def completed_proof() -> Any:
     )
 
 
+def questions_asked_completion(status: str, terminal_cause: str | None) -> bool:
+    """A run that finished by posting questions, whatever happened to the round."""
+
+    return status == "completed" and terminal_cause == QUESTIONS_ASKED
+
+
+def is_waiting_on_answers(
+    status: str,
+    terminal_cause: str | None,
+    cancelled_at: datetime | None,
+    *,
+    round_outstanding: bool,
+) -> bool:
+    """A questions run whose own round is still outstanding on an open issue."""
+
+    return (
+        questions_asked_completion(status, terminal_cause)
+        and cancelled_at is None
+        and round_outstanding
+    )
+
+
+async def question_round_outstanding(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
+) -> bool:
+    """Whether ``request_id`` is the work item's current outstanding round."""
+
+    found = (
+        await session.execute(
+            select(
+                FactoryQuestionRound.state,
+                FactoryQuestionRound.asking_request_id,
+            ).where(FactoryQuestionRound.work_item_id == work_item_id)
+        )
+    ).one_or_none()
+    if found is None:
+        return False
+    state, asking_request_id = found
+    return bool(state == OUTSTANDING and asking_request_id == request_id)
+
+
+def _questions_comment_due() -> Any:
+    """A finalized questions comment whose waiting pill is no longer true.
+
+    The comment finalizes when it is first posted. An answer updates the
+    round, and cancellation deletes it. Either one is newer than
+    ``finalized_at`` exactly once, so the comment is rewritten once and then
+    left alone.
+    """
+
+    this_round_outstanding = exists().where(
+        FactoryQuestionRound.work_item_id == WorkItem.id,
+        FactoryQuestionRound.asking_request_id == ExecutionRequest.id,
+        FactoryQuestionRound.state == OUTSTANDING,
+    )
+    still_waiting = and_(this_round_outstanding, WorkItem.cancelled_at.is_(None))
+    # Only while this request is still the row's asker. A later round reuses
+    # the row, and rewriting this comment then would drop its round number.
+    round_moved = exists().where(
+        FactoryQuestionRound.work_item_id == WorkItem.id,
+        FactoryQuestionRound.asking_request_id == ExecutionRequest.id,
+        FactoryQuestionRound.state != OUTSTANDING,
+        FactoryQuestionRound.updated_at > FactoryStatusComment.finalized_at,
+    )
+    round_gone = and_(
+        ~exists().where(FactoryQuestionRound.work_item_id == WorkItem.id),
+        WorkItem.cancelled_at.is_not(None),
+        WorkItem.cancelled_at > FactoryStatusComment.finalized_at,
+    )
+    return and_(
+        ExecutionRequest.status == "completed",
+        ExecutionRequest.terminal_cause == QUESTIONS_ASKED,
+        FactoryStatusComment.finalized_at.is_not(None),
+        ~still_waiting,
+        or_(round_moved, round_gone),
+    )
+
+
 def _admitted_before_merge_sql() -> Any:
     """Whether the request was admitted before its WorkItem's pull request merged.
 
@@ -1044,7 +1137,11 @@ async def _claim_next(
                     else (FactoryStatusComment.execution_request_id.in_(request_ids),)
                 ),
                 ExecutionRequest.objective.is_not(None),
-                or_(FactoryStatusComment.finalized_at.is_(None), label_due),
+                or_(
+                    FactoryStatusComment.finalized_at.is_(None),
+                    label_due,
+                    _questions_comment_due(),
+                ),
                 lease_available(
                     FactoryStatusComment.sync_owner, FactoryStatusComment.sync_lease_expires_at
                 ),
@@ -1087,6 +1184,16 @@ async def _claim_next(
         # this comment during a rolling upgrade: it renders the unknown cause
         # as a failure and labels a completed request pr-open, which this
         # version never applies to a question ending. Write the body again.
+        row.finalized_at = None
+    round_outstanding = await question_round_outstanding(session, work_item.id, request.id)
+    if (
+        request.status == "completed"
+        and request.terminal_cause == QUESTIONS_ASKED
+        and row.finalized_at is not None
+        and not (round_outstanding and work_item.cancelled_at is None)
+    ):
+        # The stored body still says this request is waiting. The round is
+        # answered or the issue is closed, so write the body again.
         row.finalized_at = None
     now = await _clock(session)
     await session.execute(
@@ -1523,10 +1630,18 @@ async def _render(
                 is None
             )
             usage = await request_usage(session, request.id)
+            commit_sha = None
+            if request.reply_target_url and work_item.publication_lineage_id is not None:
+                commit_sha = await session.scalar(
+                    select(ThreadPublicationLineage.head_sha).where(
+                        ThreadPublicationLineage.id == work_item.publication_lineage_id
+                    )
+                )
             result = result_section(
                 cause,
                 pr_url=pr_url,
                 feedback_url=request.reply_target_url,
+                commit_sha=commit_sha,
                 # Issue summaries use only attributed, bounded agent facts.
                 # PR replies retain their bounded, inert final-message quote.
                 detail=(
@@ -1547,6 +1662,18 @@ async def _render(
                     else None
                 ),
                 work_item_cancelled=work_item.cancelled_at is not None,
+                waiting_on_answers=(
+                    is_waiting_on_answers(
+                        request.status,
+                        cause,
+                        work_item.cancelled_at,
+                        round_outstanding=await question_round_outstanding(
+                            session, work_item.id, request.id
+                        ),
+                    )
+                    if cause == QUESTIONS_ASKED
+                    else True
+                ),
             )
             if cause != QUESTIONS_ASKED and await question_unrecorded(
                 session, work_item.id, request.id
@@ -1629,8 +1756,20 @@ async def _render(
         report.phase not in _EARLY_FOLLOW_UP_PHASES for report in reports
     ):
         progress_line = _READING_PULL_REQUEST
+    round_outstanding = await question_round_outstanding(session, work_item.id, request.id)
+    waiting_on_answers = is_waiting_on_answers(
+        request.status,
+        cause,
+        work_item.cancelled_at,
+        round_outstanding=round_outstanding,
+    )
     pill_label, _color, _live = pill_for(
-        request.status, publishing, retrying=retrying, answered=answered
+        request.status,
+        publishing,
+        retrying=retrying,
+        answered=answered,
+        waiting_on_answers=waiting_on_answers,
+        questions_asked=questions_asked_completion(request.status, cause),
     )
     pending_count = await session.scalar(
         select(func.count(ExecutionRequest.id)).where(
@@ -1814,8 +1953,10 @@ async def _render(
             line = f"Checks were not verified: {code_span(ci_observation.reason or 'invalidated')}."
         body += f"\n\n{line}"
     mention = github_status_mention(settings, work_item.tracker_kind)
-    if mention is not None and target.kind in {"pull_request", "review_thread"}:
-        body = append_github_ask_line(body, mention)
+    if mention is not None and target.kind == "issue":
+        body = append_github_ask_line(body, mention, "issue")
+    elif mention is not None and target.kind in {"pull_request", "review_thread"}:
+        body = append_github_ask_line(body, mention, "pull_request")
     return body
 
 
