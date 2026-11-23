@@ -58,6 +58,11 @@ Stop it with SIGINT or
 SIGTERM and remove only that execution's owned state. An unsupported call returns
 HTTP 501 with `unsupported_request`, is retained in SQLite, and makes the server
 exit unsuccessfully. The Python API also raises on `close()` after such a call.
+An unknown bearer on `GET /user` returns 401 `{"message":"Bad credentials"}` and
+appends `GET /user` to `rejected_auth`. The bearer itself is not stored. That
+rejection is not an unsupported request, so `unknown_requests` stays empty and
+`close()` does not treat it as a failure. A known bearer returns 200 and appends
+nothing to either list.
 
 Tests can construct `GithubStub(root, recording, seed_tree=seed, issue_file=issue)`,
 call `start()`, set clients' trust to `ca_file`, advance replay time with
