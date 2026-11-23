@@ -1075,7 +1075,7 @@ class ScriptedRun:
         self.stub._put("issue", 3815, issue)
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
 
-    def bind_slack(self) -> None:
+    def bind_slack(self, *, public: bool = False) -> None:
         """Bind the factory agent to the Slack channel the recorder stands in for."""
 
         if not self.gateway_enabled():
@@ -1088,10 +1088,11 @@ class ScriptedRun:
         )
         agent = self.evidence["agent_id"]
         headers = {"X-API-Key": self.env["CURIE_API_KEY"]}
+        field = "factory_public_slack_channel" if public else "factory_slack_channel"
         for method, path, body in (
             ("POST", f"/agents/{agent}/channels",
              {"kind": "slack", "address": scenario.SLACK_CHANNEL}),
-            ("PATCH", f"/agents/{agent}", {"factory_slack_channel": scenario.SLACK_CHANNEL}),
+            ("PATCH", f"/agents/{agent}", {field: scenario.SLACK_CHANNEL}),
         ):
             status, _ = fe.http_json(
                 method, self.env["CURIE_API_URL"] + path, headers=headers, body=body
@@ -1979,7 +1980,9 @@ class ScriptedRun:
                 audit = service.unexpected if service is self.model else service.unknown_requests
                 # A model audit entry carries the turn's input text. The Jira
                 # leg uploads its evidence publicly, so it records the count.
-                public = service is self.model and self.jira_enabled()
+                public = service is self.model and (
+                    self.jira_enabled() or self.args.scenario == "slack-steering"
+                )
                 self.evidence[field] = len(audit) if public else audit
                 port = service.port
                 host = service.host
@@ -2161,6 +2164,10 @@ def main(args: argparse.Namespace) -> int:
             from learned_rules_run import LearnedRulesRun
 
             run: ScriptedRun = LearnedRulesRun(args)
+        elif args.scenario == "slack-steering":
+            from slack_steering_run import SlackSteeringRun
+
+            run = SlackSteeringRun(args)
         else:
             run = ScriptedRun(args)
     except fe.ConfigError as exc:

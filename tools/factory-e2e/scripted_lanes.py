@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 REVISION_PLACEHOLDER = "{{observed_revision}}"
 IMPLEMENTATION = "implementation"
@@ -339,6 +339,8 @@ class SlackRecorder:
             body = {key: values[0] for key, values in parse_qs(raw.decode()).items()}
         if not isinstance(body, dict):
             body = {}
+        query = parse_qs(urlsplit(handler.path).query)
+        body = {key: values[0] for key, values in query.items()} | body
         authorization = handler.headers.get("Authorization", "")
         with self._lock:
             if not authorization.startswith("Bearer "):
@@ -366,6 +368,33 @@ class SlackRecorder:
             payload |= {"channel": body.get("channel"), "ts": body.get("ts")}
         elif method == "auth.test":
             payload |= {"user_id": "U0EXAMPLE9", "team_id": "T0EXAMPLE1", "bot_id": "B0EXAMPLE1"}
+        elif method == "conversations.info":
+            from scripted_scenario import SLACK_CHANNEL
+
+            if body.get("channel") != SLACK_CHANNEL:
+                payload = {"ok": False, "error": "channel_not_found"}
+            else:
+                payload["channel"] = {
+                    "id": SLACK_CHANNEL,
+                    "context_team_id": "T0EXAMPLE1",
+                    "is_channel": True,
+                    "is_private": False,
+                    "is_group": False,
+                    "is_im": False,
+                    "is_mpim": False,
+                    "is_shared": False,
+                    "is_ext_shared": False,
+                    "is_org_shared": False,
+                    "is_pending_ext_shared": False,
+                    "is_archived": False,
+                }
+        elif method == "conversations.replies":
+            payload["messages"] = [
+                {"ts": post.ts, "text": post.text, "user": "U0EXAMPLE9", "bot_id": "B0EXAMPLE1"}
+                for post in self.posts()
+                if post.method == "chat.postMessage" and post.thread_ts is None
+                and post.channel == body.get("channel") and post.ts == body.get("ts")
+            ]
         encoded = json.dumps(payload).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
