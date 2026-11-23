@@ -116,7 +116,9 @@ class LocalVoiceRecognizer:
         try:
             async with asyncio.timeout(CHILD_WALL_SECONDS):
                 return await self._run(mime, data)
-        except (OSError, TimeoutError):
+        except TimeoutError:
+            return Refused(reason="media_limit")
+        except OSError:
             return Refused(reason="unavailable")
 
     async def _run(self, mime: str, data: bytes) -> str | Refused:
@@ -140,7 +142,8 @@ class LocalVoiceRecognizer:
             # Cancellation can interrupt spawn or recur during shutdown. Only the reaper
             # releases the shared slot, after the child has exited.
             await asyncio.shield(_reap_and_release(launch))
-        if proc.returncode == -signal.SIGALRM:
+        # Linux sends SIGKILL when the child reaches its hard RLIMIT_CPU.
+        if proc.returncode in (-signal.SIGALRM, -signal.SIGXCPU, -signal.SIGKILL):
             return Refused(reason="media_limit")
         if proc.returncode != 0:
             return Refused(reason=CHILD_REFUSALS.get(proc.returncode or -1, "unavailable"))

@@ -51,7 +51,7 @@ async def test_fifo_model_path_is_never_opened_for_a_blocking_read(tmp_path: Pat
         assert not await recognizer.available()
 
 
-@pytest.mark.parametrize("end", ["cancel", "deadline"])
+@pytest.mark.parametrize("end", ["cancel", "deadline", "cpu_limit"])
 async def test_concurrent_service_instances_reap_the_real_child(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -74,8 +74,12 @@ async def test_concurrent_service_instances_reap_the_real_child(
         assert await LocalVoiceRecognizer(path).recognize("audio/wav", data) == Refused(
             reason="unavailable"
         )
-        if end == "deadline":
-            assert await first == Refused(reason="unavailable")
+        if end == "cpu_limit":
+            resource.prlimit(child, resource.RLIMIT_CPU, (0, 0))
+            os.kill(child, signal.SIGCONT)
+        if end != "cancel":
+            async with asyncio.timeout(5):
+                assert await first == Refused(reason="media_limit")
     finally:
         if not first.done():
             first.cancel()
