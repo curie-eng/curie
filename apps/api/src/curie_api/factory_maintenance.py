@@ -31,10 +31,35 @@ class MaintenanceRepair:
 
     status: Literal["admitted", "replayed"]
     request_id: UUID
-    mode: Literal["active_continuation", "successor"]
+    mode: Literal["successor"] = "successor"
+
+
+@dataclass(frozen=True, kw_only=True)
+class MaintenanceAuthority:
+    """Publication pins read from the admission by its repair request ID."""
+
+    repair_request_id: UUID
+    reason: MaintenanceReason
+    head_sha: str
+    base_ref: str
+    base_sha: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class MaintenanceInstructions:
+    objective: str
+    publication_mode: Literal["base_conflict_merge"] | None
+
+
+class MaintenanceReasonHook(Protocol):
+    def __call__(
+        self, authority: MaintenanceAuthority, /, *, objective: str
+    ) -> MaintenanceInstructions: ...
 
 
 RefusalReason = Literal[
+    "repair_disabled",
+    "reason_unavailable",
     "work_item_cancelled",
     "pr_closed",
     "identity_unverified",
@@ -46,7 +71,7 @@ RefusalReason = Literal[
     "base_changed",
     "window_expired",
     "budget_exhausted",
-    "active_round_limit",
+    "source_not_completed",
     "prior_green_missing",
     "evidence_unavailable",
     "failure_not_attributable",

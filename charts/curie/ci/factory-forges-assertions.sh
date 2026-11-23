@@ -28,6 +28,7 @@ api:
   githubRepoAllowlist: ["acme-corp/*"]
 factory:
   enabled: true
+  maintenanceRepairEnabled: true
   intake: poll
   cardBaseUrl: https://curie.example.com
   ciWaitSeconds: 1500
@@ -141,6 +142,9 @@ forges = json.loads(value("CURIE_FORGES") or "{}")
 volumes = [v for v in spec.get("volumes", []) or [] if "projected" in v and any(
     "secret" in s for s in v["projected"].get("sources", []))]
 mounts = [m for m in container.get("volumeMounts", []) or [] if m["mountPath"] == MOUNT]
+
+if value("FACTORY_MAINTENANCE_REPAIR_ENABLED") != ("false" if mode == "default" else "true"):
+    fail("factory.maintenanceRepairEnabled did not reach the API")
 
 if mode == "default":
     if value("FACTORY_CI_WAIT_S") != "3600":

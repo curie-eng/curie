@@ -1341,6 +1341,7 @@ console:
 # A credential names its Secret: existingSecret, existingSecretKey.
 factory:
   enabled: false
+  maintenanceRepairEnabled: false
   # Mount ggml-base.en.bin for the API recognizer. Message intake requires a source adapter.
   voiceModelClaim: ""
   githubAppClientId: ""
