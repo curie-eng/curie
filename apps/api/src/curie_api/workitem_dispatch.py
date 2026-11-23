@@ -1304,9 +1304,7 @@ async def acquire(
     if isinstance(locked, DispatchConflict):
         return locked
     work_item, request, deadline, now = locked
-    previously_acquired = (
-        request.acquired_generation is not None or request.last_deferral_reason is not None
-    )
+    already_acquired = request.acquired_generation == generation
     claimed = await _claim_acquire(
         session, work_item, request, owner=owner, generation=generation, now=now
     )
@@ -1420,7 +1418,7 @@ async def acquire(
         session,
         work_item,
         request,
-        previously_acquired=previously_acquired,
+        already_acquired=already_acquired,
         generation=generation,
         digest=input_sha256,
         now=now,

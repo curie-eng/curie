@@ -577,3 +577,75 @@ def test_public_guidance_settles_the_placeholder_and_publishes_one_queued_status
     (queued,) = [post for post in messages if post.response.get("ts") == record["posted_ref"]]
     assert "queued" in queued.text.lower()
     assert all(marker not in post.haystack for post in messages)
+
+
+@pytest.mark.parametrize("disable_destination", [False, True])
+def test_deferred_confirmation_requires_public_mode_after_an_open_pull_request_appears(
+    steering: runtime.SteeringStack, monkeypatch: pytest.MonkeyPatch, disable_destination: bool
+) -> None:
+    from curie_api.factory_steering_execution import redrive
+    from test_factory_public_notifications import configure_public, drain_public
+
+    stack = steering
+    assert configure_public(stack, monkeypatch, runtime.CHANNEL).is_success
+    original, item = stack.admit(next(runtime._ISSUES))
+    epoch = stack.start(original)
+    drain_public(stack)
+    (post,) = stack.slack.roots(stack.factory_token)
+    root = post.response["ts"]
+    writer = stack.person()
+    authority, command, confirmation = _confirmed(stack, writer, root)
+
+    async def accept(engine: AsyncEngine) -> None:
+        async with AsyncSession(engine) as session, session.begin():
+            result = await admit_confirmed_text(
+                session, command, settings=get_settings(), authority=authority,
+                confirmation=confirmation,
+            )
+            assert result == QueuedSteering(
+                steering_id=command.steering_id, execution_request_id=None, replayed=False
+            )
+
+    runtime._db(accept)
+    pr = next(runtime._PULLS)
+    _, branch = stack.own_pull_request(item, pr)
+    stack.github.open_pull(pr, branch)
+    stack.finish(original, epoch, published=True)
+    if disable_destination:
+        cleared = stack.client.patch(
+            f"/agents/{stack.agent_id}", headers=stack.platform,
+            json={"factory_public_slack_channel": None},
+        )
+        assert cleared.is_success
+        assert _authorize(stack, writer, root) == RefusedSteering(reason="no_pull_request")
+
+    async def reconcile(engine: AsyncEngine) -> None:
+        async with AsyncSession(engine) as session:
+            await redrive(
+                session, item, command.steering_id,
+                settings=get_settings(), client=stack.client.app.state.http_client,
+            )
+
+    runtime._db(reconcile)
+    runtime._db(reconcile)
+    (entry,) = runtime._rows(
+        "SELECT state, refusal_code, execution_request_id FROM curie.factory_steering_ledger "
+        "WHERE steering_id = :key", {"key": command.steering_id},
+    )
+    requests = [row["id"] for row in stack.requests()]
+    if disable_destination:
+        assert entry == {
+            "state": "refused", "refusal_code": "authority_changed", "execution_request_id": None
+        }
+        assert requests == [original]
+        assert configure_public(stack, monkeypatch, runtime.CHANNEL).is_success
+        drain_public(stack)
+        drain_public(stack)
+        notices = stack.slack.thread_posts(stack.factory_token, root)
+        assert sum("authority_changed" in notice.text for notice in notices) == 1
+        assert all(command.text not in notice.text for notice in notices)
+    else:
+        assert entry == {
+            "state": "queued", "refusal_code": None, "execution_request_id": command.steering_id
+        }
+        assert requests == [original, command.steering_id]

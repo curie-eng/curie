@@ -18,78 +18,9 @@ from .models import FactorySlackPublicThread, ThreadPublicationLineage, WorkItem
 async def reserve_public_root(
     session: AsyncSession, work_item_id: uuid.UUID, sequence: int
 ) -> None:
-    bind = {"item": work_item_id, "sequence": sequence}
     await session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(CAST(:item AS text), 194))"),
-        {"item": str(work_item_id)},
-    )
-    await session.execute(
-        text(f"""
-        INSERT INTO {SCHEMA}.factory_slack_public_threads
-            (work_item_id, agent_id, channel_identity, channel, first_sequence)
-        SELECT w.id, w.agent_id, b.identity, a.factory_public_slack_channel, :sequence
-          FROM {SCHEMA}.work_items w JOIN {SCHEMA}.agents a ON a.id = w.agent_id
-          CROSS JOIN LATERAL (
-            SELECT min(c.adapter) AS identity FROM {SCHEMA}.agent_channels c
-             WHERE c.agent_id = a.id AND c.kind = 'slack'
-               AND c.address = a.factory_public_slack_channel AND c.adapter IS NOT NULL
-             HAVING count(*) = 1
-          ) b
-         WHERE w.id = :item AND a.factory_slack_since IS NOT NULL
-        ON CONFLICT (work_item_id) DO NOTHING
-    """),
-        bind,
-    )
-    # A kickoff's placeholder is recorded after request allocation, in the same transaction.
-    old = (
-        await session.execute(
-            text(f"""
-        SELECT t.work_item_id
-          FROM {SCHEMA}.factory_slack_threads t
-          JOIN {SCHEMA}.factory_slack_public_threads p
-            USING (work_item_id, channel_identity, channel)
-         WHERE t.work_item_id = :item
-           AND (p.root_ts IS NULL OR p.root_ts = t.root_ts)
-         FOR UPDATE OF t, p
-    """),
-            bind,
-        )
-    ).first()
-    if old is None:
-        return
-    await session.execute(
-        text(f"""
-        UPDATE {SCHEMA}.factory_slack_public_threads p
-           SET root_ts = COALESCE(p.root_ts, t.root_ts),
-               card_ts = COALESCE(p.card_ts, t.card_ts), origin = t.origin,
-               requester_slack_user = t.requester_slack_user,
-               card_upgrade_cutoff = t.card_upgrade_cutoff
-          FROM {SCHEMA}.factory_slack_threads t
-         WHERE p.work_item_id = :item AND t.work_item_id = p.work_item_id
-    """),
-        bind,
-    )
-    await session.execute(
-        text(f"""
-        INSERT INTO {SCHEMA}.factory_slack_public_posts
-            (work_item_id, post_key, kind, sequence, rank, ordinal, payload, attempts,
-             not_before, posted_at, posted_ref, failed_at, created_at)
-        SELECT work_item_id, post_key, kind, sequence, rank, ordinal, '{{}}'::jsonb, attempts,
-               not_before, posted_at, posted_ref, failed_at, created_at
-          FROM {SCHEMA}.factory_slack_posts
-         WHERE work_item_id = :item AND last_error IS DISTINCT FROM 'transferred_to_public'
-        ON CONFLICT (work_item_id, post_key) DO NOTHING
-    """),
-        bind,
-    )
-    await session.execute(
-        text(f"""
-        UPDATE {SCHEMA}.factory_slack_posts SET failed_at = now(),
-               last_error = 'transferred_to_public', payload = '{{}}'::jsonb,
-               lease_owner = NULL, lease_expires_at = NULL
-         WHERE work_item_id = :item AND posted_at IS NULL AND failed_at IS NULL
-    """),
-        bind,
+        text(f"SELECT {SCHEMA}.reserve_factory_slack_public_root(:item, :sequence, false)"),
+        {"item": work_item_id, "sequence": sequence},
     )
 
 

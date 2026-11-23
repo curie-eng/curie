@@ -80,3 +80,9 @@ notification. That delivery can include issue and pull request details or
 a phase note. The database refuses subsequent legacy card leases for the
 same kickoff root. A repository can also change visibility between the
 shareability check and Slack accepting a message.
+
+During a rolling upgrade, an earlier reconciler can publish an execution
+message containing only the original objective. An earlier API can start
+that execution without checking its input. If it finishes before a current
+API records application, the steering reconciler closes the queued entry
+with `execution_ended`. The thread reports that the guidance went unapplied.

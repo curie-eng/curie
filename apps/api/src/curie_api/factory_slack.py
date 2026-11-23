@@ -452,6 +452,7 @@ async def _read_voice_run(
     *,
     voice: bool,
     locked: bool = False,
+    deferred: bool = False,
 ) -> _Run | RefusedSteering:
     lineage = None
     if item.publication_lineage_id is not None:
@@ -477,6 +478,8 @@ async def _read_voice_run(
     if locked:
         destination = destination.with_for_update(read=True)
     public_channel = await session.scalar(destination)
+    if deferred and public_channel is None:
+        return RefusedSteering(reason="authority_changed")
     if not public_channel and (voice or lineage is None or lineage.pr_number is None):
         return RefusedSteering(
             reason="lineage_closed" if lineage is None and not voice else "no_pull_request"
@@ -544,7 +547,12 @@ async def _receiving_team(session: AsyncSession, resolution: Resolution) -> str 
 
 
 async def _authorize(
-    session: AsyncSession, source: _Source, *, settings: Settings, client: httpx.AsyncClient
+    session: AsyncSession,
+    source: _Source,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    deferred: bool = False,
 ) -> SlackVoiceAuthorization | RefusedSteering:
     evidence = SlackEvidence.model_validate_json(source.evidence_json)
     async with AsyncSession(bind=session.bind) as reader:
@@ -572,7 +580,9 @@ async def _authorize(
         )
         if owner_refusal is not None and source.file_id is not None:
             return owner_refusal
-        run = await _read_voice_run(reader, item, mode, voice=source.file_id is not None)
+        run = await _read_voice_run(
+            reader, item, mode, voice=source.file_id is not None, deferred=deferred
+        )
         if isinstance(run, RefusedSteering):
             return run
         if run.public_channel and not repository_allowed(settings, run.repository):
@@ -1131,7 +1141,7 @@ async def redrive_pending(
         content_sha256=entry.source_content_sha256,
         evidence_json=json.dumps(facts["evidence"]),
     )
-    authority = await _authorize(session, source, settings=settings, client=client)
+    authority = await _authorize(session, source, settings=settings, client=client, deferred=True)
     # Acquire or cancellation may settle the pending row during the provider read.
     await identity_fence.lock_identity_reader(session)
     tracker_item = await session.get(WorkItem, entry.work_item_id)
@@ -1162,8 +1172,6 @@ async def redrive_pending(
         return current.decision(replayed=True)
     elif isinstance(authority, RefusedSteering):
         reason = authority.reason
-    elif not authority.run.public_channel:
-        reason = "no_pull_request"
     elif authority.work_item_id != item.id:
         reason = "target_mismatch"
     elif not _same_facts(facts, _source_facts(authority)):

@@ -79,7 +79,7 @@ async def requires_redispatch(
     item: WorkItem,
     request: ExecutionRequest,
     *,
-    previously_acquired: bool,
+    already_acquired: bool,
     generation: int,
     digest: str | None,
     now: datetime,
@@ -92,7 +92,7 @@ async def requires_redispatch(
     selected: list[UUID] = []
     if request.steering_sealed_at is None:
         request.steering_sealed_at = now
-        if not previously_acquired and not assigned:
+        if not already_acquired and not assigned:
             selected = await _select_pending(session, item, request, now)
     if not selected and (not assigned or matches_input(request.objective, assigned, digest)):
         return False

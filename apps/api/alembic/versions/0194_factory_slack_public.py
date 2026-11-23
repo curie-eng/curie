@@ -152,6 +152,63 @@ def upgrade() -> None:
         EXECUTE FUNCTION curie.factory_slack_guard_origin_post()
     """)
 
+    op.execute("""
+        CREATE FUNCTION curie.reserve_factory_slack_public_root(
+            item_id uuid, start_sequence integer, shared_kickoff_only boolean
+        ) RETURNS void LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(hashtextextended(item_id::text, 194));
+          INSERT INTO curie.factory_slack_public_threads
+                (work_item_id, agent_id, channel_identity, channel, first_sequence)
+          SELECT w.id, w.agent_id, b.identity, a.factory_public_slack_channel, start_sequence
+            FROM curie.work_items w JOIN curie.agents a ON a.id = w.agent_id
+            CROSS JOIN LATERAL (
+                SELECT min(c.adapter) AS identity FROM curie.agent_channels c
+                 WHERE c.agent_id = a.id AND c.kind = 'slack'
+                   AND c.address = a.factory_public_slack_channel AND c.adapter IS NOT NULL
+                 HAVING count(*) = 1
+            ) b
+           WHERE w.id = item_id AND a.factory_slack_since IS NOT NULL
+             AND (NOT shared_kickoff_only OR EXISTS (
+                 SELECT 1 FROM curie.factory_slack_threads t
+                  WHERE t.work_item_id = w.id AND t.origin = 'kickoff' AND t.root_ts IS NOT NULL
+                    AND t.channel = a.factory_public_slack_channel
+                    AND t.channel_identity = b.identity
+             ))
+          ON CONFLICT (work_item_id) DO NOTHING;
+
+          PERFORM t.work_item_id
+            FROM curie.factory_slack_threads t JOIN curie.factory_slack_public_threads p
+                 USING (work_item_id, channel_identity, channel)
+           WHERE t.work_item_id = item_id AND (p.root_ts IS NULL OR p.root_ts = t.root_ts)
+           FOR UPDATE OF t, p;
+          IF NOT FOUND THEN RETURN; END IF;
+
+          UPDATE curie.factory_slack_public_threads p
+             SET root_ts = COALESCE(p.root_ts, t.root_ts),
+                 card_ts = COALESCE(p.card_ts, t.card_ts),
+                 origin = t.origin, requester_slack_user = t.requester_slack_user,
+                 card_upgrade_cutoff = t.card_upgrade_cutoff
+            FROM curie.factory_slack_threads t
+           WHERE p.work_item_id = item_id AND t.work_item_id = p.work_item_id;
+
+          INSERT INTO curie.factory_slack_public_posts
+                (work_item_id, post_key, kind, sequence, rank, ordinal, payload, attempts,
+                 not_before, posted_at, posted_ref, failed_at, created_at)
+          SELECT work_item_id, post_key, kind, sequence, rank, ordinal, '{}'::jsonb, attempts,
+                 not_before, posted_at, posted_ref,
+                 CASE WHEN last_error IS DISTINCT FROM 'transferred_to_public' THEN failed_at END,
+                 created_at
+            FROM curie.factory_slack_posts WHERE work_item_id = item_id
+          ON CONFLICT (work_item_id, post_key) DO NOTHING;
+
+          UPDATE curie.factory_slack_posts
+             SET failed_at = now(), last_error = 'transferred_to_public', payload = '{}'::jsonb,
+                 lease_owner = NULL, lease_expires_at = NULL
+           WHERE work_item_id = item_id AND posted_at IS NULL AND failed_at IS NULL;
+        END $$
+    """)
+
 
 def downgrade() -> None:
     op.execute("""
@@ -165,6 +222,7 @@ def downgrade() -> None:
         OR EXISTS (SELECT 1 FROM curie.factory_slack_posts WHERE kind LIKE 'steering_%')
         THEN RAISE EXCEPTION 'factory_slack_public_state_present'; END IF; END $$
     """)
+    op.execute("DROP FUNCTION curie.reserve_factory_slack_public_root(uuid, integer, boolean)")
     op.execute("DROP TRIGGER factory_slack_guard_origin_post ON curie.factory_slack_posts")
     op.execute("DROP FUNCTION curie.factory_slack_guard_origin_post()")
     op.execute("DROP TRIGGER factory_slack_guard_origin_card ON curie.factory_slack_threads")

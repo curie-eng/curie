@@ -3,20 +3,29 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
 from curie_api import factory_steering_ledger as ledger
 from curie_api import workitem_dispatch as dispatch
+from curie_api.config import get_settings
 from curie_api.models import ExecutionRequest
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_api.workitems.lifecycle import WorkItemOutcome
 from forge_fakes import factory_wake, no_external_calls
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from test_github_factory_base import (
+    _execute,
+    _execution,
+    _label,
+    base_app,  # noqa: F401
+)
 from test_workitem_dispatch import (
     ADDRESS,
     CLAIM_NAME,
@@ -120,6 +129,110 @@ async def _state(session: AsyncSession, key: UUID) -> ledger.SteeringEntry:
     entry = await ledger.get(session, key)
     assert entry is not None
     return entry
+
+
+def test_first_grant_after_base_label_settling_selects_queued_guidance(
+    runs_stream: str,
+    valkey: redis.Redis,
+    base_app: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, forge = base_app
+    monkeypatch.setenv("FACTORY_BASE_LABEL_SETTLE_S", "60")
+    get_settings.cache_clear()
+    number = 3815
+    _execute(
+        "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter) "
+        "SELECT :id, id, 'slack', :channel, 'default' FROM curie.agents "
+        "WHERE repo_full_name='acme-corp/acme-bot'",
+        {"id": uuid4(), "channel": ADDRESS},
+    )
+    _execute(
+        "UPDATE curie.agents SET factory_public_slack_channel=:channel, "
+        "factory_slack_since=clock_timestamp() WHERE repo_full_name='acme-corp/acme-bot'",
+        {"channel": ADDRESS},
+    )
+    assert _label(client, forge, number).json()["status"] == "factory_admitted"
+    row = _execution(number)
+    request, item = row["id"], row["work_item_id"]
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession], loop: WorkItemReconciler, bus: aioredis.Redis
+    ) -> None:
+        async def published(generation: int) -> QueuedTurn:
+            await loop._publish_execute_wakes()
+            record = (await bus.xrevrange(runs_stream, count=1))[0][1]
+            turn = QueuedTurn.model_validate_json(record[STREAM_PAYLOAD_FIELD.encode()])
+            assert turn.event_id == f"work-item-{request}-execute-{generation}"
+            return turn
+
+        old = await published(1)
+        async with maker() as session:
+            early = await _acquire(session, request, 1, old.text)
+            assert isinstance(early, dispatch.DispatchConflict) and early.code == "not_dispatchable"
+            waiting = await session.get(ExecutionRequest, request, populate_existing=True)
+            assert waiting is not None and waiting.last_deferral_reason == "base_label_settling"
+            assert waiting.acquired_generation is None and waiting.steering_sealed_at is None
+            key = await _record(session, item, GUIDANCE)
+            await session.execute(
+                text(
+                    "UPDATE curie.execution_requests SET base_settle_until=clock_timestamp(), "
+                    "dispatch_not_before=clock_timestamp() WHERE id=:id"
+                ),
+                {"id": request},
+            )
+            await session.commit()
+        eligible = await published(2)
+        assert eligible.text == old.text
+        async with (
+            maker() as session,
+            httpx.AsyncClient(transport=httpx.MockTransport(forge.handle)) as external,
+        ):
+            selected = await dispatch.acquire(
+                session,
+                request,
+                owner=OWNER,
+                generation=2,
+                wake=await factory_wake(session, request),
+                context=None,
+                client=external,
+                input_sha256=ledger.digest(eligible.text),
+            )
+            assert (
+                isinstance(selected, dispatch.DispatchConflict) and selected.code == "not_published"
+            )
+        guided = await published(3)
+        assert guided.text == old.text + "\n\nAdditional guidance:\n" + GUIDANCE
+        async with maker() as session:
+            stale = await _acquire(session, request, 3, old.text)
+            assert isinstance(stale, dispatch.DispatchConflict) and stale.code == "not_published"
+            assert (await _state(session, key)).applied_at is None
+            await session.execute(
+                text(
+                    "UPDATE curie.execution_requests SET dispatch_not_before=clock_timestamp() "
+                    "WHERE id=:id"
+                ),
+                {"id": request},
+            )
+            await session.commit()
+        retry = await published(4)
+        assert retry.text == guided.text
+        async with maker() as session:
+            grant = await _acquire(session, request, 4, retry.text)
+            assert isinstance(grant, dispatch.AcquireGrant)
+            refused = await _start(session, request, grant, received=old.text)
+            assert (
+                isinstance(refused, dispatch.DispatchConflict)
+                and refused.code == "not_dispatchable"
+            )
+            entry = await _state(session, key)
+            assert entry.execution_request_id == request and entry.applied_at is None
+            assert isinstance(
+                await _start(session, request, grant, received=retry.text), dispatch.StartResult
+            )
+            assert (await _state(session, key)).state == "applied"
+
+    _run(steps, runs_stream)
 
 
 def test_selected_guidance_republishes_and_only_the_matching_start_applies(
