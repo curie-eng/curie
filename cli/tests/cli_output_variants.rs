@@ -486,6 +486,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Done" => FactoryProgressOutput::Done {
                 agent: "acme-bot".to_string(),
                 factory_slack_channel: Some("C0EXAMPLE1".to_string()),
+                factory_public_slack_channel: None,
                 changed: false,
             },
         ],

@@ -3720,6 +3720,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/factory-slack/publication/{work_item_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Public Publication */
+        get: operations["get_public_publication_v1_internal_factory_slack_publication__work_item_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/factory-slack/steer": {
         parameters: {
             query?: never;
@@ -3731,7 +3748,7 @@ export interface paths {
         put?: never;
         /**
          * Steer Factory Run
-         * @description Admit a revision of the run's pull request, or name why not.
+         * @description Queue authorized guidance for an implementation or its published pull request.
          *
          *     Every refusal is final for the delivery and answers 200. A code host that
          *     cannot answer now is 503, so the worker keeps the delivery pending. A
@@ -5376,6 +5393,8 @@ export interface components {
             context: components["schemas"]["FactoryContext"] | null;
             /** Generation */
             generation: number;
+            /** Input Sha256 */
+            input_sha256?: string | null;
             /** Owner */
             owner: string;
             wake: components["schemas"]["FactoryWake"];
@@ -5869,6 +5888,8 @@ export interface components {
             deploy_notifications: boolean;
             /** Execution Deadline Seconds */
             execution_deadline_seconds?: number | null;
+            /** Factory Public Slack Channel */
+            factory_public_slack_channel?: string | null;
             /** Factory Slack Channel */
             factory_slack_channel?: string | null;
             /** Hook Partitions */
@@ -5979,6 +6000,8 @@ export interface components {
             deploy_notifications?: boolean | null;
             /** Execution Deadline Seconds */
             execution_deadline_seconds?: number | null;
+            /** Factory Public Slack Channel */
+            factory_public_slack_channel?: string | null;
             /** Factory Slack Channel */
             factory_slack_channel?: string | null;
             /** Hook Partitions */
@@ -9591,7 +9614,12 @@ export interface components {
              * Outcome
              * @enum {string}
              */
-            outcome: "admitted" | "not_mapped" | "receipt_mismatch" | "sender_unverified" | "code_host_identity_missing" | "code_host_identity_ambiguous" | "code_host_identity_unsupported" | "code_host_mismatch" | "repository_mismatch" | "not_authorized" | "work_item_cancelled" | "lineage_closed" | "no_pull_request" | "pull_request_not_open" | "pull_request_branch_mismatch" | "authority_changed" | "objective_too_large" | "admission_refused";
+            outcome: "admitted" | "queued" | "applied" | "source_changed" | "target_mismatch" | "guidance_queue_full" | "guidance_expired" | "invalid_text" | "not_mapped" | "receipt_mismatch" | "sender_unverified" | "code_host_identity_missing" | "code_host_identity_ambiguous" | "code_host_identity_unsupported" | "code_host_mismatch" | "repository_mismatch" | "not_authorized" | "work_item_cancelled" | "lineage_closed" | "no_pull_request" | "pull_request_not_open" | "pull_request_branch_mismatch" | "authority_changed" | "objective_too_large" | "admission_refused";
+            /**
+             * Pull Request Shareable
+             * @default false
+             */
+            pull_request_shareable?: boolean;
             /** Pull Request Url */
             pull_request_url?: string | null;
             /** Reason */
@@ -13341,6 +13369,8 @@ export interface components {
             delivered_limits: components["schemas"]["DeliveredLimitsIn"];
             /** Generation */
             generation: number;
+            /** Input Sha256 */
+            input_sha256?: string | null;
             /** Owner */
             owner: string;
             /** Sandbox Name */
@@ -22909,6 +22939,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FactorySlackKickoffOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_public_publication_v1_internal_factory_slack_publication__work_item_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string | number;
+                    };
                 };
             };
             /** @description Validation Error */

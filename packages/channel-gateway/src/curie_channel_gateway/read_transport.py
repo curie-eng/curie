@@ -50,6 +50,7 @@ from .reply_errors import (
     IndeterminateReplyDeliveryError,
     InvalidReplyTargetError,
     OversizedAdapterResponseError,
+    PublicChannelUnverifiedError,
     reply_error_response,
 )
 from .reply_route import ReplyRoute
@@ -85,9 +86,10 @@ _API_OPERATIONS = frozenset(
         "document",
         "replace_cell",
         "account_profile",
+        "public_channel",
     }
 )
-_WORKER_OPERATIONS = frozenset({"identity_of", "fetch", "reply"})
+_WORKER_OPERATIONS = frozenset({"identity_of", "fetch", "reply", "public_reply"})
 # The identity caller is an external HTTP identity provider. It may ask only
 # which email belongs to a Slack user (@spec GATEWAY-USER-EMAIL-1).
 _IDENTITY_OPERATIONS = frozenset({"user_email"})
@@ -189,6 +191,7 @@ class _Parameters(BaseModel):
 
 @dataclass(frozen=True)
 class GatewayProviders:
+    public_channel: Callable[[str, str], Awaitable[bool]] | None = None
     channel: ChannelReader[BindingRoute, ResolvedWindow, ProviderPage, ChannelMessage] | None = None
     canvas: CanvasReader[BindingRoute, CanvasFile, CanvasPage, CanvasDocument] | None = None
     senders: SenderIdentities | None = None
@@ -283,6 +286,9 @@ def gateway_application(
             if len(body) > MAX_ACK_BODY_BYTES:
                 raise OversizedAdapterResponseError("oversized_adapter_response")
             result = DeliveryResult(200, body, isinstance(ack, BestEffortUnreachableAck))
+        except PublicChannelUnverifiedError as refusal:
+            reply_state.release_unwritten(key)
+            return reply_failure(refusal)
         except (TimeoutError, asyncio.CancelledError):
             result = reply_failure(IndeterminateReplyDeliveryError("reply_delivery_indeterminate"))
         except UNREACHABLE_REPLY_ERRORS:
@@ -307,11 +313,15 @@ def gateway_application(
             route = GatewayReplyRoute(
                 endpoint=request.headers.get(PROVIDER_ENDPOINT_HEADER),
                 adapter=request.match_info["identity"],
+                factory_public=request.match_info["operation"] == "public_reply",
             )
         except (ValidationError, ValueError):
             return reply_response(reply_failure(InvalidReplyTargetError("invalid_reply_target")))
         best = request.headers.get(BEST_EFFORT_HEADER) == "true"
-        scope = hashlib.sha256(json.dumps((route.adapter, route.endpoint)).encode()).hexdigest()
+        scope_parts: tuple[str | None, ...] = (route.adapter, route.endpoint)
+        if route.factory_public:
+            scope_parts += ("public_reply",)
+        scope = hashlib.sha256(json.dumps(scope_parts).encode()).hexdigest()
         key = scope + ":" + reply_request_key(body, best)
         try:
             claimed, result = reply_state.claim(key, hashlib.sha256(body).hexdigest())
@@ -332,7 +342,7 @@ def gateway_application(
     async def receive(request: web.Request) -> web.Response:
         identity = request.match_info["identity"]
         operation = request.match_info["operation"]
-        if operation == "reply":
+        if operation in {"reply", "public_reply"}:
             return await receive_reply(request)
         result: Any
         adapter: TypeAdapter[Any]
@@ -361,6 +371,12 @@ def gateway_application(
                 return web.Response(body=membership_body, content_type="application/json")
             if operation == "user_email":
                 return await user_email(identity, params)
+            if operation == "public_channel":
+                if params.model_fields_set != {"channel"} or not params.channel:
+                    raise ValueError
+                if ports.public_channel is None:
+                    raise GatewayUnavailableError("public channel check unavailable")
+                return web.json_response(await ports.public_channel(identity, params.channel))
             if operation == "account_profile":
                 if (
                     params.model_fields_set != {"user_id", "workspace"}
@@ -566,6 +582,9 @@ class GatewayClient:
                 return result.validate_json(body)
         except (httpx.HTTPError, ValidationError):
             raise GatewayUnavailableError("gateway unavailable") from None
+
+    async def verify_public_channel(self, identity: str, channel: str) -> bool:
+        return await self.call(identity, "public_channel", {"channel": channel}, TypeAdapter(bool))
 
     def groups(self, identity: str) -> RemoteGroups:
         return RemoteGroups(self, identity)

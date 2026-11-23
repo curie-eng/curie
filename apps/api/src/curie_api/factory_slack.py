@@ -1,68 +1,31 @@
-"""A Slack mention in a factory run's root asks for one more revision of its pull request (#5414).
-
-The worker hands over a threaded ``app_mention`` whose root it found in
-``factory_slack_threads``, with the dispatcher's verified mention receipt. This
-module decides, in order, and refuses with a named outcome at the first check
-that fails:
-
-1. The receipt names the same delivery, route and sender as the turn, and
-   is a person's version 1 receipt for a thread reply: a root mention's
-   receipt and a declared test driver's version 2 receipt, which kickoff
-   reads (#5380), never steer.
-2. The root is a factory run's root.
-3. The sender resolves to an active principal in the receiving channel
-   identity (`identity.service.resolve_principal`).
-4. The WorkItem is not cancelled, its lineage is open, and the lineage has a
-   pull request.
-5. The configured code host is the lineage repository's own, by kind and
-   host (``code_host_mismatch`` otherwise): for GitHub the registry's GitHub
-   entry, whose host must equal the lineage's; for any other kind the entry
-   that kind and host name.
-6. The code host can name an account by its immutable id
-   (`Operation.ACCOUNT_LOGIN`), and the principal holds exactly one active
-   link in that host's ``github_host`` namespace.
-7. Read now from the code host, outside any lock: the stored repository still
-   has its immutable id (`forges.hosts.resolve_stored`) and the pull request
-   read belongs to it (``repository_mismatch`` otherwise), the pull request is
-   open on the lineage's branch, the account's current login, and the person's
-   authority on the pull request (`forges.authority.may_act_on_feedback`).
-
-Then one transaction holds the identity reader lock, repeats the sender and
-link checks (any difference is ``authority_changed``), takes the issue lock,
-re-reads the WorkItem and lineage, and admits a revision through
-`workitem_dispatch.admit_revision` with the WorkItem's own tracker binding and
-conversation, the pull request as the reply target, and a request id derived
-from the delivery, so a redelivered mention admits once. The admission carries
-the mode and owner the locked WorkItem calls for (#5378, ADR 0268): a personal
-WorkItem names the sender as its owner at the sender's current enrollment
-generation, so admission refuses anyone but its owner and a stale or inactive
-enrollment; a service WorkItem carries the installation's mode and no owner,
-as tracker ingress does, so a personal installation refuses it with
-``personal_owner_required``. The revision copies the WorkItem's owner tuple,
-never the sender's. A redelivery whose
-facts no longer match the request an earlier attempt committed (the account's
-login was renamed meanwhile, say) answers that committed request as admitted
-and replayed, never a refusal: it was admitted under the authority valid then.
-Logs carry codes and ids only, never the body.
-"""
+"""Authenticate factory Slack guidance and bind it to its first eligible execution."""
 
 from __future__ import annotations
 
 import json
-import logging
+import re
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from datetime import timedelta
+from typing import Any, cast, get_args
 
 import httpx
 from curie_internal.slack_mention_receipt import SlackMentionReceipt
 from pydantic import ValidationError
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import factory_steering_ledger as ledger
 from . import identity_fence, workitem_dispatch
 from .config import Settings
-from .factory_confirmed_steering import RefusedSteering
+from .factory_confirmed_steering import (
+    AppliedSteering,
+    ConfirmedText,
+    QueuedSteering,
+    RefusedSteering,
+    SlackSteeringSource,
+    SteeringDecision,
+)
 from .factory_follow_up import with_pull_request_follow_up_marker
 from .forges import types
 from .forges.authority import feedback_allowlist, may_act_on_feedback
@@ -88,7 +51,7 @@ from .models import (
     Agent,
     ChannelIdentity,
     ExecutionRequest,
-    FactorySlackThread,
+    FactorySlackPublicThread,
     IdentityLink,
     IdentityNamespace,
     PersonalClaudeEnrollment,
@@ -105,9 +68,8 @@ from .schemas.workitems import (
     FactorySlackSteerOutcome,
 )
 from .workitem_dispatch import Admission
-from .workitems.lifecycle import WorkItemOutcome
-
-logger = logging.getLogger(__name__)
+from .workitems.lifecycle import WorkItemOutcome, database_now
+from .workspace_policy import repository_allowed
 
 # The ``identity_namespaces`` kind that holds code host accounts by host.
 GITHUB_HOST_KIND = "github_host"
@@ -129,40 +91,27 @@ class _Link:
     account_id: str
 
 
-@dataclass(frozen=True)
-class _Run:
-    """What the unlocked reads established, compared again under the locks."""
-
-    work_item_id: uuid.UUID
-    tracker_issue: TrackerIssueRef
-    installation_id: int | None
-    lineage_id: uuid.UUID
-    repository: RepositoryRef
-    branch: str
-    pr_number: int
-    pr_url: str
-
-
 @dataclass(frozen=True, kw_only=True, repr=False)
-class _VoiceSource:
+class _Source:
     delivery_id: str
     channel_identity: str
-    team_id: str
-    api_app_id: str
+    team_id: str | None
+    api_app_id: str | None
     channel: str
     root_ts: str
     message_ts: str
-    file_id: str
+    file_id: str | None
     content_sha256: str
     author: str
     evidence_json: str
 
 
 @dataclass(frozen=True, kw_only=True)
-class _VoiceRun:
+class _Run:
     agent_id: uuid.UUID
     owner: OwnerTuple
     installation_mode: ModelAuthMode
+    public_channel: str | None
     tracker_issue: TrackerIssueRef
     repository: RepositoryRef
     installation_id: int | None
@@ -179,11 +128,12 @@ class SlackVoiceAuthorization:
 
     work_item_id: uuid.UUID
     principal_id: uuid.UUID
-    source: _VoiceSource
+    source: _Source
     resolution: Resolution
     link: _Link
     login: str
-    run: _VoiceRun
+    run: _Run
+    public_source: bool
 
 
 def steering_request_id(channel_identity: str, delivery_id: str) -> uuid.UUID:
@@ -230,7 +180,8 @@ def _receipt(data: FactorySlackSteerIn) -> tuple[SlackMentionReceipt, SlackEvide
     except ValidationError:
         return None
     if (
-        receipt.delivery_id != data.delivery_id
+        data.receipt.get("bot_user_id") is not None
+        or receipt.delivery_id != data.delivery_id
         or receipt.channel_identity != data.channel_identity
         or receipt.channel != data.channel
         or receipt.root_ts != data.root_ts
@@ -240,12 +191,16 @@ def _receipt(data: FactorySlackSteerIn) -> tuple[SlackMentionReceipt, SlackEvide
         return None
     # Cross-consumer controls (#5380): kickoff also reads root and declared
     # driver receipts; steering judges a person's thread reply only.
-    if receipt.version != 1 or receipt.message_ts == receipt.root_ts:
+    if (
+        receipt.version != 1
+        or receipt.message_ts == receipt.root_ts
+        or evidence.delivery != "app_mention"
+    ):
         return None
     return receipt, evidence
 
 
-def _voice_source(data: FactorySlackSteerIn, evidence: SlackEvidence) -> _VoiceSource | None:
+def _voice_source(data: FactorySlackSteerIn, evidence: SlackEvidence) -> _Source | None:
     """Bind the adapter's verified file receipt to this delivery and its sender evidence."""
 
     receipt = data.receipt
@@ -271,7 +226,15 @@ def _voice_source(data: FactorySlackSteerIn, evidence: SlackEvidence) -> _VoiceS
     fields = ("message_ts", "voice_file_id", "content_sha256", "api_app_id", "team_id")
     if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in fields):
         return None
-    return _VoiceSource(
+    if not (
+        re.fullmatch(r"[0-9a-f]{64}", receipt["content_sha256"])
+        and re.fullmatch(r"F[A-Z0-9]+", receipt["voice_file_id"])
+        and re.fullmatch(r"A[A-Z0-9]+", receipt["api_app_id"])
+        and re.fullmatch(r"T[A-Z0-9]+", receipt["team_id"])
+        and re.fullmatch(r"[0-9]+\.[0-9]+", receipt["message_ts"])
+    ):
+        return None
+    return _Source(
         delivery_id=data.delivery_id,
         channel_identity=data.channel_identity,
         channel=data.channel,
@@ -287,7 +250,7 @@ def _voice_source(data: FactorySlackSteerIn, evidence: SlackEvidence) -> _VoiceS
 
 
 async def _resolve(
-    session: AsyncSession, data: FactorySlackSteerIn, evidence: SlackEvidence
+    session: AsyncSession, data: _Source, evidence: SlackEvidence
 ) -> Resolution:
     return await resolve_principal(
         session,
@@ -408,7 +371,7 @@ async def _linked_code_host(
     registry: ForgeRegistry,
     client: httpx.AsyncClient,
     principal_id: uuid.UUID,
-    run: _Run | _VoiceRun,
+    run: _Run,
 ) -> tuple[CodeHost, _Link] | FactorySlackSteerOut:
     code_host = _code_host(registry, client, run.repository, run.installation_id)
     if isinstance(code_host, FactorySlackSteerOut):
@@ -423,51 +386,30 @@ async def _linked_code_host(
     return code_host, links[0]
 
 
-async def _mapped_work_item_id(
-    session: AsyncSession, data: FactorySlackSteerIn
-) -> uuid.UUID | None:
-    work_item_id: uuid.UUID | None = await session.scalar(
-        select(FactorySlackThread.work_item_id).where(
-            FactorySlackThread.channel_identity == data.channel_identity,
-            FactorySlackThread.channel == data.channel,
-            FactorySlackThread.root_ts == data.root_ts,
+async def _mapping(session: AsyncSession, source: _Source) -> tuple[uuid.UUID, str] | None:
+    row = (
+        await session.execute(
+            text("""
+        SELECT work_item_id, destination_role FROM curie.factory_slack_mapped_roots
+        WHERE channel_identity = :identity AND channel = :channel AND root_ts = :root
+    """),
+            {
+                "identity": source.channel_identity,
+                "channel": source.channel,
+                "root": source.root_ts,
+            },
         )
-    )
-    return work_item_id
-
-
-async def _read_run(
-    session: AsyncSession, work_item_id: uuid.UUID
-) -> _Run | FactorySlackSteerOut:
-    item = await session.get(WorkItem, work_item_id)
-    if item is None:
-        return _refused("not_mapped")
-    if item.cancelled_at is not None:
-        return _refused("work_item_cancelled")
-    lineage = (
-        None
-        if item.publication_lineage_id is None
-        else await session.get(ThreadPublicationLineage, item.publication_lineage_id)
-    )
-    if lineage is None or lineage.status != "open":
-        return _refused("lineage_closed")
-    repository = lineage.repository
-    if lineage.pr_number is None or lineage.pr_url is None or repository is None:
-        return _refused("no_pull_request")
-    return _Run(
-        work_item_id=item.id,
-        tracker_issue=item.tracker_issue,
-        installation_id=item.code_host_installation_id,
-        lineage_id=lineage.id,
-        repository=repository,
-        branch=lineage.branch,
-        pr_number=lineage.pr_number,
-        pr_url=lineage.pr_url,
-    )
+    ).one_or_none()
+    return None if row is None else (row.work_item_id, row.destination_role)
 
 
 async def _voice_owner_refusal(
-    session: AsyncSession, item: WorkItem, principal_id: uuid.UUID, installation_mode: ModelAuthMode
+    session: AsyncSession,
+    item: WorkItem,
+    principal_id: uuid.UUID,
+    installation_mode: ModelAuthMode,
+    *,
+    voice: bool,
 ) -> RefusedSteering | None:
     if item.tenant_id is not None and item.tenant_id != DEFAULT_TENANT_ID:
         return RefusedSteering(reason="owner_tenant_mismatch")
@@ -484,7 +426,7 @@ async def _voice_owner_refusal(
         if installation_mode == "personal":
             return RefusedSteering(reason="personal_owner_required")
         return None
-    if principal_id != item.owner_principal_id:
+    if voice and principal_id != item.owner_principal_id:
         return RefusedSteering(reason="owner_mismatch")
     enrollment = (
         await session.execute(
@@ -496,30 +438,54 @@ async def _voice_owner_refusal(
     ).one_or_none()
     if enrollment is None or not enrollment.active:
         return RefusedSteering(reason="enrollment_inactive")
+    if principal_id != item.owner_principal_id:
+        return RefusedSteering(reason="owner_mismatch")
     if enrollment.generation != item.enrollment_generation:
         return RefusedSteering(reason="enrollment_generation_mismatch")
     return None
 
 
 async def _read_voice_run(
-    session: AsyncSession, item: WorkItem, installation_mode: ModelAuthMode
-) -> _VoiceRun | RefusedSteering:
+    session: AsyncSession,
+    item: WorkItem,
+    installation_mode: ModelAuthMode,
+    *,
+    voice: bool,
+    locked: bool = False,
+) -> _Run | RefusedSteering:
     lineage = None
     if item.publication_lineage_id is not None:
-        lineage = await session.get(ThreadPublicationLineage, item.publication_lineage_id)
+        lineage = await session.get(
+            ThreadPublicationLineage,
+            item.publication_lineage_id,
+            with_for_update={"read": True} if locked else None,
+            populate_existing=locked,
+        )
         if lineage is None or lineage.status != "open":
             return RefusedSteering(reason="lineage_closed")
         if lineage.repository is not None and lineage.repository != item.repository:
             return RefusedSteering(reason="repository_mismatch")
         if (lineage.pr_number is None) != (lineage.pr_url is None):
             return RefusedSteering(reason="no_pull_request")
-        if lineage.pr_number is not None and lineage.repository is None:
+        if lineage.pr_number is not None and (
+            lineage.repository is None
+            or lineage.code_host_installation_id != item.code_host_installation_id
+        ):
             return RefusedSteering(reason="repository_mismatch")
     implementation_id = None
+    destination = select(Agent.factory_public_slack_channel).where(Agent.id == item.agent_id)
+    if locked:
+        destination = destination.with_for_update(read=True)
+    public_channel = await session.scalar(destination)
+    if not public_channel and (voice or lineage is None or lineage.pr_number is None):
+        return RefusedSteering(
+            reason="lineage_closed" if lineage is None and not voice else "no_pull_request"
+        )
     if lineage is None or lineage.pr_number is None:
+        if await session.get(FactorySlackPublicThread, item.id) is None:
+            return RefusedSteering(reason="no_pull_request")
         implementation_id = await session.scalar(
-            select(ExecutionRequest.id)
-            .where(
+            select(ExecutionRequest.id).where(
                 ExecutionRequest.work_item_id == item.id,
                 ExecutionRequest.execution_kind == "implementation",
                 or_(
@@ -536,10 +502,11 @@ async def _read_voice_run(
         )
         if implementation_id is None:
             return RefusedSteering(reason="no_pull_request")
-    return _VoiceRun(
+    return _Run(
         agent_id=item.agent_id,
         owner=OwnerTuple.of(item),
         installation_mode=installation_mode,
+        public_channel=public_channel,
         tracker_issue=item.tracker_issue,
         repository=item.repository,
         installation_id=item.code_host_installation_id,
@@ -564,36 +531,52 @@ async def authorize_voice_source(
     source = _voice_source(data, evidence)
     if source is None:
         return RefusedSteering(reason="receipt_mismatch")
+    return await _authorize(session, source, settings=settings, client=client)
+
+
+async def _receiving_team(session: AsyncSession, resolution: Resolution) -> str | None:
+    team: str | None = await session.scalar(
+        select(ProviderInstallation.external_account_id)
+        .join(ChannelIdentity, ChannelIdentity.provider_installation_id == ProviderInstallation.id)
+        .where(ChannelIdentity.id == resolution.channel_identity_id)
+    )
+    return team
+
+
+async def _authorize(
+    session: AsyncSession, source: _Source, *, settings: Settings, client: httpx.AsyncClient
+) -> SlackVoiceAuthorization | RefusedSteering:
+    evidence = SlackEvidence.model_validate_json(source.evidence_json)
     async with AsyncSession(bind=session.bind) as reader:
-        work_item_id = await _mapped_work_item_id(reader, data)
-        if work_item_id is None:
+        mapping = await _mapping(reader, source)
+        if mapping is None:
             return RefusedSteering(reason="not_mapped")
+        work_item_id, role = mapping
         item = await reader.get(WorkItem, work_item_id)
         if item is None:
             return RefusedSteering(reason="not_mapped")
         if item.cancelled_at is not None:
             return RefusedSteering(reason="work_item_cancelled")
-        resolution = await _resolve(reader, data, evidence)
+        resolution = await _resolve(reader, source, evidence)
         if resolution.status != "resolved" or resolution.principal_id is None:
             return RefusedSteering(reason="sender_unverified")
         principal_id = resolution.principal_id
-        team = await reader.scalar(
-            select(ProviderInstallation.external_account_id)
-            .join(
-                ChannelIdentity,
-                ChannelIdentity.provider_installation_id == ProviderInstallation.id,
-            )
-            .where(ChannelIdentity.id == resolution.channel_identity_id)
-        )
-        if team != source.team_id:
+        if (
+            source.team_id is not None
+            and await _receiving_team(reader, resolution) != source.team_id
+        ):
             return RefusedSteering(reason="receipt_mismatch")
         mode = settings.factory_model_auth_mode
-        owner_refusal = await _voice_owner_refusal(reader, item, principal_id, mode)
-        if owner_refusal is not None:
+        owner_refusal = await _voice_owner_refusal(
+            reader, item, principal_id, mode, voice=source.file_id is not None
+        )
+        if owner_refusal is not None and source.file_id is not None:
             return owner_refusal
-        run = await _read_voice_run(reader, item, mode)
+        run = await _read_voice_run(reader, item, mode, voice=source.file_id is not None)
         if isinstance(run, RefusedSteering):
             return run
+        if run.public_channel and not repository_allowed(settings, run.repository):
+            return RefusedSteering(reason="repository_mismatch")
         registry = forges_registry(settings)
         linked = await _linked_code_host(reader, registry, client, principal_id, run)
         if isinstance(linked, FactorySlackSteerOut):
@@ -604,6 +587,8 @@ async def authorize_voice_source(
     if refusal is not None:
         return RefusedSteering(reason=refusal)
     assert login is not None
+    if owner_refusal is not None:
+        return owner_refusal
     return SlackVoiceAuthorization(
         work_item_id=work_item_id,
         principal_id=principal_id,
@@ -612,6 +597,7 @@ async def authorize_voice_source(
         link=link,
         login=login,
         run=run,
+        public_source=role == "public",
     )
 
 
@@ -626,6 +612,8 @@ async def _pull_refusal(
         if exc.args == ("pull_request_mismatch",):
             return "repository_mismatch"
         raise
+    if pull.ref.repository != repository:
+        return "repository_mismatch"
     if pull.state is not PullRequestState.OPEN or pull.ref.number != str(number):
         return "pull_request_not_open"
     if pull.head_ref != branch:
@@ -635,7 +623,7 @@ async def _pull_refusal(
 
 async def _provider_refusal(
     code_host: CodeHost,
-    run: _Run | _VoiceRun,
+    run: _Run,
     account_id: str,
     allowlist: frozenset[str],
 ) -> tuple[FactorySlackSteerOutcome | None, str | None]:
@@ -664,81 +652,6 @@ async def _provider_refusal(
     except httpx.HTTPError:
         raise CodeHostUnavailable("transport") from None
     return None, login
-
-
-async def steer(
-    session: AsyncSession,
-    data: FactorySlackSteerIn,
-    *,
-    settings: Settings,
-    client: httpx.AsyncClient,
-) -> FactorySlackSteerOut:
-    """Decide one threaded mention in a factory root; admit a revision when allowed.
-
-    Raises `CodeHostUnavailable` when the code host cannot answer now.
-    """
-
-    decision = await _decide(session, data, settings=settings, client=client)
-    logger.info(
-        "factory slack steering delivery %s: %s%s",
-        data.delivery_id,
-        decision.outcome,
-        "" if decision.reason is None else f" ({decision.reason})",
-    )
-    return decision
-
-
-async def _decide(
-    session: AsyncSession,
-    data: FactorySlackSteerIn,
-    *,
-    settings: Settings,
-    client: httpx.AsyncClient,
-) -> FactorySlackSteerOut:
-    checked = _receipt(data)
-    if checked is None:
-        return _refused("receipt_mismatch")
-    receipt, evidence = checked
-    work_item_id = await _mapped_work_item_id(session, data)
-    if work_item_id is None:
-        return _refused("not_mapped")
-    resolution = await _resolve(session, data, evidence)
-    if resolution.status != "resolved" or resolution.principal_id is None:
-        return _refused("sender_unverified", reason=resolution.reason)
-    principal_id = resolution.principal_id
-    run = await _read_run(session, work_item_id)
-    if isinstance(run, FactorySlackSteerOut):
-        return run
-    registry = forges_registry(settings)
-    linked = await _linked_code_host(session, registry, client, principal_id, run)
-    if isinstance(linked, FactorySlackSteerOut):
-        return linked
-    code_host, link = linked
-    allowlist = _allowlist(registry, run.tracker_issue, run.repository)
-    # End the read transaction: no snapshot or lock is held across provider reads.
-    await session.rollback()
-
-    refusal, login = await _provider_refusal(code_host, run, link.account_id, allowlist)
-    if refusal is not None:
-        return _refused(refusal)
-    assert login is not None
-
-    try:
-        return await _admit(
-            session,
-            registry,
-            data,
-            receipt,
-            evidence,
-            principal_id,
-            link,
-            run,
-            login,
-            installation_mode=settings.factory_model_auth_mode,
-        )
-    finally:
-        if session.in_transaction():
-            await session.rollback()
 
 
 async def _owner_facts(
@@ -775,59 +688,113 @@ async def _owner_facts(
     return "personal", OwnerContext(DEFAULT_TENANT_ID, principal_id, generation)
 
 
-async def _admit(
-    session: AsyncSession,
-    registry: ForgeRegistry,
-    data: FactorySlackSteerIn,
-    receipt: SlackMentionReceipt,
-    evidence: SlackEvidence,
-    principal_id: uuid.UUID,
-    link: _Link,
-    run: _Run,
-    login: str,
-    *,
-    installation_mode: ModelAuthMode,
-) -> FactorySlackSteerOut:
-    """Under the identity reader and issue locks, re-check and admit in one transaction."""
+def _source_facts(authority: SlackVoiceAuthorization) -> dict[str, Any]:
+    source = authority.source
+    run = authority.run
+    return {
+        "message_ts": source.message_ts,
+        "author": source.author,
+        "file_id": source.file_id,
+        "original_delivery_id": source.delivery_id,
+        "team_id": source.team_id,
+        "api_app_id": source.api_app_id,
+        "evidence": json.loads(source.evidence_json),
+        "principal_id": str(authority.principal_id),
+        "identity_id": str(authority.resolution.channel_identity_id),
+        "namespace_id": str(authority.resolution.namespace_id),
+        "link_id": str(authority.link.link_id),
+        "account_id": authority.link.account_id,
+        "provider": run.repository.kind,
+        "host": run.repository.host,
+        "repository_id": run.repository.project_id,
+        "publication": {
+            "lineage_id": str(run.lineage_id) if run.lineage_id is not None else None,
+            "branch": run.branch,
+            "pr_number": run.pr_number,
+        },
+        "installation_id": run.installation_id,
+        "owner": {
+            key: str(value) if isinstance(value, uuid.UUID) else value
+            for key, value in run.owner.columns().items()
+        },
+    }
 
+
+def _same_facts(stored: dict[str, Any], current: dict[str, Any]) -> bool:
+    # Prepublication guidance can gain a first branch and PR. Already bound coordinates cannot move.
+    fixed = {key: value for key, value in stored.items() if key != "publication"}
+    if fixed != {key: value for key, value in current.items() if key != "publication"}:
+        return False
+    return all(
+        value is None or current["publication"][key] == value
+        for key, value in stored["publication"].items()
+    )
+
+
+async def _lock_authority(
+    session: AsyncSession,
+    authority: SlackVoiceAuthorization,
+    settings: Settings,
+    confirmation_evidence: SlackEvidence | None = None,
+) -> WorkItem | RefusedSteering:
+    source = authority.source
     await identity_fence.lock_identity_reader(session)
-    current = await _resolve(session, data, evidence)
-    links = (
-        await _links(session, principal_id, run.repository) if current.status == "resolved" else []
+    await lock_issue(session, authority.run.tracker_issue)
+    item = await session.get(
+        WorkItem, authority.work_item_id, with_for_update=True, populate_existing=True
     )
-    if current.principal_id != principal_id or links != [link]:
-        return _refused("authority_changed")
-    await lock_issue(session, run.tracker_issue)
-    item = await session.scalar(
-        select(WorkItem)
-        .where(WorkItem.id == run.work_item_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if item is None:
-        return _refused("not_mapped")
+    mapping = await _mapping(session, source)
+    if item is None or mapping is None or mapping[0] != authority.work_item_id:
+        return RefusedSteering(reason="target_mismatch")
+    evidence = SlackEvidence.model_validate_json(source.evidence_json)
+    current = await _resolve(session, source, evidence)
+    if current != authority.resolution or (mapping[1] == "public") != authority.public_source:
+        return RefusedSteering(reason="authority_changed")
+    if (
+        confirmation_evidence is not None
+        and await _resolve(session, source, confirmation_evidence) != current
+    ):
+        return RefusedSteering(reason="authority_changed")
+    if source.team_id is not None and await _receiving_team(session, current) != source.team_id:
+        return RefusedSteering(reason="authority_changed")
+    if await _links(session, authority.principal_id, item.repository) != [authority.link]:
+        return RefusedSteering(reason="authority_changed")
     if item.cancelled_at is not None:
-        return _refused("work_item_cancelled")
-    lineage = await session.scalar(
-        select(ThreadPublicationLineage)
-        .where(ThreadPublicationLineage.id == run.lineage_id)
-        .with_for_update(read=True)
-        .execution_options(populate_existing=True)
+        return RefusedSteering(reason="authority_changed")
+    mode = settings.factory_model_auth_mode
+    await _owner_facts(session, item, authority.principal_id, mode)
+    if (
+        await _voice_owner_refusal(
+            session, item, authority.principal_id, mode, voice=source.file_id is not None
+        )
+        is not None
+    ):
+        return RefusedSteering(reason="authority_changed")
+    run = await _read_voice_run(session, item, mode, voice=source.file_id is not None, locked=True)
+    if run != authority.run:
+        return RefusedSteering(reason="authority_changed")
+    return item
+
+
+async def _revision(
+    session: AsyncSession,
+    item: WorkItem,
+    authority: SlackVoiceAuthorization,
+    settings: Settings,
+    steering_id: uuid.UUID,
+    body: str,
+) -> RefusedSteering | None:
+    run = authority.run
+    assert run.pr_url is not None and run.pr_number is not None and run.branch is not None
+    revision_objective = objective(run.pr_url, run.branch, authority.login, body)
+    if len(revision_objective) > MAX_OBJECTIVE:
+        return RefusedSteering(reason="objective_too_large")
+    kind, address, conversation = reply_route(
+        forges_registry(settings), item.tracker_issue, item.repository_path
     )
-    if lineage is None or item.publication_lineage_id != lineage.id or lineage.status != "open":
-        return _refused("lineage_closed")
-    if lineage.pr_number is None or lineage.pr_url is None:
-        return _refused("no_pull_request")
-    if lineage.pr_number != run.pr_number or lineage.repository != run.repository:
-        return _refused("pull_request_not_open")
-    if lineage.branch != run.branch:
-        return _refused("pull_request_branch_mismatch")
-    pr_url = lineage.pr_url
-    text = objective(pr_url, run.branch, login, receipt.body)
-    if len(text) > MAX_OBJECTIVE:
-        return _refused("objective_too_large")
-    kind, address, conversation = reply_route(registry, item.tracker_issue, item.repository_path)
-    mode, owner = await _owner_facts(session, item, principal_id, installation_mode)
+    mode, owner = await _owner_facts(
+        session, item, authority.principal_id, settings.factory_model_auth_mode
+    )
     facts = Admission(
         agent_id=item.agent_id,
         kind=kind,
@@ -836,73 +803,394 @@ async def _admit(
         issue=item.tracker_issue,
         repository=item.repository,
         code_host_installation_id=item.code_host_installation_id,
-        objective=text,
-        requester=f"{run.repository.kind}:{link.account_id}:{login}",
-        request_id=steering_request_id(data.channel_identity, data.delivery_id),
+        objective=revision_objective,
+        requester=f"{run.repository.kind}:{authority.link.account_id}:{authority.login}",
+        request_id=steering_id,
         reply_target=ReplyTarget.on_pull_request(
             PullRequestRef(run.repository, str(run.pr_number))
         ),
-        reply_url=pr_url,
+        reply_url=run.pr_url,
         model_auth_mode=mode,
         owner=owner,
     )
-    # Dispatch commits inside a savepoint, so the identity reader and issue
-    # locks stay held until the admission commits with them.
+    async with session.begin_nested() as admission:
+        async with AsyncSession(
+            bind=await session.connection(),
+            join_transaction_mode="create_savepoint",
+            expire_on_commit=False,
+        ) as writer:
+            result = await workitem_dispatch.admit_revision(writer, facts)
+            if isinstance(result, WorkItemOutcome):
+                await writer.commit()
+                return None
+        await admission.rollback()
+        return RefusedSteering(reason=str(result.code))
+
+
+def _historical_match(row: ExecutionRequest, authority: SlackVoiceAuthorization, body: str) -> bool:
+    """Old revisions stored the original immutable actor and the complete accepted objective."""
+    prefix = f"{authority.run.repository.kind}:{authority.link.account_id}:"
+    run = authority.run
+    if (
+        row.work_item_id != authority.work_item_id
+        or not row.requester
+        or not row.requester.startswith(prefix)
+        or run.branch is None
+        or run.pr_url is None
+        or row.reply_target_pr_number != str(run.pr_number)
+        or row.reply_target_url != run.pr_url
+        or row.reply_target_kind != "pull_request"
+    ):
+        return False
+    return row.objective == objective(run.pr_url, run.branch, row.requester[len(prefix) :], body)
+
+
+async def _accept(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    authority: SlackVoiceAuthorization,
+    steering_id: uuid.UUID,
+    body: str,
+    first_delivery_id: str,
+    confirmation_evidence: SlackEvidence | None = None,
+) -> SteeringDecision:
+    item = await _lock_authority(session, authority, settings, confirmation_evidence)
+    if isinstance(item, RefusedSteering):
+        return item
+    if not body.strip():
+        return RefusedSteering(reason="invalid_text")
+    if len(body) > MAX_OBJECTIVE:
+        return RefusedSteering(reason="objective_too_large")
+    # A conflicting draft key on a different WorkItem does not share this WorkItem lock.
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"factory-steering:{steering_id}"},
+    )
+    existing = await ledger.get(session, steering_id)
+    source = authority.source
+    facts = _source_facts(authority)
+    if existing is not None:
+        if existing.work_item_id != item.id:
+            return RefusedSteering(reason="target_mismatch")
+        if (
+            existing.source_identity != source.channel_identity
+            or existing.source_channel != source.channel
+            or existing.source_root_ts != source.root_ts
+            or not _same_facts(existing.source_facts, facts)
+            or existing.source_content_sha256 != source.content_sha256
+            or existing.accepted_text != body
+            or existing.accepted_text_sha256 != ledger.digest(body)
+        ):
+            return RefusedSteering(reason="source_changed")
+        return existing.decision(replayed=True)
+    historical = await session.get(ExecutionRequest, steering_id)
+    if historical is not None and (
+        source.file_id is not None or not _historical_match(historical, authority, body)
+    ):
+        return RefusedSteering(reason="source_changed")
+    request_id = None
+    if historical is not None:
+        request_id = historical.id
+    elif authority.run.pr_number is not None:
+        refused = await _revision(session, item, authority, settings, steering_id, body)
+        if refused is not None:
+            return refused
+        request_id = steering_id
+    else:
+        now = await database_now(session)
+        unassigned = await ledger.pending(session, item.id)
+        expired = [
+            entry.steering_id
+            for entry in unassigned
+            if entry.created_at + timedelta(hours=24) <= now
+        ]
+        if expired:
+            await ledger.refuse(session, item.id, expired, "guidance_expired")
+        if await session.scalar(
+            text(
+                "SELECT count(*) >= 8 FROM curie.factory_steering_ledger "
+                "WHERE work_item_id = :id AND state = 'queued'"
+            ),
+            {"id": item.id},
+        ):
+            return RefusedSteering(reason="guidance_queue_full")
+    if not authority.run.public_channel and not authority.public_source and source.file_id is None:
+        return QueuedSteering(
+            steering_id=steering_id,
+            execution_request_id=request_id,
+            replayed=historical is not None,
+        )
+    await ledger.record(
+        session,
+        steering_id=steering_id,
+        work_item_id=item.id,
+        source_identity=source.channel_identity,
+        source_channel=source.channel,
+        source_root_ts=source.root_ts,
+        source_facts=facts,
+        first_delivery_id=first_delivery_id,
+        source_content_sha256=source.content_sha256,
+        accepted_text=body,
+        execution_request_id=request_id,
+    )
+    return QueuedSteering(
+        steering_id=steering_id, execution_request_id=request_id, replayed=historical is not None
+    )
+
+
+def _confirmation_evidence(
+    command: ConfirmedText, authority: SlackVoiceAuthorization, confirmation: FactorySlackSteerIn
+) -> SlackEvidence | None:
+    source = authority.source
+    expected = SlackSteeringSource(
+        channel_identity=source.channel_identity,
+        channel=source.channel,
+        root_ts=source.root_ts,
+        message_ts=source.message_ts,
+        file_id=source.file_id or "",
+        author=source.author,
+        principal_id=authority.principal_id,
+        confirmation_delivery_id=confirmation.delivery_id,
+    )
+    receipt = confirmation.receipt
+    if (
+        command.source != expected
+        or command.source_content_sha256 != source.content_sha256
+        or not source.file_id
+        or not source.team_id
+        or not source.api_app_id
+        or confirmation.channel_identity != source.channel_identity
+        or confirmation.channel != source.channel
+        or confirmation.root_ts != source.root_ts
+        or confirmation.author != source.author
+        or confirmation.delivery_id == source.delivery_id
+        or receipt.get("delivery_id") != confirmation.delivery_id
+        or receipt.get("version") != 1
+        or receipt.get("team_id") != source.team_id
+        or receipt.get("api_app_id") != source.api_app_id
+        or receipt.get("channel_identity") != source.channel_identity
+        or receipt.get("channel") != source.channel
+        or receipt.get("user_id") != source.author
+        or receipt.get("root_ts") != source.root_ts
+        or not isinstance(receipt.get("message_ts"), str)
+        or not receipt["message_ts"]
+        or receipt["message_ts"] in {source.root_ts, source.message_ts}
+        or receipt.get("driver_bot_id") is not None
+        or "voice_file_id" in receipt
+        or "content_sha256" in receipt
+    ):
+        return None
+    bot = receipt.get("bot_user_id")
+    body = receipt.get("body")
+    if (
+        not isinstance(bot, str)
+        or not re.fullmatch(r"[UW][A-Z0-9]+", bot)
+        or not isinstance(body, str)
+    ):
+        return None
+    if not re.fullmatch(
+        rf"[ \t]*<@{re.escape(bot)}(?:\|[^>]+)?>[ \t]+"
+        rf"confirm {command.draft_id.hex[:12]}\.[1-9][0-9]{{0,8}}",
+        body,
+    ):
+        return None
+    try:
+        evidence = SlackEvidence.model_validate(receipt.get("evidence"))
+    except ValidationError:
+        return None
+    return (
+        evidence
+        if evidence.delivery == "app_mention" and evidence.user_id == source.author
+        else None
+    )
+
+
+async def admit_confirmed_text(
+    session: AsyncSession,
+    command: ConfirmedText,
+    /,
+    *,
+    settings: Settings,
+    authority: SlackVoiceAuthorization,
+    confirmation: FactorySlackSteerIn,
+) -> SteeringDecision:
+    """Bind a freshly authenticated confirmation to the caller's locked draft and transaction."""
+    if command.work_item_id != authority.work_item_id:
+        return RefusedSteering(reason="target_mismatch")
+    mapping = await _mapping(session, authority.source)
+    if mapping is None or mapping[0] != command.work_item_id:
+        return RefusedSteering(reason="target_mismatch")
+    evidence = _confirmation_evidence(command, authority, confirmation)
+    if evidence is None:
+        return RefusedSteering(reason="source_changed")
     async with AsyncSession(
         bind=await session.connection(),
         join_transaction_mode="create_savepoint",
         expire_on_commit=False,
-    ) as admission:
-        result = await workitem_dispatch.admit_for_verified_owner(
-            admission,
-            facts,
-            work_item_id=item.id,
-            principal_id=principal_id,
-            admit=workitem_dispatch.admit_revision,
+    ) as writer:
+        result = await _accept(
+            writer,
+            settings=settings,
+            authority=authority,
+            steering_id=command.steering_id,
+            body=command.text,
+            first_delivery_id=confirmation.delivery_id,
+            confirmation_evidence=evidence,
         )
-        await admission.commit()
-    if not isinstance(result, WorkItemOutcome) and result.code == "identity_mismatch":
-        committed = await _committed_request(session, facts.request_id, run.work_item_id)
-        if committed is not None:
-            await session.commit()
-            return committed.model_copy(update={"pull_request_url": pr_url})
-    await session.commit()
-    return _answer(result, facts.request_id, pr_url)
+        await writer.commit()
+    return result
 
 
-async def _committed_request(
-    session: AsyncSession, request_id: uuid.UUID, work_item_id: uuid.UUID
-) -> FactorySlackSteerOut | None:
-    """The answer for a request an earlier attempt of this delivery committed.
-
-    ``admit_revision`` refuses a replay whose facts differ from the committed
-    snapshot. The request id is this delivery's own, so a row with it on this
-    WorkItem is the revision that attempt admitted.
-    """
-
-    row = await session.scalar(
-        select(ExecutionRequest)
-        .where(ExecutionRequest.id == request_id, ExecutionRequest.work_item_id == work_item_id)
-        .execution_options(populate_existing=True)
-    )
-    if row is None:
-        return None
+def _ordinary_answer(decision: SteeringDecision) -> FactorySlackSteerOut:
+    if isinstance(decision, RefusedSteering):
+        if decision.reason in get_args(FactorySlackSteerOutcome):
+            return _refused(cast(FactorySlackSteerOutcome, decision.reason))
+        return _refused("admission_refused", reason=decision.reason)
     return FactorySlackSteerOut(
-        outcome="admitted",
-        request_id=str(row.id),
-        request_status=row.status,
-        replayed=True,
+        outcome="applied" if isinstance(decision, AppliedSteering) else "queued",
+        request_id=str(decision.execution_request_id) if decision.execution_request_id else None,
+        replayed=decision.replayed,
     )
 
 
-def _answer(result: Any, request_id: uuid.UUID, pr_url: str) -> FactorySlackSteerOut:
-    if isinstance(result, WorkItemOutcome):
-        request = result.request
-        return FactorySlackSteerOut(
+async def steer(
+    session: AsyncSession,
+    data: FactorySlackSteerIn,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> FactorySlackSteerOut:
+    checked = _receipt(data)
+    if checked is None:
+        return _refused("receipt_mismatch")
+    receipt, evidence = checked
+    source = _Source(
+        delivery_id=data.delivery_id,
+        channel_identity=data.channel_identity,
+        channel=data.channel,
+        root_ts=data.root_ts,
+        author=data.author,
+        message_ts=receipt.message_ts,
+        team_id=None,
+        api_app_id=None,
+        file_id=None,
+        content_sha256=ledger.digest(receipt.body),
+        evidence_json=evidence.model_dump_json(),
+    )
+    authority = await _authorize(session, source, settings=settings, client=client)
+    if isinstance(authority, RefusedSteering):
+        return _ordinary_answer(authority)
+    decision = await _accept(
+        session,
+        settings=settings,
+        authority=authority,
+        steering_id=steering_request_id(data.channel_identity, data.delivery_id),
+        body=receipt.body,
+        first_delivery_id=data.delivery_id,
+    )
+    if (
+        isinstance(decision, QueuedSteering)
+        and not authority.run.public_channel
+        and not authority.public_source
+        and decision.execution_request_id is not None
+    ):
+        request = await session.get(ExecutionRequest, decision.execution_request_id)
+        answer = FactorySlackSteerOut(
             outcome="admitted",
-            request_id=str(request.id if request is not None else request_id),
-            request_status=None if request is None else request.status,
-            replayed=result.replayed,
-            pull_request_url=pr_url,
+            request_id=str(decision.execution_request_id),
+            request_status=request.status if request else None,
+            pull_request_url=authority.run.pr_url,
+            replayed=decision.replayed,
         )
-    return _refused("admission_refused", reason=str(result.code))
+    else:
+        answer = _ordinary_answer(decision)
+    await session.commit()
+    return answer
+
+
+async def redrive_pending(
+    session: AsyncSession,
+    entry: ledger.SteeringEntry,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> SteeringDecision:
+    """Reread the original actor and current repository before locking and assigning a follow-up."""
+    facts = entry.source_facts
+    source = _Source(
+        delivery_id=facts["original_delivery_id"],
+        channel_identity=entry.source_identity,
+        channel=entry.source_channel,
+        root_ts=entry.source_root_ts,
+        message_ts=facts["message_ts"],
+        team_id=facts["team_id"],
+        api_app_id=facts["api_app_id"],
+        file_id=facts["file_id"],
+        author=facts["author"],
+        content_sha256=entry.source_content_sha256,
+        evidence_json=json.dumps(facts["evidence"]),
+    )
+    authority = await _authorize(session, source, settings=settings, client=client)
+    # Acquire or cancellation may settle the pending row during the provider read.
+    await identity_fence.lock_identity_reader(session)
+    tracker_item = await session.get(WorkItem, entry.work_item_id)
+    if tracker_item is None:
+        return RefusedSteering(reason="not_mapped")
+    await lock_issue(session, tracker_item.tracker_issue)
+    item = await session.get(
+        WorkItem, entry.work_item_id, with_for_update=True, populate_existing=True
+    )
+    current = await ledger.get(session, entry.steering_id)
+    if item is None or current is None:
+        return RefusedSteering(reason="not_mapped")
+    if current.state != "queued" or current.execution_request_id is not None:
+        return current.decision(replayed=True)
+    reason = None
+    if item.cancelled_at is not None:
+        reason = "work_item_cancelled"
+    elif entry.created_at + timedelta(hours=24) <= await database_now(session):
+        reason = "guidance_expired"
+    elif item.readmit_request_id or await session.scalar(
+        select(ExecutionRequest.id)
+        .where(
+            ExecutionRequest.work_item_id == item.id,
+            ExecutionRequest.status.in_(("waiting", "queued", "running", "cancellation_requested")),
+        )
+        .limit(1)
+    ):
+        return current.decision(replayed=True)
+    elif isinstance(authority, RefusedSteering):
+        reason = authority.reason
+    elif not authority.run.public_channel:
+        reason = "no_pull_request"
+    elif authority.work_item_id != item.id:
+        reason = "target_mismatch"
+    elif not _same_facts(facts, _source_facts(authority)):
+        reason = "authority_changed"
+    else:
+        locked = await _lock_authority(session, authority, settings)
+        if isinstance(locked, RefusedSteering):
+            reason = locked.reason
+        elif authority.run.pr_number is None:
+            reason = "no_pull_request"
+        else:
+            refused = await _revision(
+                session, locked, authority, settings, entry.steering_id, entry.accepted_text
+            )
+            if refused is None:
+                await ledger.assign(
+                    session,
+                    item.id,
+                    entry.steering_id,
+                    [entry.steering_id],
+                    objective_embedded=True,
+                )
+                return QueuedSteering(
+                    steering_id=entry.steering_id,
+                    execution_request_id=entry.steering_id,
+                    replayed=False,
+                )
+            reason = refused.reason
+    await ledger.refuse(session, item.id, [entry.steering_id], reason)
+    return RefusedSteering(reason=reason)

@@ -755,7 +755,12 @@ class GitHubCodeHost:
         if not project_id.startswith(PATH_ID_PREFIX) and str(repository_id) != project_id:
             raise NotFound("repository_mismatch")
         return RepositoryRef(
-            self.kind, self.host, str(repository_id), full_name, default_branch=default_branch
+            self.kind,
+            self.host,
+            str(repository_id),
+            full_name,
+            default_branch=default_branch,
+            is_public=(payload.get("visibility") == "public" and payload.get("private") is False),
         )
 
     async def current_installation_credential(self, repository: RepositoryRef) -> Credential:

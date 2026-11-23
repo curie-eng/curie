@@ -3781,6 +3781,26 @@
               "required": false
             },
             {
+              "global": false,
+              "help": "Use this workspace-public Slack channel for run progress and steering. This clears the previous progress channel",
+              "id": "public_slack_channel",
+              "long": "public-slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the workspace-public run channel",
+              "id": "no_public_slack_channel",
+              "long": "no-public-slack-channel",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "default_values": [
                 "http://localhost:28000"
               ],
@@ -3815,7 +3835,7 @@
             }
           ],
           "hidden": false,
-          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie local surfaces <agent> --add slack=<CHANNEL_ID>` (when another agent already holds the default Slack identity on that channel, add it under a free declared identity with `--adapter <identity>`), or, when the channel is bound under several identities, remove the extra with `curie local surfaces <agent> --remove slack=<CHANNEL_ID> --adapter <identity>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears the configured progress channel: the progress lane stops rooting runs there and stops replying and editing cards in the threads it already rooted. A thread that a Slack kickoff started keeps its own progress either way.",
+          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith no destination flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie local surfaces <agent> --add slack=<CHANNEL_ID>` (when another agent already holds the default Slack identity on that channel, add it under a free declared identity with `--adapter <identity>`), or, when the channel is bound under several identities, remove the extra with `curie local surfaces <agent> --remove slack=<CHANNEL_ID> --adapter <identity>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears the configured progress channel: the progress lane stops rooting runs there and stops replying and editing cards in the threads it already rooted. A thread that a Slack kickoff started keeps its own progress either way.",
           "name": "factory-progress"
         },
         {
@@ -7651,6 +7671,26 @@
               "required": false
             },
             {
+              "global": false,
+              "help": "Use this workspace-public Slack channel for run progress and steering. This clears the previous progress channel",
+              "id": "public_slack_channel",
+              "long": "public-slack-channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the workspace-public run channel",
+              "id": "no_public_slack_channel",
+              "long": "no-public-slack-channel",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -7705,7 +7745,7 @@
             }
           ],
           "hidden": false,
-          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith neither flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>` (when another agent already holds the default Slack identity on that channel, add it under a free declared identity with `--adapter <identity>`), or, when the channel is bound under several identities, remove the extra with `curie cluster surfaces <agent> --remove slack=<CHANNEL_ID> --adapter <identity>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears the configured progress channel: the progress lane stops rooting runs there and stops replying and editing cards in the threads it already rooted. A thread that a Slack kickoff started keeps its own progress either way.",
+          "long_about": "Read or set the Slack channel one agent's factory runs post progress to (`PATCH /agents/{id}`, `factory_slack_channel`).\n\nThis is its own verb, not a flag on `curie cluster factory`: that command configures release-wide Helm intake, has no API connection and no agent argument, so a per-agent setting there would be ambiguous.\n\nWith no destination flag this inspects. The agent must already hold exactly one Slack binding with an identity for the channel; add it first with `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>` (when another agent already holds the default Slack identity on that channel, add it under a free declared identity with `--adapter <identity>`), or, when the channel is bound under several identities, remove the extra with `curie cluster surfaces <agent> --remove slack=<CHANNEL_ID> --adapter <identity>`. Binding it is a separate decision because it also makes the agent answer there.\n\n`--no-slack-channel` clears the configured progress channel: the progress lane stops rooting runs there and stops replying and editing cards in the threads it already rooted. A thread that a Slack kickoff started keeps its own progress either way.",
           "name": "factory-progress"
         },
         {

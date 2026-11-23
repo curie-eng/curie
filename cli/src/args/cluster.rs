@@ -1256,7 +1256,7 @@ pub(crate) enum ClusterAction {
     /// command configures release-wide Helm intake, has no API connection and
     /// no agent argument, so a per-agent setting there would be ambiguous.
     ///
-    /// With neither flag this inspects. The agent must already hold exactly
+    /// With no destination flag this inspects. The agent must already hold exactly
     /// one Slack binding with an identity for the channel; add it first with
     /// `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>` (when another
     /// agent already holds the default Slack identity on that channel, add it
@@ -1274,11 +1274,25 @@ pub(crate) enum ClusterAction {
         /// Agent name or id.
         agent: String,
         /// Post progress to this Slack channel id (public C..., private G...).
-        #[arg(long, value_name = "CHANNEL_ID", conflicts_with = "no_slack_channel")]
+        #[arg(
+            long,
+            value_name = "CHANNEL_ID",
+            group = "factory_progress_destination"
+        )]
         slack_channel: Option<String>,
         /// Clear the configured progress channel.
-        #[arg(long)]
+        #[arg(long, group = "factory_progress_destination")]
         no_slack_channel: bool,
+        /// Use this workspace-public Slack channel for run progress and steering. This clears the previous progress channel.
+        #[arg(
+            long,
+            value_name = "CHANNEL_ID",
+            group = "factory_progress_destination"
+        )]
+        public_slack_channel: Option<String>,
+        /// Clear the workspace-public run channel.
+        #[arg(long, group = "factory_progress_destination")]
+        no_public_slack_channel: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.

@@ -74,7 +74,7 @@ import httpx
 from curie_internal.issue_links import IssueLink, find_issue_links
 from curie_internal.slack_mention_receipt import SlackMentionReceipt, kickoff_request_id
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -82,8 +82,10 @@ from starlette.concurrency import run_in_threadpool
 from . import factory_rediscovery, identity_fence, workitem_dispatch
 from .config import Settings
 from .crud import channels as crud_channels
+from .db import SCHEMA
 from .factory_base import BaseRefusal, ResolvedBase, bases_for, choose_base, resolve_base
 from .factory_slack import CodeHostUnavailable
+from .factory_slack_public import reserve_public_root
 from .forges.errors import ForgeError, NotFound
 from .forges.hosts import (
     factory_code_host,
@@ -108,6 +110,7 @@ from .models import (
     Agent,
     AgentChannel,
     ExecutionRequest,
+    FactorySlackPublicThread,
     FactorySlackThread,
     IdentityConnectToken,
     IdentityNamespace,
@@ -235,17 +238,13 @@ def _factory_serves(settings: Settings, registry: ForgeRegistry) -> bool:
     )
 
 
-async def _thread_at_root(
-    session: AsyncSession, data: FactorySlackKickoffIn
-) -> FactorySlackThread | None:
-    found: FactorySlackThread | None = await session.scalar(
-        select(FactorySlackThread)
-        .where(
-            FactorySlackThread.channel_identity == data.channel_identity,
-            FactorySlackThread.channel == data.channel,
-            FactorySlackThread.root_ts == data.root_ts,
-        )
-        .execution_options(populate_existing=True)
+async def _thread_at_root(session: AsyncSession, data: FactorySlackKickoffIn) -> uuid.UUID | None:
+    found: uuid.UUID | None = await session.scalar(
+        text(f"""
+        SELECT work_item_id FROM {SCHEMA}.factory_slack_mapped_roots
+        WHERE channel_identity = :identity AND channel = :channel AND root_ts = :root
+    """),
+        {"identity": data.channel_identity, "channel": data.channel, "root": data.root_ts},
     )
     return found
 
@@ -257,6 +256,12 @@ async def _thread_of(session: AsyncSession, work_item_id: uuid.UUID) -> FactoryS
         .execution_options(populate_existing=True)
     )
     return found
+
+
+async def _has_destination(session: AsyncSession, work_item_id: uuid.UUID) -> bool:
+    return await _thread_of(session, work_item_id) is not None or (
+        await session.get(FactorySlackPublicThread, work_item_id) is not None
+    )
 
 
 def _is_this_root(thread: FactorySlackThread, data: FactorySlackKickoffIn) -> bool:
@@ -485,9 +490,9 @@ async def _read_target(
         return state
     item = await work_item_for(session, issue)
     existing = None if item is None else item.id
-    thread = None if existing is None else await _thread_of(session, existing)
+    has_destination = existing is not None and await _has_destination(session, existing)
     await session.rollback()
-    if thread is not None:
+    if has_destination:
         return _refused("thread_conflict")
     base: ResolvedBase | None = None
     if existing is None:
@@ -697,7 +702,7 @@ async def _admit(
     if await _thread_at_root(session, data) is not None:
         return _refused("thread_conflict")
     item = await work_item_for(session, target.issue)
-    if item is not None and await _thread_of(session, item.id) is not None:
+    if item is not None and await _has_destination(session, item.id):
         return _refused("thread_conflict")
     base = None if item is not None else target.base
     if item is None:
@@ -766,6 +771,16 @@ async def _admit(
         return _refused("admission_refused", reason="request_mismatch")
     work_item_id = result.work_item.id
     await session.execute(
+        text("""
+        SELECT pg_advisory_xact_lock(hashtextextended(jsonb_build_array(
+            CAST(:identity AS text), CAST(:channel AS text), CAST(:root AS text))::text, 0))
+    """),
+        {"identity": data.channel_identity, "channel": data.channel, "root": data.root_ts},
+    )
+    if await _thread_at_root(session, data) is not None:
+        await session.rollback()
+        return _refused("thread_conflict")
+    await session.execute(
         insert(FactorySlackThread)
         .values(
             work_item_id=work_item_id,
@@ -787,13 +802,14 @@ async def _admit(
     if (
         by_item is None
         or at_root is None
-        or by_item.work_item_id != at_root.work_item_id
+        or by_item.work_item_id != at_root
         or not _is_this_root(by_item, data)
         or by_item.agent_id != receiving.agent_id
         or by_item.first_sequence != request.sequence
     ):
         await session.rollback()
         return _refused("thread_conflict")
+    await reserve_public_root(session, work_item_id, request.sequence)
     await session.commit()
     return FactorySlackKickoffOut(
         outcome="admitted",

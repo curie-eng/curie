@@ -1299,12 +1299,19 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             agent,
             slack_channel,
             no_slack_channel,
+            public_slack_channel,
+            no_public_slack_channel,
             conn,
             dry_run,
         } => {
             // Validate the id BEFORE discovering the connection: a malformed
             // id is a usage error that needs no cluster lookup to report.
-            let change = commands::FactoryProgressChange::resolve(slack_channel, no_slack_channel)?;
+            let change = commands::FactoryProgressChange::resolve(
+                slack_channel,
+                no_slack_channel,
+                public_slack_channel,
+                no_public_slack_channel,
+            )?;
             let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
                 conn.api_url,
                 conn.api_key,

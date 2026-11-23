@@ -54,6 +54,8 @@ from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from ..reply_errors import (
+    InvalidReplyTargetError,
+    PublicChannelUnverifiedError,
     UnconfiguredSlackIdentityError,
     UntrustedSlackEndpointError,
 )
@@ -351,6 +353,49 @@ UNREACHABLE_REPLY_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 
+class _PublicLookupUnavailable(aiohttp.ClientConnectionError):
+    """The transport failed before Slack received a provider write."""
+
+
+async def _verify_public_channel(client: AsyncWebClient, channel: str) -> None:
+    try:
+        auth = await _rate_limited_call(client.auth_test, "auth.test")
+        info = await _rate_limited_call(
+            lambda: client.conversations_info(channel=channel), "conversations.info"
+        )
+    except UNREACHABLE_REPLY_ERRORS:
+        raise _PublicLookupUnavailable("factory_public_lookup_unavailable") from None
+    except SlackApiError:
+        raise PublicChannelUnverifiedError("factory_public_channel_unverified") from None
+    team = auth.get("team_id")
+    facts = info.get("channel")
+    if (
+        auth.get("ok") is not True
+        or info.get("ok") is not True
+        or not isinstance(team, str)
+        or not team
+        or not isinstance(facts, dict)
+        or facts.get("id") != channel
+        or facts.get("context_team_id") != team
+        or facts.get("is_channel") is not True
+        or any(
+            facts.get(flag) is not False
+            for flag in (
+                "is_private",
+                "is_group",
+                "is_im",
+                "is_mpim",
+                "is_shared",
+                "is_ext_shared",
+                "is_org_shared",
+                "is_pending_ext_shared",
+                "is_archived",
+            )
+        )
+    ):
+        raise PublicChannelUnverifiedError("factory_public_channel_unverified")
+
+
 class SlackReplyAdapter:
     """A ``ReplySink`` backed by the Slack Web API (chat.update).
 
@@ -430,6 +475,8 @@ class SlackReplyAdapter:
         endpoint = route.endpoint
         identity = slack_speaking_identity("slack", route.adapter, endpoint)
         target = event.target
+        if getattr(route, "factory_public", False):
+            return await self._public_reply(event, endpoint=endpoint, identity=identity)
         if isinstance(event, TurnStatus):
             await self._set_status(
                 channel=target.address,
@@ -557,6 +604,61 @@ class SlackReplyAdapter:
             host,
             None,
         ) in self._trusted_origins
+
+    async def verify_public_channel(self, identity: str, channel: str) -> bool:
+        try:
+            await _verify_public_channel(self._client_for(None, identity), channel)
+        except PublicChannelUnverifiedError:
+            return False
+        return True
+
+    async def _public_reply(
+        self, event: ReplyEvent, *, endpoint: str | None, identity: str
+    ) -> ReplyAck:
+        target = event.target
+        message: OutboundMessage | None
+        edit_ref: str | None = None
+        if isinstance(event, ReplyPost) and event.audience_user is None and event.progress is None:
+            message = event.message
+        elif (
+            isinstance(event, ReplyUpdate) and event.message_mode == "replace" and target.reply_ref
+        ):
+            message = event.message
+            edit_ref = target.reply_ref
+        else:
+            raise InvalidReplyTargetError("invalid_public_reply")
+        if message is None:
+            raise InvalidReplyTargetError("invalid_public_reply")
+        channel = target.address
+        blocks = to_blocks(_reply_from_message(message))
+
+        async def send(client: AsyncWebClient) -> str | None:
+            await _verify_public_channel(client, channel)
+            if edit_ref is not None:
+                await client.chat_update(
+                    channel=channel, ts=edit_ref, text=message.text, blocks=blocks
+                )
+                return edit_ref
+            sent = await client.chat_postMessage(
+                channel=channel,
+                thread_ts=_thread_ts(target.conversation_id),
+                text=message.text,
+                blocks=blocks,
+                client_msg_id=event.delivery_id if isinstance(event, ReplyPost) else None,
+            )
+            return _adopt_posted_ts(sent)
+
+        try:
+            ref = await self._with_transport_fallback(
+                endpoint,
+                send,
+                describe="factory_public_reply",
+                operation="update" if edit_ref is not None else "post",
+                identity=identity,
+            )
+        except _PublicLookupUnavailable:
+            raise PublicChannelUnverifiedError("factory_public_channel_unverified") from None
+        return ReplyAck(ref=ref)
 
     def _client_for(self, endpoint: str | None, identity: str = DEFAULT_IDENTITY) -> AsyncWebClient:
         """The cached client for this turn's endpoint, or the worker default.

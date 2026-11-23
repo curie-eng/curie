@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -38,6 +39,7 @@ from curie_api.workitems.lifecycle import (
     terminalize_execution,
 )
 
+from . import factory_steering_execution, factory_steering_ledger
 from .config import Settings, get_settings
 from .factory_notices import ANSWER_PULL_REQUEST_ENDED_SENTENCE, start_failed_sentence
 from .factory_reply_target import reply_columns
@@ -1236,6 +1238,7 @@ async def acquire(
     wake: FactoryWake,
     context: FactoryContext | None,
     client: httpx.AsyncClient,
+    input_sha256: str | None = None,
 ) -> AcquireGrant | DispatchConflict:
     from .factory_base_reconcile import resolve_for_acquire
     from .factory_maintenance_observer import repair_refusal
@@ -1301,6 +1304,9 @@ async def acquire(
     if isinstance(locked, DispatchConflict):
         return locked
     work_item, request, deadline, now = locked
+    previously_acquired = (
+        request.acquired_generation is not None or request.last_deferral_reason is not None
+    )
     claimed = await _claim_acquire(
         session, work_item, request, owner=owner, generation=generation, now=now
     )
@@ -1410,6 +1416,20 @@ async def acquire(
                 generation=generation,
                 refusal="not_dispatchable",
             )
+    if await factory_steering_execution.requires_redispatch(
+        session,
+        work_item,
+        request,
+        previously_acquired=previously_acquired,
+        generation=generation,
+        digest=input_sha256,
+        now=now,
+        deadline=deadline,
+        backoff_seconds=get_settings().work_item_backoff_base_seconds,
+    ):
+        return await _refuse(
+            session, "not_published", work_item_id=work_item.id, request_id=request_id
+        )
     gate = (
         None
         if request.resource_gate is None
@@ -1736,6 +1756,7 @@ async def start(
     sandbox_name: str,
     context: FactoryContext,
     delivered_limits: Mapping[str, Any],
+    input_sha256: str | None = None,
 ) -> StartResult | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -1743,7 +1764,8 @@ async def start(
     work_item, request = locked
     now = await database_now(session)
     if (
-        request.acquire_owner != owner
+        request.dispatch_generation != generation
+        or request.acquire_owner != owner
         or request.acquired_generation != generation
         or request.acquire_expires_at is None
         or request.acquire_expires_at <= now
@@ -1785,30 +1807,58 @@ async def start(
         )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
-    result = await start_execution_where(
-        session,
-        work_item_id=work_item.id,
-        request_id=request.id,
-        expected_work_item_version=work_item.version,
-        expected_request_version=request.version,
-        extra_where=(
-            ExecutionRequest.acquire_owner == owner,
-            ExecutionRequest.acquired_generation == generation,
-            ExecutionRequest.acquire_expires_at > func.clock_timestamp(),
-        ),
-        extra_values={
-            "execution_attempts": 1,
-            "runtime_owner": owner,
-            "runtime_epoch": ExecutionRequest.runtime_epoch + 1,
-            "runtime_heartbeat_expires_at": func.clock_timestamp() + ttl,
-            "runtime_claim_name": claim_name,
-            "runtime_sandbox_name": sandbox_name,
-            "acquired_generation": None,
-            "acquire_owner": None,
-            "acquire_expires_at": None,
-        },
-        delivered_limits=delivered_limits,
+    entries = await factory_steering_ledger.assigned(session, request.id)
+    if entries and (
+        request.objective is None
+        or any(entry.state != "queued" for entry in entries)
+        or not factory_steering_execution.matches_input(request.objective, entries, input_sha256)
+    ):
+        return await _refuse(
+            session, "not_dispatchable", work_item_id=work_item.id, request_id=request_id
+        )
+    # Lifecycle commits its transition. Keep that commit inside the transaction
+    # recording the first consuming start for a guided request.
+    transaction = (
+        AsyncSession(
+            bind=await session.connection(),
+            join_transaction_mode="create_savepoint",
+            expire_on_commit=False,
+        )
+        if entries
+        else nullcontext(session)
     )
+    async with transaction as starting:
+        result = await start_execution_where(
+            starting,
+            work_item_id=work_item.id,
+            request_id=request.id,
+            expected_work_item_version=work_item.version,
+            expected_request_version=request.version,
+            extra_where=(
+                ExecutionRequest.dispatch_generation == generation,
+                ExecutionRequest.acquire_owner == owner,
+                ExecutionRequest.acquired_generation == generation,
+                ExecutionRequest.acquire_expires_at > func.clock_timestamp(),
+            ),
+            extra_values={
+                "execution_attempts": 1,
+                "runtime_owner": owner,
+                "runtime_epoch": ExecutionRequest.runtime_epoch + 1,
+                "runtime_heartbeat_expires_at": func.clock_timestamp() + ttl,
+                "runtime_claim_name": claim_name,
+                "runtime_sandbox_name": sandbox_name,
+                "acquired_generation": None,
+                "acquire_owner": None,
+                "acquire_expires_at": None,
+            },
+            delivered_limits=delivered_limits,
+        )
+    if entries:
+        if isinstance(result, WorkItemOutcome):
+            await factory_steering_ledger.apply(
+                session, work_item.id, request_id, [entry.steering_id for entry in entries]
+            )
+        await session.commit()
     if isinstance(result, WorkItemConflict):
         mapped = _map_start_conflict(result)
         return DispatchConflict(

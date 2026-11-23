@@ -730,35 +730,53 @@ class FactorySlackChannelUnbound(Exception):
     """The agent does not hold exactly one Slack binding, with an identity, there."""
 
 
-async def update_agent_factory_slack_channel(
-    session: AsyncSession, agent: Agent, channel: str | None
-) -> Agent:
-    """Set or clear the factory Slack destination (#5414).
+class FactorySlackDestinationConflict(Exception):
+    """An agent with public run threads cannot also set a legacy destination."""
 
-    A channel names the agent's one Slack binding for that address whose
-    adapter is the posting identity. A changed channel restarts
-    ``factory_slack_since`` on the database clock; null clears both.
-    """
 
-    if channel is None:
-        agent.factory_slack_channel = None
-        agent.factory_slack_since = None
-    else:
-        bindings = await session.scalar(
-            select(func.count())
-            .select_from(AgentChannel)
-            .where(
-                AgentChannel.agent_id == agent.id,
+async def factory_slack_binding(session: AsyncSession, agent_id: uuid.UUID, channel: str) -> str:
+    identities = list(
+        await session.scalars(
+            select(AgentChannel.adapter).where(
+                AgentChannel.agent_id == agent_id,
                 AgentChannel.kind == "slack",
                 AgentChannel.address == channel,
                 AgentChannel.adapter.is_not(None),
             )
         )
-        if bindings != 1:
+    )
+    if len(identities) != 1 or identities[0] is None:
+        raise FactorySlackChannelUnbound(channel)
+    return identities[0]
+
+
+async def update_agent_factory_slack_channel(
+    session: AsyncSession,
+    agent: Agent,
+    channel: str | None,
+    *,
+    public: bool = False,
+    verified_identity: str | None = None,
+) -> Agent:
+    await session.refresh(agent, with_for_update=True)
+    if channel is not None:
+        if not public and agent.factory_public_slack_channel is not None:
+            raise FactorySlackDestinationConflict
+        identity = await factory_slack_binding(session, agent.id, channel)
+        if public and identity != verified_identity:
             raise FactorySlackChannelUnbound(channel)
-        if agent.factory_slack_channel != channel or agent.factory_slack_since is None:
-            agent.factory_slack_channel = channel
-            agent.factory_slack_since = func.now()
+    if public:
+        previous = agent.factory_public_slack_channel
+        agent.factory_public_slack_channel = channel
+        if channel is not None:
+            agent.factory_slack_channel = None
+    else:
+        previous = agent.factory_slack_channel
+        agent.factory_slack_channel = channel
+    if channel is not None and (channel != previous or agent.factory_slack_since is None):
+        agent.factory_slack_since = func.now()
+    elif agent.factory_public_slack_channel is None and agent.factory_slack_channel is None:
+        agent.factory_slack_since = None
     await session.commit()
     await session.refresh(agent)
     return agent

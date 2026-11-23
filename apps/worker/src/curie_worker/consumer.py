@@ -91,6 +91,7 @@ from .progress import (
 )
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 from .upgrade_drain import UpgradeDrainGate
+from .workitem_dispatch import received_execution_input
 
 logger = logging.getLogger(__name__)
 
@@ -879,11 +880,12 @@ class Consumer(StreamConsumer):
                                     await self._kernel.resolve_capacity_grant(
                                         qevent, recovered_wait.grant_epoch
                                     )
-                                await self._kernel.process_event(
-                                    qevent,
-                                    lease=lease,
-                                    **identity_arguments,
-                                )
+                                with received_execution_input(qevent.event_id, qevent.text):
+                                    await self._kernel.process_event(
+                                        qevent,
+                                        lease=lease,
+                                        **identity_arguments,
+                                    )
                                 if self._kernel._can_park(
                                     qevent
                                 ) and await self._kernel._markers.is_terminal(qevent.event_id):

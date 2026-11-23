@@ -9,9 +9,12 @@ run record keyed by request id.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -237,6 +240,36 @@ def parse_work_item_event_id(event_id: str) -> WorkItemEvent | None:
     )
 
 
+_received_input: ContextVar[tuple[WorkItemEvent, str] | None] = ContextVar(
+    "received_execution_input", default=None
+)
+
+
+@contextmanager
+def received_execution_input(event_id: str, text: str) -> Iterator[None]:
+    event = parse_work_item_event_id(event_id)
+    evidence = (
+        (event, hashlib.sha256(text.encode("utf-8")).hexdigest())
+        if event is not None and event.kind == "execute"
+        else None
+    )
+    token = _received_input.set(evidence)
+    try:
+        yield
+    finally:
+        _received_input.reset(token)
+
+
+def _input_evidence(request_id: uuid.UUID, generation: int) -> dict[str, str]:
+    received = _received_input.get()
+    if received is None:
+        return {}
+    event, digest = received
+    if event.request_id == request_id and event.generation == generation:
+        return {"input_sha256": digest}
+    return {}
+
+
 def _conflict_code(response: httpx.Response) -> str:
     try:
         body = response.json()
@@ -365,6 +398,7 @@ class WorkItemDispatchClient:
                 "generation": generation,
                 "wake": wake.model_dump(mode="json"),
                 "context": context.model_dump(mode="json") if context is not None else None,
+                **_input_evidence(request_id, generation),
             },
         )
         try:
@@ -445,6 +479,7 @@ class WorkItemDispatchClient:
                     "sandbox_name": sandbox_name,
                     "context": context.model_dump(mode="json"),
                     "delivered_limits": delivered_limits,
+                    **_input_evidence(request_id, generation),
                 },
             )
         except WorkItemConflict as exc:

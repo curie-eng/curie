@@ -81,6 +81,7 @@ class TargetRoute(BaseModel):
 
     endpoint: str | None = None
     adapter: str | None = None
+    factory_public: bool = False
 
 
 class ReplySink(ReplyEventTransport[TargetRoute], Protocol):

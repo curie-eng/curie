@@ -3481,6 +3481,34 @@ Delivery is at least once and ordered per WorkItem: the root first, then the car
 
 Upgrading to a release with the card: a thread whose run is live at upgrade time gets its card as its next reply, since it cannot be the first. Threads that ended before the upgrade get no card. The migration records a durable cutoff, so a run live at upgrade time still gets its card after a worker outage. Phase, PR open and run outcome lines left unposted by an older release are never posted and never hold back the card or a reply. The worker no longer reads a phase lines setting.
 
+#### Public run threads
+
+Set `curie cluster factory-progress <agent> --public-slack-channel C0EXAMPLE1`
+or use the same flag on `curie local factory-progress`. Both send
+`PATCH /agents/{agent_id}` with `{"factory_public_slack_channel":"C0EXAMPLE1"}`.
+Record the previous progress channel before switching. Setting the public
+channel clears the previous destination atomically. Inspect with no flag.
+To restore the previous destination, clear public mode with
+`--no-public-slack-channel` and then set `--slack-channel` again.
+
+The posting app must have exactly one binding for the channel and be able
+to read its conversation metadata. Curie checks that the channel is public
+in that workspace when configured and again on delivery. Private, shared or
+unverifiable destinations refuse delivery. The public root and its card show
+run state and high-level steps. A publicly accessible repository can also
+show its pull request and checks for the observed head. The app omits issue
+titles, private links, source messages and steering text. Tracker runs and
+kickoffs in another channel get a separate public thread. A kickoff in the
+public channel keeps its original thread. Retries and revisions reuse it.
+
+An authorized engineer can mention the app in a mapped thread while
+implementation is waiting or running. Queued guidance expires in 24 hours.
+The thread shows when an execution takes it. After publication, eligible
+guidance requests a revision of the same pull request. Public delivery
+resumes after a rollback followed by an upgrade. An older API and worker
+can expose a private PR URL in an in-channel kickoff during a mixed-version
+deployment if the sender posted its issue link there.
+
 ### Factory Slack steering
 
 A person steers a run by explicitly mentioning the app in that run's Slack thread; the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack) describes what a steering mention does. Membership in the channel and having tagged the original issue confer no authority. Steering needs an operator-managed account link from the person to a code-host account, created with the platform key:

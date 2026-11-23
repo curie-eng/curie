@@ -69,6 +69,7 @@ fn agent_value_named(name: &str, channel: Option<&str>, identities: &[&str]) -> 
         "memory": false,
         "created_at": "2026-11-20T00:00:00Z",
         "factory_slack_channel": channel,
+        "factory_public_slack_channel": null,
     })
 }
 
@@ -104,33 +105,30 @@ fn api_named(
     patch: Patch,
     identities: &'static [&'static str],
 ) -> MockServer {
-    let stored: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(initial.map(str::to_string)));
+    let stored = Arc::new(Mutex::new(agent_value_named(name, initial, identities)));
     serve(move |req| {
         let (method, path) = (req.method.as_str(), req.path.as_str());
         let current = stored.lock().unwrap().clone();
         match method {
-            "GET" if path == "/agents" => Response::json(
-                200,
-                &serde_json::Value::Array(vec![agent_value_named(
-                    name,
-                    current.as_deref(),
-                    identities,
-                )])
-                .to_string(),
-            ),
+            "GET" if path == "/agents" => {
+                Response::json(200, &serde_json::Value::Array(vec![current]).to_string())
+            }
             "PATCH" if path == format!("/agents/{AGENT_ID}") => match &patch {
                 Patch::Refuse(status, body) => Response::json(*status, body),
                 Patch::Store => {
                     let body: serde_json::Value =
                         serde_json::from_slice(&req.body).expect("the PATCH body is JSON");
+                    let mut stored = stored.lock().unwrap();
                     if let Some(value) = body.get("factory_slack_channel") {
-                        *stored.lock().unwrap() = value.as_str().map(str::to_string);
+                        stored["factory_slack_channel"] = value.clone();
                     }
-                    let now = stored.lock().unwrap().clone();
-                    Response::json(
-                        200,
-                        &agent_value_named(name, now.as_deref(), identities).to_string(),
-                    )
+                    if let Some(value) = body.get("factory_public_slack_channel") {
+                        stored["factory_public_slack_channel"] = value.clone();
+                        if !value.is_null() {
+                            stored["factory_slack_channel"] = serde_json::Value::Null;
+                        }
+                    }
+                    Response::json(200, &stored.to_string())
                 }
             },
             _ => Response::json(405, r#"{"detail":"unexpected request"}"#),
@@ -246,6 +244,35 @@ fn set_sends_only_the_channel_and_reports_it_at_both_tiers() {
         assert_eq!(value["factory_slack_channel"], CHANNEL, "{tier}");
         assert_eq!(value["changed"], true, "{tier}");
         assert_eq!(value["agent"], AGENT_NAME, "{tier}");
+    }
+}
+
+#[test]
+fn public_channel_set_inspect_and_clear_at_both_tiers() {
+    for tier in TIERS {
+        let server = api(Some("C0EXAMPLE9"), Patch::Store);
+        let invoke = |args: &[&str]| run(&tier_args(tier, &server.base_url, args));
+        let set = invoke(&["--public-slack-channel", CHANNEL, "--json"]);
+        assert_eq!(set.code, 0, "{}", set.output());
+        assert_valid(&cli_schema(), &set.json(), "public channel result");
+        assert_eq!(set.json()["factory_public_slack_channel"], CHANNEL);
+        assert!(set.json()["factory_slack_channel"].is_null());
+        let inspect = invoke(&["--json"]);
+        assert_eq!(inspect.json()["factory_public_slack_channel"], CHANNEL);
+        assert_eq!(inspect.json()["changed"], false);
+        let clear = invoke(&["--no-public-slack-channel", "--json"]);
+        assert_eq!(clear.code, 0, "{}", clear.output());
+        assert!(clear.json()["factory_public_slack_channel"].is_null());
+        assert_eq!(
+            patches(&server),
+            [
+                serde_json::json!({"factory_public_slack_channel": CHANNEL}),
+                serde_json::json!({"factory_public_slack_channel": null}),
+            ]
+        );
+        let conflict = invoke(&["--public-slack-channel", CHANNEL, "--no-slack-channel"]);
+        assert_eq!(conflict.code, 2);
+        assert_eq!(patches(&server).len(), 2);
     }
 }
 
@@ -677,7 +704,7 @@ fn status_renders_a_set_channel_and_writes_nothing() {
         assert_valid(&cli_schema(), &value, "the --json payload");
         assert_eq!(
             value,
-            serde_json::json!({"agent": AGENT_NAME, "factory_slack_channel": CHANNEL, "changed": false}),
+            serde_json::json!({"agent": AGENT_NAME, "factory_slack_channel": CHANNEL, "factory_public_slack_channel": null, "changed": false}),
             "{tier}"
         );
         assert!(

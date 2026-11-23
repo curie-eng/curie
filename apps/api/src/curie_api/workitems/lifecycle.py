@@ -28,6 +28,7 @@ from ..config import get_settings
 from ..factory_no_change import no_change_marker_line
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
 from ..factory_retry_policy import Disposition, DispositionKind, RetryFacts, RetrySafety
+from ..factory_slack_public import reserve_public_root
 from ..forges.errors import ForgeError
 from ..forges.registry import forges_registry
 from ..forges.trackers import comment_prefix, issue_link, reply_route
@@ -1098,6 +1099,7 @@ async def insert_waiting_request(
             )
         )
         await session.flush()
+        await reserve_public_root(session, work_item.id, sequence)
     return True
 
 
@@ -1244,6 +1246,7 @@ async def create_revision_request(
                 )
             )
             await session.flush()
+            await reserve_public_root(session, work_item.id, sequence)
     except IntegrityError:
         await session.rollback()
         return await _conflict(session, "stale_version", work_item_id=work_item_id)

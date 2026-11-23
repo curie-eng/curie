@@ -28,6 +28,7 @@ from opentelemetry.trace import SpanKind
 from redis.exceptions import ResponseError
 from redis.typing import EncodableT
 from sqlalchemy import exists, func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -40,6 +41,7 @@ from . import (
     factory_notices,
     factory_provider_gate,
     factory_review_feedback,
+    factory_steering_execution,
     factory_tracker_intake,
 )
 from .code_host_trust import code_host_verify
@@ -96,6 +98,7 @@ class WorkItemReconciler:
         # Monotonic due time per non-GitHub lineage's review feedback read (#4399).
         self._review_feedback_due: dict[str, float] = {}
         self._step_consecutive_failures: dict[str, int] = {}
+        self._steering_cursor = uuid.UUID(int=0)
 
     def _stream(self) -> str:
         return self._settings.runs_stream
@@ -164,6 +167,7 @@ class WorkItemReconciler:
             # rolling upgrade (#5785), before readmission and promotion.
             ("redrive_question_rounds", self._redrive_question_rounds),
             ("readmit_pending", self._readmit_pending),
+            ("redrive_steering", self._redrive_steering),
             ("drain_answer_retries", self._drain_answer_retries),
             ("reconcile_missed_labels", self._reconcile_missed_labels),
             ("poll_trackers", self._poll_trackers),
@@ -191,6 +195,29 @@ class WorkItemReconciler:
     async def _redispatch_lapsed_acquisitions(self) -> None:
         async with self._sessionmaker() as session:
             await redispatch_lapsed_acquisitions(session)
+
+    async def _redrive_steering(self) -> None:
+        async with self._sessionmaker() as session:
+            entries = await factory_steering_execution.due(
+                session, limit=self._settings.work_item_batch_limit, after=self._steering_cursor
+            )
+        if not entries:
+            return
+        async with httpx.AsyncClient(
+            timeout=self._settings.github_app_timeout_seconds,
+            verify=code_host_verify(self._settings),
+        ) as client:
+            for work_item_id, steering_id in entries:
+                self._steering_cursor = steering_id
+                async with self._sessionmaker() as session:
+                    try:
+                        await factory_steering_execution.redrive(
+                            session, work_item_id, steering_id,
+                            settings=self._settings, client=client,
+                        )
+                    except SQLAlchemyError:
+                        # Dispatch parameter values include restricted execution input.
+                        raise RuntimeError("steering persistence unavailable") from None
 
     async def run_forever(self) -> None:
         while True:
@@ -734,11 +761,12 @@ class WorkItemReconciler:
     async def _execute_turn(self, request_id: uuid.UUID, generation: int) -> QueuedTurn | None:
         async with self._sessionmaker() as session:
             loaded = await load_execute_wake(session, request_id)
-        if loaded is None:
-            return None
-        request, _work_item, binding = loaded
+            if loaded is None:
+                return None
+            request, _work_item, binding = loaded
+            text = await factory_steering_execution.execute_text(session, request)
         if (
-            request.objective is None
+            text is None
             or request.requester is None
             or request.reply_kind is None
             or request.reply_address is None
@@ -755,7 +783,7 @@ class WorkItemReconciler:
             event_id=execute_event_id(request_id, generation),
             conversation_id=request.reply_conversation_id,
             author=request.requester,
-            text=request.objective,
+            text=text,
             source=TurnSource.WEBHOOK,
             reply_handle=ReplyHandle(
                 kind=request.reply_kind,

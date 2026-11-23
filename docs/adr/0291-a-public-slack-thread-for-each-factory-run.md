@@ -74,5 +74,9 @@ visible to each audience.
 Public deliveries remain owed across rollback and resume on upgrade. During
 a mixed-version deployment, an earlier API and worker together can add a
 private pull request URL to an in-channel kickoff where the sender already
-posted the issue link. A repository can also change visibility between the
+posted the issue link. When an operator selects a channel containing an
+existing kickoff, an earlier worker may already be sending its card or a
+notification. That delivery can include issue and pull request details or
+a phase note. The database refuses subsequent legacy card leases for the
+same kickoff root. A repository can also change visibility between the
 shareability check and Slack accepting a message.

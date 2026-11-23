@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from aci_protocol.turn import route_identity
+from curie_channel_gateway.read_transport import GatewayError
 from curie_protected_hooks.source_policy_sql import (
     SourceGate,
     SourceGateInvalid,
@@ -55,6 +56,7 @@ from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 from ..e2e_connector import prepare_connectors
+from ..identities import gateway_client
 from ..models import Agent, AgentChannel, ConnectorCapability
 from ..publication_policy import PublicationPolicyConflict
 from ..runner_resources import RunnerResourcesError, quota_refusal
@@ -461,13 +463,27 @@ async def update_agent(
     # on. Both nullable overrides get it -- they are the same seam, and fixing
     # one beside the other would leave the sibling broken on an adjacent line.
     sent = data.model_fields_set
-    if "factory_slack_channel" in sent:
-        # First among the writes: each helper commits on its own, so a refusal
-        # here leaves no other field of this request persisted.
+    if {"factory_slack_channel", "factory_public_slack_channel"} & sent:
+        public = "factory_public_slack_channel" in sent
+        if public and "factory_slack_channel" in sent:
+            raise HTTPException(422, {"code": "specify_one_factory_slack_destination"})
+        channel = data.factory_public_slack_channel if public else data.factory_slack_channel
+        identity = None
         try:
+            if public and channel is not None:
+                identity = await crud_agents.factory_slack_binding(session, agent.id, channel)
+                gateway = gateway_client(get_settings(), request.app.state.http_client)
+                if gateway is None:
+                    raise HTTPException(503, {"code": "factory_slack_visibility_unavailable"})
+                if not await gateway.verify_public_channel(identity, channel):
+                    raise HTTPException(422, {"code": "factory_slack_channel_not_public"})
             agent = await crud_agents.update_agent_factory_slack_channel(
-                session, agent, data.factory_slack_channel
+                session, agent, channel, public=public, verified_identity=identity
             )
+        except GatewayError:
+            raise HTTPException(503, {"code": "factory_slack_visibility_unavailable"}) from None
+        except crud_agents.FactorySlackDestinationConflict:
+            raise HTTPException(409, {"code": "factory_public_slack_channel_set"}) from None
         except crud_agents.FactorySlackChannelUnbound:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, {"code": "factory_slack_channel_unbound"}

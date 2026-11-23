@@ -124,6 +124,7 @@ class AcquireBody(BaseModel):
     generation: int = Field(ge=1)
     wake: workitem_dispatch.FactoryWake
     context: workitem_dispatch.FactoryContext | None
+    input_sha256: str | None = Field(default=None, pattern="^[0-9a-f]{64}$")
 
 
 class DeferBody(BaseModel):
@@ -169,6 +170,7 @@ class StartBody(BaseModel):
     sandbox_name: str = Field(min_length=1)
     context: workitem_dispatch.FactoryContext
     delivered_limits: DeliveredLimitsIn
+    input_sha256: str | None = Field(default=None, pattern="^[0-9a-f]{64}$")
 
 
 class HeartbeatBody(BaseModel):
@@ -513,6 +515,7 @@ async def acquire_work_item_request(
         wake=body.wake,
         context=body.context,
         client=request.app.state.http_client,
+        input_sha256=body.input_sha256,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)
@@ -567,6 +570,7 @@ async def start_work_item_request(
         sandbox_name=body.sandbox_name,
         context=body.context,
         delivered_limits=body.delivered_limits.model_dump(),
+        input_sha256=body.input_sha256,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

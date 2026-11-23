@@ -646,11 +646,18 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             agent,
             slack_channel,
             no_slack_channel,
+            public_slack_channel,
+            no_public_slack_channel,
             api_url,
             api_key,
             dry_run,
         } => {
-            let change = commands::FactoryProgressChange::resolve(slack_channel, no_slack_channel)?;
+            let change = commands::FactoryProgressChange::resolve(
+                slack_channel,
+                no_slack_channel,
+                public_slack_channel,
+                no_public_slack_channel,
+            )?;
             emit(
                 commands::factory_progress(
                     AgentActionOpts {

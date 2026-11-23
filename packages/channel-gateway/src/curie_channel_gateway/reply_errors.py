@@ -39,6 +39,10 @@ class ProviderEgressRefusedError(RejectedAdapterResponseError):
     reason = "provider egress refused"
 
 
+class PublicChannelUnverifiedError(RejectedAdapterResponseError):
+    """The speaking client could not verify the destination is workspace-public."""
+
+
 class OversizedAdapterResponseError(RuntimeError):
     """The adapter's acknowledgement body exceeded ``MAX_ACK_BODY_BYTES``.
 
@@ -109,6 +113,7 @@ ERROR_RESPONSES: Mapping[type[Exception], tuple[int, str]] = MappingProxyType(
         UntrustedSlackEndpointError: (421, "untrusted_slack_endpoint"),
         RejectedAdapterResponseError: (422, "rejected_adapter_response"),
         ProviderEgressRefusedError: (424, ProviderEgressRefusedError.reason),
+        PublicChannelUnverifiedError: (423, "factory_public_channel_unverified"),
         ReplayedReplyRequestError: (425, "reply_request_replayed"),
         OversizedAdapterResponseError: (502, "oversized_adapter_response"),
         ProviderReplyUnreachableError: (503, "reply_provider_unreachable"),

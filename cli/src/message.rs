@@ -7078,6 +7078,7 @@ mod tests {
             publication_draft: false,
             publication_branch_prefix: None,
             factory_slack_channel: None,
+            factory_public_slack_channel: None,
             connector_requester_identity: None,
             connector_requester_identity_version: None,
         }
@@ -8709,6 +8710,7 @@ mod tests {
                 publication_draft: false,
                 publication_branch_prefix: None,
                 factory_slack_channel: None,
+                factory_public_slack_channel: None,
                 connector_requester_identity: None,
                 connector_requester_identity_version: None,
             },
@@ -8740,6 +8742,7 @@ mod tests {
                 publication_draft: false,
                 publication_branch_prefix: None,
                 factory_slack_channel: None,
+                factory_public_slack_channel: None,
                 connector_requester_identity: None,
                 connector_requester_identity_version: None,
             },

@@ -175,6 +175,12 @@ class Agent(Base):
             name="agents_approver_ticket_requires_requester_identity_ck",
         ),
         CheckConstraint(
+            "factory_public_slack_channel IS NULL OR "
+            "(factory_slack_channel IS NULL AND "
+            "factory_public_slack_channel ~ '^[CG][A-Z0-9]{6,}$')",
+            name="agents_factory_public_slack_channel_ck",
+        ),
+        CheckConstraint(
             "factory_slack_channel IS NULL OR factory_slack_channel ~ '^[CG][A-Z0-9]{6,}$'",
             name="agents_factory_slack_channel_ck",
         ),
@@ -363,6 +369,7 @@ class Agent(Base):
     # checked on write. NULL posts nothing. ``factory_slack_since`` is the
     # database time it was last set, so only runs live from then on are posted;
     # both are cleared together.
+    factory_public_slack_channel: Mapped[str | None] = mapped_column(Text, default=None)
     factory_slack_channel: Mapped[str | None] = mapped_column(Text, default=None)
     factory_slack_since: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
@@ -1798,6 +1805,9 @@ class ExecutionRequest(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    steering_sealed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     dispatch_generation: Mapped[int] = mapped_column(default=1, server_default="1")
     published_generation: Mapped[int | None] = mapped_column(default=None)
     dispatch_not_before: Mapped[datetime] = mapped_column(
@@ -2532,6 +2542,8 @@ FACTORY_SLACK_POST_KINDS = (
     "needs_person",
     "ready",
     "maintenance",
+    "steering_applied",
+    "steering_refused",
 )
 
 
@@ -2579,6 +2591,98 @@ class FactorySlackPost(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class FactorySlackPublicThread(Base):
+    """The bound public destination and its card lease."""
+
+    __tablename__ = "factory_slack_public_threads"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_identity", "channel", "root_ts", name="factory_slack_public_threads_root_key"
+        ),
+        CheckConstraint(
+            f"origin IN ({', '.join(repr(origin) for origin in FACTORY_SLACK_THREAD_ORIGINS)})",
+            name="factory_slack_public_threads_origin_ck",
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    channel_identity: Mapped[str] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(Text)
+    root_ts: Mapped[str | None] = mapped_column(Text, default=None)
+    first_sequence: Mapped[int] = mapped_column()
+    origin: Mapped[str] = mapped_column(Text, default="configured", server_default="configured")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    card_upgrade_cutoff: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("'now'::timestamptz")
+    )
+    # The progress card (#5715). A kickoff stores the dispatcher's placeholder
+    # ts as ``card_ts`` at admission; any other thread stores its card post's.
+    card_ts: Mapped[str | None] = mapped_column(Text, default=None)
+    # The digest of the last render Slack acknowledged, and when it was sent.
+    card_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    card_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # One worker edits a card at a time: replace edits land last write wins.
+    card_lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    card_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # The Slack user id that sent a kickoff mention; the notify replies mention it.
+    requester_slack_user: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+FACTORY_SLACK_PUBLIC_POST_KINDS = (*FACTORY_SLACK_POST_KINDS, "steering_queued")
+
+
+class FactorySlackPublicPost(Base):
+    """One message owed to a factory Slack root, delivered at least once (#5414)."""
+
+    __tablename__ = "factory_slack_public_posts"
+    __table_args__ = (
+        CheckConstraint(
+            f"kind IN ({', '.join(repr(kind) for kind in FACTORY_SLACK_PUBLIC_POST_KINDS)})",
+            name="factory_slack_public_posts_kind_ck",
+        ),
+        CheckConstraint("payload = '{}'::jsonb", name="factory_slack_public_posts_payload_ck"),
+        UniqueConstraint(
+            "work_item_id", "post_key", name="factory_slack_public_posts_post_key_key"
+        ),
+        Index(
+            "ix_factory_slack_public_posts_owed",
+            "work_item_id",
+            "sequence",
+            "rank",
+            "ordinal",
+            postgresql_where=text("posted_at IS NULL AND failed_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.factory_slack_public_threads.work_item_id", ondelete="CASCADE"),
+    )
+    post_key: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    sequence: Mapped[int] = mapped_column()
+    rank: Mapped[int] = mapped_column()
+    ordinal: Mapped[int] = mapped_column(BigInteger)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_ref: Mapped[str | None] = mapped_column(Text, default=None)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 FACTORY_INTAKE_NOTICE_REASONS = (
@@ -2659,6 +2763,40 @@ class FactorySlackRefusalPost(Base):
         UniqueConstraint("notice_id", name="factory_slack_refusal_posts_notice_key"),
         Index(
             "ix_factory_slack_refusal_posts_owed",
+            "created_at",
+            "id",
+            postgresql_where=text("posted_at IS NULL AND failed_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    notice_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(f"{SCHEMA}.factory_intake_notices.id", ondelete="CASCADE"),
+    )
+    channel_identity: Mapped[str] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_ref: Mapped[str | None] = mapped_column(Text, default=None)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FactorySlackPublicRefusalPost(Base):
+    """A public refusal carries no issue identity or intake text."""
+
+    __tablename__ = "factory_slack_public_refusal_posts"
+    __table_args__ = (
+        CheckConstraint("payload = '{}'::jsonb", name="factory_slack_public_refusals_payload_ck"),
+        UniqueConstraint("notice_id", name="factory_slack_public_refusal_posts_notice_key"),
+        Index(
+            "ix_factory_slack_public_refusal_posts_owed",
             "created_at",
             "id",
             postgresql_where=text("posted_at IS NULL AND failed_at IS NULL"),

@@ -187,6 +187,8 @@ pub struct AgentUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory_slack_channel: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_public_slack_channel: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_partitions: Option<BTreeMap<String, HookPartitionInput>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_rule_proposals: Option<bool>,

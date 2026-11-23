@@ -81,6 +81,7 @@ class RepositoryRef:
     # Filled by `resolve_repository`; None when the reference was built from
     # stored facts without a read. Never part of identity.
     default_branch: str | None = field(default=None, compare=False)
+    is_public: bool = field(default=False, compare=False)
 
     def __post_init__(self) -> None:
         _require_text(

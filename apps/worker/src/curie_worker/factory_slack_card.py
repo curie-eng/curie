@@ -353,6 +353,43 @@ def card_reports(rows: Sequence[dict[str, object]]) -> tuple[CardReport, ...]:
     return tuple(reports)
 
 
+_PUBLIC_STAGES = {
+    "read_issue": "Reading the issue",
+    "investigate": "Investigating",
+    "pin_criteria": "Planning",
+    "plan_review": "Reviewing the plan",
+    "failing_test": "Testing",
+    "plan": "Planning",
+    "implement": "Implementing",
+    "review_diff": "Reviewing changes",
+    "test": "Testing",
+    "publish": "Publishing",
+    "wait_ci": "Waiting for checks",
+}
+_PUBLIC_STATES: dict[str, CardState] = {
+    "queued": "starting",
+    "waiting": "starting",
+    "running": "working",
+    "completed": "finished",
+    "failed": "needs a person",
+    "expired": "needs a person",
+    "cancelled": "stopped",
+    "cancellation_requested": "stopped",
+}
+
+
+def render_public_card(run: str, status: str, phase: str | None, publication: str) -> CardRender:
+    state = _PUBLIC_STATES.get(status, "working")
+    outcome = state if state == "needs a person" else f"is {state}"
+    lines = [f"Factory run {run} {outcome}."]
+    if phase is not None and phase in _PUBLIC_STAGES:
+        lines.append(_PUBLIC_STAGES[phase])
+    if publication:
+        lines.append(publication)
+    message = OutboundMessage(version=MESSAGE_VERSION, text="\n".join(lines))
+    return CardRender(message, state, hashlib.sha256(message.text.encode()).hexdigest())
+
+
 __all__ = [
     "CardRender",
     "CardReport",
@@ -366,5 +403,6 @@ __all__ = [
     "needs_person_text",
     "ready_text",
     "render_card",
+    "render_public_card",
     "starting_text",
 ]
