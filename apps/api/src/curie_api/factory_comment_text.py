@@ -9,18 +9,31 @@ from __future__ import annotations
 import re
 import unicodedata
 import uuid
+from typing import Literal
 from urllib.parse import urlsplit
 
 from curie_telemetry.redact import redact_text
 
+AskSurface = Literal["issue", "pull_request"]
 
-def github_ask_line(mention: str) -> str:
-    """How to ask the factory, for a GitHub tracker. Other forges do not use it."""
 
-    return (
-        "Ask the factory: comment on this pull request. "
-        f"The first 10 revisions need no mention; after that, mention @{mention}."
-    )
+def github_ask_line(mention: str, surface: AskSurface) -> str:
+    """How to ask the factory, for a GitHub tracker. Other forges do not use it.
+
+    ``surface`` is the tracker object the comment is posted on. An issue says
+    to comment on this issue and mention the App. A pull request, including a
+    review thread on that pull request, says to comment on this pull request.
+    The first 10 plain revisions of a pull request need no mention.
+    """
+
+    if surface == "issue":
+        return f"Ask the factory: comment on this issue and mention @{mention}."
+    if surface == "pull_request":
+        return (
+            "Ask the factory: comment on this pull request. "
+            f"The first 10 revisions need no mention; after that, mention @{mention}."
+        )
+    raise ValueError(f"unknown github ask surface: {surface}")
 
 
 _ASK_PREFIX = "Ask the factory:"
@@ -80,7 +93,7 @@ def end_trailing_decisions(body: str) -> str:
     return f"{closed}\n" if body.endswith("\n") else closed
 
 
-def append_github_ask_line(body: str, mention: str) -> str:
+def append_github_ask_line(body: str, mention: str, surface: AskSurface) -> str:
     """Put that line last, dropping every earlier ask line, whatever its wording.
 
     A trailing Decisions section is closed off first (`end_trailing_decisions`),
@@ -89,7 +102,7 @@ def append_github_ask_line(body: str, mention: str) -> str:
     agent wrote it and a malformed one is never made valid by dropping that line.
     """
 
-    line = github_ask_line(mention)
+    line = github_ask_line(mention, surface)
     lines = body.splitlines()
     protected = _decisions_lines(lines)
     kept: list[str] = []
