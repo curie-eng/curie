@@ -8,7 +8,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::support;
@@ -184,9 +184,10 @@ def reply_text(payload):
 def relay_body(reply_ref, after):
     state = read_state()
     turn = next((item for item in state["turns"] if item["payload"]["reply_handle"].get("placeholder") == reply_ref), None)
-    if turn is None or os.environ.get("CURIE_TEST_RELAY_MODE") == "timeout":
+    mode = os.environ.get("CURIE_TEST_RELAY_MODE")
+    if turn is None or mode == "timeout":
         return {"events": [], "next_cursor": after, "terminal": False}
-    if os.environ.get("CURIE_TEST_RELAY_MODE") == "approval":
+    if mode == "approval":
         # The turn parks on an approval: the worker posts the notice and reports
         # awaiting-approval, which is not a terminal page.
         payload = turn["payload"]
@@ -218,7 +219,6 @@ def relay_body(reply_ref, after):
             live["pending"] = False
             live["acked"] = True
             state["worker_xacks"].append(live["stream_id"])
-    update_state(worker_xack)
     payload = turn["payload"]
     handle = payload["reply_handle"]
     target = {
@@ -245,6 +245,14 @@ def relay_body(reply_ref, after):
             "outcome": "delivered",
         },
     ]
+    if mode in ("close_once", "close_always"):
+        events.insert(0, {
+            "version": "1.0", "event": "turn.status", "target": target,
+            "event_id": payload["event_id"], "status": "running",
+        })
+        if after < 2:
+            return {"events": events[after:2], "next_cursor": 2, "terminal": False}
+    update_state(worker_xack)
     return {"events": events[after:], "next_cursor": len(events), "terminal": True}
 
 def serve_http(client):
@@ -283,6 +291,11 @@ def serve_http(client):
             elif mode == "503_once" and attempt == 1:
                 status = "503 Service Unavailable"
                 body = b'{"detail":"relay temporarily unavailable"}'
+            elif (mode == "close_once" and attempt == 2) or (mode == "close_always" and attempt > 1):
+                return
+            elif mode == "malformed":
+                status = "200 OK"
+                body = b'{"events":[],"next_cursor":"invalid","terminal":false}'
             else:
                 status = "200 OK"
                 body = json.dumps(relay_body(reply_ref, after)).encode("utf-8")
@@ -428,6 +441,16 @@ impl Fixture {
     }
 
     fn command(&self, cwd: &Path, text: &str, continue_turn: bool) -> Command {
+        self.command_with_timeout(cwd, text, continue_turn, "3")
+    }
+
+    fn command_with_timeout(
+        &self,
+        cwd: &Path,
+        text: &str,
+        continue_turn: bool,
+        timeout_secs: &str,
+    ) -> Command {
         let mut command = Command::new(bin());
         command
             .args(["cluster", "message", text])
@@ -453,7 +476,7 @@ impl Fixture {
                 "--stream",
                 "curie:test:cluster-message-2096",
                 "--timeout-secs",
-                "3",
+                timeout_secs,
                 "--json",
             ])
             .current_dir(cwd)
@@ -903,6 +926,122 @@ fn transient_relay_503_retries_without_duplicate_enqueue_then_replies() {
     assert_eq!(state["worker_xacks"].as_array().map(Vec::len), Some(1));
     assert_eq!(state["xack_commands"], serde_json::json!([]));
     assert_no_worker_rollout(&fixture.log(), &state);
+}
+
+#[test]
+fn relay_poll_recovers_after_connection_closes_before_headers() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(fixture.state_home.path(), "alpha", false)
+        .env("CURIE_TEST_RELAY_MODE", "close_once")
+        .output()
+        .expect("run through one relay connection close");
+
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let result = json_output(&output);
+    assert_eq!(result["reply"], "reply-alpha");
+    assert_eq!(result["finalized"], true);
+
+    let state = fixture.state();
+    assert_eq!(state["turns"].as_array().map(Vec::len), Some(1));
+    let turn = &state["turns"][0];
+    let reply_ref = assert_relay_turn(&turn["payload"], "alpha");
+    let gets = state["http_gets"].as_array().expect("recorded relay GETs");
+    assert_eq!(gets.len(), 3, "{gets:#?}");
+    for (get, cursor) in gets.iter().zip([0, 2, 2]) {
+        assert_eq!(
+            get["path"],
+            format!("/cluster-message-replies/{reply_ref}?after={cursor}")
+        );
+        assert_eq!(get["api_key"], API_KEY);
+    }
+    assert_eq!(
+        state["worker_xacks"],
+        serde_json::json!([turn["stream_id"]])
+    );
+    assert_eq!(state["xack_commands"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn relay_poll_transport_closes_respect_original_deadline() {
+    let fixture = Fixture::new();
+    let mut command = tokio::process::Command::from(fixture.command_with_timeout(
+        fixture.state_home.path(),
+        "alpha",
+        false,
+        "2",
+    ));
+    command
+        .env("CURIE_TEST_RELAY_MODE", "close_always")
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let child = command.spawn().expect("start relay deadline control");
+    let group = child.id().expect("relay CLI process group") as libc::pid_t;
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    let output = match tokio::time::timeout(Duration::from_secs(5), &mut output).await {
+        Ok(result) => result.expect("read relay deadline control output"),
+        Err(_) => {
+            // The group includes the CLI's fixture port-forwards.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            let _ = output.await;
+            panic!("relay CLI exceeded the five-second process guard");
+        }
+    };
+
+    assert_eq!(output.status.code(), Some(3), "{}", describe(&output));
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(
+        json_output(&output),
+        serde_json::json!({"reply": null, "finalized": false, "timed_out": true})
+    );
+    let state = fixture.state();
+    assert_eq!(state["turns"].as_array().map(Vec::len), Some(1));
+    let turn = &state["turns"][0];
+    let reply_ref = assert_relay_turn(&turn["payload"], "alpha");
+    let gets = state["http_gets"].as_array().expect("recorded relay GETs");
+    assert!(
+        gets.len() >= 3,
+        "expected repeated connection closes: {gets:#?}"
+    );
+    assert_eq!(
+        gets[0]["path"],
+        format!("/cluster-message-replies/{reply_ref}?after=0")
+    );
+    for get in &gets[1..] {
+        assert_eq!(
+            get["path"],
+            format!("/cluster-message-replies/{reply_ref}?after=2")
+        );
+    }
+    assert_eq!(turn["pending"], true);
+    assert_eq!(state["worker_xacks"], serde_json::json!([]));
+    assert_eq!(state["xack_commands"], serde_json::json!([]));
+}
+
+#[test]
+fn malformed_relay_page_fails_without_retrying() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(fixture.state_home.path(), "alpha", false)
+        .env("CURIE_TEST_RELAY_MODE", "malformed")
+        .output()
+        .expect("run against a malformed relay page");
+
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(
+        json_output(&output)["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("decoding cluster-message reply page")),
+        "{}",
+        describe(&output)
+    );
+    let state = fixture.state();
+    assert_eq!(state["http_gets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(state["turns"].as_array().map(Vec::len), Some(1));
+    assert_eq!(state["xack_commands"], serde_json::json!([]));
 }
 
 #[test]
