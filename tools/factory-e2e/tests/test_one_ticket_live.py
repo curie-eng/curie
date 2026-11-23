@@ -3,7 +3,7 @@
 The live run needs a Jira Cloud site, a real model and a scratch cluster, so it
 is proved by running it. These pin what must hold before then: the scenario's
 registration and refusals (``-k registration``), the beat judge and its bounds
-over the real Jira REST and usage-line shapes (``-k judge``), and the
+over Jira REST, usage-line, and aggregate API shapes, and the
 anonymizer, the evidence serializer and ``check-clean`` (``-k anonymize``).
 Every identity below is invented; nothing touches the network.
 """
@@ -277,6 +277,10 @@ def test_registration_fixtures_leave_the_decision_open_and_answer_it_plainly() -
 # --- the judge ----------------------------------------------------------------------------
 
 
+def _aggregate_sample(total: Any, *, complete: Any = True) -> dict[str, Any]:
+    return {"estimated_cost_usd": total, "cost_complete": complete}
+
+
 def _passing_obs() -> dict[str, Any]:
     return {
         "investigating_s": 25.0,
@@ -293,12 +297,13 @@ def _passing_obs() -> dict[str, Any]:
             {"number": 7, "opened_s": 1600.0, "names_key": True, "has_citation": True}
         ],
         "answered_run_ended": True,
+        "pre_merge_usage": _aggregate_sample("4.20"),
         "merge_ok": True,
         "merged_s": 2000.0,
         "merged_notice_s": 2040.0,
         "status_id_unchanged": True,
         "request_count": 2,
-        "usage": {"kind": "total", "total": "4.20"},
+        "usage": _aggregate_sample("4.20"),
         "factory_created_issues": 0,
     }
 
@@ -380,6 +385,10 @@ BROKEN: dict[str, tuple[dict[str, Any] | Any, str]] = {
         "the pull request body has no line starting 'Answered on the ticket by '",
     ),
     "merge-failed": ({"merge_ok": False}, "the merge failed"),
+    "pre-merge-usage-missing": (
+        {"pre_merge_usage": None},
+        "the aggregate usage total is unavailable before the merge",
+    ),
     "no-merged-notice": (
         {"merged_notice_s": None},
         "no 'Pull request merged:' line within 600 s of the merge",
@@ -522,44 +531,39 @@ def test_judge_usage_total_classifies_each_line(text: str, expected: tuple[str, 
     assert otl.usage_total(text) == expected
 
 
-def _with_usage(line: str) -> dict[str, Any]:
-    kind, total = otl.usage_total(line)
-    obs = _passing_obs()
-    obs["usage"] = {"kind": kind, "total": None if total is None else str(total)}
-    return obs
-
-
 @pytest.mark.parametrize(
-    ("line", "message"),
+    ("usage", "message"),
     [
         (
-            "Usage: implementer 9,000,000 tokens ($25.01), total $25.01",
-            "the estimated cost is $25.01, over the 25 USD bound",
+            _aggregate_sample("25.01"),
+            "the aggregate estimated cost is $25.01, over the 25 USD bound",
         ),
         (
-            "Usage: implementer 9,000,000 tokens ($30.00), total at least $30.00, "
-            "usage not reported for 1 run",
-            "the estimated cost is at least $30.00, over the 25 USD bound",
+            _aggregate_sample("30.00", complete=False),
+            "the aggregate estimated cost is at least $30.00, over the 25 USD bound",
         ),
-        (USAGE_UNKNOWN, "the usage line reads 'total cost unknown'"),
-        (USAGE_NOT_REPORTED, "the merged status comment carries no usage total"),
-        ("Factory status: completed", "the merged status comment carries no usage total"),
+        (_aggregate_sample("3.10", complete=False), "the aggregate usage is incomplete"),
+        (_aggregate_sample("3.10", complete="true"), "the aggregate usage is incomplete"),
+        ({"estimated_cost_usd": "3.10"}, "the aggregate usage is incomplete"),
+        ({}, "the aggregate usage total is unavailable"),
     ],
 )
-def test_judge_rejects_a_cost_over_or_outside_the_bound(line: str, message: str) -> None:
-    assert message in otl.judge(_with_usage(line))
+def test_judge_rejects_a_cost_over_or_outside_the_bound(
+    usage: dict[str, Any], message: str
+) -> None:
+    assert otl.judge(dict(_passing_obs(), usage=usage)) == [message]
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        "Usage: implementer 900,000 tokens ($3.10), total at least $3.10, "
-        "usage not reported for 1 run",
-        "Usage: implementer 9,000,000 tokens ($25.00), total $25.00",
-    ],
-)
-def test_judge_passes_a_cost_within_the_bound(line: str) -> None:
-    assert otl.judge(_with_usage(line)) == []
+@pytest.mark.parametrize("total", [None, "NaN", "sNaN", "Infinity", "-0.01", "invalid", True])
+def test_judge_rejects_an_invalid_aggregate_total(total: Any) -> None:
+    assert otl.judge(dict(_passing_obs(), usage=_aggregate_sample(total))) == [
+        "the aggregate usage total is unavailable"
+    ]
+
+
+@pytest.mark.parametrize("total", ["0.00", "25.00"])
+def test_judge_passes_a_cost_within_the_bound(total: str) -> None:
+    assert otl.judge(dict(_passing_obs(), usage=_aggregate_sample(total))) == []
 
 
 # Handoff (b): the builders over the real Jira REST shapes, into the judge.
@@ -684,8 +688,6 @@ def _obs_from_shapes(before: dict[str, Any], after: dict[str, Any]) -> dict[str,
             )
             seen["received"] = seen.get("received") or otl.has_line(text, otl.ANSWER_RECEIVED_LINE)
             if otl.has_line(text, otl.MERGED_LINE):
-                kind, total = otl.usage_total(text)
-                obs["usage"] = {"kind": kind, "total": None if total is None else str(total)}
                 seen["merged"] = True
         if marker.startswith(otl.QUESTIONS_MARKER_PREFIX):
             seen["question"] = True
@@ -710,7 +712,6 @@ def test_judge_handoff_reads_real_jira_shapes_and_catches_a_same_category_status
     # A category comparison would pass this pair: both are "new".
     assert before["fields"]["status"]["statusCategory"]["key"] == "new"
     assert after["fields"]["status"]["statusCategory"]["key"] == "new"
-    assert obs["usage"] == {"kind": "at_least", "total": "3.10"}
     assert otl.judge(obs) == ["the Jira status id changed between labelling and the merged notice"]
 
 
@@ -1420,6 +1421,9 @@ class _World:
         return_created: bool = True,
         third_request_after: float | None = None,
         late_usage: tuple[float, str] | None = None,
+        usage_after: tuple[float, tuple[int, Any]] | None = None,
+        pre_merge_usage: tuple[int, Any] | None = None,
+        final_usage: tuple[int, Any] | None = None,
     ):
         self.clock = clock
         self.ask_usage = ask_usage
@@ -1429,6 +1433,9 @@ class _World:
         self.return_created = return_created
         self.third_request_after = third_request_after
         self.late_usage = late_usage
+        self.usage_after = usage_after
+        self.pre_merge_usage = pre_merge_usage
+        self.final_usage = final_usage
         self.ends_after = ends_after
         self.investigating = investigating
         self.second_pull_after = second_pull_after
@@ -1438,6 +1445,8 @@ class _World:
         self.answered: float | None = None
         self.merged: float | None = None
         self.settled_reads = 0
+        self.change_listings = 0
+        self.final_issue_read = False
         self.posted: list[tuple[str, str]] = []
         self.merges: list[Any] = []
 
@@ -1459,6 +1468,7 @@ class _World:
 
     def issue_fields(self, issue_id: str) -> tuple[int, dict[str, Any]]:
         assert issue_id == "10042"
+        self.final_issue_read = self.answered is not None
         labels = ["curie-factory"]
         if self.since(self.labelled, 405) and self.answered is None:
             labels.append(otl.QUESTIONS_LABEL)
@@ -1519,6 +1529,7 @@ class _World:
         return 201, {"id": "10200", "created": _jira_time(self.answered)}
 
     def changes_opened(self) -> list[int]:
+        self.change_listings += 1
         found = [7] if self.since(self.answered, 1100) else []
         if self.second_pull_after is not None and self.since(self.answered, self.second_pull_after):
             found.append(8)
@@ -1533,6 +1544,19 @@ class _World:
         return 0
 
     # -- the platform --
+
+    def usage_response(self) -> tuple[int, Any]:
+        if self.final_issue_read and self.final_usage is not None:
+            return self.final_usage
+        if (
+            self.change_listings >= 2
+            and not self.final_issue_read
+            and self.pre_merge_usage is not None
+        ):
+            return self.pre_merge_usage
+        if self.usage_after is not None and self.since(self.answered, self.usage_after[0]):
+            return self.usage_after[1]
+        return 200, _aggregate_sample("3.10")
 
     def detail(self) -> dict[str, Any] | None:
         assert self.labelled is not None
@@ -1588,6 +1612,9 @@ class _World:
 class _FakePreflight:
     """The Preflight surface ``drive`` reads."""
 
+    api_key = "fixture-api-key"
+    work_item_usage = fe.Preflight.work_item_usage
+
     def __init__(self, world: _World, ids: Any) -> None:
         self.world = world
         self.config = fe.dataclasses.make_dataclass("Config", ["repo"])(REPO)
@@ -1611,6 +1638,11 @@ class _FakePreflight:
         self.detail_reads += 1
         return self.world.detail()
 
+    def api(self, method: str, path: str, *, headers: Mapping[str, str]) -> tuple[int, Any]:
+        assert method == "GET" and path == "/work-items/wi-1/usage"
+        assert headers == {"X-API-Key": self.api_key}
+        return self.world.usage_response()
+
     def as_actor(self, method: str, path: str) -> tuple[int, Any]:
         assert method == "GET" and path in (
             f"/repos/{REPO}/pulls/7",
@@ -1633,6 +1665,104 @@ def _drive(tmp_path: Path, **world: Any) -> tuple[_FakePreflight, _World, _Clock
     return p, w, clock
 
 
+def test_drive_stops_when_two_under_bound_request_comments_exceed_the_aggregate_bound(
+    tmp_path: Path,
+) -> None:
+    p, world, _ = _drive(
+        tmp_path,
+        ask_usage="Usage: implementer 400,000 tokens ($20.00), total $20.00",
+        late_usage=(1200, "Usage: implementer 400,000 tokens ($10.00), total $10.00"),
+        usage_after=(1200, (200, _aggregate_sample("30.00"))),
+    )
+    obs = p.evidence["scenario"]
+    assert world.posted and world.merges == []
+    assert obs["request_count"] == 2
+    assert obs["usage"] == _aggregate_sample("30.00")
+    assert obs["verdict"] == "failed"
+    assert "the aggregate estimated cost is $30.00, over the 25 USD bound" in obs["failures"]
+
+
+def test_drive_accepts_the_exact_complete_aggregate_bound(tmp_path: Path) -> None:
+    usage = _aggregate_sample("25.00")
+    p, world, _ = _drive(tmp_path, usage_after=(1200, (200, usage)))
+    obs = p.evidence["scenario"]
+    assert len(world.merges) == 1
+    assert obs.get("pre_merge_usage") == obs["usage"] == usage
+    assert obs["verdict"] == "passed", obs["failures"]
+
+
+def test_drive_stops_on_a_partial_aggregate_above_the_bound_while_running(tmp_path: Path) -> None:
+    usage = _aggregate_sample("25.0001", complete=False)
+    p, world, clock = _drive(tmp_path, usage_after=(300, (200, usage)))
+    obs = p.evidence["scenario"]
+    assert world.posted and world.merges == []
+    assert world.answered is not None and clock.now == world.answered + 300
+    detail = world.detail()
+    assert detail is not None and detail["requests"][1]["status"] == "running"
+    assert obs["usage"] == usage
+    assert obs["verdict"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [(503, None), (200, _aggregate_sample("8.00", complete=False))],
+    ids=["unavailable", "incomplete"],
+)
+def test_drive_waits_through_pending_aggregate_usage(
+    response: tuple[int, Any], tmp_path: Path
+) -> None:
+    complete = (200, _aggregate_sample("24.50"))
+    p, world, _ = _drive(
+        tmp_path,
+        usage_after=(0, response),
+        pre_merge_usage=complete,
+        final_usage=complete,
+        late_usage=(300, USAGE_UNKNOWN),
+    )
+    obs = p.evidence["scenario"]
+    assert len(world.merges) == 1
+    assert obs["usage"] == complete[1]
+    assert obs["verdict"] == "passed", obs["failures"]
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ((503, None), "the aggregate usage total is unavailable"),
+        ((200, _aggregate_sample("24.00", complete=False)), "the aggregate usage is incomplete"),
+    ],
+    ids=["unavailable", "incomplete"],
+)
+def test_drive_requires_a_complete_aggregate_on_the_last_pre_merge_read(
+    response: tuple[int, Any], message: str, tmp_path: Path
+) -> None:
+    p, world, _ = _drive(tmp_path, pre_merge_usage=response)
+    obs = p.evidence["scenario"]
+    assert obs["answered_run_ended"] is True
+    assert world.merges == []
+    assert obs["usage"] == _aggregate_sample("3.10")
+    assert obs["verdict"] == "failed"
+    assert f"{message} before the merge" in obs["failures"]
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ((503, None), "the aggregate usage total is unavailable"),
+        ((200, _aggregate_sample("24.00", complete=False)), "the aggregate usage is incomplete"),
+    ],
+    ids=["unavailable", "incomplete"],
+)
+def test_drive_requires_a_complete_final_aggregate(
+    response: tuple[int, Any], message: str, tmp_path: Path
+) -> None:
+    p, world, _ = _drive(tmp_path, final_usage=response)
+    obs = p.evidence["scenario"]
+    assert len(world.merges) == 1 and obs["merged_notice_s"] is not None
+    assert obs["verdict"] == "failed"
+    assert message in obs["failures"]
+
+
 def test_judge_drive_end_to_end_passes_on_the_happy_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1644,7 +1774,7 @@ def test_judge_drive_end_to_end_passes_on_the_happy_path(
     assert obs["pre_answer_read"] == "ok" and obs["answered_run_ended"] is True
     assert world.posted == [("10042", "Round half up, two decimal places by default.")]
     assert len(world.merges) == 1
-    assert obs["usage"] == {"kind": "at_least", "total": "3.10"}
+    assert obs["usage"] == _aggregate_sample("3.10")
     assert obs["request_count"] == 2 and obs["status_id_unchanged"] is True
     # The run's identities, the issue id among them, are in the sanitizer.
     assert p.scenario_options["identities"]["issue"] == ["10042", ISSUE_KEY]
@@ -1840,39 +1970,6 @@ def test_judge_drive_stops_before_the_merge_when_a_third_request_appears(
         "over the bound of 2" in obs["failures"]
     )
     assert "the merge failed" not in obs["failures"]
-
-
-@pytest.mark.parametrize(
-    ("line", "stop", "message"),
-    [
-        (
-            OVER_BOUND,
-            {"reason": "usage", "kind": "total", "total": "26.00"},
-            "a status comment's estimated cost is $26.00, over the 25 USD bound",
-        ),
-        (
-            USAGE_UNKNOWN,
-            {"reason": "usage", "kind": "unknown", "total": None},
-            "a status comment's usage line reads 'total cost unknown'",
-        ),
-    ],
-)
-def test_judge_drive_stops_when_the_usage_crosses_the_bound_after_the_answer(
-    line: str,
-    stop: dict[str, Any],
-    message: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(fe, "_await_ending", _no_await_ending)
-    # Fails with the in-run check reverted: the run goes on to the merge.
-    p, w, clock = _drive(tmp_path, late_usage=(300, line))
-    obs = p.evidence["scenario"]
-    assert w.posted and w.merges == []
-    assert obs["spend_stop"] == stop
-    assert w.answered is not None and clock.now <= w.answered + 300 + otl.POLL_SECONDS
-    assert obs["verdict"] == "failed"
-    assert f"the run was stopped after the answer: {message}" in obs["failures"]
 
 
 def test_judge_rejects_a_pre_answer_usage_shape() -> None:
