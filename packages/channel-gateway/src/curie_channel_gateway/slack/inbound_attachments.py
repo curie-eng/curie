@@ -48,6 +48,7 @@ its own schedule, and one unreadable entry must not cost a multi-file upload
 every ref it had.
 """
 
+import re
 from typing import Any
 
 from aci_protocol import Attachment
@@ -127,3 +128,57 @@ def derive_attachments(event: dict[str, Any]) -> list[Attachment]:
         if ref is not None:
             refs.append(ref)
     return refs
+
+
+def requires_voice_receipt(event: dict[str, Any]) -> bool:
+    """Reserve uncertain and audio-shaped uploads for the voice receipt decision."""
+    if "files" not in event:
+        return False
+    files = event["files"]
+    if not isinstance(files, list) or len(files) > _MAX_ATTACHMENTS:
+        return True
+    for entry in files:
+        if not isinstance(entry, dict):
+            return True
+        mime = _non_blank_str(entry.get("mimetype"))
+        if (
+            mime is None
+            or mime.lower().startswith("audio/")
+            or entry.get("subtype") == "slack_audio"
+            or entry.get("media_display_type") in ("audio", "slack_audio")
+            or entry.get("file_access", "visible") != "visible"
+            or "audio_wave_samples" in entry
+        ):
+            return True
+    return False
+
+
+def hosted_voice_clip_id(event: dict[str, Any]) -> str | None:
+    """Identify the sender's one accessible native clip on the replayed Slack shape."""
+    files = event.get("files")
+    if not isinstance(files, list) or len(files) != 1 or not isinstance(files[0], dict):
+        return None
+    clip = files[0]
+    mime = _non_blank_str(clip.get("mimetype"))
+    if (
+        clip.get("subtype") != "slack_audio"
+        or mime is None
+        or not re.fullmatch(r"audio/[a-z0-9][a-z0-9.+-]*", mime.lower())
+        or clip.get("mode") != "hosted"
+        or clip.get("is_external") is not False
+        or clip.get("external_type")
+        or clip.get("external_url")
+        or clip.get("bot_id")
+        or clip.get("bot_user_id")
+        or clip.get("is_deleted")
+        or clip.get("is_tombstoned")
+        or clip.get("is_hidden_by_limit")
+        or clip.get("file_access", "visible") != "visible"
+        or not event.get("user")
+        or clip.get("user") != event["user"]
+    ):
+        return None
+    sender_team = event.get("user_team") or event.get("team")
+    if sender_team and "user_team" in clip and clip["user_team"] != sender_team:
+        return None
+    return _non_blank_str(clip.get("id"))

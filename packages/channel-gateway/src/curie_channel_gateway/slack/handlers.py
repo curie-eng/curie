@@ -55,6 +55,7 @@ decision 2). Routing, retries, and run orchestration are the worker's job (F1),
 not the dispatcher's.
 """
 
+import hashlib
 import logging
 import re
 import threading
@@ -73,6 +74,7 @@ from curie_internal.slack_mention_receipt import SlackMentionReceipt, write_rece
 from curie_internal.turn_queue import claim_event, enqueue
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind
+from pydantic import ValidationError
 from slack_bolt import App
 from slack_bolt.response import BoltResponse
 from slack_sdk.errors import SlackApiError
@@ -120,7 +122,7 @@ from .identity import (
     principal_observer_middleware,
     slack_evidence,
 )
-from .inbound_attachments import derive_attachments
+from .inbound_attachments import derive_attachments, hosted_voice_clip_id, requires_voice_receipt
 from .inbound_text import derive_text
 from .inbound_text import strip_self_mention as _strip_self_mention
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
@@ -646,6 +648,69 @@ def _delivery_canary(
     return False
 
 
+def _voice_mention_receipt(
+    *,
+    body: dict[str, Any],
+    event: dict[str, Any],
+    delivery_id: str,
+    channel_identity: str,
+    bot_user_id: str | None,
+    authorized_team_id: str | None,
+) -> SlackMentionReceipt | None:
+    raw_text = event.get("text")
+    if (
+        body.get("type") != "event_callback"
+        or event.get("type") != "app_mention"
+        or ("subtype" in event and event["subtype"] != "file_share")
+        or any(key in event for key in ("bot_id", "bot_profile", "app_id"))
+        or event.get("channel_type") not in (None, "channel", "group")
+        or not bot_user_id
+        or not isinstance(raw_text, str)
+        or re.search(rf"<@{re.escape(bot_user_id)}(?:\|[^>]*)?>", raw_text) is None
+    ):
+        return None
+    authorizations = body.get("authorizations")
+    if (
+        not authorized_team_id
+        or body.get("team_id") != authorized_team_id
+        or not isinstance(authorizations, list)
+        or len(authorizations) != 1
+        or not isinstance(authorizations[0], dict)
+    ):
+        return None
+    receiver = authorizations[0]
+    if (
+        receiver.get("is_bot") is not True
+        or receiver.get("user_id") != bot_user_id
+        or receiver.get("team_id") != authorized_team_id
+    ):
+        return None
+    file_id = hosted_voice_clip_id(event)
+    evidence = slack_evidence(body)
+    if file_id is None or evidence is None:
+        return None
+    try:
+        return SlackMentionReceipt.model_validate(
+            {
+                "version": 3,
+                "delivery_id": delivery_id,
+                "channel_identity": channel_identity,
+                "channel": event.get("channel"),
+                "root_ts": event.get("thread_ts"),
+                "message_ts": event.get("ts"),
+                "user_id": event.get("user"),
+                "body": "",
+                "evidence": evidence,
+                "voice_file_id": file_id,
+                "api_app_id": body.get("api_app_id"),
+                "team_id": authorized_team_id,
+                "content_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+            }
+        )
+    except (ValidationError, UnicodeEncodeError):
+        return None
+
+
 def _write_mention_receipt(
     *,
     redis_client: "Redis",
@@ -658,11 +723,14 @@ def _write_mention_receipt(
     channel: str,
     slack_identity: str,
     text: str,
+    bot_user_id: str | None,
+    authorized_team_id: str | None,
 ) -> None:
     """Record the receipt a factory steering or kickoff decision reads (#5414, #5380).
 
-    Only the native Socket Mode mention lane calls this, and a direct message
-    or a subtyped message never writes one. Three senders write a receipt:
+    Only the native Socket Mode mention lane writes receipts. A sender's single
+    native clip on a human thread reply takes the version 3 path. Other
+    mentions retain the three text cases:
 
     1. A person replying in a channel thread: version 1, as before.
     2. A person's top-level channel mention whose text links an issue:
@@ -678,7 +746,21 @@ def _write_mention_receipt(
     types the mark is a person.
     """
 
-    if lane != "mention" or event.get("subtype") or event.get("channel_type") == "im":
+    if lane != "mention" or event.get("channel_type") == "im":
+        return
+    if requires_voice_receipt(event):
+        receipt = _voice_mention_receipt(
+            body=body,
+            event=event,
+            delivery_id=delivery_id,
+            channel_identity=minted_adapter(slack_identity),
+            bot_user_id=bot_user_id,
+            authorized_team_id=authorized_team_id,
+        )
+        if receipt is not None:
+            write_receipt(redis_client, receipt, ttl_s=config.mention_receipt_ttl_seconds)
+        return
+    if event.get("subtype"):
         return
     thread_ts = event.get("thread_ts")
     message_ts = event.get("ts")
@@ -741,6 +823,7 @@ def process_event(
     admission: AdmissionGate,
     bot_user_id: str | None = None,
     bot_id: str | None = None,
+    authorized_team_id: str | None = None,
     identity_bots: Mapping[str, str] | None = None,
     approval_resolver: ApprovalResolveClient | None = None,
     clock: Clock = _utc_now_iso,
@@ -881,6 +964,8 @@ def process_event(
             channel=channel,
             slack_identity=slack_identity,
             text=raw_text,
+            bot_user_id=bot_user_id,
+            authorized_team_id=authorized_team_id,
         )
         if not claim_event(redis_client, config, delivery_id):
             drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
@@ -1392,6 +1477,7 @@ def register_handlers(
             admission=admission_gate,
             bot_user_id=context.get("bot_user_id"),
             bot_id=context.get("bot_id"),
+            authorized_team_id=getattr(context.get("authorize_result"), "team_id", None),
             identity_bots=identity_bots,
             clock=clock,
             logger=logger,

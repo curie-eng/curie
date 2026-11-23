@@ -9,7 +9,7 @@ sender evidence the API judges, so factory steering and kickoff never read
 either from the queued turn text. The frozen ``QueuedTurn`` is not changed; the
 receipt is a separate key in the same Valkey trust domain.
 
-Two versions exist:
+The receipt version identifies the source:
 
 1. Version 1, a person. Written for a person's mention that replies in a
    channel thread (``root_ts`` is the thread, ``message_ts`` the reply) and for
@@ -19,6 +19,9 @@ Two versions exist:
    driver's own channel. ``user_id`` and ``evidence.user_id`` are the declared
    driver's bot user and ``driver_bot_id`` its declared bot id; the event's
    ``user`` and text are never read as identity.
+3. Version 3, a human thread mention with one native audio clip. The receiving
+   app and team, file id and digest of the raw event text bind the source. The
+   body is empty and only a confirmed voice draft may supply steering text.
 
 ``driver_bot_id`` is present exactly on version 2 and is left out of a version
 1 receipt's serialized form, so version 1 bytes are the ones written before
@@ -34,6 +37,7 @@ redelivery finds the request it already admitted.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any, Literal, Self
 
@@ -51,6 +55,8 @@ from redis.asyncio import Redis as AsyncRedis
 
 from .keyspace import SLACK_MENTION_RECEIPT_PREFIX
 
+_VOICE_FIELDS = ("voice_file_id", "api_app_id", "team_id", "content_sha256")
+
 
 class MalformedMentionReceiptError(ValueError):
     """A stored receipt is not valid JSON or does not match the receipt schema."""
@@ -61,8 +67,7 @@ class SlackMentionReceipt(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    # 1 a person, 2 an ADR 0202 declared test driver.
-    version: Literal[1, 2]
+    version: Literal[1, 2, 3]
     delivery_id: str
     # minted_adapter(slack_identity): the identity the delivery arrived on.
     channel_identity: str
@@ -78,17 +83,42 @@ class SlackMentionReceipt(BaseModel):
     evidence: dict[str, Any]
     driver_bot_id: str | None = Field(default=None, pattern=r"^B[A-Z0-9]+$")
 
+    voice_file_id: str | None = Field(default=None, pattern=r"^F[A-Z0-9]+$")
+    api_app_id: str | None = Field(default=None, pattern=r"^A[A-Z0-9]+$")
+    team_id: str | None = Field(default=None, pattern=r"^T[A-Z0-9]+$")
+    content_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
     @model_validator(mode="after")
-    def _driver_only_on_version_2(self) -> Self:
+    def _version_fields(self) -> Self:
         if (self.version == 2) != (self.driver_bot_id is not None):
-            raise ValueError("driver_bot_id is required on version 2 and forbidden on version 1")
+            raise ValueError("driver_bot_id is required exactly on version 2")
+        if self.version != 3:
+            if self.model_fields_set.intersection(_VOICE_FIELDS):
+                raise ValueError("voice fields require a version 3 receipt")
+            return self
+        if any(getattr(self, name) is None for name in _VOICE_FIELDS):
+            raise ValueError("missing voice receipt source identity or text digest")
+        if (
+            self.body
+            or self.root_ts == self.message_ts
+            or not re.fullmatch(r"[CG][A-Z0-9]+", self.channel)
+            or not re.fullmatch(r"[UW][A-Z0-9]+", self.user_id)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+", self.root_ts)
+            or not re.fullmatch(r"[0-9]+\.[0-9]+", self.message_ts)
+            or self.evidence.get("delivery") != "app_mention"
+            or self.evidence.get("user_id") != self.user_id
+        ):
+            raise ValueError("invalid voice mention source")
         return self
 
     @model_serializer(mode="wrap")
-    def _omit_absent_driver(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+    def _omit_other_versions_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         data: dict[str, Any] = handler(self)
         if self.driver_bot_id is None:
             data.pop("driver_bot_id", None)
+        if self.version != 3:
+            for name in _VOICE_FIELDS:
+                data.pop(name, None)
         return data
 
 

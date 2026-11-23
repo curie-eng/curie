@@ -20,6 +20,7 @@ substituted. Event shapes follow the current dispatcher fixtures.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from collections.abc import Iterator
@@ -420,7 +421,9 @@ def test_a_redelivery_neither_enqueues_again_nor_overwrites_the_receipt(
     assert _stored(redis_client, delivery_id) == first
 
 
+@pytest.mark.parametrize("voice", [False, True], ids=["text", "voice"])
 def test_an_http_selected_mention_writes_no_receipt(
+    voice: bool,
     redis_client: redis.Redis,
     config: DispatcherConfig,
     delivered: list[str],
@@ -428,6 +431,10 @@ def test_an_http_selected_mention_writes_no_receipt(
     """A selected app_mention is still submitted, and it leaves no receipt."""
 
     body, event = native()
+    if voice:
+        event["files"] = [{**_hosted_clip(), "user": event["user"]}]
+        event["subtype"] = "file_share"
+        body["api_app_id"] = "A0EXAMPLE1"
     event_id = _event_id()
     body = {**body, "event_id": event_id}
     delivery_id = delivery_key(event_id, NAME)
@@ -514,3 +521,192 @@ def test_a_receipt_write_failure_claims_nothing_and_a_later_delivery_still_lands
     assert escaped_root not in receipt.body
     ttl = redis_client.ttl(_receipt_key(delivery_id))
     assert 0 < ttl <= RECEIPT_TTL_S
+
+
+def _hosted_clip() -> dict[str, Any]:
+    # Slack documents these fields at https://docs.slack.dev/reference/objects/file-object/.
+    # The slack_audio subtype and audio MIME combination is a local replay assumption.
+    return {
+        "id": "F0EXAMPLE1",
+        "mode": "hosted",
+        "subtype": "slack_audio",
+        "name": "example.m4a",
+        "mimetype": "audio/mp4",
+        "is_external": False,
+        "user": PERSON,
+        "user_team": "T1",
+        "url_private": "https://files.example.com/private",
+        "transcription": {"text": "untrusted file metadata"},
+    }
+
+
+def _voice_envelope(event_id: str) -> dict[str, Any]:
+    # https://docs.slack.dev/reference/events/app_mention/ shows the outer app and workspace
+    # IDs and the literal bot user mention in the nested event's text.
+    event = _mention("  <@U0BOT>  café  ")
+    event.update(user_team="T1", team="T1", files=[_hosted_clip()])
+    return {
+        **_body(event_id, event),
+        "api_app_id": "A0EXAMPLE1",
+        "team_id": "T1",
+        "is_ext_shared_channel": False,
+        "authorizations": [{"is_bot": True, "team_id": "T1", "user_id": "U0BOT"}],
+    }
+
+
+@pytest.mark.parametrize("file_share", [False, True], ids=["mention", "file_share"])
+def test_native_voice_receipt_binds_original_file_and_text_digest_on_replay(
+    redis_client: redis.Redis, config: DispatcherConfig, delivered: list[str], file_share: bool
+) -> None:
+    event_id = _event_id()
+    delivery_id = delivery_key(event_id, NAMED.name)
+    delivered.append(delivery_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    if file_share:
+        event["subtype"] = "file_share"
+    _deliver(config, redis_client, event_id, event, identity=NAMED, payload=body)
+
+    receipt = _stored(redis_client, delivery_id)
+    assert receipt.model_dump() == {
+        "version": 3,
+        "delivery_id": delivery_id,
+        "channel_identity": NAMED.name,
+        "channel": CHANNEL,
+        "root_ts": ROOT_TS,
+        "message_ts": REPLY_TS,
+        "user_id": PERSON,
+        "body": "",
+        "evidence": slack_evidence(body),
+        "voice_file_id": "F0EXAMPLE1",
+        "api_app_id": "A0EXAMPLE1",
+        "team_id": "T1",
+        "content_sha256": hashlib.sha256(event["text"].encode()).hexdigest(),
+    }
+    assert 0 < redis_client.ttl(_receipt_key(delivery_id)) <= RECEIPT_TTL_S
+    event["files"][0]["id"] = "F0EXAMPLE2"
+    event["text"] = "<@U0BOT> changed"
+    _deliver(config, redis_client, event_id, event, identity=NAMED, payload=body)
+
+    assert _stored(redis_client, delivery_id) == receipt
+    (queued,) = _queued(redis_client, config)
+    assert queued.event_id == delivery_id
+    assert [attachment.id for attachment in queued.attachments] == ["F0EXAMPLE1"]
+
+
+@pytest.mark.parametrize(
+    ("event_fields", "file_fields", "body_fields"),
+    [
+        pytest.param({"text": "<@U0OTHER> hello"}, {}, {}, id="different_app_mentioned"),
+        pytest.param(
+            {
+                "text": "",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "<@U0BOT>",
+                        },
+                    }
+                ],
+            },
+            {},
+            {},
+            id="derived_mention_only",
+        ),
+        pytest.param({"type": "message"}, {}, {}, id="ordinary_message"),
+        pytest.param({"thread_ts": None, "text": f"<@U0BOT> {ISSUE_LINK}"}, {}, {}, id="root"),
+        pytest.param({"thread_ts": REPLY_TS}, {}, {}, id="echoed_root"),
+        pytest.param({"channel": "D0EXAMPLE1"}, {}, {}, id="dm_address"),
+        pytest.param({"channel_type": "mpim"}, {}, {}, id="multiparty_dm"),
+        pytest.param({"app_id": "A0EXAMPLE2"}, {}, {}, id="app_sender"),
+        pytest.param({"bot_id": "B0EXAMPLE2"}, {}, {}, id="sibling_bot"),
+        pytest.param({"subtype": "thread_broadcast"}, {}, {}, id="broadcast"),
+        pytest.param({}, {"id": ""}, {}, id="missing_file_id"),
+        pytest.param({}, {"user": "U0OTHER"}, {}, id="another_uploader"),
+        pytest.param({}, {"user_team": "T0OTHER"}, {}, id="another_file_workspace"),
+        pytest.param({}, {"bot_user_id": "U0OTHER"}, {}, id="bot_uploaded_file"),
+        pytest.param({}, {"is_tombstoned": True}, {}, id="tombstoned_file"),
+        pytest.param({}, {"is_external": True}, {}, id="external_file"),
+        pytest.param({}, {"mode": "external"}, {}, id="external_mode"),
+        pytest.param({}, {"file_access": "check_file_info"}, {}, id="inaccessible_file"),
+        pytest.param({}, {"mimetype": "video/mp4"}, {}, id="ambiguous_media"),
+        pytest.param({}, {"mimetype": "audio/"}, {}, id="malformed_audio_type"),
+        pytest.param({}, {"subtype": None}, {}, id="ordinary_audio_upload"),
+        pytest.param(
+            {},
+            {"subtype": None, "mimetype": "video/mp4", "media_display_type": "audio"},
+            {},
+            id="ambiguous_native_display",
+        ),
+        pytest.param({}, {"subtype": None, "mimetype": None}, {}, id="unknown_upload_type"),
+        pytest.param({"files": [_hosted_clip(), _hosted_clip()]}, {}, {}, id="two_files"),
+        pytest.param({}, {}, {"api_app_id": None}, id="missing_receiving_app"),
+        pytest.param({}, {}, {"team_id": None}, id="missing_receiving_workspace"),
+        pytest.param({}, {}, {"team_id": "T0OTHER"}, id="other_receiving_workspace"),
+        pytest.param(
+            {},
+            {},
+            {
+                "authorizations": [
+                    {"is_bot": True, "team_id": "T1", "user_id": "U0OTHER"},
+                ]
+            },
+            id="other_receiving_bot",
+        ),
+    ],
+)
+def test_ineligible_voice_mention_writes_no_receipt_of_any_version(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    delivered: list[str],
+    event_fields: dict[str, Any],
+    file_fields: dict[str, Any],
+    body_fields: dict[str, Any],
+) -> None:
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    event["files"][0].update(file_fields)
+    event.update(event_fields)
+    body.update(body_fields)
+
+    _deliver(
+        config, redis_client, event_id, event, payload=body, identity_bots={"B0EXAMPLE2": "U0OTHER"}
+    )
+
+    assert redis_client.get(_receipt_key(event_id)) is None
+
+
+def test_refused_voice_caller_gets_no_receipt_or_turn(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+) -> None:
+    event_id = _event_id()
+    delivered.append(event_id)
+    admission_api.lists[(CHANNEL, "default")] = {"U0OTHER"}
+    body = _voice_envelope(event_id)
+    _deliver(config, redis_client, event_id, body["event"], payload=body)
+
+    assert redis_client.get(_receipt_key(event_id)) is None
+    assert not _queued(redis_client, config)
+
+
+def test_text_mention_with_an_ordinary_document_keeps_its_text_receipt(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    delivered: list[str],
+) -> None:
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    event["files"] = [{"id": "F0EXAMPLE2", "name": "notes.txt", "mimetype": "text/plain"}]
+    _deliver(config, redis_client, event_id, event, payload=body)
+
+    receipt = _stored(redis_client, event_id)
+    assert (receipt.version, receipt.body) == (1, event["text"])

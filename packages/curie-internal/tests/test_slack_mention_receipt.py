@@ -102,7 +102,7 @@ def test_a_version_2_receipt_names_the_declared_driver() -> None:
         {"version": 2},
         {"version": 2, "driver_bot_id": None},
         {"driver_bot_id": "B0EXAMPLE1"},
-        {"version": 3},
+        {"version": 4},
         {"version": "2", "driver_bot_id": "B0EXAMPLE1"},
         {"version": 2, "driver_bot_id": "U0EXAMPLE1"},
         {"version": 2, "driver_bot_id": ""},
@@ -201,3 +201,42 @@ def test_the_reader_reads_both_versions_and_refuses_a_disagreeing_receipt(
             asyncio.run(read(forged_id))
     finally:
         valkey.delete(*keys)
+
+
+def _voice_fields() -> dict[str, Any]:
+    return {
+        **_fields("person_thread_reply"),
+        "version": 3,
+        "body": "",
+        "voice_file_id": "F0EXAMPLE1",
+        "api_app_id": "A0EXAMPLE1",
+        "team_id": "T0EXAMPLE1",
+        "content_sha256": "a" * 64,
+    }
+
+
+def test_voice_receipt_round_trips_without_text_or_driver() -> None:
+    fields = _voice_fields()
+    receipt = SlackMentionReceipt.model_validate(fields)
+    assert json.loads(receipt.model_dump_json()) == fields
+    assert SlackMentionReceipt.model_validate_json(receipt.model_dump_json()) == receipt
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"version": 1},
+        {"version": 2, "driver_bot_id": "B0EXAMPLE2"},
+        {"body": "voice transcript"},
+        {"content_sha256": "AB"},
+        {"voice_file_id": "F/file"},
+        {"api_app_id": None},
+        {"team_id": None},
+        {"driver_bot_id": "B0EXAMPLE2"},
+        {"root_ts": _fields("person_thread_reply")["message_ts"]},
+        {"evidence": {"delivery": "message", "user_id": "U0OTHER"}},
+    ],
+)
+def test_voice_receipt_refuses_mixed_or_incomplete_authority(changes: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        SlackMentionReceipt.model_validate({**_voice_fields(), **changes})
