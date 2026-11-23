@@ -22,6 +22,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from curie_api.config import get_settings
 from curie_api.forges import registry as forge_registry
 from curie_api.forges import types
 from curie_api.forges.config import (
@@ -47,7 +48,9 @@ from curie_api.forges.registry import (
     register,
 )
 from curie_api.forges.types import CredentialScope
+from curie_api.github_factory_review import github_voice_runtime
 from forge_fakes import config_samples as samples
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 INSTALLED_CODE_HOSTS = frozenset(
     {types.GITHUB, types.GITLAB, types.BITBUCKET_CLOUD, types.BITBUCKET_DC}
@@ -209,6 +212,18 @@ def test_a_config_without_a_github_entry_has_no_github_adapters() -> None:
     registry = build_registry(ForgesConfig())
     assert registry.github_tracker() is None
     assert registry.github_code_host() is None
+
+
+@pytest.mark.anyio
+async def test_voice_enabled_without_a_registered_github_code_host_starts_no_adapter() -> None:
+    settings = get_settings().model_copy(
+        update={"factory_enabled": True, "factory_voice_enabled": True, "forges": ForgesConfig()}
+    )
+    async with (
+        httpx.AsyncClient() as client,
+        github_voice_runtime(settings, async_sessionmaker(), client) as voice,
+    ):
+        assert voice is None
 
 
 # Reserved kinds ---------------------------------------------------------------------

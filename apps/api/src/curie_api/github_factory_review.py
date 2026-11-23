@@ -21,7 +21,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager, suppress
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal, Protocol
 
 import httpx
 from fastapi import HTTPException
@@ -74,9 +74,6 @@ from .repo_full_name import repo_url_path
 from .workitem_dispatch import Admission
 from .workitems.lifecycle import WorkItemOutcome
 from .workspace_policy import repository_is_allowed
-
-if TYPE_CHECKING:
-    from .forges.github.voice import GitHubVoice
 
 logger = logging.getLogger(__name__)
 
@@ -649,19 +646,27 @@ async def voice_comment_address(settings: Settings, event: str, payload: Any) ->
     return None
 
 
+class VoiceCommentHandler(Protocol):
+    async def handle(
+        self, session: AsyncSession, payload: dict[str, Any], address: str
+    ) -> WebhookResult: ...
+
+
 @asynccontextmanager
 async def github_voice_runtime(
     settings: Settings,
     sessions: async_sessionmaker[AsyncSession],
     client: httpx.AsyncClient,
-) -> AsyncIterator[GitHubVoice | None]:
+) -> AsyncIterator[VoiceCommentHandler | None]:
     if not settings.factory_enabled or not settings.factory_voice_enabled:
         yield None
         return
-    from .factory_voice import build_voice_draft_service
-    from .forges.github.voice import GitHubVoice
+    connection = forges_registry(settings).github_code_host()
+    if connection is None:
+        yield None
+        return
 
-    runtime = GitHubVoice(sessions, settings, client, build_voice_draft_service(settings, sessions))
+    runtime = connection.voice_adapter(sessions, settings, client)
     task = asyncio.create_task(runtime.run())
     try:
         yield runtime
@@ -674,7 +679,7 @@ async def github_voice_runtime(
 async def handle_factory_review_delivery(
     session: AsyncSession,
     *,
-    voice: GitHubVoice | None,
+    voice: VoiceCommentHandler | None,
     voice_address: str | None,
     settings: Settings,
     client: httpx.AsyncClient,

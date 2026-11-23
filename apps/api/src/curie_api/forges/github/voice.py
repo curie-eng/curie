@@ -41,7 +41,7 @@ from curie_api.factory_voice_contract import (
     VoiceSource,
 )
 from curie_api.forges.errors import ForgeError
-from curie_api.forges.hosts import factory_code_host_entry, github_host
+from curie_api.forges.hosts import github_host
 from curie_api.forges.ports import MarkedComments
 from curie_api.forges.registry import forges_registry
 from curie_api.forges.trackers import code_host_for_repository, reply_route
@@ -67,6 +67,7 @@ from curie_api.schemas.deployments import WebhookResult
 from curie_api.workspace_policy import repository_is_allowed
 
 from .comments import GitHubMarkedComments
+from .connection import GitHubCodeHostConnection
 from .voice_media import read_comment_media, read_voice_comment
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,7 @@ def _prompt(code: str, text: str) -> str:
 
 @dataclass(frozen=True)
 class GitHubVoice:
+    connection: GitHubCodeHostConnection
     sessions: async_sessionmaker[AsyncSession]
     settings: Settings
     client: httpx.AsyncClient
@@ -156,12 +158,11 @@ class GitHubVoice:
         return Target(item, tenant, lineage.id, bound, audience)
 
     async def verify(self, target: Target) -> VerifiedRepository:
-        connection = factory_code_host_entry(forges_registry(self.settings))
         verified = await verify_repository(
             target.bound,
             client=self.client,
-            credentials=connection.credentials.credentials,
-            api_url=connection.config.api_url,
+            credentials=self.connection.credentials.credentials,
+            api_url=self.connection.config.api_url,
         )
         if verified.repository.get("visibility") in ("internal", "private"):
             raise FeedbackIgnored("voice_private_repository")

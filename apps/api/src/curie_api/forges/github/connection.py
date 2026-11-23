@@ -27,9 +27,13 @@ from curie_api.forges.errors import Unavailable
 from curie_api.forges.types import RepositoryRef
 
 if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from curie_api.config import Settings
     from curie_api.forges.github.code_host import GitHubCodeHost
     from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
     from curie_api.forges.github.tracker import GitHubTracker
+    from curie_api.forges.github.voice import GitHubVoice
 
 
 def html_base(api_url: str, host: str) -> str:
@@ -185,6 +189,19 @@ class GitHubCodeHostConnection:
             repository_paths={repository.project_id: repository.path}
             if repository is not None
             else {},
+        )
+
+    def voice_adapter(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        settings: Settings,
+        client: httpx.AsyncClient,
+    ) -> GitHubVoice:
+        from curie_api.factory_voice import build_voice_draft_service
+        from curie_api.forges.github.voice import GitHubVoice
+
+        return GitHubVoice(
+            self, sessions, settings, client, build_voice_draft_service(settings, sessions)
         )
 
     def _marked_comments(
