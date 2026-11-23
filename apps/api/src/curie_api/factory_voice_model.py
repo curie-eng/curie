@@ -21,6 +21,7 @@ MODEL_SHA256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002
 MODEL_BYTES = 147_964_211
 CHILD_WALL_SECONDS = 180
 CHILD_ADDRESS_SPACE = 2 * 1024**3
+CHILD_MEDIA_LIMIT_EXIT = 12
 _CHILD_SLOT = threading.Lock()
 _MODEL_CHECK = threading.Lock()
 _THREAD_LIMITS = {
@@ -38,7 +39,7 @@ _THREAD_LIMITS = {
 CHILD_REFUSALS: Final[dict[int, Refusal]] = {
     10: "disabled",
     11: "invalid_media",
-    12: "media_limit",
+    CHILD_MEDIA_LIMIT_EXIT: "media_limit",
     13: "no_speech",
     14: "unavailable",
 }
@@ -129,6 +130,7 @@ class LocalVoiceRecognizer:
                 "curie_api.factory_voice_child",
                 str(self.model_path),
                 mime,
+                str(CHILD_ADDRESS_SPACE),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -142,8 +144,14 @@ class LocalVoiceRecognizer:
             # Cancellation can interrupt spawn or recur during shutdown. Only the reaper
             # releases the shared slot, after the child has exited.
             await asyncio.shield(_reap_and_release(launch))
-        # Linux sends SIGKILL when the child reaches its hard RLIMIT_CPU.
-        if proc.returncode in (-signal.SIGALRM, -signal.SIGXCPU, -signal.SIGKILL):
+        # Native allocation failure can abort or fault before the child can return a refusal.
+        if proc.returncode in (
+            -signal.SIGALRM,
+            -signal.SIGXCPU,
+            -signal.SIGKILL,
+            -signal.SIGABRT,
+            -signal.SIGSEGV,
+        ):
             return Refused(reason="media_limit")
         if proc.returncode != 0:
             return Refused(reason=CHILD_REFUSALS.get(proc.returncode or -1, "unavailable"))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import re
 from typing import TYPE_CHECKING, Never
@@ -185,7 +186,11 @@ def decode_audio(declared_type: str, data: bytes) -> bytes | Refused:
                 _append_pcm(pcm, resampler.resample(frame))
             _append_pcm(pcm, resampler.resample(None))
             return bytes(pcm) if pcm else Refused(reason="invalid_media")
-    except _MediaLimit:
+    except (_MediaLimit, MemoryError):
         return Refused(reason="media_limit")
-    except (av.FFmpegError, OSError, ValueError, OverflowError):
+    except (av.FFmpegError, OSError) as exc:
+        if exc.errno == errno.ENOMEM:
+            return Refused(reason="media_limit")
+        return Refused(reason="invalid_media")
+    except (ValueError, OverflowError):
         return Refused(reason="invalid_media")

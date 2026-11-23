@@ -51,7 +51,9 @@ async def test_fifo_model_path_is_never_opened_for_a_blocking_read(tmp_path: Pat
         assert not await recognizer.available()
 
 
-@pytest.mark.parametrize("end", ["cancel", "deadline", "cpu_limit"])
+@pytest.mark.parametrize(
+    "end", ["cancel", "deadline", "cpu_limit", "address_limit", "native_abort", "native_fault"]
+)
 async def test_concurrent_service_instances_reap_the_real_child(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -63,6 +65,10 @@ async def test_concurrent_service_instances_reap_the_real_child(
     path = tmp_path / "without-model.bin"
     if end == "deadline":
         monkeypatch.setattr(factory_voice_model, "CHILD_WALL_SECONDS", 1)
+    if end == "address_limit":
+        with path.open("wb") as model:
+            model.truncate(factory_voice_model.MODEL_BYTES)
+        monkeypatch.setattr(factory_voice_model, "CHILD_ADDRESS_SPACE", 1)
     first = asyncio.create_task(LocalVoiceRecognizer(path).recognize("audio/wav", data))
     try:
         async with asyncio.timeout(5):
@@ -76,6 +82,10 @@ async def test_concurrent_service_instances_reap_the_real_child(
         )
         if end == "cpu_limit":
             resource.prlimit(child, resource.RLIMIT_CPU, (0, 0))
+        if end in {"native_abort", "native_fault"}:
+            resource.prlimit(child, resource.RLIMIT_CORE, (0, 0))
+            os.kill(child, signal.SIGABRT if end == "native_abort" else signal.SIGSEGV)
+        if end not in {"deadline", "cancel"}:
             os.kill(child, signal.SIGCONT)
         if end != "cancel":
             async with asyncio.timeout(5):

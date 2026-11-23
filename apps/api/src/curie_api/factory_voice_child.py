@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import importlib
 import os
 import resource
@@ -103,7 +104,9 @@ def _recognize(path: Path, mime: str) -> str | Refused:
 
     try:
         model = open_model(path)
-    except OSError:
+    except OSError as exc:
+        if exc.errno == errno.ENOMEM:
+            raise
         return Refused(reason="disabled")
     with model:
         stamp = os.fstat(model.fileno())
@@ -125,19 +128,33 @@ def _recognize(path: Path, mime: str) -> str | Refused:
 
 def main() -> int:
     from .factory_voice_contract import Refused
-    from .factory_voice_model import CHILD_ADDRESS_SPACE, CHILD_REFUSALS, CHILD_WALL_SECONDS
+    from .factory_voice_model import (
+        CHILD_ADDRESS_SPACE,
+        CHILD_MEDIA_LIMIT_EXIT,
+        CHILD_REFUSALS,
+        CHILD_WALL_SECONDS,
+    )
 
     _cap(resource.RLIMIT_CORE, 0)
-    _cap(resource.RLIMIT_AS, CHILD_ADDRESS_SPACE)
     _cap(resource.RLIMIT_CPU, CHILD_WALL_SECONDS)
     os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
     with os.fdopen(os.dup(1), "wb") as reply:
         os.dup2(2, 1)
-        result = _recognize(Path(sys.argv[1]), sys.argv[2])
-        if isinstance(result, Refused):
-            return next(code for code, reason in CHILD_REFUSALS.items() if reason == result.reason)
-        reply.write(result.encode("utf-8"))
-        return 0
+        _cap(resource.RLIMIT_AS, min(CHILD_ADDRESS_SPACE, max(0, int(sys.argv[3]))))
+        try:
+            result = _recognize(Path(sys.argv[1]), sys.argv[2])
+            if isinstance(result, Refused):
+                return next(
+                    code for code, reason in CHILD_REFUSALS.items() if reason == result.reason
+                )
+            reply.write(result.encode("utf-8"))
+            return 0
+        except MemoryError:
+            return CHILD_MEDIA_LIMIT_EXIT
+        except OSError as exc:
+            if exc.errno == errno.ENOMEM:
+                return CHILD_MEDIA_LIMIT_EXIT
+            raise
 
 
 if __name__ == "__main__":
