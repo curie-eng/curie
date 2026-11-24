@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import factory_e2e as fe
@@ -9,6 +11,7 @@ import pytest
 import scripted_kind as sk
 from slack_steering_model import ANCHOR, INSTRUCTION, SteeringRouter
 from slack_steering_run import SlackSteeringRun, verify_consumers, verify_revision
+from slack_voice_run import SlackVoiceRun, VoiceRouter
 
 NONCE = "a1" * 16
 
@@ -92,12 +95,66 @@ def test_scripted_cli_selects_steering_and_keeps_publication_driver(
     monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
     monkeypatch.setattr(sk.ScriptedRun, "cleanup", lambda run: [])
     monkeypatch.setattr(sk.ScriptedRun, "one_ticket_verdict_error", lambda run: None)
-    for name in ("publication", "slack-steering"):
+    for name in ("publication", "slack-steering", "slack-voice"):
         args = fe.parse_args(
             ["scripted", "--scenario", name, "--build-images", "--transcript", str(sk.TRANSCRIPT)]
         )
         assert sk.main(args) == 0
-    assert selected == [sk.ScriptedRun, SlackSteeringRun]
+    assert selected == [sk.ScriptedRun, SlackSteeringRun, SlackVoiceRun]
+
+
+def test_voice_model_uses_the_confirmed_edit_and_keeps_the_button_timeout(tmp_path: Path) -> None:
+    router = VoiceRouter()
+    script = SimpleNamespace()
+    module = sk._module("voice_model_server", sk.REPO_ROOT / "tools/model-script/model_script.py")
+    router.install(script, module, fallback=False)
+    transcript = "Change the button label to Retry."
+    edited = transcript + " Keep the existing timeout."
+    reply = {"kind": "slack_mention", "body": edited}
+    messages = [_frame(reply)]
+
+    def request(frames: list[dict[str, Any]]) -> dict[str, Any] | None:
+        return script._match("POST", "/v1/messages", json.dumps({"messages": frames}).encode())
+
+    assert request(messages) is None
+    router.expected = edited
+    for invalid in (reply | {"body": transcript}, reply | {"kind": "pull_request_body"}):
+        assert request([_frame(invalid)]) is None
+    for expected in (
+        "Skill",
+        "mcp__curie__get_issue",
+        "Agent",
+        "mcp__curie__report_progress",
+        "Read",
+        "Edit",
+    ):
+        answer = request(messages)
+        assert answer is not None
+        (tool,) = answer["message"]["content"]
+        assert tool["name"] == expected
+        messages.extend(
+            [
+                {"role": "assistant", "content": [tool]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": tool["id"], "content": "ok"}
+                    ],
+                },
+            ]
+        )
+    assert len(router.received) == 1
+    fixture = SlackVoiceRun(fe.parse_args(["scripted", "--scenario", "slack-voice"]))
+    fixture.workdir = tmp_path
+    path = Path(tool["input"]["file_path"]).relative_to("/workspace")
+    actual = (fixture.fixture_tree() / path).read_text()
+    old, new = tool["input"]["old_string"], tool["input"]["new_string"]
+    assert actual.count(old) == 1
+    before = ET.fromstring(actual.splitlines()[1])
+    after = ET.fromstring(actual.replace(old, new).splitlines()[1])
+    assert before.tag == after.tag == "button"
+    assert before.attrib == after.attrib == {"type": "button", "data-timeout-ms": "1500"}
+    assert (before.text, after.text) == ("Try again", "Retry")
 
 
 def test_publication_requires_exact_edit_on_the_same_pull_request_and_branch() -> None:
