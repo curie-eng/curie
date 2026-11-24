@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 
 from .factory_maintenance import (
@@ -15,19 +16,26 @@ from .models import ThreadPublicationLineage
 from .repository_access import IssuedCredential
 
 
-async def conflict_graph_refusal(
+@dataclass(frozen=True)
+class VerifiedConflict:
+    objective: str
+    paths: tuple[str, ...]
+
+
+async def inspect_conflict_objective(
     observation: MaintenanceObservation,
     lineage: ThreadPublicationLineage,
     credential: IssuedCredential,
     observed_at: datetime,
-) -> RefusalReason | None:
+    objective: str,
+) -> tuple[VerifiedConflict | None, RefusalReason | None]:
     repository = lineage.repository
     if repository is None:
-        return "identity_unverified"
+        return None, "identity_unverified"
     if lineage.base_ref != observation.base_ref:
-        return "base_changed"
+        return None, "base_changed"
     if lineage.base_sha == observation.base_sha:
-        return "no_current_conflict"
+        return None, "no_current_conflict"
     snapshot = RebaseSnapshot(
         transition_id=observation.request_id,
         repository=repository,
@@ -41,16 +49,16 @@ async def conflict_graph_refusal(
         committer_time=observed_at,
     )
     try:
-        await inspect_same_base_conflicts(snapshot, credential)
+        paths = await inspect_same_base_conflicts(snapshot, credential)
     except RebaseRefused as exc:
         if exc.code == "head_changed":
-            return "foreign_head"
+            return None, "foreign_head"
         if exc.code == "target_changed":
-            return "base_changed"
+            return None, "base_changed"
         if exc.code == "no_conflict":
-            return "no_current_conflict"
-        return "evidence_unavailable"
-    return None
+            return None, "no_current_conflict"
+        return None, "evidence_unavailable"
+    return VerifiedConflict(objective, paths), None
 
 
 def conflict_instructions(

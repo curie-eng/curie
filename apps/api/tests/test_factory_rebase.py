@@ -588,7 +588,7 @@ def test_inspect_conflict_uses_its_admitted_tip_after_a_base_fast_forward(
 def test_admission_refusal_from_the_observed_git_graph(
     same_base_conflict: GitGraph, change: str, expected: str | None
 ) -> None:
-    from curie_api.factory_conflict import conflict_graph_refusal
+    from curie_api.factory_conflict import VerifiedConflict, inspect_conflict_objective
     from curie_api.factory_maintenance import MaintenanceObservation
     from curie_api.models import ThreadPublicationLineage
 
@@ -620,10 +620,11 @@ def test_admission_refusal_from_the_observed_git_graph(
     elif change == "rewind":
         git(graph.origin, "update-ref", "refs/heads/main", graph.old_base)
     before = git(graph.origin, "show-ref")
-    assert (
-        asyncio.run(conflict_graph_refusal(observation, lineage, graph.credential(), COMMIT_TIME))
-        == expected
+    objective, refusal = asyncio.run(
+        inspect_conflict_objective(observation, lineage, graph.credential(), COMMIT_TIME, "repair")
     )
+    assert refusal == expected
+    assert objective == (VerifiedConflict("repair", ("shared.txt",)) if change == "none" else None)
     assert git(graph.origin, "show-ref") == before
 
 

@@ -128,7 +128,10 @@ def test_acquire_grant_carries_the_publication_recovery_candidate() -> None:
 
 
 @pytest.mark.parametrize("running", [False, True])
-def test_conflict_workspace_pins_are_a_pair_on_the_authenticated_request(running: bool) -> None:
+@pytest.mark.parametrize("sha_length", [40, 64])
+def test_conflict_workspace_pins_are_a_pair_on_the_authenticated_request(
+    running: bool, sha_length: int
+) -> None:
     def read(fields: dict[str, object]) -> WorkItemAcquireGrant | WorkItemRunning:
         if running:
             return _run(
@@ -137,19 +140,24 @@ def test_conflict_workspace_pins_are_a_pair_on_the_authenticated_request(running
             )
         return _acquire({**BASE, **fields})
 
-    head, base = "a" * 40, "b" * 40
-    pins = read({"conflict_head_sha": head, "conflict_base_sha": base}).conflict_workspace
+    head, base = "a" * sha_length, "b" * sha_length
+    fields = {"conflict_head_sha": head, "conflict_base_sha": base, "conflict_paths": ["rules"]}
+    pins = read(fields).conflict_workspace
     assert pins is not None and (pins.head_sha, pins.base_sha) == (head, base)
+    assert pins.paths == ("rules",)
     assert read({}).conflict_workspace is None
-    for fields in (
+    for invalid in (
+        {**fields, "conflict_paths": []},
+        {**fields, "conflict_paths": None},
+        {**fields, "conflict_paths": ["rules", "rules"]},
         {"conflict_head_sha": head},
         {"conflict_base_sha": base},
-        {"conflict_head_sha": head, "conflict_base_sha": head},
-        {"conflict_head_sha": "main", "conflict_base_sha": base},
-        {"conflict_head_sha": head, "conflict_base_sha": "release"},
+        {**fields, "conflict_base_sha": head},
+        {**fields, "conflict_head_sha": "main"},
+        {**fields, "conflict_base_sha": "release"},
     ):
         with pytest.raises(WorkItemTransportError):
-            read(fields)
+            read(invalid)
 
 
 @pytest.mark.parametrize(

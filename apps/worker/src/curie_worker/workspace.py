@@ -689,6 +689,7 @@ _CONFLICT_HISTORY_LIMIT = 256
 class ConflictWorkspace:
     head_sha: str
     base_sha: str
+    paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -698,6 +699,8 @@ class ConflictWorkspace:
             or self.head_sha == self.base_sha
         ):
             raise ValueError("conflict workspace requires distinct full commit IDs")
+        if not self.paths or len(set(self.paths)) != len(self.paths):
+            raise ValueError("conflict workspace requires distinct admitted paths")
 
 
 def _is_full_sha(value: str | None) -> bool:

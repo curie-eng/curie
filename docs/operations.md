@@ -1762,7 +1762,9 @@ the repository checks for both changes. Approval covers the cumulative patch
 from that base tip. Publication pushes the verified two-parent commit only
 while the branch still holds the admitted PR head. A protected path or
 conflicting intentions require human review. Fresh CI must pass on the
-published merge commit before the repair completes.
+published merge commit before the repair completes. Enable maintenance repair
+only after the worker upgrade has fully rolled out. An older worker can claim
+and fail a conflict publication.
 
 Per-repository factory settings live under `factory.bindings[].repos[]`. A
 binding joins one tracker (`tracker`) to its repositories, and each `repos`

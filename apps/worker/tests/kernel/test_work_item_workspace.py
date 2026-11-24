@@ -669,7 +669,7 @@ def test_factory_turn_receives_only_authoritative_publication_context(
             preparer, _, _, head, base = _conflict_preparer(
                 managed_workspace, tmp_path, WORK_ITEM_REPO
             )
-            pins = managed_workspace.ConflictWorkspace(head, base)
+            pins = managed_workspace.ConflictWorkspace(head, base, ("rules.txt",))
             workspace_factory = _conflict_workspace_factory(preparer)
 
         request_id = uuid.uuid4()
@@ -1248,7 +1248,7 @@ def test_conflict_ancestry_refusal_reaches_the_request_before_start(
         request_id = uuid.uuid4()
         expected = _execution_publication_context(request_id, head)
         items = _DeferRecordingWorkItems()
-        items.conflict_workspace = managed_workspace.ConflictWorkspace(head, base)
+        items.conflict_workspace = managed_workspace.ConflictWorkspace(head, base, ("rules.txt",))
         async with make_harness(
             binding=_Binding(),
             workspace_factory=_conflict_workspace_factory(preparer),
@@ -2560,7 +2560,7 @@ def test_conflict_permission_resume_publishes_only_for_its_original_execution(
             class PublicationApi(_TurnPublicationApi):
                 create_publication = staticmethod(client.create_publication)
 
-            items = _WorkItems(managed_workspace.ConflictWorkspace(head, base))
+            items = _WorkItems(managed_workspace.ConflictWorkspace(head, base, ("rules.txt",)))
             async with make_harness(
                 binding=_Binding(),
                 approvals=client,
@@ -2601,11 +2601,14 @@ def test_conflict_permission_resume_publishes_only_for_its_original_execution(
                         repo_full_name=WORK_ITEM_REPO,
                         base_sha=base,
                         patch=(
+                            b"diff --git a/feature.txt b/feature.txt\n"
+                            b"new file mode 100644\n--- /dev/null\n+++ b/feature.txt\n"
+                            b"@@ -0,0 +1 @@\n+feature behavior\n"
                             b"diff --git a/rules.txt b/rules.txt\n"
                             b"--- a/rules.txt\n+++ b/rules.txt\n"
                             b"@@ -1 +1,2 @@\n base rule\n+" + resolution + b"\n"
                         ),
-                        changed_paths=("rules.txt",),
+                        changed_paths=("feature.txt", "rules.txt"),
                         contains_workflow_files=False,
                         publication_title="Resolve rules",
                         publication_body="Keep both rules.",

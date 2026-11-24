@@ -13068,6 +13068,8 @@ export interface components {
             conflict_base_sha?: string | null;
             /** Conflict Head Sha */
             conflict_head_sha?: string | null;
+            /** Conflict Paths */
+            conflict_paths?: string[] | null;
             context: components["schemas"]["FactoryContext"] | null;
             /** Conversation Id */
             conversation_id: string;

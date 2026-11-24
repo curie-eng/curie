@@ -1163,7 +1163,7 @@ async def _retain_and_validate_publication_snapshot(
         git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
         protected_paths=self._config.publication_protected_paths,
         allow_dependency_additions=self._config.publication_allow_dependency_additions,
-        reject_conflict_markers=run is not None and run.conflict_workspace is not None,
+        conflict_workspace=run.conflict_workspace if run is not None else None,
     )
 
 

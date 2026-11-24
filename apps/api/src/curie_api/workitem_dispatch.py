@@ -219,6 +219,7 @@ class AcquireGrant:
     predecessor_claim_name: str | None
     conflict_head_sha: str | None
     conflict_base_sha: str | None
+    conflict_paths: tuple[str, ...] | None
 
 
 class FactoryWake(BaseModel):
@@ -257,6 +258,7 @@ class RunningResult:
     refusal: RefusalCode | None
     conflict_head_sha: str | None
     conflict_base_sha: str | None
+    conflict_paths: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -1467,6 +1469,7 @@ async def acquire(
         predecessor_claim_name=await _fenced_predecessor_claim(session, request),
         conflict_head_sha=conflict.head_sha if conflict else None,
         conflict_base_sha=conflict.base_sha if conflict else None,
+        conflict_paths=conflict.conflict_paths if conflict else None,
     )
     await session.commit()
     return grant
@@ -2580,6 +2583,7 @@ async def running_for_conversation(
         refusal=current if isinstance(current, str) else None,
         conflict_head_sha=conflict.head_sha if conflict else None,
         conflict_base_sha=conflict.base_sha if conflict else None,
+        conflict_paths=conflict.conflict_paths if conflict else None,
     )
     await session.commit()
     return "running", result

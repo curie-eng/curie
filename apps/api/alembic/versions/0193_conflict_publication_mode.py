@@ -18,6 +18,7 @@ LOCK_TIMEOUT_MS = 15000
 
 def upgrade() -> None:
     op.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'")
+    op.execute("ALTER TABLE curie.factory_maintenance_admissions ADD COLUMN conflict_paths text[]")
     op.execute(
         """
         ALTER TABLE curie.publications ADD COLUMN publication_mode text,
@@ -73,10 +74,17 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'")
-    op.execute("LOCK TABLE curie.publications IN ACCESS EXCLUSIVE MODE")
+    op.execute(
+        "LOCK TABLE curie.publications, curie.factory_maintenance_admissions "
+        "IN ACCESS EXCLUSIVE MODE"
+    )
     op.execute(
         """
         DO $$ BEGIN
+          IF EXISTS (SELECT FROM curie.factory_maintenance_admissions
+                      WHERE conflict_paths IS NOT NULL) THEN
+            RAISE EXCEPTION 'cannot discard the admitted conflict paths';
+          END IF;
           IF EXISTS (SELECT FROM curie.publications WHERE publication_mode IS NOT NULL) THEN
             RAISE EXCEPTION 'cannot discard the publication mode of a conflict repair';
           END IF;
@@ -85,5 +93,6 @@ def downgrade() -> None:
     )
     op.execute("DROP TRIGGER protect_conflict_publication ON curie.publications")
     op.execute("DROP FUNCTION curie.protect_conflict_publication()")
+    op.drop_column("factory_maintenance_admissions", "conflict_paths", schema="curie")
     op.drop_column("publications", "expected_merge_sha", schema="curie")
     op.drop_column("publications", "publication_mode", schema="curie")

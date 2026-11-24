@@ -12,6 +12,8 @@ import httpx
 import pytest
 from curie_api import factory_ci
 from curie_api.config import get_settings
+from curie_api.factory_conflict import VerifiedConflict
+from curie_api.factory_conflict_authority import conflict_publication_authority
 from curie_api.factory_maintenance import (
     MaintenanceObservation,
     MaintenanceReason,
@@ -113,6 +115,7 @@ async def _successor(
         source.objective, source.requester = "Update the guide", "factory"
         source.reply_kind, source.reply_address = "slack", "C0EXAMPLE1"
         source.reply_conversation_id = case["reply_conversation_id"]
+        lineage.head_sha = forge.branches[lineage.branch]
         original.execution_request_id = source.id
         original.terminal_at = (await lifecycle.database_now(session)).replace(tzinfo=None)
         await session.flush()
@@ -138,15 +141,18 @@ async def _successor(
             work_item_version=completed.work_item.version,
             request_version=completed.request.version,
             lineage_version=lineage.version,
-            head_sha=FIRST_REVISION_SHA,
+            head_sha=lineage.head_sha,
             base_ref="main",
-            base_sha=TARGET,
+            base_sha=forge.branches["main"],
             reason=reason,
         )
         case["truth"]["mergeable"] = reason == "late_ci_red"
         if reason == "base_conflict":
             receipt = await commit_observation(
-                session, observation, objective="Resolve the conflict in the guide", refusal=None
+                session,
+                observation,
+                objective=VerifiedConflict("Resolve the conflict in the guide", ("README.md",)),
+                refusal=None,
             )
         else:
             forge.report_check(TARGET, "build", "success")
@@ -160,6 +166,28 @@ async def _successor(
             receipt = await observer(observation)
     assert isinstance(receipt, MaintenanceRepair) and receipt.status == "admitted", receipt
     return receipt.request_id
+
+
+def test_sha256_successor_retains_both_pins_and_conflict_paths(
+    precheck_case: dict[str, Any], repair_forge: github.GitHubRepositoryFake
+) -> None:
+    head, base = "a" * 64, "b" * 64
+    repair_forge.branches.update({precheck_case["lineage"]["branch"]: head, "main": base})
+
+    async def resolve() -> None:
+        request_id = await _successor(precheck_case, repair_forge, "base_conflict")
+        async with precheck_case["client"].app.state.sessionmaker() as session:
+            request = await session.get(ExecutionRequest, request_id)
+            assert request is not None
+            authority = await conflict_publication_authority(session, request)
+            assert authority is not None
+            assert (authority.head_sha, authority.base_sha, authority.conflict_paths) == (
+                head,
+                base,
+                ("README.md",),
+            )
+
+    precheck_case["client"].portal.call(resolve)
 
 
 @pytest.mark.parametrize(
@@ -227,6 +255,7 @@ def test_persisted_successor_selects_workspace_and_publication_authority(
     )
     assert running.status_code == 200, running.text
     for response in (acquire, running):
+        assert response.json()["conflict_paths"] == (["README.md"] if is_conflict else None)
         assert response.json()["conflict_base_sha"] == (TARGET if is_conflict else None)
         assert response.json()["conflict_head_sha"] == (FIRST_REVISION_SHA if is_conflict else None)
 

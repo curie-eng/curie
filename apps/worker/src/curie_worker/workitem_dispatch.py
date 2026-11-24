@@ -346,9 +346,14 @@ def _optional_name(value: object) -> str | None:
 def _conflict_workspace(body: dict[str, Any]) -> ConflictWorkspace | None:
     head = body.get("conflict_head_sha")
     base = body.get("conflict_base_sha")
-    if head is None and base is None:
+    paths = body.get("conflict_paths")
+    if head is None and base is None and paths is None:
         return None
-    return ConflictWorkspace(_required_string(head), _required_string(base))
+    if not isinstance(paths, list):
+        raise ValueError("missing admitted conflict paths")
+    return ConflictWorkspace(
+        _required_string(head), _required_string(base), tuple(_required_string(p) for p in paths)
+    )
 
 
 def _execution_kind(body: dict[str, Any]) -> tuple[ExecutionKind, uuid.UUID | None]:

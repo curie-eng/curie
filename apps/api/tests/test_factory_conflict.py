@@ -202,6 +202,7 @@ def test_poll_admits_one_successor_only_for_a_verified_conflict(
                 "successor",
                 source.request_id,
             )
+            assert receipt.conflict_paths == ["shared.txt"]
             assert (receipt.head_sha, receipt.base_ref, receipt.base_sha) == (
                 repo.source,
                 "main",

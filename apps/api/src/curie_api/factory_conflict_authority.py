@@ -23,7 +23,7 @@ from .models import (
 from .personal_execution import OwnerTuple
 from .schemas.publications import PublicationCreate
 
-_SHA = re.compile(r"[0-9a-f]{40}")
+_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 class ConflictAuthorityMismatch(Exception):
@@ -40,6 +40,7 @@ class ConflictPublicationAuthority:
     head_sha: str
     base_sha: str
     publication_mode: Literal["base_conflict_merge"]
+    conflict_paths: tuple[str, ...]
 
     def approval_arguments(self, patch: bytes) -> dict[str, str]:
         return {
@@ -130,6 +131,8 @@ async def conflict_publication_authority(
         or item.base_branch != lineage.base_ref
         or item.base_requested_branch not in (None, lineage.base_ref)
         or item.readmit_base_branch not in (None, lineage.base_ref)
+        or not row.conflict_paths
+        or len(row.head_sha) != len(row.base_sha)
         or row.head_sha == row.base_sha
         or not _SHA.fullmatch(row.head_sha)
         or not _SHA.fullmatch(row.base_sha)
@@ -155,7 +158,11 @@ async def conflict_publication_authority(
     if instructions is None or instructions.publication_mode != "base_conflict_merge":
         raise ConflictAuthorityMismatch
     return ConflictPublicationAuthority(
-        lineage.id, authority.head_sha, authority.base_sha, instructions.publication_mode
+        lineage.id,
+        authority.head_sha,
+        authority.base_sha,
+        instructions.publication_mode,
+        tuple(row.conflict_paths),
     )
 
 

@@ -2559,7 +2559,7 @@ def test_conflict_claim_archive_and_snapshot_retain_both_sides(
         repo_full_name="acme-corp/acme-bot",
         lineage_branch="feature",
         lineage_head=head,
-        conflict_workspace=workspace.ConflictWorkspace(head, base),
+        conflict_workspace=workspace.ConflictWorkspace(head, base, ("rules.txt",)),
     )
     assert result.prepared.materialized_head == base
     retained = coordinator.current("1700000000.000100")
@@ -2613,6 +2613,7 @@ def test_conflict_claim_archive_and_snapshot_retain_both_sides(
             scratch_root=tmp_path,
             protected_paths=protected,
             allow_dependency_additions=False,
+            conflict_workspace=workspace.ConflictWorkspace(head, base, ("rules.txt",)),
         )
 
     validate(())
@@ -2627,6 +2628,23 @@ def test_conflict_claim_archive_and_snapshot_retain_both_sides(
     assert (target / "rules.txt").read_text() == "base rule\nfeature rule\n"
     assert (target / "base.txt").read_text() == "base behavior\n"
     assert (target / "feature.txt").read_text() == "feature behavior\n"
+
+    for marker in ("<<<<<<< HEAD", "=======", ">>>>>>> feature", "||||||| base"):
+        (checkout / "rules.txt").write_text(f"resolved\n{marker}\n")
+        candidate = _snapshot_over_http(checkout, base)
+        with pytest.raises(PublicationValidationRefused, match="conflict marker"):
+            validate(())
+    (checkout / "rules.txt").write_text("Heading\n===========\ninline <<<<<<< HEAD\n")
+    candidate = _snapshot_over_http(checkout, base)
+    validate(())
+    for clean_path in ("base.txt", "feature.txt"):
+        clean = checkout / clean_path
+        original = clean.read_bytes()
+        clean.unlink()
+        candidate = _snapshot_over_http(checkout, base)
+        with pytest.raises(PublicationValidationRefused, match="outside the admitted conflict"):
+            validate(())
+        clean.write_bytes(original)
 
 
 def _workspace_warnings(caplog: pytest.LogCaptureFixture) -> list[Any]:

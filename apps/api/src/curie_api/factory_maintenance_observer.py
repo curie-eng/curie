@@ -17,7 +17,7 @@ from . import factory_ci
 from .config import Settings
 from .factory_base_reconcile import base_selection_unchanged
 from .factory_ci_recovery import settled_ci_facts
-from .factory_conflict import conflict_graph_refusal
+from .factory_conflict import VerifiedConflict, inspect_conflict_objective
 from .factory_maintenance import (
     MaintenanceObservation,
     MaintenanceRefusal,
@@ -256,7 +256,7 @@ class MaintenanceObserver:
 
     async def _verify(
         self, obs: MaintenanceObservation, facts: factory_ci.CiFacts, green_at: datetime | None
-    ) -> tuple[str | None, RefusalReason | None]:
+    ) -> tuple[str | VerifiedConflict | None, RefusalReason | None]:
         item, lineage = facts.work_item, facts.lineage
         registry = forges_registry(self.settings)
         host = self._host(item, lineage)
@@ -335,10 +335,7 @@ class MaintenanceObserver:
             credential = await issue_stored_credential(
                 self.settings, self.client, repository=repository, scope=CredentialScope.CLONE
             )
-            graph_refusal = await conflict_graph_refusal(obs, lineage, credential, now)
-            if graph_refusal is not None:
-                return None, graph_refusal
-            return issue, None
+            return await inspect_conflict_objective(obs, lineage, credential, now, issue)
         if green_at is None:
             return None, "prior_green_missing"
         if (

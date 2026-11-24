@@ -18160,6 +18160,20 @@
             ],
             "title": "Conflict Head Sha"
           },
+          "conflict_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conflict Paths"
+          },
           "context": {
             "anyOf": [
               {

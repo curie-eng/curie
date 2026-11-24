@@ -20,6 +20,7 @@ from packaging.utils import canonicalize_name
 
 from .runner_client import RunnerWorkspaceSnapshot
 from .workspace import (
+    ConflictWorkspace,
     WorkspaceClaimCoordinator,
     WorkspacePreparationError,
     scrubbed_git_environment,
@@ -445,15 +446,65 @@ def _validate_changed_paths(paths: tuple[str, ...], protected_paths: tuple[str, 
             raise PublicationValidationRefused("publication-validation", reason)
 
 
+_CONFLICT_MARKER = re.compile(rb"^(?:<{7}|={7}|>{7}|[|]{7})(?:\s|$)")
+
+
 def _refuse_conflict_markers(checkout: Path, file_modes: dict[str, tuple[str, str]]) -> None:
     for path, (_, new_mode) in file_modes.items():
         if new_mode == "000000":
             continue
         with (checkout / path).open("rb") as resolved:
-            if any(line.startswith((b"<<<<<<<", b"=======", b">>>>>>>")) for line in resolved):
+            if any(_CONFLICT_MARKER.match(line) for line in resolved):
                 raise PublicationValidationRefused(
                     "publication-validation", "resolution contains a conflict marker"
                 )
+
+
+def _validate_conflict_tree(
+    checkout: Path, pins: ConflictWorkspace, patch_file: Path, git_env: dict[str, str], timeout: int
+) -> None:
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=checkout,
+            env=git_env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            check=check,
+        )
+
+    merge = git(
+        f"--attr-source={pins.base_sha}",
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "--no-messages",
+        "-z",
+        pins.base_sha,
+        pins.head_sha,
+        check=False,
+    )
+    tree, *paths = merge.stdout.removesuffix(b"\0").split(b"\0")
+    admitted = {path.encode("utf-8") for path in pins.paths}
+    if (
+        merge.returncode != 1
+        or re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", tree) is None
+        or set(paths) != admitted
+    ):
+        raise PublicationValidationRefused(
+            "publication-validation", "mechanical merge does not reproduce the admitted conflicts"
+        )
+    # Rebuild the exact object overlay the publisher commits, including Git modes.
+    git("read-tree", pins.base_sha)
+    git("apply", "--cached", "--binary", str(patch_file))
+    changes = git(
+        "diff", "--cached", "--no-renames", "--name-only", "-z", tree.decode("ascii"), "--"
+    ).stdout
+    if any(path and path not in admitted for path in changes.split(b"\0")):
+        raise PublicationValidationRefused(
+            "publication-validation", "resolution differs outside the admitted conflict paths"
+        )
 
 
 def validate_snapshot_against_base(
@@ -466,7 +517,7 @@ def validate_snapshot_against_base(
     git_timeout_seconds: int = 30,
     protected_paths: tuple[str, ...],
     allow_dependency_additions: bool,
-    reject_conflict_markers: bool = False,
+    conflict_workspace: ConflictWorkspace | None = None,
 ) -> None:
     """Rehash the private base and prove the binary patch applies to it."""
 
@@ -489,6 +540,13 @@ def validate_snapshot_against_base(
     if len(snapshot.patch) > max_patch_bytes:
         raise PublicationValidationRefused(
             "publication-validation", f"patch exceeds {max_patch_bytes} raw bytes"
+        )
+    if conflict_workspace and (
+        not snapshot.patch or snapshot.base_sha != conflict_workspace.base_sha
+    ):
+        raise PublicationValidationRefused(
+            "publication-validation",
+            "conflict resolution requires a patch against its admitted base",
         )
     if not snapshot.changed_paths:
         if snapshot.patch:
@@ -643,7 +701,10 @@ def validate_snapshot_against_base(
                         "patch contains a symlink, submodule, or unsafe file mode",
                     )
                 file_modes[raw_diff[index + 1]] = (old_mode, new_mode)
-            if reject_conflict_markers:
+            if conflict_workspace is not None:
+                _validate_conflict_tree(
+                    checkout, conflict_workspace, patch_file, git_env, git_timeout_seconds
+                )
                 _refuse_conflict_markers(checkout, file_modes)
             if not allow_dependency_additions:
                 _validate_dependency_additions(

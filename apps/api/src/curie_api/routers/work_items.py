@@ -262,6 +262,7 @@ class RunningWorkItemRequest(BaseModel):
     refusal: workitem_dispatch.RefusalCode | None
     conflict_head_sha: str | None = None
     conflict_base_sha: str | None = None
+    conflict_paths: tuple[str, ...] | None = None
 
 
 class PersonalContextRequestOut(BaseModel):
@@ -398,6 +399,7 @@ async def running_work_item_request(
         refusal=row.refusal,
         conflict_head_sha=row.conflict_head_sha,
         conflict_base_sha=row.conflict_base_sha,
+        conflict_paths=row.conflict_paths,
     )
 
 
@@ -537,6 +539,7 @@ async def acquire_work_item_request(
         "predecessor_claim_name": result.predecessor_claim_name,
         "conflict_head_sha": result.conflict_head_sha,
         "conflict_base_sha": result.conflict_base_sha,
+        "conflict_paths": result.conflict_paths,
     }
 
 

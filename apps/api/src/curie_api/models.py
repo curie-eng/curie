@@ -2026,6 +2026,7 @@ class FactoryMaintenanceAdmission(Base):
     base_sha: Mapped[str] = mapped_column(Text)
     reason: Mapped[str] = mapped_column(Text)
     mode: Mapped[str] = mapped_column(Text)
+    conflict_paths: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
     model_auth_mode: Mapped[str] = mapped_column(Text)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
