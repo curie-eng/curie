@@ -29,7 +29,17 @@ from curie_api.github_factory_review import (
 from curie_api.github_review_events import FeedbackIgnored
 from curie_api.models import DEFAULT_TENANT_ID
 from curie_test_support.static_shell import wait_until
-from forge_fakes.github import INSTALLATION_ID, MENTION, REPO, REPO_ID, SENDER_ID, post_delivery
+from forge_fakes.config_samples import jira_tracker
+from forge_fakes.github import (
+    INSTALLATION_ID,
+    MENTION,
+    REPO,
+    REPO_ID,
+    SENDER_ID,
+    forges_document,
+    forges_env_json,
+    post_delivery,
+)
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from test_github_factory_ingress import _code, _rows
 from test_github_factory_review import _execute
@@ -43,6 +53,8 @@ from test_github_plain_feedback import (
     factory_github,
     running_factory,
 )
+from test_github_review_events import _review_stack, post_review
+from test_github_review_events import review_app_key as review_app_key
 from test_github_voice_media import BODY, UPLOAD
 
 pytestmark = pytest.mark.usefixtures("clean_db", "valkey")
@@ -124,6 +136,13 @@ def test_no_voice_revision_before_a_factory_publication(factory: Factory, on_iss
     response = factory.post(posted.deliveries[0])
     assert _code(response) == "lineage_unbound"
     assert _all_requests() == 1
+
+
+def test_recording_on_an_issue_without_a_work_item_follows_issue_intake(factory: Factory) -> None:
+    issue = factory.github.seed_issue("Untracked issue", "Example")
+    posted = factory.github.add_conversation_comment(issue, REVIEWER, BODY)
+    assert _code(factory.post(posted.deliveries[0])) == "ordinary_comment"
+    assert _all_requests() == 0
 
 
 @pytest.mark.parametrize(
@@ -222,9 +241,11 @@ def test_confirmed_text_and_cap_share_the_callers_transaction(factory: Factory, 
         )
 
 
-def test_disabled_voice_never_fetches_comment_or_attachment(
+@pytest.mark.parametrize("door", ["webhook", "poll"])
+def test_disabled_voice_preserves_factory_plain_feedback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    door: str,
 ) -> None:
     monkeypatch.delenv("FACTORY_VOICE_ENABLED", raising=False)
     github = factory_github(monkeypatch, tmp_path)
@@ -232,12 +253,54 @@ def test_disabled_voice_never_fetches_comment_or_attachment(
         with running_factory(github, new_agent=True) as running:
             pull = running.pull()
             posted = running.comment(pull, BODY)
-            before = len(github.http_requests)
-            assert _code(running.post(posted.deliveries[0])) == "voice_disabled"
-            assert github.http_requests[before:] == []
-            assert len(_requests(pull.issue)) == 1
+            if door == "webhook":
+                assert running.post(posted.deliveries[0]).json()["status"] == "factory_admitted"
+            else:
+                running.poll()
+            assert len(_requests(pull.issue)) == 2
+            assert _lineage(pull)["plain_feedback_revisions"] == 1
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "tracker", "body"),
+    [
+        (False, "github", BODY),
+        (True, "github", "confirm abcd1234ef01.1"),
+        (True, "jira", f"@{MENTION} confirm abcd1234ef01.1"),
+    ],
+    ids=["voice-disabled", "unowned-pull", "jira-tracker"],
+)
+def test_slack_bound_review_receives_voice_shaped_comment(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    review_app_key: str,
+    enabled: bool,
+    tracker: str,
+    body: str,
+) -> None:
+    document = forges_document(private_key=review_app_key)
+    if tracker == "jira":
+        document["trackers"] = [jira_tracker()]
+        document["trackers"][0]["credential"] = {
+            "type": "static_token",
+            "username": "bot@example.com",
+            "token": "example-token",
+        }
+    env = {
+        "FACTORY_ENABLED": "true",
+        "FACTORY_INTAKE": "webhook",
+        "FACTORY_VOICE_ENABLED": str(enabled).lower(),
+        "CURIE_FORGES": forges_env_json(document, tmp_path),
+    }
+    with _review_stack(request, monkeypatch, review_app_key, publish=True, env=env) as stack:
+        client, truth, valkey, stream = stack
+        truth.payload["comment"]["body"] = truth.comment["body"] = body
+        response = post_review(client, truth)
+        assert response.json()["status"] == "feedback_queued", response.text
+        assert valkey.xlen(stream) == 1
 
 
 @pytest.mark.parametrize("kind", ["issue", "pull_request"])
@@ -440,6 +503,9 @@ def test_signed_confirmation_admits_one_edited_revision_on_the_same_work_item(
     prompt = [c for c in factory.github.comments if code in c["body"]]
     assert len(prompt) == 1 and prompt[0]["_number"] == number
     assert "Change the button label to Retry." in prompt[0]["body"]
+    invalid = factory.github.add_conversation_comment(number, REVIEWER, f"edit {code} One\r\nTwo")
+    assert _code(factory.post(invalid.deliveries[0])) == "voice_invalid_text"
+    assert _rows("SELECT version FROM curie.factory_voice_drafts") == [{"version": 1}]
     text = "Change the button label to Retry. Keep the existing timeout."
     edit = factory.github.add_conversation_comment(number, REVIEWER, f"edit {code} {text}")
     assert factory.post(edit.deliveries[0]).json()["status"] == "voice_edit_accepted"

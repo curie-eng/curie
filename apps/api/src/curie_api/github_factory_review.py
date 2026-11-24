@@ -48,12 +48,12 @@ from .forges.github.review_snapshot import (
     read_submitted_review,
     review_request_id,
 )
-from .forges.hosts import factory_app_slug, factory_code_host_entry, factory_tracker, github_host
+from .forges.hosts import factory_app_slug, factory_code_host_entry, github_host, github_issue_ref
 from .forges.registry import ForgeRegistry, forges_registry
 from .forges.trackers import code_host_for_repository, reply_route
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget
-from .github_factory import lock_issue
-from .github_factory_events import is_voice_body, mentions_factory, voice_reply
+from .github_factory import lock_issue, work_item_for
+from .github_factory_events import is_plain_issue, is_voice_body, mentions_factory, voice_reply
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import (
     FeedbackIgnored,
@@ -93,8 +93,8 @@ PLAIN_FEEDBACK_CAP = 10
 MENTION_NOTICE_MARKER = "curie-factory-mention-needed"
 
 
-def _payload_pull_request(event: str, payload: Any) -> tuple[int, int] | None:
-    """Repository id and PR number claimed by the payload, for routing only."""
+def _payload_conversation(event: str, payload: Any) -> tuple[int, int] | None:
+    """Repository id and conversation number claimed by the payload, for routing only."""
 
     if not isinstance(payload, dict):
         return None
@@ -102,7 +102,11 @@ def _payload_pull_request(event: str, payload: Any) -> tuple[int, int] | None:
     holder = payload.get("issue") if event == "issue_comment" else payload.get("pull_request")
     if not isinstance(repository, dict) or not isinstance(holder, dict):
         return None
-    if event == "issue_comment" and not isinstance(holder.get("pull_request"), dict):
+    if (
+        event == "issue_comment"
+        and "pull_request" in holder
+        and not isinstance(holder["pull_request"], dict)
+    ):
         return None
     repository_id, number = repository.get("id"), holder.get("number")
     if type(repository_id) is not int or type(number) is not int:
@@ -157,11 +161,15 @@ async def conversation_owner(
 
 
 async def factory_owns(session: AsyncSession, settings: Settings, event: str, payload: Any) -> bool:
-    """True when a WorkItem owns the lineage for the payload's pull request."""
+    """Route a tracker issue by its WorkItem and a pull request by its publication lineage."""
 
-    claimed = _payload_pull_request(event, payload)
+    claimed = _payload_conversation(event, payload)
     if claimed is None:
         return False
+    if event == "issue_comment" and is_plain_issue(payload):
+        repository_id, number = claimed
+        issue = github_issue_ref(settings, repository_id=repository_id, issue_number=number)
+        return await work_item_for(session, issue) is not None
     return await conversation_owner(session, settings, *claimed) is not None
 
 
@@ -333,15 +341,16 @@ async def admit_parsed_feedback(
     """
 
     registry = forges_registry(settings)
-    mention = factory_tracker(registry).config.mention
-    app_slug = await factory_app_slug(registry)
-    if feedback.event == "issue_comment" and is_voice_body(feedback.body, mention, app_slug):
-        raise FeedbackIgnored("voice_comment")
     if not repository_is_allowed(feedback.repo_full_name, settings.github_repo_allowlist):
         raise FeedbackIgnored("repository_not_allowed")
     owner = await conversation_owner(session, settings, feedback.repository_id, feedback.pr_number)
     if owner is None:
         raise FeedbackIgnored("lineage_unbound")
+    tracker = registry.github_tracker()
+    if tracker is None:
+        raise FeedbackIgnored("tracker_unconfigured")
+    mention = tracker.config.mention
+    app_slug = await factory_app_slug(registry)
     work_item = owner[0]
     # Serialize with issue cancellation, then re-read under the lock.
     await lock_issue(session, work_item.tracker_issue)
@@ -637,7 +646,10 @@ async def voice_comment_address(settings: Settings, event: str, payload: Any) ->
     prefix, space, remainder = body.partition(" ")
     if prefix.startswith("@") and space and voice_reply(remainder) is not None:
         registry = forges_registry(settings)
-        mention = factory_tracker(registry).config.mention
+        tracker = registry.github_tracker()
+        if tracker is None:
+            return None
+        mention = tracker.config.mention
         if voice_reply(body, mention) is not None:
             return mention
         app_slug = await factory_app_slug(registry)

@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 import pytest
 from curie_api import factory_poll_intake
+from curie_api.config import get_settings
 from curie_api.forges.github.comments import static_token
 from curie_api.forges.github.tracker import GitHubTracker
 from curie_api.github_review_events import FeedbackIgnored, label_actor
@@ -346,11 +347,10 @@ def _intake_verdicts(stub: Any, since: str) -> dict[int, tuple[bool, str]]:
             listed, _ = await tracker.issue_comments_since(since, None)
             assert listed is not None
             threshold = ots.instant(since)
-            app_slug = await tracker.app_slug()
             verdicts: dict[int, tuple[bool, str]] = {}
             for comment in listed:
                 notice = factory_poll_intake._answer_notice(
-                    comment, tracker, installation_id=5501, mention=False, app_slug=app_slug
+                    comment, tracker, installation_id=5501, mention=False
                 )
                 assert notice is not None, "the listed comment names no issue comment"
                 try:
@@ -431,7 +431,7 @@ def _offered_to_the_answer_intake(
             cursor = factory_poll_intake.Cursor(comments_since=ots.instant(since))
             await factory_poll_intake._admit_mentions(
                 object(),  # type: ignore[arg-type]
-                object(),  # type: ignore[arg-type]
+                get_settings(),
                 client,
                 cursor,
                 _tracker(stub, client),

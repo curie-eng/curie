@@ -99,13 +99,20 @@ async def github_webhook(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "webhook body is not valid JSON") from exc
 
     address = (
-        await voice_comment_address(settings, x_github_event, payload) if factory_enabled else None
+        await voice_comment_address(settings, x_github_event, payload)
+        if factory_enabled and settings.factory_voice_enabled
+        else None
     )
-    voice = address is not None
-    plain_issue_comment = (
-        x_github_event == "issue_comment" and is_plain_issue(payload) and not voice
+    plain_issue_comment = x_github_event == "issue_comment" and is_plain_issue(payload)
+    owned = (
+        factory_enabled
+        and is_review
+        and (address is not None or not plain_issue_comment)
+        and await factory_owns(session, settings, x_github_event, payload)
     )
-    if plain_issue_comment:
+    if not owned:
+        address = None
+    if plain_issue_comment and address is None:
         comment = payload.get("comment")
         if isinstance(comment, dict) and isinstance(comment.get("body"), str):
             try:
@@ -115,7 +122,7 @@ async def github_webhook(
             else:
                 return WebhookResult(status="ignored")
 
-    if x_github_event == "issues" or (factory_enabled and plain_issue_comment):
+    if x_github_event == "issues" or (factory_enabled and plain_issue_comment and address is None):
         return await handle_factory_delivery(
             session,
             settings=settings,
@@ -132,8 +139,7 @@ async def github_webhook(
         # it disabled, actionable PR feedback reaches the factory's unbound guard.
         review_enabled = settings.github_review_ingress_enabled
         if factory_enabled and (
-            voice
-            or await factory_owns(session, settings, x_github_event, payload)
+            owned
             or (
                 not review_enabled
                 and is_actionable_feedback(

@@ -31,6 +31,7 @@ from curie_api.factory_voice_contract import (
     Confirmed,
     CurrentSource,
     Draft,
+    Edit,
     EditAccepted,
     GitHubConversation,
     Pending,
@@ -340,6 +341,8 @@ class GitHubVoice:
                 outcome = current
             elif isinstance(reply, Refused):
                 outcome = reply
+            elif isinstance(reply.action, Edit) and "\r" in reply.action.text:
+                outcome = Refused(reason="invalid_text")
             else:
                 _body, login = current
                 actor = Actor(provider_user_id=str(sender), principal_id=None)
