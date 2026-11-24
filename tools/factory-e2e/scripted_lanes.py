@@ -292,6 +292,8 @@ class SlackRecorder:
         self._lock = threading.Lock()
         self.calls: list[dict[str, Any]] = []
         self.unauthenticated = 0
+        self._voice_messages: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._voice_files: dict[str, dict[str, Any]] = {}
         recorder = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -318,6 +320,17 @@ class SlackRecorder:
 
     def start(self) -> None:
         self._thread.start()
+
+    def add_voice_message(self, event: dict[str, Any], *, accessible: bool) -> None:
+        """Slack owns the canonical message and file independently of Socket Mode delivery."""
+        with self._lock:
+            key = (event["channel"], event["thread_ts"], event["ts"])
+            self._voice_messages[key] = {**event, "type": "message"}
+            if accessible:
+                for upload in event.get("files", []):
+                    self._voice_files[upload["id"]] = {
+                        **upload, "url_private_download": "https://files.slack.com/" + upload["id"]
+                    }
 
     def close(self) -> None:
         if self._closed:
@@ -368,6 +381,14 @@ class SlackRecorder:
             payload |= {"channel": body.get("channel"), "ts": body.get("ts")}
         elif method == "auth.test":
             payload |= {"user_id": "U0EXAMPLE9", "team_id": "T0EXAMPLE1", "bot_id": "B0EXAMPLE1"}
+        elif method == "bots.info":
+            payload["bot"] = {"id": "B0EXAMPLE1", "app_id": "A0EXAMPLE1"}
+        elif method == "files.info":
+            with self._lock:
+                upload = self._voice_files.get(body.get("file", ""))
+            payload = (
+                {"ok": True, "file": upload} if upload else {"ok": False, "error": "file_not_found"}
+            )
         elif method == "conversations.info":
             from scripted_scenario import SLACK_CHANNEL
 
@@ -395,6 +416,12 @@ class SlackRecorder:
                 if post.method == "chat.postMessage" and post.thread_ts is None
                 and post.channel == body.get("channel") and post.ts == body.get("ts")
             ]
+            with self._lock:
+                message = self._voice_messages.get(
+                    (body.get("channel", ""), body.get("ts", ""), body.get("oldest", ""))
+                )
+            if message and body.get("latest") == message["ts"]:
+                payload["messages"].append(message)
         encoded = json.dumps(payload).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")

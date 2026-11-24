@@ -166,6 +166,59 @@ class VoiceThread:
     adapter: SlackVoice
     posts: list[dict[str, Any]]
     provider_calls: list[str]
+    message_files: list[dict[str, Any]]
+    stack: runtime.SteeringStack
+
+    def send(self, stored, path="voice"):
+        from curie_api.config import get_settings
+
+        response = self.stack.client.post(
+            f"/v1/internal/factory-slack/{path}",
+            headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+            json=payload(stored).model_dump(),
+        )
+        assert response.status_code == 200, response.text
+        assert response.headers["Cache-Control"] == "no-store"
+        return response.json()
+
+    def reply(self, command, *, actor=None, root=None):
+        from curie_channel_gateway.slack.identities import delivery_key
+        from curie_internal.slack_mention_receipt import receipt_key, write_receipt
+
+        author = (actor or self.writer).slack_user
+        base = decision_receipt().model_dump(mode="json")
+        base.update(
+            user_id=author,
+            root_ts=root or self.run.root_ts,
+            channel_identity=self.stack.identity,
+            message_ts=f"1800100500.{uuid4().int % 1000000:06d}",
+            delivery_id=delivery_key(f"Ev{uuid4().hex}", self.stack.identity),
+            evidence={**self.receipt.evidence, "user_id": author},
+            body=f"<@{runtime.FACTORY_BOT_USER}> {command}",
+            bot_user_id=runtime.FACTORY_BOT_USER,
+        )
+        candidate = SlackMentionReceipt.model_validate(base)
+        self.stack.base.doomed_keys.append(receipt_key(candidate.delivery_id))
+        assert write_receipt(self.stack.valkey, candidate, ttl_s=90)
+        return candidate
+
+    def pump(self):
+        assert self.stack.client.portal.call(
+            self.adapter.service.process_pending, "slack", self.adapter
+        )
+
+    def display_draft(self):
+        import re
+
+        assert self.send(self.receipt)["outcome"] == "pending"
+        assert self.posts == []
+        self.pump()
+        self.pump()
+        (post,) = self.posts
+        assert TRANSCRIPT in post["text"]
+        assert post["channel"] == self.receipt.channel and post["thread_ts"] == self.run.root_ts
+        (code,) = re.findall(r"^confirm ([0-9a-f]{12}\.1)$", post["text"], re.M)
+        return code
 
 
 TRANSCRIPT = "Change the button label to Retry."
@@ -264,6 +317,7 @@ def voice_thread(steering, monkeypatch):
         is_external=False,
         size=len(audio),
     )
+    message_files = [file]
     posts = []
     provider_calls = []
 
@@ -284,7 +338,7 @@ def voice_thread(steering, monkeypatch):
                 ts=original.message_id,
                 user=writer.slack_user,
                 text=addressed,
-                files=[file],
+                files=message_files,
             )
             answer = dict(messages=[message])
         else:
@@ -336,7 +390,9 @@ def voice_thread(steering, monkeypatch):
                     yield adapter
 
     with steering.client.portal.wrap_async_context_manager(enabled_api()) as adapter:
-        yield VoiceThread(writer, run, receipt, original, adapter, posts, provider_calls)
+        yield VoiceThread(
+            writer, run, receipt, original, adapter, posts, provider_calls, message_files, steering
+        )
 
 
 def test_enabled_voice_route_commits_only_confirmed_feedback(
@@ -344,64 +400,31 @@ def test_enabled_voice_route_commits_only_confirmed_feedback(
 ) -> None:
     import re
 
-    from curie_api.config import get_settings
     from curie_api.factory_voice_bindings import source_key
-    from curie_channel_gateway.slack.identities import delivery_key
-    from curie_internal.slack_mention_receipt import receipt_key, write_receipt
 
     writer, run, receipt = voice_thread.writer, voice_thread.run, voice_thread.receipt
-    posts, adapter = voice_thread.posts, voice_thread.adapter
+    posts = voice_thread.posts
     other = steering.person()
     edited = "Keep the existing timeout. Change the button label to Retry."
 
-    def send(stored, path="voice"):
-        response = steering.client.post(
-            f"/v1/internal/factory-slack/{path}",
-            headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
-            json=payload(stored).model_dump(),
-        )
-        assert response.status_code == 200, response.text
-        assert response.headers["Cache-Control"] == "no-store"
-        return response.json()
-
-    def reply(command, *, actor=writer, root=run.root_ts):
-        base = decision_receipt().model_dump(mode="json")
-        base.update(
-            user_id=actor.slack_user,
-            root_ts=root,
-            channel_identity=steering.identity,
-            message_ts=f"1800100500.{uuid4().int % 1000000:06d}",
-            delivery_id=delivery_key(f"Ev{uuid4().hex}", steering.identity),
-            evidence={**receipt.evidence, "user_id": actor.slack_user},
-            body=f"<@{runtime.FACTORY_BOT_USER}> {command}",
-            bot_user_id=runtime.FACTORY_BOT_USER,
-        )
-        candidate = SlackMentionReceipt.model_validate(base)
-        steering.base.doomed_keys.append(receipt_key(candidate.delivery_id))
-        assert write_receipt(steering.valkey, candidate, ttl_s=90)
-        return candidate
-
-    def pump():
-        assert steering.client.portal.call(adapter.service.process_pending, "slack", adapter)
-
-    assert send(receipt)["outcome"] == "pending"
-    assert send(receipt)["outcome"] == "pending"
-    assert posts == []
-    pump()
-    pump()
-    assert len(posts) == 1 and TRANSCRIPT in posts[0]["text"]
-    assert posts[0]["channel"] == receipt.channel and posts[0]["thread_ts"] == run.root_ts
-    (code,) = re.findall(r"^confirm ([0-9a-f]{12}\.1)$", posts[0]["text"], re.M)
-    assert send(reply(f"confirm {code}", actor=other))["reason"] == "forbidden"
-    assert send(reply(f"confirm {code}", root="1800000009.000009"))["reason"] == "forbidden"
-    edit = reply(f"edit {code} {edited}")
+    assert voice_thread.send(receipt)["outcome"] == "pending"
+    code = voice_thread.display_draft()
+    assert (
+        voice_thread.send(voice_thread.reply(f"confirm {code}", actor=other))["reason"]
+        == "forbidden"
+    )
+    assert (
+        voice_thread.send(voice_thread.reply(f"confirm {code}", root="1800000009.000009"))["reason"]
+        == "forbidden"
+    )
+    edit = voice_thread.reply(f"edit {code} {edited}")
     for wrong_route in ("steer", "kickoff"):
-        assert send(edit, wrong_route)["outcome"] == "receipt_mismatch"
-    assert send(edit)["outcome"] == "draft"
-    pump()
+        assert voice_thread.send(edit, wrong_route)["outcome"] == "receipt_mismatch"
+    assert voice_thread.send(edit)["outcome"] == "draft"
+    voice_thread.pump()
     assert len(posts) == 2 and edited in posts[1]["text"]
     (new_code,) = re.findall(r"^confirm ([0-9a-f]{12}\.2)$", posts[1]["text"], re.M)
-    assert send(reply(f"confirm {code}"))["reason"] == "stale_version"
+    assert voice_thread.send(voice_thread.reply(f"confirm {code}"))["reason"] == "stale_version"
     assert steering.revisions(run) == []
     assert (
         runtime._rows(
@@ -410,13 +433,13 @@ def test_enabled_voice_route_commits_only_confirmed_feedback(
         )
         == []
     )
-    confirmation = reply(f"confirm {new_code}")
-    assert send(confirmation) == {
+    confirmation = voice_thread.reply(f"confirm {new_code}")
+    assert voice_thread.send(confirmation) == {
         "outcome": "confirmed",
         "disposition": "queued",
         "replayed": False,
     }
-    assert send(reply(f"confirm {new_code}")) == {
+    assert voice_thread.send(voice_thread.reply(f"confirm {new_code}")) == {
         "outcome": "confirmed",
         "disposition": "queued",
         "replayed": True,
@@ -434,6 +457,26 @@ def test_enabled_voice_route_commits_only_confirmed_feedback(
     assert saved["accepted_text"] == edited
     assert saved["source_facts"]["principal_id"] == str(writer.principal_id)
     assert saved["source_facts"]["publication"]["pr_number"] == run.pr
+
+
+def test_removing_the_clip_after_draft_delivery_refuses_confirmation(
+    voice_thread: VoiceThread,
+) -> None:
+    from curie_api.factory_voice_bindings import source_key
+
+    code = voice_thread.display_draft()
+    voice_thread.message_files.clear()
+    result = voice_thread.send(voice_thread.reply(f"confirm {code}"))
+    assert (result["outcome"], result["reason"]) == ("refused", "source_changed")
+    assert voice_thread.stack.revisions(voice_thread.run) == []
+    assert not runtime._rows(
+        "SELECT steering_id FROM curie.factory_steering_ledger WHERE work_item_id=:id",
+        {"id": voice_thread.run.work_item_id},
+    )
+    assert runtime._rows(
+        "SELECT status, admission_id FROM curie.factory_voice_drafts WHERE source_key=:key",
+        {"key": source_key(voice_thread.original)},
+    ) == [{"status": "changed", "admission_id": None}]
 
 
 def test_draft_delivery_requires_current_actor_and_code_host_authority(
