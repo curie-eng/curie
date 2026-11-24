@@ -1,4 +1,4 @@
-"""Provision the offline weights and two authenticated media files for Slack voice replay."""
+"""Provision the offline weights and authenticated media files for Slack voice replay."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from scripted_kind import ScriptedRun
@@ -19,7 +19,18 @@ if TYPE_CHECKING:
 MODEL_CLAIM = "slack-voice-model"
 MODEL_NAME = "ggml-base.en.bin"
 MODEL_SHA256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
-MEDIA = {"F0EXAMPLE1": "retry-label.m4a", "F0EXAMPLE2": "silence.wav"}
+
+
+class Recording(NamedTuple):
+    filename: str
+    mime: str
+
+
+MEDIA = {
+    "F0EXAMPLE1": Recording("retry-label.webm", "audio/webm"),
+    "F0EXAMPLE2": Recording("silence.wav", "audio/wav"),
+    "F0EXAMPLE4": Recording("retry-label.m4a", "audio/mp4"),
+}
 _MEDIA_SERVICE = "slack-voice-media"
 _TLS = "slack-voice-media-tls"
 _TRUST = "slack-voice-media-ca"
@@ -167,7 +178,7 @@ def prepare(run: ScriptedRun) -> None:
             "configmap",
             _MEDIA_SERVICE,
             f"--from-file=fixture.py={Path(__file__).resolve()}",
-            *(f"--from-file={name}={vectors / name}" for name in MEDIA.values()),
+            *(f"--from-file={clip.filename}={vectors / clip.filename}" for clip in MEDIA.values()),
         )
         claim = {
             "apiVersion": "v1",
@@ -311,14 +322,14 @@ class MediaHandler(BaseHTTPRequestHandler):
         ):
             self.send_error(403)
             return
-        name = MEDIA.get(self.path.removeprefix("/"))
-        if name is None:
+        clip = MEDIA.get(self.path.removeprefix("/"))
+        if clip is None:
             self.send_error(404)
             return
-        data = Path("/media", name).read_bytes()
+        data = Path("/media", clip.filename).read_bytes()
         self.send_response(200)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Type", "audio/mp4" if name.endswith(".m4a") else "audio/wav")
+        self.send_header("Content-Type", clip.mime)
         self.end_headers()
         self.wfile.write(data)
 

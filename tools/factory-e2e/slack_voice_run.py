@@ -107,7 +107,9 @@ class SlackVoiceRun(SlackSteeringRun):
             "text": f"<@{BOT_USER}> {text}",
         }
         if file_id:
-            name = fixture.MEDIA.get(file_id, "unavailable.m4a")
+            recording = fixture.MEDIA.get(
+                file_id, fixture.Recording("unavailable.m4a", "audio/mp4")
+            )
             event.update(
                 subtype="file_share",
                 files=[
@@ -115,8 +117,8 @@ class SlackVoiceRun(SlackSteeringRun):
                         "id": file_id,
                         "mode": "hosted",
                         "subtype": "slack_audio",
-                        "name": name,
-                        "mimetype": "audio/wav" if name.endswith(".wav") else "audio/mp4",
+                        "name": recording.filename,
+                        "mimetype": recording.mime,
                         "is_external": False,
                         "user": actor,
                         "user_team": TEAM,
@@ -243,7 +245,7 @@ class SlackVoiceRun(SlackSteeringRun):
         no_revision()
 
         start = len(self.slack.posts())
-        old, _ = self.send(root, "Check the expiring source.", file_id=CLIP)
+        old, _ = self.send(root, "Check the expiring source.", file_id="F0EXAMPLE4")
         _, old_code = self.draft(root, start)
         if self.ingress("expire", {"event_id": old["event_id"]}) != {"expired": True}:
             raise sk.ScriptedScenarioError("could not expire the control source receipt")
