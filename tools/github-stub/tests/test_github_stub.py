@@ -575,6 +575,28 @@ def test_git_smart_http_clones_pushes_and_exposes_the_pushed_ref(
     assert pull["base"]["ref"] == "main"
     fetched = _ok(github.get(f"/repos/{REPO}/pulls/{pull['number']}"))
     assert fetched["html_url"] == pull["html_url"]
+    # The individual PR response exposes its mergeability against the current base.
+    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    assert fetched["mergeable"] is True
+    git("switch", "main", cwd=checkout)
+    (checkout / "example.txt").write_text("The target added different content.\n")
+    git("add", "example.txt", cwd=checkout)
+    git(
+        "-c",
+        "user.name=Example Author",
+        "-c",
+        "user.email=author@example.com",
+        "commit",
+        "-m",
+        "Advance the current target",
+        cwd=checkout,
+    )
+    git("push", "origin", "main", cwd=checkout)
+    dirty = _ok(github.get(f"/repos/{REPO}/pulls/{pull['number']}"))
+    assert (dirty["mergeable"], dirty["mergeable_state"]) == (False, "dirty")
+    assert dirty["head"]["sha"] == pushed_sha
+    assert dirty["base"]["ref"] == "main"
+    assert dirty["base"]["sha"] == git("rev-parse", "main", cwd=checkout)
     # GitHub returns a global node ID on every pull request
     # (https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request), and the
     # API's publication identity check refuses a pull request without one.

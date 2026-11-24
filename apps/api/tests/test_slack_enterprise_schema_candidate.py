@@ -13,7 +13,7 @@ from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[3]
 MIGRATION = ROOT / "apps/api/alembic/versions/0139_slack_enterprise_namespaces.py"
-CANDIDATE = {"schema_min": "0195", "schema_head": "0195"}
+CANDIDATE = {"schema_min": "0193", "schema_head": "0193"}
 
 
 def load(relative: str) -> Any:
@@ -31,7 +31,7 @@ def script() -> ScriptDirectory:
 def test_migration_0139_keeps_parent_0138_below_factory_base_head() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: additive revision after approval provenance."""
     graph = script()
-    assert graph.get_heads() == ["0195"]
+    assert graph.get_heads() == ["0193"]
     revision = graph.get_revision("0139")
     assert revision is not None and revision.down_revision == "0138"
     assert Path(revision.path).resolve() == MIGRATION.resolve()
@@ -62,7 +62,7 @@ def test_every_coupled_candidate_consumer_requires_0169(relative: str, extract: 
 def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: exact graph parent and file digest."""
     revisions = load("cli/src/application_schema_windows.json")["revisions"]
-    assert revisions[-50:] == [
+    assert revisions[-51:] == [
         "0138",
         "0139",
         "0140",
@@ -113,6 +113,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
         "0191",
         "0194",
         "0195",
+        "0193",
     ]
     kinds = load("apps/api/src/curie_api/revision_kinds.json")
     assert kinds["0139"] == "expand"

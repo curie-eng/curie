@@ -245,7 +245,7 @@ async def _complete(
         start_failure_detail = (
             turn.error_message
             if turn is not None
-            and turn.classification == "workspace-error"
+            and turn.classification in {"workspace-error", "conflict-ancestry-refused"}
             and turn.error_message
             and turn.error_message.strip()
             else None

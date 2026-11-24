@@ -248,6 +248,21 @@ def _cached_patch(repo: Path) -> bytes:
     ).stdout
 
 
+def test_ordinary_publication_allows_literal_marker_examples(tmp_path: Path) -> None:
+    validation = importlib.import_module("curie_worker.publication_validation")
+    repo = _prepared_repo(tmp_path)
+    coordinator = _coordinator(_archive_readme(repo))
+    (repo / "README.md").write_text("<<<<<<< HEAD\n=======\n>>>>>>> topic\n")
+    validation.validate_snapshot_against_base(
+        coordinator,
+        thread_key="example-thread",
+        snapshot=_snapshot(("README.md",), _cached_patch(repo)),
+        scratch_root=tmp_path,
+        protected_paths=(),
+        allow_dependency_additions=False,
+    )
+
+
 def test_publication_refuses_github_actions_and_codeowners(tmp_path: Path) -> None:
     validation = importlib.import_module("curie_worker.publication_validation")
     repo = _prepared_repo(tmp_path)

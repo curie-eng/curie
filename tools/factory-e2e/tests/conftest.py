@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -23,6 +25,17 @@ def candidate_curie(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     binary.chmod(0o755)
     monkeypatch.setenv("CURIE_BIN", str(binary))
     return binary
+
+
+@pytest.fixture
+def model_python(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    commands = tmp_path / "model-commands"
+    commands.mkdir()
+    python = commands / "python3"
+    python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    python.chmod(0o755)
+    monkeypatch.setenv("PATH", str(commands), prepend=os.pathsep)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
 
 
 def _parse_case_shard(value: str) -> tuple[int, int]:

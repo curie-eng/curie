@@ -621,6 +621,12 @@ def publication_lineage_outcome_conflict(
             "publication.revision_not_approved",
             "publication revision must be approved before advancing its lineage",
         )
+    if publication.publication_mode == "base_conflict_merge" and (
+        publication.expected_merge_sha != data.head_sha
+    ):
+        return PublicationLineageConflict(
+            "publication.lineage_stale", "the head differs from the prepared conflict merge"
+        )
     needs_metadata_timestamp = data.state == "open" and not publication.patch_bytes
     if needs_metadata_timestamp != (data.metadata_updated_at is not None):
         return PublicationLineageConflict(
@@ -713,9 +719,10 @@ async def advance_publication_lineage(
             "publication.lineage_stale", "stored publication lineage is incomplete"
         )
     first_publication = lineage.head_sha is None and lineage.pr_number is None
-    if first_publication and first_parent_proof is None:
+    conflict_repair = publication.publication_mode == "base_conflict_merge"
+    if (first_publication or conflict_repair) and first_parent_proof is None:
         raise PublicationLineageConflict(
-            "publication.lineage_stale", "first publication requires a verified commit proof"
+            "publication.lineage_stale", "publication requires a verified commit proof"
         )
     base_values: dict[str, str] = {}
     if first_parent_proof is not None:
@@ -730,6 +737,8 @@ async def advance_publication_lineage(
             or proof.expected_prior_head != publication.expected_prior_head
             or proof.commit_sha != data.head_sha
             or proof.first_publication != first_publication
+            or proof.second_parent_sha != (publication.base_sha if conflict_repair else None)
+            or (conflict_repair and (first_publication or proof.parent_sha != lineage.head_sha))
             or re.fullmatch(r"[0-9a-f]{40,64}", proof.parent_sha) is None
             or proof.parent_sha == proof.commit_sha
             or (identity is not None and identity.base_ref != proof.base_branch)
@@ -874,10 +883,8 @@ async def advance_publication_lineage(
             lineage=lineage,
         )
     await session.commit()
-    refreshed = await session.get(ThreadPublicationLineage, lineage.id)
-    assert refreshed is not None
-    await session.refresh(refreshed)
-    return refreshed
+    await session.refresh(lineage)
+    return lineage
 
 
 async def require_current_lineage_workspace(

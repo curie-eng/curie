@@ -938,7 +938,11 @@ async def advance_publication_lineage(
             raise LookupError("publication lineage not found")
         identity = await _verified_identity(request, session, publication, data)
         first_parent_proof: VerifiedPublicationCommit | None = None
-        if publication.lineage.head_sha is None or publication.lineage.pr_number is None:
+        if (
+            publication.lineage.head_sha is None
+            or publication.lineage.pr_number is None
+            or publication.publication_mode == "base_conflict_merge"
+        ):
             repository = await lineage_repository(session, settings, publication.lineage)
             code_host = publishing_code_host(settings, request.app.state.http_client, repository)
             base_branch = await publication_base_ref(session, code_host, publication, repository)

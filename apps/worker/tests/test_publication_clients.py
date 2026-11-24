@@ -255,7 +255,11 @@ async def test_revision_commit_is_verified_by_the_api_with_the_revision_marker(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         verified = await _code_host(handler, client).verify_revision_commit(
-            PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+            PUBLICATION_ID,
+            REVISION_HEAD,
+            revision_id=REVISION_ID,
+            expected_parent=PRIOR_HEAD,
+            expected_second_parent=None,
         )
 
     assert verified == PublicationRevisionCommit(commit_sha=REVISION_HEAD, parent_sha=parent_sha)
@@ -266,6 +270,38 @@ async def test_revision_commit_is_verified_by_the_api_with_the_revision_marker(
             "expected_parent": PRIOR_HEAD,
         }
     ]
+
+
+@pytest.mark.parametrize("returned_second_parent", [None, PRIOR_HEAD, "c" * 40])
+async def test_conflict_commit_proof_binds_the_stored_second_parent(
+    returned_second_parent: str | None,
+) -> None:
+    target = "c" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["expected_second_parent"] == target
+        return httpx.Response(
+            200,
+            json={
+                "commit_sha": REVISION_HEAD,
+                "parent_sha": PRIOR_HEAD,
+                "second_parent_sha": returned_second_parent,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        proof = _code_host(handler, client).verify_revision_commit(
+            PUBLICATION_ID,
+            REVISION_HEAD,
+            revision_id=REVISION_ID,
+            expected_parent=PRIOR_HEAD,
+            expected_second_parent=target,
+        )
+        if returned_second_parent == target:
+            assert await proof == PublicationRevisionCommit(REVISION_HEAD, PRIOR_HEAD, target)
+        else:
+            with pytest.raises(PublicationReconcileError, match="different merge parents"):
+                await proof
 
 
 async def test_an_adopted_revision_is_named_to_the_api_for_its_own_marker() -> None:
@@ -280,7 +316,11 @@ async def test_an_adopted_revision_is_named_to_the_api_for_its_own_marker() -> N
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         verified = await _code_host(handler, client).verify_revision_commit(
-            PUBLICATION_ID, REVISION_HEAD, revision_id=adopted, expected_parent=PRIOR_HEAD
+            PUBLICATION_ID,
+            REVISION_HEAD,
+            revision_id=adopted,
+            expected_parent=PRIOR_HEAD,
+            expected_second_parent=None,
         )
 
     assert verified == PublicationRevisionCommit(commit_sha=REVISION_HEAD, parent_sha=PRIOR_HEAD)
@@ -304,7 +344,11 @@ async def test_a_refused_revision_commit_carries_the_api_reason() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(PublicationReconcileError, match="wrong expected parent"):
             await _code_host(handler, client).verify_revision_commit(
-                PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+                PUBLICATION_ID,
+                REVISION_HEAD,
+                revision_id=REVISION_ID,
+                expected_parent=PRIOR_HEAD,
+                expected_second_parent=None,
             )
 
 
@@ -315,7 +359,11 @@ async def test_a_different_verified_commit_is_refused() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(PublicationReconcileError, match="different commit"):
             await _code_host(handler, client).verify_revision_commit(
-                PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+                PUBLICATION_ID,
+                REVISION_HEAD,
+                revision_id=REVISION_ID,
+                expected_parent=PRIOR_HEAD,
+                expected_second_parent=None,
             )
 
 
@@ -349,10 +397,18 @@ async def test_revision_verification_requires_a_full_commit_and_actual_parent(bo
         code_host = _code_host(handler, client)
         with pytest.raises(PublicationReconcileError):
             await code_host.verify_revision_commit(
-                PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+                PUBLICATION_ID,
+                REVISION_HEAD,
+                revision_id=REVISION_ID,
+                expected_parent=PRIOR_HEAD,
+                expected_second_parent=None,
             )
         assert await code_host.verify_revision_commit(
-            PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+            PUBLICATION_ID,
+            REVISION_HEAD,
+            revision_id=REVISION_ID,
+            expected_parent=PRIOR_HEAD,
+            expected_second_parent=None,
         ) == PublicationRevisionCommit(commit_sha=REVISION_HEAD, parent_sha="c" * 40)
 
 

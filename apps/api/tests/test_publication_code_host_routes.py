@@ -17,7 +17,7 @@ import socket
 import uuid
 from collections.abc import Iterator
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,9 @@ import pytest
 import redis
 import redis.asyncio as async_redis
 from curie_api.config import get_settings
+from curie_api.crud import publication_queries
+from curie_api.crud.errors import PublicationLineageConflict
+from curie_api.crud.lineages import advance_publication_lineage
 from curie_api.factory_rediscovery import issue_marker
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable
 from curie_api.forges.registry import forges_registry
@@ -37,8 +40,23 @@ from curie_api.forges.types import (
     PullRequestState,
     RepositoryRef,
 )
-from curie_api.models import ExecutionRequest, Publication, WorkItem
+from curie_api.models import (
+    Approval,
+    ApprovalStatus,
+    ExecutionRequest,
+    Publication,
+    ThreadPublicationLineage,
+    WorkItem,
+)
+from curie_api.publication_authority import VerifiedPublicationIdentity
+from curie_api.publication_pulls import PullRequestRefused
+from curie_api.publication_verification import (
+    VerifiedPublicationCommit,
+    publication_base_ref,
+    verify_publication_commit,
+)
 from curie_api.routers import publication_code_host
+from curie_api.schemas.publications import PublicationLineageAdvance
 from curie_test_support.valkey import NO_RETRY
 from fastapi.testclient import TestClient
 from forge_fakes.github import (
@@ -50,6 +68,8 @@ from forge_fakes.github import (
     github_repository_binding,
 )
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.tests.test_workitem_outcomes import (  # noqa: F401 - the stack fixture
     BASE_SHA,
@@ -2093,3 +2113,424 @@ def test_revision_response_requires_full_lowercase_commit_ids(
         ).parent_sha
         == BASE_SHA
     )
+
+
+_REPAIR_MODE = "base_conflict_merge"
+_ADMITTED_BASE = _sha(600)
+_LATER_BASE = _sha(601)
+_REPAIRED_HEAD = _sha(602)
+_FOREIGN = _sha(603)
+
+
+def _repair_graph(code_host: _CodeHost, revision_id: uuid.UUID) -> None:
+    _graph_commit(code_host, BASE_SHA)
+    _graph_commit(code_host, HEAD_SHA, BASE_SHA)
+    _graph_commit(code_host, _ADMITTED_BASE, BASE_SHA)
+    _graph_commit(code_host, _LATER_BASE, _ADMITTED_BASE)
+    _graph_commit(code_host, _FOREIGN)
+    code_host.commits[_REPAIRED_HEAD] = Commit(
+        sha=_REPAIRED_HEAD,
+        parents=(HEAD_SHA, _ADMITTED_BASE),
+        message=f"Resolve release tag conflict\n\nCurie-Revision: {revision_id}\n",
+    )
+    code_host.head = _REPAIRED_HEAD
+    code_host.base_head = _LATER_BASE
+
+
+def _in_memory_repair() -> tuple[Publication, _CodeHost, RepositoryRef]:
+    lineage = ThreadPublicationLineage(
+        id=uuid.uuid4(),
+        status="open",
+        version=4,
+        latest_revision=2,
+        pr_number=PR_NUMBER,
+        base_ref="release/stable",
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    publication = Publication(
+        id=uuid.uuid4(),
+        status="running",
+        version=7,
+        revision_number=2,
+        publication_mode=_REPAIR_MODE,
+        expected_merge_sha=_REPAIRED_HEAD,
+        expected_prior_head=HEAD_SHA,
+        base_sha=_ADMITTED_BASE,
+        adoptable_revision_ids=[],
+        lineage_id=lineage.id,
+        lineage=lineage,
+    )
+    code_host = _CodeHost()
+    _repair_graph(code_host, publication.id)
+    repository = RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
+    return publication, code_host, repository
+
+
+@pytest.mark.parametrize("tip", [_ADMITTED_BASE, _LATER_BASE], ids=["admitted-tip", "advanced"])
+def test_repair_commit_proves_both_parents_against_the_original_named_base(tip: str) -> None:
+    publication, code_host, repository = _in_memory_repair()
+    code_host.base_head = tip
+    proof = asyncio.run(
+        verify_publication_commit(
+            code_host,
+            repository,
+            publication,
+            commit_sha=_REPAIRED_HEAD,
+            base_branch="release/stable",
+            revision_ids=frozenset({publication.id}),
+        )
+    )
+
+    assert publication.lineage is not None
+    assert proof == VerifiedPublicationCommit(
+        publication_id=publication.id,
+        publication_version=7,
+        lineage_id=publication.lineage.id,
+        lineage_version=4,
+        approved_base_sha=_ADMITTED_BASE,
+        expected_prior_head=HEAD_SHA,
+        commit_sha=_REPAIRED_HEAD,
+        parent_sha=HEAD_SHA,
+        second_parent_sha=_ADMITTED_BASE,
+        base_branch="release/stable",
+        first_publication=False,
+    )
+    assert code_host.branch_reads == ["release/stable"]
+
+
+@pytest.mark.parametrize(
+    ("defect", "refusal"),
+    [
+        ("unprepared", "revision_mismatch"),
+        ("different-prepared-commit", "revision_mismatch"),
+        ("one-parent", "revision_mismatch"),
+        ("reversed-parents", "revision_mismatch"),
+        ("foreign-parent", "revision_mismatch"),
+        ("extra-parent", "revision_mismatch"),
+        ("ordinary-merge", "revision_mismatch"),
+        ("stale-lineage-head", "revision_mismatch"),
+        ("duplicate-marker", "revision_mismatch"),
+        ("extra-foreign-marker", "revision_mismatch"),
+        ("marker-suffix", "revision_mismatch"),
+        ("adopted-marker", "revision_mismatch"),
+        ("retarget", "revision_mismatch"),
+        ("foreign-lineage-base", "base_ancestry_mismatch"),
+        ("admitted-tip-off-base", "base_ancestry_mismatch"),
+        ("old-head-already-contains-base", "base_ancestry_mismatch"),
+    ],
+)
+def test_repair_commit_refuses_unproved_merge_authority(defect: str, refusal: str) -> None:
+    publication, code_host, repository = _in_memory_repair()
+    commit = code_host.commits[_REPAIRED_HEAD]
+    marker = f"Curie-Revision: {publication.id}"
+    revision_id = publication.id
+    base_branch = "release/stable"
+    if defect == "unprepared":
+        publication.expected_merge_sha = None
+    elif defect == "different-prepared-commit":
+        publication.expected_merge_sha = _FOREIGN
+    elif defect == "one-parent":
+        commit = replace(commit, parents=(HEAD_SHA,))
+    elif defect == "reversed-parents":
+        commit = replace(commit, parents=(_ADMITTED_BASE, HEAD_SHA))
+    elif defect == "foreign-parent":
+        commit = replace(commit, parents=(HEAD_SHA, _FOREIGN))
+    elif defect == "extra-parent":
+        commit = replace(commit, parents=(HEAD_SHA, _ADMITTED_BASE, _FOREIGN))
+    elif defect == "ordinary-merge":
+        publication.publication_mode = None
+    elif defect == "stale-lineage-head":
+        assert publication.lineage is not None
+        publication.lineage.head_sha = _FOREIGN
+    elif defect == "duplicate-marker":
+        commit = replace(commit, message=f"{marker}\n{marker}\n")
+    elif defect == "extra-foreign-marker":
+        commit = replace(commit, message=f"{marker}\nCurie-Revision: {uuid.uuid4()}\n")
+    elif defect == "marker-suffix":
+        commit = replace(commit, message=f"{marker} suffix\n")
+    elif defect == "adopted-marker":
+        revision_id = uuid.uuid4()
+        publication.adoptable_revision_ids = [revision_id]
+        commit = replace(commit, message=f"Curie-Revision: {revision_id}\n")
+    elif defect == "retarget":
+        base_branch = "main"
+    elif defect == "foreign-lineage-base":
+        _graph_commit(code_host, _ADMITTED_BASE, _FOREIGN)
+    elif defect == "admitted-tip-off-base":
+        _graph_commit(code_host, _LATER_BASE, BASE_SHA)
+    elif defect == "old-head-already-contains-base":
+        _graph_commit(code_host, HEAD_SHA, BASE_SHA, _ADMITTED_BASE)
+    code_host.commits[_REPAIRED_HEAD] = commit
+
+    with pytest.raises(PullRequestRefused) as exc:
+        asyncio.run(
+            verify_publication_commit(
+                code_host,
+                repository,
+                publication,
+                commit_sha=_REPAIRED_HEAD,
+                base_branch=base_branch,
+                revision_ids=frozenset({revision_id}),
+            )
+        )
+
+    assert exc.value.code == refusal
+
+
+RepairRevision = tuple[TestClient, dict[str, Any], dict[str, Any], _CodeHost]
+
+
+@pytest.fixture
+def repair_revision(seeded: Seeded) -> RepairRevision:
+    return _insert_repair_revision(seeded, patch=b"release tag conflict repair")
+
+
+def _insert_repair_revision(seeded: Seeded, *, patch: bytes | None) -> RepairRevision:
+    client, previous, code_host = seeded
+    revision_id = uuid.uuid4()
+
+    async def insert(session: AsyncSession) -> None:
+        original = await publication_queries.get_publication(session, uuid.UUID(previous["id"]))
+        assert original is not None and original.lineage is not None
+        lineage = original.lineage
+        approved = await session.get(Approval, original.approval_id)
+        assert approved is not None
+        approval = Approval(
+            agent_id=lineage.agent_id,
+            conversation_id=approved.conversation_id,
+            author=approved.author,
+            summary="Apply the release tag conflict repair",
+            status=ApprovalStatus.approved,
+            purpose="publication",
+            dedupe_key=f"repair-{revision_id}",
+            reply_kind=original.reply_kind,
+            reply_channel=original.reply_channel,
+            resolved_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+        lineage.latest_revision += 1
+        lineage.version += 1
+        session.add(
+            Publication(
+                id=revision_id,
+                approval=approval,
+                deployment_id=original.deployment_id,
+                workspace_conversation_id=original.workspace_conversation_id,
+                lineage=lineage,
+                revision_number=lineage.latest_revision,
+                publication_mode=_REPAIR_MODE,
+                expected_prior_head=HEAD_SHA,
+                base_sha=_ADMITTED_BASE,
+                status="running",
+                lease_owner="repair-test-worker",
+                lease_expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=1),
+                repo_full_name=REPO,
+                title=original.title,
+                body=original.body,
+                patch_bytes=patch,
+                changed_paths=["release_tag.py"],
+                reply_kind=original.reply_kind,
+                reply_channel=original.reply_channel,
+            )
+        )
+        await session.commit()
+
+    with_session(insert)
+    _repair_graph(code_host, revision_id)
+    return client, previous, {"id": str(revision_id)}, code_host
+
+
+@pytest.mark.parametrize("patch", [None, b""])
+def test_database_requires_patch_bytes_for_a_runnable_conflict_publication(
+    seeded: Seeded, patch: bytes | None
+) -> None:
+    with pytest.raises(IntegrityError, match="publications_conflict_mode_ck"):
+        _insert_repair_revision(seeded, patch=patch)
+
+
+def test_database_preserves_the_approved_patch_until_terminal_cleanup(
+    repair_revision: RepairRevision,
+) -> None:
+    _, _, repair, _ = repair_revision
+    approved = _stored_state(repair)["patch_bytes"]
+    update_patch = "UPDATE curie.publications SET patch_bytes = :patch WHERE id = :id"
+    for replacement in (b"changed", b"", None):
+        with pytest.raises(IntegrityError):
+            _execute(update_patch, {"patch": replacement, "id": repair["id"]})
+        assert _stored_state(repair)["patch_bytes"] == approved
+    _execute(
+        "UPDATE curie.publications SET status = 'failed', patch_bytes = NULL WHERE id = :id",
+        {"id": repair["id"]},
+    )
+    assert _stored_state(repair)["patch_bytes"] is None
+    with pytest.raises(IntegrityError):
+        _execute(update_patch, {"patch": approved, "id": repair["id"]})
+
+
+def _record_merge_sha(publication: dict[str, Any], sha: str | None) -> None:
+    _execute(
+        "UPDATE curie.publications SET expected_merge_sha = :sha WHERE id = :id",
+        {"sha": sha, "id": publication["id"]},
+    )
+
+
+def test_database_only_records_one_valid_merge_sha_for_a_conflict(
+    repair_revision: RepairRevision,
+) -> None:
+    _, previous, repair, _ = repair_revision
+    with pytest.raises(IntegrityError, match="publications_expected_merge_sha_ck"):
+        _record_merge_sha(previous, _REPAIRED_HEAD)
+    for invalid in (HEAD_SHA, _ADMITTED_BASE, "A" * 40, "?" * 40, "a" * 39, "a" * 65):
+        with pytest.raises(IntegrityError, match="publications_expected_merge_sha_ck"):
+            _record_merge_sha(repair, invalid)
+    assert _stored_state(repair)["publication"]["expected_merge_sha"] is None
+    prepared = "a" * 64
+    _record_merge_sha(repair, prepared)
+    _record_merge_sha(repair, prepared)
+    for changed in (_FOREIGN, None):
+        with pytest.raises(IntegrityError, match="prepared conflict merge SHA is immutable"):
+            _record_merge_sha(repair, changed)
+    assert _stored_state(repair)["publication"]["expected_merge_sha"] == prepared
+
+
+def test_repair_verification_route_requires_the_stored_second_parent(
+    repair_revision: RepairRevision,
+) -> None:
+    client, previous, repair, code_host = repair_revision
+    body = {
+        "commit_sha": _REPAIRED_HEAD,
+        "revision_id": repair["id"],
+        "expected_parent": HEAD_SHA,
+    }
+    history = _stored_state(previous)
+    url = _url(repair["id"], "revision-commit")
+    valid = {**body, "expected_second_parent": _ADMITTED_BASE}
+    unprepared = client.post(url, json=valid, headers=WORKER_HEADERS)
+    assert unprepared.status_code == 409, unprepared.text
+    assert unprepared.json()["detail"]["code"] == "publication.revision_mismatch"
+    _record_merge_sha(repair, _REPAIRED_HEAD)
+    before = _stored_state(repair)
+    for override in ({}, {"expected_second_parent": _LATER_BASE}):
+        refused = client.post(url, json={**body, **override}, headers=WORKER_HEADERS)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "publication.revision_mismatch"
+    ordinary = client.post(
+        _url(previous["id"], "revision-commit"),
+        json={
+            "commit_sha": HEAD_SHA,
+            "revision_id": previous["id"],
+            "expected_parent": BASE_SHA,
+            "expected_second_parent": _ADMITTED_BASE,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert ordinary.status_code == 409, ordinary.text
+    assert ordinary.json()["detail"]["code"] == "publication.revision_mismatch"
+    code_host.commits[_FOREIGN] = replace(code_host.commits[_REPAIRED_HEAD], sha=_FOREIGN)
+    foreign = client.post(url, json={**valid, "commit_sha": _FOREIGN}, headers=WORKER_HEADERS)
+    assert foreign.status_code == 409, foreign.text
+    assert foreign.json()["detail"]["code"] == "publication.revision_mismatch"
+    assert code_host.reads == []
+
+    accepted = client.post(url, json=valid, headers=WORKER_HEADERS)
+
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json() == {
+        "commit_sha": _REPAIRED_HEAD,
+        "parent_sha": HEAD_SHA,
+        "second_parent_sha": _ADMITTED_BASE,
+    }
+    assert code_host.reads == [_REPAIRED_HEAD]
+    assert _stored_state(repair) == before
+    assert _stored_state(previous) == history
+    assert not (code_host.opened or code_host.updated or code_host.label_calls)
+
+
+def test_repair_lineage_cas_requires_the_second_parent_bound_to_the_verified_snapshot(
+    repair_revision: RepairRevision,
+) -> None:
+    _, previous, repair, code_host = repair_revision
+    before = _stored_state(repair)
+    history = _stored_state(previous)
+    repair_id = uuid.UUID(repair["id"])
+    identity = VerifiedPublicationIdentity(
+        host="github.com",
+        repository_id=101,
+        installation_id=202,
+        pr_node_id="PR_example_123",
+        base_ref="main",
+    )
+    outcome = PublicationLineageAdvance(
+        expected_version=before["lineage_version"],
+        expected_head_sha=HEAD_SHA,
+        expected_publication_version=before["publication_version"],
+        lease_owner=before["lease_owner"],
+        state="open",
+        pr_number=PR_NUMBER,
+        pr_url=PR_URL,
+        head_sha=_REPAIRED_HEAD,
+        metadata_updated_at=None,
+    )
+
+    async def prove_before_rollback(session: AsyncSession) -> VerifiedPublicationCommit:
+        publication = await publication_queries.get_publication(session, repair_id)
+        assert publication is not None
+        publication.expected_merge_sha = _REPAIRED_HEAD
+        await session.flush()
+        repository = RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
+        proof = await verify_publication_commit(
+            code_host,
+            repository,
+            publication,
+            commit_sha=_REPAIRED_HEAD,
+            base_branch=await publication_base_ref(session, code_host, publication, repository),
+            revision_ids=frozenset({repair_id}),
+        )
+        await session.rollback()
+        return proof
+
+    async def advance(
+        session: AsyncSession, proof: VerifiedPublicationCommit | None, head: str = _REPAIRED_HEAD
+    ) -> None:
+        await advance_publication_lineage(
+            session,
+            repair_id,
+            outcome.model_copy(update={"head_sha": head}),
+            github_html_base="https://github.com",
+            first_parent_proof=proof,
+            identity=identity,
+        )
+
+    proof = with_session(prove_before_rollback)
+    with pytest.raises(PublicationLineageConflict) as unprepared:
+        with_session(lambda session: advance(session, proof))
+    assert unprepared.value.code == "publication.lineage_stale"
+    assert _stored_state(repair) == before
+    _record_merge_sha(repair, _REPAIRED_HEAD)
+    before = _stored_state(repair)
+    for refusal in (
+        None,
+        replace(proof, second_parent_sha=None),
+        replace(proof, second_parent_sha=_LATER_BASE),
+    ):
+        with pytest.raises(PublicationLineageConflict) as exc:
+            with_session(lambda session, proof=refusal: advance(session, proof))
+        assert exc.value.code == "publication.lineage_stale"
+        assert _stored_state(repair) == before
+    with pytest.raises(PublicationLineageConflict) as crossed:
+        foreign_proof = replace(proof, commit_sha=_FOREIGN)
+        with_session(lambda session: advance(session, foreign_proof, _FOREIGN))
+    assert crossed.value.code == "publication.lineage_stale"
+    assert _stored_state(repair) == before
+    with_session(lambda session: advance(session, proof))
+
+    after = _stored_state(repair)
+    assert after["status"] == "succeeded"
+    assert after["head_sha"] == _REPAIRED_HEAD
+    assert after["lineage_version"] == before["lineage_version"] + 1
+    assert after["lineage"]["base_ref"] == before["lineage"]["base_ref"] == "main"
+    assert after["lineage"]["branch"] == before["lineage"]["branch"]
+    assert after["pr_number"] == before["pr_number"] == PR_NUMBER
+    assert after["lease_owner"] is None and after["patch_bytes"] is None
+    assert _stored_state(previous)["publication"] == history["publication"]
+    assert not (code_host.opened or code_host.updated or code_host.label_calls)

@@ -17,6 +17,7 @@ from . import factory_ci
 from .config import Settings
 from .factory_base_reconcile import base_selection_unchanged
 from .factory_ci_recovery import settled_ci_facts
+from .factory_conflict import VerifiedConflict, inspect_conflict_objective
 from .factory_maintenance import (
     MaintenanceObservation,
     MaintenanceRefusal,
@@ -25,7 +26,7 @@ from .factory_maintenance import (
 )
 from .factory_maintenance_progress import record_event
 from .factory_maintenance_store import commit_observation, replay
-from .forges.errors import ForgeError
+from .forges.errors import ForgeError, Unsupported
 from .forges.hosts import issue_url
 from .forges.ports import CodeHost
 from .forges.registry import forges_registry
@@ -33,6 +34,7 @@ from .forges.trackers import code_host_for_repository, tracker_for_work_item
 from .forges.types import (
     Actor,
     CheckState,
+    CredentialScope,
     Disposition,
     MarkedNotice,
     PullRequest,
@@ -49,6 +51,7 @@ from .models import (
     ThreadPublicationLineage,
     WorkItem,
 )
+from .repository_access import issue_stored_credential
 from .workitems import lifecycle
 
 
@@ -157,24 +160,30 @@ class MaintenanceObserver:
             now = await lifecycle.database_now(session)
             final_poll = now >= window.expires_at
             session.expunge_all()
-        async with asyncio.timeout(15):
-            host = self._host(item, lineage)
-            foreign = pull.head_sha != observation.head_sha
-            actionable = (
-                foreign
-                or pull.conflicted
-                or (await host.observe_ci(item.repository, observation.head_sha)).state
-                is RollupState.FAILURE
-            )
-            if actionable:
-                tip = await host.branch_head(item.repository, observation.base_ref)
-                observation = replace(observation, base_sha=tip or observation.base_sha)
+        tip = None
+        try:
+            async with asyncio.timeout(15):
+                host = self._host(item, lineage)
+                foreign = pull.head_sha != observation.head_sha
+                actionable = (
+                    foreign
+                    or pull.conflicted
+                    or (await host.observe_ci(item.repository, observation.head_sha)).state
+                    is RollupState.FAILURE
+                )
+                if actionable:
+                    tip = await host.branch_head(item.repository, observation.base_ref)
+        except (ForgeError, TimeoutError) as error:
+            if pull.conflicted and not final_poll and not isinstance(error, Unsupported):
+                await self._refuse_poll(observation, "evidence_unavailable")
+            raise
         if actionable:
+            if tip is not None:
+                observation = replace(observation, base_sha=tip)
             if final_poll:
-                async with self.sessions() as session:
-                    await commit_observation(
-                        session, observation, objective=None, refusal="window_expired"
-                    )
+                await self._refuse_poll(observation, "window_expired")
+            elif pull.conflicted and tip is None:
+                await self._refuse_poll(observation, "evidence_unavailable")
             else:
                 await self(observation)
         if final_poll:
@@ -188,6 +197,12 @@ class MaintenanceObserver:
                     .values(final_poll_at=now)
                 )
                 await session.commit()
+
+    async def _refuse_poll(
+        self, observation: MaintenanceObservation, refusal: RefusalReason
+    ) -> None:
+        async with self.sessions() as session:
+            await commit_observation(session, observation, objective=None, refusal=refusal)
 
     async def __call__(
         self, observation: MaintenanceObservation, /
@@ -241,7 +256,7 @@ class MaintenanceObserver:
 
     async def _verify(
         self, obs: MaintenanceObservation, facts: factory_ci.CiFacts, green_at: datetime | None
-    ) -> tuple[str | None, RefusalReason | None]:
+    ) -> tuple[str | VerifiedConflict | None, RefusalReason | None]:
         item, lineage = facts.work_item, facts.lineage
         registry = forges_registry(self.settings)
         host = self._host(item, lineage)
@@ -317,7 +332,10 @@ class MaintenanceObserver:
         if obs.reason == "base_conflict":
             if verdict.kind != "merge_conflict" or not view.conflicted:
                 return None, "no_current_conflict"
-            return issue, None
+            credential = await issue_stored_credential(
+                self.settings, self.client, repository=repository, scope=CredentialScope.CLONE
+            )
+            return await inspect_conflict_objective(obs, lineage, credential, now, issue)
         if green_at is None:
             return None, "prior_green_missing"
         if (

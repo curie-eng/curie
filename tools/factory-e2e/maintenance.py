@@ -126,7 +126,7 @@ class MaintenanceInstall(ci.CandidateInstall):
             {".curie/verification.json": json.dumps(declaration), ".gitignore": "__pycache__/\n"},
         )
         self.checks((base, "success", CHECK))
-        self.install(self.maintenance_values())
+        self.install(self.maintenance_values(case))
         self.port_forward()
         self.agent_id = self.create_agent(fe.FACTORY_AGENT, LABEL)
         self.deploy_bundle(fe.FACTORY_AGENT)
@@ -139,7 +139,12 @@ class MaintenanceInstall(ci.CandidateInstall):
         )
         self.api("PATCH", f"/agents/{self.agent_id}", {"factory_slack_channel": channel})
 
-    def maintenance_values(self) -> dict[str, Any]:
+    def maintenance_values(self, case: str) -> dict[str, Any]:
+        ci_paths = [CHANGE]
+        if case == "conflict":
+            from maintenance_conflict import fixture
+
+            ci_paths = list(fixture.INITIAL_PR_FILES)
         values = self.base_values(model_base_url=f"http://{self.stub_ip}:8123")
         values["factory"].update(maintenanceRepairEnabled=True, ciWaitSeconds=180)
         values["api"].setdefault("extraEnv", []).append(
@@ -156,7 +161,7 @@ class MaintenanceInstall(ci.CandidateInstall):
                         "codeHost": "github",
                         "projectId": "4401",
                         "path": tch.STUB_REPO,
-                        "ci": {"required": {"key": CHECK, "paths": [CHANGE]}},
+                        "ci": {"required": {"key": CHECK, "paths": ci_paths}},
                     }
                 ],
             }
@@ -179,6 +184,19 @@ class MaintenanceInstall(ci.CandidateInstall):
         self.kubectl("-n", self.inputs.namespace, "rollout", "status", deployment, "--timeout=600s")
         if replicas:
             self.port_forward()
+        else:
+            selector = (
+                f"app.kubernetes.io/instance={self.inputs.release},app.kubernetes.io/component=api"
+            )
+            wait(
+                "API pods gone before the fixture changes the PR",
+                lambda: (
+                    not self.kubectl(
+                        "-n", self.inputs.namespace, "get", "pods", "-l", selector, "-o", "name"
+                    ).strip()
+                ),
+                seconds=120,
+            )
 
     def restart(self) -> None:
         name = "deployment/" + self.inputs.release + "-api"
@@ -666,8 +684,6 @@ def late(run: MaintenanceInstall, control: str) -> None:
 
 
 def main(args: argparse.Namespace) -> int:
-    if args.control and args.case != "late":
-        raise fe.ConfigError("--control requires --case late")
     env = dict(os.environ)
     suffix = uuid.uuid4().hex[:8]
     env.setdefault(NAMES.namespace, f"test-maintenance-{suffix}")
@@ -692,8 +708,13 @@ def main(args: argparse.Namespace) -> int:
                 active(run)
             elif args.case == "recovery":
                 recovery(run)
+            elif args.case == "conflict":
+                from maintenance_conflict import conflict
+
+                for control in args.control:
+                    conflict(run, control)
             else:
-                for control in args.control or fe.MAINTENANCE_CONTROLS:
+                for control in args.control:
                     late(run, control)
         finally:
             try:

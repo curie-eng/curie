@@ -143,6 +143,8 @@ async def read_publication_pull_request(
         pull = await code_host.read_pull_request(PullRequestRef(repository, str(pr_number)))
     except ForgeError as exc:
         raise forge_failure(exc) from None
+    if publication.publication_mode == "base_conflict_merge" and pull.base_ref != lineage.base_ref:
+        _refuse("lineage_stale", "the pull request target changed after conflict admission")
     return _out(pull)
 
 
@@ -172,7 +174,11 @@ async def read_publication_branch_head(
     return PublicationBranchHeadOut(head_sha=head, base_branch=base_branch)
 
 
-@router.post("/{publication_id}/revision-commit", response_model=PublicationRevisionOut)
+@router.post(
+    "/{publication_id}/revision-commit",
+    response_model=PublicationRevisionOut,
+    response_model_exclude_none=True,
+)
 async def verify_publication_revision(
     publication_id: uuid.UUID,
     data: PublicationRevisionVerify,
@@ -190,8 +196,11 @@ async def verify_publication_revision(
 
     response.headers["Cache-Control"] = "no-store"
     publication, lineage = await _stored(session, publication_id)
-    if data.revision_id not in publication_revision_ids(publication) or data.expected_parent != (
-        publication.expected_prior_head
+    if (
+        data.revision_id not in publication_revision_ids(publication)
+        or data.expected_parent != publication.expected_prior_head
+        or data.expected_second_parent
+        != (publication.base_sha if publication.publication_mode == "base_conflict_merge" else None)
     ):
         _refuse("revision_mismatch", "the verification names another publication revision")
     code_host, repository = await _code_host(request, session, lineage)
@@ -209,7 +218,11 @@ async def verify_publication_revision(
         _refuse(refused.code, refused.message)
     except ForgeError as exc:
         raise forge_failure(exc) from None
-    return PublicationRevisionOut(commit_sha=verified.commit_sha, parent_sha=verified.parent_sha)
+    return PublicationRevisionOut(
+        commit_sha=verified.commit_sha,
+        parent_sha=verified.parent_sha,
+        second_parent_sha=verified.second_parent_sha,
+    )
 
 
 def _no_other_publication(
@@ -367,7 +380,7 @@ async def recover_publication_pull_request(
             repository,
             contract,
             expected_head_sha=data.expected_head_sha,
-            adopt_only=data.adopt_only,
+            adopt_only=data.adopt_only or publication.publication_mode == "base_conflict_merge",
             before_open=_no_other_publication(request, session, publication, lineage, code_host),
         )
     except PullRequestRefused as refused:
@@ -402,7 +415,7 @@ async def update_publication_pull_request_metadata(
         _refuse("not_approved", "the publication is not approved for a pull request")
     if lineage.status != "open":
         _refuse("lineage_terminal", "the pull request for this thread is merged or closed")
-    if publication.patch_bytes != b"":
+    if publication.publication_mode == "base_conflict_merge" or publication.patch_bytes != b"":
         # A patch is pushed by the Job; a purged revision has nothing to apply.
         _refuse("not_metadata_only", "the publication is not a metadata-only revision")
     if (

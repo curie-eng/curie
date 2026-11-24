@@ -76,6 +76,7 @@ from ..workitem_dispatch import (
 )
 from ..workspace import (
     WORKSPACES_DISABLED_REFUSAL,
+    ConflictWorkspace,
     WorkspacePreparationError,
     WorkspaceRepositoryNotAllowed,
     WorkspaceSelectionRefused,
@@ -533,6 +534,7 @@ async def _route_and_start(
     if owned_run is not None and owned_run.agent_id != agent_id:
         raise WorkItemStartRefused("factory_agent_mismatch")
     caller_run = str(owned_run.request_id) if owned_run is not None else None
+    conflict = owned_run.conflict_workspace if owned_run is not None else None
     # #5429: a publication recovery run never steers and never opens a turn.
     recovery = owned_run is not None and owned_run.is_publication_recovery
     # #5378: whose grant a runtime for this delivery boots with. None is a
@@ -664,6 +666,8 @@ async def _route_and_start(
         raise WorkspaceSelectionRefused(
             "The pull request changed after GitHub feedback verification; no model turn started."
         )
+    if conflict is not None and (workspace_repo is None or lineage_head != conflict.head_sha):
+        raise WorkspacePreparationError("lineage-checkout", "the admitted PR head is unavailable")
     if (
         workspace_deployment_id is not None
         and self._workspace is None
@@ -698,7 +702,13 @@ async def _route_and_start(
     # claiming is compared with this full snapshot rather than treating the
     # mere presence of an affinity record as proof that a live route was
     # retained.
-    materialized_lineage_head = lineage_head or lineage_base_sha
+    materialized_lineage_head = (
+        conflict.base_sha if conflict is not None else lineage_head or lineage_base_sha
+    )
+    if conflict is not None and (
+        existing_handle is None or existing_handle.caller_run != caller_run
+    ):
+        force_lineage_replacement = True
     if materialized_lineage_head is not None or publication_visible_outcome_revision is not None:
         force_lineage_replacement = force_lineage_replacement or (
             existing_handle is None
@@ -968,6 +978,7 @@ async def _route_and_start(
                 lineage_branch=lineage_branch,
                 lineage_head=lineage_head,
                 lineage_base_sha=lineage_base_sha,
+                conflict_workspace=conflict,
                 publication_visible_outcome_revision=(publication_visible_outcome_revision or 0),
                 force_lineage_replacement=force_lineage_replacement,
                 pending_publication_approval=pending_publication_approval,
@@ -1646,6 +1657,7 @@ async def _cap_caller_token_to_deadline(
         lineage_branch=lineage_branch,
         lineage_head=lineage_head,
         lineage_base_sha=lineage_base_sha,
+        conflict_workspace=run.conflict_workspace,
         publication_visible_outcome_revision=(publication_visible_outcome_revision or 0),
         agent_name=agent_name,
         runner_resources=runner_resources,
@@ -1668,6 +1680,7 @@ async def _claim_or_resume(
     lineage_branch: str | None = None,
     lineage_head: str | None = None,
     lineage_base_sha: str | None = None,
+    conflict_workspace: ConflictWorkspace | None = None,
     publication_visible_outcome_revision: int = 0,
     force_lineage_replacement: bool = False,
     pending_publication_approval: bool = False,
@@ -1699,6 +1712,7 @@ async def _claim_or_resume(
             lineage_branch=lineage_branch,
             lineage_head=lineage_head,
             lineage_base_sha=lineage_base_sha,
+            conflict_workspace=conflict_workspace,
             publication_visible_outcome_revision=publication_visible_outcome_revision,
             force_lineage_replacement=force_lineage_replacement,
             pending_publication_approval=pending_publication_approval,
@@ -1759,6 +1773,7 @@ async def _claim_or_resume_as(
     lineage_branch: str | None,
     lineage_head: str | None,
     lineage_base_sha: str | None,
+    conflict_workspace: ConflictWorkspace | None,
     publication_visible_outcome_revision: int,
     force_lineage_replacement: bool,
     pending_publication_approval: bool,
@@ -1831,6 +1846,12 @@ async def _claim_or_resume_as(
         existing = None
         if not force_lineage_replacement:
             existing = await _adopt(self, thread_key)
+        if conflict_workspace is not None and existing is not None and existing != replace_handle:
+            if (
+                existing.caller_run != caller_run
+                or existing.workspace_materialized_head != conflict_workspace.base_sha
+            ):
+                raise RouteChangedError(thread_key)
         if attachment_fresh_only and existing is not None:
             # A runner appeared after the attachment lookup; it never saw
             # the staged files, so refuse rather than adopt it (#2739).
@@ -1974,8 +1995,9 @@ async def _claim_or_resume_as(
                 lineage_branch=lineage_branch,
                 lineage_head=lineage_head,
                 lineage_base_sha=lineage_base_sha,
+                conflict_workspace=conflict_workspace,
                 publication_visible_outcome_revision=(publication_visible_outcome_revision),
-                fresh_only=attachment_fresh_only,
+                fresh_only=attachment_fresh_only or conflict_workspace is not None,
                 caller_run=caller_run,
                 **identity_arguments,
                 **_personal_kwargs(personal),

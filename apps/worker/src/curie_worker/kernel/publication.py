@@ -148,6 +148,17 @@ async def _bind_publication_context(
         or context.queued_event_id != queued_event_id
     ):
         raise RunnerError("publication context identity was refused")
+    conflict = run.conflict_workspace
+    if conflict is not None:
+        if (
+            context is None
+            or context.expected_head != conflict.head_sha
+            or handle.workspace_materialized_head != conflict.base_sha
+        ):
+            raise RunnerError("publication context no longer matches the conflict workspace")
+        # Metadata comparison snapshots the checkout at the PR head. A conflict
+        # successor can only propose a patch against its admitted base tip.
+        context = None
     if context is not None:
         # The worker may self-dial localhost while the sandbox reaches the
         # API through its bridge network. The API signs the authority, not
@@ -230,6 +241,8 @@ async def _continue_unpublished(
         return outcome
     run = self._work_item_runs.get(parsed.request_id)
     if run is None or run.event_id != qevent.event_id or not run.started or run.finished:
+        return outcome
+    if run.conflict_workspace is not None:
         return outcome
     if (
         not outcome.terminal_ok

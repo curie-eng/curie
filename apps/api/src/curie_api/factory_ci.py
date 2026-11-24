@@ -1557,6 +1557,15 @@ async def gate(
             for check in view.checks
         )
     )
+    if maintenance is not None and maintenance.reason == "base_conflict":
+        positive = (
+            positive
+            and view is not None
+            and view.merged is False
+            and bool(facts.publications)
+            and facts.publications[-1].publication_mode == "base_conflict_merge"
+            and facts.publications[-1].expected_merge_sha == subject.head_sha
+        )
     if (
         maintenance is not None
         and verdict.kind in ("green", "no_ci")

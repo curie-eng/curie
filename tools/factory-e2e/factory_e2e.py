@@ -306,17 +306,32 @@ CANDIDATE_SEARCH_DEPTH = 30
 # How often --hold checks that the install is still usable.
 HOLD_TICK_SECONDS = 60
 LOCK_DIR = Path.home() / ".cache" / "curie-factory-e2e"
-MAINTENANCE_CONTROLS = (
-    "repair",
-    "later-publication",
-    "failed-repair",
-    "no-ci",
-    "foreign-head",
-    "base-red",
-    "cancelled",
-    "closed",
-    "expiry",
-)
+MAINTENANCE_CONTROLS = {
+    "active": (),
+    "recovery": (),
+    "late": (
+        "repair",
+        "later-publication",
+        "failed-repair",
+        "no-ci",
+        "foreign-head",
+        "base-red",
+        "cancelled",
+        "closed",
+        "expiry",
+    ),
+    "conflict": (
+        "completed",
+        "active",
+        "human-before-push",
+        "protected",
+        "incompatible",
+        "exhausted",
+        "closed",
+        "recover-push-without-job",
+        "refuse-foreign-merge",
+    ),
+}
 FACTORY_AGENT = "factory-e2e"
 DEFAULT_MODEL = "z-ai/glm-5.3-flash"
 REFERENCE_MODEL_DEFAULT = "anthropic/claude-sonnet-4.5"
@@ -6910,13 +6925,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "Use --context <context> or CURIE_FACTORY_KUBE_CONTEXT to name a disposable cluster. "
         "The driver creates and removes a fresh namespace and Helm release.",
     )
-    maintenance.add_argument("--case", required=True, choices=("active", "late", "recovery"))
+    maintenance.add_argument("--case", required=True, choices=MAINTENANCE_CONTROLS)
     maintenance.add_argument("--context", help="explicit throwaway Kubernetes context")
     maintenance.add_argument(
         "--control",
         action="append",
-        choices=MAINTENANCE_CONTROLS,
-        help="run the selected late CI controls on one install; repeatable (expiry takes 24h)",
+        help="select a control for late CI or conflict; repeat to select several. "
+        "Omit to run all controls for the case (late CI expiry takes 24h).",
     )
     scripted = sub.add_parser(
         "scripted",
@@ -6961,7 +6976,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     pairing.add_argument("--revision-file", type=Path, help="the review text")
     scripted.add_argument("--build-images", action="store_true")
     scripted.add_argument("--record", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.mode == "maintenance":
+        allowed = MAINTENANCE_CONTROLS[args.case]
+        for control in args.control or ():
+            if control not in allowed:
+                choices = ", ".join(allowed) or "none"
+                maintenance.error(
+                    f"--case {args.case} does not accept {control!r}. Controls: {choices}"
+                )
+        args.control = args.control or list(allowed)
+    return args
 
 
 def _acceptance_module() -> Any:

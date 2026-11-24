@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from . import factory_maintenance_progress
 from .config import get_settings
 from .factory_base_reconcile import transition_blocks
+from .factory_conflict import VerifiedConflict
 from .factory_maintenance import (
     MaintenanceAuthority,
     MaintenanceObservation,
@@ -247,7 +248,7 @@ async def commit_observation(
     session: AsyncSession,
     observation: MaintenanceObservation,
     *,
-    objective: str | None,
+    objective: VerifiedConflict | str | None,
     refusal: RefusalReason | None,
 ) -> MaintenanceRepair | MaintenanceRefusal:
     """Commit a verified provider decision, its first runnable wake and its single debit."""
@@ -275,6 +276,10 @@ async def commit_observation(
         FactoryMaintenanceLineage, lineage.id, with_for_update=True, populate_existing=True
     )
     refusal = await _local_refusal(session, observation, item, request, lineage, window, refusal)
+    conflict_paths = None
+    if isinstance(objective, VerifiedConflict):
+        conflict_paths = list(objective.paths)
+        objective = objective.objective
     repair_id = uuid.uuid4()
     instructions = (
         maintenance_instructions(
@@ -295,6 +300,7 @@ async def commit_observation(
             refusal = "reason_unavailable"
         elif (
             not objective
+            or (observation.reason == "base_conflict") != bool(conflict_paths)
             or not instructions.objective.strip()
             or len(instructions.objective) > 65536
         ):
@@ -346,6 +352,7 @@ async def commit_observation(
             base_sha=observation.base_sha,
             reason=observation.reason,
             mode="successor",
+            conflict_paths=conflict_paths,
             admitted_at=now,
             **OwnerTuple.of(item).columns(),
         )

@@ -4,6 +4,8 @@ Date: 2026-10-31
 
 Status: Accepted
 
+[ADR 0290](0290-publish-conflict-repairs-with-two-approved-parents.md) partially amends items 1 and 4 of parent selection for an admitted conflict repair.
+
 Accepted 2026-11-05 with explicit maintainer approval from TheConnMan.
 
 This decision partially supersedes two Decision clauses of

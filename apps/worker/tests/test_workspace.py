@@ -2476,6 +2476,177 @@ def _extract_archive(payload: bytes, destination: Path) -> Path:
     return destination
 
 
+def _conflict_preparer(
+    workspace: Any, tmp_path: Path, repo: str
+) -> tuple[Any, Path, str, str, str]:
+    source = _source_repo(tmp_path, files={"rules.txt": "common\n"}, links={})
+    common = _git(source, "rev-parse", "HEAD").strip()
+    _git(source, "checkout", "-b", "feature")
+    (source / "rules.txt").write_text("feature rule\n")
+    (source / "feature.txt").write_text("feature behavior\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-m", "Feature")
+    head = _git(source, "rev-parse", "HEAD").strip()
+    _git(source, "checkout", "main")
+    (source / "rules.txt").write_text("base rule\n")
+    (source / "base.txt").write_text("base behavior\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-m", "Base change")
+    base = _git(source, "rev-parse", "HEAD").strip()
+    _git(source, "commit", "--allow-empty", "-m", "Later base advance")
+    url = f"https://github.com/{repo}.git"
+
+    class Credentials:
+        def select(self, _deployment: uuid.UUID, _thread: str, _author: str, requested: str) -> str:
+            assert requested == repo
+            return repo
+
+        def redeem(self, _deployment: uuid.UUID, _thread: str) -> Any:
+            return workspace.WorkspaceCredential(
+                repo_full_name=repo,
+                clone_url=url,
+                origin="https://github.com",
+                header_form="authorization_basic",
+                authorization_header=GIT_CREDENTIAL,
+                base_branch="main",
+                base_commit=common,
+            )
+
+    class LocalRemote(workspace.SubprocessCommands):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
+            if argv[1] == "fetch":
+                argv = [
+                    "git",
+                    "-c",
+                    "protocol.version=0",
+                    "-c",
+                    f"url.{source.as_uri()}.insteadOf={url}",
+                    *argv[1:],
+                ]
+                kwargs["env"] = {**kwargs["env"], "GIT_ALLOW_PROTOCOL": "file"}
+            return super().run(argv, **kwargs)
+
+    preparer = workspace.WorkspacePreparer(
+        credentials=Credentials(),
+        commands=LocalRemote(),
+        objects=_StreamingObjectStore(),
+        scratch_root=tmp_path / "scratch",
+        limits=_limits(workspace),
+    )
+    return preparer, source, common, head, base
+
+
+def test_conflict_claim_archive_and_snapshot_retain_both_sides(
+    workspace: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    from curie_worker.publication_validation import (
+        PublicationValidationRefused,
+        validate_snapshot_against_base,
+    )
+    from curie_worker.sandbox import staging
+
+    from apps.worker.tests.test_publication_snapshot_trusted_base import _snapshot_over_http
+
+    preparer, source, common, head, base = _conflict_preparer(
+        workspace, tmp_path, "acme-corp/acme-bot"
+    )
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer, substrate=_RecordingSubstrate()
+    )
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        repo_full_name="acme-corp/acme-bot",
+        lineage_branch="feature",
+        lineage_head=head,
+        conflict_workspace=workspace.ConflictWorkspace(head, base, ("rules.txt",)),
+    )
+    assert result.prepared.materialized_head == base
+    retained = coordinator.current("1700000000.000100")
+    assert retained is not None and retained.base_sha == base
+
+    def download(signed_request: Any, *, timeout: float) -> io.BytesIO:
+        assert signed_request.full_url == retained.reference.url
+        return io.BytesIO(preparer.objects.objects[retained.object_key])
+
+    monkeypatch.setattr(staging.urllib.request, "urlopen", download)
+    inputs = staging.ClaimInputStaging()
+    inputs._init_staging(
+        bundle_store={},
+        bundle_max_uncompressed_bytes=4096,
+        bundle_max_compression_ratio=10,
+        bundle_max_members=10,
+        workspace_limits=preparer.limits,
+        attachment_limits=None,
+    )
+    request.addfinalizer(lambda: inputs._cleanup_workspace("successor"))
+    boot = result.prepared.claim_env()
+    checkout = Path(
+        inputs._prepare_workspace(
+            "successor",
+            boot[workspace.WORKSPACE_REF_ENV],
+            boot[workspace.WORKSPACE_SHA256_ENV],
+        )
+    )
+    assert _git(checkout, "rev-parse", "HEAD").strip() == base
+    assert _git(checkout, "rev-parse", "refs/curie/conflict-head").strip() == head
+    assert _git(checkout, "merge-base", "HEAD", "refs/curie/conflict-head").strip() == common
+    merged = subprocess.run(
+        ["git", "merge", "--squash", "refs/curie/conflict-head"],
+        cwd=checkout,
+        env={**os.environ, **_LOCAL_GIT_ENV},
+        capture_output=True,
+        check=False,
+    )
+    assert merged.returncode == 1 and _git(checkout, "ls-files", "-u", "rules.txt")
+    (checkout / "rules.txt").write_text("base rule\nfeature rule\n")
+    _git(checkout, "add", "rules.txt")
+    candidate = _snapshot_over_http(checkout, retained.base_sha)
+    assert candidate.base_sha == base
+    assert set(candidate.changed_paths) == {"rules.txt", "feature.txt"}
+
+    def validate(protected: tuple[str, ...]) -> None:
+        validate_snapshot_against_base(
+            coordinator,
+            thread_key="1700000000.000100",
+            snapshot=candidate,
+            scratch_root=tmp_path,
+            protected_paths=protected,
+            allow_dependency_additions=False,
+            conflict_workspace=workspace.ConflictWorkspace(head, base, ("rules.txt",)),
+        )
+
+    validate(())
+    with pytest.raises(PublicationValidationRefused, match="protected"):
+        validate(("feature.txt",))
+    target = tmp_path / "reviewed-tree"
+    _git(tmp_path, "clone", str(source), str(target))
+    _git(target, "checkout", "--detach", base)
+    patch = tmp_path / "approved.patch"
+    patch.write_bytes(candidate.patch)
+    _git(target, "apply", "--index", str(patch))
+    assert (target / "rules.txt").read_text() == "base rule\nfeature rule\n"
+    assert (target / "base.txt").read_text() == "base behavior\n"
+    assert (target / "feature.txt").read_text() == "feature behavior\n"
+
+    for marker in ("<<<<<<< HEAD", "=======", ">>>>>>> feature", "||||||| base"):
+        (checkout / "rules.txt").write_text(f"resolved\n{marker}\n")
+        candidate = _snapshot_over_http(checkout, base)
+        with pytest.raises(PublicationValidationRefused, match="conflict marker"):
+            validate(())
+    (checkout / "rules.txt").write_text("Heading\n===========\ninline <<<<<<< HEAD\n")
+    candidate = _snapshot_over_http(checkout, base)
+    validate(())
+    for clean_path in ("base.txt", "feature.txt"):
+        clean = checkout / clean_path
+        original = clean.read_bytes()
+        clean.unlink()
+        candidate = _snapshot_over_http(checkout, base)
+        with pytest.raises(PublicationValidationRefused, match="outside the admitted conflict"):
+            validate(())
+        clean.write_bytes(original)
+
+
 def _workspace_warnings(caplog: pytest.LogCaptureFixture) -> list[Any]:
     return [
         record

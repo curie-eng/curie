@@ -50,6 +50,7 @@ def revision_refusal(
     commit_sha: str,
     revision_ids: Collection[uuid.UUID],
     expected_parent: str,
+    expected_second_parent: str | None = None,
 ) -> str | None:
     """Why ``commit`` is not a marked commit of ``revision_ids`` on its expected parent.
 
@@ -63,7 +64,12 @@ def revision_refusal(
         f"Curie-Revision: {revision_id}" in lines for revision_id in revision_ids
     ):
         return "remote commit has no matching revision marker"
-    if len(commit.parents) != 1 or commit.parents[0] != expected_parent:
+    parents: tuple[str, ...] = (expected_parent,)
+    if expected_second_parent is not None:
+        parents += (expected_second_parent,)
+        if sum(line.startswith("Curie-Revision:") for line in lines) != 1:
+            return "conflict repair requires exactly one revision marker"
+    if commit.parents != parents:
         return "remote revision has the wrong expected parent"
     return None
 

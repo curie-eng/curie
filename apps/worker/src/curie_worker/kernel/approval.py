@@ -62,6 +62,7 @@ from ..turn_progress import (
 )
 from ..ui_evidence import relay_ui_evidence
 from ..workitem_dispatch import (
+    WorkItemRun,
     parse_work_item_event_id,
 )
 from ..workspace import (
@@ -870,12 +871,7 @@ async def _pause_for_approval(
     # so the durable record, the card and the publication request stay free
     # of it.
     inference = workspace._workspace_inference_notice(outcome.workspace_inferred_repo)
-    parsed_publication = parse_work_item_event_id(qevent.event_id)
-    publication_run = (
-        self._work_item_runs.get(parsed_publication.request_id)
-        if parsed_publication is not None and parsed_publication.kind in {"execute", "ci"}
-        else None
-    )
+    publication_run = _approval_work_item(self, qevent)
     if self._approval_run_abandoned(qevent):
         return _ApprovalPause(created=False, abandoned=True)
     # The selected creation's identity block, which a DM card's registration
@@ -939,11 +935,8 @@ async def _pause_for_approval(
                     route=route_name,
                     card_channel=policy_card_channel,
                     work_item_request_id=(
-                        parsed_publication.request_id
-                        if parsed_publication is not None
-                        and parsed_publication.kind in {"execute", "ci"}
-                        and publication_run is not None
-                        and publication_run.started
+                        publication_run.request_id
+                        if publication_run is not None and publication_run.started
                         else None
                     ),
                     work_item_runtime_epoch=(
@@ -1620,6 +1613,20 @@ async def _escalate_unanswerable_email_approval(
     )
 
 
+def _approval_work_item(self: Kernel, qevent: QueuedTurn) -> WorkItemRun | None:
+    parsed = parse_work_item_event_id(qevent.event_id)
+    if parsed is not None and parsed.kind in {"execute", "ci"}:
+        run = self._work_item_runs.get(parsed.request_id)
+    else:
+        owned_id = constants._OWNED_WORK_ITEM.get()
+        if owned_id is None or not self._is_approval_resume(qevent.event_id):
+            return None
+        run = self._work_item_runs.get(owned_id)
+        if run is None or run.conflict_workspace is None:
+            return None
+    return run if run is not None and run.event_id == qevent.event_id else None
+
+
 def _approval_run_abandoned(self: Kernel, qevent: QueuedTurn) -> bool:
     """True when the WorkItem run bound to this event was abandoned (#4331).
 
@@ -1627,11 +1634,8 @@ def _approval_run_abandoned(self: Kernel, qevent: QueuedTurn) -> bool:
     handed to a successor, so it is not created.
     """
 
-    parsed = parse_work_item_event_id(qevent.event_id)
-    if parsed is None or parsed.kind not in {"execute", "ci"}:
-        return False
-    run = self._work_item_runs.get(parsed.request_id)
-    if run is None or run.event_id != qevent.event_id or not run.abandoned:
+    run = _approval_work_item(self, qevent)
+    if run is None or not run.abandoned:
         return False
     logger.warning(
         "work-item %s was abandoned as a stale owner; creating no approval for %s",

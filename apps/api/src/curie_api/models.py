@@ -2026,6 +2026,7 @@ class FactoryMaintenanceAdmission(Base):
     base_sha: Mapped[str] = mapped_column(Text)
     reason: Mapped[str] = mapped_column(Text)
     mode: Mapped[str] = mapped_column(Text)
+    conflict_paths: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
     model_auth_mode: Mapped[str] = mapped_column(Text)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
@@ -3130,6 +3131,20 @@ class Publication(Base):
             "AND NOT (id = ANY(adoptable_revision_ids))",
             name="publications_adoptable_revision_ids_ck",
         ),
+        CheckConstraint(
+            "publication_mode IS NULL OR (publication_mode = 'base_conflict_merge' "
+            "AND expected_prior_head IS NOT NULL AND base_sha <> expected_prior_head "
+            "AND revision_number IS NOT NULL AND revision_number > 1 "
+            "AND CASE WHEN patch_bytes IS NULL THEN status IN "
+            "('succeeded', 'failed', 'denied', 'expired') ELSE octet_length(patch_bytes) > 0 END)",
+            name="publications_conflict_mode_ck",
+        ),
+        CheckConstraint(
+            "expected_merge_sha IS NULL OR (publication_mode IS NOT DISTINCT FROM "
+            "'base_conflict_merge' AND expected_merge_sha ~ '^[0-9a-f]{40,64}$' "
+            "AND expected_merge_sha <> expected_prior_head AND expected_merge_sha <> base_sha)",
+            name="publications_expected_merge_sha_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -3154,6 +3169,8 @@ class Publication(Base):
     )
     revision_number: Mapped[int | None] = mapped_column(default=None)
     expected_prior_head: Mapped[str | None] = mapped_column(default=None)
+    publication_mode: Mapped[str | None] = mapped_column(Text, default=None)
+    expected_merge_sha: Mapped[str | None] = mapped_column(Text, default=None)
     # The earlier failed revisions of this lineage whose pushed commit this
     # publication may adopt instead of pushing its own (migration 0175, #5429).
     # Computed once at creation; non-empty only for a publication recovery

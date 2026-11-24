@@ -14,6 +14,7 @@ from aci_protocol import (
     RetryCondition,
 )
 
+from ..approvals import ApprovalMissing
 from ..binding import FactoryWake
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
@@ -25,6 +26,7 @@ from ..workitem_dispatch import (
     TerminationObservation,
     WorkItemConflict,
     WorkItemRun,
+    WorkItemRunning,
     WorkItemTransportError,
     parse_work_item_event_id,
 )
@@ -32,7 +34,7 @@ from ..workitem_dispatch import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import claim, clock, constants, failures, memory, routing
+from . import approval, claim, clock, constants, failures, memory, routing
 from .log import logger
 
 _TERMINAL_WATCH_STATUS_READ_LIMIT = 3
@@ -363,6 +365,45 @@ def _work_item_repository(self: Kernel, event_id: str) -> str | None:
     return run.repository_path if run is not None and run.event_id == event_id else None
 
 
+async def _verify_conflict_resume(
+    self: Kernel, event_id: str, found: WorkItemRunning, wake: FactoryWake
+) -> None:
+    """Trace settled session approvals back to this conflict execution's execute wake."""
+
+    seen: set[str] = set()
+    while len(seen) < 32:
+        approval_id = approval._approval_id_from_resume_event(event_id)
+        if approval_id is None or approval_id in seen:
+            break
+        try:
+            if str(uuid.UUID(approval_id)) != approval_id:
+                break
+        except ValueError:
+            break
+        seen.add(approval_id)
+        if self._approval_reader is None:
+            raise WorkItemTransportError("conflict approval reader is unavailable")
+        try:
+            row = await self._approval_reader.get(approval_id)
+        except ApprovalMissing:
+            break
+        if row is None:
+            raise WorkItemTransportError("conflict approval origin is unavailable")
+        if (
+            row.id != approval_id
+            or row.agent_id != str(found.agent_id)
+            or row.conversation_id != wake.conversation_id
+            or row.reply_channel != wake.address
+            or row.status not in {"approved", "rejected", "expired"}
+            or not isinstance(row.dedupe_key, str)
+        ):
+            break
+        event_id = row.dedupe_key
+        if event_id == f"work-item-{found.request_id}-execute-{found.generation}":
+            return
+    raise failures._FactoryExecutionEnded
+
+
 async def _adopt_resumed_work_item(
     self: Kernel, event_id: str, thread_key: str, *, wake: FactoryWake
 ) -> uuid.UUID | None:
@@ -394,6 +435,8 @@ async def _adopt_resumed_work_item(
             raise failures._FactoryExecutionEnded
         return None
     parsed = parse_work_item_event_id(event_id)
+    if found.conflict_workspace is not None:
+        await _verify_conflict_resume(self, event_id, found, wake)
     if parsed is not None and parsed.is_ci_fix:
         if found.request_id != parsed.request_id:
             return found.request_id

@@ -166,6 +166,7 @@ async def publication_store() -> AsyncIterator[tuple[AsyncEngine, str, PostgresP
                     "repo_full_name text NOT NULL, status text NOT NULL DEFAULT 'approved', "
                     "version integer NOT NULL DEFAULT 1, revision_number integer DEFAULT 1, "
                     "expected_prior_head text NOT NULL, base_sha text NOT NULL, "
+                    "publication_mode text, expected_merge_sha text, "
                     "adoptable_revision_ids uuid[] NOT NULL DEFAULT '{}', "
                     "patch_bytes bytea, changed_paths text[], title text, body text, "
                     "observed_title_sha256 text, observed_body_sha256 text, "
@@ -476,6 +477,105 @@ async def test_claim_carries_the_stored_adoptable_revisions(
 
     assert recovery is not None
     assert recovery.adoptable_revision_ids == adoptable
+
+
+async def test_conflict_claim_and_terminal_write_require_the_stored_merge_parent(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+) -> None:
+    engine, schema, store = publication_store
+    target = "c" * 40
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                f'UPDATE "{schema}".publications SET publication_mode = :mode, base_sha = :target'
+            ),
+            {"mode": "base_conflict_merge", "target": target},
+        )
+        await connection.execute(
+            text(
+                f'UPDATE "{schema}".thread_publication_lineages '
+                "SET head_sha = :prior, pr_url = :url, pr_number = 123"
+            ),
+            {"prior": PRIOR_HEAD, "url": PR_URL},
+        )
+    work = await store.claim_next()
+    assert work is not None
+    assert work.publication_mode == "base_conflict_merge"
+    assert work.base_sha == target
+    assert work.expected_prior_head == work.expected_remote_head == PRIOR_HEAD
+    assert work.lineage_base_sha == PRIOR_HEAD
+
+    await store.record_expected_merge_sha(
+        work.publication_id, version=work.version, commit_sha=REVISION_HEAD
+    )
+    work = await store.claim_next()
+    assert work is not None and work.expected_merge_sha == REVISION_HEAD
+
+    async def close(second_parent: str | None) -> None:
+        await store.mark_lineage_terminal(
+            work.lineage_id,
+            expected_version=work.lineage_version,
+            expected_stored_head=work.expected_prior_head,
+            state="merged",
+            pr_number=123,
+            pr_url=PR_URL,
+            head_sha=REVISION_HEAD,
+            publication_id=work.publication_id,
+            expected_publication_version=work.version,
+            lease_owner=work.lease_owner,
+            first_parent_sha=None,
+            second_parent_sha=second_parent,
+        )
+
+    for wrong_parent in (None, PRIOR_HEAD):
+        with pytest.raises(PublicationStoreError, match="CAS was lost"):
+            await close(wrong_parent)
+    await close(target)
+
+
+async def test_prepared_merge_sha_requires_a_current_lease_and_can_only_be_recorded_once(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+) -> None:
+    engine, schema, store = publication_store
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                f'UPDATE "{schema}".publications SET publication_mode = :mode, base_sha = :target'
+            ),
+            {"mode": "base_conflict_merge", "target": "c" * 40},
+        )
+    work = await store.claim_next()
+    assert work is not None and work.expected_merge_sha is None
+    stale = work.version
+    with pytest.raises(PublicationStoreError, match="CAS was lost"):
+        await store.record_expected_merge_sha(
+            PUBLICATION_ID, version=stale - 1, commit_sha=REVISION_HEAD
+        )
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(f'UPDATE "{schema}".publications SET lease_expires_at = now()')
+        )
+    with pytest.raises(PublicationStoreError, match="CAS was lost"):
+        await store.record_expected_merge_sha(
+            PUBLICATION_ID, version=stale, commit_sha=REVISION_HEAD
+        )
+
+    successor = PostgresPublicationStore(engine, schema=schema, lease_owner="successor")
+    fresh = await successor.claim_next()
+    assert fresh is not None and fresh.expected_merge_sha is None
+    with pytest.raises(PublicationStoreError, match="CAS was lost"):
+        await store.record_expected_merge_sha(
+            PUBLICATION_ID, version=fresh.version, commit_sha=REVISION_HEAD
+        )
+    await successor.record_expected_merge_sha(
+        PUBLICATION_ID, version=fresh.version, commit_sha=REVISION_HEAD
+    )
+    claimed = await store.claim_next()
+    assert claimed is not None and claimed.expected_merge_sha == REVISION_HEAD
+    with pytest.raises(PublicationStoreError, match="CAS was lost"):
+        await store.record_expected_merge_sha(
+            PUBLICATION_ID, version=claimed.version, commit_sha="e" * 40
+        )
 
 
 async def test_charged_retry_blocks_claim_for_fifteen_seconds_then_reclaims(
@@ -875,6 +975,8 @@ class _Store:
         self.card_retry_terminal_after = 99
         self.cleanup_pending: set[uuid.UUID] = set()
         self.cleanup_claimed: set[uuid.UUID] = set()
+        self.conflict_cleanup = False
+        self.prepared_merges: list[tuple[uuid.UUID, int, str]] = []
         self.cleanup_completed: set[uuid.UUID] = set()
         self.cleanup_retries: list[tuple[uuid.UUID, str]] = []
         self.lineage_terminals: list[dict[str, Any]] = []
@@ -903,12 +1005,19 @@ class _Store:
             self.cleanup_pending.add(publication_id)
             self.card_pending = None
 
+    def record_expected_merge_sha(
+        self, publication_id: uuid.UUID, *, version: int, commit_sha: str
+    ) -> None:
+        self.prepared_merges.append((publication_id, version, commit_sha))
+
     def claim_pending_cleanup(self) -> Any | None:
         publication_id = next(iter(self.cleanup_pending), None)
         if publication_id is None:
             return None
         self.cleanup_claimed.add(publication_id)
-        return SimpleNamespace(publication_id=publication_id, version=1)
+        return SimpleNamespace(
+            publication_id=publication_id, version=1, conflict_merge=self.conflict_cleanup
+        )
 
     def mark_cleanup_completed(self, publication_id: uuid.UUID) -> None:
         self.cleanup_pending.discard(publication_id)
@@ -1017,6 +1126,7 @@ class _Store:
         expected_publication_version: int,
         lease_owner: str,
         first_parent_sha: str | None,
+        second_parent_sha: str | None = None,
     ) -> None:
         self.lineage_terminals.append(
             {
@@ -1031,6 +1141,7 @@ class _Store:
                 "expected_publication_version": expected_publication_version,
                 "lease_owner": lease_owner,
                 "first_parent_sha": first_parent_sha,
+                **({"second_parent_sha": second_parent_sha} if second_parent_sha else {}),
             }
         )
 
@@ -1148,6 +1259,10 @@ class _Cluster:
             self.observe_timed_out = True
         if self.applied and self.observe_after_apply_error is not None:
             raise self.observe_after_apply_error
+        if job_name.endswith("-verify"):
+            if job_name in self.active_jobs:
+                return self.observation
+            return self.module.PublicationJobObservation(phase="pending", logs="", exists=False)
         if job_name not in self.active_jobs:
             observation = self.preexisting_observation or self.module.PublicationJobObservation(
                 phase="pending", logs="", exists=False
@@ -1188,6 +1303,8 @@ class _CodeHost:
         self.branch_calls: list[uuid.UUID] = []
         self.recover_calls: list[tuple[uuid.UUID, str, bool]] = []
         self.verify_calls: list[tuple[uuid.UUID, str, uuid.UUID, str]] = []
+        self.second_parent_sha: str | None = None
+        self.requested_merge_parents: list[str] = []
         self.metadata_calls: list[uuid.UUID] = []
         self.state = "open"
         self.head_sha = PRIOR_HEAD
@@ -1244,7 +1361,10 @@ class _CodeHost:
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
+        expected_second_parent: str | None,
     ) -> Any:
+        if expected_second_parent is not None:
+            self.requested_merge_parents.append(expected_second_parent)
         self.calls.append("verify_revision_commit")
         self.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
         if (commit_sha, revision_id, expected_parent) not in self.allowed_revisions:
@@ -1254,6 +1374,7 @@ class _CodeHost:
         return self.module.PublicationRevisionCommit(
             commit_sha=commit_sha,
             parent_sha=self.allowed_revisions[(commit_sha, revision_id, expected_parent)],
+            second_parent_sha=self.second_parent_sha,
         )
 
     def read_branch_head(self, publication_id: uuid.UUID) -> Any:
@@ -1502,6 +1623,174 @@ def _lineage_work(
         lease_owner="publication-loop-test",
         adoptable_revision_ids=(),
     )
+
+
+def _conflict_work(module: Any) -> Any:
+    return replace(
+        _lineage_work(module),
+        publication_mode="base_conflict_merge",
+        base_sha="c" * 40,
+        lineage_base_sha="f" * 40,
+    )
+
+
+async def test_conflict_prepare_must_commit_the_sha_before_launching_a_push(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, code_host, _ = _loop(publication)
+    work = _conflict_work(publication)
+    code_host.pushed(PRIOR_HEAD)
+    prepare_names = publication.publication_resource_names(work.publication_id, prepare_merge=True)
+    push_names = publication.publication_resource_names(work.publication_id)
+    cluster.observation = _job(
+        publication, "succeeded", logs=f"CURIE_PREPARED_MERGE_SHA={REVISION_HEAD}\n"
+    )
+    await loop.reconcile(work)
+    assert [resource.names for resource in cluster.applied] == [prepare_names]
+    assert store.prepared_merges == []
+    await loop.reconcile(work)
+    assert [resource.names for resource in cluster.validated_existing] == [prepare_names]
+    assert store.prepared_merges == [(PUBLICATION_ID, work.version, REVISION_HEAD)]
+    assert [resource.names for resource in cluster.applied] == [prepare_names]
+    await loop.reconcile(replace(work, version=work.version + 2, expected_merge_sha=REVISION_HEAD))
+    assert [resource.names for resource in cluster.applied] == [prepare_names, push_names]
+    assert _job_env(cluster.applied[1])["EXPECTED_MERGE_SHA"] == REVISION_HEAD
+    assert len(credentials.calls) == 2
+
+
+@pytest.mark.parametrize("owner_running", [False, True])
+@pytest.mark.parametrize("remote", [REVISION_HEAD, "e" * 40])
+async def test_merge_recovery_after_job_and_log_loss_requires_the_persisted_sha(
+    publication: Any, owner_running: bool, remote: str
+) -> None:
+    lineage = _Lineage()
+    loop, store, credentials, cluster, code_host, _ = _loop(publication, lineage=lineage)
+    work = replace(
+        _conflict_work(publication), expected_merge_sha=REVISION_HEAD, owner_running=owner_running
+    )
+    # Either head would pass a parent/marker-only forge check.
+    code_host.allowed_revisions[(remote, REVISION_ID, PRIOR_HEAD)] = PRIOR_HEAD
+    code_host.second_parent_sha = work.base_sha
+    code_host.pushed(remote)
+    await loop.reconcile(work, allow_launch=owner_running)
+    assert credentials.calls == []
+    assert cluster.applied == []
+    if remote == REVISION_HEAD:
+        assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
+        assert code_host.verify_calls == [(PUBLICATION_ID, remote, REVISION_ID, PRIOR_HEAD)]
+        assert code_host.requested_merge_parents == [work.base_sha]
+        assert lineage.advances[0]["head_sha"] == REVISION_HEAD
+    else:
+        assert store.completed[PUBLICATION_ID] == ("failed", None)
+        assert "foreign_head" in store.failures[0][1]
+        assert not lineage.advances
+        assert not code_host.verify_calls
+
+
+@pytest.mark.parametrize("owner_running", [False, True])
+async def test_successful_conflict_job_with_lagging_branch_read_is_recoverable(
+    publication: Any, owner_running: bool
+) -> None:
+    lineage = _Lineage()
+    loop, store, _, cluster, host, _ = _loop(publication, lineage=lineage)
+    work = replace(
+        _conflict_work(publication), expected_merge_sha=REVISION_HEAD, owner_running=owner_running
+    )
+    host.pushed(PRIOR_HEAD)
+    host.second_parent_sha = work.base_sha
+    cluster.preexisting_observation = _job(publication, "succeeded", logs="")
+    await loop.reconcile(work)
+    assert not store.completed and not cluster.applied and not lineage.advances
+    host.pushed(REVISION_HEAD)
+    await loop.reconcile(work)
+    assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
+    assert lineage.advances[0]["head_sha"] == REVISION_HEAD
+    assert not cluster.applied
+
+
+async def test_conflict_job_contract_mismatch_recovers_push_before_charging(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    loop, store, _, cluster, host, _ = _loop(publication, lineage=lineage)
+    work = replace(_conflict_work(publication), expected_merge_sha=REVISION_HEAD)
+    host.pushed(PRIOR_HEAD)
+    host.second_parent_sha = work.base_sha
+    cluster.preexisting_observation = _job(publication, "running", logs="")
+    cluster.apply_error = publication.PublicationResourceError("publication Job contract changed")
+    await loop.reconcile(work)
+    assert store.releases == [PUBLICATION_ID] and not store.retries and not store.completed
+
+    host.pushed(REVISION_HEAD)
+    host.branch_contexts = [
+        publication.PublicationBranchHead(head_sha=PRIOR_HEAD, base_branch="main")
+    ]
+    await loop.reconcile(work)
+    assert cluster.validated_existing
+    assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
+    assert lineage.advances[0]["head_sha"] == REVISION_HEAD
+    assert not store.retries and not cluster.applied
+
+
+@pytest.mark.parametrize("parent", [None, PRIOR_HEAD])
+async def test_conflict_merge_requires_both_verified_parents(
+    publication: Any, parent: str | None
+) -> None:
+    lineage = _Lineage()
+    loop, store, _, _, code_host, _ = _loop(publication, lineage=lineage)
+    work = replace(_conflict_work(publication), expected_merge_sha=REVISION_HEAD)
+    code_host.pushed(REVISION_HEAD)
+    code_host.second_parent_sha = parent
+    await loop.reconcile(work)
+    assert not lineage.advances
+    assert store.retries == [
+        (PUBLICATION_ID, "revision verification returned different merge parents")
+    ]
+
+
+async def test_empty_conflict_work_refuses_without_metadata_or_a_job(publication: Any) -> None:
+    loop, store, credentials, cluster, code_host, _ = _loop(publication)
+    await loop.reconcile(replace(_conflict_work(publication), patch=b"", changed_paths=()))
+    assert code_host.calls == []
+    assert cluster.applied == []
+    assert credentials.calls == []
+    assert store.retries == [(PUBLICATION_ID, "conflict publication requires a non-empty patch")]
+
+
+@pytest.mark.parametrize("phase", ["pending", "running"])
+async def test_ended_merge_owner_waits_for_a_live_push_then_reads_the_final_branch(
+    publication: Any, phase: str
+) -> None:
+    lineage = _Lineage()
+    loop, store, credentials, cluster, code_host, _ = _loop(publication, lineage=lineage)
+    work = replace(
+        _conflict_work(publication), owner_running=False, expected_merge_sha=REVISION_HEAD
+    )
+    code_host.second_parent_sha = work.base_sha
+    code_host.pushed(PRIOR_HEAD)
+    cluster.preexisting_observation = _job(publication, phase)
+    await loop.reconcile(work, allow_launch=False)
+    assert store.releases == [PUBLICATION_ID]
+    assert not store.completed and not store.retries
+    cluster.preexisting_observation = _job(publication, "failed", logs="")
+    code_host.pushed(REVISION_HEAD)
+    await loop.reconcile(work, allow_launch=False)
+    assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
+    assert code_host.requested_merge_parents == [work.base_sha]
+    assert lineage.advances[0]["head_sha"] == REVISION_HEAD
+    assert not credentials.calls and not cluster.applied
+
+
+@pytest.mark.parametrize("recorded, remote", [(None, REVISION_HEAD), (REVISION_HEAD, PRIOR_HEAD)])
+async def test_ended_merge_owner_without_an_exact_push_never_launches(
+    publication: Any, recorded: str | None, remote: str
+) -> None:
+    loop, store, credentials, cluster, code_host, _ = _loop(publication)
+    work = replace(_conflict_work(publication), owner_running=False, expected_merge_sha=recorded)
+    code_host.pushed(remote)
+    await loop.reconcile(work, allow_launch=False)
+    assert store.completed[PUBLICATION_ID] == ("failed", None)
+    assert credentials.calls == [] and cluster.applied == [] and code_host.verify_calls == []
 
 
 def _card_work() -> Any:
@@ -3127,6 +3416,7 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
                 expected_publication_version: int,
                 lease_owner: str,
                 first_parent_sha: str | None,
+                second_parent_sha: str | None = None,
             ) -> None:
                 await durable.mark_lineage_terminal(
                     lineage_id,
@@ -3140,6 +3430,7 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
                     expected_publication_version=expected_publication_version,
                     lease_owner=lease_owner,
                     first_parent_sha=first_parent_sha,
+                    second_parent_sha=second_parent_sha,
                 )
 
         loop, _, credentials, cluster, github, replies = _loop(publication)
@@ -3938,8 +4229,14 @@ async def test_remote_revision_identity_outage_keeps_bounded_uncharged_retries(
     error = "revision identity temporarily unavailable"
 
     def unavailable(
-        publication_id: uuid.UUID, commit_sha: str, *, revision_id: uuid.UUID, expected_parent: str
+        publication_id: uuid.UUID,
+        commit_sha: str,
+        *,
+        revision_id: uuid.UUID,
+        expected_parent: str,
+        expected_second_parent: str | None,
     ) -> Any:
+        assert expected_second_parent is None
         github.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
         raise PublicationIdentityUnavailable(error)
 
@@ -5139,8 +5436,14 @@ async def test_every_revision_verification_site_refuses_a_different_returned_com
         github.pushed(REVISION_HEAD)
 
     def verify(
-        publication_id: uuid.UUID, commit_sha: str, *, revision_id: uuid.UUID, expected_parent: str
+        publication_id: uuid.UUID,
+        commit_sha: str,
+        *,
+        revision_id: uuid.UUID,
+        expected_parent: str,
+        expected_second_parent: str | None,
     ) -> Any:
+        assert expected_second_parent is None
         github.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
         return publication.PublicationRevisionCommit(
             commit_sha="e" * 40 if proof_fault == "different_commit" else commit_sha,
@@ -5176,8 +5479,14 @@ async def test_terminal_pull_verification_refuses_a_different_returned_commit(
     loop, store, _, _, github, _ = _loop(publication)
 
     def verify(
-        publication_id: uuid.UUID, commit_sha: str, *, revision_id: uuid.UUID, expected_parent: str
+        publication_id: uuid.UUID,
+        commit_sha: str,
+        *,
+        revision_id: uuid.UUID,
+        expected_parent: str,
+        expected_second_parent: str | None,
     ) -> Any:
+        assert expected_second_parent is None
         github.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
         return publication.PublicationRevisionCommit(commit_sha="e" * 40, parent_sha="c" * 40)
 
@@ -5496,3 +5805,222 @@ def test_supervisor_rejects_non_positive_batch_limit(publication: Any) -> None:
         publication.PublicationReconcileLoop(
             store=_Store(), reconciler=_RecordingReconciler(), batch_limit=0
         )
+
+
+async def test_ended_owner_recovers_pushed_merge_through_real_publication_api(
+    publication: Any,
+    timeout_recovery_case: tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import timedelta
+
+    from curie_api.config import get_settings
+    from curie_api.crud.publication_queries import get_publication
+    from curie_api.models import (
+        AgentChannel,
+        Approval,
+        ExecutionRequest,
+        Publication,
+        ThreadWorkspace,
+        WorkItem,
+    )
+    from curie_api.routers.publication_code_host import router as code_host_router
+    from curie_api.routers.publications import internal_router
+    from curie_worker.publication_clients import PublicationCredentialClient
+    from fastapi import FastAPI
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from apps.api.tests.forge_fakes import github
+
+    repro, engine, original_id, seeded, _ = timeout_recovery_case
+    repo, branch = seeded["repo"], seeded["branch"]
+    settings = get_settings()
+    monkeypatch.setattr(settings, "internal_worker_token", "example-publisher-token")
+    monkeypatch.setattr(settings, "github_api_url", github.GITHUB_API)
+    monkeypatch.setattr(settings, "github_app_id", github.APP_ID)
+    monkeypatch.setattr(settings, "github_app_private_key", github.PRIVATE_KEY)
+    monkeypatch.setattr(settings, "github_repo_allowlist", (repo,))
+    monkeypatch.setattr(settings, "github_review_ingress_enabled", False)
+    monkeypatch.setattr(github, "REPO", repo)
+    github.fake_installation_tokens(monkeypatch)
+    forge = github.GitHubRepositoryFake()
+    repair_id, owner_id = uuid.uuid4(), uuid.uuid4()
+    now = datetime.now(UTC)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions.begin() as session:
+        original = await get_publication(session, original_id)
+        assert original is not None and original.lineage is not None
+        lineage = original.lineage
+        forge.seed_commit(lineage.base_sha, parents=[], message="Base")
+        forge.branches[branch] = forge.branches["main"] = lineage.base_sha
+        prior_head = forge.push_head(branch, message=f"Change\n\nCurie-Revision: {original_id}")
+        target = forge.push_head("main")
+        pr_number = forge.seed_pull(branch, "main")
+        pr_url = f"https://github.com/{repo}/pull/{pr_number}"
+        original.status = "succeeded"
+        original.patch_bytes = None
+        original.result_url = pr_url
+        original.terminal_at = original.resource_cleanup_completed_at = now.replace(tzinfo=None)
+        binding = AgentChannel(
+            agent_id=lineage.agent_id,
+            kind="slack",
+            address=original.reply_channel,
+            adapter="default",
+        )
+        workspace = ThreadWorkspace(
+            agent_id=lineage.agent_id,
+            conversation_id=lineage.conversation_id,
+            repo_full_name=repo,
+            selected_by="factory",
+            selected_by_deployment_id=lineage.deployment_id,
+        )
+        item = WorkItem(
+            agent_id=lineage.agent_id,
+            conversation_id=lineage.conversation_id,
+            publication_lineage_id=lineage.id,
+            tracker_kind="github",
+            tracker_host="github.com",
+            tracker_scope_id=str(github.REPO_ID),
+            tracker_issue_id="42",
+            code_host_kind="github",
+            code_host_host="github.com",
+            repository_project_id=str(github.REPO_ID),
+            code_host_installation_id=github.INSTALLATION_ID,
+            repository_path=repo,
+        )
+        session.add_all([binding, workspace, item])
+        await session.flush()
+        lineage.binding_id = binding.id
+        lineage.binding_generation = binding.generation
+        lineage.code_host_kind = item.code_host_kind
+        lineage.code_host_host = item.code_host_host
+        lineage.repository_project_id = item.repository_project_id
+        lineage.code_host_installation_id = item.code_host_installation_id
+        lineage.code_host_pr_id = f"PR_fixture_{pr_number}"
+        lineage.base_ref = "main"
+        lineage.pr_number, lineage.pr_url, lineage.head_sha = pr_number, pr_url, prior_head
+        lineage.latest_revision = lineage.version = 2
+        owner = ExecutionRequest(
+            id=owner_id,
+            work_item_id=item.id,
+            sequence=1,
+            status="running",
+            wait_deadline=now,
+            started_at=now,
+            execution_deadline=now + timedelta(minutes=10),
+            execution_attempts=1,
+            runtime_owner="factory",
+            runtime_epoch=1,
+            runtime_heartbeat_expires_at=now + timedelta(minutes=1),
+        )
+        session.add(owner)
+        await session.flush()
+        session.add(
+            Publication(
+                id=repair_id,
+                approval=Approval(
+                    agent_id=lineage.agent_id,
+                    conversation_id=CONVERSATION_ID,
+                    author="requester",
+                    summary="Repair the base conflict",
+                    status="approved",
+                    resolved_by="approver",
+                    resolved_at=now.replace(tzinfo=None),
+                    purpose="publication",
+                    dedupe_key=f"repair-{repair_id}",
+                    reply_kind=original.reply_kind,
+                    reply_channel=original.reply_channel,
+                ),
+                execution_request_id=owner.id,
+                deployment_id=original.deployment_id,
+                workspace_conversation_id=lineage.conversation_id,
+                lineage=lineage,
+                revision_number=lineage.latest_revision,
+                publication_mode="base_conflict_merge",
+                expected_prior_head=prior_head,
+                base_sha=target,
+                repo_full_name=repo,
+                status="approved",
+                patch_bytes=b"diff --git a/README.md b/README.md\n",
+                changed_paths=["README.md"],
+                title=original.title,
+                body=original.body,
+                reply_kind=original.reply_kind,
+                reply_channel=original.reply_channel,
+                approval_card_reported_at=now.replace(tzinfo=None),
+            )
+        )
+
+    prepare_store = PostgresPublicationStore(engine, schema="curie", lease_owner="preparer")
+    prepare = await prepare_store.claim_next()
+    assert prepare is not None and prepare.publication_id == repair_id and prepare.owner_running
+    merge = REVISION_HEAD
+    await prepare_store.record_expected_merge_sha(
+        repair_id, version=prepare.version, commit_sha=merge
+    )
+    forge.seed_commit(
+        merge, parents=[prior_head, target], message=f"Repair\n\nCurie-Revision: {repair_id}"
+    )
+    forge.branches[branch] = merge
+    async with sessions.begin() as session:
+        ended = await session.get(ExecutionRequest, owner_id)
+        assert ended is not None
+        ended.status, ended.terminal_at, ended.terminal_cause = "completed", now, "completed"
+        ended.runtime_owner = ended.runtime_heartbeat_expires_at = None
+
+    store = PostgresPublicationStore(engine, schema="curie", lease_owner="recovery-worker")
+    recovery = await store.claim_next()
+    assert recovery is not None and recovery.publication_id == repair_id
+    assert not recovery.owner_running and recovery.expected_merge_sha == merge
+    cluster = _Cluster(publication)
+    app = FastAPI()
+    app.include_router(code_host_router)
+    app.include_router(internal_router)
+    app.state.sessionmaker = sessions
+    responses: dict[str, httpx.Response] = {}
+
+    async def record(response: httpx.Response) -> None:
+        await response.aread()
+        responses[response.request.url.path.rsplit("/", 1)[-1]] = response
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(forge.handle)) as external,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="https://publication.example.com",
+            event_hooks={"response": [record]},
+        ) as api,
+    ):
+        app.state.http_client = external
+        clients = dict(api_base_url=str(api.base_url), worker_token=settings.internal_worker_token)
+        loop = publication.PublicationReconciler(
+            store=store,
+            cluster=cluster,
+            credentials=PublicationCredentialClient(client=api, **clients),
+            code_host=PublicationCodeHostClient(client=api, **clients),
+            lineage=PublicationLineageClient(client=api, **clients),
+            replies=_Replies(),
+            transcript=_Transcript(),
+            job_settings=repro._JOB_SETTINGS,
+        )
+        await loop.reconcile(recovery)
+
+    assert "credential" not in responses
+    assert cluster.applied == [] and forge.writes == 0
+    assert cluster.observed == [publication.publication_resource_names(repair_id).job]
+    assert list(responses) == ["branch-head", "revision-commit", "pull-request", "lineage"]
+    assert responses["revision-commit"].json() == {
+        "commit_sha": merge,
+        "parent_sha": prior_head,
+        "second_parent_sha": target,
+    }
+    assert responses["lineage"].status_code == 200, responses["lineage"].text
+    async with sessions() as session:
+        stored = await get_publication(session, repair_id)
+        assert stored is not None and stored.lineage is not None
+        assert stored.status == "succeeded" and stored.patch_bytes is None
+        assert stored.expected_merge_sha == stored.lineage.head_sha == merge
+        assert stored.result_url == stored.lineage.pr_url == pr_url
+        assert stored.lineage.version == recovery.lineage_version + 1
+        assert stored.lineage.latest_revision == recovery.revision_number
+    assert await store.claim_next() is None

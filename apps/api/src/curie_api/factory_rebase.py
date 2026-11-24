@@ -551,3 +551,121 @@ async def describe_changed_paths(
             raise RebaseRefused("invalid_paths") from None
 
     return await _run(snapshot, credential, describe)
+
+
+def _check_conflict_refs(git: _Git, previous_tip: str | None = None) -> str:
+    snapshot = git.snapshot
+    head = _head_ref(snapshot.branch)
+    target = _head_ref(snapshot.target_ref)
+    _, output = git.command("ls-remote", "--refs", git.clone_url, head, target)
+    refs = output.splitlines()
+    if f"{_sha(snapshot.old_head_sha)}\t{head}".encode() not in refs:
+        raise RebaseRefused("head_changed")
+    observed = [line.split(b"\t", 1)[0] for line in refs if line.endswith(b"\t" + target.encode())]
+    if len(observed) != 1:
+        raise RebaseRefused("target_changed")
+    tip = _sha(observed[0].decode("ascii"))
+    if tip == previous_tip:
+        return tip
+    # Some smart HTTP servers serve only advertised tips. Their complete
+    # histories include every ancestor needed for the pinned comparison.
+    git.fetch(snapshot.old_head_sha, tip)
+    if tip != snapshot.target_sha.lower():
+        present, _ = git.command("cat-file", "-e", snapshot.target_sha, check=False)
+        if present:
+            raise RebaseRefused("target_changed")
+        code, _ = git.command("merge-base", "--is-ancestor", snapshot.target_sha, tip, check=False)
+        if code == 1:
+            raise RebaseRefused("target_changed")
+        if code:
+            raise RebaseRefused("invalid_ancestry")
+    return tip
+
+
+def _text_conflict_paths(git: _Git, base: str, target: str, head: str) -> tuple[str, ...]:
+    code, output = git.command(
+        f"--attr-source={target}",
+        "merge-tree",
+        "--write-tree",
+        "--messages",
+        "-z",
+        target,
+        head,
+        check=False,
+    )
+    if code == 0:
+        raise RebaseRefused("no_conflict")
+    if code != 1:
+        raise RebaseRefused("git_failed")
+
+    # merge-tree -z emits the tree, unmerged index stages, then typed messages.
+    stages, separator, messages = output.partition(b"\0\0")
+    if not separator:
+        raise RebaseRefused("unsupported_conflict")
+    versions: dict[bytes, dict[bytes, bytes]] = {}
+    modes: dict[bytes, bytes] = {}
+    for row in stages.split(b"\0")[1:]:
+        metadata, _, name = row.partition(b"\t")
+        fields = metadata.split()
+        if not name or len(fields) != 3:
+            raise RebaseRefused("unsupported_conflict")
+        mode, blob, stage = fields
+        if mode not in {b"100644", b"100755"} or mode != modes.setdefault(name, mode):
+            raise RebaseRefused("unsupported_conflict")
+        versions.setdefault(name, {})[stage] = blob
+
+    conflicts = set()
+    records = iter(messages.removesuffix(b"\0").split(b"\0"))
+    for count in records:
+        name, kind, message = next(records, b""), next(records, b""), next(records, b"")
+        if count != b"1" or not message or kind not in {b"Auto-merging", b"CONFLICT (contents)"}:
+            raise RebaseRefused("unsupported_conflict")
+        if kind == b"CONFLICT (contents)":
+            conflicts.add(name)
+    if not conflicts or conflicts != versions.keys():
+        raise RebaseRefused("unsupported_conflict")
+
+    paths = []
+    for name in sorted(conflicts):
+        try:
+            path = name.decode("utf-8")
+        except UnicodeError:
+            raise RebaseRefused("invalid_paths") from None
+        entries = versions[name]
+        if entries.keys() != {b"1", b"2", b"3"}:
+            raise RebaseRefused("unsupported_conflict")
+        # A rename can carry a content conflict to a new path. Each stage must
+        # come from this exact path in the merge base and both recorded tips.
+        code, blobs = git.command(
+            "rev-parse", f"{base}:{path}", f"{target}:{path}", f"{head}:{path}", check=False
+        )
+        if code or blobs.splitlines() != [entries[b"1"], entries[b"2"], entries[b"3"]]:
+            raise RebaseRefused("unsupported_conflict")
+        paths.append(path)
+    return tuple(paths)
+
+
+async def inspect_same_base_conflicts(
+    snapshot: RebaseSnapshot, credential: IssuedCredential
+) -> tuple[str, ...]:
+    """Inspect conflict paths for an advance of the caller-bound original target ref."""
+
+    def inspect(git: _Git) -> tuple[str, ...]:
+        old_base = _sha(snapshot.old_base_sha)
+        head = _sha(snapshot.old_head_sha)
+        target = _sha(snapshot.target_sha)
+        git.initialize()
+        tip = _check_conflict_refs(git)
+        code, bases = git.command("merge-base", "--all", target, head, check=False)
+        ancestors = bases.splitlines()
+        if code or len(ancestors) != 1:
+            raise RebaseRefused("invalid_ancestry")
+        base = _sha(ancestors[0].decode("ascii"))
+        if base in {target, head}:
+            raise RebaseRefused("invalid_ancestry")
+        git.require_ancestor(old_base, base)
+        paths = _text_conflict_paths(git, base, target, head)
+        _check_conflict_refs(git, previous_tip=tip)
+        return paths
+
+    return await _run(snapshot, credential, inspect)

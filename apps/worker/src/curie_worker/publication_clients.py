@@ -385,21 +385,26 @@ class PublicationCodeHostClient:
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
+        expected_second_parent: str | None,
     ) -> PublicationRevisionCommit:
+        body: dict[str, object] = {
+            "commit_sha": commit_sha,
+            "revision_id": str(revision_id),
+            "expected_parent": expected_parent,
+        }
+        if expected_second_parent is not None:
+            body["expected_second_parent"] = expected_second_parent
         response = await self._call(
             "POST",
             self._url(publication_id, "revision-commit"),
             "revision verification",
-            body={
-                "commit_sha": commit_sha,
-                "revision_id": str(revision_id),
-                "expected_parent": expected_parent,
-            },
+            body=body,
         )
         try:
             data = response.json()
             observed = data["commit_sha"]
             parent_sha = data["parent_sha"]
+            second_parent_sha = data.get("second_parent_sha")
         except (KeyError, TypeError, ValueError) as exc:
             raise PublicationReconcileError("revision verification response was unusable") from exc
         if observed != commit_sha:
@@ -413,7 +418,16 @@ class PublicationCodeHostClient:
             raise PublicationReconcileError(
                 "revision verification returned an invalid commit proof"
             )
-        return PublicationRevisionCommit(commit_sha=observed, parent_sha=parent_sha)
+        if second_parent_sha != expected_second_parent or (
+            expected_second_parent is not None
+            and (_SHA.fullmatch(expected_second_parent) is None or parent_sha != expected_parent)
+        ):
+            raise PublicationReconcileError(
+                "revision verification returned different merge parents"
+            )
+        return PublicationRevisionCommit(
+            commit_sha=observed, parent_sha=parent_sha, second_parent_sha=second_parent_sha
+        )
 
     async def update_pull_request_metadata(self, publication_id: uuid.UUID) -> PublicationPullState:
         """Apply a metadata-only revision to its stored pull request, through the API."""

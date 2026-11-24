@@ -283,6 +283,7 @@ class PublicationOut(BaseModel):
     lineage_id: uuid.UUID | None
     revision_number: int | None
     expected_prior_head: str | None
+    publication_mode: Literal["base_conflict_merge"] | None = None
     lineage_base_sha: str | None
     lineage_head_sha: str | None
     lineage_state: Literal["open", "merged", "closed"] | None
@@ -348,11 +349,13 @@ class PublicationRevisionVerify(BaseModel):
     commit_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)
     revision_id: uuid.UUID
     expected_parent: str = Field(pattern=_COMMIT_SHA_PATTERN)
+    expected_second_parent: str | None = Field(default=None, pattern=_COMMIT_SHA_PATTERN)
 
 
 class PublicationRevisionOut(BaseModel):
     commit_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)
     parent_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)
+    second_parent_sha: str | None = Field(default=None, pattern=_COMMIT_SHA_PATTERN)
 
 
 class PublicationPullRecover(BaseModel):
