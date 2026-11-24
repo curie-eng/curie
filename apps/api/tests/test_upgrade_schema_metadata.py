@@ -95,6 +95,10 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     assert revisions["0196"]["kind"] == "expand"
     assert revisions["0191"]["parents"] == ["0196"]
     assert revisions["0191"]["kind"] == "expand"
+    assert revisions["0194"]["parents"] == ["0191"]
+    assert revisions["0194"]["kind"] == "expand"
+    assert revisions["0195"]["parents"] == ["0194"]
+    assert revisions["0195"]["kind"] == "expand"
     for revision in graph.walk_revisions():
         parent = revision.down_revision
         parents = list(parent) if isinstance(parent, (list, tuple)) else [parent] if parent else []

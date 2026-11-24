@@ -954,15 +954,14 @@ class PostgresFactorySlackStore:
             )
         if self.public_role and work.kind == "maintenance":
             async with self._engine.connect() as connection:
-                event = (
-                    await connection.execute(
-                        text(f"""
-                            SELECT outcome, reason FROM {self._maintenance_events}
-                             WHERE work_item_id = :item AND id = :event
-                        """),
-                        {"item": work.work_item_id, "event": int(work.post_key.split(":", 1)[1])},
-                    )
-                ).mappings().one()
+                result = await connection.execute(
+                    text(f"""
+                        SELECT outcome, reason FROM {self._maintenance_events}
+                         WHERE work_item_id = :item AND id = :event
+                    """),
+                    {"item": work.work_item_id, "event": int(work.post_key.split(":", 1)[1])},
+                )
+                event = result.mappings().one()
             if event["outcome"] == "green":
                 return "CI checks passed."
             if event["outcome"] == "no_ci":

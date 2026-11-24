@@ -66,6 +66,21 @@ def test_tracker_public_run_isolated_from_legacy_senders(
     )
     assert all(marker not in call.haystack for call in stack.slack.calls)
     assert _rows("SELECT work_item_id FROM curie.factory_slack_threads") == []
+    lineage, _ = stack.own_pull_request(item, 8012)
+    private_head = "fa" * 20
+    _rows(
+        """
+        INSERT INTO curie.factory_maintenance_events
+               (work_item_id, lineage_id, source_request_id, head_sha, reason, outcome)
+        VALUES (:item, :lineage, :request, :head, 'late_ci_red', 'green')
+        """,
+        {"item": item, "lineage": lineage, "request": request, "head": private_head},
+    )
+    assert stack.client.portal.call(run)
+    assert stack.client.portal.call(run)
+    messages = stack.slack.thread_posts(stack.factory_token, root_ts)
+    assert [m.text for m in messages].count("CI checks passed.") == 1
+    assert all(private_head not in m.text for m in messages)
     assert _rows("SELECT kind FROM curie.factory_slack_posts") == []
     assert _rows("SELECT DISTINCT payload FROM curie.factory_slack_public_posts") == [
         {"payload": {}}

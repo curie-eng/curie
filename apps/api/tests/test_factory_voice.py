@@ -42,7 +42,7 @@ from curie_api.main import create_app
 from curie_api.models import DEFAULT_TENANT_ID, Agent, FactoryVoiceDraft, WorkItem
 from factory_run_support import _run
 from factory_voice_fakes import FixtureVoiceRecognizer
-from sqlalchemy import Connection, Engine, delete, event, select, text, update
+from sqlalchemy import Connection, Engine, delete, event, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 
@@ -169,12 +169,12 @@ async def setup_voice(
     sessions: async_sessionmaker[AsyncSession],
 ) -> tuple[VoiceDraftService, Provider, Recognizer]:
     async with sessions.begin() as session:
-        agent = Agent(name="voice-example")
-        session.add(agent)
-        await session.flush()
+        agent_id = (
+            await session.execute(insert(Agent).values(name="voice-example").returning(Agent.id))
+        ).scalar_one()
         item = WorkItem(
             tenant_id=DEFAULT_TENANT_ID,
-            agent_id=agent.id,
+            agent_id=agent_id,
             conversation_id="voice-example",
             tracker_kind="github",
             tracker_host="github.com",
