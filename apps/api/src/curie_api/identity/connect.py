@@ -102,7 +102,12 @@ async def configured_provider(
     return config if synced is not None else None
 
 
-async def connect_issuer(session: AsyncSession, tenant_id: uuid.UUID) -> str | None:
+async def connect_issuer(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    allow_personal_issuer: bool = True,
+) -> str | None:
     try:
         await principal_authority.lock_scope(session, tenant_id)
     except principal_authority.PrincipalAuthorityRefusal:
@@ -117,6 +122,10 @@ async def connect_issuer(session: AsyncSession, tenant_id: uuid.UUID) -> str | N
     # when a snapshot becomes unavailable or its authority is disabled.
     if await session.get(TenantIdentityProvider, tenant_id) is not None:
         return None
+    # Validation of a token already issued keeps the console issuer. New
+    # issuance opts in through issue_for_sender; ordinary admission does not.
+    if not allow_personal_issuer:
+        return None
     return settings.oidc_issuer
 
 
@@ -127,6 +136,7 @@ async def issue_for_sender(
     provider: str,
     channel_identity: str,
     slack: SlackEvidence | None,
+    allow_personal_issuer: bool = False,
 ) -> str | None:
     resolution = await resolve_principal(
         session,
@@ -141,7 +151,9 @@ async def issue_for_sender(
     native_id = slack.user_id
     if native_id is None:
         return None
-    issuer = await connect_issuer(session, tenant_id)
+    issuer = await connect_issuer(
+        session, tenant_id, allow_personal_issuer=allow_personal_issuer
+    )
     namespace = await session.scalar(
         select(IdentityNamespace)
         .where(
