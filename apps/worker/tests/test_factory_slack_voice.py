@@ -6,16 +6,21 @@ import asyncio
 import hashlib
 import itertools
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
 from curie_api.factory_slack_voice import verified_request
 from curie_api.schemas.workitems import FactorySlackSteerIn
+from curie_channel_gateway.slack.identities import delivery_key, minted_adapter
 from curie_internal.slack_mention_receipt import (
     FACTORY_VOICE_TURN,
     SlackMentionReceipt,
     receipt_key,
+    voice_source_key,
 )
+from curie_internal.turn_queue import enqueue, from_stream_fields
 from curie_worker.factory_slack_voice import VOICE_PATH, decide_voice_receipt, voice_status
 from curie_worker.factory_steering import KICKOFF_PATH, STEER_PATH, SteeringUnavailable
 
@@ -30,9 +35,15 @@ from apps.api.tests.test_factory_slack_runtime import (
     TEAM,
     SteeringStack,
     _assert_no_sandbox,
+    _reached_sandbox,
 )
 from apps.api.tests.test_factory_slack_runtime import steering as steering
-from apps.worker.tests.test_factory_steering import _card_client, _card_turn, _deliver_envelope
+from apps.worker.tests.test_factory_steering import (
+    DM_CHANNEL,
+    _card_client,
+    _card_turn,
+    _deliver_envelope,
+)
 
 
 @pytest.mark.parametrize(
@@ -85,6 +96,8 @@ def test_unavailable_or_malformed_voice_status_leaves_the_turn_pending(
 def test_worker_sends_only_its_bound_receipt_on_voice_replay(
     verb: str, status: dict[str, str]
 ) -> None:
+    from curie_worker.factory_slack_voice import matches_voice_receipt
+
     turn = _card_turn(None)
     turn = replace(turn, qevent=turn.qevent.model_copy(update={"text": FACTORY_VOICE_TURN}))
     private_text = f"<@{FACTORY_BOT_USER}> {verb}"
@@ -119,6 +132,7 @@ def test_worker_sends_only_its_bound_receipt_on_voice_replay(
 
     async def exercise() -> None:
         async with client._client:
+            assert matches_voice_receipt(receipt, turn)
             for _ in range(2):
                 response = await decide_voice_receipt(
                     client, turn, receipt, deadline=None, record_intent=record_intent
@@ -133,10 +147,10 @@ def test_worker_sends_only_its_bound_receipt_on_voice_replay(
                 receipt.model_copy(update={"root_ts": receipt.message_ts}),
                 receipt.model_copy(update={"delivery_id": "EvOTHER"}),
             ):
-                refusal = await decide_voice_receipt(
-                    client, turn, invalid, deadline=None, record_intent=record_intent
-                )
-                assert not refusal.admitted
+                assert not matches_voice_receipt(invalid, turn)
+            if receipt.version == 1:
+                invalid = receipt.model_copy(update={"body": f"<@{FACTORY_BOT_USER}> edit prose"})
+                assert not matches_voice_receipt(invalid, turn)
 
     asyncio.run(exercise())
     assert intent == [0, 1]
@@ -147,8 +161,71 @@ def test_worker_sends_only_its_bound_receipt_on_voice_replay(
     assert FACTORY_VOICE_TURN not in str(body)
 
 
+@pytest.mark.parametrize("channel", [CHANNEL, DM_CHANNEL], ids=["unmapped", "dm"])
+def test_literal_voice_marker_remains_ordinary_chat(steering: SteeringStack, channel: str) -> None:
+    actor = steering.person().slack_user
+    since = len(steering.k8s.requests)
+    if channel == DM_CHANNEL:
+        bound = steering.client.post(
+            f"/agents/{steering.agent_id}/channels",
+            headers=steering.platform,
+            json={"kind": "slack", "address": channel, "adapter": steering.identity},
+        )
+        assert bound.status_code == 201, bound.text
+    delivery_id = delivery_key("EvEXAMPLE1", steering.identity)
+    turn = QueuedTurn(
+        event_id=delivery_id,
+        conversation_id="1800000901.000001",
+        author=actor,
+        text=FACTORY_VOICE_TURN,
+        source=TurnSource.SLACK,
+        reply_handle=ReplyHandle(
+            kind="slack",
+            channel=channel,
+            placeholder=None,
+            adapter=minted_adapter(steering.identity),
+        ),
+        received_at=datetime.now(UTC).isoformat(),
+    )
+    entry_id = enqueue(steering.valkey, steering.dispatcher_config, turn)
+    ((_, fields),) = steering.valkey.xrange(steering.names["stream"], min=entry_id, max=entry_id)
+    assert from_stream_fields(fields).text == FACTORY_VOICE_TURN
+
+    assert steering.consume() == entry_id
+    assert _reached_sandbox(steering, since)
+    assert all(
+        path not in {VOICE_PATH, STEER_PATH, KICKOFF_PATH}
+        for path, _, _ in steering.api_hop.exchanges
+    )
+    assert steering.valkey_hop.touched(receipt_key(delivery_id)) == []
+
+
+def test_literal_voice_marker_uses_ordinary_steering_in_a_mapped_thread(
+    steering: SteeringStack,
+) -> None:
+    run = steering.open_steered_run()
+    actor = steering.person().slack_user
+    delivery = steering.queued_mention(actor, FACTORY_VOICE_TURN, thread_ts=run.root_ts)
+    ((entry_id, fields),) = steering.valkey.xrevrange(steering.names["stream"], count=1)
+    key = receipt_key(delivery.delivery_id)
+    assert from_stream_fields(fields).text == FACTORY_VOICE_TURN
+    receipt = SlackMentionReceipt.model_validate_json(steering.valkey.get(key))
+    assert receipt.version == 1 and receipt.bot_user_id is None
+
+    assert steering.consume() == entry_id
+    ((status, answer),) = steering.api_hop.steer_answers()
+    assert status == 200 and answer["outcome"] == "admitted"
+    assert len(steering.requests()) == 2
+    assert all(path != VOICE_PATH for path, _, _ in steering.api_hop.exchanges)
+    assert steering.valkey_hop.touched(key) == [["GET", key]]
+    _assert_no_sandbox(steering)
+
+
 def test_only_a_mapped_clip_receipt_reaches_the_voice_route(steering: SteeringStack) -> None:
     """Local Socket Mode replay through the real worker and the default-disabled API."""
+    steering.dispatcher_config = steering.dispatcher_config.model_copy(
+        update={"factory_voice_enabled": True}
+    )
     run = steering.open_steered_run()
     actor = steering.person().slack_user
     known_requests = {row["id"] for row in steering.requests()}
@@ -168,16 +245,17 @@ def test_only_a_mapped_clip_receipt_reaches_the_voice_route(steering: SteeringSt
     }
 
     def deliver(
-        root_ts: str,
         text: str,
         *,
         files: list[dict[str, Any]] | None = None,
         expire: bool = False,
+        mismatch: bool = False,
+        queued: bool = True,
     ) -> None:
         event: dict[str, Any] = {
             "type": "app_mention",
             "channel": CHANNEL,
-            "thread_ts": root_ts,
+            "thread_ts": run.root_ts,
             "ts": f"1800000999.{next(ticks):06d}",
             "user": actor,
             "user_team": TEAM,
@@ -187,31 +265,62 @@ def test_only_a_mapped_clip_receipt_reaches_the_voice_route(steering: SteeringSt
         if files is not None:
             event.update(subtype="file_share", files=files)
         delivery = _deliver_envelope(steering, event)
+        key = receipt_key(delivery.delivery_id)
+        if not queued:
+            assert delivery.placeholder is None
+            assert steering.valkey.get(key) is None
+            assert steering.consume() is None
+            return
+        ((_, fields),) = steering.valkey.xrevrange(steering.names["stream"], count=1)
+        assert from_stream_fields(fields).text == FACTORY_VOICE_TURN
+        receipt = SlackMentionReceipt.model_validate_json(steering.valkey.get(key))
+        if files is not None:
+            assert receipt.version == 3 and receipt.team_id and receipt.api_app_id
+            steering.base.doomed_keys.append(
+                voice_source_key(
+                    receipt.channel_identity,
+                    receipt.team_id,
+                    receipt.api_app_id,
+                    receipt.channel,
+                    receipt.root_ts,
+                    receipt.message_ts,
+                )
+            )
+        else:
+            assert receipt.version == 1 and receipt.bot_user_id == FACTORY_BOT_USER
         if expire:
-            assert steering.valkey.delete(receipt_key(delivery.delivery_id))
+            assert steering.valkey.delete(key)
+        if mismatch:
+            assert receipt.version == 3
+            changed = receipt.model_copy(update={"delivery_id": "EvOTHER"})
+            assert steering.valkey.set(key, changed.model_dump_json(), keepttl=True)
         assert steering.consume() is not None
         assert steering.is_terminal(delivery.delivery_id)
+        assert steering.valkey_hop.touched(key) == [["GET", key]]
         assert delivery.placeholder is not None
         placeholder_texts = steering.placeholder_texts(delivery.placeholder)
         assert placeholder_texts and text not in placeholder_texts[-1]
+        if not expire and not mismatch:
+            assert placeholder_texts[-1] == "Voice feedback is disabled on this installation."
 
     start = len(steering.api_hop.exchanges)
-    deliver(run.root_ts, "Expired clip.", files=[file], expire=True)
-    deliver(run.root_ts, "Wrong uploader.", files=[{**file, "user": "U0EXAMPLE8"}])
-    deliver("1800000900.000333", "Unmapped thread.", files=[file])
+    deliver("Expired clip.", files=[file], expire=True)
+    deliver("Mismatched receipt.", files=[file], mismatch=True)
+    deliver("Wrong uploader.", files=[{**file, "user": "U0EXAMPLE8"}], queued=False)
     assert all(
         path not in {VOICE_PATH, STEER_PATH, KICKOFF_PATH}
         for path, _, _ in steering.api_hop.exchanges[start:]
     )
-    deliver(run.root_ts, "A recorded suggestion.", files=[file])
-    deliver(run.root_ts, "edit abcd1234ef01.1 Keep the timeout.")
-    deliver(run.root_ts, "confirm abcd1234ef01.2")
+    deliver("A recorded suggestion.", files=[file])
+    deliver("edit abcd1234ef01.1 Keep the timeout.")
+    deliver("confirm abcd1234ef01.2")
+    deliver("reject abcd1234ef01.2")
     answers = [
         (path, status, body)
         for path, status, body in steering.api_hop.exchanges[start:]
         if path in {VOICE_PATH, STEER_PATH, KICKOFF_PATH}
     ]
-    assert len(answers) == 3
+    assert len(answers) == 4
     assert all(
         path == VOICE_PATH
         and status == 200

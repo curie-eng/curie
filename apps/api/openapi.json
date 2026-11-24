@@ -18873,6 +18873,36 @@
         "title": "SlackReportOut",
         "type": "object"
       },
+      "SlackRootIn": {
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Channel",
+            "type": "string"
+          },
+          "channel_identity": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Channel Identity",
+            "type": "string"
+          },
+          "root_ts": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Root Ts",
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel_identity",
+          "channel",
+          "root_ts"
+        ],
+        "title": "SlackRootIn",
+        "type": "object"
+      },
       "SourceBindingConfig": {
         "additionalProperties": false,
         "description": "How one hook maps a workload identity onto a coding target (#2572).",
@@ -31255,6 +31285,67 @@
           }
         },
         "summary": "Check Admission",
+        "tags": [
+          "channels"
+        ]
+      }
+    },
+    "/channels/factory-slack/mapped-root": {
+      "post": {
+        "description": "Check whether a Socket Mode receiver's thread belongs to a factory run.",
+        "operationId": "is_factory_slack_root_channels_factory_slack_mapped_root_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SlackRootIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Is Factory Slack Root Channels Factory Slack Mapped Root Post",
+                  "type": "boolean"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Is Factory Slack Root",
         "tags": [
           "channels"
         ]

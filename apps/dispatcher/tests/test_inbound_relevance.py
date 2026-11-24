@@ -447,6 +447,7 @@ class Row:
     caller_list: tuple[str, tuple[str, ...]] | None = None
     #: ADR 0175: the fake platform API answers every admission question 503.
     api_down: bool = False
+    mapped_voice_root_status: int | None = None
     #: #4960: channels whose mentions are delivery canaries for this row.
     canary_channels: tuple[str, ...] = ()
 
@@ -1008,6 +1009,28 @@ MATRIX: tuple[Row, ...] = (
         dedupe_id="Ev-api-down",
     ),
     Row(
+        name="voice_candidate_while_the_mapping_api_cannot_answer",
+        expected=DropReason.VOICE_MAPPING_UNAVAILABLE,
+        why="A voice candidate must wait for a definitive mapping answer before the claim.",
+        request=_events_api_request(
+            "env-voice-mapping-down", "EvVoiceMappingDown",
+            _mention(text="<@U0BOT> confirm abcdef012345.4", thread_ts="1700.0000"),
+        ),
+        mapped_voice_root_status=503,
+        dedupe_id="EvVoiceMappingDown",
+    ),
+    Row(
+        name="mapped_voice_candidate_without_receiving_app_attestation",
+        expected=DropReason.INVALID_VOICE_MENTION,
+        why="A mapped candidate without a verified receipt cannot produce a voice turn.",
+        request=_events_api_request(
+            "env-voice-unverified", "EvVoiceUnverified",
+            _mention(text="<@U0BOT> confirm abcdef012345.4", thread_ts="1700.0000"),
+        ),
+        mapped_voice_root_status=200,
+        dedupe_id="EvVoiceUnverified",
+    ),
+    Row(
         name="mention_in_a_delivery_canary_channel",
         expected=DropReason.DELIVERY_CANARY,
         why=(
@@ -1061,6 +1084,10 @@ def test_every_inbound_payload_is_enqueued_or_refused_with_a_named_reason(
         config = config.model_copy(
             update={"slack_delivery_canary_channels": row.canary_channels}
         )
+    if row.mapped_voice_root_status is not None:
+        config = config.model_copy(update={"factory_voice_enabled": True})
+        admission_api.mapped_roots.add(("default", "C123", "1700.0000"))
+        admission_api.mapped_root_status = row.mapped_voice_root_status
 
     before = len(_stream_entries(redis_client, config))
     harness = _build_harness(config, redis_client)

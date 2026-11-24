@@ -395,6 +395,26 @@ def voice_thread(steering, monkeypatch):
         )
 
 
+def test_gateway_can_check_only_the_exact_mapped_root_with_its_platform_key(steering):
+    run = steering.open_steered_run()
+    path = "/channels/factory-slack/mapped-root"
+    root = {
+        "channel_identity": steering.identity, "channel": runtime.CHANNEL, "root_ts": run.root_ts
+    }
+
+    assert steering.client.post(path, json=root).status_code == 401
+    for changes, expected in (
+        ({}, True),
+        ({"channel_identity": "another-app"}, False),
+        ({"channel": "C0OTHER"}, False),
+        ({"root_ts": "1800000009.000009"}, False),
+    ):
+        response = steering.client.post(path, json={**root, **changes}, headers=steering.platform)
+        assert response.status_code == 200, response.text
+        assert response.json() is expected
+        assert response.headers["cache-control"] == "no-store"
+
+
 def test_enabled_voice_route_commits_only_confirmed_feedback(
     steering, voice_thread: VoiceThread
 ) -> None:

@@ -292,6 +292,10 @@ def test_source_index_requires_the_live_original_receipt(valkey: redis.Redis) ->
     assert write_receipt(valkey, receipt, ttl_s=60)
     try:
         assert asyncio.run(read(**scope)) == receipt
+        redelivery = receipt.model_copy(update={"delivery_id": f"Ev0EXAMPLE{uuid.uuid4().hex}"})
+        assert not write_receipt(valkey, redelivery, ttl_s=60)
+        assert valkey.get(receipt_key(redelivery.delivery_id)) is None
+        assert asyncio.run(read(**scope)) == receipt
         other_message = receipt.model_copy(update={"message_ts": "1800000000.000002"})
         assert not write_receipt(valkey, other_message, ttl_s=60)
         other_scope = {**scope, "message_ts": other_message.message_ts}

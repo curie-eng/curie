@@ -70,8 +70,11 @@ def voice_reply_text(raw_text: str, bot_user_id: str) -> str | None:
 
 
 _STORE_VOICE_SOURCE = """
+if redis.call('EXISTS', KEYS[2]) == 1 then
+    return 0
+end
 if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[3]) then
-    redis.call('SET', KEYS[2], ARGV[2], 'NX', 'EX', ARGV[3])
+    redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
     return 1
 end
 return 0
@@ -208,7 +211,7 @@ async def read_voice_source_receipt(
 
 
 def write_receipt(redis: Redis, receipt: SlackMentionReceipt, *, ttl_s: int) -> bool:
-    """Store ``receipt`` once; False when a receipt for the delivery already exists."""
+    """Store ``receipt`` once; False if the delivery or its voice source already has a receipt."""
 
     if ttl_s <= 0:
         raise ValueError("mention receipt TTL must be positive")

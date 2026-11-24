@@ -130,27 +130,13 @@ def derive_attachments(event: dict[str, Any]) -> list[Attachment]:
     return refs
 
 
-def requires_voice_receipt(event: dict[str, Any]) -> bool:
-    """Reserve uncertain and audio-shaped uploads for the voice receipt decision."""
-    if "files" not in event:
-        return False
-    files = event["files"]
-    if not isinstance(files, list) or len(files) > _MAX_ATTACHMENTS:
-        return True
-    for entry in files:
-        if not isinstance(entry, dict):
-            return True
-        mime = _non_blank_str(entry.get("mimetype"))
-        if (
-            mime is None
-            or mime.lower().startswith("audio/")
-            or entry.get("subtype") == "slack_audio"
-            or entry.get("media_display_type") in ("audio", "slack_audio")
-            or entry.get("file_access", "visible") != "visible"
-            or "audio_wave_samples" in entry
-        ):
-            return True
-    return False
+def has_native_voice_clip(event: dict[str, Any]) -> bool:
+    """Identify the explicit native subtype among the files intake can reference."""
+    files = event.get("files")
+    return isinstance(files, list) and any(
+        isinstance(entry, dict) and entry.get("subtype") == "slack_audio"
+        for entry in files[:_MAX_ATTACHMENTS]
+    )
 
 
 def hosted_voice_clip_id(event: dict[str, Any]) -> str | None:

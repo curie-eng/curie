@@ -5388,7 +5388,9 @@ to verify its app identity, `files:read` to read the clip, and `chat:write` to
 deliver the draft. Reading the original message also requires the channel's
 history scope (`channels:history` for a public channel or `groups:history`
 for a private channel). Curie checks the sender's linked identity and current
-factory feedback permissions before retrieving any bytes.
+factory feedback permissions before retrieving any bytes. When Slack omits the
+duration, the gateway still caps the download at the smaller of its file limit
+and 10 MiB. The decoder enforces the five-minute limit before recognition.
 
 When the transcript arrives, mention the same app in the same thread with
 `confirm <code>` to submit the displayed text, `reject <code>` to close the
@@ -5397,6 +5399,9 @@ produces a new code. Only the original author can confirm it. A queued
 acknowledgement means the factory has accepted guidance. An applied
 acknowledgement identifies guidance consumed by an execution.
 
-Local replay exercises the assumed native clip file object. The event Slack
-delivers for a native clip with an app mention, its download fields, and the
-installed app's access to those bytes still require live verification.
+A deployed local Socket Mode replay transcribed a WebM clip and applied one
+confirmed Retry label edit to the same pull request, preserving the timeout.
+The WAV case exercised silence refusal. The AAC case exercised expiration of
+the source receipt without checking its transcript. Live Slack delivery with
+an app mention, the download fields, native clip encoding and workspace
+permissions remain unverified.

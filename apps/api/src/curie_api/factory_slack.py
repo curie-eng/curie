@@ -386,21 +386,23 @@ async def _linked_code_host(
     return code_host, links[0]
 
 
-async def _mapping(session: AsyncSession, source: _Source) -> tuple[uuid.UUID, str] | None:
+async def mapped_slack_root(
+    session: AsyncSession, channel_identity: str, channel: str, root_ts: str
+) -> tuple[uuid.UUID, str] | None:
     row = (
         await session.execute(
             text("""
-        SELECT work_item_id, destination_role FROM curie.factory_slack_mapped_roots
-        WHERE channel_identity = :identity AND channel = :channel AND root_ts = :root
-    """),
-            {
-                "identity": source.channel_identity,
-                "channel": source.channel,
-                "root": source.root_ts,
-            },
+                SELECT work_item_id, destination_role FROM curie.factory_slack_mapped_roots
+                WHERE channel_identity = :identity AND channel = :channel AND root_ts = :root
+            """),
+            {"identity": channel_identity, "channel": channel, "root": root_ts},
         )
     ).one_or_none()
     return None if row is None else (row.work_item_id, row.destination_role)
+
+
+async def _mapping(session: AsyncSession, source: _Source) -> tuple[uuid.UUID, str] | None:
+    return await mapped_slack_root(session, source.channel_identity, source.channel, source.root_ts)
 
 
 async def _voice_owner_refusal(

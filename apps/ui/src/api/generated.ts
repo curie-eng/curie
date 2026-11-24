@@ -1940,6 +1940,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channels/factory-slack/mapped-root": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Is Factory Slack Root
+         * @description Check whether a Socket Mode receiver's thread belongs to a factory run.
+         */
+        post: operations["is_factory_slack_root_channels_factory_slack_mapped_root_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/channels/token": {
         parameters: {
             query?: never;
@@ -13349,6 +13369,15 @@ export interface components {
              */
             provider_installation_id: string;
         };
+        /** SlackRootIn */
+        SlackRootIn: {
+            /** Channel */
+            channel: string;
+            /** Channel Identity */
+            channel_identity: string;
+            /** Root Ts */
+            root_ts: string;
+        };
         /**
          * SourceBindingConfig
          * @description How one hook maps a workload identity onto a coding target (#2572).
@@ -19319,6 +19348,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AdmissionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    is_factory_slack_root_channels_factory_slack_mapped_root_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SlackRootIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": boolean;
                 };
             };
             /** @description Validation Error */

@@ -94,6 +94,7 @@ class SlackVoiceRun(SlackSteeringRun):
         channel: str = SLACK_CHANNEL,
         file_id: str | None = None,
         admission_may_refuse: bool = False,
+        mapped: bool = True,
     ) -> tuple[dict[str, Any], str | None]:
         assert self.slack is not None
         event: dict[str, Any] = {
@@ -138,7 +139,8 @@ class SlackVoiceRun(SlackSteeringRun):
             raise sk.ScriptedScenarioError("Socket Mode replay was not acknowledged")
         if admission_may_refuse and not ack["claimed"] and ack["receipt_version"] is None:
             return message, None
-        if not ack["claimed"] or ack["receipt_version"] != (3 if file_id else 1):
+        expected_receipt = (3 if mapped else None) if file_id else 1
+        if not ack["claimed"] or ack["receipt_version"] != expected_receipt:
             raise sk.ScriptedScenarioError("Socket Mode replay did not create the expected receipt")
         placeholders = [
             p.ts
@@ -221,8 +223,8 @@ class SlackVoiceRun(SlackSteeringRun):
                 raise sk.ScriptedScenarioError("unconfirmed or refused feedback admitted work")
 
         for channel, thread, actor, media, allowed in (
-            (SLACK_CHANNEL, "1800000000.000999", USER, CLIP, ("mapped",)),
-            ("C0EXAMPLE8", root, USER, CLIP, ("mapped",)),
+            (SLACK_CHANNEL, "1800000000.000999", USER, CLIP, ()),
+            ("C0EXAMPLE8", root, USER, CLIP, ()),
             (SLACK_CHANNEL, root, UNLINKED, CLIP, ("cannot", "verified")),
             (SLACK_CHANNEL, root, USER, "F0EXAMPLE3", ("changed", "cannot")),
         ):
@@ -233,8 +235,10 @@ class SlackVoiceRun(SlackSteeringRun):
                 actor=actor,
                 file_id=media,
                 admission_may_refuse=channel != SLACK_CHANNEL or actor == UNLINKED,
+                mapped=channel == SLACK_CHANNEL and thread == root,
             )
-            self.status(slot, allowed)
+            if allowed:
+                self.status(slot, allowed)
             no_revision()
 
         start = len(self.slack.posts())

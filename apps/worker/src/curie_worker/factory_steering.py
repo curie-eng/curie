@@ -504,12 +504,6 @@ class FactorySteeringClient:
         except _READ_ERRORS as exc:
             # Unknown, so possibly a mapped root: never ordinary chat.
             raise SteeringUnavailable("factory run mapping could not be read") from exc
-        if qevent.text == FACTORY_VOICE_TURN:
-            from .factory_slack_voice import decide_voice
-
-            return await decide_voice(
-                self, turn, mapping=mapping, deadline=deadline, record_intent=record_intent
-            )
         if mapping is None:
             return await self._unmapped(turn, deadline=deadline, record_intent=record_intent)
         if mapping.kickoff_replay:
@@ -528,7 +522,9 @@ class FactorySteeringClient:
             if mapping.destination_role == "public":
                 raise SteeringUnavailable("factory public steering is unavailable") from exc
             raise
-        if mapping.destination_role != "public":
+        from .factory_slack_voice import VoiceSteeringReply
+
+        if mapping.destination_role != "public" or isinstance(answer, VoiceSteeringReply):
             return answer
         await self._public_ack(turn, answer, deadline)
         return replace(answer, text="", progress_card=True, delivered=True)
@@ -619,6 +615,14 @@ class FactorySteeringClient:
             return _refused()
         except RedisError as exc:
             raise SteeringUnavailable("mention receipt could not be read") from exc
+        from .factory_slack_voice import decide_voice_receipt, matches_voice_receipt, voice_refused
+
+        if matches_voice_receipt(receipt, turn):
+            if qevent.text != FACTORY_VOICE_TURN or qevent.attachments:
+                return voice_refused("invalid_source")
+            return await decide_voice_receipt(
+                self, turn, receipt, deadline=deadline, record_intent=record_intent
+            )
         if receipt is None or not self._matches(receipt, turn):
             logger.info("factory steering refused %s: no matching receipt", qevent.event_id)
             return _refused()

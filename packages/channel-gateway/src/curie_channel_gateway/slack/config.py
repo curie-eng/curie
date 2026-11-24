@@ -34,6 +34,7 @@ Env mapping:
     CURIE_THREAD_CONTEXT_CACHE_PREFIX -> thread_context_cache_prefix
     CURIE_THREAD_CONTEXT_TTL_SECONDS  -> thread_context_ttl_seconds
     CURIE_MENTION_RECEIPT_TTL_SECONDS -> mention_receipt_ttl_seconds
+    FACTORY_VOICE_ENABLED            -> factory_voice_enabled
     CURIE_DM_CONTINUITY_MAX_MESSAGES  -> dm_continuity_max_messages
     CURIE_HEARTBEAT_FILE             -> heartbeat_file
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
@@ -247,6 +248,7 @@ class DispatcherConfig(BaseSettings):
         gt=0,
         validation_alias="CURIE_MENTION_RECEIPT_TTL_SECONDS",
     )
+    factory_voice_enabled: bool = Field(default=False, validation_alias="FACTORY_VOICE_ENABLED")
     # How many earlier direct messages a top-level im may quote. Zero turns
     # the read off. The alias is the only env name; a boolean is not a count.
     dm_continuity_max_messages: int = Field(

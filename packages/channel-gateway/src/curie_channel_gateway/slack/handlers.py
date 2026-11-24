@@ -56,6 +56,7 @@ not the dispatcher's.
 """
 
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -66,6 +67,7 @@ from datetime import UTC, datetime
 from queue import Full, Queue
 from typing import TYPE_CHECKING, Any, Literal
 
+import httpx
 from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_internal.driver_declaration import DeclaredDriver
@@ -73,11 +75,12 @@ from curie_internal.issue_links import find_issue_links
 from curie_internal.slack_mention_receipt import (
     FACTORY_VOICE_TURN,
     SlackMentionReceipt,
+    receipt_key,
     voice_reply_text,
     write_receipt,
 )
 from curie_internal.turn_queue import claim_event, enqueue
-from curie_telemetry import operation_span, record_metric
+from curie_telemetry import inject_trace_context, operation_span, record_metric
 from opentelemetry.trace import SpanKind
 from pydantic import ValidationError
 from slack_bolt import App
@@ -127,7 +130,7 @@ from .identity import (
     principal_observer_middleware,
     slack_evidence,
 )
-from .inbound_attachments import derive_attachments, hosted_voice_clip_id, requires_voice_receipt
+from .inbound_attachments import derive_attachments, has_native_voice_clip, hosted_voice_clip_id
 from .inbound_text import derive_text
 from .inbound_text import strip_self_mention as _strip_self_mention
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
@@ -681,45 +684,150 @@ def _voice_mention_receipt(
     channel_identity: str,
     bot_user_id: str | None,
     authorized_team_id: str | None,
+    native_clip: bool,
+    raw_text: object,
 ) -> SlackMentionReceipt | None:
-    raw_text = event.get("text")
     if (
         body.get("type") != "event_callback"
-        or event.get("type") != "app_mention"
-        or ("subtype" in event and event["subtype"] != "file_share")
-        or any(key in event for key in ("bot_id", "bot_profile", "app_id"))
-        or event.get("channel_type") not in (None, "channel", "group")
         or not bot_user_id
         or not isinstance(raw_text, str)
-        or re.search(rf"<@{re.escape(bot_user_id)}(?:\|[^>]*)?>", raw_text) is None
+        or not _verified_voice_receiver(body, bot_user_id, authorized_team_id)
     ):
         return None
-    if not _verified_voice_receiver(body, bot_user_id, authorized_team_id):
-        return None
-    file_id = hosted_voice_clip_id(event)
     evidence = slack_evidence(body)
-    if file_id is None or evidence is None:
+    if evidence is None:
         return None
     try:
+        if native_clip:
+            file_id = hosted_voice_clip_id(event)
+            if (
+                file_id is None
+                or ("subtype" in event and event["subtype"] != "file_share")
+                or re.search(rf"<@{re.escape(bot_user_id)}(?:\|[^>]*)?>", raw_text) is None
+            ):
+                return None
+            fields = {
+                "version": 3,
+                "body": "",
+                "voice_file_id": file_id,
+                "content_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+            }
+        else:
+            if event.get("subtype") or ("files" in event and event["files"] != []):
+                return None
+            fields = {"version": 1, "body": raw_text, "bot_user_id": bot_user_id}
         return SlackMentionReceipt.model_validate(
             {
-                "version": 3,
+                **fields,
                 "delivery_id": delivery_id,
                 "channel_identity": channel_identity,
                 "channel": event.get("channel"),
                 "root_ts": event.get("thread_ts"),
                 "message_ts": event.get("ts"),
                 "user_id": event.get("user"),
-                "body": "",
                 "evidence": evidence,
-                "voice_file_id": file_id,
                 "api_app_id": body.get("api_app_id"),
                 "team_id": authorized_team_id,
-                "content_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
             }
         )
     except (ValidationError, UnicodeEncodeError):
         return None
+
+
+def _mapped_voice_root(
+    config: DispatcherConfig, channel_identity: str, channel: str, root_ts: str
+) -> bool | None:
+    headers = {"X-API-Key": config.api_key, "Accept-Encoding": "identity"}
+    inject_trace_context(headers)
+    try:
+        with httpx.stream(
+            "POST",
+            f"{config.api_base_url.rstrip('/')}/channels/factory-slack/mapped-root",
+            json={"channel_identity": channel_identity, "channel": channel, "root_ts": root_ts},
+            headers=headers,
+            timeout=httpx.Timeout(connect=0.5, read=1.5, write=0.5, pool=0.5),
+        ) as response:
+            if response.status_code != 200:
+                return None
+            payload = bytearray()
+            for chunk in response.iter_raw():
+                if len(payload) + len(chunk) > 16:
+                    return None
+                payload.extend(chunk)
+            mapped = json.loads(payload)
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        return None
+    return mapped if isinstance(mapped, bool) else None
+
+
+def _stage_voice_mention(
+    *,
+    redis_client: "Redis",
+    config: DispatcherConfig,
+    body: dict[str, Any],
+    event: dict[str, Any],
+    lane: Lane,
+    delivery_id: str,
+    channel: str,
+    slack_identity: str,
+    bot_user_id: str | None,
+    authorized_team_id: str | None,
+) -> bool | DropReason:
+    """Reserve an eligible mapped mention and write its receipt before the turn claim."""
+    root_ts = event.get("thread_ts")
+    message_ts = event.get("ts")
+    if (
+        not config.factory_voice_enabled
+        or lane != "mention"
+        or event.get("type") != "app_mention"
+        or not isinstance(root_ts, str)
+        or not root_ts
+        or not isinstance(message_ts, str)
+        or not message_ts
+        or root_ts == message_ts
+        or not isinstance(event.get("channel"), str)
+        or not channel.startswith(("C", "G"))
+        or event.get("channel_type") not in (None, "channel", "group")
+        or event.get("subtype") not in (None, "file_share")
+        or any(key in event for key in ("bot_id", "bot_profile", "app_id"))
+    ):
+        return False
+    native_clip = has_native_voice_clip(event)
+    raw_text = event.get("text")
+    if not native_clip and not (
+        bot_user_id and isinstance(raw_text, str) and voice_reply_text(raw_text, bot_user_id)
+    ):
+        return False
+    channel_identity = minted_adapter(slack_identity)
+    mapped = _mapped_voice_root(config, channel_identity, channel, root_ts)
+    if mapped is None:
+        return DropReason.VOICE_MAPPING_UNAVAILABLE
+    if not mapped:
+        return False
+    receipt = _voice_mention_receipt(
+        body=body,
+        event=event,
+        delivery_id=delivery_id,
+        channel_identity=channel_identity,
+        bot_user_id=bot_user_id,
+        authorized_team_id=authorized_team_id,
+        native_clip=native_clip,
+        raw_text=raw_text,
+    )
+    if receipt is None:
+        return DropReason.INVALID_VOICE_MENTION
+    if write_receipt(redis_client, receipt, ttl_s=config.mention_receipt_ttl_seconds):
+        return True
+    # A listener can stop after storing the receipt and before the turn claim.
+    # Resume only the delivery whose exact receipt was already stored.
+    stored = redis_client.get(receipt_key(delivery_id))
+    if isinstance(stored, (bytes, str)):
+        try:
+            if SlackMentionReceipt.model_validate_json(stored) == receipt:
+                return True
+        except ValidationError:
+            pass
+    return DropReason.INVALID_VOICE_MENTION
 
 
 def _write_mention_receipt(
@@ -734,14 +842,11 @@ def _write_mention_receipt(
     channel: str,
     slack_identity: str,
     text: str,
-    bot_user_id: str | None,
-    authorized_team_id: str | None,
 ) -> None:
     """Record the receipt a factory steering or kickoff decision reads (#5414, #5380).
 
-    Only the native Socket Mode mention lane writes receipts. A sender's single
-    native clip on a human thread reply takes the version 3 path. Other
-    mentions retain the three text cases:
+    Only the native Socket Mode mention lane writes receipts. Text receipts
+    cover three cases:
 
     1. A person replying in a channel thread: version 1, as before.
     2. A person's top-level channel mention whose text links an issue:
@@ -758,18 +863,6 @@ def _write_mention_receipt(
     """
 
     if lane != "mention" or event.get("channel_type") == "im":
-        return
-    if requires_voice_receipt(event):
-        receipt = _voice_mention_receipt(
-            body=body,
-            event=event,
-            delivery_id=delivery_id,
-            channel_identity=minted_adapter(slack_identity),
-            bot_user_id=bot_user_id,
-            authorized_team_id=authorized_team_id,
-        )
-        if receipt is not None:
-            write_receipt(redis_client, receipt, ttl_s=config.mention_receipt_ttl_seconds)
         return
     if event.get("subtype"):
         return
@@ -804,38 +897,18 @@ def _write_mention_receipt(
         evidence = slack_evidence(body)
     if evidence is None:
         return
-    fields: dict[str, Any] = {}
-    if bot_user_id and voice_reply_text(text, bot_user_id) is not None:
-        if (
-            version != 1
-            or event.get("type") != "app_mention"
-            or event.get("text") != text
-            or any(key in event for key in ("bot_id", "bot_profile", "app_id"))
-            or event.get("channel_type") not in (None, "group", "channel")
-            or body.get("type") != "event_callback"
-            or not _verified_voice_receiver(body, bot_user_id, authorized_team_id)
-        ):
-            return
-        fields.update(bot_user_id=bot_user_id, api_app_id=body.get("api_app_id"),
-                      team_id=authorized_team_id)
-    try:
-        receipt = SlackMentionReceipt(
-            version=version,
-            delivery_id=delivery_id,
-            channel_identity=minted_adapter(slack_identity),
-            channel=channel,
-            root_ts=root_ts,
-            message_ts=message_ts,
-            user_id=user_id,
-            body=text,
-            evidence=evidence,
-            driver_bot_id=driver_bot_id,
-            **fields,
-        )
-    except ValidationError:
-        if fields:
-            return
-        raise
+    receipt = SlackMentionReceipt(
+        version=version,
+        delivery_id=delivery_id,
+        channel_identity=minted_adapter(slack_identity),
+        channel=channel,
+        root_ts=root_ts,
+        message_ts=message_ts,
+        user_id=user_id,
+        body=text,
+        evidence=evidence,
+        driver_bot_id=driver_bot_id,
+    )
     write_receipt(redis_client, receipt, ttl_s=config.mention_receipt_ttl_seconds)
 
 
@@ -973,6 +1046,21 @@ def process_event(
             web_client=web_client,
         ):
             return None
+        voice_turn = _stage_voice_mention(
+            redis_client=redis_client,
+            config=config,
+            body=body,
+            event=event,
+            lane=lane,
+            delivery_id=delivery_id,
+            channel=channel,
+            slack_identity=slack_identity,
+            bot_user_id=bot_user_id,
+            authorized_team_id=authorized_team_id,
+        )
+        if isinstance(voice_turn, DropReason):
+            drop(log, voice_turn, event_id=delivery_id, lane=lane)
+            return None
         # Factory steering and kickoff evidence (#5414, #5380): a person's
         # thread reply or issue-linking top-level mention, or a declared
         # driver's marked action, records what was said, and who said it, under
@@ -981,20 +1069,19 @@ def process_event(
         # it. The body is the derived event text exactly as Slack delivered it,
         # before the self-mention strip and any thread context or DM continuity
         # rewrite. A Valkey failure here raises like the claim's.
-        _write_mention_receipt(
-            redis_client=redis_client,
-            config=config,
-            body=body,
-            event=event,
-            lane=lane,
-            driver=driver,
-            delivery_id=delivery_id,
-            channel=channel,
-            slack_identity=slack_identity,
-            text=raw_text,
-            bot_user_id=bot_user_id,
-            authorized_team_id=authorized_team_id,
-        )
+        if not voice_turn:
+            _write_mention_receipt(
+                redis_client=redis_client,
+                config=config,
+                body=body,
+                event=event,
+                lane=lane,
+                driver=driver,
+                delivery_id=delivery_id,
+                channel=channel,
+                slack_identity=slack_identity,
+                text=raw_text,
+            )
         if not claim_event(redis_client, config, delivery_id):
             drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
             return None
@@ -1052,21 +1139,6 @@ def process_event(
                 web_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=REFUSAL)
                 return None
 
-        voice_turn = (
-            lane == "mention"
-            and channel.startswith(("C", "G"))
-            and event.get("channel_type") not in ("im", "mpim")
-            and (
-                (
-                    isinstance(event.get("files"), list)
-                    and any(
-                        isinstance(file, dict) and file.get("subtype") == "slack_audio"
-                        for file in event["files"]
-                    )
-                )
-                or (bot_user_id is not None and voice_reply_text(raw_text, bot_user_id) is not None)
-            )
-        )
         if voice_turn:
             text = FACTORY_VOICE_TURN
             attachments = []
