@@ -106,6 +106,7 @@ _CAUSE_TEXT = {
     ),
     "execution_deadline": "the run did not finish before its deadline.",
     "capacity_wait_expired": "sandbox admission did not complete before the wait expired.",
+    "maintenance_refused": "maintenance repair was refused before it started.",
     "retry_condition_expired": (
         "the automatic retry was still blocked on its named condition when its wait expired."
     ),

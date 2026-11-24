@@ -397,6 +397,8 @@ def render_public_card(
     )
     outcome = state if state == "needs a person" else f"is {state}"
     lines = [f"Factory run {run} {outcome}."]
+    if terminal_cause == "maintenance_refused":
+        lines.append(_sentence(cause_text(terminal_cause)))
     if phase is not None and phase in _PUBLIC_STAGES:
         lines.append(_PUBLIC_STAGES[phase])
     if publication:

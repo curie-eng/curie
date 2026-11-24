@@ -52,7 +52,9 @@ from curie_api.factory_maintenance import MaintenanceObservation, MaintenanceRep
 from curie_api.factory_maintenance_store import commit_observation
 from curie_api.factory_notices import FINAL_MARKER
 from curie_api.models import ExecutionRequest, ThreadPublicationLineage, WorkItem
+from curie_api.workitem_dispatch import Admission, admit_revision
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_api.workitems.lifecycle import WorkItemOutcome
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from forge_fakes import factory_wake
 from forge_fakes.github import (
@@ -2353,9 +2355,7 @@ def test_active_maintenance_requires_a_new_head_with_green_checks(
         assert "Reason: repair_head_unverified" in _body(sink, repair_id)
 
 
-def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: Any) -> None:
-    client, _sink, _published, repair_id, pull = maintenance_successor
-
+def _acquire_maintenance(client: Any, repair_id: uuid.UUID) -> httpx.Response:
     async def acquire_body() -> dict[str, Any]:
         async with client.app.state.sessionmaker() as session:
             request = await session.get(ExecutionRequest, repair_id)
@@ -2367,16 +2367,88 @@ def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: 
                 "context": None,
             }
 
-    url = f"/v1/internal/work-items/requests/{repair_id}/acquire"
-    body = client.portal.call(acquire_body)
+    return client.post(
+        f"/v1/internal/work-items/requests/{repair_id}/acquire",
+        headers=WORKER,
+        json=client.portal.call(acquire_body),
+    )
+
+
+def test_disabled_maintenance_settles_and_unblocks_revision(
+    maintenance_successor: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _sink, published, repair_id, _pull = maintenance_successor
+    revision_id = uuid.uuid4()
+
+    async def queue_revision() -> None:
+        async with client.app.state.sessionmaker() as session:
+            item = await session.get(WorkItem, published["work_item_id"])
+            repair = await session.get(ExecutionRequest, repair_id)
+            assert item and repair and repair.reply_kind and repair.reply_address
+            assert repair.reply_conversation_id
+            result = await admit_revision(
+                session,
+                Admission(
+                    agent_id=item.agent_id,
+                    kind=repair.reply_kind,
+                    address=repair.reply_address,
+                    reply_conversation_id=repair.reply_conversation_id,
+                    issue=item.tracker_issue,
+                    repository=item.repository,
+                    code_host_installation_id=item.code_host_installation_id,
+                    objective="Update the tests on the open pull request.",
+                    requester="github:123:acme-maintainer",
+                    request_id=revision_id,
+                ),
+            )
+            assert isinstance(result, WorkItemOutcome) and result.request
+            assert result.request.status == "queued"
+
+    client.portal.call(queue_revision)
+    _reconcile()
+    _, repair, revision = _all(published["number"])
+    assert (repair["id"], repair["status"]) == (repair_id, "waiting")
+    assert (revision["id"], revision["status"]) == (revision_id, "queued")
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "factory_maintenance_repair_enabled", False)
+    refused = _acquire_maintenance(client, repair_id)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "not_dispatchable"
+    _, repair, revision = _all(published["number"])
+    assert (repair["status"], repair["terminal_cause"]) == ("failed", "maintenance_refused")
+    assert (revision["id"], revision["status"]) == (revision_id, "waiting")
+    view = client.get(
+        f"/work-items/{published['work_item_id']}", headers={"X-API-Key": settings.api_key}
+    )
+    assert view.is_success, view.text
+    assert next(
+        request for request in view.json()["requests"] if request["sequence"] == 2
+    )["terminal_cause"] == "maintenance_refused"
+    assert any(
+        event["outcome"] == "repair_disabled" and event["repair_request_id"] == str(repair_id)
+        for event in view.json()["maintenance_history"]
+    )
+    assert _rows(
+        "SELECT repairs_used FROM curie.factory_maintenance_lineages WHERE work_item_id = :id",
+        {"id": published["work_item_id"]},
+    ) == [{"repairs_used": 1}]
+
+    _reconcile()
+    _start_running(client, revision_id)
+    assert _all(published["number"])[2]["status"] == "running"
+
+
+def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: Any) -> None:
+    client, _sink, published, repair_id, pull = maintenance_successor
     pull["head"]["sha"] = HEAD_C
-    refused = client.post(url, headers=WORKER, json=body)
+    refused = _acquire_maintenance(client, repair_id)
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "not_dispatchable"
     assert _rows(
-        "SELECT status, acquire_owner FROM curie.execution_requests WHERE id = :id",
+        "SELECT status, terminal_cause, acquire_owner FROM curie.execution_requests WHERE id = :id",
         {"id": repair_id},
-    ) == [{"status": "waiting", "acquire_owner": None}]
+    ) == [{"status": "failed", "terminal_cause": "maintenance_refused", "acquire_owner": None}]
     assert _rows(
         "SELECT outcome FROM curie.factory_maintenance_events WHERE repair_request_id = :id "
         "AND outcome = 'foreign_head'",
@@ -2384,8 +2456,8 @@ def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: 
     ) == [{"outcome": "foreign_head"}]
 
     pull["head"]["sha"] = HEAD_A
-    accepted = client.post(url, headers=WORKER, json=body)
-    assert accepted.status_code == 200, accepted.text
+    assert _acquire_maintenance(client, repair_id).status_code == 409
+    assert _all(published["number"])[1]["terminal_cause"] == "maintenance_refused"
 
 
 def test_maintenance_publication_refuses_a_foreign_pull_head(maintenance_successor: Any) -> None:

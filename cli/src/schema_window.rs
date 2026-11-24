@@ -792,9 +792,9 @@ print(json.dumps(graph))
         // Learned memory rules require 0185.
         // The plain feedback cap requires 0186.
         // Reading sealed execution input requires schema revision 0195.
-        // Conflict repair publication reads require 0193.
-        assert_eq!(candidate.schema_min, "0193");
-        assert_eq!(candidate.schema_head, "0193");
+        // Maintenance refusal settlement requires 0197.
+        assert_eq!(candidate.schema_min, "0197");
+        assert_eq!(candidate.schema_head, "0197");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -873,7 +873,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0191", &current));
         assert!(!live_in_window("0194", &current));
         assert!(!live_in_window("0195", &current));
-        assert!(live_in_window("0193", &current));
+        assert!(!live_in_window("0193", &current));
+        assert!(live_in_window("0197", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

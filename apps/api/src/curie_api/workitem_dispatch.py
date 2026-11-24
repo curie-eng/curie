@@ -46,6 +46,8 @@ from .factory_conflict_authority import (
     ConflictPublicationSettled,
     conflict_publication_authority,
 )
+from .factory_maintenance import RefusalReason
+from .factory_maintenance_progress import record_event as record_maintenance_event
 from .factory_notices import ANSWER_PULL_REQUEST_ENDED_SENTENCE, start_failed_sentence
 from .factory_reply_target import reply_columns
 from .factory_retry_policy import RetrySafety
@@ -59,6 +61,7 @@ from .models import (
     AgentChannel,
     ExecutionRequest,
     FactoryBaseTransition,
+    FactoryMaintenanceAdmission,
     PersonalClaudeEnrollment,
     WorkItem,
 )
@@ -1240,6 +1243,61 @@ async def _claim_acquire(
     return None
 
 
+async def _settle_maintenance_refusal(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest, *, reason: RefusalReason
+) -> DispatchConflict:
+    """Settle under the WorkItem lock and commit with any queued revision."""
+
+    work_item_id, request_id = work_item.id, request.id
+    changed = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request_id,
+            ExecutionRequest.version == request.version,
+            ExecutionRequest.status == "waiting",
+        )
+        .values(
+            status="failed",
+            terminal_at=func.clock_timestamp(),
+            terminal_cause="maintenance_refused",
+            dispatch_owner=None,
+            dispatch_lease_expires_at=None,
+            acquired_generation=None,
+            acquire_owner=None,
+            acquire_expires_at=None,
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed is None:
+        return await _refuse(
+            session, "not_dispatchable", work_item_id=work_item_id, request_id=request_id
+        )
+    admission = (
+        await session.scalars(
+            select(FactoryMaintenanceAdmission).where(
+                FactoryMaintenanceAdmission.repair_request_id == request_id
+            )
+        )
+    ).one()
+    await record_maintenance_event(session, admission, reason, repair_request_id=request_id)
+    request = await reload_request(session, request_id)
+    await lifecycle.settle_terminal(session, work_item, request, detail=reason)
+    now = await database_now(session)
+    await lifecycle.admit_next_revision(
+        session,
+        work_item_id=work_item_id,
+        wait_deadline=now + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+    )
+    return DispatchConflict(
+        code="not_dispatchable",
+        work_item_id=work_item_id,
+        request_id=request_id,
+        status="failed",
+    )
+
+
 async def acquire(
     session: AsyncSession,
     request_id: uuid.UUID,
@@ -1295,10 +1353,19 @@ async def acquire(
             return await _defer_factory_refusal(
                 session, work_item, request, owner=owner, generation=generation, refusal=refusal
             )
-    if await repair_refusal(session, request_id, get_settings(), client, record=True) is not None:
-        return await _refuse(session, "not_dispatchable", request_id=request_id)
+    maintenance_refusal = await repair_refusal(session, request_id, get_settings(), client)
     await session.commit()
     session.expire_all()
+    if maintenance_refusal is not None:
+        locked = await _lock_acquirable(
+            session, request_id, owner=owner, generation=generation, wake=wake
+        )
+        if isinstance(locked, DispatchConflict):
+            return locked
+        work_item, request, _, _ = locked
+        return await _settle_maintenance_refusal(
+            session, work_item, request, reason=maintenance_refusal
+        )
     ready = await resolve_for_acquire(
         session,
         request_id=request_id,
@@ -1333,6 +1400,12 @@ async def acquire(
         )
     assert isinstance(current, FactoryContext)
     pending_pin = session.info.pop("factory_base_pin", None)
+    try:
+        conflict = await conflict_publication_authority(session, request)
+    except ConflictAuthorityMismatch:
+        return await _settle_maintenance_refusal(
+            session, work_item, request, reason="conflict_authority_mismatch"
+        )
     if pending_pin is not None:
         from .factory_notices import mark_status_comment_stale
         from .models import ThreadPublicationLineage
@@ -1451,11 +1524,6 @@ async def acquire(
             ),
         )
     )
-    try:
-        conflict = await conflict_publication_authority(session, request)
-    except ConflictAuthorityMismatch:
-        await session.rollback()
-        return await _refuse(session, "not_dispatchable", request_id=request_id)
     grant = AcquireGrant(
         generation=generation,
         work_item_id=work_item.id,

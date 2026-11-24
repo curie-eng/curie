@@ -83,8 +83,8 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # Learned memory rules require 0185.
     # The plain feedback cap requires 0186.
     # Reading sealed execution input requires schema revision 0195.
-    # Conflict repair publication reads require 0193.
-    candidate = {"schema_min": "0193", "schema_head": "0193"}
+    # Maintenance refusal settlement requires 0197.
+    candidate = {"schema_min": "0197", "schema_head": "0197"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -92,7 +92,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-73:] == [
+    assert catalog["revisions"][-74:] == [
         "0095",
         "0096",
         "0097",
@@ -166,6 +166,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0194",
         "0195",
         "0193",
+        "0197",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

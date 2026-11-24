@@ -568,15 +568,16 @@ class Stack:
         assert response.status_code == 200, response.text
         return response.json()
 
-    def start(self, request_id: uuid.UUID) -> int:
+    def acquire(
+        self, request_id: uuid.UUID, *, input_sha256: str | None = None
+    ) -> httpx.Response:
         view = self.request_view(request_id)
-        generation = view["dispatch_generation"]
-        acquired = self.client.post(
+        return self.client.post(
             f"/v1/internal/work-items/requests/{request_id}/acquire",
             headers=self.internal,
             json={
                 "owner": OWNER,
-                "generation": generation,
+                "generation": view["dispatch_generation"],
                 "wake": {
                     "kind": view["reply_kind"],
                     "address": view["reply_address"],
@@ -584,18 +585,24 @@ class Stack:
                     "conversation_id": view["reply_conversation_id"],
                 },
                 "context": None,
+                "input_sha256": input_sha256,
             },
         )
+
+    def start(self, request_id: uuid.UUID, *, input_sha256: str | None = None) -> int:
+        acquired = self.acquire(request_id, input_sha256=input_sha256)
         assert acquired.status_code == 200, acquired.text
+        grant = acquired.json()
         started = self.client.post(
             f"/v1/internal/work-items/requests/{request_id}/start",
             headers=self.internal,
             json={
                 "owner": OWNER,
-                "generation": generation,
+                "generation": grant["generation"],
                 "claim_name": f"claim-{request_id.hex[:12]}",
                 "sandbox_name": f"sbx-{request_id.hex[:12]}",
-                "context": acquired.json()["context"],
+                "context": grant["context"],
+                "input_sha256": input_sha256,
                 "delivered_limits": {
                     "memory_bytes": None,
                     "ephemeral_storage_bytes": None,

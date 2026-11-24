@@ -68,6 +68,7 @@ RefusalReason = Literal[
     "superseded",
     "snapshot_changed",
     "foreign_head",
+    "conflict_authority_mismatch",
     "base_changed",
     "window_expired",
     "budget_exhausted",

@@ -38,6 +38,7 @@ async def record_event(
         previous is not None
         and previous.head_sha == observation.head_sha
         and previous.outcome == outcome
+        and previous.repair_request_id == repair_request_id
         and (
             outcome not in {"admitted", "base_changed"}
             or (

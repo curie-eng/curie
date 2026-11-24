@@ -1521,10 +1521,11 @@ class ExecutionRequest(Base):
         # may also end ``retry_condition_expired`` when it was blocked. Then
         # migration 0184 (#5785): a started completed request may also end
         # ``questions_asked``, a request that posted questions and opened no
-        # pull request.
+        # pull request. Migration 0197 allows an unstarted maintenance refusal.
         CheckConstraint(
             "((status = 'failed' AND started_at IS NULL AND execution_deadline IS NULL "
-            "AND terminal_at IS NOT NULL AND terminal_cause = 'start_failed' "
+            "AND terminal_at IS NOT NULL "
+            "AND terminal_cause IN ('start_failed', 'maintenance_refused') "
             "AND termination_observation IS NULL) "
             "OR (status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
             "AND execution_deadline IS NULL AND terminal_at IS NULL "

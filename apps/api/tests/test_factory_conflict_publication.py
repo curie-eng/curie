@@ -190,6 +190,47 @@ def test_sha256_successor_retains_both_pins_and_conflict_paths(
     precheck_case["client"].portal.call(resolve)
 
 
+def test_acquire_settles_mismatched_conflict_authority(
+    precheck_case: dict[str, Any], repair_forge: github.GitHubRepositoryFake
+) -> None:
+    case = precheck_case
+    client = case["client"]
+    repair_id = client.portal.call(_successor, case, repair_forge, "base_conflict")
+    case["truth"]["node_id"] = "PR_other"
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET code_host_pr_id = :pr WHERE id = :id",
+        {"id": case["lineage_id"], "pr": "PR_other"},
+    )
+    requests = "/v1/internal/work-items/requests"
+    acquire_url = f"{requests}/{repair_id}/acquire"
+    claim = {
+        "owner": "factory",
+        "generation": 1,
+        "wake": {
+            "kind": "slack",
+            "adapter": "default",
+            "address": "C0EXAMPLE1",
+            "conversation_id": case["reply_conversation_id"],
+        },
+        "context": None,
+    }
+    for _ in range(2):
+        refused = client.post(acquire_url, headers=WORKER_HEADERS, json=claim)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "not_dispatchable"
+
+    view = client.get(f"{requests}/{repair_id}", headers=WORKER_HEADERS)
+    assert view.is_success, view.text
+    assert view.json()["status"] == "failed"
+    assert view.json()["terminal_cause"] == "maintenance_refused"
+    assert view.json()["started_at"] is None
+    assert _rows(
+        "SELECT outcome FROM curie.factory_maintenance_events WHERE repair_request_id = :id "
+        "ORDER BY id",
+        {"id": repair_id},
+    ) == [{"outcome": "admitted"}, {"outcome": "conflict_authority_mismatch"}]
+
+
 @pytest.mark.parametrize(
     ("reason", "foreign_ci_head"),
     [("base_conflict", False), ("base_conflict", True), ("late_ci_red", False)],
@@ -213,18 +254,6 @@ def test_persisted_successor_selects_workspace_and_publication_authority(
     requests = "/v1/internal/work-items/requests"
     acquire_url = f"{requests}/{repair_id}/acquire"
     claim = {"owner": "factory", "generation": 1, "wake": wake, "context": None}
-    if is_conflict:
-        change_pr = (
-            "UPDATE curie.thread_publication_lineages SET code_host_pr_id = :pr WHERE id = :id"
-        )
-        original_node = case["truth"]["node_id"]
-        case["truth"]["node_id"] = "PR_other"
-        _execute(change_pr, {"id": case["lineage_id"], "pr": "PR_other"})
-        refused = client.post(acquire_url, headers=WORKER_HEADERS, json=claim)
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"]["code"] == "not_dispatchable"
-        case["truth"]["node_id"] = original_node
-        _execute(change_pr, {"id": case["lineage_id"], "pr": original_node})
     acquire = client.post(acquire_url, headers=WORKER_HEADERS, json=claim)
     assert acquire.status_code == 200, acquire.text
     start = client.post(
