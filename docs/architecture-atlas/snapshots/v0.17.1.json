@@ -83,7 +83,7 @@
   ],
   "overview": {
     "title": "The request-to-reply loop",
-    "description": "Read left to right. Green seams have multiple exercised implementations, yellow seams have one implementation behind a clean boundary, red seams require coordinated changes, and blue seams are planned. This snapshot records v0.17.0 source at the architecture pin.",
+    "description": "Read left to right. Green seams have multiple exercised implementations, yellow seams have one implementation behind a clean boundary, red seams require coordinated changes, and blue seams are planned. This snapshot records v0.17.1 source at the architecture pin.",
     "stages": [
       {
         "id": "surfaces",
