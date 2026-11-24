@@ -36,21 +36,21 @@ from .relevance import NON_CONTENT_SUBTYPES
 DIRECT_MESSAGE_CHANNEL_TYPE = "im"
 
 
-def is_plain_direct_message(event: Any) -> bool:
-    """A person's own one-to-one direct message to the bot (ADR 0263 decision 1).
-
-    Exactly ``channel_type`` ``im``, no ``subtype`` key at all, no ``bot_id``
-    key and a nonempty user: group DMs, channel messages, edits, deletions,
-    file shares and bot posts are not. @spec HTTP-INVOCATION-EXECUTION-26.
-    """
+def is_supported_direct_message(event: Any) -> bool:
+    """A human one-to-one DM with plain text or usable file references."""
     if type(event) is not dict:
         return False
     user = event.get("user")
-    return (
-        event.get("type") == "message"
-        and event.get("channel_type") == DIRECT_MESSAGE_CHANNEL_TYPE
-        and "subtype" not in event and "bot_id" not in event
-        and type(user) is str and bool(user)
+    if (
+        event.get("type") != "message"
+        or event.get("channel_type") != DIRECT_MESSAGE_CHANNEL_TYPE
+        or "bot_id" in event
+        or type(user) is not str
+        or not user
+    ):
+        return False
+    return "subtype" not in event or (
+        event["subtype"] == "file_share" and bool(derive_attachments(event))
     )
 
 
@@ -460,7 +460,7 @@ class HttpReceiverRuntime:
                 type(body) is not dict or type(event) is not dict
                 or body.get("event") != event or body.get("type") != "event_callback"
                 or body.get("team_id") != scope.installation_account
-                or not (event.get("type") == "app_mention" or is_plain_direct_message(event))
+                or not (event.get("type") == "app_mention" or is_supported_direct_message(event))
                 or (event.get("bot_id") and driver is None)
                 or event.get("subtype") in NON_CONTENT_SUBTYPES
                 or slack_identity != scope.channel_identity_name or bot_user_id != scope.bot_user_id

@@ -767,11 +767,14 @@ def test_github_issue_status_comment_says_comment_on_this_issue(admitted: Any) -
     _reconcile()
 
     body = _posts(sink)[0][1] or ""
+    ask = "Ask the factory: comment on this issue and mention @curie."
     assert "Status: QUEUED" in body
     assert WAITING in body
     assert marker_for(request_id) in body
-    assert github_ask_line(MENTION, "issue") in body
-    assert "comment on this pull request." not in body
+    assert body.rstrip("\n").splitlines()[-1] == ask
+    assert body.count(ask) == 1
+    assert "comment on this pull request" not in body
+    assert "first 10 revisions" not in body
 
 
 def _assert_one_current_ask_line(body: str) -> None:
