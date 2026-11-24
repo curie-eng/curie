@@ -237,24 +237,15 @@ class SlackVoiceRun(SlackSteeringRun):
             if self.ledger(item) or self.request_ids(item) != first_requests:
                 raise sk.ScriptedScenarioError("unconfirmed or refused feedback admitted work")
 
-        for channel, thread, actor, media, allowed in (
-            (SLACK_CHANNEL, "1800000000.000999", USER, CLIP, (ORDINARY_REPLY.lower(),)),
-            ("C0EXAMPLE8", root, USER, CLIP, ()),
-            (SLACK_CHANNEL, root, UNLINKED, CLIP, ("cannot", "verified")),
-            (SLACK_CHANNEL, root, USER, "F0EXAMPLE3", ("changed", "cannot")),
+        for actor, media, allowed in (
+            (UNLINKED, CLIP, ("cannot", "verified")),
+            (USER, "F0EXAMPLE3", ("changed", "cannot")),
         ):
-            mapped = channel == SLACK_CHANNEL and thread == root
             _, slot = self.send(
-                thread,
-                "Review this clip." if mapped else ORDINARY_REQUEST,
-                channel=channel,
-                actor=actor,
-                file_id=media,
-                admission_may_refuse=channel != SLACK_CHANNEL or actor == UNLINKED,
-                mapped=mapped,
+                root, "Review this clip.", actor=actor, file_id=media,
+                admission_may_refuse=actor == UNLINKED,
             )
-            if allowed:
-                self.status(slot, allowed)
+            self.status(slot, allowed)
             no_revision()
 
         start = len(self.slack.posts())
@@ -306,6 +297,12 @@ class SlackVoiceRun(SlackSteeringRun):
         self.status(duplicate, ("queued", "applied"))
         _, revision = self.wait_for("one revised publication", lambda: self.settled(item, 2))
         final_pr, new_head, final_url = self.code_host()
+        self.send(root, ORDINARY_REQUEST, channel="C0EXAMPLE8", file_id=CLIP,
+                  admission_may_refuse=True, mapped=False)
+        _, ordinary = self.send("1800000000.000999", ORDINARY_REQUEST, file_id=CLIP, mapped=False)
+        self.status(ordinary, (ORDINARY_REPLY.lower(),))
+        if self.code_host() != (final_pr, new_head, final_url):
+            raise sk.ScriptedScenarioError("feedback outside the mapped thread changed the PR")
         before = self.repo_bytes("show", f"{head}:{FILE}")
         after = self.repo_bytes("show", f"{new_head}:{FILE}")
         if (
