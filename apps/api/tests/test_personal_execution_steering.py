@@ -37,6 +37,7 @@ import pytest
 import test_factory_slack_runtime as runtime
 from curie_api.models import DEFAULT_TENANT_ID
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from test_factory_public_notifications import configure_public
 from test_factory_slack_runtime import OwnerTuple, Person, SteeringStack, SteerRun
 from test_personal_execution_revalidation import _confirm_resume_teardown, _resume_requests
 
@@ -356,8 +357,11 @@ def test_a_personal_work_item_of_another_tenant_refuses_a_steer_resolved_in_the_
     runtime._assert_no_sandbox(stack)
 
 
+@pytest.mark.parametrize("public_destination", [False, True])
 def test_owner_slack_steer_resumes_at_current_generation_after_teardown(
     steering: SteeringStack,
+    monkeypatch: pytest.MonkeyPatch,
+    public_destination: bool,
 ) -> None:
     owner = steering.person()
     other = steering.person()
@@ -379,8 +383,22 @@ def test_owner_slack_steer_resumes_at_current_generation_after_teardown(
 
     _confirm_resume_teardown(run.request_id)
     [before] = _resume_requests(run.work_item_id)
+    if public_destination:
+        configured = configure_public(steering, monkeypatch, runtime.CHANNEL)
+        assert configured.is_success, configured.text
+        steering.api_hop.drop_next_answer(runtime.STEER_PATH)
     resumed = steering.steer_queued(owner.slack_user, "Please resume.", thread_ts=run.root_ts)
-    runtime._admitted(resumed)
+    if public_destination:
+        ((status, queued),) = steering.api_hop.dropped
+        assert status == 200 and queued["outcome"] == "queued", queued
+        assert steering.reclaim(steering.steerer) == 1
+        status, replay = steering.api_hop.steer_answers()[-1]
+        assert status == 200 and replay["outcome"] == "queued" and replay["replayed"], replay
+        assert queued["request_id"] == replay["request_id"] == str(
+            steering.expected_request_id(resumed.delivery)
+        )
+    else:
+        runtime._admitted(resumed)
     predecessor, successor = _resume_requests(run.work_item_id)
     assert predecessor == before
     assert (successor["enrollment_generation"], successor["status"]) == (2, "waiting")

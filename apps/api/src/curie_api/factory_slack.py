@@ -410,6 +410,7 @@ async def _voice_owner_refusal(
     installation_mode: ModelAuthMode,
     *,
     voice: bool,
+    lock_enrollment: bool = False,
 ) -> RefusedSteering | None:
     if item.tenant_id is not None and item.tenant_id != DEFAULT_TENANT_ID:
         return RefusedSteering(reason="owner_tenant_mismatch")
@@ -428,14 +429,13 @@ async def _voice_owner_refusal(
         return None
     if voice and principal_id != item.owner_principal_id:
         return RefusedSteering(reason="owner_mismatch")
-    enrollment = (
-        await session.execute(
-            select(PersonalClaudeEnrollment.active, PersonalClaudeEnrollment.generation).where(
-                PersonalClaudeEnrollment.tenant_id == item.tenant_id,
-                PersonalClaudeEnrollment.principal_id == principal_id,
-            )
-        )
-    ).one_or_none()
+    query = select(PersonalClaudeEnrollment.active, PersonalClaudeEnrollment.generation).where(
+        PersonalClaudeEnrollment.tenant_id == item.tenant_id,
+        PersonalClaudeEnrollment.principal_id == principal_id,
+    )
+    if lock_enrollment:
+        query = query.with_for_update(read=True)
+    enrollment = (await session.execute(query)).one_or_none()
     if enrollment is None or not enrollment.active:
         return RefusedSteering(reason="enrollment_inactive")
     if principal_id != item.owner_principal_id:
@@ -597,7 +597,12 @@ async def _authorize(
     if refusal is not None:
         return RefusedSteering(reason=refusal)
     assert login is not None
-    if owner_refusal is not None:
+    if owner_refusal is not None and not (
+        owner_refusal.reason == "enrollment_generation_mismatch"
+        and not deferred
+        and source.file_id is None
+        and run.pr_number is not None
+    ):
         return owner_refusal
     return SlackVoiceAuthorization(
         work_item_id=work_item_id,
@@ -746,6 +751,8 @@ async def _lock_authority(
     authority: SlackVoiceAuthorization,
     settings: Settings,
     confirmation_evidence: SlackEvidence | None = None,
+    *,
+    owner_resume: bool = False,
 ) -> WorkItem | RefusedSteering:
     source = authority.source
     await identity_fence.lock_identity_reader(session)
@@ -772,12 +779,16 @@ async def _lock_authority(
     if item.cancelled_at is not None:
         return RefusedSteering(reason="authority_changed")
     mode = settings.factory_model_auth_mode
-    await _owner_facts(session, item, authority.principal_id, mode)
-    if (
-        await _voice_owner_refusal(
-            session, item, authority.principal_id, mode, voice=source.file_id is not None
-        )
-        is not None
+    refused = await _voice_owner_refusal(
+        session,
+        item,
+        authority.principal_id,
+        mode,
+        voice=source.file_id is not None,
+        lock_enrollment=not owner_resume,
+    )
+    if refused is not None and not (
+        owner_resume and refused.reason == "enrollment_generation_mismatch"
     ):
         return RefusedSteering(reason="authority_changed")
     run = await _read_voice_run(session, item, mode, voice=source.file_id is not None, locked=True)
@@ -829,7 +840,13 @@ async def _revision(
             join_transaction_mode="create_savepoint",
             expire_on_commit=False,
         ) as writer:
-            result = await workitem_dispatch.admit_revision(writer, facts)
+            result = await workitem_dispatch.admit_for_verified_owner(
+                writer,
+                facts,
+                work_item_id=item.id,
+                principal_id=authority.principal_id,
+                admit=workitem_dispatch.admit_revision,
+            )
             if isinstance(result, WorkItemOutcome):
                 await writer.commit()
                 return None
@@ -865,7 +882,10 @@ async def _accept(
     first_delivery_id: str,
     confirmation_evidence: SlackEvidence | None = None,
 ) -> SteeringDecision:
-    item = await _lock_authority(session, authority, settings, confirmation_evidence)
+    owner_resume = authority.source.file_id is None and authority.run.pr_number is not None
+    item = await _lock_authority(
+        session, authority, settings, confirmation_evidence, owner_resume=owner_resume
+    )
     if isinstance(item, RefusedSteering):
         return item
     if not body.strip():
@@ -931,6 +951,10 @@ async def _accept(
             execution_request_id=request_id,
             replayed=historical is not None,
         )
+    if owner_resume and item.model_auth_mode == "personal" and historical is None:
+        # The verified owner can resume at a newer generation in the admission savepoint.
+        await session.refresh(item, ["enrollment_generation"])
+        facts["owner"]["enrollment_generation"] = item.enrollment_generation
     await ledger.record(
         session,
         steering_id=steering_id,
