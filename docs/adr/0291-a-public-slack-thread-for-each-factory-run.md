@@ -30,13 +30,13 @@ neither repository access nor ownership of a personal run.
    origin. An older run becomes eligible on its next request. Serialize root
    assignments across both tables so a thread identifies one WorkItem.
 2. Verify the channel is public in the posting workspace when configured and
-   before its first post. Refuse private, externally shared and unverifiable
-   destinations with an operator-visible reason. Render the root, card,
+   before its first post. Refuse private, shared (including organization-wide)
+   and unverifiable destinations with an operator-visible reason. Render the root, card,
    steering replies and refusals from structured facts suitable for the
    audience. For a restricted repository omit its name and URLs. Include
    the pull request and checks for its observed head only when shareable.
-   The API omits restricted pull request URLs in public threads. A worker
-   requires the API's affirmative shareability marker to print a URL there.
+   Public steering acknowledgements omit URLs. The ready notice and the card
+   can link to the pull request once the API verifies that it is shareable.
    Keep source text, transcripts and free-form reports out of public messages
    and their outbox. Notify readiness on publication. Later checks update
    the card.

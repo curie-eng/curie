@@ -881,13 +881,15 @@ class PostgresFactorySlackStore:
                 (
                     await connection.execute(
                         text(f"""
-                SELECT q.status, clock_timestamp() AS now,
+                SELECT q.status, q.terminal_cause, clock_timestamp() AS now,
+                       w.cancelled_at IS NOT NULL AS work_item_cancelled,
                        (SELECT r.phase FROM {self._reports} r
                          WHERE r.execution_request_id = q.id ORDER BY r.id DESC LIMIT 1) AS phase,
                        EXISTS (SELECT 1 FROM {self._publications} b
                                 WHERE b.execution_request_id = q.id
                                   AND b.status = 'succeeded') AS published
-                  FROM {self._threads} t CROSS JOIN LATERAL ({self._shown}) q
+                  FROM {self._threads} t JOIN {self._work_items} w ON w.id = t.work_item_id
+                 CROSS JOIN LATERAL ({self._shown}) q
                  WHERE t.work_item_id = :item
             """),
                         {"item": card.work_item_id},
@@ -900,7 +902,12 @@ class PostgresFactorySlackStore:
             return None
         publication = await self._publication_text(card.work_item_id) if facts["published"] else ""
         render = render_public_card(
-            str(card.work_item_id), facts["status"], facts["phase"], publication
+            str(card.work_item_id),
+            facts["status"],
+            facts["phase"],
+            publication,
+            terminal_cause=facts["terminal_cause"],
+            work_item_cancelled=facts["work_item_cancelled"],
         )
         return render, facts["now"]
 

@@ -136,6 +136,12 @@ def _view(request: CardRequest) -> PhaseView | None:
     return phase_view(request.declaration, request.reports, request.status, request.terminal_cause)
 
 
+def _completed_state(terminal_cause: str | None, work_item_cancelled: bool) -> CardState:
+    if terminal_cause == "questions_asked":
+        return "stopped" if work_item_cancelled else "waiting on answers"
+    return "finished"
+
+
 def card_state(request: CardRequest, view: PhaseView | None) -> CardState:
     """The header word for the shown request."""
 
@@ -143,10 +149,8 @@ def card_state(request: CardRequest, view: PhaseView | None) -> CardState:
         return "stopped"
     if request.status in _NEEDS_A_PERSON:
         return "needs a person"
-    if request.status == "completed" and request.terminal_cause == "questions_asked":
-        return "stopped" if request.work_item_cancelled else "waiting on answers"
     if request.status == "completed":
-        return "finished"
+        return _completed_state(request.terminal_cause, request.work_item_cancelled)
     published = request.pr_url is not None
     if published and (view is None or view.current == WAIT_CI_PHASE):
         return "finished"
@@ -370,7 +374,6 @@ _PUBLIC_STATES: dict[str, CardState] = {
     "queued": "starting",
     "waiting": "starting",
     "running": "working",
-    "completed": "finished",
     "failed": "needs a person",
     "expired": "needs a person",
     "cancelled": "stopped",
@@ -378,8 +381,20 @@ _PUBLIC_STATES: dict[str, CardState] = {
 }
 
 
-def render_public_card(run: str, status: str, phase: str | None, publication: str) -> CardRender:
-    state = _PUBLIC_STATES.get(status, "working")
+def render_public_card(
+    run: str,
+    status: str,
+    phase: str | None,
+    publication: str,
+    *,
+    terminal_cause: str | None,
+    work_item_cancelled: bool,
+) -> CardRender:
+    state = (
+        _completed_state(terminal_cause, work_item_cancelled)
+        if status == "completed"
+        else _PUBLIC_STATES.get(status, "working")
+    )
     outcome = state if state == "needs a person" else f"is {state}"
     lines = [f"Factory run {run} {outcome}."]
     if phase is not None and phase in _PUBLIC_STAGES:

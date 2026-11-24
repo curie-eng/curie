@@ -378,8 +378,6 @@ async def _verify_public_channel(client: AsyncWebClient, channel: str) -> None:
         or facts.get("id") != channel
         or facts.get("context_team_id") != team
         or facts.get("is_channel") is not True
-        or type(facts.get("is_shared")) is not bool
-        or (facts["is_shared"] and facts.get("is_org_shared") is not True)
         or any(
             facts.get(flag) is not False
             for flag in (
@@ -387,6 +385,8 @@ async def _verify_public_channel(client: AsyncWebClient, channel: str) -> None:
                 "is_group",
                 "is_im",
                 "is_mpim",
+                "is_shared",
+                "is_org_shared",
                 "is_ext_shared",
                 "is_pending_ext_shared",
                 "is_archived",

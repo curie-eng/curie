@@ -19,7 +19,10 @@ from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
     "changed,allowed",
     [
         ({}, True),
-        ({"is_shared": True, "is_org_shared": True}, True),
+        ({"is_shared": True, "is_org_shared": True}, False),
+        ({"is_org_shared": True}, False),
+        ({"is_org_shared": None}, False),
+        ({"is_pending_ext_shared": True}, False),
         ({"is_private": True}, False),
         ({"is_shared": True}, False),
         ({"is_ext_shared": True}, False),
