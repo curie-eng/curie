@@ -814,6 +814,22 @@ def test_failed_names_terminal_cause_and_delivery_budget(
     _assert_common(body)
 
 
+def test_personal_enrollment_failure_names_the_two_resume_triggers(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+    epoch = _start(stack, facts.request_id)
+    _finish(facts.request_id, epoch, "failed", "authentication_required")
+
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+    actionable = body["actionable_cause"]
+    assert "authentication_required" in actionable
+    assert "remove and reapply the issue's trigger label" in actionable
+    assert "Slack thread if the run has an open pull request" in actionable
+
+
 def test_failed_start_failed_names_the_attempts_and_last_reason(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:

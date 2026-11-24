@@ -53,6 +53,7 @@ from starlette.concurrency import run_in_threadpool
 
 from curie_api.factory_label_reconcile import (
     bound_repositories,
+    cancellable_github_item,
     open_work_item_repositories,
     parse_time,
     tracker_work_item_repositories,
@@ -724,7 +725,7 @@ async def _cancel_stale(
             await session.scalars(
                 select(WorkItem).where(
                     *_in_scope(tracker),
-                    WorkItem.cancelled_at.is_(None),
+                    cancellable_github_item(),
                 )
             )
         )
@@ -732,12 +733,12 @@ async def _cancel_stale(
         # Each WorkItem against the label that admitted it (#4361 decision 10).
         # A Slack kickoff's WorkItem has none (#5380): it is watched for its
         # issue closing alone, so no label removal, earlier or later, cancels it.
-        watched: dict[int, str | None] = {}
+        watched: dict[int, tuple[str | None, bool]] = {}
         for item in items:
             label = github_factory.admitting_label(registry, item, kickoff_items=kickoff)
             if label is not None or item.id in kickoff:
-                watched[int(item.tracker_issue_id)] = label
-    keys = {_etag_key(number, label) for number, label in watched.items()}
+                watched[int(item.tracker_issue_id)] = (label, item.cancelled_at is not None)
+    keys = {_etag_key(number, label) for number, (label, _) in watched.items()}
     if only is None:
         for key in list(cursor.etags):
             if key.startswith("issue:") and key not in keys:
@@ -745,7 +746,7 @@ async def _cancel_stale(
     for number in sorted(watched):
         if only is not None and number not in only:
             continue
-        label = watched[number]
+        label, cancelled = watched[number]
         key = _etag_key(number, label)
         try:
             issue, etag = await tracker.conditional_issue(number, cursor.etags.get(key))
@@ -756,7 +757,7 @@ async def _cancel_stale(
                 raise Unavailable(f"issue {number}")
             if issue.get("state") == "closed":
                 action, kind = "closed", "closed"
-            elif label is not None and label not in names:
+            elif not cancelled and label is not None and label not in names:
                 action, kind = "unlabeled", "unlabeled"
             else:
                 if etag:

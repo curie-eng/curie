@@ -22,20 +22,25 @@ The enrollment row is advanced with SQL, standing in for #5377's replacement.
 Postgres is real; the concurrency test uses two independent engines.
 """
 
+# ruff: noqa: F811  (the shared fixtures are imported, then requested)
+
 from __future__ import annotations
 
 import asyncio
 import importlib
 from collections.abc import Iterator
-from typing import Any
+from contextlib import closing
+from pathlib import Path
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
 import personal_execution_support as support
 import pytest
-from curie_api import workitem_dispatch
+from curie_api import personal_enrollments, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.main import create_app
+from curie_api.models import ExecutionRequest
 from curie_api.workitem_dispatch import (
     AcquireGrant,
     DeferResult,
@@ -47,8 +52,18 @@ from curie_api.workitems import lifecycle
 from curie_api.workitems.lifecycle import WorkItemOutcome
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake, no_external_calls
+from forge_fakes.github import LABEL, GitHubAPI, _issue_event, _post, _sender
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from test_personal_execution_admission import (
+    DEFAULT_TENANT,
+    GitHubFactory,
+    _github_items,
+    _seed_default_tenant_owner,
+    github_factory,  # noqa: F401
+    owned_rows,  # noqa: F401
+)
+from test_personal_execution_lifecycle import _seed_transcript, _transcripts
 
 WORKER_TOKEN = "personal-revalidation-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
@@ -56,6 +71,290 @@ NOT_FOUND = {"detail": {"code": "not_found"}}
 SERVICE_CONVERSATION = "1700000000.000200"
 REVISION_OBJECTIVE = "Address the follow up comment on the issue"
 RELABEL_OBJECTIVE = "Run the task again after the label was added back"
+
+
+def _github_personal_failure(
+    github_factory: GitHubFactory,
+    number: int,
+    *,
+    failure: Literal["authentication_required", "enrollment_fenced", "start_failed"] = (
+        "authentication_required"
+    ),
+) -> tuple[TestClient, GitHubAPI, UUID, UUID, int]:
+    owner = _seed_default_tenant_owner()
+    client, github = github_factory("personal")
+    account = int(github.label_actor["id"])
+    _link_github_account(client, owner, account)
+    first = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert first.json()["status"] == "factory_admitted", first.text
+    [item] = _github_items(number)
+    [request] = _resume_requests(item["id"])
+    if failure == "authentication_required":
+        _fail_github_personal_request(item["id"], request["id"])
+    elif failure == "enrollment_fenced":
+        _start_github_personal_request(item["id"], request["id"])
+
+    async def replace_enrollment(session: AsyncSession) -> None:
+        await personal_enrollments._lock_owner(session, DEFAULT_TENANT, owner)
+        await session.execute(
+            text(
+                "UPDATE curie.personal_claude_enrollments "
+                "SET generation = 2, version = version + 1 WHERE principal_id = :owner"
+            ),
+            {"owner": owner},
+        )
+        await lifecycle.fence_enrollment_generation(
+            session, tenant_id=DEFAULT_TENANT, owner_principal_id=owner
+        )
+        await session.commit()
+
+    support.with_session(replace_enrollment)
+    if failure == "start_failed":
+        support.rows(
+            "UPDATE curie.execution_requests SET status = 'failed', terminal_at = now(), "
+            "terminal_cause = 'start_failed', last_deferral_reason = "
+            "'not_started:enrollment_generation_mismatch' WHERE id = :id",
+            {"id": request["id"]},
+        )
+    return client, github, item["id"], request["id"], account
+
+
+def _link_github_account(client: TestClient, owner: UUID, account: int) -> None:
+    linked = client.post(
+        f"/identity/admin/{DEFAULT_TENANT}/code-host-links",
+        headers={"X-API-Key": get_settings().api_key},
+        json={
+            "principal_id": str(owner),
+            "code_host_kind": "github",
+            "host": "github.com",
+            "account_id": str(account),
+            "created_by_principal_id": str(owner),
+        },
+    )
+    assert linked.status_code == 201, linked.text
+
+
+def _start_github_personal_request(item_id: UUID, request_id: UUID) -> int:
+    support.rows(
+        "UPDATE curie.work_items SET base_resolved_request_id = :request WHERE id = :id",
+        {"id": item_id, "request": request_id},
+    )
+    return support.start_request(request_id)
+
+
+def _fail_github_personal_request(item_id: UUID, request_id: UUID) -> None:
+    epoch = _start_github_personal_request(item_id, request_id)
+    support.finish_failed(request_id, epoch, cause="authentication_required")
+
+
+def _resume_requests(item_id: UUID) -> list[dict[str, Any]]:
+    return support.rows(
+        "SELECT id, status, terminal_cause, enrollment_generation, version "
+        "FROM curie.execution_requests WHERE work_item_id = :id ORDER BY sequence",
+        {"id": item_id},
+    )
+
+
+def _confirm_resume_teardown(request_id: UUID) -> None:
+    support.rows(
+        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = clock_timestamp() "
+        "WHERE id = :id",
+        {"id": request_id},
+    )
+    support.record_termination(request_id)
+
+
+def test_owner_github_relabel_resumes_at_current_enrollment_generation(
+    github_factory: GitHubFactory, owned_rows: None
+) -> None:
+    number = 58881
+    client, github, item_id, failed_id, account = _github_personal_failure(github_factory, number)
+    _confirm_resume_teardown(failed_id)
+    [item] = support.rows("SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": item_id})
+    agent = item["agent_id"]
+    thread = _seed_transcript(agent, item_id)
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.json()["status"] == "factory_cancelled", removed.text
+    github.labels = [LABEL]
+    github.advance_label_event(number)
+    relabel = _issue_event(
+        "labeled", number, label={"name": LABEL}, sender=_sender(sender_id=account + 1)
+    )
+
+    [before] = _resume_requests(item_id)
+    resumed = _post(client, "issues", relabel)
+    assert resumed.json()["status"] == "factory_admitted", resumed.text
+    assert _github_items(number)[0]["enrollment_generation"] == 2
+    predecessor, successor = _resume_requests(item_id)
+    assert predecessor == before
+    assert (predecessor["enrollment_generation"], predecessor["terminal_cause"]) == (
+        1,
+        "authentication_required",
+    )
+    assert (successor["enrollment_generation"], successor["status"]) == (2, "waiting")
+    assert _transcripts(agent, thread) == 1
+
+    async def refusal(session: AsyncSession) -> str | None:
+        request = await session.get(ExecutionRequest, successor["id"])
+        assert request is not None
+        return await workitem_dispatch._personal_enrollment_refusal(session, request)
+
+    assert support.with_session(refusal) is None
+
+
+def test_owner_github_relabel_waits_for_worker_teardown(
+    github_factory: GitHubFactory, owned_rows: None
+) -> None:
+    number = 58883
+    client, github, item_id, failed_id, _ = _github_personal_failure(github_factory, number)
+    github.advance_label_event(number)
+    relabel = _issue_event("labeled", number, label={"name": LABEL})
+    before = _resume_requests(item_id)
+    refused = _post(client, "issues", relabel)
+    assert refused.json()["errors"] == [{"code": "runtime_live"}], refused.text
+    assert any(
+        "try again shortly" in comment["body"].lower() for comment in github.issue_comments[number]
+    )
+    assert _github_items(number)[0]["enrollment_generation"] == 1
+    assert _resume_requests(item_id) == before
+
+    _confirm_resume_teardown(failed_id)
+    github.advance_label_event(number)
+    resumed = _post(client, "issues", relabel)
+    assert resumed.json()["status"] == "factory_admitted", resumed.text
+    assert [request["enrollment_generation"] for request in _resume_requests(item_id)] == [1, 2]
+
+
+def test_owner_github_relabel_recovers_a_stale_start_failure(
+    github_factory: GitHubFactory, owned_rows: None
+) -> None:
+    number = 58885
+    client, github, item_id, failed_id, _ = _github_personal_failure(
+        github_factory, number, failure="start_failed"
+    )
+    [item] = support.rows("SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": item_id})
+    agent = item["agent_id"]
+    thread = _seed_transcript(agent, item_id)
+    [before] = _resume_requests(item_id)
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.json()["status"] == "factory_cancelled", removed.text
+    github.labels = [LABEL]
+    github.advance_label_event(number)
+
+    resumed = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+
+    assert resumed.json()["status"] == "factory_admitted", resumed.text
+    predecessor, successor = _resume_requests(item_id)
+    assert (successor["enrollment_generation"], successor["status"]) == (2, "waiting")
+    assert predecessor == before
+    assert (predecessor["id"], predecessor["terminal_cause"]) == (failed_id, "start_failed")
+    assert _transcripts(agent, thread) == 1
+
+
+@pytest.mark.parametrize("close_before_teardown", [False, True], ids=["resume", "close"])
+def test_owner_unlabel_preserves_a_stopping_enrollment_fence(
+    github_factory: GitHubFactory, owned_rows: None, close_before_teardown: bool
+) -> None:
+    number = 58886
+    client, github, item_id, stopping_id, _ = _github_personal_failure(
+        github_factory, number, failure="enrollment_fenced"
+    )
+    [item] = support.rows("SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": item_id})
+    agent = item["agent_id"]
+    thread = _seed_transcript(agent, item_id)
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.json()["status"] == "factory_cancellation_requested", removed.text
+    github.labels = [LABEL]
+    github.advance_label_event(number)
+    relabel = _issue_event("labeled", number, label={"name": LABEL})
+    before = _resume_requests(item_id)
+
+    refused = _post(client, "issues", relabel)
+    assert refused.json()["errors"] == [{"code": "runtime_live"}], refused.text
+    assert _resume_requests(item_id) == before
+    assert _github_items(number)[0]["enrollment_generation"] == 1
+    assert before[0]["terminal_cause"] == "enrollment_fenced"
+
+    if close_before_teardown:
+        github.issue_state = "closed"
+        closed = _post(client, "issues", _issue_event("closed", number))
+        assert closed.json()["status"] == "factory_duplicate", closed.text
+
+    _confirm_resume_teardown(stopping_id)
+    [predecessor] = _resume_requests(item_id)
+    if close_before_teardown:
+        assert (predecessor["status"], predecessor["terminal_cause"]) == (
+            "cancelled",
+            "issue_cancelled",
+        )
+        assert _transcripts(agent, thread) == 0
+    else:
+        assert (predecessor["status"], predecessor["terminal_cause"]) == (
+            "failed",
+            "enrollment_fenced",
+        )
+        github.advance_label_event(number)
+        resumed = _post(client, "issues", relabel)
+        assert resumed.json()["status"] == "factory_admitted", resumed.text
+        old, successor = _resume_requests(item_id)
+        assert old == predecessor
+        assert successor["enrollment_generation"] == 2
+        assert _transcripts(agent, thread) == 1
+
+
+def test_non_owner_github_relabel_keeps_the_old_enrollment_generation(
+    github_factory: GitHubFactory, owned_rows: None
+) -> None:
+    number = 58882
+    client, github, item_id, failed_id, account = _github_personal_failure(github_factory, number)
+    _confirm_resume_teardown(failed_id)
+    other = _seed_default_tenant_owner()
+    _link_github_account(client, other, account + 1)
+    github.advance_label_event(number)
+    github.label_actor = _sender(login="acme-other-writer", sender_id=account + 1)
+    github.permission_user_id = account + 1
+
+    relabel = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+
+    assert relabel.json()["status"] == "factory_admitted", relabel.text
+    assert _github_items(number)[0]["enrollment_generation"] == 1
+    predecessor, successor = _resume_requests(item_id)
+    assert predecessor["id"] == failed_id
+    assert successor["enrollment_generation"] == 1
+
+
+def test_polled_close_expires_a_personal_transcript_retained_through_unlabel(
+    owned_rows: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from test_factory_poll_intake import _admit_label, _factory, _run_once
+
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", "personal")
+    with closing(_factory(monkeypatch, tmp_path, "poll")) as factory:
+        client, github = next(factory)
+        owner = _seed_default_tenant_owner()
+        _link_github_account(client, owner, github.permission_user_id)
+        number, request = _admit_label(client, github)
+        item_id = request["work_item_id"]
+        _fail_github_personal_request(item_id, request["id"])
+        [item] = support.rows(
+            "SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": item_id}
+        )
+        agent = item["agent_id"]
+        thread = _seed_transcript(agent, item_id)
+        github.unlabel_issue(number)
+        _run_once(github)
+        [removed] = support.rows(
+            "SELECT cancelled_at FROM curie.work_items WHERE id = :id", {"id": item_id}
+        )
+        assert removed["cancelled_at"] is not None
+        assert _transcripts(agent, thread) == 1
+
+        github.close_issue(number)
+        _run_once(github)
+        assert _transcripts(agent, thread) == 0
 
 
 @pytest.fixture

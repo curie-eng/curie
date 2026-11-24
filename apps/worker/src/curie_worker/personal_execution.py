@@ -55,8 +55,9 @@ OWNER_PRINCIPAL_INACTIVE = "owner_principal_inactive"
 EXECUTION_AUTHORITY_LOST = "execution_authority_lost"
 WORK_ITEM_CANCELLED = "work_item_cancelled"
 OWNER_PROVENANCE_MISMATCH = "owner_provenance_mismatch"
-#: Enrollment fences, classified authentication-required like a grant refusal:
-#: the owner reconnects or replaces the enrollment, then the request resumes.
+#: Enrollment fences are classified authentication-required like a grant refusal.
+#: After restoring enrollment, the owner can reapply the issue's trigger label
+#: or mention the app in the run's Slack thread if its pull request is open.
 ENROLLMENT_INACTIVE = "enrollment_inactive"
 ENROLLMENT_GENERATION_MISMATCH = "enrollment_generation_mismatch"
 

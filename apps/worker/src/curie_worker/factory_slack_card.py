@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Final, Literal
 
 from channel_protocol import MESSAGE_VERSION, MessageLink, OutboundMessage
-from curie_internal.factory_cause import cause_text
+from curie_internal.factory_cause import PERSONAL_RESUME_STEPS, cause_text
 from curie_internal.factory_phase_view import WAIT_CI_PHASE, PhaseView, phase_view
 
 CardState = Literal[
@@ -275,9 +275,7 @@ def render_card(subject: CardSubject, request: CardRequest, *, now: datetime) ->
         # fence sentence. Service mode keeps the shared cause sentence.
         # The notify reply keeps the shared cause sentence (#5720).
         if request.terminal_cause == "authentication_required" and request.personal:
-            sentence = "Your Claude plan was rejected. Reconnect it on the Claude plan page."
-        elif request.terminal_cause == "enrollment_fenced":
-            sentence = _sentence(cause_text("enrollment_fenced"))
+            sentence = f"Your Claude plan was rejected. {PERSONAL_RESUME_STEPS}"
         else:
             sentence = _sentence(cause_text(str(request.terminal_cause or "")))
         body.extend(["", f":raising_hand: *Needs a person.* {escaped(sentence)}"])

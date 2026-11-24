@@ -85,7 +85,10 @@ def test_grant_notice_posts_once_to_the_owner_and_survives_a_restart(
     issue_url = f"https://github.com/{REPO}/issues/{number}"
     assert posted.params["text"] == (
         "Your Claude plan was rejected when Curie tried to use it, so your factory run for "
-        f"#{number} Fix the greeting stopped. The work is kept.\n{issue_url}"
+        f"#{number} Fix the greeting stopped. The work is kept. "
+        "The owner can reconnect or replace the enrollment on the Claude plan page if needed. "
+        "To resume, the owner can remove and reapply the issue's trigger label, or mention the app "
+        f"in the run's Slack thread if the run has an open pull request.\n{issue_url}"
     )
     assert _button_urls(posted) == [RECONNECT_URL]
     blocks = posted.params["blocks"]
@@ -410,8 +413,9 @@ def test_grant_notice_card_uses_the_recorded_cause() -> None:
     a provider rejection onto the enrollment fence sentence.
     """
 
-    rejection = "Your Claude plan was rejected. Reconnect it on the Claude plan page."
-    assert rejection in _needs_person_card(cause="authentication_required", personal=True)
+    rejection = "Your Claude plan was rejected."
+    rejected = _needs_person_card(cause="authentication_required", personal=True)
+    assert rejection in rejected
     fence = cause_text("enrollment_fenced")
     fenced = _needs_person_card(cause="enrollment_fenced", personal=True)
     assert fence[:1].upper() + fence[1:] in fenced
@@ -420,3 +424,6 @@ def test_grant_notice_card_uses_the_recorded_cause() -> None:
     service = _needs_person_card(cause="authentication_required", personal=False)
     assert shared[:1].upper() + shared[1:] in service
     assert rejection not in service
+    for card in (rejected, fenced):
+        assert "remove and reapply the issue's trigger label" in card
+        assert "Slack thread if the run has an open pull request" in card

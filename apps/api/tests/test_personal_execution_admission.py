@@ -280,6 +280,10 @@ def _delete_owned() -> tuple[int, int, int]:
             f"DELETE FROM curie.work_items WHERE owner_principal_id IN ({principals})",
             mark,
         )
+        for table in ("identity_audit_events", "identity_links", "personal_claude_custody"):
+            await _exec(
+                connection, f"DELETE FROM curie.{table} WHERE principal_id IN ({principals})", mark
+            )
         await _exec(
             connection,
             "DELETE FROM curie.personal_claude_enrollments "

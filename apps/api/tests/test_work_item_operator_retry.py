@@ -584,6 +584,7 @@ def test_exhausted_allowance_names_the_used_count_and_cause(
     [
         ("no_pull_request", "no_effects", "not_retryable", ("disposition", "terminal")),
         ("budget_exceeded", "no_effects", "not_retryable", ("disposition", "terminal")),
+        ("authentication_required", "no_effects", "not_retryable", ("disposition", "terminal")),
         ("model_unreachable", "flagged", "side_effects_unproven", ("retry_safety", "flagged")),
         ("model_unreachable", "uncertain", "side_effects_unproven", ("retry_safety", "uncertain")),
     ],
