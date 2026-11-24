@@ -2692,7 +2692,9 @@ request, a `state` and an `actionable_cause`. The states:
 - `cancellation_requested`: termination requested (`issue_cancelled`,
   `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
 - `cancelled`: the issue label was removed or the issue was closed. A pull
-  request already opened is kept.
+  request already opened is kept. A completed run whose own pull request
+  merged stays `published` if the issue is still open or the close was
+  recorded within ten minutes before or after Curie observed the merge.
 - `expired`: `capacity_wait_expired`, `retry_condition_expired` or
   `execution_deadline`. A capacity wait that expires after a failed start
   still names the previous start failure. A `retry_condition_expired` cause
@@ -2705,7 +2707,9 @@ request, a `state` and an `actionable_cause`. The states:
 - `awaiting_approval`: a publication approval or a tool approval on the same
   conversation is pending.
 - `publishing`: the publication is approved and in flight.
-- `published`: a pull request is open for the work.
+- `published`: a pull request is open for the work, or the run completed and
+  Curie observed its pull request merge. A merged completion says the work
+  completed.
 - `completed_unpublished`: the run completed with no publication, or its
   publication was denied, expired or failed.
 

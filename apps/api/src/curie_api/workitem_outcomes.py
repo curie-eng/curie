@@ -24,7 +24,7 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
 from curie_internal.factory_phase_view import phase_view
@@ -104,6 +104,80 @@ def _previous_start_failure(req: ExecutionRequest) -> str:
     return f"; previous start failure: {detail}" if detail else ""
 
 
+# Curie writes lineage.updated_at when it observes the merge, which can be
+# after GitHub has already closed the issue. The close counts when it is
+# within ten minutes before or after that observation.
+_OBSERVED_MERGE_CLOSE_TOLERANCE = timedelta(minutes=10)
+
+
+def _utc(value: datetime) -> datetime:
+    """Read a stamp as UTC.
+
+    The lineage stores the time Curie observed the merge without a time zone.
+    The request and the issue close store a time zone. Both clocks are UTC.
+    """
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _close_matches_observed_merge(
+    cancelled_at: datetime | None, observed_at: datetime | None
+) -> bool:
+    """Whether the close is the one Curie ties to an observed merge.
+
+    ``observed_at`` is the lineage's ``updated_at``, written when Curie records
+    the merge, not GitHub's merge time. The close counts when it is within ten
+    minutes before or after that stamp.
+    """
+
+    if cancelled_at is None or observed_at is None:
+        return False
+    cancelled = _utc(cancelled_at)
+    observed = _utc(observed_at)
+    return (
+        observed - _OBSERVED_MERGE_CLOSE_TOLERANCE
+        <= cancelled
+        <= observed + _OBSERVED_MERGE_CLOSE_TOLERANCE
+    )
+
+
+def _merged_completion(
+    req: ExecutionRequest | None,
+    lineage: ThreadPublicationLineage | None,
+    *,
+    cancelled_at: datetime | None = None,
+) -> bool:
+    """Whether this request is the run that merged its own pull request.
+
+    The stamp is the lineage's ``updated_at``, written when Curie observes the
+    merge, not when GitHub merged. A request admitted after that observation,
+    or one that finished for another cause, is a later run that still points
+    at the merged pull request. A lineage with no stamp skips the admission
+    time check. A close counts when it is within ten minutes before or after
+    the observation. A close further away does not.
+    """
+
+    if (
+        req is None
+        or lineage is None
+        or req.status != "completed"
+        or req.terminal_cause != "completed"
+        or lineage.status != "merged"
+        or lineage.pr_number is None
+    ):
+        return False
+    observed_at = lineage.updated_at
+    if observed_at is not None and (
+        req.created_at is None or _utc(req.created_at) > _utc(observed_at)
+    ):
+        return False
+    if cancelled_at is not None and not _close_matches_observed_merge(cancelled_at, observed_at):
+        return False
+    return True
+
+
 def _cause(
     state: WorkItemOutcomeState,
     req: ExecutionRequest | None,
@@ -111,6 +185,8 @@ def _cause(
     publication: Publication | None,
     approval: Approval | None,
     now: datetime,
+    *,
+    cancelled_at: datetime | None,
 ) -> str:
     if req is None:
         if state == "cancelled":
@@ -253,10 +329,10 @@ def _cause(
         )
     if state == "published":
         assert lineage is not None
-        return (
-            f"pull request #{lineage.pr_number} opened; CI and review are the "
-            "next signals"
-        )
+        if _merged_completion(req, lineage, cancelled_at=cancelled_at):
+            closed = " and closed the issue" if cancelled_at is not None else ""
+            return f"completed: pull request #{lineage.pr_number} merged{closed}"
+        return f"pull request #{lineage.pr_number} opened; CI and review are the next signals"
     # completed_unpublished
     if publication is None:
         return "execution completed without a publication"
@@ -336,7 +412,10 @@ def derive_outcome(
         state = "completed_unpublished"
     elif req.status == "running":
         state = "running"
-    elif req.status == "cancelled" or item.cancelled_at is not None:
+    elif req.status == "cancelled" or (
+        item.cancelled_at is not None
+        and not _merged_completion(req, lineage, cancelled_at=item.cancelled_at)
+    ):
         state = "cancelled"
     elif req.status == "expired":
         state = "expired"
@@ -406,7 +485,15 @@ def derive_outcome(
         actionable_cause=(
             "ci_observed_after_run"
             if observed_completion
-            else _cause(state, req, lineage, publication, approval, now)
+            else _cause(
+                state,
+                req,
+                lineage,
+                publication,
+                approval,
+                now,
+                cancelled_at=item.cancelled_at,
+            )
         ),
         objective=objective[:OBJECTIVE_LIMIT] if objective is not None else None,
         objective_truncated=truncated,
