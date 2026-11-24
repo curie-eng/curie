@@ -99,7 +99,7 @@ from .forges.registry import forges_registry
 from .forges.surfaces import bound_labels
 from .forges.types import TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
-from .github_factory_events import FactoryNotice, mentions_factory
+from .github_factory_events import FactoryNotice, is_voice_body, mentions_factory
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
 from .github_review_truth import VerifiedRepository
 from .models import (
@@ -941,6 +941,11 @@ async def retry_answers(
     for comment_id in comment_ids:
         try:
             value = await tracker.issue_comment(comment_id)
+            if settings.factory_voice_enabled and is_voice_body(
+                value.get("body"), tracker.mention, await tracker.app_slug()
+            ):
+                results[comment_id] = "settled"
+                continue
             notice = _answer_notice(value, tracker, installation_id=installation_id, mention=False)
             handled = notice is not None and await _admit_answer(
                 sessionmaker, settings, tracker, notice, value
@@ -1104,11 +1109,17 @@ async def _admit_mentions(
         )
     )
     app_slug = await tracker.app_slug()
+    factory_conversations = factory_issues | owned_pulls
     for comment in listed:
         if not isinstance(comment, dict):
             continue
         body = comment.get("body")
-        if comment.get("id") in retried:
+        answer_on = trailing_id(comment.get("issue_url"))
+        if comment.get("id") in retried or (
+            settings.factory_voice_enabled
+            and answer_on in factory_conversations
+            and is_voice_body(body, tracker.mention, app_slug)
+        ):
             continue
         if (
             isinstance(body, str)
@@ -1130,7 +1141,6 @@ async def _admit_mentions(
         # was already decided as an answer replays its receipt and is never
         # also a mention after the round ends. A comment on an owned pull
         # request stays review feedback.
-        answer_on = trailing_id(comment.get("issue_url"))
         mentioned = isinstance(body, str) and mentions_factory(body, tracker.mention, app_slug)
         if (
             answer_on is not None

@@ -150,20 +150,13 @@ async def verify_feedback_truth(
     )
 
 
-async def verify_feedback_in_repository(
-    feedback: UnverifiedFeedback,
+async def verify_open_pull(
     lineage: BoundReviewLineage,
     verified: VerifiedRepository,
     *,
     settings: Settings,
     client: httpx.AsyncClient,
-) -> str:
-    """`verify_feedback_truth` against an already verified repository read.
-
-    The pull request, the feedback object and the sender's write permission
-    (ADR 0197 authority 3) are still read fresh for this one piece of feedback.
-    """
-    check_feedback_lineage(feedback, lineage)
+) -> dict[str, Any]:
     if verified.installation_id != lineage.installation_id:
         raise FeedbackIgnored("installation_unverified")
     api, token, repository = verified.api, verified.token, verified.repository
@@ -209,11 +202,31 @@ async def verify_feedback_in_repository(
         raise FeedbackIgnored("repository_mismatch")
     if pr.get("state") != "open" or pr.get("merged") is not False:
         raise FeedbackIgnored("terminal_pull_request")
-    if head.get("sha") != lineage.head_sha or (
-        feedback.head_sha is not None and feedback.head_sha != lineage.head_sha
-    ):
+    if head.get("sha") != lineage.head_sha:
         raise FeedbackIgnored("stale_feedback_head")
 
+    return pr
+
+
+async def verify_feedback_in_repository(
+    feedback: UnverifiedFeedback,
+    lineage: BoundReviewLineage,
+    verified: VerifiedRepository,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> str:
+    """`verify_feedback_truth` against an already verified repository read.
+
+    The pull request, the feedback object and the sender's write permission
+    (ADR 0197 authority 3) are still read fresh for this one piece of feedback.
+    """
+    check_feedback_lineage(feedback, lineage)
+    pr = await verify_open_pull(lineage, verified, settings=settings, client=client)
+    if feedback.head_sha is not None and feedback.head_sha != lineage.head_sha:
+        raise FeedbackIgnored("stale_feedback_head")
+    api, token, repository = verified.api, verified.token, verified.repository
+    repo_path = f"/repos/{repo_url_path(lineage.repo_full_name)}"
     if feedback.event == "issue_comment":
         path = f"{repo_path}/issues/comments/{feedback.feedback_id}"
     elif feedback.event == "pull_request_review_comment":

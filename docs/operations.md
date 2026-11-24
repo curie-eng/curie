@@ -2436,6 +2436,44 @@ comment on a fresh issue is the run's only GitHub response, with the pull
 request URL included when publication succeeds, so a `github` binding needs no
 endpoint or adapter.
 
+### GitHub voice feedback
+
+Local replay verifies one WAV attachment in a public GitHub issue comment and
+in a pull request conversation comment. In both cases the adapter reads the
+current comment and checks its author's write access before fetching the
+file. A changed comment or an ambiguous attachment is refused. Private and
+internal repositories are unsupported. The webhook refuses both with
+`voice_private_repository`.
+Media downloads carry no GitHub credentials.
+
+GitHub.com voice feedback requires a signed `issue_comment` webhook delivery.
+Voice is off by default. Enabling it routes recording attachments and voice
+decisions on factory-owned conversations to the voice adapter. A revision
+requires an open factory pull request. With voice off, comments follow the
+usual issue and pull request feedback rules.
+The author reviews the transcript in the same conversation and replies with
+`confirm <code>`, `edit <code> <replacement>` or `reject <code>`. An edit
+displays a new code. Replacement text containing a carriage return is refused
+with `voice_invalid_text` and the original code remains valid. Only confirmation
+of the displayed version can queue a revision, subject to the plain-feedback
+cap. Immediate refusal codes appear
+only in the webhook response. To retry a transient confirmation failure,
+post a new comment with the same confirmation code.
+
+The signed webhook tests replayed the same WAV in an issue and a pull request
+conversation. A fixture recognizer checked the WAV bytes and returned a fixed
+transcript. In each conversation, the author edited the transcript and
+confirmed the new code. Each confirmation queued one revision on the original
+WorkItem. Repeated confirmations queued no additional revisions.
+
+A separate CPU recognizer run transcribed the retry-label and preserve-timeout
+recordings. Its issue-number fixture failed the identifier check.
+[Model verification results](https://github.com/curie-eng/curie/pull/5938)
+
+Provider ingress still needs a browser-uploaded WAV in each kind of public
+comment and a signed delivery from GitHub. The diff on a live pull request
+remains unverified.
+
 ### Driving the factory end to end
 
 `curie dev factory-e2e preflight` proves the signed intake loop against a real

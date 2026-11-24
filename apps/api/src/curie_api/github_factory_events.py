@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from .factory_voice_contract import Refused, VoiceReply, parse_voice_reply
 from .github_review_events import (
     FeedbackIgnored,
     human_sender,
@@ -77,6 +78,44 @@ class FactoryNotice:
                 f"{self.issue_number}/{self.delivery_id}"
             )
         return uuid.uuid5(uuid.NAMESPACE_URL, identity)
+
+
+_ATTACHED_LINK = re.compile(
+    r"!?\[(?P<label>[^\[\]\r\n]*)\]\((?P<href>https?://[^\s<>()]+)\)|(?P<bare>https?://[^\s<>()]+)",
+    re.IGNORECASE,
+)
+_AUDIO_NAME = re.compile(r"\.(?:wav|mp3|m4a|ogg|webm|mp4|mov)$", re.IGNORECASE)
+
+
+def voice_reply(body: str, *addresses: str | None) -> VoiceReply | Refused | None:
+    prefix, separator, text = body.partition(" ")
+    if (
+        separator
+        and prefix.startswith("@")
+        and prefix[1:].removesuffix("[bot]").casefold()
+        in {address.casefold() for address in addresses if address}
+    ):
+        return parse_voice_reply(text)
+    return parse_voice_reply(body)
+
+
+def is_voice_body(body: object, *addresses: str | None) -> bool:
+    """Reserve commands and standalone audio links, including refused media."""
+    if not isinstance(body, str):
+        return False
+    if voice_reply(body, *addresses) is not None:
+        return True
+    audio = False
+    end = 0
+    for link in _ATTACHED_LINK.finditer(body):
+        if body[end : link.start()].strip():
+            return False
+        url = link["href"] or link["bare"]
+        path = url.partition("?")[0].partition("#")[0]
+        if _AUDIO_NAME.search(path) or _AUDIO_NAME.search(link["label"] or ""):
+            audio = True
+        end = link.end()
+    return audio and not body[end:].strip()
 
 
 def is_plain_issue(payload: Any) -> bool:

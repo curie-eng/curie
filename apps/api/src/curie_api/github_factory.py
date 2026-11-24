@@ -1183,7 +1183,10 @@ async def handle_factory_delivery(
         return ignored(audit.reason)
     try:
         registry = forges_registry(settings)
-        intake = factory_tracker(registry).config
+        tracker = registry.github_tracker()
+        if tracker is None:
+            raise FactoryRefused("tracker_unconfigured")
+        intake = tracker.config
         # A label event is judged against the labels bound on its repository
         # (#4361 decision 15), so a repository outside the allowlist is
         # refused before its surfaces are read.

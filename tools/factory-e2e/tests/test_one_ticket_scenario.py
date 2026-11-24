@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 import pytest
 from curie_api import factory_poll_intake
+from curie_api.config import get_settings
 from curie_api.forges.github.comments import static_token
 from curie_api.forges.github.tracker import GitHubTracker
 from curie_api.github_review_events import FeedbackIgnored, label_actor
@@ -430,7 +431,7 @@ def _offered_to_the_answer_intake(
             cursor = factory_poll_intake.Cursor(comments_since=ots.instant(since))
             await factory_poll_intake._admit_mentions(
                 object(),  # type: ignore[arg-type]
-                object(),  # type: ignore[arg-type]
+                get_settings(),
                 client,
                 cursor,
                 _tracker(stub, client),
