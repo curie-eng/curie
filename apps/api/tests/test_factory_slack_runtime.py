@@ -568,15 +568,16 @@ class Stack:
         assert response.status_code == 200, response.text
         return response.json()
 
-    def start(self, request_id: uuid.UUID) -> int:
+    def acquire(
+        self, request_id: uuid.UUID, *, input_sha256: str | None = None
+    ) -> httpx.Response:
         view = self.request_view(request_id)
-        generation = view["dispatch_generation"]
-        acquired = self.client.post(
+        return self.client.post(
             f"/v1/internal/work-items/requests/{request_id}/acquire",
             headers=self.internal,
             json={
                 "owner": OWNER,
-                "generation": generation,
+                "generation": view["dispatch_generation"],
                 "wake": {
                     "kind": view["reply_kind"],
                     "address": view["reply_address"],
@@ -584,18 +585,30 @@ class Stack:
                     "conversation_id": view["reply_conversation_id"],
                 },
                 "context": None,
+                "input_sha256": input_sha256,
             },
         )
+
+    def start(self, request_id: uuid.UUID, *, input_sha256: str | None = None) -> int:
+        acquired = self.acquire(request_id, input_sha256=input_sha256)
         assert acquired.status_code == 200, acquired.text
-        started = self.client.post(
+        started = self.start_acquired(request_id, acquired.json(), input_sha256=input_sha256)
+        assert started.status_code == 200, started.text
+        return int(started.json()["runtime_epoch"])
+
+    def start_acquired(
+        self, request_id: uuid.UUID, grant: dict[str, Any], *, input_sha256: str | None = None
+    ) -> httpx.Response:
+        return self.client.post(
             f"/v1/internal/work-items/requests/{request_id}/start",
             headers=self.internal,
             json={
                 "owner": OWNER,
-                "generation": generation,
+                "generation": grant["generation"],
                 "claim_name": f"claim-{request_id.hex[:12]}",
                 "sandbox_name": f"sbx-{request_id.hex[:12]}",
-                "context": acquired.json()["context"],
+                "context": grant["context"],
+                "input_sha256": input_sha256,
                 "delivered_limits": {
                     "memory_bytes": None,
                     "ephemeral_storage_bytes": None,
@@ -604,8 +617,6 @@ class Stack:
                 },
             },
         )
-        assert started.status_code == 200, started.text
-        return int(started.json()["runtime_epoch"])
 
     def finish(self, request_id: uuid.UUID, epoch: int, *, published: bool = False) -> None:
         """End a running request as the worker's settlement does.

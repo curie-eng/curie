@@ -327,6 +327,7 @@ _MAINTENANCE_REFUSALS = {
     "superseded": "A newer request supersedes this repair.",
     "snapshot_changed": "The work item or pull request changed during verification.",
     "foreign_head": "Repair paused because the pull request head differs from the factory head.",
+    "conflict_authority_mismatch": "The merge conflict repair no longer matches its admission.",
     "base_changed": "The base branch changed.",
     "window_expired": "The automatic repair window expired.",
     "budget_exhausted": "The automatic repair allowance has been spent.",

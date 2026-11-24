@@ -1746,10 +1746,19 @@ WorkItem history retains verified green and allowed no-CI settlements even when
 automatic repair is disabled. Slack reports only maintenance events recorded
 while automatic repair is enabled. Read `maintenance_history` in the
 WorkItem detail for the authorized head, base, reason, refusal or admitted
-successor. A matching failure on the base or missing evidence leaves the
-allowance available. A human push pauses repair with
-`foreign_head`. Restoring the recorded head allows reevaluation. A successful
-repair leaves the pull request open for review.
+successor. During admission, a matching failure on the base or missing
+evidence leaves the allowance available. A human push blocks admission with
+`foreign_head`.
+Restoring the recorded head allows reevaluation if the allowance is available.
+At worker acquisition, Curie settles an admitted successor immediately if
+repair is disabled, the pull request is closed, its identity or base no longer
+matches, or conflict authority fails. A foreign head or unavailable forge
+evidence can clear on a retry of the same successor. If either refusal
+persists 15 minutes after admission, Curie settles the request at the next
+acquire. The request settles as `maintenance_refused` and records the specific
+reason in `maintenance_history`. Admission spent the lineage's allowance,
+and settlement lets the next queued revision proceed. A successful repair
+leaves the pull request open for review.
 
 #### Conflicts after the base branch advances
 

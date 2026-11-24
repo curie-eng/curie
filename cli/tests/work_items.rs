@@ -416,6 +416,11 @@ fn truncated_list_is_reported() {
 #[test]
 fn detail_shows_ci_state_and_reason() {
     let mut detail = detail_item();
+    let repair = &mut detail["requests"][0];
+    repair["status"] = json!("failed");
+    repair["terminal_cause"] = json!("maintenance_refused");
+    repair["capacity_deferrals"] = json!(0);
+    repair["last_deferral_reason"] = Value::Null;
     detail["maintenance_history"] = json!([{
         "id": 1,
         "recorded_at": "2026-09-22T10:07:00Z",
@@ -461,6 +466,10 @@ fn detail_shows_ci_state_and_reason() {
     assert_eq!(value["item"]["ci"]["reason"], "github_forbidden");
     assert_eq!(value["item"]["ci_observation"], observation);
     assert_eq!(value["item"]["maintenance_history"], history);
+    assert_eq!(
+        value["item"]["requests"][0]["terminal_cause"],
+        "maintenance_refused"
+    );
     assert_eq!(
         value["item"]["tracker"]["url"],
         "https://github.com/acme-corp/acme-bot/issues/2577"

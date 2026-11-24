@@ -92,8 +92,8 @@ CONTRACT = "0041"
 # Learned memory rules require 0185.
 # The plain feedback cap requires 0186.
 # Reading sealed execution input requires schema revision 0195.
-# Conflict repair publication reads require 0193.
-APP_SCHEMA_MIN = "0193"
+# Maintenance refusal settlement requires 0197.
+APP_SCHEMA_MIN = "0197"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -126,7 +126,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
-    assert HEAD == "0193"
+    assert HEAD == "0197"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -267,6 +267,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0194",
             "0195",
             "0193",
+            "0197",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -344,8 +345,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0194",
             "0195",
             "0193",
+            "0197",
         }
-    assert current_revision() == "0193"
+    assert current_revision() == "0197"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -471,8 +473,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # Learned memory rules require 0185.
     # The plain feedback cap requires 0186.
     # Reading sealed execution input requires schema revision 0195.
-    # Conflict repair publication reads require 0193.
-    for revision in sorted(known - {"0193"}):
+    # Maintenance refusal settlement requires 0197.
+    for revision in sorted(known - {"0197"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -522,7 +524,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0191", window, known) is False
     assert can_serve("0194", window, known) is False
     assert can_serve("0195", window, known) is False
-    assert can_serve("0193", window, known) is True
+    assert can_serve("0193", window, known) is False
+    assert can_serve("0197", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

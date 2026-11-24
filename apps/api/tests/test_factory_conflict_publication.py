@@ -190,6 +190,103 @@ def test_sha256_successor_retains_both_pins_and_conflict_paths(
     precheck_case["client"].portal.call(resolve)
 
 
+def _acquire_conflict_successor(case: dict[str, Any], repair_id: uuid.UUID) -> httpx.Response:
+    claim = {
+        "owner": "factory",
+        "generation": 1,
+        "wake": {
+            "kind": "slack",
+            "adapter": "default",
+            "address": "C0EXAMPLE1",
+            "conversation_id": case["reply_conversation_id"],
+        },
+        "context": None,
+    }
+    return case["client"].post(
+        f"/v1/internal/work-items/requests/{repair_id}/acquire",
+        headers=WORKER_HEADERS,
+        json=claim,
+    )
+
+
+def test_acquire_settles_mismatched_conflict_authority(
+    precheck_case: dict[str, Any], repair_forge: github.GitHubRepositoryFake
+) -> None:
+    case = precheck_case
+    client = case["client"]
+    repair_id = client.portal.call(_successor, case, repair_forge, "base_conflict")
+    case["truth"]["node_id"] = "PR_other"
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET code_host_pr_id = :pr WHERE id = :id",
+        {"id": case["lineage_id"], "pr": "PR_other"},
+    )
+    for _ in range(2):
+        refused = _acquire_conflict_successor(case, repair_id)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "factory_start_failed"
+
+    view = client.get(f"/v1/internal/work-items/requests/{repair_id}", headers=WORKER_HEADERS)
+    assert view.is_success, view.text
+    assert view.json()["status"] == "failed"
+    assert view.json()["terminal_cause"] == "maintenance_refused"
+    assert view.json()["started_at"] is None
+    assert _rows(
+        "SELECT outcome FROM curie.factory_maintenance_events WHERE repair_request_id = :id "
+        "ORDER BY id",
+        {"id": repair_id},
+    ) == [{"outcome": "admitted"}, {"outcome": "conflict_authority_mismatch"}]
+
+
+def test_acquire_preserves_a_settled_conflict_publication(
+    precheck_case: dict[str, Any], repair_forge: github.GitHubRepositoryFake
+) -> None:
+    case = precheck_case
+    client = case["client"]
+    repair_id = client.portal.call(_successor, case, repair_forge, "base_conflict")
+    approval_id = uuid.uuid4()
+    _execute(
+        """
+        WITH approval AS (
+            INSERT INTO curie.approvals
+                (id, agent_id, conversation_id, author, summary, reply_kind, reply_channel,
+                 dedupe_key, status, purpose)
+            SELECT :approval, a.agent_id, a.conversation_id, a.author, a.summary, a.reply_kind,
+                   a.reply_channel, :dedupe, 'approved', 'publication'
+            FROM curie.approvals a JOIN curie.publications p ON p.approval_id = a.id
+            WHERE p.id = :source
+            RETURNING id
+        )
+        INSERT INTO curie.publications
+            (id, approval_id, deployment_id, lineage_id, execution_request_id, revision_number,
+             repo_full_name, status, publication_mode, base_sha, expected_prior_head, changed_paths,
+             title, body, reply_kind, reply_channel, terminal_at)
+        SELECT :publication, approval.id, p.deployment_id, p.lineage_id, :repair, 2,
+               p.repo_full_name, 'failed', 'base_conflict_merge', :base, :head, p.changed_paths,
+               p.title, p.body, p.reply_kind, p.reply_channel, now()
+        FROM curie.publications p CROSS JOIN approval WHERE p.id = :source
+        """,
+        {
+            "approval": approval_id,
+            "dedupe": f"conflict-repair-{approval_id}",
+            "publication": uuid.uuid4(),
+            "repair": repair_id,
+            "source": uuid.UUID(case["publication_id"]),
+            "head": FIRST_REVISION_SHA,
+            "base": TARGET,
+        },
+    )
+    refused = _acquire_conflict_successor(case, repair_id)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "not_dispatchable"
+    view = client.get(f"/v1/internal/work-items/requests/{repair_id}", headers=WORKER_HEADERS)
+    assert view.is_success, view.text
+    assert view.json()["terminal_cause"] is None
+    assert _rows(
+        "SELECT outcome FROM curie.factory_maintenance_events WHERE repair_request_id = :id",
+        {"id": repair_id},
+    ) == [{"outcome": "admitted"}]
+
+
 @pytest.mark.parametrize(
     ("reason", "foreign_ci_head"),
     [("base_conflict", False), ("base_conflict", True), ("late_ci_red", False)],
@@ -213,18 +310,6 @@ def test_persisted_successor_selects_workspace_and_publication_authority(
     requests = "/v1/internal/work-items/requests"
     acquire_url = f"{requests}/{repair_id}/acquire"
     claim = {"owner": "factory", "generation": 1, "wake": wake, "context": None}
-    if is_conflict:
-        change_pr = (
-            "UPDATE curie.thread_publication_lineages SET code_host_pr_id = :pr WHERE id = :id"
-        )
-        original_node = case["truth"]["node_id"]
-        case["truth"]["node_id"] = "PR_other"
-        _execute(change_pr, {"id": case["lineage_id"], "pr": "PR_other"})
-        refused = client.post(acquire_url, headers=WORKER_HEADERS, json=claim)
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"]["code"] == "not_dispatchable"
-        case["truth"]["node_id"] = original_node
-        _execute(change_pr, {"id": case["lineage_id"], "pr": original_node})
     acquire = client.post(acquire_url, headers=WORKER_HEADERS, json=claim)
     assert acquire.status_code == 200, acquire.text
     start = client.post(

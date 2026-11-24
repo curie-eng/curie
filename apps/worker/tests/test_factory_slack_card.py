@@ -1,5 +1,6 @@
-"""Pure renders of the factory Slack card for a questions-only run."""
+"""Pure renders of terminal factory Slack cards."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from curie_worker.factory_slack_card import (
@@ -107,3 +108,12 @@ def test_a_published_completion_stays_finished() -> None:
     assert rendered.message.header == "Factory run: finished"
     assert "Done." in rendered.message.text
     assert "Waiting on answers" not in rendered.message.text
+
+
+def test_a_refused_maintenance_card_names_the_failure() -> None:
+    request = replace(_request(terminal_cause="maintenance_refused"), status="failed")
+
+    rendered = render_card(_subject(), request, now=_NOW)
+
+    assert rendered.state == "needs a person"
+    assert "Maintenance repair was refused before it started." in rendered.message.text

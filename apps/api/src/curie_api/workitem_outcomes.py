@@ -293,7 +293,7 @@ def _cause(
                 + _previous_start_failure(req)
             )
         text = f"failed: {cause}"
-        if cause in {"enrollment_fenced", "authentication_required"}:
+        if cause in {"enrollment_fenced", "authentication_required", "maintenance_refused"}:
             guidance = cause_text(cause)
             text += f". {guidance[:1].upper()}{guidance[1:]}"
         elif cause == "deadline_halted":
