@@ -106,6 +106,30 @@ def test_scripted_cli_selects_steering_and_keeps_publication_driver(
     assert selected == [sk.ScriptedRun, SlackSteeringRun, SlackVoiceRun]
 
 
+def test_voice_replay_answers_only_the_ordinary_slack_control() -> None:
+    from curie_runner.sender_frame import frame_user_turn
+
+    router = VoiceRouter()
+    script = SimpleNamespace()
+    module = sk._module("voice_control_model", sk.REPO_ROOT / "tools/model-script/model_script.py")
+    router.install(script, module, fallback=False)
+
+    def ask(kind: str, channel: str, content: str) -> dict[str, Any] | None:
+        message = frame_user_turn(kind, "U0EXAMPLE1", content, channel)
+        return script._match(
+            "POST", "/v1/messages",
+            json.dumps({"messages": [{"role": "user", "content": message}]}).encode(),
+        )
+
+    text = "Acknowledge this recording outside a factory run."
+    answer = ask("message", "slack", text)
+    assert answer is not None
+    assert answer["message"]["content"] == [{"type": "text", "text": "Ordinary Slack reply."}]
+    assert ask("job", "slack", text) is None
+    assert ask("message", "github", text) is None
+    assert ask("message", "slack", "Please review this recording.") is None
+
+
 def test_voice_model_uses_the_confirmed_edit_and_keeps_the_button_timeout(tmp_path: Path) -> None:
     router = VoiceRouter()
     script = SimpleNamespace()

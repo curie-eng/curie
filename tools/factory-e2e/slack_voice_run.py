@@ -14,15 +14,18 @@ from typing import Any
 
 import scripted_kind as sk
 import slack_voice_fixture as fixture
+from scripted_lanes import first_user_text
 from scripted_scenario import SLACK_CHANNEL
 from slack_steering_ingress import BOT_USER, TEAM, USER
-from slack_steering_model import FixtureEdit, SteeringRouter
+from slack_steering_model import _FRAME, FixtureEdit, SteeringRouter, _answer
 from slack_steering_run import SlackSteeringRun
 
 BUTTON = '<button type="button" data-timeout-ms="1500">Try again</button>'
 RETRY = BUTTON.replace("Try again", "Retry")
 FILE = "retry.html"
 CLIP = "F0EXAMPLE1"
+ORDINARY_REQUEST = "Acknowledge this recording outside a factory run."
+ORDINARY_REPLY = "Ordinary Slack reply."
 OTHER = "U0EXAMPLE8"
 UNLINKED = "U0EXAMPLE7"
 PROMPT = re.compile(r"Voice transcript\n(.+?)\n\n.*\nconfirm ([a-f0-9]{12}\.[1-9][0-9]*)\n", re.S)
@@ -39,6 +42,18 @@ class VoiceRouter(SteeringRouter):
         super().__init__()
         self.expected: str | None = None
         self.release_initial.set()
+
+    def match(self, method: str, path: str, body: bytes) -> dict[str, Any] | None:
+        if method == "POST" and path == "/v1/messages":
+            prompt = first_user_text(self._parse(body))
+            frame = _FRAME.search(prompt)
+            if (
+                frame is not None
+                and frame.group(2) == ORDINARY_REQUEST
+                and "\nevent: message\nchannel: slack\n" in prompt[:frame.start()]
+            ):
+                return _answer("ordinary", 0, "message", {"type": "text", "text": ORDINARY_REPLY})
+        return super().match(method, path, body)
 
     def instruction_key(self, body: str) -> str | None:
         if self.expected is None or body != self.expected:
@@ -223,19 +238,20 @@ class SlackVoiceRun(SlackSteeringRun):
                 raise sk.ScriptedScenarioError("unconfirmed or refused feedback admitted work")
 
         for channel, thread, actor, media, allowed in (
-            (SLACK_CHANNEL, "1800000000.000999", USER, CLIP, ()),
+            (SLACK_CHANNEL, "1800000000.000999", USER, CLIP, (ORDINARY_REPLY.lower(),)),
             ("C0EXAMPLE8", root, USER, CLIP, ()),
             (SLACK_CHANNEL, root, UNLINKED, CLIP, ("cannot", "verified")),
             (SLACK_CHANNEL, root, USER, "F0EXAMPLE3", ("changed", "cannot")),
         ):
+            mapped = channel == SLACK_CHANNEL and thread == root
             _, slot = self.send(
                 thread,
-                "Review this clip.",
+                "Review this clip." if mapped else ORDINARY_REQUEST,
                 channel=channel,
                 actor=actor,
                 file_id=media,
                 admission_may_refuse=channel != SLACK_CHANNEL or actor == UNLINKED,
-                mapped=channel == SLACK_CHANNEL and thread == root,
+                mapped=mapped,
             )
             if allowed:
                 self.status(slot, allowed)
