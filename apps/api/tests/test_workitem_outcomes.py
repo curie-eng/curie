@@ -29,6 +29,7 @@ from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
 from curie_api.crud import publication_queries as crud_publication_queries
+from curie_api.factory_admission import cancel_work_item
 from curie_api.factory_base import ResolvedBase
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.github.ci import CiDetail
@@ -52,7 +53,7 @@ from curie_api.github_app import (
     GitHubInstallationRefused,
 )
 from curie_api.main import create_app
-from curie_api.models import ExecutionRequest, WorkItem
+from curie_api.models import ExecutionRequest, ThreadPublicationLineage, WorkItem
 from curie_api.publication_authority import VerifiedPublicationIdentity
 from curie_api.schemas.publications import PublicationLineageAdvance
 from curie_api.workitem_dispatch import (
@@ -1618,6 +1619,322 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         "waiting deadline"
     )
     assert "no sandbox capacity" not in outcome.actionable_cause
+
+
+def test_a_merged_factory_pull_request_that_closed_the_issue_reads_completed() -> None:
+    now = datetime.now(UTC)
+    work_item_id = uuid.uuid4()
+
+    def outcome(
+        status: str,
+        cause: str,
+        lineage_status: str,
+        *,
+        cancelled: bool,
+        admitted_at: datetime | None = None,
+        observed_at: datetime | None = None,
+        closed_at: datetime | None = None,
+    ) -> workitem_outcomes.WorkItemOutcomeOut:
+        when_closed = now if closed_at is None else closed_at
+        item = WorkItem(
+            id=work_item_id,
+            agent_id=uuid.uuid4(),
+            tracker_kind="github",
+            tracker_host="github.com",
+            tracker_scope_id="101",
+            tracker_issue_id="5296",
+            code_host_kind="github",
+            code_host_host="github.com",
+            repository_project_id="101",
+            repository_path=REPO,
+            cancelled_at=when_closed if cancelled else None,
+            created_at=now,
+            updated_at=now,
+            model_auth_mode="service",
+            coding_instructions_state="absent",
+            memory_rules_state="absent",
+            memory_rules_count=0,
+            coding_instructions_absence_reason="historical",
+            automatic_retries_used=0,
+        )
+        request = ExecutionRequest(
+            id=uuid.uuid4(),
+            work_item_id=work_item_id,
+            sequence=1,
+            status=status,
+            wait_deadline=None,
+            started_at=now,
+            execution_deadline=now,
+            terminal_at=now,
+            terminal_cause=cause,
+            termination_observation=None,
+            created_at=now if admitted_at is None else admitted_at,
+            capacity_deferrals=0,
+            last_deferral_reason=None,
+            last_start_failure_detail=None,
+            objective=OBJECTIVE,
+            requester=REQUESTER,
+            model_auth_mode="service",
+            coding_instructions_evidence="none",
+            memory_rules_evidence="none",
+            dispatch_not_before=now,
+            owner_lost_retry=False,
+        )
+        lineage = SimpleNamespace(
+            id=uuid.uuid4(),
+            pr_number=PR_NUMBER,
+            pr_url=PR_URL,
+            status=lineage_status,
+            head_sha="a" * 40,
+            updated_at=observed_at,
+        )
+        return derive_outcome(
+            item,
+            [request],
+            lineage=lineage,  # type: ignore[arg-type]
+            publication=None,
+            approval=None,
+            pending_turn_approval=False,
+            now=now,
+            issue_url="https://github.com/curie-eng/curie/issues/5296",
+        )
+
+    merged = outcome("completed", "completed", "merged", cancelled=True, observed_at=now)
+    assert merged.state == "published"
+    assert merged.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    recorded = outcome("completed", "completed", "merged", cancelled=False, observed_at=now)
+    assert recorded.state == "published"
+    assert recorded.actionable_cause == f"completed: pull request #{PR_NUMBER} merged"
+    closed = outcome("completed", "completed", "closed", cancelled=True)
+    assert closed.state == "cancelled"
+    assert closed.actionable_cause == (
+        "cancelled: the issue label was removed or the issue was closed; "
+        f"pull request #{PR_NUMBER} is retained"
+    )
+    later = outcome("cancelled", "issue_cancelled", "merged", cancelled=True)
+    assert later.state == "cancelled"
+    assert later.actionable_cause.startswith("cancelled:")
+    assert "completed:" not in later.actionable_cause
+    asked = outcome("completed", "questions_asked", "merged", cancelled=True, observed_at=now)
+    assert asked.state == "cancelled"
+    assert not asked.actionable_cause.startswith("completed:")
+    still_open = outcome("completed", "questions_asked", "merged", cancelled=False, observed_at=now)
+    assert still_open.state == "published"
+    assert not still_open.actionable_cause.startswith("completed:")
+    after_merge = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        admitted_at=now,
+        observed_at=now - timedelta(seconds=1),
+    )
+    assert after_merge.state == "cancelled"
+    assert not after_merge.actionable_cause.startswith("completed:")
+    closed_before = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now - timedelta(minutes=30),
+        admitted_at=now - timedelta(hours=1),
+        observed_at=now,
+    )
+    assert closed_before.state == "cancelled"
+    assert not closed_before.actionable_cause.startswith("completed:")
+    closed_later = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        observed_at=now - timedelta(minutes=30),
+    )
+    assert closed_later.state == "cancelled"
+    assert not closed_later.actionable_cause.startswith("completed:")
+    at_the_window = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now - timedelta(minutes=10),
+        admitted_at=now - timedelta(hours=1),
+        observed_at=now,
+    )
+    assert at_the_window.state == "published"
+    assert at_the_window.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    one_second_before = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now - timedelta(seconds=1),
+        admitted_at=now - timedelta(hours=1),
+        observed_at=now,
+    )
+    assert one_second_before.state == "published"
+    assert one_second_before.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    exactly_ten_minutes_after = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        observed_at=now - timedelta(minutes=10),
+    )
+    assert exactly_ten_minutes_after.state == "published"
+    assert exactly_ten_minutes_after.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    ten_minutes_one_second_after = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        observed_at=now - timedelta(minutes=10, seconds=1),
+    )
+    assert ten_minutes_one_second_after.state == "cancelled"
+    assert not ten_minutes_one_second_after.actionable_cause.startswith("completed:")
+    outside_the_window = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now - timedelta(minutes=10, seconds=1),
+        admitted_at=now - timedelta(hours=1),
+        observed_at=now,
+    )
+    assert outside_the_window.state == "cancelled"
+    assert not outside_the_window.actionable_cause.startswith("completed:")
+    # The lineage clock has no time zone. The request and the close do.
+    naive_merge = now.replace(tzinfo=None)
+    open_on_naive_clock = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=False,
+        admitted_at=now - timedelta(hours=1),
+        observed_at=naive_merge,
+    )
+    assert open_on_naive_clock.state == "published"
+    assert open_on_naive_clock.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged"
+    )
+    closed_on_naive_clock = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        observed_at=naive_merge,
+    )
+    assert closed_on_naive_clock.state == "published"
+    assert closed_on_naive_clock.actionable_cause == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    closed_late_on_naive_clock = outcome(
+        "completed",
+        "completed",
+        "merged",
+        cancelled=True,
+        closed_at=now,
+        admitted_at=now - timedelta(hours=1),
+        observed_at=(now - timedelta(minutes=30)).replace(tzinfo=None),
+    )
+    assert closed_late_on_naive_clock.state == "cancelled"
+    assert not closed_late_on_naive_clock.actionable_cause.startswith("completed:")
+
+
+def _published_open_pull_request(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> tuple[SimpleNamespace, str]:
+    """A completed run whose pull request is open and bound to the work item."""
+
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    _complete(seeded)
+    return seeded, str(publication["lineage_id"])
+
+
+def _close_through_issue_handler(stack: TestClient, work_item_id: uuid.UUID) -> None:
+    """Cancel through the function the issue-close handler calls."""
+
+    async def close() -> None:
+        async with stack.app.state.sessionmaker() as session:
+            item = await session.get(WorkItem, work_item_id)
+            assert item is not None and item.cancelled_at is None
+            result = await cancel_work_item(session, item)
+            assert result.status == "factory_cancelled"
+
+    stack.portal.call(close)
+
+
+def _observe_merge(stack: TestClient, lineage_id: str) -> None:
+    """Record the merge the way the reconciler does, at database now()."""
+
+    async def observe() -> None:
+        async with stack.app.state.sessionmaker() as session:
+            lineage = await session.get(ThreadPublicationLineage, uuid.UUID(lineage_id))
+            assert lineage is not None and lineage.status == "open"
+            assert lineage.head_sha is not None
+            recorded = await crud_lineages.mark_publication_lineage_terminal(
+                session,
+                lineage,
+                expected_version=lineage.version,
+                expected_head_sha=lineage.head_sha,
+                state="merged",
+            )
+            assert recorded.status == "merged"
+
+    stack.portal.call(observe)
+
+
+def _assert_merged_close(body: dict[str, Any]) -> None:
+    assert body["state"] == "published"
+    assert body["actionable_cause"] == (
+        f"completed: pull request #{PR_NUMBER} merged and closed the issue"
+    )
+    assert body["pr"] == {"number": PR_NUMBER, "url": PR_URL, "status": "merged"}
+    assert body["requests"][-1]["status"] == "completed"
+    assert body["requests"][-1]["terminal_cause"] == "completed"
+
+
+def test_a_close_before_curie_observes_the_merge_reads_published(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """The issue close is processed, then Curie records the merge."""
+
+    seeded, lineage_id = _published_open_pull_request(stack, auth_headers)
+    _close_through_issue_handler(stack, seeded.work_item_id)
+    _observe_merge(stack, lineage_id)
+
+    _assert_merged_close(_detail(stack, auth_headers, seeded.work_item_id))
+
+
+def test_an_observed_merge_before_the_close_reads_published(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """Curie records the merge, then the issue close is processed."""
+
+    seeded, lineage_id = _published_open_pull_request(stack, auth_headers)
+    _observe_merge(stack, lineage_id)
+    _close_through_issue_handler(stack, seeded.work_item_id)
+
+    _assert_merged_close(_detail(stack, auth_headers, seeded.work_item_id))
 
 
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
