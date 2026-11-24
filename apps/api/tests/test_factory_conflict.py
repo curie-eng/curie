@@ -153,6 +153,9 @@ def test_poll_admits_one_successor_only_for_a_verified_conflict(
             forge.mergeable = False
             forge.branches["main"] = repo.old_base
             await poll()
+            assert await outcomes() == ["no_current_conflict"]
+            assert await _counts(session) == (1, 0, 0)
+            assert server.requests == [] and forge.writes == 0
             forge.branches["main"] = repo.target
             forge.branches[BRANCH] = "c" * 40
             await poll()
@@ -170,7 +173,6 @@ def test_poll_admits_one_successor_only_for_a_verified_conflict(
             await poll()
             forge.pulls[forge.number]["state"] = "open"
             assert await outcomes() == [
-                "no_current_conflict",
                 "no_current_conflict",
                 "foreign_head",
                 "identity_unverified",
