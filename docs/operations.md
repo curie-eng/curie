@@ -5382,9 +5382,13 @@ guidance or applied it to an execution request.
 ### Slack voice feedback in a factory run thread
 
 Factory voice feedback is off by default. With the voice service enabled, use
-a threaded app mention for the clip. The receiving Slack app needs access to
-the thread and the hosted file. Curie checks the sender's linked identity
-and current factory feedback permissions before retrieving any bytes.
+a threaded app mention for the clip. Invite the app into the source channel.
+Its bot token needs `app_mentions:read` to receive the mention, `users:read`
+to verify its app identity, `files:read` to read the clip, and `chat:write` to
+deliver the draft. Reading the original message also requires the channel's
+history scope (`channels:history` for a public channel or `groups:history`
+for a private channel). Curie checks the sender's linked identity and current
+factory feedback permissions before retrieving any bytes.
 
 When the transcript arrives, mention the same app in the same thread with
 `confirm <code>` to submit the displayed text, `reject <code>` to close the
