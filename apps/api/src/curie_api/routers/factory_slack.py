@@ -49,10 +49,6 @@ class _VoiceRoute(APIRoute):
         return redacted
 
 
-voice_router = APIRouter(route_class=_VoiceRoute)
-
-
-@voice_router.post("/voice", response_model=FactorySlackVoiceOut, response_model_exclude_none=True)
 async def voice_factory_run(
     data: FactorySlackSteerIn, request: Request, response: Response
 ) -> FactorySlackVoiceOut:
@@ -70,7 +66,14 @@ async def voice_factory_run(
         ) from None
 
 
-internal_router.include_router(voice_router)
+internal_router.add_api_route(
+    "/voice",
+    voice_factory_run,
+    methods=["POST"],
+    response_model=FactorySlackVoiceOut,
+    response_model_exclude_none=True,
+    route_class_override=_VoiceRoute,
+)
 
 
 @internal_router.post("/steer", response_model=FactorySlackSteerOut)
