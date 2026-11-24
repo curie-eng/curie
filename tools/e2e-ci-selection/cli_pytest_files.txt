@@ -113,6 +113,7 @@ tools/doclint/tests/test_mcp_workspace_live_tiers.py
 tools/doclint/tests/test_root_lint.py
 tools/doclint/tests/test_sre_demo_runbook.py
 tools/doclint/tests/test_symbols.py
+tools/e2e-ci-selection/tests/test_admission_read_selection.py
 tools/e2e-ci-selection/tests/test_cli_pytest_scope.py
 tools/e2e-ci-selection/tests/test_conditional_pytest_files.py
 tools/e2e-ci-selection/tests/test_deep_tier_aggregates.py

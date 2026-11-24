@@ -33,6 +33,13 @@ ci_policy_tests:
     [.github, tools/dependency-audit-paths, conftest.py, pyproject.toml, uv.lock,
      apps/docker-daemon, apps/ui, cli, packages/aci-protocol/generated/rust,
      tools/contract-codegen]
+  tools/e2e-ci-selection/tests/test_admission_read_selection.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     apps/worker/src/curie_worker/sandbox/k8s.py,
+     apps/worker/src/curie_worker/consumer.py,
+     apps/worker/src/curie_worker/kernel/work_items.py,
+     apps/worker/tests/kernel/test_consumer.py,
+     apps/worker/tests/sandbox/test_admission_k8s.py]
   tools/e2e-ci-selection/tests/test_cli_pytest_scope.py:
     [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
      apps, cli, release/atlas.py, release/tests/test_sdk_approval_gate_workflow.py,
