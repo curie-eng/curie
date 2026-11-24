@@ -387,6 +387,14 @@ class _SelectedNotices:
             or not self._first(event_id)
         ):
             return
+        self._post(status=status, event=event, channel=channel, user=user, ts=ts,
+                   thread_ts=thread_ts)
+
+    def _post(
+        self, *, status: str, event: dict[str, Any], channel: str, user: str, ts: str,
+        thread_ts: str | None,
+    ) -> None:
+        """Post criterion 19's notice for one first-seen delivery; never raises."""
         text = SELECTED_REFUSED_TEXT if status == "refused" else SELECTED_UNAVAILABLE_TEXT
         try:
             if channel.startswith("D") or is_supported_direct_message(event):
@@ -401,6 +409,38 @@ class _SelectedNotices:
                 self._web.chat_postEphemeral(channel=channel, user=user, text=text)
         except Exception as error:  # noqa: BLE001 - a lost notice changes no outcome
             self._log.warning("selected mention notice failed error=%s", type(error).__name__)
+
+    def settle_unavailable(
+        self, *, body: dict[str, Any], event: dict[str, Any], bot_user_id: Any,
+        channel: str, placeholder: str,
+    ) -> None:
+        """Edit a nothing-queued attempt's placeholder into the unavailable notice; never raises.
+
+        A repeated native event_id, or a sender owed no notice, gets its
+        placeholder deleted instead. A failed edit posts criterion 27's notice so
+        the sender is still told. @spec HTTP-INVOCATION-EXECUTION-32.
+        """
+        user, ts, thread_ts = event.get("user"), event.get("ts"), event.get("thread_ts")
+        event_id = body.get("event_id")
+        owed = not (
+            event.get("bot_id") or event.get("subtype") in NON_CONTENT_SUBTYPES
+            or type(user) is not str or not user or user == bot_user_id
+            or type(ts) is not str or not ts
+            or (thread_ts is not None and (type(thread_ts) is not str or not thread_ts))
+            or type(event_id) is not str or not event_id
+        )
+        if not (owed and type(event_id) is str and self._first(event_id)):
+            _delete_placeholder(self._web, self._log, channel=channel, ts=placeholder)
+            return
+        try:
+            self._web.chat_update(channel=channel, ts=placeholder, text=SELECTED_UNAVAILABLE_TEXT)
+            return
+        except Exception as error:  # noqa: BLE001 - the fallback below still tells the sender
+            self._log.warning("selected placeholder notice failed error=%s", type(error).__name__)
+        self._post(
+            status="unavailable", event=event, channel=channel, user=str(user), ts=str(ts),
+            thread_ts=thread_ts if type(thread_ts) is str else None,
+        )
 
     def replace(
         self, *, body: dict[str, Any], event: dict[str, Any], bot_user_id: Any,
@@ -1348,6 +1388,14 @@ def register_handlers(
         )
         assert selected_notices is not None
         channel = str(event.get("channel"))
+        if result.nothing_queued and delivery.placeholder is not None:
+            # @spec HTTP-INVOCATION-EXECUTION-32: nothing will ever edit this
+            # placeholder, so it becomes the retry notice itself.
+            selected_notices.settle_unavailable(
+                body=body, event=event, bot_user_id=context.get("bot_user_id"),
+                channel=channel, placeholder=delivery.placeholder,
+            )
+            return
         if result.status == "refused" and delivery.placeholder is not None:
             if channel.startswith("D") or is_supported_direct_message(event):
                 # @spec HTTP-INVOCATION-EXECUTION-26/27: only the sender is in a

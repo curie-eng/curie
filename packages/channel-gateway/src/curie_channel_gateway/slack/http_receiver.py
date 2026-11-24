@@ -122,12 +122,16 @@ class ReceiverSubmission(_Frozen):
     ``duplicate`` and ``reply_ref`` describe an accepted answer: whether another
     attempt enqueued the turn, and the reply slot its receipt names, if any.
     @spec HTTP-INVOCATION-EXECUTION-27.
+
+    ``nothing_queued`` marks an unavailable answer that proves no turn was
+    queued for this attempt. @spec HTTP-INVOCATION-EXECUTION-32.
     """
 
     status: Literal["accepted", "pending", "refused", "unavailable"]
     stream_id: codec.Identifier | None
     duplicate: bool = False
     reply_ref: str | None = None
+    nothing_queued: bool = False
 
 
 # A Slack message timestamp, the only reply slot. @spec HTTP-INVOCATION-EXECUTION-27.
@@ -212,6 +216,10 @@ class PreparedSubmission:
 
 _REFUSED = ReceiverSubmission(status="refused", stream_id=None)
 _UNAVAILABLE = ReceiverSubmission(status="unavailable", stream_id=None)
+# @spec HTTP-INVOCATION-EXECUTION-32: the API refused before, or atomically with,
+# the guarded enqueue.
+_NOTHING_QUEUED = ReceiverSubmission(status="unavailable", stream_id=None, nothing_queued=True)
+_NOTHING_QUEUED_DETAIL = "identity_authority_unavailable"
 _AMBIGUOUS = (
     httpx.ReadTimeout, httpx.ReadError, httpx.WriteTimeout, httpx.WriteError,
     httpx.RemoteProtocolError,
@@ -271,7 +279,7 @@ async def _receipt(response: httpx.Response) -> ReceiverSubmission:
     """@spec HTTP-INVOCATION-EXECUTION-19."""
     if response.status_code in {401, 403, 409, 413, 422}:
         return _REFUSED
-    if response.status_code not in {200, 202}:
+    if response.status_code not in {200, 202, 503}:
         return _UNAVAILABLE
     chunks, length = [], 0
     async for chunk in response.aiter_bytes():
@@ -283,6 +291,13 @@ async def _receipt(response: httpx.Response) -> ReceiverSubmission:
         value = json.loads(
             b"".join(chunks).decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant,
         )
+        if response.status_code == 503:
+            # @spec HTTP-INVOCATION-EXECUTION-32.
+            return (
+                _NOTHING_QUEUED
+                if type(value) is dict and value.get("detail") == _NOTHING_QUEUED_DETAIL
+                else _UNAVAILABLE
+            )
         receipt = _TurnAccepted.model_validate(value)
         if response.status_code == 202:
             return (
@@ -731,7 +746,11 @@ class HttpReceiverRuntime:
                             try:
                                 result = await _receipt(response)
                                 complete = True
-                                return result
+                                # @spec HTTP-INVOCATION-EXECUTION-32: after an ambiguous
+                                # attempt an earlier request may own the placeholder.
+                                return _UNAVAILABLE if attempt and result.nothing_queued else (
+                                    result
+                                )
                             finally:
                                 await response.aclose()
                         except _AMBIGUOUS:
