@@ -1139,7 +1139,9 @@ async def _check_acquirable(
     if request.status != "waiting":
         return await _refuse(
             session,
-            "not_dispatchable",
+            "factory_start_failed"
+            if request.terminal_cause == "maintenance_refused"
+            else "not_dispatchable",
             work_item_id=work_item.id,
             request_id=request.id,
             status=request.status,
@@ -1291,7 +1293,7 @@ async def _settle_maintenance_refusal(
         wait_deadline=now + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
     )
     return DispatchConflict(
-        code="not_dispatchable",
+        code="factory_start_failed",
         work_item_id=work_item_id,
         request_id=request_id,
         status="failed",
@@ -1847,6 +1849,10 @@ async def start(
     if isinstance(locked, DispatchConflict):
         return locked
     work_item, request = locked
+    if request.terminal_cause == "maintenance_refused":
+        return await _refuse(
+            session, "factory_start_failed", work_item_id=work_item.id, request_id=request.id
+        )
     now = await database_now(session)
     if (
         request.dispatch_generation != generation

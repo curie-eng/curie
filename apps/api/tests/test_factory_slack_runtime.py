@@ -592,8 +592,14 @@ class Stack:
     def start(self, request_id: uuid.UUID, *, input_sha256: str | None = None) -> int:
         acquired = self.acquire(request_id, input_sha256=input_sha256)
         assert acquired.status_code == 200, acquired.text
-        grant = acquired.json()
-        started = self.client.post(
+        started = self.start_acquired(request_id, acquired.json(), input_sha256=input_sha256)
+        assert started.status_code == 200, started.text
+        return int(started.json()["runtime_epoch"])
+
+    def start_acquired(
+        self, request_id: uuid.UUID, grant: dict[str, Any], *, input_sha256: str | None = None
+    ) -> httpx.Response:
+        return self.client.post(
             f"/v1/internal/work-items/requests/{request_id}/start",
             headers=self.internal,
             json={
@@ -611,8 +617,6 @@ class Stack:
                 },
             },
         )
-        assert started.status_code == 200, started.text
-        return int(started.json()["runtime_epoch"])
 
     def finish(self, request_id: uuid.UUID, epoch: int, *, published: bool = False) -> None:
         """End a running request as the worker's settlement does.

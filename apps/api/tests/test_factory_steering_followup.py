@@ -83,6 +83,7 @@ def test_public_steering_orders_with_maintenance(
         monkeypatch.setattr(settings, "factory_maintenance_repair_enabled", False)
         refused = stack.acquire(repair_id)
         assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "factory_start_failed"
         assert stack.request_view(repair_id)["terminal_cause"] == "maintenance_refused"
 
     repair_id = None
@@ -94,6 +95,9 @@ def test_public_steering_orders_with_maintenance(
         assert granted.is_success, granted.text
         if order == "repair-only":
             refuse_repair(repair_id)
+            stale = stack.start_acquired(repair_id, granted.json())
+            assert stale.status_code == 409, stale.text
+            assert stale.json()["detail"]["code"] == "factory_start_failed"
             view = stack.client.get(f"/work-items/{item_id}", headers=stack.platform)
             assert view.is_success, view.text
             assert "maintenance_refused" in view.json()["actionable_cause"]

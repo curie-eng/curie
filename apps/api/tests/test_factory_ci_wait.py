@@ -2414,7 +2414,7 @@ def test_disabled_maintenance_settles_and_unblocks_revision(
     monkeypatch.setattr(settings, "factory_maintenance_repair_enabled", False)
     refused = _acquire_maintenance(client, repair_id)
     assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["code"] == "not_dispatchable"
+    assert refused.json()["detail"]["code"] == "factory_start_failed"
     _, repair, revision = _all(published["number"])
     assert (repair["status"], repair["terminal_cause"]) == ("failed", "maintenance_refused")
     assert (revision["id"], revision["status"]) == (revision_id, "waiting")
@@ -2444,7 +2444,7 @@ def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: 
     pull["head"]["sha"] = HEAD_C
     refused = _acquire_maintenance(client, repair_id)
     assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["code"] == "not_dispatchable"
+    assert refused.json()["detail"]["code"] == "factory_start_failed"
     assert _rows(
         "SELECT status, terminal_cause, acquire_owner FROM curie.execution_requests WHERE id = :id",
         {"id": repair_id},
@@ -2456,7 +2456,9 @@ def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: 
     ) == [{"outcome": "foreign_head"}]
 
     pull["head"]["sha"] = HEAD_A
-    assert _acquire_maintenance(client, repair_id).status_code == 409
+    replay = _acquire_maintenance(client, repair_id)
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == "factory_start_failed"
     assert _all(published["number"])[1]["terminal_cause"] == "maintenance_refused"
 
 

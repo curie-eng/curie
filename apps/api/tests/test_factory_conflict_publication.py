@@ -217,7 +217,7 @@ def test_acquire_settles_mismatched_conflict_authority(
     for _ in range(2):
         refused = client.post(acquire_url, headers=WORKER_HEADERS, json=claim)
         assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"]["code"] == "not_dispatchable"
+        assert refused.json()["detail"]["code"] == "factory_start_failed"
 
     view = client.get(f"{requests}/{repair_id}", headers=WORKER_HEADERS)
     assert view.is_success, view.text
