@@ -150,6 +150,8 @@ class PullRequest:
     # when the payload carried no usable time. A metadata-only revision records
     # it so CI freshness is judged after the edit.
     updated_at: datetime | None = None
+    # GitHub binds a lineage to the node ID as well as the repository and number.
+    node_id: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -617,10 +619,13 @@ class TicketLabels:
     Admission reads ``labels`` for the ``base:`` and ``repo:`` labels and label
     conflicts, and ``components`` for a binding's component map (ADR 0197
     identity 3). A tracker without components reports none.
+    ``verified_open_issue`` is true only when the same read confirms this is
+    the requested open issue. None means the tracker does not report that fact.
     """
 
     labels: frozenset[str]
     components: frozenset[str] = frozenset()
+    verified_open_issue: bool | None = None
 
 
 @dataclass(frozen=True)

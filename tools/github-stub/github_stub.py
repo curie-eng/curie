@@ -32,6 +32,7 @@ READER = {"id": 6602, "login": "reader", "type": "User"}
 RULE_WRITER = {"id": 6630, "login": "rule-writer", "type": "User"}
 RULE_READER = {"id": 6631, "login": "rule-reader", "type": "User"}
 BOT = {"id": 51, "login": "example-app[bot]", "type": "Bot"}
+HUMAN_AUTHORIZATION = "Bearer example-human-token"
 # Collaborator permission levels the REST answer may carry.
 # https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
 PERMISSION_LEVELS = ("admin", "maintain", "write", "triage", "read", "none")
@@ -58,6 +59,10 @@ def _date(value: str) -> datetime:
 
 def _utc() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _request_actor(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    return HUMAN if handler.headers.get("Authorization") == HUMAN_AUTHORIZATION else BOT
 
 
 class GithubStub:
@@ -228,7 +233,8 @@ class GithubStub:
                 " PRIMARY KEY(kind,id)); CREATE TABLE unsupported(request TEXT);"
                 "CREATE TABLE rejected_auth(request TEXT);"
                 "CREATE TABLE tokens(token TEXT PRIMARY KEY, permissions TEXT);"
-                "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL);"
+                "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL,"
+                " actor TEXT NOT NULL);"
                 "CREATE TABLE comment_history(comment_id INTEGER NOT NULL, at TEXT NOT NULL,"
                 " body TEXT NOT NULL);"
                 "CREATE TABLE oauth_codes(code_hash TEXT PRIMARY KEY, redirect_uri TEXT NOT NULL);"
@@ -890,8 +896,11 @@ class GithubStub:
     def _request(self, handler: BaseHTTPRequestHandler) -> None:
         parsed = urlsplit(handler.path)
         path = unquote(parsed.path)
+        actor = _request_actor(handler)
         with sqlite3.connect(self._database) as connection:
-            connection.execute("INSERT INTO request_log VALUES(?,?)", (handler.command, path))
+            connection.execute(
+                "INSERT INTO request_log VALUES(?,?,?)", (handler.command, path, actor["login"])
+            )
         if path.startswith("/api/v3/"):
             path = path.removeprefix("/api/v3")
         body = handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
@@ -917,11 +926,6 @@ class GithubStub:
             return
         try:
             payload = json.loads(body) if body else {}
-            actor = (
-                HUMAN
-                if handler.headers.get("Authorization") == "Bearer example-human-token"
-                else BOT
-            )
             result = self._rest(handler.command, path, parse_qs(parsed.query), payload, actor=actor)
         except (ValueError, KeyError, subprocess.CalledProcessError) as exc:
             self._json(handler, 422, {"message": str(exc)})
@@ -1093,7 +1097,7 @@ class GithubStub:
                 "REQUEST_METHOD": handler.command,
                 "CONTENT_TYPE": handler.headers.get("Content-Type", ""),
                 "CONTENT_LENGTH": str(len(body)),
-                "REMOTE_USER": "example-app",
+                "REMOTE_USER": _request_actor(handler)["login"].removesuffix("[bot]"),
                 "REMOTE_ADDR": handler.client_address[0],
                 "HTTP_GIT_PROTOCOL": handler.headers.get("Git-Protocol", ""),
             }
@@ -1477,7 +1481,28 @@ class GithubStub:
                         | {"updated_at": _utc()}
                     )
                     self._put("pull", number, pull)
-                return 200, self._fresh_pull(pull)
+                fresh = self._fresh_pull(pull)
+                if method == "GET" and fresh["state"] == "open":
+                    merge = subprocess.run(
+                        [
+                            "git",
+                            "--git-dir",
+                            str(self._repository),
+                            "merge-tree",
+                            "--write-tree",
+                            fresh["base"]["sha"],
+                            fresh["head"]["sha"],
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=30,
+                        check=False,
+                    )
+                    fresh["mergeable"] = {0: True, 1: False}.get(merge.returncode)
+                    if merge.returncode == 1:
+                        fresh["mergeable_state"] = "dirty"
+                return 200, fresh
         return None
 
     def _fresh_pull(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -1543,7 +1568,7 @@ def capture(repository: str, pull_request: int, output: Path) -> None:
     output.write_text(json.dumps(recording, indent=2) + "\n")
 
 
-def main() -> int:
+def main(stub_type: type[GithubStub] = GithubStub) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     serve = commands.add_parser("serve", help="Serve recorded GitHub behavior over trusted TLS")
@@ -1567,7 +1592,7 @@ def main() -> int:
         if args.command == "capture":
             capture(args.repository, args.pull_request, args.output)
             return 0
-        stub = GithubStub(
+        stub = stub_type(
             args.root,
             json.loads(args.recording.read_text()),
             args.host,

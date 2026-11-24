@@ -118,7 +118,7 @@ for name in sorted(os.listdir(os.path.join(seed, "tree"))):
     if not name.startswith("."):
         shutil.copyfile(os.path.join(seed, "tree", name), os.path.join(work, "tree", name))
 shutil.copyfile(os.path.join(seed, "issue.md"), os.path.join(work, "issue.md"))
-stub = [sys.executable, "/stub/github_stub.py", "serve", *sys.argv[1:]]
+stub = [sys.executable, *sys.argv[1:]]
 os.execv(sys.executable, stub)
 """
 
@@ -322,7 +322,7 @@ class CandidateInstall:
             script,
             input_text=query,
         )
-        return json.loads(out.strip().splitlines()[-1])
+        return json.loads(out)
 
     def api(self, method: str, path: str, body: Any = None, *, expected: int = 200) -> Any:
         headers = {"X-API-Key": self.api_key}
@@ -597,7 +597,11 @@ class CandidateInstall:
         self.kubectl("create", "-f", "-", input_text=json.dumps(listing))
 
     def stub_manifests(
-        self, seed_files: Mapping[str, str], seed_issue: str
+        self,
+        seed_files: Mapping[str, str],
+        seed_issue: str,
+        *,
+        entrypoint: str = "/stub/github_stub.py",
     ) -> list[dict[str, Any]]:
         image = self.inputs.images["worker"]
         manifests = poe.code_host_manifests(
@@ -611,7 +615,9 @@ class CandidateInstall:
         )
         for manifest in manifests:
             if manifest["kind"] == "Pod":
-                manifest["spec"]["containers"][0]["imagePullPolicy"] = self.inputs.pull_policy
+                container = manifest["spec"]["containers"][0]
+                container["imagePullPolicy"] = self.inputs.pull_policy
+                container["args"][0:0] = [entrypoint, "serve"]
         return manifests
 
     def start_stub(self, seed_files: Mapping[str, str], seed_issue: str) -> None:
@@ -730,7 +736,7 @@ class CandidateInstall:
             raise AssertionError("the App key is created with the stub, before the values")
         return self.app_key
 
-    def base_values(self) -> dict[str, Any]:
+    def base_values(self, *, model_base_url: str | None = None) -> dict[str, Any]:
         """Install values for the candidate images and the stub, before any proof's own."""
 
         config = fe.FactoryConfig(
@@ -746,6 +752,7 @@ class CandidateInstall:
             restore_webhook_url=None,
             webhook_secret=secrets.token_hex(24),
             actor_token="",
+            model_base_url=model_base_url,
         )
         base = fe.install_values(
             config, candidate="unused", app_key_secret=fe.APP_KEY_REF, consumer_controller=True
@@ -758,6 +765,10 @@ class CandidateInstall:
             port=STUB_PORT,
             model_cidrs=(),
         )
+        if model_base_url:
+            values["security"]["networkPolicy"]["allowedEgress"].append(
+                fe.model_proxy_egress(model_base_url)
+            )
         # The API refuses to start unless every GitHub code host's identity host
         # is the host of its GitHub API base (Settings._validate_forge_github_host),
         # so the factory entries name the stub's authority, not github.com.
@@ -780,7 +791,7 @@ class CandidateInstall:
                 "digest": runner["digest"],
                 "imagePullPolicy": pull,
                 "prewarm": {"imagePullPolicy": pull},
-                "fakeModel": True,
+                "fakeModel": model_base_url is None,
             }
         )
         factory = values["factory"]

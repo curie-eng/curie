@@ -626,6 +626,15 @@ impl crate::ui::CliOutput for WorkItemsOutput {
                     ),
                     None => line("ci", "-"),
                 }
+                for event in &item.maintenance_history {
+                    line(
+                        "maintenance",
+                        &format!(
+                            "{} {}: {} on {}",
+                            event.recorded_at, event.reason, event.outcome, event.head_sha
+                        ),
+                    );
+                }
                 line(
                     "correctness",
                     "not asserted by the platform (owned by the bundle)",

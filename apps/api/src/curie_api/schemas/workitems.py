@@ -372,6 +372,19 @@ class WorkItemCiObservationOut(BaseModel):
     observed_at: datetime | None
 
 
+class WorkItemMaintenanceEventOut(BaseModel):
+    id: int
+    recorded_at: datetime
+    lineage_id: uuid.UUID
+    source_request_id: uuid.UUID
+    repair_request_id: uuid.UUID | None
+    reason: str
+    outcome: str
+    head_sha: str
+    base_ref: str | None
+    base_sha: str | None
+
+
 class WorkItemOutcomeOut(BaseModel):
     id: uuid.UUID
     agent_id: uuid.UUID
@@ -391,6 +404,7 @@ class WorkItemOutcomeOut(BaseModel):
     # Null on the list route: CI is observed live on the detail route only.
     ci: WorkItemCiOut | None
     ci_observation: WorkItemCiObservationOut | None = None
+    maintenance_history: list[WorkItemMaintenanceEventOut] = Field(default_factory=list)
     requests: list[WorkItemRequestOut]
     # ``derive_outcome`` stays pure and leaves these null; ``_views`` fills
     # them from the factory status comment rows and phase reports.

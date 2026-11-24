@@ -412,6 +412,8 @@ spec:
               value: {{ ne $voiceClaim "" | quote }}
             - name: FACTORY_ENABLED
               value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
+            - name: FACTORY_MAINTENANCE_REPAIR_ENABLED
+              value: {{ get (.Values.factory | default dict) "maintenanceRepairEnabled" | default false | quote }}
             - name: FACTORY_GITHUB_APP_CLIENT_ID
               value: {{ get (.Values.factory | default dict) "githubAppClientId" | default "" | quote }}
             {{- if get (.Values.factory | default dict) "githubAppClientSecretExistingSecret" }}

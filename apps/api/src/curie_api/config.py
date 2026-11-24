@@ -352,6 +352,7 @@ class Settings(BaseSettings):
     # mounted file it names and refuses an inline secret. A dict passed in code
     # (tests) is validated directly.
     factory_enabled: bool = False
+    factory_maintenance_repair_enabled: bool = False
     # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
     # the missed-label backstop. The poll interval is the GitHub tracker's.
     factory_intake: Literal["poll", "webhook"] = "poll"

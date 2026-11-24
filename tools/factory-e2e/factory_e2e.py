@@ -306,6 +306,17 @@ CANDIDATE_SEARCH_DEPTH = 30
 # How often --hold checks that the install is still usable.
 HOLD_TICK_SECONDS = 60
 LOCK_DIR = Path.home() / ".cache" / "curie-factory-e2e"
+MAINTENANCE_CONTROLS = (
+    "repair",
+    "later-publication",
+    "failed-repair",
+    "no-ci",
+    "foreign-head",
+    "base-red",
+    "cancelled",
+    "closed",
+    "expiry",
+)
 FACTORY_AGENT = "factory-e2e"
 DEFAULT_MODEL = "z-ai/glm-5.3-flash"
 REFERENCE_MODEL_DEFAULT = "anthropic/claude-sonnet-4.5"
@@ -6891,6 +6902,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         help="issue-to-pr: a case-insensitive regex the agent's stated reason must match",
     )
+    maintenance = sub.add_parser(
+        "maintenance",
+        help="run PR maintenance against a disposable candidate install",
+        description="Set CURIE_C4_CANDIDATE_CLI to the compiled candidate binary and "
+        "CURIE_C4_CANDIDATE_IMAGES to a pullable image template containing {component}. "
+        "Use --context <context> or CURIE_FACTORY_KUBE_CONTEXT to name a disposable cluster. "
+        "The driver creates and removes a fresh namespace and Helm release.",
+    )
+    maintenance.add_argument("--case", required=True, choices=("active", "late", "recovery"))
+    maintenance.add_argument("--context", help="explicit throwaway Kubernetes context")
+    maintenance.add_argument(
+        "--control",
+        action="append",
+        choices=MAINTENANCE_CONTROLS,
+        help="run the selected late CI controls on one install; repeatable (expiry takes 24h)",
+    )
     scripted = sub.add_parser(
         "scripted",
         help="kind-rung factory scenario with the GitHub stub and a scripted model",
@@ -7410,6 +7437,13 @@ def main(argv: list[str] | None = None) -> int:
         return int(load_repo_runner().main(["judge", str(args.observation)]))
     if args.mode == "judge-docker":
         return int(load_docker_scenario().main(["judge", str(args.envelope)]))
+    if args.mode == "maintenance":
+        driver_module = _load_by_path("maintenance", Path(__file__).with_name("maintenance.py"))
+        try:
+            return int(driver_module.main(args))
+        except ConfigError as exc:
+            print(f"factory-e2e: {exc}", file=sys.stderr)
+            return EXIT_CONFIG
     if args.mode == "scripted":
         import importlib.util
 

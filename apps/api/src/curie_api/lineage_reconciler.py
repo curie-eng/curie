@@ -42,6 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
+import redis.asyncio as redis
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -53,6 +54,7 @@ from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import PullRequestRef, PullRequestState, RepositoryRef
 
 from .config import Settings
+from .factory_maintenance_observer import MaintenanceObserver
 from .forges.registry import forges_registry
 from .forges.trackers import code_host_for_repository, stored_repository
 from .memory_rule_lifecycle import lock_rule_owner, settle_lineage_rule_candidates
@@ -96,6 +98,7 @@ class LineageReconciler:
         *,
         interval_seconds: float,
         batch_limit: int = 50,
+        maintenance: MaintenanceObserver | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("the lineage reconcile interval must be positive")
@@ -103,6 +106,7 @@ class LineageReconciler:
             raise ValueError("the lineage reconcile batch limit must be positive")
         self._sessionmaker = sessionmaker
         self._settings = settings
+        self._maintenance = maintenance
         self._code_host_for = code_host_for
         self._interval = interval_seconds
         self._batch_limit = batch_limit
@@ -271,19 +275,25 @@ class LineageReconciler:
                 if code_host is None:
                     code_host = hosts[key] = self._code_host_for(repository)
                 pull = await code_host.read_pull_request(item.pull_request)
-            except Unavailable as exc:
-                result.skipped += 1
-                if str(exc) == RATE_LIMITED:
-                    result.rate_limited = True
-                    break
-                continue
             except ForgeError as exc:
                 result.skipped += 1
-                logger.warning(
-                    "lineage %s pull request could not be read: %s", item.lineage_id, exc
-                )
+                if isinstance(exc, Unavailable) and str(exc) == RATE_LIMITED:
+                    result.rate_limited = True
+                    break
+                if not isinstance(exc, Unavailable):
+                    logger.warning(
+                        "lineage %s pull request could not be read: %s", item.lineage_id, exc
+                    )
                 continue
             result.read += 1
+            if self._maintenance is not None:
+                try:
+                    await self._maintenance.poll(item.lineage_id, pull)
+                except (ForgeError, TimeoutError, SQLAlchemyError) as exc:
+                    if str(exc) == RATE_LIMITED:
+                        result.rate_limited = True
+                        break
+                    logger.info("maintenance observation deferred for lineage %s", item.lineage_id)
             state = _TERMINAL.get(pull.state)
             if state is None:
                 continue
@@ -336,6 +346,7 @@ def start_lineage_reconciler(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
+    valkey: redis.Redis,
 ) -> asyncio.Task[None] | None:
     """Start the pass when the factory runs and the interval is positive.
 
@@ -353,10 +364,13 @@ def start_lineage_reconciler(
     reconciler = LineageReconciler(
         sessionmaker,
         settings,
-        lambda repository: code_host_for_repository(
-            forges_registry(settings), client, repository
-        ),
+        lambda repository: code_host_for_repository(forges_registry(settings), client, repository),
         interval_seconds=interval,
+        maintenance=(
+            MaintenanceObserver(sessionmaker, settings, client, valkey)
+            if settings.factory_maintenance_repair_enabled
+            else None
+        ),
     )
     return asyncio.create_task(reconciler.run_forever())
 

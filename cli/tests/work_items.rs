@@ -415,7 +415,20 @@ fn truncated_list_is_reported() {
 
 #[test]
 fn detail_shows_ci_state_and_reason() {
-    let detail = detail_item();
+    let mut detail = detail_item();
+    detail["maintenance_history"] = json!([{
+        "id": 1,
+        "recorded_at": "2026-09-22T10:07:00Z",
+        "lineage_id": "00000000-0000-4000-8000-000000000001",
+        "source_request_id": "00000000-0000-4000-8000-000000000002",
+        "repair_request_id": null,
+        "reason": "late_ci_red",
+        "outcome": "foreign_head",
+        "head_sha": "1123456789abcdef0123456789abcdef01234567",
+        "base_ref": "main",
+        "base_sha": "0123456789abcdef0123456789abcdef01234567"
+    }]);
+    let history = detail["maintenance_history"].clone();
     let observation = detail["ci_observation"].clone();
     let body = detail.to_string();
     let server = serve(move |req| {
@@ -432,6 +445,7 @@ fn detail_shows_ci_state_and_reason() {
     assert!(text.contains("published"), "{text}");
     assert!(text.contains("unavailable"), "{text}");
     assert!(text.contains("github_forbidden"), "{text}");
+    assert!(text.contains("late_ci_red: foreign_head"), "{text}");
     assert!(
         text.contains(&format!(
             "acme-corp/acme-bot#{} https://github.com/acme-corp/acme-bot/issues/2577",
@@ -446,6 +460,7 @@ fn detail_shows_ci_state_and_reason() {
     assert_eq!(value["item"]["id"], ITEM_ID);
     assert_eq!(value["item"]["ci"]["reason"], "github_forbidden");
     assert_eq!(value["item"]["ci_observation"], observation);
+    assert_eq!(value["item"]["maintenance_history"], history);
     assert_eq!(
         value["item"]["tracker"]["url"],
         "https://github.com/acme-corp/acme-bot/issues/2577"

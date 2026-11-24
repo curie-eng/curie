@@ -353,6 +353,7 @@
         },
         "cardBaseUrl": {"type": "string"},
         "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
+        "maintenanceRepairEnabled": {"type": "boolean"},
         "codeHosts": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
         "trackers": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
         "docker": {

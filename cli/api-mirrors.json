@@ -72,7 +72,7 @@
         },
         {
           "field": "coding_instructions",
-          "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. Admission selection metadata is exposed by the API and is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. Admission selection metadata is exposed by the API and is outside the versioned work-items/v2.4 JSON projection."
         },
         {
           "field": "requester_principal_id",
@@ -80,11 +80,11 @@
         },
         {
           "field": "automatic_retries_used",
-          "why": "cli/src/commands/work.rs renders state, cause and publication. The WorkItem's used automatic retry allowance (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs renders state, cause and publication. The WorkItem's used automatic retry allowance (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.4 JSON projection."
         },
         {
           "field": "automatic_retry_limit",
-          "why": "cli/src/commands/work.rs renders state, cause and publication. The automatic retry limit (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs renders state, cause and publication. The automatic retry limit (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.4 JSON projection."
         }
       ]
     },
@@ -129,6 +129,11 @@
       "omissions": []
     },
     {
+      "struct": "WorkItemMaintenanceEvent",
+      "schema": "WorkItemMaintenanceEventOut",
+      "omissions": []
+    },
+    {
       "struct": "WorkItemRequest",
       "schema": "WorkItemRequestOut",
       "omissions": [
@@ -138,23 +143,23 @@
         },
         {
           "field": "coding_instructions_selection_id",
-          "why": "cli/src/commands/work.rs reports request lifecycle and deferral facts. The admission selection reference is exposed by the API and is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs reports request lifecycle and deferral facts. The admission selection reference is exposed by the API and is outside the versioned work-items/v2.4 JSON projection."
         },
         {
           "field": "coding_instructions_evidence",
-          "why": "cli/src/commands/work.rs does not apply or acknowledge coding instructions. Per-request selection evidence is exposed by the API and is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs does not apply or acknowledge coding instructions. Per-request selection evidence is exposed by the API and is outside the versioned work-items/v2.4 JSON projection."
         },
         {
           "field": "memory_rules_evidence",
-          "why": "cli/src/commands/work.rs does not apply or acknowledge learned rules. Per-request learned rules evidence (#5798) is exposed by the API and is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs does not apply or acknowledge learned rules. Per-request learned rules evidence (#5798) is exposed by the API and is outside the versioned work-items/v2.4 JSON projection."
         },
         {
           "field": "retry_of_request_id",
-          "why": "cli/src/commands/work.rs renders request lifecycle and deferral facts. Automatic retry lineage (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs renders request lifecycle and deferral facts. Automatic retry lineage (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.4 JSON projection."
         },
         {
           "field": "retry_kind",
-          "why": "cli/src/commands/work.rs renders the item's actionable_cause, which already says when a request is an automatic retry. The retry kind (ADR 0269) is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs renders the item's actionable_cause, which already says when a request is an automatic retry. The retry kind (ADR 0269) is outside the versioned work-items/v2.4 JSON projection."
         },
         {
           "field": "dispatch_not_before",
@@ -166,11 +171,11 @@
         },
         {
           "field": "retry_safety",
-          "why": "cli/src/commands/work.rs does not decide retries. The worker's side effect fact (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.3 JSON projection."
+          "why": "cli/src/commands/work.rs does not decide retries. The worker's side effect fact (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.4 JSON projection."
         },
         {
           "field": "resource_gate",
-          "why": "The CLI renders a blocked retry's named condition through the item's actionable_cause; the raised limit a resource gated retry waits for (#5427) is outside the versioned work-items/v2.3 JSON projection."
+          "why": "The CLI renders a blocked retry's named condition through the item's actionable_cause; the raised limit a resource gated retry waits for (#5427) is outside the versioned work-items/v2.4 JSON projection."
         }
       ]
     },

@@ -48,9 +48,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
+from curie_api.factory_maintenance import MaintenanceObservation, MaintenanceRepair
+from curie_api.factory_maintenance_store import commit_observation
 from curie_api.factory_notices import FINAL_MARKER
+from curie_api.models import ExecutionRequest, ThreadPublicationLineage, WorkItem
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+from forge_fakes import factory_wake
 from forge_fakes.github import (
     LABEL,
     REPO,
@@ -61,6 +65,7 @@ from forge_fakes.github import (
     forges_document,
     forges_env_json,
     github_repository_binding,
+    listed_publication,
 )
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_A,
@@ -535,6 +540,8 @@ def test_a_dirty_pull_without_checks_fails_promptly_without_a_ci_fix(admitted: A
     assert "Provider message:" not in body
     assert "Cause: merge_conflict" in body
     assert _ci_turns(published["id"]) == []
+    assert _count_requests(number) == 1
+    assert _rows("SELECT repair_request_id FROM curie.factory_maintenance_admissions") == []
     assert sink.reruns == []
 
 
@@ -2221,6 +2228,199 @@ def _actions_failure(
     # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
     run["details_url"] = f"https://github.com/{REPO}/actions/runs/{run_id}/job/{run_id}"
     return run
+
+
+@pytest.fixture
+def maintenance_successor(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[Any, _CommentServer, dict[str, Any], uuid.UUID, dict[str, Any]]]:
+    client, github, sink = admitted
+    monkeypatch.setenv("FACTORY_MAINTENANCE_REPAIR_ENABLED", "true")
+    get_settings.cache_clear()
+    number = 9767
+    published = {**_published(client, github, sink, number), "number": number}
+    published["pr_url"] = f"{get_settings().github_html_base}/{REPO}/pull/{published['pr']}"
+    _execute(
+        "WITH target AS (UPDATE curie.thread_publication_lineages SET pr_url = :url "
+        "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :item) "
+        "RETURNING id) UPDATE curie.publications SET result_url = :url "
+        "WHERE lineage_id IN (SELECT id FROM target)",
+        {"url": published["pr_url"], "item": published["work_item_id"]},
+    )
+
+    async def admit_repair() -> tuple[uuid.UUID, str, str]:
+        async with client.app.state.sessionmaker() as session:
+            item = await session.get(WorkItem, published["work_item_id"])
+            source = await session.get(ExecutionRequest, published["id"])
+            assert item and source and item.publication_lineage_id and item.base_commit
+            lineage = await session.get(ThreadPublicationLineage, item.publication_lineage_id)
+            assert lineage and lineage.head_sha == HEAD_A and lineage.base_ref
+            assert lineage.code_host_pr_id
+            receipt = await commit_observation(
+                session,
+                MaintenanceObservation(
+                    work_item_id=item.id,
+                    request_id=source.id,
+                    lineage_id=lineage.id,
+                    work_item_version=item.version,
+                    request_version=source.version,
+                    lineage_version=lineage.version,
+                    head_sha=HEAD_A,
+                    base_ref=lineage.base_ref,
+                    base_sha=item.base_commit,
+                    reason="late_ci_red",
+                ),
+                objective="Repair the failing build on the existing pull request.",
+                refusal=None,
+            )
+            assert isinstance(receipt, MaintenanceRepair) and receipt.status == "admitted", receipt
+            return receipt.request_id, lineage.branch, lineage.code_host_pr_id
+
+    _reconcile()
+    assert _terminal(number) == ("completed", "completed")
+    repair_id, branch, pr_id = client.portal.call(admit_repair)
+    pull = listed_publication(number, pull=published["pr"])
+    pull.update(
+        html_url=published["pr_url"], node_id=pr_id, mergeable=True, mergeable_state="clean"
+    )
+    pull["head"].update(sha=HEAD_A, ref=branch)
+    sink.pull_script = [pull]
+
+    original_client = client.app.state.http_client
+
+    async def github_api(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/pulls/{published['pr']}":
+            return httpx.Response(200, json=pull)
+        return await original_client.send(request)
+
+    external = httpx.AsyncClient(transport=httpx.MockTransport(github_api))
+    client.app.state.http_client = external
+    try:
+        yield client, sink, published, repair_id, pull
+    finally:
+        client.app.state.http_client = original_client
+        client.portal.call(external.aclose)
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("head", "checks", "expected"),
+    [
+        (HEAD_B, "failed-actions", ("failed", "ci_failed")),
+        (HEAD_A, "green", ("failed", "ci_unverified")),
+        (HEAD_B, "absent", ("failed", "ci_unverified")),
+        (HEAD_B, "green", ("completed", "completed")),
+    ],
+    ids=["failed-actions", "same-head-green", "new-head-without-checks", "new-head-green"],
+)
+def test_active_maintenance_requires_a_new_head_with_green_checks(
+    maintenance_successor: Any, head: str, checks: str, expected: tuple[str, str]
+) -> None:
+    client, sink, published, repair_id, pull = maintenance_successor
+    _start_running(client, repair_id)
+    _attach_fix(
+        published["work_item_id"],
+        repair_id,
+        revision=2,
+        head_sha=head,
+        title="Repair the build",
+        paths=["README.md"],
+    )
+    pull["head"]["sha"] = head
+    if checks == "failed-actions":
+        sink.ci_scripts[head] = [
+            ci_entry(_actions_failure("build", 88201, _database_now().isoformat()))
+        ]
+    elif checks == "absent":
+        sink.ci_scripts[head] = [ci_empty()]
+    sink.rerun_status = 201
+    observed_before = len(sink.ci_observations)
+
+    _reconcile_later(130 if checks == "absent" else 0)
+
+    assert head in sink.ci_observations[observed_before:]
+    assert sink.reruns == []
+    assert _ci_turns(repair_id) == []
+    source, repair = _all(published["number"])
+    assert (source["id"], source["status"], source["terminal_cause"]) == (
+        published["id"],
+        "completed",
+        "completed",
+    )
+    assert repair["id"] == repair_id
+    assert (repair["status"], repair["terminal_cause"]) == expected
+    if expected == ("failed", "ci_unverified"):
+        assert "Reason: repair_head_unverified" in _body(sink, repair_id)
+
+
+def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: Any) -> None:
+    client, _sink, _published, repair_id, pull = maintenance_successor
+
+    async def acquire_body() -> dict[str, Any]:
+        async with client.app.state.sessionmaker() as session:
+            request = await session.get(ExecutionRequest, repair_id)
+            assert request is not None
+            return {
+                "owner": "factory-owner",
+                "generation": request.dispatch_generation,
+                "wake": (await factory_wake(session, repair_id)).model_dump(mode="json"),
+                "context": None,
+            }
+
+    url = f"/v1/internal/work-items/requests/{repair_id}/acquire"
+    body = client.portal.call(acquire_body)
+    pull["head"]["sha"] = HEAD_C
+    refused = client.post(url, headers=WORKER, json=body)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "not_dispatchable"
+    assert _rows(
+        "SELECT status, acquire_owner FROM curie.execution_requests WHERE id = :id",
+        {"id": repair_id},
+    ) == [{"status": "waiting", "acquire_owner": None}]
+    assert _rows(
+        "SELECT outcome FROM curie.factory_maintenance_events WHERE repair_request_id = :id "
+        "AND outcome = 'foreign_head'",
+        {"id": repair_id},
+    ) == [{"outcome": "foreign_head"}]
+
+    pull["head"]["sha"] = HEAD_A
+    accepted = client.post(url, headers=WORKER, json=body)
+    assert accepted.status_code == 200, accepted.text
+
+
+def test_maintenance_publication_refuses_a_foreign_pull_head(maintenance_successor: Any) -> None:
+    client, _sink, published, repair_id, pull = maintenance_successor
+    _start_running(client, repair_id)
+    _execute(
+        "INSERT INTO curie.thread_workspaces "
+        "(id, agent_id, conversation_id, repo_full_name, selected_by) "
+        "SELECT :workspace, agent_id, conversation_id, repository_path, 'fixture' "
+        "FROM curie.work_items WHERE id = :work_item "
+        "ON CONFLICT (agent_id, conversation_id) DO NOTHING",
+        {"workspace": uuid.uuid4(), "work_item": published["work_item_id"]},
+    )
+    publication_id = _attach_fix(
+        published["work_item_id"],
+        repair_id,
+        revision=2,
+        head_sha=HEAD_B,
+        title="Repair the build",
+        paths=["README.md"],
+        status="approved",
+    )
+    url = f"/v1/internal/publications/{publication_id}/credential"
+    pull["head"]["sha"] = HEAD_C
+    refused = client.post(url, headers=WORKER)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "foreign_head"
+    assert _rows(
+        "SELECT outcome FROM curie.credential_redemption_audit_entries WHERE publication_id = :id",
+        {"id": publication_id},
+    ) == [{"outcome": "refused"}]
+
+    pull["head"]["sha"] = HEAD_A
+    accepted = client.post(url, headers=WORKER)
+    assert accepted.status_code == 200, accepted.text
 
 
 def _phase_notes(request_id: uuid.UUID) -> list[str | None]:

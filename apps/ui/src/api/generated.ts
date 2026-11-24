@@ -14076,6 +14076,38 @@ export interface components {
              */
             owner?: "bundle";
         };
+        /** WorkItemMaintenanceEventOut */
+        WorkItemMaintenanceEventOut: {
+            /** Base Ref */
+            base_ref: string | null;
+            /** Base Sha */
+            base_sha: string | null;
+            /** Head Sha */
+            head_sha: string;
+            /** Id */
+            id: number;
+            /**
+             * Lineage Id
+             * Format: uuid
+             */
+            lineage_id: string;
+            /** Outcome */
+            outcome: string;
+            /** Reason */
+            reason: string;
+            /**
+             * Recorded At
+             * Format: date-time
+             */
+            recorded_at: string;
+            /** Repair Request Id */
+            repair_request_id: string | null;
+            /**
+             * Source Request Id
+             * Format: uuid
+             */
+            source_request_id: string;
+        };
         /** WorkItemOutcomeList */
         WorkItemOutcomeList: {
             /** Items */
@@ -14116,6 +14148,8 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            /** Maintenance History */
+            maintenance_history?: components["schemas"]["WorkItemMaintenanceEventOut"][];
             memory_rules: components["schemas"]["MemoryRulesMetadata"];
             /**
              * Model Auth Mode

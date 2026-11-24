@@ -64,7 +64,10 @@ existing records, with no lifecycle hook:
    kickoff sender, or for a configured thread the WorkItem owner's (else
    requester's) one active Slack link in the posting identity's workspace,
    and no one when there is none. A request a pre-card ``terminal`` or
-   ``pull_request`` post already announced owes neither.
+   ``pull_request`` post already announced owes neither;
+4. one reply per eligible maintenance outcome, in recorded order. A CI settlement
+   recorded while maintenance repair is enabled names the checked head and
+   distinguishes verified green from permitted no CI.
 
 ``phase``, ``pull_request`` and ``terminal`` rows from before the card are
 never delivered and never hold a later post back.
@@ -217,7 +220,7 @@ _ROOT_PAYLOAD_SQL = """
 """
 # The kinds this lane delivers. Rows of the pre-card kinds stay in the table
 # and neither deliver nor hold a later post back.
-_DELIVERED_KINDS_SQL = "'root', 'card', 'needs_person', 'ready'"
+_DELIVERED_KINDS_SQL = "'root', 'card', 'needs_person', 'ready', 'maintenance'"
 _LIVE_SQL = "'queued', 'waiting', 'running', 'cancellation_requested'"
 _CARD_SEND_TIMEOUT: Final = 30.0
 # The latest implementation request at or after the thread's first sequence,
@@ -306,6 +309,45 @@ def _refusal_sentence(reason: str, login: object) -> str:
     return sentence
 
 
+_MAINTENANCE_REFUSALS = {
+    "repair_disabled": "Automatic repair is disabled.",
+    "reason_unavailable": "This kind of automatic repair is unavailable.",
+    "work_item_cancelled": "The work item was cancelled.",
+    "pr_closed": "The pull request is closed.",
+    "identity_unverified": "Curie could not verify the pull request identity.",
+    "owner_changed": "The work item owner changed.",
+    "enrollment_fenced": "The owner's model enrollment changed.",
+    "superseded": "A newer request supersedes this repair.",
+    "snapshot_changed": "The work item or pull request changed during verification.",
+    "foreign_head": "Repair paused because the pull request head differs from the factory head.",
+    "base_changed": "The base branch changed.",
+    "window_expired": "The automatic repair window expired.",
+    "budget_exhausted": "The automatic repair allowance has been spent.",
+    "source_not_completed": "The source request has no successful completion.",
+    "prior_green_missing": "The source request has no verified green CI result.",
+    "evidence_unavailable": "Curie could not verify the current repair evidence.",
+    "failure_not_attributable": "Curie could not attribute a failing check to the pull request.",
+    "no_current_conflict": "The merge conflict could not be confirmed.",
+    "retarget_pending": "The pull request is waiting for a base branch change.",
+}
+
+
+def _maintenance_text(payload: dict[str, Any]) -> str:
+    outcome = str(payload.get("outcome"))
+    if outcome in {"green", "no_ci"}:
+        head = str(payload.get("head_sha"))
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", head):
+            return "The recorded CI result has no valid commit identifier."
+        if outcome == "green":
+            return f"CI verified green on {head}."
+        return f"No CI checks applied to {head}. Policy permits completion."
+    if outcome == "admitted":
+        if payload.get("reason") == "base_conflict":
+            return "Curie queued a repair for the merge conflict."
+        return "Curie queued a repair for failing CI."
+    return _MAINTENANCE_REFUSALS.get(outcome, "See the work item for the repair outcome.")
+
+
 def render_post(kind: str, payload: dict[str, Any]) -> str:
     """The message text of one owed post, from its structured payload only."""
 
@@ -317,6 +359,8 @@ def render_post(kind: str, payload: dict[str, Any]) -> str:
         return needs_person_text(_user(payload), _str(payload.get("cause")))
     if kind == "ready":
         return ready_text(_user(payload), str(payload.get("url") or ""))
+    if kind == "maintenance":
+        return _maintenance_text(payload)
     raise ValueError(f"unknown factory Slack post kind {kind!r}")
 
 
@@ -536,6 +580,7 @@ class PostgresFactorySlackStore:
         self._reports = f'"{schema}".execution_request_phase_reports'
         self._lineages = f'"{schema}".thread_publication_lineages'
         self._publications = f'"{schema}".publications'
+        self._maintenance_events = f'"{schema}".factory_maintenance_events'
         self._threads = f'"{schema}".factory_slack_threads'
         self._posts = f'"{schema}".factory_slack_posts'
         self._notices = f'"{schema}".factory_terminal_notices'
@@ -895,6 +940,24 @@ class PostgresFactorySlackStore:
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
+        maintenance = text(
+            f"""
+            INSERT INTO {self._posts}
+                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
+            SELECT t.work_item_id, 'maintenance:' || e.id, 'maintenance',
+                   max(q.sequence) OVER (PARTITION BY t.work_item_id ORDER BY e.id), 4, e.id,
+                   jsonb_strip_nulls(jsonb_build_object(
+                       'outcome', e.outcome, 'reason', e.reason,
+                       'head_sha', CASE WHEN e.outcome IN ('green', 'no_ci') THEN e.head_sha END
+                   ))
+              FROM ({live_threads}) t
+              JOIN {self._maintenance_events} e ON e.work_item_id = t.work_item_id
+              JOIN {self._requests} q
+                ON q.id = e.source_request_id AND q.sequence >= t.first_sequence
+             WHERE e.notify_slack
+            ON CONFLICT (work_item_id, post_key) DO NOTHING
+            """
+        )
         refusals = text(
             f"""
             INSERT INTO {self._refusals} AS r
@@ -931,6 +994,7 @@ class PostgresFactorySlackStore:
             await connection.execute(cards)
             await connection.execute(needs_person)
             await connection.execute(ready)
+            await connection.execute(maintenance)
             await connection.execute(refusals)
             await connection.execute(self._grant_notices(), {"reconnect_url": self._reconnect_url})
 

@@ -6,6 +6,7 @@ import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Literal
 
 import httpx
 import redis.asyncio as redis
@@ -38,11 +39,13 @@ WINDOW_SECONDS = 86400
 RECOVERABLE = ("ci_timeout", "ci_unverified")
 
 
-async def _facts(
+async def settled_ci_facts(
     session: AsyncSession,
     item: WorkItem,
     request: ExecutionRequest,
     lineage: ThreadPublicationLineage,
+    *,
+    request_status: Literal["failed", "completed"] = "failed",
 ) -> factory_ci.CiFacts | None:
     if not lineage.head_sha:
         return None
@@ -84,7 +87,7 @@ async def _facts(
             request.terminal_cause or "",
             subject,
         ),
-        recovery=True,
+        request_status=request_status,
     )
 
 
@@ -127,7 +130,7 @@ async def _seed(session: AsyncSession, limit: int) -> None:
         )
     ).all()
     for item, request, lineage in items:
-        if await _facts(session, item, request, lineage) is None:
+        if await settled_ci_facts(session, item, request, lineage) is None:
             continue
         now = await lifecycle.database_now(session)
         inserted = await session.scalar(
@@ -203,7 +206,7 @@ async def _claim(session: AsyncSession) -> _Claim | None:
         await session.commit()
         return None
     assert item is not None and request is not None and lineage is not None
-    facts = await _facts(session, item, request, lineage)
+    facts = await settled_ci_facts(session, item, request, lineage)
     if facts is None:
         row.reason = "publication_evidence_unavailable"
         row.next_due_at = now + timedelta(seconds=factory_ci.CI_POLL_SECONDS)

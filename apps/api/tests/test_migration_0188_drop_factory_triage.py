@@ -947,7 +947,7 @@ def test_retained_triage_requests_stay_quiet_in_the_slack_progress_lane(
         for row in cutoffs
     ), cutoffs
 
-    command.upgrade(alembic_config(), REVISION)
+    command.upgrade(alembic_config(), load_window().schema_min)
     slack = RecordingSlack()
     _progress_pass(slack)
     assert slack.calls == []
@@ -1042,7 +1042,7 @@ def test_an_undiscovered_triage_work_item_stays_quiet_until_its_next_request(
     _batch(*rows)
     assert sql_rows("SELECT count(*) FROM curie.factory_slack_threads") == [(0,)]
 
-    command.upgrade(alembic_config(), REVISION)
+    command.upgrade(alembic_config(), load_window().schema_min)
     slack = RecordingSlack()
     _progress_pass(slack)
     assert slack.calls == []

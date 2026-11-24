@@ -308,5 +308,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0286 | [One labelled ticket: the factory investigates, asks on the ticket, and resumes on a plain answer](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md) | Accepted |
 | 0287 | [Learned rules are a memory kind that applies only after a person accepts it](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md) | Accepted |
 | 0288 | [The runner carries a connector's approval ticket to its gated call](0288-the-runner-carries-a-connector-approval-ticket-to-its-gated-call.md) | Accepted |
+| 0289 | [A factory pull request lineage has one maintenance allowance](0289-a-factory-pr-lineage-has-one-maintenance-allowance.md) | Accepted |
 | 0292 | [A voice draft requires confirmation before it can steer factory work](0292-confirmed-factory-voice-feedback.md) | Accepted |
 <!-- END GENERATED: adr-index -->

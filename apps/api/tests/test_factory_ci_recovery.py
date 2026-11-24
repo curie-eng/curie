@@ -163,6 +163,8 @@ def test_later_green_records_item_completion_without_changing_failed_request(
     assert result["requests"][-1]["status"] == "failed"
     assert _snapshot(request_id) == before
     assert _observation(request_id)["expires_at"] == original["expires_at"]
+    assert result["maintenance_history"] == []
+    assert len(result["requests"]) == 1
     assert _stream_turns() == turns
     assert _rows("SELECT id FROM curie.publications") == publications
     assert _rows("SELECT id FROM curie.execution_request_model_usage") == []

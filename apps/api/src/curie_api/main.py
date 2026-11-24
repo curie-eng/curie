@@ -291,7 +291,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         else None
     )
     app.state.lineage_reconciler_task = start_lineage_reconciler(
-        app.state.sessionmaker, settings, http_client
+        app.state.sessionmaker, settings, http_client, valkey
     )
     # ADR 0287 (#5796): runs whatever the reconciler switches say.
     app.state.rule_settlement_task = start_rule_settlement(app.state.sessionmaker, settings)

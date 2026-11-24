@@ -4,7 +4,7 @@ The single home of outcome semantics: ``derive_outcome`` is the only place an
 outcome ``state`` and ``actionable_cause`` are computed, and the CLI and the
 console render those strings verbatim. The module reads canonical WorkItem,
 ExecutionRequest, publication-lineage, Publication, Approval, factory status
-comment and execution phase report rows; it writes nothing and adds no store.
+comment, execution phase report and maintenance event rows.
 The title and progress strip come from the status comment rows and the phase
 reports through ``curie_internal.factory_phase_view.phase_view``, the same
 derivation the GitHub status card uses (#4102).
@@ -41,6 +41,7 @@ from curie_api.schemas.workitems import (
     WorkItemCiOut,
     WorkItemCiState,
     WorkItemCorrectnessOut,
+    WorkItemMaintenanceEventOut,
     WorkItemOutcomeOut,
     WorkItemOutcomeState,
     WorkItemProgressOut,
@@ -61,6 +62,7 @@ from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
     FactoryCiObservation,
+    FactoryMaintenanceEvent,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -755,6 +757,26 @@ async def _views(
             )
         ).all()
     }
+    maintenance: dict[uuid.UUID, list[WorkItemMaintenanceEventOut]] = defaultdict(list)
+    for event in await session.scalars(
+        select(FactoryMaintenanceEvent)
+        .where(FactoryMaintenanceEvent.work_item_id.in_(ids))
+        .order_by(FactoryMaintenanceEvent.id)
+    ):
+        maintenance[event.work_item_id].append(
+            WorkItemMaintenanceEventOut(
+                id=event.id,
+                recorded_at=event.recorded_at,
+                lineage_id=event.lineage_id,
+                source_request_id=event.source_request_id,
+                repair_request_id=event.repair_request_id,
+                reason=event.reason,
+                outcome=event.outcome,
+                head_sha=event.head_sha,
+                base_ref=event.base_ref,
+                base_sha=event.base_sha,
+            )
+        )
     pinned_rules = await memory_rules_admission.rule_numbers(session, ids)
     views = []
     for item in items:
@@ -788,6 +810,7 @@ async def _views(
             memory_rule_numbers=pinned_rules.get(item.id, ()),
         )
         view.title = _title(comments[item.id], sequences)
+        view.maintenance_history = maintenance[item.id]
         comment_row = latest_comment.get(item.id)
         if comment_row is not None:
             req = latest[item.id]

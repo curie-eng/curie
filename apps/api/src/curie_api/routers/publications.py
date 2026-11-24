@@ -27,6 +27,7 @@ from curie_api.crud import lineages as crud_lineages
 from curie_api.crud import publication_queries as crud_publication_queries
 from curie_api.crud import publications as crud_publications
 from curie_api.crud import workspaces as crud_workspaces
+from curie_api.factory_maintenance_observer import repair_refusal
 from curie_api.schemas.publications import (
     PublicationContextMint,
     PublicationCreate,
@@ -66,6 +67,7 @@ from ..forges.types import (
 from ..identity.http_approval import identity_runtime
 from ..models import (
     ExecutionRequest,
+    FactoryMaintenanceAdmission,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
@@ -672,8 +674,29 @@ async def create_publication(
             data = data.model_copy(update={"body": annotated})
 
     async def metadata_check() -> None:
+        refusal = await repair_refusal(
+            session, data.work_item_request_id, settings, request.app.state.http_client, record=True
+        )
+        if refusal:
+            await session.commit()
+            raise crud_errors.PublicationLineageConflict(
+                refusal, "Maintenance publication authority changed."
+            )
         if patch:
             return
+        if (
+            data.work_item_request_id is not None
+            and await session.scalar(
+                select(FactoryMaintenanceAdmission.id).where(
+                    FactoryMaintenanceAdmission.repair_request_id == data.work_item_request_id
+                )
+            )
+            is not None
+        ):
+            raise crud_errors.PublicationLineageConflict(
+                "publication.repair_patch_required",
+                "A maintenance repair must publish a new commit.",
+            )
         if (
             data.work_item_request_id is None
             or data.work_item_runtime_epoch is None
@@ -1134,6 +1157,18 @@ async def redeem_publication_credential(
         await refused(
             status.HTTP_403_FORBIDDEN,
             "publication repository is no longer authorized for this thread",
+        )
+    maintenance_refusal = await repair_refusal(
+        session,
+        publication.execution_request_id,
+        settings,
+        request.app.state.http_client,
+        record=True,
+    )
+    if maintenance_refusal:
+        await refused(
+            status.HTTP_409_CONFLICT,
+            {"code": maintenance_refusal, "message": "Maintenance publication authority changed."},
         )
     agent = await crud_agents.get_agent(session, deployment.agent_id)
     if not policy_still_authorizes(agent, approval):

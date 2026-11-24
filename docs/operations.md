@@ -1732,6 +1732,25 @@ the state label from `curie-factory:needs-human` to `curie-factory:pr-open`.
 Expiry says the checks were not verified within 24 hours and keeps the human
 handoff label. Other terminal causes do not start this observation.
 
+#### Late CI on an open factory pull request
+
+The optional `factory.maintenanceRepairEnabled` setting (API environment
+`FACTORY_MAINTENANCE_REPAIR_ENABLED`) defaults to false. With it enabled, the
+lineage reconciler can start one same-PR repair when CI turns red on a head
+that previously settled with verified green CI. The window closes 24 hours
+after the first eligible successful request finished. Later revisions and
+restarts preserve both the deadline and the consumed allowance. A repair must
+publish a new head and verify its CI.
+
+WorkItem history retains verified green and allowed no-CI settlements even when
+automatic repair is disabled. Slack reports only maintenance events recorded
+while automatic repair is enabled. Read `maintenance_history` in the
+WorkItem detail for the authorized head, base, reason, refusal or admitted
+successor. A matching failure on the base or missing evidence leaves the
+allowance available. A human push pauses repair with
+`foreign_head`. Restoring the recorded head allows reevaluation. A successful
+repair leaves the pull request open for review.
+
 Per-repository factory settings live under `factory.bindings[].repos[]`. A
 binding joins one tracker (`tracker`) to its repositories, and each `repos`
 entry names a `codeHost`, a `projectId`, a `path` (`owner/name`) and an `alias`.
@@ -2731,7 +2750,7 @@ identifiers and a generation only, never a credential.
 `curie <tier> work-items --json` carries the same four fields,
 and the human detail view prints one `auth` line.
 
-Each item also reports `memory_rules`, the learned rules pinned when the work item was admitted: `state`, `count`, `rule_numbers`, `sha256` and `format_version`, never the rule text. `curie <tier> work-items --json` (schema `work-items/v2.3`) prints it for the list and for one item, and the Console work item detail lists the pinned rules with their text.
+Each item also reports `memory_rules`, the learned rules pinned when the work item was admitted: `state`, `count`, `rule_numbers`, `sha256` and `format_version`, never the rule text. `curie <tier> work-items --json` (schema `work-items/v2.4`) prints it for the list and for one item, and the Console work item detail lists the pinned rules with their text.
 
 Each item also reports its automatic retry allowance:
 `automatic_retries_used` (owner loss and ordinary failures together) and

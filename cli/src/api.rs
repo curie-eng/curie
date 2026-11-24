@@ -1801,6 +1801,8 @@ pub struct WorkItemOutcome {
     pub correctness: WorkItemCorrectness,
     pub ci: Option<WorkItemCi>,
     pub ci_observation: Option<WorkItemCiObservation>,
+    #[serde(default)]
+    pub maintenance_history: Vec<WorkItemMaintenanceEvent>,
     pub requests: Vec<WorkItemRequest>,
     pub memory_rules: WorkItemMemoryRules,
 }
@@ -1913,6 +1915,20 @@ pub struct WorkItemCiObservation {
     pub created_at: String,
     pub expires_at: String,
     pub observed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemMaintenanceEvent {
+    pub id: u64,
+    pub recorded_at: String,
+    pub lineage_id: String,
+    pub source_request_id: String,
+    pub repair_request_id: Option<String>,
+    pub reason: String,
+    pub outcome: String,
+    pub head_sha: String,
+    pub base_ref: Option<String>,
+    pub base_sha: Option<String>,
 }
 
 /// `WorkItemRequestOut`: one execution request of a work item.

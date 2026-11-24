@@ -2255,6 +2255,18 @@ def test_a_delegated_check_failing_on_the_base_is_unverified() -> None:
     assert verdict.reason == "delegated_ci_failed_on_base"
 
 
+def test_late_red_requires_delegated_evidence_even_with_an_attributable_failure() -> None:
+    detail = _detail(
+        _run("lint", conclusion="failure"),
+        _delegated_run(conclusion="failure"),
+        base_runs=(_run(DELEGATED, conclusion="failure", run_id=90),),
+    )
+    active = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    late = _decide(detail, 30, delegated_checks=(DELEGATED,), require_complete_evidence=True)
+    assert active.kind == "failing"
+    assert (late.kind, late.reason) == ("unverified", "delegated_ci_failed_on_base")
+
+
 def test_a_delegated_status_failing_on_the_base_is_unverified() -> None:
     detail = _detail(
         _run("lint"),

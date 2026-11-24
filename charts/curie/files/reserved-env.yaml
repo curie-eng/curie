@@ -198,6 +198,7 @@ api:
   DB_SCHEMA: the chart-managed database schema (remove this override)
   ENVIRONMENT: api.environment
   FACTORY_CI_WAIT_S: factory.ciWaitSeconds
+  FACTORY_MAINTENANCE_REPAIR_ENABLED: factory.maintenanceRepairEnabled
   FACTORY_ENABLED: factory.enabled
   FACTORY_GITHUB_APP_CLIENT_ID: factory.githubAppClientId
   FACTORY_GITHUB_APP_CLIENT_SECRET: factory.githubAppClientSecretExistingSecret

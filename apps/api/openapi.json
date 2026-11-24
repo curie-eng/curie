@@ -20687,6 +20687,89 @@
         "title": "WorkItemCorrectnessOut",
         "type": "object"
       },
+      "WorkItemMaintenanceEventOut": {
+        "properties": {
+          "base_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Ref"
+          },
+          "base_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Sha"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "lineage_id": {
+            "format": "uuid",
+            "title": "Lineage Id",
+            "type": "string"
+          },
+          "outcome": {
+            "title": "Outcome",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "recorded_at": {
+            "format": "date-time",
+            "title": "Recorded At",
+            "type": "string"
+          },
+          "repair_request_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repair Request Id"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "recorded_at",
+          "lineage_id",
+          "source_request_id",
+          "repair_request_id",
+          "reason",
+          "outcome",
+          "head_sha",
+          "base_ref",
+          "base_sha"
+        ],
+        "title": "WorkItemMaintenanceEventOut",
+        "type": "object"
+      },
       "WorkItemOutcomeList": {
         "properties": {
           "items": {
@@ -20790,6 +20873,13 @@
             "format": "uuid",
             "title": "Id",
             "type": "string"
+          },
+          "maintenance_history": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemMaintenanceEventOut"
+            },
+            "title": "Maintenance History",
+            "type": "array"
           },
           "memory_rules": {
             "$ref": "#/components/schemas/MemoryRulesMetadata"

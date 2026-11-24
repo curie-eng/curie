@@ -529,7 +529,7 @@
       "result": "WorkItemsOutput",
       "kind": "CliOutput",
       "schema": "work-items.schema.json",
-      "version": "2.3"
+      "version": "2.4"
     },
     {
       "result": "all_targets_deploy_failure_json",

@@ -39,6 +39,7 @@ from ..models import (
     Deployment,
     ExecutionRequest,
     FactoryBaseTransition,
+    FactoryMaintenanceAdmission,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -1023,7 +1024,7 @@ async def create_or_get_work_item(
     return await outcome(session, work_item, None, replayed=inserted_id is None)
 
 
-async def _insert_waiting_request(
+async def insert_waiting_request(
     session: AsyncSession,
     work_item: WorkItem,
     *,
@@ -1128,7 +1129,7 @@ async def create_execution_request(
         return await _conflict(session, "active_request", work_item=work_item, request=active)
 
     try:
-        allocation_changed = await _insert_waiting_request(
+        allocation_changed = await insert_waiting_request(
             session,
             work_item,
             request_id=request_id,
@@ -2048,6 +2049,7 @@ async def terminalize_execution(
     retry_condition: RetryConditionFact | None,
     exhausted_volume: str | None,
     finisher: Literal["worker", "control_plane"],
+    verified_ci: tuple[str, bool] | None = None,
 ) -> WorkItemResult:
     """Settle a running request completed or failed.
 
@@ -2094,6 +2096,16 @@ async def terminalize_execution(
         "merge_conflict",
         "pr_closed",
     }
+    is_maintenance = (
+        await session.scalar(
+            select(FactoryMaintenanceAdmission.id).where(
+                FactoryMaintenanceAdmission.repair_request_id == request.id
+            )
+        )
+        is not None
+    )
+    if is_maintenance and status == "completed" and not (verified_ci and verified_ci[1]):
+        return await _conflict(session, "publication_pending", work_item=work_item, request=request)
     opened = (status == "completed" or ci_cause) and await _opened_pull_request(
         session, work_item, request
     )
@@ -2166,10 +2178,10 @@ async def terminalize_execution(
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
-        if await _unchanged_follow_up(session, work_item, request, detail):
+        if not is_maintenance and await _unchanged_follow_up(session, work_item, request, detail):
             status = "completed"
             cause = "completed"
-        elif (
+        elif not is_maintenance and (
             await factory_questions.question_ending(session, work_item.id, request.id)
             == factory_questions.QUESTIONS_ASKED
         ):
@@ -2275,6 +2287,13 @@ async def terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
+    if request.status == "completed" and verified_ci is not None:
+        from ..factory_maintenance_progress import record_ci_settlement
+        from ..factory_maintenance_store import pin_origin
+
+        head_sha, green = verified_ci
+        await pin_origin(session, work_item, request, head_sha=head_sha, green=green)
+        await record_ci_settlement(session, work_item, request, head_sha=head_sha, green=green)
     if request.status == "failed":
         disposition = factory_retry_policy.decide(
             RetryFacts(
@@ -2448,6 +2467,7 @@ async def settle_ci_verdict(
     status: Literal["completed", "failed"],
     cause: str,
     detail: str | None,
+    verified_ci: Literal["green", "no_ci"] | None = None,
 ) -> WorkItemResult:
     work_item = await lock_work_item(session, work_item_id)
     request = (
@@ -2461,6 +2481,7 @@ async def settle_ci_verdict(
         and not await _ci_fence_holds(session, work_item, request_id, expected_subject)
     ):
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    proof = (expected_subject.head_sha, verified_ci == "green") if verified_ci else None
     if isinstance(expected_subject, BaseTransitionCISubject):
         async with AsyncSession(
             bind=await session.connection(),
@@ -2482,6 +2503,7 @@ async def settle_ci_verdict(
                 retry_condition=None,
                 exhausted_volume=None,
                 finisher="control_plane",
+                verified_ci=proof,
             )
         if isinstance(result, WorkItemOutcome):
             await session.execute(
@@ -2512,6 +2534,7 @@ async def settle_ci_verdict(
         retry_condition=None,
         exhausted_volume=None,
         finisher="control_plane",
+        verified_ci=proof,
     )
 
 
@@ -3454,6 +3477,12 @@ async def admit_automatic_successor(
         or work_item.automatic_retries_used >= AUTOMATIC_RETRY_LIMIT
         or predecessor.terminal_cause
         in ("budget_exceeded", factory_questions.QUESTION_ROUNDS_EXHAUSTED)
+        or await session.scalar(
+            select(FactoryMaintenanceAdmission.id).where(
+                FactoryMaintenanceAdmission.repair_request_id == predecessor.id
+            )
+        )
+        is not None
         or await factory_questions.rounds_exhausted_for(session, work_item.id, predecessor.id)
     ):
         return False
@@ -3556,7 +3585,7 @@ async def admit_automatic_successor(
             dispatch_not_before = wait_deadline
         else:
             dispatch_not_before = due
-    admitted = await _insert_waiting_request(
+    admitted = await insert_waiting_request(
         session,
         work_item,
         request_id=uuid.uuid4(),
@@ -3650,7 +3679,7 @@ async def _admit_publication_recovery(
     request_id = uuid.uuid4()
     try:
         async with session.begin_nested():
-            admitted = await _insert_waiting_request(
+            admitted = await insert_waiting_request(
                 session,
                 work_item,
                 request_id=request_id,

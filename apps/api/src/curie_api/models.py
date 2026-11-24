@@ -1930,6 +1930,134 @@ def new_card_token() -> str:
     return secrets.token_hex(32)
 
 
+class FactoryMaintenanceLineage(Base):
+    """The fixed maintenance window and shared allowance of a factory PR."""
+
+    __tablename__ = "factory_maintenance_lineages"
+    __table_args__ = (
+        CheckConstraint("repairs_used IN (0, 1)", name="factory_maintenance_allowance_ck"),
+        CheckConstraint(
+            "expires_at = origin_completed_at + interval '86400 seconds'",
+            name="factory_maintenance_expiry_ck",
+        ),
+        CheckConstraint(
+            "(latest_green_head_sha IS NULL) = (latest_green_at IS NULL)",
+            name="factory_maintenance_green_ck",
+        ),
+    )
+
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE"), primary_key=True
+    )
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    origin_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    origin_head_sha: Mapped[str] = mapped_column(Text)
+    origin_completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    repairs_used: Mapped[int] = mapped_column(default=0, server_default="0")
+    final_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latest_settled_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    latest_settled_head_sha: Mapped[str] = mapped_column(Text)
+    latest_green_head_sha: Mapped[str | None] = mapped_column(Text)
+    latest_green_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FactoryMaintenanceAdmission(Base):
+    """Immutable authority for the single maintenance successor on this PR."""
+
+    __tablename__ = "factory_maintenance_admissions"
+    __table_args__ = (
+        UniqueConstraint("lineage_id", name="factory_maintenance_once_per_lineage"),
+        UniqueConstraint("repair_request_id", name="factory_maintenance_repair_request_key"),
+        UniqueConstraint(
+            "code_host_kind",
+            "code_host_host",
+            "repository_project_id",
+            "code_host_pr_id",
+            "lineage_id",
+            "head_sha",
+            "base_sha",
+            "reason",
+            name="factory_maintenance_observation_key",
+        ),
+        CheckConstraint("mode = 'successor'", name="factory_maintenance_mode_ck"),
+        CheckConstraint(
+            "reason IN ('late_ci_red', 'base_conflict')", name="factory_maintenance_reason_ck"
+        ),
+        CheckConstraint(OWNER_TUPLE_CHECK, name="factory_maintenance_owner_ck"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code_host_kind: Mapped[str] = mapped_column(Text)
+    code_host_host: Mapped[str] = mapped_column(Text)
+    repository_project_id: Mapped[str] = mapped_column(Text)
+    code_host_pr_id: Mapped[str] = mapped_column(Text)
+    pr_number: Mapped[int] = mapped_column(Integer)
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.factory_maintenance_lineages.lineage_id", ondelete="CASCADE")
+    )
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    source_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    repair_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    head_sha: Mapped[str] = mapped_column(Text)
+    base_ref: Mapped[str] = mapped_column(Text)
+    base_sha: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    mode: Mapped[str] = mapped_column(Text)
+    model_auth_mode: Mapped[str] = mapped_column(Text)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    enrollment_generation: Mapped[int | None] = mapped_column(BigInteger)
+    admitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class FactoryMaintenanceEvent(Base):
+    """Ordered maintenance decisions and CI settlement evidence on a WorkItem."""
+
+    __tablename__ = "factory_maintenance_events"
+    __table_args__ = (
+        Index("factory_maintenance_events_item_idx", "work_item_id", "id"),
+        Index(
+            "factory_maintenance_events_reason_idx", "work_item_id", "lineage_id", "reason", "id"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE")
+    )
+    source_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    repair_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    head_sha: Mapped[str] = mapped_column(Text)
+    base_ref: Mapped[str | None] = mapped_column(Text)
+    base_sha: Mapped[str | None] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    outcome: Mapped[str] = mapped_column(Text)
+    notify_slack: Mapped[bool] = mapped_column(default=True, server_default="true")
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
+
+
 class FactoryCiObservation(Base):
     """Bounded item-level CI proof after an immutable failed execution."""
 
@@ -2403,6 +2531,7 @@ FACTORY_SLACK_POST_KINDS = (
     "card",
     "needs_person",
     "ready",
+    "maintenance",
 )
 
 

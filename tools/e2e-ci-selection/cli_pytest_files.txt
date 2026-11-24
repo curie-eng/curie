@@ -166,6 +166,7 @@ tools/factory-e2e/tests/test_learned_rules_scenario.py
 tools/factory-e2e/tests/test_live_github_chain.py
 tools/factory-e2e/tests/test_live_github_chain_driver.py
 tools/factory-e2e/tests/test_live_github_chain_pending.py
+tools/factory-e2e/tests/test_maintenance.py
 tools/factory-e2e/tests/test_one_ticket_jira.py
 tools/factory-e2e/tests/test_one_ticket_live.py
 tools/factory-e2e/tests/test_one_ticket_scenario.py

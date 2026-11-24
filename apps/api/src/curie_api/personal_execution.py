@@ -168,7 +168,7 @@ async def _agent_tenant(session: AsyncSession, agent_id: uuid.UUID) -> uuid.UUID
     return tenant_id
 
 
-async def _verify(
+async def verify_owner_context(
     session: AsyncSession, owner: OwnerContext, *, agent_id: uuid.UUID
 ) -> OwnerRefusalCode | None:
     """Full validation of an owner context against the admitted agent.
@@ -230,7 +230,7 @@ async def new_work_item_owner(
     # an older replica would expire the transcript a fenced run keeps.
     if await rollout_hold.personal_rollout_held():
         return OwnerRefusal("personal_rollout_in_progress")
-    refused = await _verify(session, owner, agent_id=facts.agent_id)
+    refused = await verify_owner_context(session, owner, agent_id=facts.agent_id)
     if refused is not None:
         return OwnerRefusal(refused)
     return OwnerTuple.personal(owner)
@@ -249,7 +249,7 @@ async def existing_work_item_refusal(
         if mode == "personal" and work_item.model_auth_mode != "personal":
             return OwnerRefusal("personal_owner_required")
         return None
-    refused = await _verify(session, owner, agent_id=facts.agent_id)
+    refused = await verify_owner_context(session, owner, agent_id=facts.agent_id)
     if refused is not None:
         return OwnerRefusal(refused)
     mismatch = compare_owner(OwnerTuple.of(work_item), OwnerTuple.personal(owner))

@@ -108,6 +108,7 @@ from .forges.types import (
 from .models import (
     ExecutionRequest,
     FactoryBaseTransition,
+    FactoryMaintenanceAdmission,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
@@ -216,6 +217,7 @@ class CiView:
     merged: bool | None = None
     closed_unmerged: bool | None = None
     pull_head_sha: str | None = None
+    compared_base_sha: str | None = None
 
     @property
     def runs(self) -> list[NormalizedCheck]:
@@ -273,6 +275,7 @@ async def observe(
                 report.rollup.checks,
                 report.diagnostics,
                 base_failing=report.base.failing_keys if report.base is not None else frozenset(),
+                compared_base_sha=report.base.head_sha if report.base is not None else None,
             )
         else:
             rollup = await code_host.observe_ci(repository, head_sha)
@@ -630,6 +633,7 @@ def decide(
     fresh_after: datetime | None = None,
     delegated_checks: Sequence[str] = (),
     host_required_checks: Collection[str] | None = None,
+    require_complete_evidence: bool = False,
 ) -> Verdict:
     """The CI verdict for one observation. Pure: time is an argument.
 
@@ -767,18 +771,21 @@ def decide(
             failing_keys.append(status_item.key)
         elif status_item.state is not CheckState.SUCCESS:
             pending.append({"context": status_item.name, "state": status_item.reported_state})
+    failed_verdict = None
     if failing:
         # Fail fast: the whole budget is what remains of the execution deadline.
         required_python_failed = requires_python_ci and any(
             run.state in _FAILING and run.key not in base_failing for run in required_python_runs
         )
-        return Verdict(
+        failed_verdict = Verdict(
             kind="failing",
             failing=failing,
             failing_keys=tuple(failing_keys),
             pending=pending,
             reason="required_python_ci_failed" if required_python_failed else None,
         )
+        if not require_complete_evidence:
+            return failed_verdict
     # These checks are the proof of this change, so a red base means the change
     # is unproven, never green.
     if requires_python_ci and any(
@@ -857,6 +864,9 @@ def decide(
             pending=pending,
             reason="delegated_ci_missing",
         )
+
+    if failed_verdict is not None:
+        return failed_verdict
 
     if not check_runs and not statuses:
         in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
@@ -1126,7 +1136,10 @@ class CiFacts:
 
 
 async def load_ci_facts(
-    session: AsyncSession, settlement: lifecycle.PublicationSettlement, *, recovery: bool = False
+    session: AsyncSession,
+    settlement: lifecycle.PublicationSettlement,
+    *,
+    request_status: Literal["running", "failed", "completed"] = "running",
 ) -> CiFacts | None:
     request = await session.get(ExecutionRequest, settlement.request_id)
     work_item = await session.get(WorkItem, settlement.work_item_id)
@@ -1136,7 +1149,7 @@ async def load_ci_facts(
         or request.work_item_id != work_item.id
         or request.version != settlement.request_version
         or work_item.version != settlement.work_item_version
-        or request.status not in (("failed",) if recovery else ("running",))
+        or request.status != request_status
         or request.execution_deadline is None
         or work_item.publication_lineage_id is None
     ):
@@ -1197,7 +1210,7 @@ async def load_ci_facts(
             or base_transition.id != subject.id
             or base_transition.version != subject.version
             or (
-                not recovery
+                request_status == "running"
                 and not await session.scalar(
                     select(lifecycle.ready_base_transition_exists(request.id))
                 )
@@ -1256,6 +1269,7 @@ async def inspect_ci(
     now: datetime,
     *,
     may_observe: Callable[[], bool],
+    require_complete_evidence: bool = False,
 ) -> tuple[Verdict | None, CiView | None, datetime | None, MetadataCiPolicy | None, datetime]:
     """Read current CI policy and evidence without execution or publication effects."""
 
@@ -1398,6 +1412,7 @@ async def inspect_ci(
                 fresh_after=fresh_after,
                 delegated_checks=delegated_checks,
                 host_required_checks=host_required,
+                require_complete_evidence=require_complete_evidence,
             )
             if subject.kind == "base_transition" and verdict.kind == "no_ci":
                 verdict = Verdict(
@@ -1434,6 +1449,11 @@ async def gate(
 
     async with sessionmaker() as session:
         facts = await load_ci_facts(session, settlement)
+        maintenance = await session.scalar(
+            select(FactoryMaintenanceAdmission).where(
+                FactoryMaintenanceAdmission.repair_request_id == settlement.request_id
+            )
+        )
         now = await lifecycle.database_now(session)
         # Keep the loaded snapshots; nothing is locked or written here.
         session.expunge_all()
@@ -1498,6 +1518,7 @@ async def gate(
         return "waiting"
     if (
         verdict.kind == "failing"
+        and maintenance is None
         and capabilities.rerun
         and view is not None
         and view.reason is None
@@ -1527,7 +1548,22 @@ async def gate(
             )
     next_poll.pop(request.id, None)
     pr_url = lineage.pr_url
-    if verdict.kind == "failing" and round_ < CI_MAX_ROUNDS:
+    positive = (
+        view is not None
+        and view.pull_head_sha == subject.head_sha
+        and view.closed_unmerged is False
+        and any(
+            check.state is CheckState.SUCCESS and check.head_sha == subject.head_sha
+            for check in view.checks
+        )
+    )
+    if (
+        maintenance is not None
+        and verdict.kind in ("green", "no_ci")
+        and (not positive or subject.head_sha == maintenance.head_sha or verdict.kind == "no_ci")
+    ):
+        verdict = Verdict(kind="unverified", reason="repair_head_unverified")
+    if verdict.kind == "failing" and maintenance is None and round_ < CI_MAX_ROUNDS:
         assert view is not None
         if fresh_after is not None:
             assert metadata_ci is not None
@@ -1577,6 +1613,16 @@ async def gate(
             status=status,
             cause=cause,
             detail=text,
+            verified_ci=(
+                "green"
+                if verdict.kind == "green" and positive
+                else "no_ci"
+                if verdict.kind == "no_ci"
+                and view is not None
+                and view.pull_head_sha == subject.head_sha
+                and view.closed_unmerged is False
+                else None
+            ),
         )
     return "settled" if isinstance(result, lifecycle.WorkItemOutcome) else "waiting"
 
