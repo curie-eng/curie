@@ -1267,7 +1267,7 @@ def build(
         approval_reference_reader=approval_client,
         remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
         remediation_receipts=_build_remediation_receipts(config, engine, sink),
-        factory_slack_progress=_build_factory_slack_progress(config, engine, sink),
+        factory_slack_progress=_build_factory_slack_progress(config, engine, sink, eval_http),
         factory_credit=FactoryCreditLoop(engine, config),
         provider_probe=ProviderProbeLoop(engine, config, async_redis),
         stream_retention=build_stream_retention(config, async_redis),
@@ -1800,7 +1800,7 @@ def _build_factory_steering(
 
 
 def _build_factory_slack_progress(
-    config: WorkerConfig, engine: AsyncEngine, sink: ReplySinkRouter
+    config: WorkerConfig, engine: AsyncEngine, sink: ReplySinkRouter, client: httpx.AsyncClient
 ) -> FactorySlackProgressLoop | None:
     """The factory Slack progress loop (#5414), behind the factory Slack progress switch.
 
@@ -1809,12 +1809,41 @@ def _build_factory_slack_progress(
 
     if not config.factory_slack_progress_enabled:
         return None
+
+    async def publication(work_item_id: uuid.UUID) -> str:
+        if not config.internal_worker_token:
+            return ""
+        try:
+            response = await client.get(
+                f"{config.api_base_url.rstrip('/')}/v1/internal/factory-slack/publication/{work_item_id}",
+                headers={"X-Curie-Worker-Token": config.internal_worker_token},
+                follow_redirects=False,
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            facts = response.json()
+        except (httpx.HTTPError, ValueError):
+            return ""
+        if not isinstance(facts, dict) or not facts.get("url"):
+            return ""
+        line = f"PR #{facts['number']} {facts['url']}"
+        if facts.get("checks") in {"pending", "success", "failure", "none"}:
+            line += f" (checks: {facts['checks']} on {facts['head_sha'][:12]})"
+        return line
+
     return FactorySlackProgressLoop(
         store=PostgresFactorySlackStore(
             engine,
             schema=config.db_schema,
             lease_owner=config.consumer_name,
             console_origin=config.console_origin,
+        ),
+        public_store=PostgresFactorySlackStore(
+            engine,
+            schema=config.db_schema,
+            lease_owner=config.consumer_name,
+            public_role=True,
+            publication=publication,
         ),
         replies=ObservedReplySink(sink),
         interval_seconds=config.factory_slack_interval_s,

@@ -194,6 +194,7 @@ class FakeSlack:
     def __init__(self) -> None:
         self.calls: list[SlackCall] = []
         self.base_url = ""
+        self.public_channels: set[str] = set()
         self._failures: list[tuple[str, str | None, str]] = []
         self._lock = threading.Lock()
         self._ts = itertools.count(1)
@@ -256,6 +257,18 @@ class FakeSlack:
         return web.json_response(response)
 
     def _answer(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "auth.test":
+            # https://docs.slack.dev/reference/methods/auth.test/
+            return {"ok": True, "team_id": TEAM, "bot_id": FACTORY_BOT_ID}
+        if method == "conversations.info":
+            # https://docs.slack.dev/reference/objects/conversation-object/
+            channel = params["channel"]
+            return {"ok": True, "channel": {
+                "id": channel, "context_team_id": TEAM, "is_channel": True,
+                "is_private": channel not in self.public_channels, "is_group": False,
+                "is_im": False, "is_mpim": False, "is_shared": False, "is_ext_shared": False,
+                "is_org_shared": False, "is_pending_ext_shared": False, "is_archived": False,
+            }}
         if method == "chat.postMessage":
             ts = self.mint_ts()
             return {
@@ -917,7 +930,9 @@ def _stack_base(
         global _DB
         _DB = _SharedDb(client.portal, client.portal.call(_shared_engine))
         owned.callback(_release_db)
-        external = httpx.AsyncClient(transport=github)
+        external = httpx.AsyncClient(
+            transport=github, mounts={"http://127.0.0.1": httpx.AsyncHTTPTransport()}
+        )
         owned.callback(client.portal.call, external.aclose)
         client.app.state.http_client = external
         slack = FakeSlack()
@@ -1619,14 +1634,15 @@ async def _switched_progress_pass(
         )
         sink = build_reply_sink(config)
         try:
-            loop = _build_factory_slack_progress(config, worker.engine, sink)
-            if loop is None:
-                return False
-            await loop.run_pass()
-            for _ in range(100):
-                if not await loop.deliver_once():
-                    break
-            return True
+            async with httpx.AsyncClient() as http:
+                loop = _build_factory_slack_progress(config, worker.engine, sink, http)
+                if loop is None:
+                    return False
+                await loop.run_pass()
+                for _ in range(100):
+                    if not await loop.deliver_once():
+                        break
+                return True
         finally:
             await sink.aclose()
 
@@ -2078,6 +2094,8 @@ class GitHubTruth(GitHubAPI):
 
     def __init__(self) -> None:
         super().__init__()
+        self.public_repository = False
+        self.check_conclusion: str | None = None
         self.accounts: dict[int, Account] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
         self.paths: list[str] = []
@@ -2117,6 +2135,23 @@ class GitHubTruth(GitHubAPI):
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         self.paths.append(path)
+        if path == f"/repositories/{REPO_ID}" and request.method == "GET":
+            # https://docs.github.com/en/rest/repos/repos#get-a-repository
+            payload = super().handle(request).json()
+            payload.update(private=not self.public_repository,
+                           visibility="public" if self.public_repository else "private")
+            return httpx.Response(200, json=payload)
+        if path == f"/repos/{REPO}/commits/{HEAD}/check-runs":
+            # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+            check = {"id": 11, "name": "unit", "head_sha": HEAD, "app": {"id": 1},
+                     "status": "completed" if self.check_conclusion else "in_progress",
+                     "conclusion": self.check_conclusion}
+            return httpx.Response(200, json={"total_count": 1, "check_runs": [check]})
+        if path == f"/repos/{REPO}/commits/{HEAD}/status":
+            # https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
+            return httpx.Response(
+                200, json={"sha": HEAD, "state": "pending", "statuses": [], "total_count": 0}
+            )
         if request.method == "GET" and path.startswith("/user/"):
             account = self.accounts.get(int(path.removeprefix("/user/")))
             if account is None:
@@ -2995,6 +3030,7 @@ class SteeringStack(Stack):
         text_: str,
         *,
         thread_ts: str,
+        channel: str = CHANNEL,
         team: str = TEAM,
         bot_id: str | None = None,
         event_id: str | None = None,
@@ -3015,7 +3051,7 @@ class SteeringStack(Stack):
         message_ts = message_ts or f"1800000500.{next(self._ts):06d}"
         event: dict[str, Any] = {
             "type": "app_mention",
-            "channel": CHANNEL,
+            "channel": channel,
             "text": text_ if raw else f"<@{FACTORY_BOT_USER}> {text_}",
             "ts": message_ts,
             "thread_ts": thread_ts,
@@ -3376,7 +3412,7 @@ def _set_mapping_readable(stack: SteeringStack, readable: bool) -> None:
     schema = get_settings().db_schema
     verb = "GRANT SELECT ON" if readable else "REVOKE SELECT ON"
     preposition = "TO" if readable else "FROM"
-    _rows(f'{verb} "{schema}".factory_slack_threads {preposition} "{stack.role}"')
+    _rows(f'{verb} "{schema}".factory_slack_mapped_roots {preposition} "{stack.role}"')
 
 
 @contextlib.contextmanager

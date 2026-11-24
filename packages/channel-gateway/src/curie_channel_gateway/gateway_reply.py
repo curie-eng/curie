@@ -27,6 +27,7 @@ from .tls import gateway_verify
 class GatewayReplyRoute:
     endpoint: str | None = None
     adapter: str | None = None
+    factory_public: bool = False
 
 
 class GatewayReplySink:
@@ -61,7 +62,8 @@ class GatewayReplySink:
         self, event: ReplyEvent, *, route: ReplyRoute, best_effort_unreachable: bool = False
     ) -> ReplyAck:
         identity = quote(route.adapter or "default", safe="")
-        url = f"{self._endpoint}/v1/gateway/{identity}/reply"
+        operation = "public_reply" if getattr(route, "factory_public", False) else "reply"
+        url = f"{self._endpoint}/v1/gateway/{identity}/{operation}"
         wire = event.model_dump_json().encode()
         if len(wire) > 4 * 1024 * 1024:
             raise ReplyPayloadTooLargeError("reply_payload_too_large")

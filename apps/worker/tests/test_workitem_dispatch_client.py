@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import logging
 import uuid
@@ -240,6 +241,34 @@ def test_acquire_sends_wake_and_initial_authority_explicitly() -> None:
     assert granted.context == CONTEXT  # type: ignore[attr-defined]
     assert granted.agent_id == AGENT_ID  # type: ignore[attr-defined]
     assert granted.wait_deadline == datetime(2026, 9, 23, 2, tzinfo=UTC)  # type: ignore[attr-defined]
+
+
+def test_only_matching_execute_delivery_attests_to_its_received_text() -> None:
+    from channel_protocol.work_item_events import ci_event_id, execute_event_id
+
+    received = "Preserve this line exactly.\n\tRésumé "
+    observed = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(json.loads(request.content).get("input_sha256"))
+        return httpx.Response(200, json=BASE)
+
+    async def acquire_for_delivery(client: WorkItemDispatchClient) -> None:
+        async def acquire_once(request_id: uuid.UUID, generation: int) -> None:
+            await client.acquire(
+                request_id, owner="reader", generation=generation, wake=WAKE, context=None
+            )
+
+        with workitem_dispatch.received_execution_input(execute_event_id(REQUEST_ID, 4), received):
+            await acquire_once(REQUEST_ID, 4)
+            await acquire_once(REQUEST_ID, 3)
+            await acquire_once(uuid.uuid4(), 4)
+        with workitem_dispatch.received_execution_input(ci_event_id(REQUEST_ID, 2), received):
+            await acquire_once(REQUEST_ID, 2)
+        await acquire_once(REQUEST_ID, 4)
+
+    _run(handler, acquire_for_delivery)
+    assert observed == [hashlib.sha256(received.encode()).hexdigest(), None, None, None, None]
 
 
 def _running_body() -> dict[str, object]:

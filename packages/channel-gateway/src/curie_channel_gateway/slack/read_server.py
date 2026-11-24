@@ -132,6 +132,7 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
             },
             files={name: SlackFileClient(token=token) for name, token in tokens.items() if token},
             providers=GatewayProviders(
+                public_channel=sink.verify_public_channel,
                 channel=SlackChannelReader(http, tokens),
                 canvas=SlackCanvasReader(http, tokens),
                 senders=SlackSenderIdentities(tokens, base_url=config.slack_api_base_url or None),

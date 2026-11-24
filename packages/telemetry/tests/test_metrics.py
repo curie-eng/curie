@@ -53,6 +53,7 @@ _RECONCILER_STEPS = [
     "settle_overdue_cancellations",
     "redrive_question_rounds",
     "readmit_pending",
+    "redrive_steering",
     "drain_answer_retries",
     "reconcile_missed_labels",
     "poll_trackers",
@@ -797,7 +798,7 @@ def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
     assert definition["cardinality_bound"] == 16
 
 
-def test_reconciler_step_metrics_declare_only_the_api_and_fifteen_steps() -> None:
+def test_reconciler_step_metrics_declare_only_the_api_and_known_steps() -> None:
     manifest = _read(_MANIFEST)["metrics"]
     for name, instrument_type, monotonic in (
         (_RECONCILER_FAILURE_METRIC, "counter", True),

@@ -59,6 +59,18 @@
             "title": "Generation",
             "type": "integer"
           },
+          "input_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Sha256"
+          },
           "owner": {
             "minLength": 1,
             "title": "Owner",
@@ -1435,6 +1447,17 @@
             ],
             "title": "Execution Deadline Seconds"
           },
+          "factory_public_slack_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Public Slack Channel"
+          },
           "factory_slack_channel": {
             "anyOf": [
               {
@@ -1750,6 +1773,18 @@
               }
             ],
             "title": "Execution Deadline Seconds"
+          },
+          "factory_public_slack_channel": {
+            "anyOf": [
+              {
+                "pattern": "^[CG][A-Z0-9]{6,}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Public Slack Channel"
           },
           "factory_slack_channel": {
             "anyOf": [
@@ -10333,6 +10368,13 @@
           "outcome": {
             "enum": [
               "admitted",
+              "queued",
+              "applied",
+              "source_changed",
+              "target_mismatch",
+              "guidance_queue_full",
+              "guidance_expired",
+              "invalid_text",
               "not_mapped",
               "receipt_mismatch",
               "sender_unverified",
@@ -18891,6 +18933,18 @@
             "minimum": 1.0,
             "title": "Generation",
             "type": "integer"
+          },
+          "input_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Sha256"
           },
           "owner": {
             "minLength": 1,
@@ -37995,9 +38049,79 @@
         ]
       }
     },
+    "/v1/internal/factory-slack/publication/{work_item_id}": {
+      "get": {
+        "operationId": "get_public_publication_v1_internal_factory_slack_publication__work_item_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "title": "Response Get Public Publication V1 Internal Factory Slack Publication  Work Item Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Public Publication",
+        "tags": [
+          "internal-factory-slack"
+        ]
+      }
+    },
     "/v1/internal/factory-slack/steer": {
       "post": {
-        "description": "Admit a revision of the run's pull request, or name why not.\n\nEvery refusal is final for the delivery and answers 200. A code host that\ncannot answer now is 503, so the worker keeps the delivery pending. A\ndatabase failure is 503 too, raised without its exception chain: the\ndriver's error carries the bound objective, which holds the Slack body.",
+        "description": "Queue authorized guidance for an implementation or its published pull request.\n\nEvery refusal is final for the delivery and answers 200. A code host that\ncannot answer now is 503, so the worker keeps the delivery pending. A\ndatabase failure is 503 too, raised without its exception chain: the\ndriver's error carries the bound objective, which holds the Slack body.",
         "operationId": "steer_factory_run_v1_internal_factory_slack_steer_post",
         "parameters": [
           {

@@ -1311,6 +1311,7 @@
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
         {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."},
+        {"field": "factory_public_slack_channel", "why": "The public run channel belongs to factory-progress."},
         {"field": "factory_slack_channel", "why": "The factory Slack progress channel has its own operator command, factory-progress."},
         {"field": "connector_requester_identity", "why": "The connector requester identity flag belongs to approvals --requester-identity."},
         {"field": "connector_requester_identity_version", "why": "The connector requester identity flag belongs to approvals --requester-identity."}
@@ -1417,6 +1418,10 @@
         {
           "field": "publication_branch_prefix",
           "why": "Publication policy has its own verb. Emitting it from overrides would imply that verb can change it."
+        },
+        {
+          "field": "factory_public_slack_channel",
+          "why": "The public run channel belongs to factory-progress."
         },
         {
           "field": "factory_slack_channel",

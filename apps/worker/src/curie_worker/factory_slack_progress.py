@@ -104,7 +104,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -118,7 +118,7 @@ from channel_protocol.reply import (
     ReplyTarget,
     ReplyUpdate,
 )
-from curie_channel_gateway.reply_errors import InvalidReplyTargetError
+from curie_channel_gateway.reply_errors import InvalidReplyTargetError, reply_error_response
 from curie_internal.factory_cause import PERSONAL_RESUME_STEPS
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
@@ -129,9 +129,11 @@ from .factory_slack_card import (
     CardRequest,
     CardSubject,
     card_reports,
+    mention,
     needs_person_text,
     ready_text,
     render_card,
+    render_public_card,
     starting_text,
 )
 from .reply_sink import ReplySink, TargetRoute
@@ -143,6 +145,10 @@ _SLACK_KIND: Final = "slack"
 _TEXT_MAX: Final = 2000
 _ERROR_MAX: Final = 2000
 _PERMANENT_ERRORS: Final = (InvalidReplyTargetError,)
+_STEERING_AT_SOURCE: Final = """
+    (g.source_identity, g.source_channel, g.source_root_ts) =
+    (t.channel_identity, t.channel, t.root_ts)
+"""
 
 
 class FactorySlackProgressError(RuntimeError):
@@ -561,6 +567,8 @@ class PostgresFactorySlackStore:
         backoff_max_seconds: float = 300.0,
         card_edit_spacing_seconds: float = 30.0,
         console_origin: str = "",
+        public_role: bool = False,
+        publication: Callable[[uuid.UUID], Awaitable[str]] | None = None,
     ) -> None:
         if not _SAFE_SCHEMA.fullmatch(schema):
             raise ValueError("factory Slack progress database schema is invalid")
@@ -582,11 +590,56 @@ class PostgresFactorySlackStore:
         self._lineages = f'"{schema}".thread_publication_lineages'
         self._publications = f'"{schema}".publications'
         self._maintenance_events = f'"{schema}".factory_maintenance_events'
-        self._threads = f'"{schema}".factory_slack_threads'
-        self._posts = f'"{schema}".factory_slack_posts'
+        self.public_role = public_role
+        self.publication = publication
+        self._reserve_public_root = f'"{schema}".reserve_factory_slack_public_root'
+        self._origin_posts = f'"{schema}".factory_slack_posts'
+        self._public_threads = f'"{schema}".factory_slack_public_threads'
+        self._origin_threads = f'"{schema}".factory_slack_threads'
+        self._ledger = f'"{schema}".factory_steering_ledger'
+        self._threads = self._public_threads if public_role else self._origin_threads
+        post_table = "factory_slack_public_posts" if public_role else "factory_slack_posts"
+        self._posts = f'"{schema}".{post_table}'
+        self._role_eligible = (
+            "true"
+            if public_role
+            else f"""
+            NOT EXISTS (SELECT 1 FROM {self._agents} mode WHERE mode.id = t.agent_id
+                         AND mode.factory_public_slack_channel = t.channel)
+            AND NOT EXISTS (SELECT 1 FROM {self._public_threads} d
+                         WHERE (d.work_item_id, d.channel_identity, d.channel) =
+                               (t.work_item_id, t.channel_identity, t.channel))
+        """
+        )
+        self._live_thread = (
+            "a.factory_public_slack_channel IS NOT NULL"
+            if public_role
+            else "(t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL)"
+        )
+        delivery_enabled = (
+            f"""({self._live_thread} OR (
+                {{post}}.kind IN ('steering_applied', 'steering_refused') AND EXISTS (
+                    SELECT 1 FROM {self._ledger} g
+                     WHERE g.work_item_id = t.work_item_id AND {_STEERING_AT_SOURCE}
+                       AND {{post}}.kind = 'steering_' || g.state
+                       AND {{post}}.post_key = {{post}}.kind || ':' || g.steering_id)))"""
+            if public_role
+            else self._live_thread
+        )
+        self._post_delivery_enabled = delivery_enabled.format(post="p")
+        self._earlier_post_delivery_enabled = delivery_enabled.format(post="e")
+        self._delivered_kinds = (
+            _DELIVERED_KINDS_SQL + ", 'steering_queued', 'steering_applied', 'steering_refused'"
+        )
         self._notices = f'"{schema}".factory_terminal_notices'
         self._intake = f'"{schema}".factory_intake_notices'
-        self._refusals = f'"{schema}".factory_slack_refusal_posts'
+        refusal_table = (
+            "factory_slack_public_refusal_posts" if public_role else "factory_slack_refusal_posts"
+        )
+        self._refusals = f'"{schema}".{refusal_table}'
+        self._channel_setting = (
+            "factory_public_slack_channel" if public_role else "factory_slack_channel"
+        )
         self._grants = f'"{schema}".factory_grant_notices'
         self._enrollments = f'"{schema}".personal_claude_enrollments'
         self._identities = f'"{schema}".channel_identities'
@@ -712,6 +765,240 @@ class PostgresFactorySlackStore:
             """
         )
 
+    async def _adopt_public_kickoffs(self) -> None:
+        # Settings changes and earlier API versions can leave a live kickoff without a reservation.
+        # Capture only the physical kickoff at this binding. Other audiences wait for a new request.
+        async with self._engine.begin() as connection:
+            candidates = (
+                await connection.execute(
+                    text(f"""
+                SELECT w.id, COALESCE(q.live_from, q.latest, t.first_sequence) AS first_sequence
+                  FROM {self._agents} a
+                  JOIN {self._origin_threads} t ON t.agent_id = a.id
+                  JOIN {self._work_items} w ON w.id = t.work_item_id
+                  LEFT JOIN {self._public_threads} p ON p.work_item_id = w.id
+                  CROSS JOIN LATERAL (
+                      SELECT min(r.sequence) FILTER (WHERE r.terminal_at IS NULL
+                                  OR r.terminal_at >= a.factory_slack_since) AS live_from,
+                             max(r.sequence) AS latest
+                        FROM {self._requests} r
+                       WHERE r.work_item_id = w.id AND r.sequence >= t.first_sequence
+                  ) q
+                 WHERE a.factory_public_slack_channel IS NOT NULL
+                   AND t.origin = 'kickoff' AND t.root_ts IS NOT NULL
+                   AND (p.work_item_id IS NOT NULL OR t.channel = a.factory_public_slack_channel)
+                   AND {self._bound_thread}
+                   AND (p.work_item_id IS NULL OR (p.channel_identity, p.channel, p.root_ts)
+                       = (t.channel_identity, t.channel, t.root_ts))
+                   AND ((p.work_item_id IS NULL AND q.live_from IS NOT NULL) OR EXISTS (
+                       SELECT 1 FROM {self._origin_posts} old
+                        WHERE old.work_item_id = w.id AND old.posted_at IS NULL
+                          AND old.kind IN ({self._delivered_kinds})
+                          AND (old.failed_at IS NULL OR old.last_error = 'transferred_to_public')
+                          AND NOT EXISTS (SELECT 1 FROM {self._posts} mirrored
+                               WHERE mirrored.work_item_id = w.id
+                                 AND mirrored.post_key = old.post_key)
+                   ))
+                 ORDER BY w.id LIMIT 16 FOR UPDATE OF w SKIP LOCKED
+            """)
+                )
+            ).all()
+            for item, sequence in candidates:
+                await connection.execute(
+                    text(f"SELECT {self._reserve_public_root}(:id, :seq, true)"),
+                    {"id": item, "seq": sequence},
+                )
+
+    async def _public_events(self, connection: AsyncConnection) -> None:
+        await connection.execute(
+            text(f"""
+            INSERT INTO {self._posts}
+                     (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
+            SELECT t.work_item_id, 'root', 'root', 0, 0, 0, '{{}}'::jsonb
+              FROM {self._threads} t JOIN {self._agents} a ON a.id = t.agent_id
+             WHERE t.root_ts IS NULL AND a.factory_public_slack_channel IS NOT NULL
+               AND EXISTS (SELECT 1 FROM {self._requests} q WHERE q.work_item_id = t.work_item_id
+                            AND q.sequence >= t.first_sequence
+                            AND (q.created_at >= a.factory_slack_since OR q.terminal_at IS NULL
+                                 OR q.terminal_at >= a.factory_slack_since))
+            ON CONFLICT (work_item_id, post_key) DO NOTHING
+        """)
+        )
+
+    async def _steering_events(self, connection: AsyncConnection) -> None:
+        eligible = (
+            f"({self._live_thread} OR (transition.state <> 'queued' AND {_STEERING_AT_SOURCE}))"
+            if self.public_role
+            else f"({self._live_thread} AND {_STEERING_AT_SOURCE} AND transition.state <> 'queued')"
+        )
+        await connection.execute(
+            text(f"""
+            INSERT INTO {self._posts}
+                     (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
+            SELECT t.work_item_id, 'steering_' || transition.state || ':' || g.steering_id,
+                   'steering_' || transition.state, t.first_sequence,
+                   4, transition.ord, '{{}}'::jsonb
+              FROM {self._threads} t JOIN {self._agents} a ON a.id = t.agent_id
+              JOIN {self._ledger} g ON g.work_item_id = t.work_item_id
+              CROSS JOIN (VALUES ('queued', 0), ('applied', 1), ('refused', 2))
+                    transition(state, ord)
+             WHERE (transition.state = 'queued' OR transition.state = g.state)
+               AND {self._role_eligible} AND {eligible}
+            ON CONFLICT (work_item_id, post_key) DO NOTHING
+        """)
+        )
+
+    @asynccontextmanager
+    async def delivery_guard(self, work: FactorySlackWork) -> AsyncIterator[bool]:
+        # Adoption uses this same lock. A claimed origin payload can outlive its lease.
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(CAST(:id AS text), 194))"),
+                {"id": str(work.work_item_id)},
+            )
+            due = await connection.scalar(
+                text(f"""
+                SELECT EXISTS (
+                    SELECT 1 FROM {self._posts} p
+                      JOIN {self._threads} t USING (work_item_id)
+                      JOIN {self._agents} a ON a.id = t.agent_id
+                     WHERE p.id = :post AND p.lease_owner = :owner AND p.failed_at IS NULL
+                       AND p.posted_at IS NULL AND {self._role_eligible}
+                       AND {self._bound_thread} AND {self._post_delivery_enabled})
+            """),
+                {"post": work.post_id, "owner": self._lease_owner},
+            )
+            yield bool(due)
+
+    async def _publication_text(self, work_item_id: uuid.UUID) -> str:
+        return await self.publication(work_item_id) if self.publication is not None else ""
+
+    async def _render_public_card(
+        self, card: FactorySlackCard
+    ) -> tuple[CardRender, datetime] | None:
+        async with self._engine.connect() as connection:
+            facts = (
+                (
+                    await connection.execute(
+                        text(f"""
+                SELECT q.status, q.terminal_cause, clock_timestamp() AS now,
+                       w.cancelled_at IS NOT NULL AS work_item_cancelled,
+                       (SELECT r.phase FROM {self._reports} r
+                         WHERE r.execution_request_id = q.id ORDER BY r.id DESC LIMIT 1) AS phase,
+                       EXISTS (SELECT 1 FROM {self._publications} b
+                                WHERE b.execution_request_id = q.id
+                                  AND b.status = 'succeeded') AS published
+                  FROM {self._threads} t JOIN {self._work_items} w ON w.id = t.work_item_id
+                 CROSS JOIN LATERAL ({self._shown}) q
+                 WHERE t.work_item_id = :item
+            """),
+                        {"item": card.work_item_id},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        if facts is None:
+            return None
+        publication = await self._publication_text(card.work_item_id) if facts["published"] else ""
+        render = render_public_card(
+            str(card.work_item_id),
+            facts["status"],
+            facts["phase"],
+            publication,
+            terminal_cause=facts["terminal_cause"],
+            work_item_cancelled=facts["work_item_cancelled"],
+        )
+        return render, facts["now"]
+
+    async def post_text(self, work: FactorySlackWork) -> str:
+        if work.kind.startswith("steering_"):
+            if work.kind == "steering_queued":
+                return "Guidance queued for the next eligible execution."
+            async with self._engine.connect() as connection:
+                detail = (
+                    await connection.execute(
+                        text(f"""
+                    SELECT g.applied_request_id, g.refusal_code,
+                           {_STEERING_AT_SOURCE} AS at_source
+                      FROM {self._ledger} g JOIN {self._threads} t USING (work_item_id)
+                     WHERE g.work_item_id = :item AND g.steering_id = :steer
+                """),
+                        {
+                            "item": work.work_item_id,
+                            "steer": uuid.UUID(work.post_key.split(":", 1)[1]),
+                        },
+                    )
+                ).one()
+            if work.kind == "steering_applied":
+                return f"Guidance applied to execution {detail.applied_request_id}."
+            if detail.at_source and (
+                not self.public_role
+                or detail.refusal_code
+                in {
+                    "guidance_expired",
+                    "objective_too_large",
+                    "work_item_cancelled",
+                    "lineage_closed",
+                    "execution_ended",
+                    "no_pull_request",
+                    "authority_changed",
+                    "not_authorized",
+                    "owner_mismatch",
+                    "enrollment_inactive",
+                    "enrollment_generation_mismatch",
+                    "pull_request_not_open",
+                    "pull_request_branch_mismatch",
+                }
+            ):
+                return f"Guidance closed without being applied ({_escaped(detail.refusal_code)})."
+            return "Guidance closed without being applied."
+        if self.public_role and work.kind in {"root", "card"}:
+            return (
+                f"Factory run {work.work_item_id}"
+                if work.kind == "root"
+                else "Factory run starting."
+            )
+        if self.public_role and work.kind == "maintenance":
+            async with self._engine.connect() as connection:
+                result = await connection.execute(
+                    text(f"""
+                        SELECT outcome, reason FROM {self._maintenance_events}
+                         WHERE work_item_id = :item AND id = :event
+                    """),
+                    {"item": work.work_item_id, "event": int(work.post_key.split(":", 1)[1])},
+                )
+                event = result.mappings().one()
+            if event["outcome"] == "green":
+                return "CI checks passed."
+            if event["outcome"] == "no_ci":
+                return "No CI checks applied. Policy permits completion."
+            return _maintenance_text(dict(event))
+        publication = ""
+        if self.public_role and work.kind == "ready":
+            publication = await self._publication_text(work.work_item_id)
+        payload = dict(work.payload)
+        if work.kind in {"ready", "needs_person"}:
+            async with self._engine.connect() as connection:
+                payload["user"] = await connection.scalar(
+                    text(f"""
+                    SELECT {self._mention} FROM {self._threads} t
+                      JOIN {self._work_items} w ON w.id = t.work_item_id
+                      JOIN {self._agents} a ON a.id = t.agent_id
+                     WHERE t.work_item_id = :id
+                """),
+                    {"id": work.work_item_id},
+                )
+        if not self.public_role:
+            return render_post(work.kind, payload)
+        who = mention(_user(payload))
+        sentence = (
+            "The change is ready for review."
+            if work.kind == "ready"
+            else "This run needs a person."
+        )
+        return " ".join(part for part in (who, sentence, publication) if part)
+
     async def materialize(self) -> None:
         """Record every post now owed, once; repeated passes add nothing new."""
 
@@ -753,6 +1040,9 @@ class PostgresFactorySlackStore:
                    AND e.first_sequence IS NOT NULL
                    AND cardinality(b.adapters) = 1
                    AND NOT EXISTS (
+                       SELECT 1 FROM {self._public_threads} d WHERE d.work_item_id = w.id
+                   )
+                   AND NOT EXISTS (
                        SELECT 1 FROM {self._threads} x WHERE x.work_item_id = w.id
                    )
                 ON CONFLICT (work_item_id) DO NOTHING
@@ -781,6 +1071,8 @@ class PostgresFactorySlackStore:
                          AND c.adapter IS NOT NULL
                   ) b
                  WHERE t.origin = 'configured'
+                   AND NOT EXISTS (SELECT 1 FROM {self._public_threads} d
+                                    WHERE d.work_item_id = t.work_item_id)
                    AND t.root_ts IS NULL
                    AND a.factory_slack_channel IS NOT NULL
                    AND a.factory_slack_since IS NOT NULL
@@ -829,6 +1121,8 @@ class PostgresFactorySlackStore:
               LEFT JOIN {self._notices} n ON n.execution_request_id = q.id
              WHERE p.work_item_id = t.work_item_id
                AND p.kind = 'root'
+               AND {self._role_eligible}
+               AND p.failed_at IS NULL
                AND p.posted_at IS NULL
             """
         )
@@ -839,16 +1133,11 @@ class PostgresFactorySlackStore:
                    t.requester_slack_user, t.card_ts, t.agent_id, t.card_upgrade_cutoff
               FROM {self._threads} t
               JOIN {self._agents} a ON a.id = t.agent_id
-             WHERE t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL
+             WHERE {self._live_thread} AND {self._role_eligible}
         """
         # The card's first post, for a thread with no placeholder. Ranked right
         # after the root, so it is the thread's first reply.
-        cards = text(
-            f"""
-            INSERT INTO {self._posts} AS p
-                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
-            SELECT t.work_item_id, 'card', 'card', 0, 0, 1,
-                   jsonb_strip_nulls(jsonb_build_object(
+        card_payload = f"""jsonb_strip_nulls(jsonb_build_object(
                        'issue_id', w.tracker_issue_id,
                        'display_key', w.tracker_display_key,
                        'title', (
@@ -860,7 +1149,24 @@ class PostgresFactorySlackStore:
                             ORDER BY r.sequence DESC
                             LIMIT 1
                        )
-                   ))
+                   ))"""
+        needs_payload = "jsonb_strip_nulls(jsonb_build_object('cause', q.terminal_cause))"
+        ready_payload = (
+            "jsonb_strip_nulls(jsonb_build_object('url', l.pr_url, 'number', l.pr_number))"
+        )
+        maintenance_payload = """jsonb_strip_nulls(jsonb_build_object(
+                       'outcome', e.outcome, 'reason', e.reason,
+                       'head_sha', CASE WHEN e.outcome IN ('green', 'no_ci') THEN e.head_sha END
+                   ))"""
+        if self.public_role:
+            maintenance_payload = "'{}'::jsonb"
+            card_payload = needs_payload = ready_payload = "'{}'::jsonb"
+        cards = text(
+            f"""
+            INSERT INTO {self._posts} AS p
+                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
+            SELECT t.work_item_id, 'card', 'card', 0, 0, 1,
+                   {card_payload}
               FROM ({live_threads}) t
               JOIN {self._work_items} w ON w.id = t.work_item_id
               CROSS JOIN LATERAL ({self._shown}) q
@@ -877,10 +1183,7 @@ class PostgresFactorySlackStore:
             INSERT INTO {self._posts} AS p
                    (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
             SELECT t.work_item_id, 'needs_person:' || q.id, 'needs_person', q.sequence, 3, 0,
-                   jsonb_strip_nulls(jsonb_build_object(
-                       'cause', q.terminal_cause,
-                       'user', {self._mention}
-                   ))
+                   {needs_payload}
               FROM ({live_threads}) t
               JOIN {self._agents} a ON a.id = t.agent_id
               JOIN {self._work_items} w ON w.id = t.work_item_id
@@ -910,11 +1213,7 @@ class PostgresFactorySlackStore:
             INSERT INTO {self._posts} AS p
                    (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
             SELECT t.work_item_id, 'ready:' || q.id, 'ready', q.sequence, 2, 0,
-                   jsonb_strip_nulls(jsonb_build_object(
-                       'url', l.pr_url,
-                       'number', l.pr_number,
-                       'user', {self._mention}
-                   ))
+                   {ready_payload}
               FROM ({live_threads}) t
               JOIN {self._agents} a ON a.id = t.agent_id
               JOIN {self._work_items} w ON w.id = t.work_item_id
@@ -947,10 +1246,7 @@ class PostgresFactorySlackStore:
                    (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
             SELECT t.work_item_id, 'maintenance:' || e.id, 'maintenance',
                    max(q.sequence) OVER (PARTITION BY t.work_item_id ORDER BY e.id), 4, e.id,
-                   jsonb_strip_nulls(jsonb_build_object(
-                       'outcome', e.outcome, 'reason', e.reason,
-                       'head_sha', CASE WHEN e.outcome IN ('green', 'no_ci') THEN e.head_sha END
-                   ))
+                   {maintenance_payload}
               FROM ({live_threads}) t
               JOIN {self._maintenance_events} e ON e.work_item_id = t.work_item_id
               JOIN {self._requests} q
@@ -959,18 +1255,21 @@ class PostgresFactorySlackStore:
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
-        refusals = text(
-            f"""
-            INSERT INTO {self._refusals} AS r
-                   (notice_id, channel_identity, channel, payload)
-            SELECT n.id, b.adapters[1], a.factory_slack_channel,
-                   jsonb_strip_nulls(jsonb_build_object(
+        refusal_payload = """jsonb_strip_nulls(jsonb_build_object(
                        'repository_path', n.repository_path,
                        'issue_id', n.tracker_issue_id,
                        'issue_url', NULLIF(split_part(n.issue_url, '#', 1), ''),
                        'reason', n.reason,
                        'actor_login', n.actor_login
-                   ))
+                   ))"""
+        if self.public_role:
+            refusal_payload = "'{}'::jsonb"
+        refusals = text(
+            f"""
+            INSERT INTO {self._refusals} AS r
+                   (notice_id, channel_identity, channel, payload)
+            SELECT n.id, b.adapters[1], a.{self._channel_setting},
+                   {refusal_payload}
               FROM {self._intake} n
               JOIN {self._agents} a ON a.id = n.agent_id
               CROSS JOIN LATERAL (
@@ -978,26 +1277,35 @@ class PostgresFactorySlackStore:
                     FROM {self._channels} c
                    WHERE c.agent_id = a.id
                      AND c.kind = 'slack'
-                     AND c.address = a.factory_slack_channel
+                     AND c.address = a.{self._channel_setting}
                      AND c.adapter IS NOT NULL
               ) b
              WHERE n.reason IN ({_REFUSAL_REASON_SQL})
-               AND a.factory_slack_channel IS NOT NULL
+               AND a.{self._channel_setting} IS NOT NULL
                AND a.factory_slack_since IS NOT NULL
                AND n.observed_at >= a.factory_slack_since
                AND cardinality(b.adapters) = 1
             ON CONFLICT (notice_id) DO NOTHING
             """
         )
+        if self.public_role:
+            await self._adopt_public_kickoffs()
         async with self._engine.begin() as connection:
-            await connection.execute(discover)
-            await connection.execute(refresh_roots)
+            if self.public_role:
+                await self._public_events(connection)
+            else:
+                await connection.execute(discover)
+                await connection.execute(refresh_roots)
+            await self._steering_events(connection)
             await connection.execute(cards)
             await connection.execute(needs_person)
             await connection.execute(ready)
             await connection.execute(maintenance)
             await connection.execute(refusals)
-            await connection.execute(self._grant_notices(), {"reconnect_url": self._reconnect_url})
+            if not self.public_role:
+                await connection.execute(
+                    self._grant_notices(), {"reconnect_url": self._reconnect_url}
+                )
 
     async def claim_next(self) -> FactorySlackWork | None:
         """Lease the next deliverable post, or None when nothing is due."""
@@ -1009,13 +1317,13 @@ class PostgresFactorySlackStore:
               FROM {self._posts} p
               JOIN {self._threads} t ON t.work_item_id = p.work_item_id
               JOIN {self._agents} a ON a.id = t.agent_id
-             WHERE (t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL)
+             WHERE {self._post_delivery_enabled} AND {self._role_eligible}
                AND p.posted_at IS NULL
                AND p.failed_at IS NULL
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
                AND (p.not_before IS NULL OR p.not_before <= now())
                AND (p.kind = 'root' OR t.root_ts IS NOT NULL)
-               AND p.kind IN ({_DELIVERED_KINDS_SQL})
+               AND p.kind IN ({self._delivered_kinds})
                AND {self._bound_thread}
                AND NOT EXISTS (
                    SELECT 1
@@ -1023,7 +1331,8 @@ class PostgresFactorySlackStore:
                     WHERE e.work_item_id = p.work_item_id
                       AND e.posted_at IS NULL
                       AND e.failed_at IS NULL
-                      AND e.kind IN ({_DELIVERED_KINDS_SQL})
+                      AND e.kind IN ({self._delivered_kinds})
+                      AND {self._earlier_post_delivery_enabled}
                       AND (e.sequence, e.rank, e.ordinal, e.id)
                           < (p.sequence, p.rank, p.ordinal, p.id)
                )
@@ -1094,6 +1403,26 @@ class PostgresFactorySlackStore:
             ).scalar_one_or_none()
             if updated is None:
                 raise FactorySlackProgressError("factory Slack post acknowledgement was lost")
+            if self.public_role and work.kind in ("steering_applied", "steering_refused"):
+                # A cleared destination can settle its own guidance before its queued notice.
+                await connection.execute(
+                    text(f"""
+                    INSERT INTO {self._posts} AS q
+                           (work_item_id, post_key, kind, sequence, rank, ordinal, payload,
+                            failed_at, last_error)
+                    SELECT work_item_id, :queued_key, 'steering_queued', sequence, rank, 0,
+                           '{{}}'::jsonb, now(), 'superseded_by_settlement'
+                      FROM {self._posts} WHERE id = :id
+                    ON CONFLICT (work_item_id, post_key) DO UPDATE
+                       SET failed_at = EXCLUDED.failed_at, last_error = EXCLUDED.last_error,
+                           lease_owner = NULL, lease_expires_at = NULL
+                     WHERE q.posted_at IS NULL AND q.failed_at IS NULL
+                """),
+                    {
+                        "id": work.post_id,
+                        "queued_key": "steering_queued:" + work.post_key.split(":", 1)[1],
+                    },
+                )
             if work.kind in ("root", "card"):
                 column = "root_ts" if work.kind == "root" else "card_ts"
                 await connection.execute(
@@ -1122,7 +1451,7 @@ class PostgresFactorySlackStore:
               FROM {self._threads} t
               JOIN {self._agents} a ON a.id = t.agent_id
               CROSS JOIN LATERAL ({self._shown}) q
-             WHERE (t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL)
+             WHERE {self._live_thread} AND {self._role_eligible}
                AND NOT (t.work_item_id = ANY(:excluded))
                AND t.card_ts IS NOT NULL
                AND t.root_ts IS NOT NULL
@@ -1141,6 +1470,7 @@ class PostgresFactorySlackStore:
                               AND t.card_edited_at < w.cancelled_at
                        )
                    )
+                   OR (:public_role AND t.card_edited_at <= now() - CAST(:spacing AS interval))
                )
                AND (
                    t.card_edited_at IS NULL
@@ -1163,7 +1493,12 @@ class PostgresFactorySlackStore:
             row = (
                 (
                     await connection.execute(
-                        due, {"spacing": self._card_spacing, "excluded": list(excluded)}
+                        due,
+                        {
+                            "spacing": self._card_spacing,
+                            "excluded": list(excluded),
+                            "public_role": self.public_role,
+                        },
                     )
                 )
                 .mappings()
@@ -1214,6 +1549,9 @@ class PostgresFactorySlackStore:
 
     async def render(self, card: FactorySlackCard) -> tuple[CardRender, datetime] | None:
         """The card's render from current records, and the database time it was read at."""
+
+        if self.public_role:
+            return await self._render_public_card(card)
 
         facts = text(
             f"""
@@ -1432,7 +1770,7 @@ class PostgresFactorySlackStore:
               FROM {self._refusals} r
               JOIN {self._intake} n ON n.id = r.notice_id
               JOIN {self._agents} a ON a.id = n.agent_id
-             WHERE a.factory_slack_channel IS NOT NULL
+             WHERE a.{self._channel_setting} IS NOT NULL
                AND r.posted_at IS NULL
                AND r.failed_at IS NULL
                AND (r.lease_expires_at IS NULL OR r.lease_expires_at < now())
@@ -1803,6 +2141,7 @@ class FactorySlackProgressLoop:
         replies: ReplySink,
         interval_seconds: float = 2.0,
         batch_limit: int = 16,
+        public_store: PostgresFactorySlackStore | None = None,
     ) -> None:
         if interval_seconds <= 0 or batch_limit <= 0:
             raise ValueError("factory Slack progress interval and batch limit must be positive")
@@ -1810,6 +2149,11 @@ class FactorySlackProgressLoop:
         self._replies = replies
         self._interval = interval_seconds
         self._batch_limit = batch_limit
+        self._public_loop = (
+            FactorySlackProgressLoop(store=public_store, replies=replies, batch_limit=batch_limit)
+            if public_store is not None
+            else None
+        )
 
     async def _emit(
         self,
@@ -1821,6 +2165,7 @@ class FactorySlackProgressLoop:
         conversation_id: str | None,
         links: Sequence[MessageLink] = (),
         plan_url: str | None = None,
+        public: bool = False,
     ) -> str | None:
         composed = list(links)
         if plan_url:
@@ -1843,7 +2188,7 @@ class FactorySlackProgressLoop:
                 requested_by="",
                 delivery_id=delivery_id,
             ),
-            route=TargetRoute(adapter=identity),
+            route=TargetRoute(adapter=identity, factory_public=public),
             best_effort_unreachable=False,
         )
         return ack.ref
@@ -1859,10 +2204,12 @@ class FactorySlackProgressLoop:
 
         work = await self._store.claim_next()
         if work is not None:
-            return await self._deliver_work(work)
-        grant = await self._store.claim_grant_notice()
-        if grant is not None:
-            return await self._deliver_grant(grant)
+            async with self._store.delivery_guard(work) as due:
+                return await self._deliver_work(work) if due else False
+        if not self._store.public_role:
+            grant = await self._store.claim_grant_notice()
+            if grant is not None:
+                return await self._deliver_grant(grant)
         refusal = await self._store.claim_refusal()
         if refusal is None:
             return None
@@ -1871,8 +2218,12 @@ class FactorySlackProgressLoop:
     async def _deliver_work(self, work: FactorySlackWork) -> bool:
         try:
             ref = await self._emit(
-                text_value=render_post(work.kind, work.payload),
-                delivery_id=delivery_id_for(work.work_item_id, work.post_key),
+                text_value=await self._store.post_text(work),
+                delivery_id=delivery_id_for(
+                    work.work_item_id,
+                    f"public/{work.post_key}" if self._store.public_role else work.post_key,
+                ),
+                public=self._store.public_role,
                 channel=work.channel,
                 identity=work.channel_identity,
                 conversation_id=None if work.kind == "root" else work.root_ts,
@@ -1882,7 +2233,11 @@ class FactorySlackProgressLoop:
         except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             permanent = isinstance(exc, _PERMANENT_ERRORS)
             await self._store.retry(
-                work, error=f"{type(exc).__name__}: {str(exc)[:1000]}", permanent=permanent
+                work,
+                error=reply_error_response(exc)[1]
+                if self._store.public_role
+                else f"{type(exc).__name__}: {str(exc)[:1000]}",
+                permanent=permanent,
             )
             logger.warning(
                 "factory Slack post %s for work item %s refused (%s); %s",
@@ -1949,7 +2304,10 @@ class FactorySlackProgressLoop:
     async def _deliver_refusal(self, work: FactorySlackRefusal) -> bool:
         try:
             ref = await self._emit(
-                text_value=render_refusal(work.payload),
+                text_value="A factory request was refused."
+                if self._store.public_role
+                else render_refusal(work.payload),
+                public=self._store.public_role,
                 delivery_id=refusal_delivery_id(work.notice_id),
                 channel=work.channel,
                 identity=work.channel_identity,
@@ -1967,7 +2325,11 @@ class FactorySlackProgressLoop:
         except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             permanent = isinstance(exc, _PERMANENT_ERRORS)
             await self._store.retry_refusal(
-                work, error=f"{type(exc).__name__}: {str(exc)[:1000]}", permanent=permanent
+                work,
+                error=reply_error_response(exc)[1]
+                if self._store.public_role
+                else f"{type(exc).__name__}: {str(exc)[:1000]}",
+                permanent=permanent,
             )
             logger.warning(
                 "factory Slack refusal %s refused (%s); %s",
@@ -2014,10 +2376,19 @@ class FactorySlackProgressLoop:
                         conversation_id=card.root_ts,
                         reply_ref=card.card_ts,
                     ),
+                    delivery_id=(
+                        delivery_id_for(
+                            card.work_item_id, f"public/card/{card.edited_at}/{render.digest}"
+                        )
+                        if self._store.public_role
+                        else None
+                    ),
                     message=render.message,
                     message_mode="replace",
                 ),
-                route=TargetRoute(adapter=card.channel_identity),
+                route=TargetRoute(
+                    adapter=card.channel_identity, factory_public=self._store.public_role
+                ),
                 best_effort_unreachable=False,
             )
         except asyncio.CancelledError:
@@ -2028,7 +2399,7 @@ class FactorySlackProgressLoop:
             logger.warning(
                 "factory Slack card for work item %s refused (%s); retrying after backoff",
                 card.work_item_id,
-                type(exc).__name__,
+                reply_error_response(exc)[1] if self._store.public_role else type(exc).__name__,
             )
             return False
         await self._store.ack_card(connection, card, render, now)
@@ -2056,7 +2427,9 @@ class FactorySlackProgressLoop:
     async def deliver_once(self) -> bool:
         """Attempt one due post; False when nothing is due."""
 
-        return await self._deliver() is not None
+        if await self._deliver() is not None:
+            return True
+        return self._public_loop is not None and await self._public_loop.deliver_once()
 
     async def run_pass(self) -> int:
         """Materialize, attempt up to ``batch_limit`` posts, then edit due cards.
@@ -2072,7 +2445,10 @@ class FactorySlackProgressLoop:
                 break
             if outcome:
                 delivered += 1
-        return delivered + await self.edit_cards()
+        delivered += await self.edit_cards()
+        if self._public_loop is not None:
+            delivered += await self._public_loop.run_pass()
+        return delivered
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         """Run a pass each interval until ``shutdown`` is set."""

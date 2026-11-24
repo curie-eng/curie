@@ -31,7 +31,6 @@ from _migration_support import (
     stamped_revision,
 )
 from alembic import command
-from alembic.script import ScriptDirectory
 from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyPost, ReplyUpdate
 from curie_api.config import get_settings
 from curie_api.schema_compat import (
@@ -499,12 +498,6 @@ def _check_values(name: str) -> set[str]:
     return set(re.findall(r"'((?:[^']|'')*)'::text", row[0]))
 
 
-def _head() -> str:
-    head = ScriptDirectory.from_config(alembic_config()).get_current_head()
-    assert head is not None
-    return head
-
-
 # --- AC3 -----------------------------------------------------------------------------
 
 
@@ -574,9 +567,9 @@ def test_upgrade_with_triage_rows_drops_the_triage_schema_and_keeps_kept_rows(
     for table in TRIAGE_TABLES:
         assert sql_rows(f"SELECT count(*) FROM curie.{table}") == [(1,)], table
 
-    command.upgrade(alembic_config(), _head())
+    command.upgrade(alembic_config(), REVISION)
 
-    assert stamped_revision() == _head()
+    assert stamped_revision() == REVISION
     assert not set(TRIAGE_TABLES) & _tables()
     for table, columns in DROPPED_COLUMNS.items():
         assert not columns & column_names(table), table
@@ -947,10 +940,7 @@ def test_retained_triage_requests_stay_quiet_in_the_slack_progress_lane(
         for row in cutoffs
     ), cutoffs
 
-    command.upgrade(alembic_config(), load_window().schema_min)
-    slack = RecordingSlack()
-    _progress_pass(slack)
-    assert slack.calls == []
+    command.upgrade(alembic_config(), REVISION)
     retired = sql_dicts(
         "SELECT work_item_id, failed_at IS NOT NULL AS failed, last_error "
         "FROM curie.factory_slack_posts WHERE kind = 'needs_person' ORDER BY work_item_id"
@@ -966,6 +956,11 @@ def test_retained_triage_requests_stay_quiet_in_the_slack_progress_lane(
         ),
         key=lambda row: str(row["work_item_id"]),
     )
+
+    command.upgrade(alembic_config(), load_window().schema_min)
+    slack = RecordingSlack()
+    _progress_pass(slack)
+    assert slack.calls == []
 
     # Liveness: the quieting is per retained request, not per thread.
     _batch(
@@ -1042,10 +1037,7 @@ def test_an_undiscovered_triage_work_item_stays_quiet_until_its_next_request(
     _batch(*rows)
     assert sql_rows("SELECT count(*) FROM curie.factory_slack_threads") == [(0,)]
 
-    command.upgrade(alembic_config(), load_window().schema_min)
-    slack = RecordingSlack()
-    _progress_pass(slack)
-    assert slack.calls == []
+    command.upgrade(alembic_config(), REVISION)
     threads = sql_dicts(
         "SELECT work_item_id, first_sequence, root_ts, channel_identity, channel "
         "FROM curie.factory_slack_threads"
@@ -1063,6 +1055,11 @@ def test_an_undiscovered_triage_work_item_stays_quiet_until_its_next_request(
         ),
         key=lambda row: str(row["work_item_id"]),
     )
+
+    command.upgrade(alembic_config(), load_window().schema_min)
+    slack = RecordingSlack()
+    _progress_pass(slack)
+    assert slack.calls == []
 
     # Liveness: the next request on the WorkItem gets the thread a newly
     # discovered one would get, and the other WorkItem stays silent.

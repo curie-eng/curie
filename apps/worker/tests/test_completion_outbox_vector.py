@@ -70,6 +70,7 @@ def test_completion_outbox_health_literals_match_the_frozen_vector() -> None:
 
 def test_non_answer_completion_serializes_the_legacy_protected_shape() -> None:
     from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
+    from curie_protected_hooks.settlement_records import validate_completion_json
     from curie_worker.markers import CompletionRecord
     from curie_worker.reply_sink import TargetRoute
 
@@ -87,10 +88,6 @@ def test_non_answer_completion_serializes_the_legacy_protected_shape() -> None:
         route=TargetRoute(),
         created_at=1.0,
     )
-    assert set(record.model_dump(mode="json")) == {
-        "event_id",
-        "event",
-        "route",
-        "created_at",
-        "done",
-    }
+    assert validate_completion_json(record.model_dump_json(), record.event_id) == record.model_dump(
+        mode="json"
+    )

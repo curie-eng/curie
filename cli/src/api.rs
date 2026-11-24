@@ -375,10 +375,11 @@ pub struct Agent {
     pub publication_draft: bool,
     #[serde(default)]
     pub publication_branch_prefix: Option<String>,
-    /// The Slack channel a factory run's progress posts to. `None` means no
-    /// Slack progress. Set through `<tier> factory-progress`.
+    /// The original factory Slack progress destination.
     #[serde(default)]
     pub factory_slack_channel: Option<String>,
+    #[serde(default)]
+    pub factory_public_slack_channel: Option<String>,
     /// Whether this agent's connector calls carry the verified requester (ADR
     /// 0270 decision 1). `None` means a platform older than the flag, which
     /// `approvals --requester-identity` reports instead of reading it as off.
@@ -3791,32 +3792,24 @@ impl ApiClient {
             .context("decoding updated agent")
     }
 
-    /// `PATCH /agents/{id}` carrying only `factory_slack_channel`: a channel
-    /// sets it, `None` sends an explicit `null` and clears it.
-    ///
-    /// A 409 whose body is `{"detail": {"code": "factory_slack_channel_unbound"}}`
-    /// becomes a failure that names the exact `surfaces` command for `tier`
-    /// that fits how many Slack bindings the agent holds for the channel. The command is only named, never run: a surface binding also
-    /// makes the agent answer in that channel and picks its Slack identity,
-    /// which is a separate decision from where factory progress posts. A 422
-    /// is a usage error carrying the API's message. Everything else falls
-    /// through to [`Self::expect_ok`].
+    /// Update the selected factory progress destination and explain binding refusals.
     pub async fn update_agent_factory_slack_channel(
         &self,
         agent: &Agent,
-        channel: Option<&str>,
+        body: &AgentUpdate,
         tier: &str,
     ) -> Result<Agent> {
-        let body = AgentUpdate {
-            factory_slack_channel: Some(channel.map(str::to_string)),
-            ..AgentUpdate::default()
-        };
+        let channel = body
+            .factory_public_slack_channel
+            .as_ref()
+            .or(body.factory_slack_channel.as_ref())
+            .and_then(Option::as_deref);
         let resp = self
             .send_request(
                 self.http
                     .patch(format!("{}/agents/{}", self.base_url, agent.id))
                     .header("X-API-Key", &self.api_key)
-                    .json::<AgentUpdate>(&body),
+                    .json::<AgentUpdate>(body),
                 "PATCH /agents/{id}",
             )
             .await?;

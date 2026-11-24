@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
+if TYPE_CHECKING:
+    from .config import Settings
+    from .factory_slack import SlackVoiceAuthorization
+    from .schemas.workitems import FactorySlackSteerIn
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -75,3 +80,20 @@ class ConfirmedTextIngress(Protocol):
     async def __call__(
         self, session: AsyncSession, command: ConfirmedText, /
     ) -> SteeringDecision: ...
+
+
+class ConfirmedSlackIngress(Protocol):
+    """Bind the fresh source check and confirmation receipt before handing this port to voice."""
+
+    async def __call__(
+        self,
+        session: AsyncSession,
+        command: ConfirmedText,
+        /,
+        *,
+        settings: Settings,
+        authority: SlackVoiceAuthorization,
+        confirmation: FactorySlackSteerIn,
+    ) -> SteeringDecision:
+        """Recheck local authority and admit in the caller's transaction using database I/O only."""
+        ...

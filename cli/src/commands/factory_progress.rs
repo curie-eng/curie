@@ -8,18 +8,14 @@
 use super::*;
 use crate::api_requests::AgentUpdate;
 
-/// What one `factory-progress` invocation intends to do to the stored channel.
-///
-/// Three states because the API's PATCH has three: an omitted key leaves the
-/// channel alone, an explicit JSON null clears it, and a channel id sets it.
+/// The one destination this invocation changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FactoryProgressChange {
-    /// Neither flag: read the stored channel and write nothing.
     Inspect,
-    /// `--no-slack-channel`: send an explicit null.
     Clear,
-    /// `--slack-channel <ID>`: set this channel.
     Set(String),
+    ClearPublic,
+    SetPublic(String),
 }
 
 /// Whether `id` has the shape the API accepts, `^[CG][A-Z0-9]{6,}$`.
@@ -31,61 +27,62 @@ fn is_slack_channel_id(id: &str) -> bool {
 }
 
 impl FactoryProgressChange {
-    /// Resolve the `--slack-channel` / `--no-slack-channel` pair into one intent.
-    ///
-    /// Args:
-    ///   slack_channel: the `--slack-channel` value, if one was passed.
-    ///   no_slack_channel: whether `--no-slack-channel` was passed.
-    ///
-    /// Returns:
-    ///   The intent, or a usage error naming the expected shape when the id is
-    ///   malformed or both flags were passed. Surrounding whitespace is
-    ///   trimmed; nothing else is altered, so a lowercase id is refused rather
-    ///   than quietly uppercased into a different channel.
-    pub fn resolve(slack_channel: Option<String>, no_slack_channel: bool) -> Result<Self> {
-        match (slack_channel, no_slack_channel) {
-            (Some(_), true) => Err(crate::exit::usage(
-                "--slack-channel and --no-slack-channel contradict each other; pass one",
-            )),
-            (Some(raw), false) => {
-                let id = raw.trim();
-                if is_slack_channel_id(id) {
-                    Ok(Self::Set(id.to_string()))
-                } else {
-                    Err(anyhow::Error::from(
-                        crate::exit::CliError::usage(format!(
-                            "{id:?} is not a Slack channel id; expected a public or private channel id \
-                             matching ^[CG][A-Z0-9]{{6,}}$, such as C0EXAMPLE1"
-                        ))
-                        .with_fix("copy the channel id from Slack: channel details, About, bottom of the pane"),
-                    ))
-                }
+    pub fn resolve(
+        slack_channel: Option<String>,
+        no_slack_channel: bool,
+        public_slack_channel: Option<String>,
+        no_public_slack_channel: bool,
+    ) -> Result<Self> {
+        let (raw, public) = match (
+            slack_channel,
+            no_slack_channel,
+            public_slack_channel,
+            no_public_slack_channel,
+        ) {
+            (None, false, None, false) => return Ok(Self::Inspect),
+            (None, true, None, false) => return Ok(Self::Clear),
+            (None, false, None, true) => return Ok(Self::ClearPublic),
+            (Some(id), false, None, false) => (id, false),
+            (None, false, Some(id), false) => (id, true),
+            _ => {
+                return Err(crate::exit::usage(
+                    "pass one factory progress destination flag",
+                ))
             }
-            (None, true) => Ok(Self::Clear),
-            (None, false) => Ok(Self::Inspect),
+        };
+        let id = raw.trim();
+        if !is_slack_channel_id(id) {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "{id:?} is not a Slack channel id; expected a public or private channel id \
+                     matching ^[CG][A-Z0-9]{{6,}}$, such as C0EXAMPLE1"
+                ))
+                .with_fix(
+                    "copy the channel id from Slack: channel details, About, bottom of the pane",
+                ),
+            ));
         }
-    }
-
-    /// The channel this change would write, if it writes one.
-    fn target(&self) -> Option<&str> {
-        match self {
-            Self::Set(id) => Some(id),
-            _ => None,
-        }
+        Ok(if public {
+            Self::SetPublic(id.to_owned())
+        } else {
+            Self::Set(id.to_owned())
+        })
     }
 }
 
 /// The PATCH body for a change, or `None` when this invocation only inspects.
 pub fn factory_progress_patch_body(change: &FactoryProgressChange) -> Option<AgentUpdate> {
-    let factory_slack_channel = match change {
+    let mut body = AgentUpdate::default();
+    match change {
         FactoryProgressChange::Inspect => return None,
-        FactoryProgressChange::Clear => Some(None),
-        FactoryProgressChange::Set(id) => Some(Some(id.clone())),
-    };
-    Some(AgentUpdate {
-        factory_slack_channel,
-        ..AgentUpdate::default()
-    })
+        FactoryProgressChange::Clear => body.factory_slack_channel = Some(None),
+        FactoryProgressChange::Set(id) => body.factory_slack_channel = Some(Some(id.clone())),
+        FactoryProgressChange::ClearPublic => body.factory_public_slack_channel = Some(None),
+        FactoryProgressChange::SetPublic(id) => {
+            body.factory_public_slack_channel = Some(Some(id.clone()))
+        }
+    }
+    Some(body)
 }
 
 /// The one-line human summary of a `factory-progress` result.
@@ -95,9 +92,13 @@ pub fn factory_progress_patch_body(change: &FactoryProgressChange) -> Option<Age
 pub fn factory_progress_summary(
     agent: &str,
     factory_slack_channel: Option<&str>,
+    factory_public_slack_channel: Option<&str>,
     changed: bool,
 ) -> String {
     let verb = if changed { " now" } else { "" };
+    if let Some(channel) = factory_public_slack_channel {
+        return format!("public factory run channel for {agent}{verb}: {channel}");
+    }
     let value = factory_slack_channel.unwrap_or("none (no progress channel configured)");
     format!("factory progress channel for {agent}{verb}: {value}")
 }
@@ -109,6 +110,7 @@ pub enum FactoryProgressOutput {
     Done {
         agent: String,
         factory_slack_channel: Option<String>,
+        factory_public_slack_channel: Option<String>,
         changed: bool,
     },
 }
@@ -120,10 +122,12 @@ impl crate::ui::CliOutput for FactoryProgressOutput {
             FactoryProgressOutput::Done {
                 agent,
                 factory_slack_channel,
+                factory_public_slack_channel,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
                 "factory_slack_channel": factory_slack_channel,
+                "factory_public_slack_channel": factory_public_slack_channel,
                 "changed": changed,
             }),
         }
@@ -135,10 +139,12 @@ impl crate::ui::CliOutput for FactoryProgressOutput {
             FactoryProgressOutput::Done {
                 agent,
                 factory_slack_channel,
+                factory_public_slack_channel,
                 changed,
             } => ui.payload(&factory_progress_summary(
                 agent,
                 factory_slack_channel.as_deref(),
+                factory_public_slack_channel.as_deref(),
                 *changed,
             )),
         }
@@ -181,24 +187,33 @@ pub async fn factory_progress(
     }
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
-    if body.is_none() {
+    let Some(body) = body else {
         // Inspect: `find_agent` already returns the full agent row.
         return Ok(FactoryProgressOutput::Done {
             agent: agent.name,
             factory_slack_channel: agent.factory_slack_channel,
+            factory_public_slack_channel: agent.factory_public_slack_channel,
             changed: false,
         });
-    }
+    };
     let cl = ui.checklist();
     let step = cl.step(&format!(
         "updating factory progress channel for {}",
         agent.name
     ));
     let saved = match client
-        .update_agent_factory_slack_channel(&agent, change.target(), tier)
+        .update_agent_factory_slack_channel(&agent, &body, tier)
         .await
     {
         Ok(saved) => {
+            if let Some(public) = &body.factory_public_slack_channel {
+                if saved.factory_public_slack_channel.as_ref() != public.as_ref()
+                    || (public.is_some() && saved.factory_slack_channel.is_some())
+                {
+                    step.fail("public destination unconfirmed");
+                    bail!("the API did not confirm the requested public factory run destination");
+                }
+            }
             step.done("updated");
             saved
         }
@@ -210,6 +225,7 @@ pub async fn factory_progress(
     Ok(FactoryProgressOutput::Done {
         agent: saved.name,
         factory_slack_channel: saved.factory_slack_channel,
+        factory_public_slack_channel: saved.factory_public_slack_channel,
         changed: true,
     })
 }
@@ -249,7 +265,7 @@ mod tests {
     #[test]
     fn resolve_accepts_the_api_shape_and_trims_whitespace() {
         for id in ["C0EXAMPLE1", "G0EXAMPLE1", "CABCDEF", "  C0EXAMPLE1\n"] {
-            let change = FactoryProgressChange::resolve(Some(id.to_string()), false)
+            let change = FactoryProgressChange::resolve(Some(id.to_string()), false, None, false)
                 .unwrap_or_else(|e| panic!("{id:?} must be accepted: {e}"));
             assert_eq!(change, FactoryProgressChange::Set(id.trim().to_string()));
         }
@@ -266,7 +282,7 @@ mod tests {
             "C0 EXAMPLE1",
             "U0EXAMPLE1",
         ] {
-            let err = FactoryProgressChange::resolve(Some(id.to_string()), false)
+            let err = FactoryProgressChange::resolve(Some(id.to_string()), false, None, false)
                 .expect_err(&format!("{id:?} must be refused"));
             assert!(
                 err.to_string().contains("^[CG][A-Z0-9]{6,}$"),
@@ -278,32 +294,35 @@ mod tests {
     #[test]
     fn resolve_maps_the_flag_pair_to_one_intent() {
         assert_eq!(
-            FactoryProgressChange::resolve(None, false).expect("inspect"),
+            FactoryProgressChange::resolve(None, false, None, false).expect("inspect"),
             FactoryProgressChange::Inspect
         );
         assert_eq!(
-            FactoryProgressChange::resolve(None, true).expect("clear"),
+            FactoryProgressChange::resolve(None, true, None, false).expect("clear"),
             FactoryProgressChange::Clear
         );
-        assert!(FactoryProgressChange::resolve(Some("C0EXAMPLE1".to_string()), true).is_err());
+        assert!(
+            FactoryProgressChange::resolve(Some("C0EXAMPLE1".to_string()), true, None, false)
+                .is_err()
+        );
     }
 
     #[test]
     fn the_summary_names_the_channel_or_says_none() {
         assert_eq!(
-            factory_progress_summary("acme-bot", Some("C0EXAMPLE1"), false),
+            factory_progress_summary("acme-bot", Some("C0EXAMPLE1"), None, false),
             "factory progress channel for acme-bot: C0EXAMPLE1"
         );
         assert_eq!(
-            factory_progress_summary("acme-bot", None, false),
+            factory_progress_summary("acme-bot", None, None, false),
             "factory progress channel for acme-bot: none (no progress channel configured)"
         );
         assert_eq!(
-            factory_progress_summary("acme-bot", Some("C0EXAMPLE1"), true),
+            factory_progress_summary("acme-bot", Some("C0EXAMPLE1"), None, true),
             "factory progress channel for acme-bot now: C0EXAMPLE1"
         );
         assert_eq!(
-            factory_progress_summary("acme-bot", None, true),
+            factory_progress_summary("acme-bot", None, None, true),
             "factory progress channel for acme-bot now: none (no progress channel configured)"
         );
     }

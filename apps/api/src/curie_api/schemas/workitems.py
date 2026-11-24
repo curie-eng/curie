@@ -436,6 +436,13 @@ class WorkItemOutcomeList(BaseModel):
 # final for its delivery; only an unavailable code host answers 503.
 FactorySlackSteerOutcome = Literal[
     "admitted",
+    "queued",
+    "applied",
+    "source_changed",
+    "target_mismatch",
+    "guidance_queue_full",
+    "guidance_expired",
+    "invalid_text",
     "not_mapped",
     "receipt_mismatch",
     "sender_unverified",
@@ -481,7 +488,7 @@ class FactorySlackSteerOut(BaseModel):
     request_id: str | None = None
     request_status: str | None = None
     replayed: bool = False
-    pull_request_url: str | None = None
+    pull_request_url: str | None = Field(default=None, exclude_if=lambda value: value is None)
     reason: str | None = None
 
 

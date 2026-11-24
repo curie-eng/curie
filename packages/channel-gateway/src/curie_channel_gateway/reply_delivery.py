@@ -203,6 +203,11 @@ class ReplyDeliveryStore:
             self._db.execute("ROLLBACK")
             raise
 
+    def release_unwritten(self, key: str) -> None:
+        self._db.execute(
+            "DELETE FROM gateway_reply_deliveries WHERE request_key = ? AND status IS NULL", (key,)
+        )
+
     def finish(self, key: str, result: DeliveryResult) -> None:
         self._db.execute(
             "UPDATE gateway_reply_deliveries SET status = ?, body = ?, unreachable = ? "

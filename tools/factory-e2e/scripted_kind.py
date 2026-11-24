@@ -468,12 +468,15 @@ class ScriptedRun:
                 f"curie-{component}:facts-{self.run_id}" for component in ("api", "worker", "ui")
             )
         )
+        self.owned_build_tag: str | None = None
+        self.runner_source = "curie-runner:latest"
         self.created_images: list[str] = []
         self.facts_runner_images: dict[str, str] = {}
         self.cluster = f"curie-factory-scripted-{self.run_id}"
         self.context = f"kind-{self.cluster}"
         self.registry = f"{self.cluster}-registry"
         self.namespace = "curie"
+        self.release = "curie"
         self.evidence_path = REPO_ROOT / f"target/factory-e2e/scripted-{self.run_id}.json"
         self.evidence: dict[str, Any] = {
             "result": "failed",
@@ -752,24 +755,26 @@ class ScriptedRun:
                 components.append(GATEWAY_COMPONENT)
             for component in components:
                 self.check_disk(f"building {component}")
+                tag = self.owned_build_tag or "local"
+                if self.args.scenario == "facts":
+                    tag = f"facts-{self.run_id}"
+                image = f"curie-{component}:{tag}"
                 self.command(
                     "docker",
                     "build",
                     "-f",
                     f"apps/{component}/Dockerfile",
                     "-t",
-                    f"curie-{component}:facts-{self.run_id}"
-                    if self.args.scenario == "facts"
-                    else f"curie-{component}:local",
+                    image,
                     ".",
                     timeout=1800,
                 )
                 if self.args.scenario == "facts":
-                    self.created_images.append(f"curie-{component}:facts-{self.run_id}")
+                    self.created_images.append(image)
                 self.check_disk(f"built {component}")
             if self.args.scenario != "facts":
                 self.check_disk("building runner")
-                self.command(self.curie, "build", "--tag", "curie-runner:latest", timeout=1800)
+                self.command(self.curie, "build", "--tag", self.runner_source, timeout=1800)
                 self.check_disk("built runner")
         for image in self.image_refs:
             try:
@@ -845,7 +850,7 @@ class ScriptedRun:
         # run's own registry before the chart names it.
         runner_image = f"{registry_ref}/curie-runner"
         if self.args.scenario != "facts":
-            self.command("docker", "tag", "curie-runner:latest", f"{runner_image}:latest")
+            self.command("docker", "tag", self.runner_source, f"{runner_image}:latest")
             self.command("docker", "push", f"{runner_image}:latest", timeout=900)
         else:
             self.build_facts_runner_images(registry_ref)
@@ -1006,7 +1011,7 @@ class ScriptedRun:
             "--kube-context",
             self.context,
             "install",
-            "curie",
+            self.release,
             "charts/curie",
             "-n",
             self.namespace,
@@ -1018,13 +1023,13 @@ class ScriptedRun:
             "15m",
             timeout=1000,
         )
-        for deployment in ("curie-api", "curie-worker", "curie-ui"):
+        for component in ("api", "worker", "ui"):
             self.kubectl(
                 "-n",
                 self.namespace,
                 "rollout",
                 "status",
-                f"deployment/{deployment}",
+                f"deployment/{self.release}-{component}",
                 "--timeout=300s",
             )
         if self.args.scenario == "facts":
@@ -1075,7 +1080,7 @@ class ScriptedRun:
         self.stub._put("issue", 3815, issue)
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
 
-    def bind_slack(self) -> None:
+    def bind_slack(self, *, public: bool = False) -> None:
         """Bind the factory agent to the Slack channel the recorder stands in for."""
 
         if not self.gateway_enabled():
@@ -1084,14 +1089,15 @@ class ScriptedRun:
             raise ScriptedScenarioError("the Slack recorder did not start")
         self.kubectl(
             "-n", self.namespace, "rollout", "status",
-            "deployment/curie-channel-gateway", "--timeout=300s",
+            f"deployment/{self.release}-channel-gateway", "--timeout=300s",
         )
         agent = self.evidence["agent_id"]
         headers = {"X-API-Key": self.env["CURIE_API_KEY"]}
+        field = "factory_public_slack_channel" if public else "factory_slack_channel"
         for method, path, body in (
             ("POST", f"/agents/{agent}/channels",
              {"kind": "slack", "address": scenario.SLACK_CHANNEL}),
-            ("PATCH", f"/agents/{agent}", {"factory_slack_channel": scenario.SLACK_CHANNEL}),
+            ("PATCH", f"/agents/{agent}", {field: scenario.SLACK_CHANNEL}),
         ):
             status, _ = fe.http_json(
                 method, self.env["CURIE_API_URL"] + path, headers=headers, body=body
@@ -1268,7 +1274,7 @@ class ScriptedRun:
             "-n",
             self.namespace,
             "get",
-            "deployment/curie-worker",
+            f"deployment/{self.release}-worker",
             "-o",
             'jsonpath={.spec.template.spec.containers[?(@.name=="worker")].env[?(@.name=="CURIE_PUBLICATION_NAMESPACE")].value}',
             timeout=10,
@@ -1289,7 +1295,8 @@ class ScriptedRun:
         )
         return json.loads(
             self.kubectl(
-                "-n", self.namespace, "exec", "deployment/curie-api", "--", "python", "-c", code
+                "-n", self.namespace, "exec", f"deployment/{self.release}-api",
+                "--", "python", "-c", code
             )
         )
 
@@ -1315,10 +1322,9 @@ class ScriptedRun:
             3815, body, author={"id": 6602, "login": "reader", "type": "User"}
         )
         self.wait_facts(str(writer["id"]))
-        self.kubectl("-n", self.namespace, "rollout", "restart", "deployment/curie-api")
-        self.kubectl(
-            "-n", self.namespace, "rollout", "status", "deployment/curie-api", "--timeout=300s"
-        )
+        api = f"deployment/{self.release}-api"
+        self.kubectl("-n", self.namespace, "rollout", "restart", api)
+        self.kubectl("-n", self.namespace, "rollout", "status", api, "--timeout=300s")
         # A fresh request forces a completed post-restart poll, so this is not
         # an instantaneous count of a pre-restart comment.
         changed = body.replace('["uv"]', '["jq"]')
@@ -1454,7 +1460,9 @@ class ScriptedRun:
     def deploy(self, registry_ref: str) -> None:
         assert self.workdir is not None
         secret = json.loads(
-            self.kubectl("-n", self.namespace, "get", "secret", "curie-secrets", "-o", "json")
+            self.kubectl(
+                "-n", self.namespace, "get", "secret", f"{self.release}-secrets", "-o", "json"
+            )
         )
         api_key = base64.b64decode(secret["data"]["apiKey"]).decode()
         self.secrets.append(api_key)
@@ -1482,7 +1490,7 @@ class ScriptedRun:
                 "-n",
                 self.namespace,
                 "port-forward",
-                "svc/curie-api",
+                f"svc/{self.release}-api",
                 ":8000",
                 "--address",
                 "127.0.0.1",
@@ -1522,7 +1530,7 @@ class ScriptedRun:
         self.evidence["agent_id"] = agent["id"]
         bundle = self.workdir / "bundle"
         shutil.copytree(REPO_ROOT / "examples/dark-factory", bundle)
-        layer_bytes = kind_images.runner_layer_budget(self.command, "curie-runner:latest")
+        layer_bytes = kind_images.runner_layer_budget(self.command, self.runner_source)
         self.check_disk("building the runner layer", required_bytes=layer_bytes)
         runner_base = f"{registry_ref}/curie-runner:latest"
         self.command(
@@ -1539,7 +1547,7 @@ class ScriptedRun:
             timeout=900,
         )
         self.check_disk("built runner layer", required_bytes=layer_bytes)
-        common = ["--namespace", self.namespace, "--release", "curie", "--api-url", api_url]
+        common = ["--namespace", self.namespace, "--release", self.release, "--api-url", api_url]
         self.command(
             self.curie,
             "cluster",
@@ -1713,7 +1721,7 @@ class ScriptedRun:
             "-n",
             self.namespace,
             "exec",
-            "statefulset/curie-postgres",
+            f"statefulset/{self.release}-postgres",
             "--",
             "psql",
             "-U",
@@ -1979,7 +1987,9 @@ class ScriptedRun:
                 audit = service.unexpected if service is self.model else service.unknown_requests
                 # A model audit entry carries the turn's input text. The Jira
                 # leg uploads its evidence publicly, so it records the count.
-                public = service is self.model and self.jira_enabled()
+                public = service is self.model and (
+                    self.jira_enabled() or self.args.scenario == "slack-steering"
+                )
                 self.evidence[field] = len(audit) if public else audit
                 port = service.port
                 host = service.host
@@ -2090,6 +2100,19 @@ class ScriptedRun:
                 sqlite3.Error,
             ) as exc:
                 errors.append(str(exc))
+        if self.owned_build_tag:
+            try:
+                args = (
+                    "docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}",
+                    "--filter", f"reference=curie-*:{self.owned_build_tag}",
+                )
+                tags = set(self.command(*args).split()).intersection(self.image_refs)
+                if tags:
+                    self.command("docker", "image", "rm", *sorted(tags))
+                if set(self.command(*args).split()).intersection(self.image_refs):
+                    errors.append("owned candidate image tags remain after teardown")
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                errors.append(str(exc))
         if self.created_images:
             try:
                 self.command("docker", "image", "rm", *self.created_images)
@@ -2161,6 +2184,10 @@ def main(args: argparse.Namespace) -> int:
             from learned_rules_run import LearnedRulesRun
 
             run: ScriptedRun = LearnedRulesRun(args)
+        elif args.scenario == "slack-steering":
+            from slack_steering_run import SlackSteeringRun
+
+            run = SlackSteeringRun(args)
         else:
             run = ScriptedRun(args)
     except fe.ConfigError as exc:

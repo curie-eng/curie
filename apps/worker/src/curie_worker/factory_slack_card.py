@@ -136,6 +136,12 @@ def _view(request: CardRequest) -> PhaseView | None:
     return phase_view(request.declaration, request.reports, request.status, request.terminal_cause)
 
 
+def _completed_state(terminal_cause: str | None, work_item_cancelled: bool) -> CardState:
+    if terminal_cause == "questions_asked":
+        return "stopped" if work_item_cancelled else "waiting on answers"
+    return "finished"
+
+
 def card_state(request: CardRequest, view: PhaseView | None) -> CardState:
     """The header word for the shown request."""
 
@@ -143,10 +149,8 @@ def card_state(request: CardRequest, view: PhaseView | None) -> CardState:
         return "stopped"
     if request.status in _NEEDS_A_PERSON:
         return "needs a person"
-    if request.status == "completed" and request.terminal_cause == "questions_asked":
-        return "stopped" if request.work_item_cancelled else "waiting on answers"
     if request.status == "completed":
-        return "finished"
+        return _completed_state(request.terminal_cause, request.work_item_cancelled)
     published = request.pr_url is not None
     if published and (view is None or view.current == WAIT_CI_PHASE):
         return "finished"
@@ -353,6 +357,54 @@ def card_reports(rows: Sequence[dict[str, object]]) -> tuple[CardReport, ...]:
     return tuple(reports)
 
 
+_PUBLIC_STAGES = {
+    "read_issue": "Reading the issue",
+    "investigate": "Investigating",
+    "pin_criteria": "Planning",
+    "plan_review": "Reviewing the plan",
+    "failing_test": "Testing",
+    "plan": "Planning",
+    "implement": "Implementing",
+    "review_diff": "Reviewing changes",
+    "test": "Testing",
+    "publish": "Publishing",
+    "wait_ci": "Waiting for checks",
+}
+_PUBLIC_STATES: dict[str, CardState] = {
+    "queued": "starting",
+    "waiting": "starting",
+    "running": "working",
+    "failed": "needs a person",
+    "expired": "needs a person",
+    "cancelled": "stopped",
+    "cancellation_requested": "stopped",
+}
+
+
+def render_public_card(
+    run: str,
+    status: str,
+    phase: str | None,
+    publication: str,
+    *,
+    terminal_cause: str | None,
+    work_item_cancelled: bool,
+) -> CardRender:
+    state = (
+        _completed_state(terminal_cause, work_item_cancelled)
+        if status == "completed"
+        else _PUBLIC_STATES.get(status, "working")
+    )
+    outcome = state if state == "needs a person" else f"is {state}"
+    lines = [f"Factory run {run} {outcome}."]
+    if phase is not None and phase in _PUBLIC_STAGES:
+        lines.append(_PUBLIC_STAGES[phase])
+    if publication:
+        lines.append(publication)
+    message = OutboundMessage(version=MESSAGE_VERSION, text="\n".join(lines))
+    return CardRender(message, state, hashlib.sha256(message.text.encode()).hexdigest())
+
+
 __all__ = [
     "CardRender",
     "CardReport",
@@ -366,5 +418,6 @@ __all__ = [
     "needs_person_text",
     "ready_text",
     "render_card",
+    "render_public_card",
     "starting_text",
 ]

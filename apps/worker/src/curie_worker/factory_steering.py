@@ -67,7 +67,7 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 import httpx
@@ -80,6 +80,7 @@ from channel_protocol import (
     OutboundMessage,
     ReplyPost,
     ReplyTarget,
+    ReplyUpdate,
 )
 from curie_internal.factory_cause import PERSONAL_RESUME_RUNTIME_LIVE
 from curie_internal.issue_links import find_issue_links
@@ -127,6 +128,13 @@ _READ_ERRORS: Final = (SQLAlchemyError, OSError, TimeoutError)
 
 _HEADLINES: Final = {
     ADMITTED: "Revision queued for this pull request.",
+    "queued": "Your guidance is queued for the next eligible execution.",
+    "applied": "An execution has applied your guidance.",
+    "source_changed": "The source of this guidance changed.",
+    "target_mismatch": "This guidance belongs to a different factory run.",
+    "guidance_queue_full": "This run already has eight pending messages.",
+    "guidance_expired": "This guidance expired before an execution could apply it.",
+    "invalid_text": "The guidance was empty.",
     EVIDENCE_MISSING: "This factory run cannot be steered from this message.",
     UNCONFIGURED: "Steering is not configured on this worker, so it did not ask for a decision.",
     BUDGET_EXPIRED: (
@@ -238,6 +246,7 @@ class SteeringReply:
     text: str
     request_id: str | None = None
     pull_request_url: str | None = None
+    delivered: bool = False
     # An admitted kickoff, fresh or replayed (#5715): the turn posts no reply
     # and leaves the placeholder alone, because the progress lane renders the
     # run's card into it (or posts the card first when there is none).
@@ -246,7 +255,7 @@ class SteeringReply:
     @property
     def admitted(self) -> bool:
         """Whether the decision queued (or had already queued) the request."""
-        return self.outcome == ADMITTED
+        return self.outcome in {ADMITTED, "queued", "applied"} or self.delivered
 
 
 @dataclass(frozen=True)
@@ -255,6 +264,7 @@ class MappedRoot:
 
     work_item_id: uuid.UUID
     kickoff_replay: bool
+    destination_role: str
 
 
 @dataclass(frozen=True)
@@ -285,6 +295,7 @@ def render_reply(
     outcome: str,
     *,
     reason: str | None = None,
+    request_id: str | None = None,
     pull_request_url: str | None = None,
     replayed: bool = False,
 ) -> str:
@@ -295,10 +306,17 @@ def render_reply(
         headline = "This revision was already queued."
     elif outcome == "admission_refused" and reason == "runtime_live":
         headline = PERSONAL_RESUME_RUNTIME_LIVE
+    elif outcome == "queued" and replayed:
+        headline = "Your guidance was already queued."
     lines = [headline]
     if outcome == ADMITTED and pull_request_url:
         lines.append(f"Pull request: {_plain(pull_request_url)}")
-    if outcome != ADMITTED and outcome != BUDGET_EXPIRED:
+    if outcome in {"applied", "queued"} and request_id:
+        try:
+            lines.append(f"Execution: {uuid.UUID(request_id)}")
+        except ValueError:
+            pass
+    if outcome not in {ADMITTED, "applied", "queued", BUDGET_EXPIRED}:
         lines.append(_EARLIER_ATTEMPTS)
     lines.append(_detail(outcome, reason))
     return "\n".join(lines)
@@ -361,7 +379,7 @@ class FactorySteeringClient:
         if not _SAFE_SCHEMA.fullmatch(schema):
             raise ValueError("factory steering database schema is invalid")
         self._engine = engine
-        self._threads = f'"{schema}".factory_slack_threads'
+        self._threads = f'"{schema}".factory_slack_mapped_roots'
         self._requests = f'"{schema}".execution_requests'
         self._channels = f'"{schema}".agent_channels'
         self._redis = redis
@@ -385,7 +403,7 @@ class FactorySteeringClient:
                 await connection.execute(
                     text(
                         f"""
-                        SELECT t.work_item_id,
+                        SELECT t.work_item_id, t.destination_role,
                                EXISTS (
                                    SELECT 1
                                      FROM {self._requests} r
@@ -409,7 +427,8 @@ class FactorySteeringClient:
         if row is None:
             return None
         return MappedRoot(
-            work_item_id=uuid.UUID(str(row.work_item_id)), kickoff_replay=bool(row.kickoff_replay)
+            work_item_id=uuid.UUID(str(row.work_item_id)), kickoff_replay=bool(row.kickoff_replay),
+            destination_role=str(row.destination_role),
         )
 
     async def _factory_agent(self, identity: str, channel: str) -> bool:
@@ -491,7 +510,77 @@ class FactorySteeringClient:
             return await self._kickoff(
                 turn, mapped=True, deadline=deadline, record_intent=record_intent
             )
-        return await self._steer(turn, deadline=deadline, record_intent=record_intent)
+        try:
+            answer = await self._steer(
+                turn,
+                deadline=deadline,
+                record_intent=record_intent,
+                public=mapping.destination_role == "public",
+            )
+        except SteeringUnavailable as exc:
+            if mapping.destination_role == "public":
+                raise SteeringUnavailable("factory public steering is unavailable") from exc
+            raise
+        if mapping.destination_role != "public":
+            return answer
+        await self._public_ack(turn, answer, deadline)
+        return replace(answer, text="", progress_card=True, delivered=True)
+
+    async def _public_ack(
+        self,
+        turn: _Turn,
+        answer: SteeringReply,
+        deadline: float | None,
+    ) -> None:
+        if answer.outcome in {"queued", "applied"}:
+            if not turn.handle.placeholder:
+                return
+            status = "received"
+            body = "Received."
+        else:
+            status = answer.outcome if answer.outcome in _HEADLINES else "admission_refused"
+            body = f"{_HEADLINES[status]}\nOutcome: {status}"
+        delivery = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"factory-public-decision:{status}:{turn.identity}:{turn.qevent.event_id}",
+            )
+        )
+        message = OutboundMessage(version=MESSAGE_VERSION, text=body)
+        target = ReplyTarget(
+            kind=_SLACK_KIND,
+            address=turn.handle.channel,
+            conversation_id=turn.root_ts,
+            reply_ref=turn.handle.placeholder,
+        )
+        event: ReplyPost | ReplyUpdate
+        if turn.handle.placeholder:
+            event = ReplyUpdate(
+                version=SCOPED_REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=target,
+                message_mode="replace",
+                message=message,
+                delivery_id=delivery,
+            )
+        else:
+            event = ReplyPost(
+                version="1.1",
+                event="reply.post",
+                target=target,
+                message=message,
+                delivery_id=delivery,
+                requested_by="",
+            )
+        try:
+            async with asyncio.timeout_at(deadline):
+                await self._replies.emit(
+                    event,
+                    route=TargetRoute(adapter=turn.identity, factory_public=True),
+                    best_effort_unreachable=False,
+                )
+        except Exception as exc:
+            raise SteeringUnavailable("factory public acknowledgement is unavailable") from exc
 
     async def _steer(
         self,
@@ -499,6 +588,7 @@ class FactorySteeringClient:
         *,
         deadline: float | None,
         record_intent: Callable[[], Awaitable[None]],
+        public: bool = False,
     ) -> SteeringReply:
         """A turn in a mapped root that is not its own kickoff's replay."""
 
@@ -535,10 +625,9 @@ class FactorySteeringClient:
             pending_text=UNCONFIRMED_TEXT,
         )
         outcome, reason, request_id, replayed = _decision(body, UNCONFIRMED_TEXT)
-        try:
-            pull_request_url = _optional_text(body, "pull_request_url")
-        except SteeringUnavailable as exc:
-            raise SteeringUnavailable(str(exc), pending_text=UNCONFIRMED_TEXT) from exc
+        url = None
+        if outcome == ADMITTED and not public:
+            url = _optional_text(body, "pull_request_url")
         if outcome == NOT_MAPPED:
             # The local read said mapped. A disagreement is never ordinary chat.
             logger.warning("factory steering %s: API reports an unmapped root", qevent.event_id)
@@ -549,11 +638,12 @@ class FactorySteeringClient:
             text=render_reply(
                 outcome,
                 reason=reason,
-                pull_request_url=pull_request_url,
+                request_id=request_id,
+                pull_request_url=url,
                 replayed=replayed,
             ),
             request_id=request_id,
-            pull_request_url=pull_request_url,
+            pull_request_url=url,
         )
 
     async def _unmapped(

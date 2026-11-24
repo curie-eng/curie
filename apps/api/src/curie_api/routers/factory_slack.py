@@ -1,6 +1,7 @@
 """The worker asks whether a Slack mention steers a factory run (#5414) or starts one (#5380)."""
 
 import logging
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.exc import SQLAlchemyError
@@ -10,6 +11,7 @@ from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_slack import CodeHostUnavailable, steer
 from ..factory_slack_kickoff import kickoff
+from ..factory_slack_public import public_publication
 from ..schemas.workitems import (
     FactorySlackKickoffIn,
     FactorySlackKickoffOut,
@@ -29,7 +31,7 @@ logger = logging.getLogger(__name__)
 async def steer_factory_run(
     data: FactorySlackSteerIn, request: Request, response: Response, session: SessionDep
 ) -> FactorySlackSteerOut:
-    """Admit a revision of the run's pull request, or name why not.
+    """Queue authorized guidance for an implementation or its published pull request.
 
     Every refusal is final for the delivery and answers 200. A code host that
     cannot answer now is 503, so the worker keeps the delivery pending. A
@@ -88,3 +90,13 @@ async def kickoff_factory_run(
             {"code": "persistence_unavailable"},
             headers={"Retry-After": "10", "Cache-Control": "no-store"},
         ) from None
+
+
+@internal_router.get("/publication/{work_item_id}")
+async def get_public_publication(
+    work_item_id: uuid.UUID, request: Request, response: Response, session: SessionDep
+) -> dict[str, str | int]:
+    response.headers["Cache-Control"] = "no-store"
+    return await public_publication(
+        session, work_item_id, settings=get_settings(), client=request.app.state.http_client
+    )

@@ -1278,6 +1278,7 @@ def _card_decide(
     *,
     placeholder: str | None,
     steer: bool = False,
+    public: bool = False,
     receipt: bool = True,
 ) -> tuple[steering_module.SteeringReply | None, list[tuple[str, dict[str, Any]]]]:
     turn = _card_turn(placeholder)
@@ -1295,7 +1296,9 @@ def _card_decide(
 
     async def run() -> steering_module.SteeringReply | None:
         if steer:
-            return await client._steer(turn, deadline=None, record_intent=record_intent)
+            return await client._steer(
+                turn, deadline=None, record_intent=record_intent, public=public
+            )
         return await client._kickoff(turn, mapped=False, deadline=None, record_intent=record_intent)
 
     return asyncio.run(run()), sent
@@ -1376,3 +1379,21 @@ def test_progress_card_admitted_kickoff_has_no_rendered_reply() -> None:
 
     with pytest.raises(ValueError, match="progress card"):
         steering_module.render_kickoff_reply("admitted")
+
+
+@pytest.mark.parametrize("marker", [None, False, "true", 1, True])
+def test_public_steering_does_not_render_a_legacy_apis_private_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+    marker: object,
+) -> None:
+    answer = {**_ADMITTED, "pull_request_url": "https://github.com/acme-corp/private/pull/7"}
+    if marker is not None:
+        answer["pull_request_shareable"] = marker
+    reply, _ = _card_decide(
+        monkeypatch, answer, placeholder=_CARD_PLACEHOLDER, steer=True, public=True
+    )
+    assert reply is not None and reply.admitted
+    assert reply.pull_request_url is None
+    assert answer["pull_request_url"] not in reply.text
+    origin, _ = _card_decide(monkeypatch, answer, placeholder=_CARD_PLACEHOLDER, steer=True)
+    assert origin is not None and answer["pull_request_url"] in origin.text
