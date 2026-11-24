@@ -45,7 +45,7 @@ from curie_api.factory_notices import (
     result_section,
 )
 from curie_api.forges.registry import forges_registry
-from curie_api.workitem_dispatch import DispatchConflict, acquire, start
+from curie_api.workitem_dispatch import DispatchConflict, acquire, get_request, start
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from forge_fakes import factory_wake
@@ -359,11 +359,13 @@ def _observe_termination(client: Any, request_id: uuid.UUID) -> None:
 def _start_running(client: Any, request_id: uuid.UUID) -> int:
     async def go() -> int:
         async with client.app.state.sessionmaker() as session:
+            request = await get_request(session, request_id)
+            assert request is not None
             acquired = await acquire(
                 session,
                 request_id,
                 owner="factory-owner",
-                generation=1,
+                generation=request.dispatch_generation,
                 wake=await factory_wake(session, request_id),
                 context=None,
                 client=client.app.state.http_client,
@@ -373,7 +375,7 @@ def _start_running(client: Any, request_id: uuid.UUID) -> int:
                 session,
                 request_id,
                 owner="factory-owner",
-                generation=1,
+                generation=acquired.generation,
                 claim_name="claim-factory",
                 sandbox_name="sbx-factory",
                 context=acquired.context,

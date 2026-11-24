@@ -46,6 +46,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aci_protocol import STREAM_PAYLOAD_FIELD
+from channel_protocol.work_item_events import execute_event_id
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_maintenance import MaintenanceObservation, MaintenanceRepair
@@ -2280,7 +2281,9 @@ def maintenance_successor(
 
     _reconcile()
     assert _terminal(number) == ("completed", "completed")
-    repair_id, branch, pr_id = client.portal.call(admit_repair)
+    with monkeypatch.context() as repair_settings:
+        repair_settings.setattr(get_settings(), "work_item_wait_budget_seconds", 3600)
+        repair_id, branch, pr_id = client.portal.call(admit_repair)
     pull = listed_publication(number, pull=published["pr"])
     pull.update(
         html_url=published["pr_url"], node_id=pr_id, mergeable=True, mergeable_state="clean"
@@ -2374,10 +2377,9 @@ def _acquire_maintenance(client: Any, repair_id: uuid.UUID) -> httpx.Response:
     )
 
 
-def test_disabled_maintenance_settles_and_unblocks_revision(
-    maintenance_successor: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client, _sink, published, repair_id, _pull = maintenance_successor
+def _queue_maintenance_revision(
+    client: Any, published: dict[str, Any], repair_id: uuid.UUID
+) -> uuid.UUID:
     revision_id = uuid.uuid4()
 
     async def queue_revision() -> None:
@@ -2409,6 +2411,21 @@ def test_disabled_maintenance_settles_and_unblocks_revision(
     _, repair, revision = _all(published["number"])
     assert (repair["id"], repair["status"]) == (repair_id, "waiting")
     assert (revision["id"], revision["status"]) == (revision_id, "queued")
+    return revision_id
+
+
+def _assert_maintenance_spent(published: dict[str, Any]) -> None:
+    assert _rows(
+        "SELECT repairs_used FROM curie.factory_maintenance_lineages WHERE work_item_id = :id",
+        {"id": published["work_item_id"]},
+    ) == [{"repairs_used": 1}]
+
+
+def test_disabled_maintenance_settles_and_unblocks_revision(
+    maintenance_successor: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _sink, published, repair_id, _pull = maintenance_successor
+    revision_id = _queue_maintenance_revision(client, published, repair_id)
 
     settings = get_settings()
     monkeypatch.setattr(settings, "factory_maintenance_repair_enabled", False)
@@ -2422,44 +2439,118 @@ def test_disabled_maintenance_settles_and_unblocks_revision(
         f"/work-items/{published['work_item_id']}", headers={"X-API-Key": settings.api_key}
     )
     assert view.is_success, view.text
-    assert next(
-        request for request in view.json()["requests"] if request["sequence"] == 2
-    )["terminal_cause"] == "maintenance_refused"
+    repair_view = next(request for request in view.json()["requests"] if request["sequence"] == 2)
+    assert repair_view["terminal_cause"] == "maintenance_refused"
     assert any(
         event["outcome"] == "repair_disabled" and event["repair_request_id"] == str(repair_id)
         for event in view.json()["maintenance_history"]
     )
-    assert _rows(
-        "SELECT repairs_used FROM curie.factory_maintenance_lineages WHERE work_item_id = :id",
-        {"id": published["work_item_id"]},
-    ) == [{"repairs_used": 1}]
+    _assert_maintenance_spent(published)
 
     _reconcile()
     _start_running(client, revision_id)
     assert _all(published["number"])[2]["status"] == "running"
 
 
-def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: Any) -> None:
-    client, _sink, published, repair_id, pull = maintenance_successor
-    pull["head"]["sha"] = HEAD_C
+def _assert_maintenance_deferred(client: Any, repair_id: uuid.UUID, *, reason: str) -> None:
     refused = _acquire_maintenance(client, repair_id)
     assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["code"] == "factory_start_failed"
+    assert refused.json()["detail"]["code"] == "not_dispatchable"
     assert _rows(
-        "SELECT status, terminal_cause, acquire_owner FROM curie.execution_requests WHERE id = :id",
+        "SELECT status, terminal_cause, acquire_owner, start_deferrals "
+        "FROM curie.execution_requests WHERE id = :id",
         {"id": repair_id},
-    ) == [{"status": "failed", "terminal_cause": "maintenance_refused", "acquire_owner": None}]
+    ) == [
+        {"status": "waiting", "terminal_cause": None, "acquire_owner": None, "start_deferrals": 0}
+    ]
     assert _rows(
         "SELECT outcome FROM curie.factory_maintenance_events WHERE repair_request_id = :id "
-        "AND outcome = 'foreign_head'",
-        {"id": repair_id},
-    ) == [{"outcome": "foreign_head"}]
+        "AND outcome = :reason",
+        {"id": repair_id, "reason": reason},
+    ) == [{"outcome": reason}]
 
+
+def _redispatch_maintenance(repair_id: uuid.UUID) -> None:
+    _execute(
+        "UPDATE curie.execution_requests SET dispatch_not_before = clock_timestamp() "
+        "WHERE id = :id",
+        {"id": repair_id},
+    )
+    _reconcile()
+    events = [turn["event_id"] for turn in _stream_turns()]
+    assert events.count(execute_event_id(repair_id, 1)) == 1
+    assert events.count(execute_event_id(repair_id, 2)) == 1
+
+
+def test_maintenance_acquire_refuses_a_foreign_pull_head(maintenance_successor: Any) -> None:
+    client, _sink, published, repair_id, pull = maintenance_successor
+    _reconcile()
+    pull["head"]["sha"] = HEAD_C
+    _assert_maintenance_deferred(client, repair_id, reason="foreign_head")
     pull["head"]["sha"] = HEAD_A
-    replay = _acquire_maintenance(client, repair_id)
-    assert replay.status_code == 409, replay.text
-    assert replay.json()["detail"]["code"] == "factory_start_failed"
-    assert _all(published["number"])[1]["terminal_cause"] == "maintenance_refused"
+    _redispatch_maintenance(repair_id)
+    _start_running(client, repair_id)
+    assert _all(published["number"])[1]["status"] == "running"
+    _assert_maintenance_spent(published)
+
+
+def test_maintenance_acquire_retries_when_forge_evidence_is_unavailable(
+    maintenance_successor: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _sink, published, repair_id, _pull = maintenance_successor
+    _reconcile()
+    _execute(
+        "UPDATE curie.execution_requests SET published_generation = NULL, "
+        "dispatch_owner = 'factory-dispatcher', "
+        "dispatch_lease_expires_at = clock_timestamp() + INTERVAL '1 minute' WHERE id = :id",
+        {"id": repair_id},
+    )
+    http_client = client.app.state.http_client
+    send = http_client.send
+    unavailable = True
+
+    async def fail_once(request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        nonlocal unavailable
+        if unavailable and request.url.path == f"/repos/{REPO}/pulls/{published['pr']}":
+            unavailable = False
+            raise httpx.ReadTimeout("forge unavailable", request=request)
+        return await send(request, **kwargs)
+
+    monkeypatch.setattr(http_client, "send", fail_once)
+    _assert_maintenance_deferred(client, repair_id, reason="evidence_unavailable")
+    _redispatch_maintenance(repair_id)
+    _start_running(client, repair_id)
+    assert _all(published["number"])[1]["status"] == "running"
+    _assert_maintenance_spent(published)
+
+
+def test_maintenance_acquire_settles_persistent_foreign_head_and_unblocks_revision(
+    maintenance_successor: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _sink, published, repair_id, pull = maintenance_successor
+    revision_id = _queue_maintenance_revision(client, published, repair_id)
+    monkeypatch.setattr(get_settings(), "work_item_backoff_base_seconds", 3600)
+    pull["head"]["sha"] = HEAD_C
+    _assert_maintenance_deferred(client, repair_id, reason="foreign_head")
+    assert _rows(
+        "SELECT r.dispatch_not_before - a.admitted_at AS retry_age "
+        "FROM curie.execution_requests r JOIN curie.factory_maintenance_admissions a "
+        "ON a.repair_request_id = r.id WHERE r.id = :id",
+        {"id": repair_id},
+    ) == [{"retry_age": timedelta(minutes=15)}]
+    _redispatch_maintenance(repair_id)
+
+    with _clock_offset(16 * 60):
+        refused = _acquire_maintenance(client, repair_id)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "factory_start_failed"
+    _, repair, revision = _all(published["number"])
+    assert (repair["status"], repair["terminal_cause"]) == ("failed", "maintenance_refused")
+    assert (revision["id"], revision["status"]) == (revision_id, "waiting")
+    _assert_maintenance_spent(published)
+    _reconcile()
+    _start_running(client, revision_id)
+    assert _all(published["number"])[2]["status"] == "running"
 
 
 def test_maintenance_publication_refuses_a_foreign_pull_head(maintenance_successor: Any) -> None:

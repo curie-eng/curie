@@ -1750,12 +1750,15 @@ successor. During admission, a matching failure on the base or missing
 evidence leaves the allowance available. A human push blocks admission with
 `foreign_head`.
 Restoring the recorded head allows reevaluation if the allowance is available.
-If Curie refuses an admitted successor at worker acquisition, it settles the
-request as `maintenance_refused` and records the specific reason in
-`maintenance_history`. This includes turning off maintenance repair while
-the successor waits. The admission already spent the lineage's allowance,
-and the next queued revision can proceed. A successful repair leaves the pull
-request open for review.
+At worker acquisition, Curie settles an admitted successor immediately if
+repair is disabled, the pull request is closed, its identity or base no longer
+matches, or conflict authority fails. A foreign head or unavailable forge
+evidence can clear on a retry of the same successor. If either refusal
+persists 15 minutes after admission, Curie settles the request at the next
+acquire. The request settles as `maintenance_refused` and records the specific
+reason in `maintenance_history`. Admission spent the lineage's allowance,
+and settlement lets the next queued revision proceed. A successful repair
+leaves the pull request open for review.
 
 #### Conflicts after the base branch advances
 
