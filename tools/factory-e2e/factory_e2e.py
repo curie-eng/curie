@@ -6939,14 +6939,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     scripted.add_argument(
         "--scenario",
-        choices=("publication", "facts", "jira-one-ticket", "learned-rules", "slack-steering"),
+        choices=(
+            "publication",
+            "facts",
+            "jira-one-ticket",
+            "learned-rules",
+            "slack-steering",
+            "slack-voice",
+        ),
         required=True,
         help=(
             "run issue-to-PR (with the one-ticket flow and the Slack progress card on the "
             "same install), admission facts, the one-ticket flow on a Jira-tracked ticket "
             "(the Jira stub as tracker), or the learned rule chain over three tickets "
             "(--transcript names the ticket A file; its -b and -c siblings sit beside it), "
-            "or prepublication and postpublication Slack guidance on one pull request"
+            "or Slack guidance on one pull request through text or a confirmed local voice clip"
         ),
     )
     scripted.add_argument(

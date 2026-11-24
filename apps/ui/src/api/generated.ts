@@ -1940,6 +1940,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channels/factory-slack/mapped-root": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Is Factory Slack Root
+         * @description Check whether a Socket Mode receiver's thread belongs to a factory run.
+         */
+        post: operations["is_factory_slack_root_channels_factory_slack_mapped_root_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/channels/token": {
         parameters: {
             query?: never;
@@ -3756,6 +3776,23 @@ export interface paths {
          *     driver's error carries the bound objective, which holds the Slack body.
          */
         post: operations["steer_factory_run_v1_internal_factory_slack_steer_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/factory-slack/voice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Voice Factory Run */
+        post: operations["voice_factory_run_v1_internal_factory_slack_voice_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -9629,6 +9666,23 @@ export interface components {
             /** Request Status */
             request_status?: string | null;
         };
+        /** FactorySlackVoiceOut */
+        FactorySlackVoiceOut: {
+            /** Disposition */
+            disposition?: ("queued" | "applied") | null;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "pending" | "draft" | "confirmed" | "rejected" | "refused";
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Replayed
+             * @default false
+             */
+            replayed?: boolean;
+        };
         /** FactoryWake */
         FactoryWake: {
             /** Adapter */
@@ -13326,6 +13380,15 @@ export interface components {
              * Format: uuid
              */
             provider_installation_id: string;
+        };
+        /** SlackRootIn */
+        SlackRootIn: {
+            /** Channel */
+            channel: string;
+            /** Channel Identity */
+            channel_identity: string;
+            /** Root Ts */
+            root_ts: string;
         };
         /**
          * SourceBindingConfig
@@ -19310,6 +19373,41 @@ export interface operations {
             };
         };
     };
+    is_factory_slack_root_channels_factory_slack_mapped_root_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SlackRootIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": boolean;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     mint_channel_token_channels_token_post: {
         parameters: {
             query?: never;
@@ -23016,6 +23114,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FactorySlackSteerOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    voice_factory_run_v1_internal_factory_slack_voice_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorySlackSteerIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactorySlackVoiceOut"];
                 };
             };
             /** @description Validation Error */

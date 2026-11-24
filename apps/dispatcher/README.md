@@ -393,6 +393,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_THREAD_CONTEXT_CACHE_PREFIX` | `curie:slack-root-context:` | Valkey key prefix for the cached thread-root answers (see *Replies in a thread this bot rooted*); change it only when two installs share one Valkey |
 | `CURIE_THREAD_CONTEXT_TTL_SECONDS` | `2592000` | how long a cached thread-root answer is kept, 30 days by default to match the idle transcript window; must be positive |
 | `CURIE_MENTION_RECEIPT_TTL_SECONDS` | `604800` | how long the receipt of a human mention in a channel thread is kept (Valkey key `curie:slack-mention-receipt:<delivery id>`, written once before the dedupe claim); the worker reads it to decide factory run steering, and a turn in a factory run thread whose receipt has expired is refused. 7 days by default; must be positive |
+| `FACTORY_VOICE_ENABLED` | `false` | enable native Socket Mode voice feedback for mapped factory threads. For a native clip or coded decision in an eligible thread, the dispatcher checks the mapping with the platform API before reserving a voice receipt. |
 | `CURIE_DM_CONTINUITY_MAX_MESSAGES` | `20` | how many earlier direct messages a top-level one to one direct message may quote; 0 turns the read off; allowed 0 through 40 |
 
 ### Boot preflights

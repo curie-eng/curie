@@ -863,7 +863,7 @@ class ScriptedRun:
             self.workdir / "github",
             recording,
             host=callback,
-            seed_tree=FIXTURE,
+            seed_tree=self.fixture_tree(),
             issue_file=ISSUE,
         )
         self.stub.start()
@@ -1187,6 +1187,9 @@ class ScriptedRun:
         """Whether a request no lane claims is answered from the run's transcript."""
 
         return True
+
+    def fixture_tree(self) -> Path:
+        return FIXTURE
 
     def before_install(self, registry_ref: str) -> None:
         """After the namespace and the app Secret exist, before ``helm install``."""
@@ -1988,7 +1991,7 @@ class ScriptedRun:
                 # A model audit entry carries the turn's input text. The Jira
                 # leg uploads its evidence publicly, so it records the count.
                 public = service is self.model and (
-                    self.jira_enabled() or self.args.scenario == "slack-steering"
+                    self.jira_enabled() or self.args.scenario in {"slack-steering", "slack-voice"}
                 )
                 self.evidence[field] = len(audit) if public else audit
                 port = service.port
@@ -2184,6 +2187,10 @@ def main(args: argparse.Namespace) -> int:
             from learned_rules_run import LearnedRulesRun
 
             run: ScriptedRun = LearnedRulesRun(args)
+        elif args.scenario == "slack-voice":
+            from slack_voice_run import SlackVoiceRun
+
+            run = SlackVoiceRun(args)
         elif args.scenario == "slack-steering":
             from slack_steering_run import SlackSteeringRun
 

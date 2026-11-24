@@ -20,6 +20,7 @@ substituted. Event shapes follow the current dispatcher fixtures.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from collections.abc import Iterator
@@ -33,6 +34,12 @@ from curie_channel_gateway.slack.app import build_app
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.identities import SlackIdentityCredentials, delivery_key
 from curie_channel_gateway.slack.identity import slack_evidence
+from curie_internal.slack_mention_receipt import (
+    FACTORY_VOICE_TURN,
+    SlackMentionReceipt,
+    voice_source_key,
+    write_receipt,
+)
 from curie_internal.turn_queue import from_stream_fields
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -47,6 +54,7 @@ PERSON = "U0EXAMPLE1"
 ROOT_TS = "1700000000.000100"
 REPLY_TS = "1700000000.000200"
 PLACEHOLDER_TS = "1700000000.000300"
+VOICE_ROOT = {"channel_identity": "default", "channel": CHANNEL, "root_ts": ROOT_TS}
 # CURIE_MENTION_RECEIPT_TTL_SECONDS default.
 RECEIPT_TTL_S = 604800
 ROOT_TEXT = "Factory run for acme-corp/acme-bot issue 41"
@@ -83,12 +91,21 @@ def delivered(redis_client: redis.Redis) -> Iterator[list[str]]:
     test uses fresh event ids and deletes exactly its own keys.
     """
 
-    prefix, _model = _steering()
+    prefix, model = _steering()
     ids: list[str] = []
     yield ids
     keys: list[str] = []
     for delivery_id in ids:
-        keys.extend(redis_client.scan_iter(f"{prefix}*{delivery_id}*"))
+        for key in redis_client.scan_iter(f"{prefix}*{delivery_id}*"):
+            keys.append(key)
+            receipt = model.model_validate_json(redis_client.get(key))
+            if receipt.version == 3:
+                keys.append(
+                    voice_source_key(
+                        receipt.channel_identity, receipt.team_id, receipt.api_app_id,
+                        receipt.channel, receipt.root_ts, receipt.message_ts,
+                    )
+                )
     if keys:
         redis_client.delete(*keys)
 
@@ -420,14 +437,22 @@ def test_a_redelivery_neither_enqueues_again_nor_overwrites_the_receipt(
     assert _stored(redis_client, delivery_id) == first
 
 
+@pytest.mark.parametrize("voice", [False, True], ids=["text", "voice"])
 def test_an_http_selected_mention_writes_no_receipt(
+    voice: bool,
     redis_client: redis.Redis,
     config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
     delivered: list[str],
 ) -> None:
     """A selected app_mention is still submitted, and it leaves no receipt."""
 
     body, event = native()
+    if voice:
+        config = config.model_copy(update={"factory_voice_enabled": True})
+        event["files"] = [{**_hosted_clip(), "user": event["user"]}]
+        event["subtype"] = "file_share"
+        body["api_app_id"] = "A0EXAMPLE1"
     event_id = _event_id()
     body = {**body, "event_id": event_id}
     delivery_id = delivery_key(event_id, NAME)
@@ -479,6 +504,7 @@ def test_an_http_selected_mention_writes_no_receipt(
     assert redis_client.exists(config.dedupe_key(delivery_id)) == 0
     prefix, _model = _steering()
     assert list(redis_client.scan_iter(f"{prefix}*{event_id}*")) == []
+    assert admission_api.mapped_root_requests == []
     rig.closed()
 
 
@@ -514,3 +540,532 @@ def test_a_receipt_write_failure_claims_nothing_and_a_later_delivery_still_lands
     assert escaped_root not in receipt.body
     ttl = redis_client.ttl(_receipt_key(delivery_id))
     assert 0 < ttl <= RECEIPT_TTL_S
+
+
+def _hosted_clip() -> dict[str, Any]:
+    # Slack documents these fields at https://docs.slack.dev/reference/objects/file-object/.
+    # The slack_audio subtype and audio MIME combination is a local replay assumption.
+    return {
+        "id": "F0EXAMPLE1",
+        "mode": "hosted",
+        "subtype": "slack_audio",
+        "name": "example.m4a",
+        "mimetype": "audio/mp4",
+        "is_external": False,
+        "user": PERSON,
+        "user_team": "T1",
+        "url_private": "https://files.example.com/private",
+        "transcription": {"text": "untrusted file metadata"},
+    }
+
+
+def _voice_envelope(event_id: str) -> dict[str, Any]:
+    # https://docs.slack.dev/reference/events/app_mention/ shows the outer app and workspace
+    # IDs and the literal bot user mention in the nested event's text.
+    event = _mention("  <@U0BOT>  café  ")
+    seconds, micros = divmod(int(event_id[-10:], 16), 1_000_000)
+    event.update(
+        ts=f"{1700000001 + seconds}.{micros:06d}", user_team="T1", team="T1",
+        files=[_hosted_clip()],
+    )
+    return {
+        **_body(event_id, event),
+        "api_app_id": "A0EXAMPLE1",
+        "team_id": "T1",
+        "is_ext_shared_channel": False,
+        "authorizations": [{"is_bot": True, "team_id": "T1", "user_id": "U0BOT"}],
+    }
+
+
+@pytest.fixture
+def mapped_voice_config(
+    config: DispatcherConfig, admission_api: FakeAdmissionApi,
+) -> DispatcherConfig:
+    admission_api.mapped_roots.add(("default", CHANNEL, ROOT_TS))
+    return config.model_copy(update={"factory_voice_enabled": True})
+
+
+def test_factory_voice_ingress_uses_the_default_off_environment_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FACTORY_VOICE_ENABLED", raising=False)
+    assert not DispatcherConfig(approval_chat_attester_secret="test-secret").factory_voice_enabled
+    monkeypatch.setenv("FACTORY_VOICE_ENABLED", "true")
+    assert DispatcherConfig(approval_chat_attester_secret="test-secret").factory_voice_enabled
+
+
+@pytest.mark.parametrize("file_share", [False, True], ids=["mention", "file_share"])
+def test_native_voice_receipt_binds_original_file_and_text_digest_on_replay(
+    redis_client: redis.Redis,
+    mapped_voice_config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+    file_share: bool,
+) -> None:
+    config = mapped_voice_config
+    admission_api.mapped_roots.add((NAMED.name, CHANNEL, ROOT_TS))
+    event_id = _event_id()
+    delivery_id = delivery_key(event_id, NAMED.name)
+    delivered.append(delivery_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    if file_share:
+        event["subtype"] = "file_share"
+    _deliver(config, redis_client, event_id, event, identity=NAMED, payload=body)
+
+    receipt = _stored(redis_client, delivery_id)
+    assert receipt.model_dump() == {
+        "version": 3,
+        "delivery_id": delivery_id,
+        "channel_identity": NAMED.name,
+        "channel": CHANNEL,
+        "root_ts": ROOT_TS,
+        "message_ts": event["ts"],
+        "user_id": PERSON,
+        "body": "",
+        "evidence": slack_evidence(body),
+        "voice_file_id": "F0EXAMPLE1",
+        "api_app_id": "A0EXAMPLE1",
+        "team_id": "T1",
+        "content_sha256": hashlib.sha256(event["text"].encode()).hexdigest(),
+    }
+    assert 0 < redis_client.ttl(_receipt_key(delivery_id)) <= RECEIPT_TTL_S
+    event["files"][0]["id"] = "F0EXAMPLE2"
+    event["text"] = "<@U0BOT> changed"
+    _deliver(config, redis_client, event_id, event, identity=NAMED, payload=body)
+
+    assert _stored(redis_client, delivery_id) == receipt
+    (queued,) = _queued(redis_client, config)
+    assert queued.event_id == delivery_id
+    assert queued.text == FACTORY_VOICE_TURN
+    assert queued.attachments == []
+    assert admission_api.mapped_root_requests == [dict(VOICE_ROOT, channel_identity=NAMED.name)] * 2
+    assert admission_api.mapped_root_headers == [config.api_key] * 2
+
+
+def test_an_indexed_voice_source_only_mints_its_original_delivery(
+    redis_client: redis.Redis,
+    mapped_voice_config: DispatcherConfig,
+    delivered: list[str],
+) -> None:
+    event_id, other_event_id = _event_id(), _event_id()
+    delivered.extend((event_id, other_event_id))
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    evidence = slack_evidence(body)
+    assert evidence is not None
+    receipt = SlackMentionReceipt(
+        version=3,
+        delivery_id=event_id,
+        channel_identity="default",
+        channel=CHANNEL,
+        root_ts=ROOT_TS,
+        message_ts=event["ts"],
+        user_id=PERSON,
+        body="",
+        evidence=evidence,
+        voice_file_id="F0EXAMPLE1",
+        api_app_id="A0EXAMPLE1",
+        team_id="T1",
+        content_sha256=hashlib.sha256(event["text"].encode()).hexdigest(),
+    )
+    assert write_receipt(redis_client, receipt, ttl_s=RECEIPT_TTL_S)
+
+    post, _ = _deliver(
+        mapped_voice_config, redis_client, other_event_id, event,
+        payload={**body, "event_id": other_event_id},
+    )
+
+    post.assert_not_called()
+    assert _queued(redis_client, mapped_voice_config) == []
+    assert redis_client.get(_receipt_key(other_event_id)) is None
+    assert redis_client.exists(mapped_voice_config.dedupe_key(other_event_id)) == 0
+
+    post, _ = _deliver(mapped_voice_config, redis_client, event_id, event, payload=body)
+
+    post.assert_called_once()
+    (queued,) = _queued(redis_client, mapped_voice_config)
+    assert queued.event_id == event_id
+    assert queued.text == FACTORY_VOICE_TURN
+    assert queued.attachments == []
+    assert _stored(redis_client, event_id) == receipt
+
+
+@pytest.mark.parametrize(
+    ("event_fields", "file_fields", "body_fields"),
+    [
+        pytest.param({"text": "<@U0OTHER> hello"}, {}, {}, id="different_app_mentioned"),
+        pytest.param(
+            {
+                "text": "",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "<@U0BOT>",
+                        },
+                    }
+                ],
+            },
+            {},
+            {},
+            id="derived_mention_only",
+        ),
+        pytest.param({}, {"id": ""}, {}, id="missing_file_id"),
+        pytest.param({}, {"id": "not-a-slack-file-id"}, {}, id="malformed_file_id"),
+        pytest.param({}, {"user": "U0OTHER"}, {}, id="another_uploader"),
+        pytest.param({}, {"user_team": "T0OTHER"}, {}, id="another_file_workspace"),
+        pytest.param({}, {"bot_user_id": "U0OTHER"}, {}, id="bot_uploaded_file"),
+        pytest.param({}, {"is_tombstoned": True}, {}, id="tombstoned_file"),
+        pytest.param({}, {"is_external": True}, {}, id="external_file"),
+        pytest.param({}, {"mode": "external"}, {}, id="external_mode"),
+        pytest.param({}, {"file_access": "check_file_info"}, {}, id="inaccessible_file"),
+        pytest.param({}, {"mimetype": "video/mp4"}, {}, id="ambiguous_media"),
+        pytest.param({}, {"mimetype": "audio/"}, {}, id="malformed_audio_type"),
+        pytest.param({"files": [_hosted_clip(), _hosted_clip()]}, {}, {}, id="two_files"),
+        pytest.param({"files": [_hosted_clip(), None]}, {}, {}, id="malformed_file_list"),
+        pytest.param({}, {}, {"api_app_id": None}, id="missing_receiving_app"),
+        pytest.param({}, {}, {"api_app_id": "malformed-app"}, id="malformed_receiving_app"),
+        pytest.param({}, {}, {"team_id": None}, id="missing_receiving_workspace"),
+        pytest.param({}, {}, {"team_id": "T0OTHER"}, id="other_receiving_workspace"),
+        pytest.param(
+            {},
+            {},
+            {
+                "authorizations": [
+                    {"is_bot": True, "team_id": "T1", "user_id": "U0OTHER"},
+                ]
+            },
+            id="other_receiving_bot",
+        ),
+    ],
+)
+def test_mapped_invalid_voice_mention_refuses_before_writing_receipt_or_turn(
+    redis_client: redis.Redis,
+    mapped_voice_config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+    event_fields: dict[str, Any],
+    file_fields: dict[str, Any],
+    body_fields: dict[str, Any],
+) -> None:
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    event["files"][0].update(file_fields)
+    event.update(event_fields)
+    body.update(body_fields)
+
+    post, _ = _deliver(
+        mapped_voice_config, redis_client, event_id, event, payload=body,
+    )
+
+    assert admission_api.mapped_root_requests == [VOICE_ROOT]
+    post.assert_not_called()
+    assert redis_client.get(_receipt_key(event_id)) is None
+    assert redis_client.exists(mapped_voice_config.dedupe_key(event_id)) == 0
+    assert _queued(redis_client, mapped_voice_config) == []
+
+
+def test_refused_voice_caller_gets_no_receipt_or_turn(
+    redis_client: redis.Redis,
+    mapped_voice_config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+) -> None:
+    event_id = _event_id()
+    delivered.append(event_id)
+    admission_api.lists[(CHANNEL, "default")] = {"U0OTHER"}
+    body = _voice_envelope(event_id)
+    post, _ = _deliver(mapped_voice_config, redis_client, event_id, body["event"], payload=body)
+
+    assert admission_api.mapped_root_requests == []
+    post.assert_not_called()
+    assert redis_client.get(_receipt_key(event_id)) is None
+    assert not _queued(redis_client, mapped_voice_config)
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled_unmapped"])
+@pytest.mark.parametrize("decision", [False, True], ids=["clip", "coded_decision"])
+def test_disabled_or_unmapped_native_voice_candidate_keeps_ordinary_turn(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+    enabled: bool,
+    decision: bool,
+) -> None:
+    config = config.model_copy(update={"factory_voice_enabled": enabled})
+    if not enabled:
+        admission_api.mapped_roots.add(("default", CHANNEL, ROOT_TS))
+        admission_api.mapped_root_status = 503
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    event["parent_user_id"] = PERSON
+    if decision:
+        del event["files"]
+        event["text"] = "  <@U0BOT>  edit abcdef012345.4  Keep the timeout.  "
+    post, _ = _deliver(config, redis_client, event_id, event, payload=body)
+
+    assert admission_api.mapped_root_requests == ([VOICE_ROOT] if enabled else [])
+    post.assert_called_once()
+    receipt = _stored(redis_client, event_id)
+    assert (receipt.version, receipt.body) == (1, event["text"])
+    assert receipt.voice_file_id is None and receipt.bot_user_id is None
+    (queued,) = _queued(redis_client, config)
+    if decision:
+        assert queued.text == "edit abcdef012345.4  Keep the timeout."
+        assert queued.attachments == []
+    else:
+        assert queued.text == "café"
+        assert [(a.id, a.name, a.mime_type) for a in queued.attachments] == [
+            ("F0EXAMPLE1", "example.m4a", "audio/mp4")
+        ]
+
+
+@pytest.mark.parametrize("threaded", [False, True], ids=["top_level", "mapped_thread"])
+@pytest.mark.parametrize("case", ["native_clip", "typeless_restricted_file", "literal_confirm"])
+def test_disabled_factory_voice_keeps_ordinary_receipt_and_turn(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+    threaded: bool,
+    case: str,
+) -> None:
+    config = config.model_copy(update={"factory_voice_enabled": False})
+    admission_api.mapped_roots.add(("default", CHANNEL, ROOT_TS))
+    admission_api.mapped_root_status = 503
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    event["parent_user_id"] = PERSON
+    expected_text = "café"
+    expected_refs = [("F0EXAMPLE1", "example.m4a", "audio/mp4")]
+    if case == "typeless_restricted_file":
+        event["files"] = [
+            {"id": "F0EXAMPLE2", "name": "notes.txt", "file_access": "check_file_info"}
+        ]
+        expected_refs = [("F0EXAMPLE2", "notes.txt", None)]
+    elif case == "literal_confirm":
+        del event["files"]
+        expected_text = "confirm abcdef012345.4"
+        event["text"] = f"<@U0BOT> {expected_text}"
+        expected_refs = []
+    if not threaded:
+        del event["thread_ts"]
+        if case != "literal_confirm":
+            expected_text = f"{expected_text} {ISSUE_LINK}"
+            event["text"] = f"<@U0BOT> {expected_text}"
+    post, _ = _deliver(config, redis_client, event_id, event, payload=body)
+
+    (queued,) = _queued(redis_client, config)
+    assert queued.text == expected_text
+    assert [(a.id, a.name, a.mime_type) for a in queued.attachments] == expected_refs
+    if threaded or case != "literal_confirm":
+        receipt = _stored(redis_client, event_id)
+        assert (receipt.version, receipt.body) == (1, event["text"])
+        assert receipt.voice_file_id is None and receipt.bot_user_id is None
+    else:
+        assert redis_client.get(_receipt_key(event_id)) is None
+    assert admission_api.mapped_root_requests == []
+    post.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("files", "expected_refs"),
+    [
+        pytest.param([{}], [], id="incomplete_file_object"),
+        pytest.param({"id": "F0EXAMPLE2"}, [], id="malformed_file_list"),
+        pytest.param(
+            [None, {"id": "F0EXAMPLE2", "name": "notes.txt", "mimetype": "text/plain"}],
+            [("F0EXAMPLE2", "notes.txt", "text/plain")],
+            id="malformed_entry_with_valid_document",
+        ),
+        pytest.param(
+            [{"id": "F0EXAMPLE2", "name": "notes.txt", "file_access": "check_file_info"}],
+            [("F0EXAMPLE2", "notes.txt", None)],
+            id="restricted_typeless_document",
+        ),
+        pytest.param(
+            [{"id": "F0EXAMPLE2", "name": "notes.bin", "mimetype": 17}],
+            [("F0EXAMPLE2", "notes.bin", None)],
+            id="malformed_mime_type",
+        ),
+        pytest.param(
+            [{"id": "F0EXAMPLE2", "name": "example.m4a", "mimetype": "audio/mp4"}],
+            [("F0EXAMPLE2", "example.m4a", "audio/mp4")],
+            id="ordinary_audio_upload",
+        ),
+        pytest.param(
+            [
+                {"id": "F0EXAMPLE2", "name": "example.mp4", "mimetype": "video/mp4",
+                 "audio_wave_samples": [1], "media_display_type": "audio"}
+            ],
+            [("F0EXAMPLE2", "example.mp4", "video/mp4")],
+            id="display_and_wave_metadata",
+        ),
+    ],
+)
+def test_ordinary_upload_keeps_its_receipt_and_turn_with_voice_enabled(
+    redis_client: redis.Redis,
+    mapped_voice_config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+    files: Any,
+    expected_refs: list[tuple[str, str, str | None]],
+) -> None:
+    admission_api.mapped_root_status = 503
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    event.update(files=files, parent_user_id=PERSON)
+    post, _ = _deliver(mapped_voice_config, redis_client, event_id, event, payload=body)
+
+    assert admission_api.mapped_root_requests == []
+    post.assert_called_once()
+    receipt = _stored(redis_client, event_id)
+    assert (receipt.version, receipt.body) == (1, event["text"])
+    assert receipt.voice_file_id is None and receipt.bot_user_id is None
+    (queued,) = _queued(redis_client, mapped_voice_config)
+    assert queued.text == "café"
+    assert [(a.id, a.name, a.mime_type) for a in queued.attachments] == expected_refs
+
+
+@pytest.mark.parametrize(
+    ("event_fields", "ordinary_receipt"),
+    [
+        pytest.param({"thread_ts": None, "text": f"<@U0BOT> {ISSUE_LINK}"}, True, id="root"),
+        pytest.param({"thread_ts": "message_ts"}, False, id="echoed_root"),
+        pytest.param({"type": "message", "channel_type": "im", "channel": "D0EXAMPLE1"},
+                     False, id="direct_message"),
+        pytest.param({"channel_type": "mpim"}, True, id="multiparty_dm"),
+        pytest.param({"app_id": "A0EXAMPLE2"}, True, id="app_sender"),
+        pytest.param({"bot_id": "B0EXAMPLE2"}, False, id="sibling_bot"),
+        pytest.param({"subtype": "thread_broadcast"}, False, id="broadcast"),
+    ],
+)
+def test_voice_looking_content_outside_channel_thread_keeps_ordinary_turn(
+    redis_client: redis.Redis,
+    mapped_voice_config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+    event_fields: dict[str, Any],
+    ordinary_receipt: bool,
+) -> None:
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    event.update(parent_user_id=PERSON, **event_fields)
+    if event["thread_ts"] == "message_ts":
+        event["thread_ts"] = event["ts"]
+    post, _ = _deliver(
+        mapped_voice_config, redis_client, event_id, event, payload=body,
+        identity_bots={"B0EXAMPLE2": "U0OTHER"},
+    )
+
+    assert admission_api.mapped_root_requests == []
+    post.assert_called_once()
+    if ordinary_receipt:
+        receipt = _stored(redis_client, event_id)
+        assert (receipt.version, receipt.body) == (1, event["text"])
+        assert receipt.voice_file_id is None and receipt.bot_user_id is None
+    else:
+        assert redis_client.get(_receipt_key(event_id)) is None
+    (queued,) = _queued(redis_client, mapped_voice_config)
+    assert queued.text == event["text"].replace("<@U0BOT>", "").strip()
+    assert [(a.id, a.name, a.mime_type) for a in queued.attachments] == [
+        ("F0EXAMPLE1", "example.m4a", "audio/mp4")
+    ]
+
+
+@pytest.mark.parametrize("case", ["verified", "wrong_receiver", "malformed_app", "with_file"])
+def test_native_draft_decision_requires_a_valid_receipt_before_queuing_marker(
+    redis_client: redis.Redis,
+    mapped_voice_config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+    case: str,
+) -> None:
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    del event["files"]
+    event["text"] = "<@U0BOT> edit abcdef012345.4  Keep <@U0OTHER> & the timeout."
+    if case == "wrong_receiver":
+        body["authorizations"][0]["user_id"] = "U0OTHER"
+    elif case == "malformed_app":
+        body["api_app_id"] = "malformed-app"
+    elif case == "with_file":
+        event["files"] = [{"id": "F0EXAMPLE2", "name": "notes.txt", "mimetype": "text/plain"}]
+    post, _ = _deliver(mapped_voice_config, redis_client, event_id, event, payload=body)
+
+    assert admission_api.mapped_root_requests == [VOICE_ROOT]
+    if case != "verified":
+        post.assert_not_called()
+        assert redis_client.get(_receipt_key(event_id)) is None
+        assert redis_client.exists(mapped_voice_config.dedupe_key(event_id)) == 0
+        assert _queued(redis_client, mapped_voice_config) == []
+    else:
+        post.assert_called_once()
+        (queued,) = _queued(redis_client, mapped_voice_config)
+        assert queued.text == FACTORY_VOICE_TURN
+        assert queued.attachments == []
+        receipt = _stored(redis_client, event_id)
+        assert receipt.version == 1
+        assert receipt.body == event["text"]
+        assert (receipt.api_app_id, receipt.team_id, receipt.bot_user_id) == (
+            "A0EXAMPLE1",
+            "T1",
+            "U0BOT",
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "response"),
+    [
+        pytest.param(503, b"true", id="outage"),
+        pytest.param(404, b"false", id="missing_route"),
+        pytest.param(200, b"null", id="null"),
+        pytest.param(200, b'"false"', id="string"),
+        pytest.param(200, b"not json", id="invalid_json"),
+    ],
+)
+def test_unavailable_voice_mapping_refuses_before_receipt_or_dedupe(
+    redis_client: redis.Redis,
+    mapped_voice_config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    delivered: list[str],
+    status: int,
+    response: bytes,
+) -> None:
+    admission_api.mapped_root_status = status
+    admission_api.mapped_root_body = response
+    event_id = _event_id()
+    delivered.append(event_id)
+    body = _voice_envelope(event_id)
+    event = body["event"]
+    post, _ = _deliver(mapped_voice_config, redis_client, event_id, event, payload=body)
+
+    assert admission_api.mapped_root_requests == [VOICE_ROOT]
+    post.assert_not_called()
+    assert redis_client.get(_receipt_key(event_id)) is None
+    assert redis_client.exists(mapped_voice_config.dedupe_key(event_id)) == 0
+    assert _queued(redis_client, mapped_voice_config) == []
+
+    admission_api.mapped_root_status = 200
+    admission_api.mapped_root_body = None
+    _deliver(mapped_voice_config, redis_client, event_id, event, payload=body)
+    assert admission_api.mapped_root_requests == [VOICE_ROOT] * 2
+    (queued,) = _queued(redis_client, mapped_voice_config)
+    assert queued.text == FACTORY_VOICE_TURN
+    assert queued.attachments == []
+    assert _stored(redis_client, event_id).version == 3

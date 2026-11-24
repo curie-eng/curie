@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Final, Literal, Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
+from curie_internal.factory_voice_reply import VOICE_REPLY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .factory_confirmed_steering import (
@@ -97,13 +97,9 @@ class VoiceReply:
     action: Action
 
 
-_DRAFT_CODE: Final = r"[0-9a-f]{12}\.[1-9][0-9]{0,8}"
-_VOICE_REPLY = re.compile(rf"(confirm|reject|edit) ({_DRAFT_CODE})(?: (.*))?", re.DOTALL)
-
-
 def parse_voice_reply(text: str) -> VoiceReply | Refused | None:
     """Parse the complete reply after the adapter removes its verified mention."""
-    match = _VOICE_REPLY.fullmatch(text)
+    match = VOICE_REPLY.fullmatch(text)
     if match is None:
         return None
     verb, code, body = match.groups()

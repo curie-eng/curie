@@ -8,9 +8,12 @@ import hmac
 import json
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlsplit
+from uuid import UUID
 
 import httpx
 from aci_protocol.turn import SLACK_KIND, slack_speaking_identity
@@ -69,6 +72,16 @@ from .request_replay import (
     request_headers,
 )
 from .slack.files import FileResponse, SlackFileError
+from .slack.voice import (
+    MAX_VOICE_BYTES,
+    VOICE_ERROR_STATUS,
+    SlackVoiceGateway,
+    VoiceClipSource,
+    VoiceDraftPost,
+)
+from .slack.voice import (
+    SlackVoiceReadError as SlackVoiceReadError,
+)
 from .user_email_models import UserEmailLookupError, UserEmailUnknown
 
 MAX_FILE_BYTES = 32 * 1024 * 1024
@@ -87,6 +100,8 @@ _API_OPERATIONS = frozenset(
         "replace_cell",
         "account_profile",
         "public_channel",
+        "read_voice_clip",
+        "post_voice_draft",
     }
 )
 _WORKER_OPERATIONS = frozenset({"identity_of", "fetch", "reply", "public_reply"})
@@ -197,6 +212,7 @@ class GatewayProviders:
     senders: SenderIdentities | None = None
     emails: UserEmailSource | None = None
     profiles: AccountProfiles | None = None
+    voice: SlackVoiceGateway | None = None
 
 
 def gateway_application(
@@ -339,7 +355,28 @@ def gateway_application(
             )
         return reply_response(await asyncio.shield(active_replies[key]))
 
-    async def receive(request: web.Request) -> web.Response:
+    async def voice(request: web.Request, identity: str, operation: str) -> web.StreamResponse:
+        if ports.voice is None:
+            raise SlackVoiceReadError("unavailable")
+        if operation == "post_voice_draft":
+            draft = VoiceDraftPost.model_validate_json(await request.read())
+            await ports.voice.post(identity, draft)
+            return web.Response(status=204, headers={"Cache-Control": "no-store"})
+        source = VoiceClipSource.model_validate_json(await request.read())
+        if file_capacity.locked():
+            raise SlackVoiceReadError("unavailable")
+        async with file_capacity:
+            clip = await ports.voice.read(identity, source, min(max_file_bytes, MAX_VOICE_BYTES))
+            response = web.StreamResponse(
+                headers={"Content-Type": clip.mime_type, "Cache-Control": "no-store"}
+            )
+            response.content_length = len(clip.data)
+            await response.prepare(request)
+            await response.write(clip.data)
+            await response.write_eof()
+            return response
+
+    async def receive(request: web.Request) -> web.StreamResponse:
         identity = request.match_info["identity"]
         operation = request.match_info["operation"]
         if operation in {"reply", "public_reply"}:
@@ -347,6 +384,8 @@ def gateway_application(
         result: Any
         adapter: TypeAdapter[Any]
         try:
+            if operation in {"read_voice_clip", "post_voice_draft"}:
+                return await voice(request, identity, operation)
             params = _Parameters.model_validate_json(await request.read())
             arguments = params.model_dump(exclude_unset=True)
             # Preserve typed dataclasses when calling the frozen ports.
@@ -432,6 +471,8 @@ def gateway_application(
             return web.Response(body=body, content_type="application/json")
         except (ValidationError, ValueError, TypeError):
             raise web.HTTPBadRequest(text="invalid gateway request") from None
+        except SlackVoiceReadError as exc:
+            return web.json_response({"error": exc.reason}, status=VOICE_ERROR_STATUS[exc.reason])
         except ChannelReadRefused as exc:
             # Only the bounded refusal vocabulary crosses the transport.
             return web.json_response(
@@ -544,19 +585,25 @@ class GatewayClient:
         self._senders: dict[str, str] = {}
         self._sender_tasks: dict[str, asyncio.Task[None]] = {}
 
+    def signed_post(
+        self, identity: str, operation: str, body: bytes, *, timeout: float | None = None
+    ) -> AbstractAsyncContextManager[httpx.Response]:
+        url = f"{self.endpoint}/v1/gateway/{quote(identity, safe='')}/{operation}"
+        return self.http.stream(
+            "POST",
+            url,
+            content=body,
+            headers=request_headers(self._token, "POST", url, body),
+            timeout=self.http.timeout if timeout is None else timeout,
+            follow_redirects=False,
+        )
+
     async def call[T](
         self, identity: str, operation: str, params: Mapping[str, Any], result: TypeAdapter[T]
     ) -> T:
-        url = f"{self.endpoint}/v1/gateway/{quote(identity, safe='')}/{operation}"
         body_bytes = TypeAdapter(dict[str, Any]).dump_json(dict(params))
         try:
-            async with self.http.stream(
-                "POST",
-                url,
-                headers=request_headers(self._token, "POST", url, body_bytes),
-                content=body_bytes,
-                follow_redirects=False,
-            ) as response:
+            async with self.signed_post(identity, operation, body_bytes) as response:
                 body = bytearray()
                 async for chunk in response.aiter_bytes():
                     if len(body) + len(chunk) > MAX_RESULT_BYTES:
@@ -611,6 +658,112 @@ class GatewayClient:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _check_voice_status(response: httpx.Response, expected: int) -> None:
+    if response.status_code == expected:
+        return
+    if response.status_code in VOICE_ERROR_STATUS.values() and not response.headers.get(
+        "content-encoding"
+    ):
+        body = bytearray()
+        async for chunk in response.aiter_bytes(256):
+            if len(body) + len(chunk) > 256:
+                raise SlackVoiceReadError("unavailable")
+            body.extend(chunk)
+        try:
+            answer = json.loads(body)
+        except (ValueError, RecursionError):
+            raise SlackVoiceReadError("unavailable") from None
+        for reason, status in VOICE_ERROR_STATUS.items():
+            if response.status_code == status and answer == {"error": reason}:
+                raise SlackVoiceReadError(reason)
+    raise SlackVoiceReadError("unavailable")
+
+
+async def read_voice_clip(
+    client: GatewayClient,
+    *,
+    identity: str,
+    team_id: str,
+    app_id: str,
+    channel: str,
+    root_ts: str,
+    message_ts: str,
+    author: str,
+    file_id: str,
+    content_sha256: str,
+) -> tuple[str, bytes]:
+    try:
+        source = VoiceClipSource(
+            team_id=team_id,
+            app_id=app_id,
+            channel=channel,
+            root_ts=root_ts,
+            message_ts=message_ts,
+            author=author,
+            file_id=file_id,
+            content_sha256=content_sha256,
+        )
+        async with client.signed_post(
+            identity, "read_voice_clip", source.model_dump_json().encode(), timeout=65.0
+        ) as response:
+            await _check_voice_status(response, 200)
+            mime = response.headers.get("content-type", "")
+            if not mime.startswith("audio/") or response.headers.get("content-encoding"):
+                raise SlackVoiceReadError("invalid_media")
+            body = bytearray()
+            async for chunk in response.aiter_bytes(64 * 1024):
+                if len(chunk) > MAX_VOICE_BYTES - len(body):
+                    raise SlackVoiceReadError("media_limit")
+                body.extend(chunk)
+            if not body:
+                raise SlackVoiceReadError("invalid_media")
+            return mime, bytes(body)
+    except ValidationError:
+        raise SlackVoiceReadError("source_changed") from None
+    except httpx.HTTPError:
+        raise SlackVoiceReadError("unavailable") from None
+
+
+async def post_voice_draft(
+    client: GatewayClient,
+    *,
+    identity: str,
+    team_id: str,
+    app_id: str,
+    channel: str,
+    root_ts: str,
+    message_ts: str,
+    author: str,
+    file_id: str,
+    content_sha256: str,
+    text: str,
+    delivery_id: UUID,
+    expires_at: datetime | None,
+) -> None:
+    try:
+        draft = VoiceDraftPost(
+            team_id=team_id,
+            app_id=app_id,
+            channel=channel,
+            root_ts=root_ts,
+            message_ts=message_ts,
+            author=author,
+            file_id=file_id,
+            content_sha256=content_sha256,
+            text=text,
+            delivery_id=delivery_id,
+            expires_at=expires_at,
+        )
+        async with client.signed_post(
+            identity, "post_voice_draft", draft.model_dump_json().encode(), timeout=35.0
+        ) as response:
+            await _check_voice_status(response, 204)
+    except ValidationError:
+        raise SlackVoiceReadError("source_changed") from None
+    except httpx.HTTPError:
+        raise SlackVoiceReadError("unavailable") from None
 
 
 class RemoteGroups:

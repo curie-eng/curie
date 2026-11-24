@@ -302,6 +302,10 @@
       "value": "curie:kill-events",
       "reason": "Canonical shared internal wire key declaration"
     },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:20": {
+      "value": "curie:slack-voice-source:",
+      "reason": "Canonical shared internal wire key declaration"
+    },
     "packages/curie-internal/src/curie_internal/keyspace.py:module:3": {
       "value": "curie:worker",
       "reason": "Canonical shared internal wire key declaration"

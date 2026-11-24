@@ -424,6 +424,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/identity/binding-classification/check",
     "/channel-read",
     "/channels/admission",
+    "/channels/factory-slack/mapped-root",
     "/channels/token",
     "/channels/turns",
     "/channels/turns/admission",
@@ -576,6 +577,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
     # Factory Slack run steering (#5414) and kickoff (#5380).
     "/v1/internal/factory-slack/steer",
+    "/v1/internal/factory-slack/voice",
     "/v1/internal/factory-slack/kickoff",
     "/v1/internal/factory-slack/publication/{work_item_id}",
     "/v1/internal/channel-read/context",

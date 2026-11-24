@@ -47,6 +47,7 @@ from .db import (
     create_voice_retention_engine,
 )
 from .evalqueue import EvalQueue
+from .factory_slack_voice import build_slack_voice, stop_pump
 from .factory_voice_retention import purge_expired_drafts
 from .forges.registry import forges_registry
 from .github_app import credentials_for, log_credential_path
@@ -417,6 +418,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         protected_reconciler.start()
         from .github_factory_review import github_voice_runtime
 
+        slack_voice = build_slack_voice(settings, app.state.sessionmaker, valkey, http_client)
+        app.state.factory_slack_voice = slack_voice
+        voice_task = asyncio.create_task(slack_voice.pump()) if slack_voice is not None else None
         voice_purge = asyncio.create_task(
             purge_expired_drafts(
                 create_voice_retention_engine(), enabled=settings.factory_voice_enabled
@@ -428,6 +432,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.github_voice = voice
                 yield
         finally:
+            await stop_pump(voice_task)
             voice_purge.cancel()
             with suppress(asyncio.CancelledError):
                 await voice_purge

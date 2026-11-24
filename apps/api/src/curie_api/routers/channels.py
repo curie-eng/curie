@@ -92,7 +92,7 @@ from .. import (
 )
 from ..admission import AdmissionDecision
 from ..approval_auth import platform_key_or_adapter
-from ..auth import require_api_key, verify_platform_key
+from ..auth import require_api_key, require_platform_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
 from ..delivery import (
@@ -107,6 +107,7 @@ from ..delivery import (
     take_backlog_slot,
 )
 from ..deps import SessionDep
+from ..factory_slack import mapped_slack_root
 from ..identity import connect
 from ..identity.http_invocation import binding_requires_http_identity, current_http_invocation
 from ..identity.slack import SlackEvidence
@@ -977,6 +978,22 @@ async def _enqueue_turn(
 
     response.status_code = status.HTTP_202_ACCEPTED
     return TurnAccepted(event_id=event_id, stream_id=None, duplicate=True)
+
+
+class SlackRootIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_identity: str = Field(min_length=1, max_length=256)
+    channel: str = Field(min_length=1, max_length=64)
+    root_ts: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/factory-slack/mapped-root", dependencies=[Depends(require_platform_key)])
+async def is_factory_slack_root(data: SlackRootIn, session: SessionDep, response: Response) -> bool:
+    """Check whether a Socket Mode receiver's thread belongs to a factory run."""
+    response.headers["Cache-Control"] = "no-store"
+    mapping = await mapped_slack_root(session, data.channel_identity, data.channel, data.root_ts)
+    return mapping is not None
 
 
 # --- POST /channels/admission ---------------------------------------------------

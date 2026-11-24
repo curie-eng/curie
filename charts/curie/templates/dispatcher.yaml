@@ -33,7 +33,7 @@ malformed allowlist still reports its invalid field first. */ -}}
 {{- $threadedReserved = dict "CURIE_SLACK_THREADED_BOT_ALLOWLIST" "dispatcher.threadedBotAllowlist" -}}
 {{- end -}}
 {{- $httpReceiver := include "curie.httpIdentity.receiverSecret" . -}}
-{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" (merge $threadedReserved (include "curie.slack.reservedEnv" (dict "root" . "workload" "dispatcher") | fromJson))) -}}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" (merge $threadedReserved (dict "FACTORY_VOICE_ENABLED" "factory.voiceModelClaim") (include "curie.slack.reservedEnv" (dict "root" . "workload" "dispatcher") | fromJson))) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -106,6 +106,8 @@ spec:
             # drift apart. BYO references never pass through helm values (#1759).
             {{- include "curie.env.slack" (dict "root" . "workload" "dispatcher") | trim | nindent 12 }}
             {{- include "curie.env.api" . | nindent 12 }}
+            - name: FACTORY_VOICE_ENABLED
+              value: {{ ne (get (.Values.factory | default dict) "voiceModelClaim" | default "") "" | quote }}
             - name: CURIE_API_PREFLIGHT_TIMEOUT_SECONDS
               value: {{ .Values.dispatcher.apiPreflightTimeoutSeconds | quote }}
             # Independent HMAC credential for Slack click identity/channel

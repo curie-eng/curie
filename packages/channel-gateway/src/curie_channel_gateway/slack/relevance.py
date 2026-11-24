@@ -67,6 +67,8 @@ class DropReason(StrEnum):
     UNADDRESSABLE_ACTION = "unaddressable_action"
     CALLER_NOT_ALLOWED = "caller_not_allowed"
     ADMISSION_UNAVAILABLE = "admission_unavailable"
+    VOICE_MAPPING_UNAVAILABLE = "voice_mapping_unavailable"
+    INVALID_VOICE_MENTION = "invalid_voice_mention"
     DELIVERY_CANARY = "delivery_canary"
 
 
@@ -137,6 +139,14 @@ DROP_RATIONALES: Mapping[DropReason, str] = MappingProxyType(
             "bot and no usable answer was cached, so the delivery is refused rather "
             "than admitted unchecked (ADR 0175 fails closed). This is an outage "
             "signal, not a list typo: the route may carry no list at all."
+        ),
+        DropReason.VOICE_MAPPING_UNAVAILABLE: (
+            "The platform API could not establish whether this voice candidate is in a "
+            "mapped factory thread, so the delivery is refused before the idempotency claim."
+        ),
+        DropReason.INVALID_VOICE_MENTION: (
+            "The mapped factory thread received a voice candidate without a verifiable "
+            "receipt, so the delivery is refused before the idempotency claim."
         ),
         DropReason.DELIVERY_CANARY: (
             "The mention arrived in a channel listed as a delivery canary, whose only "

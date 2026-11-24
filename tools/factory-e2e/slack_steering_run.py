@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import time
 import uuid
 from collections.abc import Callable
@@ -93,19 +94,22 @@ class SlackSteeringRun(sk.ScriptedRun):
     def make_router(self, model_module: Any) -> SteeringRouter:
         return self.guidance
 
-    def ingress(self, operation: str, body: dict[str, str] | None = None) -> Any:
-        raw = self.kubectl(
-            "-n",
-            self.namespace,
-            "exec",
-            f"deployment/{self.release}-api",
-            "--",
-            "python",
-            "-c",
-            _INGRESS.read_text(),
-            operation,
-            json.dumps(body or {}),
-        )
+    def ingress(self, operation: str, body: dict[str, Any] | None = None) -> Any:
+        try:
+            raw = self.kubectl(
+                "-n",
+                self.namespace,
+                "exec",
+                f"deployment/{self.release}-api",
+                "--",
+                "python",
+                "-c",
+                _INGRESS.read_text(),
+                operation,
+                json.dumps(body or {}),
+            )
+        except subprocess.TimeoutExpired:
+            raise sk.ScriptedScenarioError("Slack ingress timed out") from None
         return json.loads(raw)
 
     def wait_for(self, name: str, ready: Callable[[], Any]) -> Any:
@@ -196,7 +200,7 @@ class SlackSteeringRun(sk.ScriptedRun):
     def repo_bytes(self, *args: str) -> bytes:
         return self.stub._run("git", "--git-dir", str(self.stub._repository), *args)
 
-    def run_publication(self, github: Any) -> None:
+    def bind_sender(self, github: Any) -> str:
         self.bind_slack(public=True)
         person = self.ingress("seed")
         self.facts_api(
@@ -210,6 +214,10 @@ class SlackSteeringRun(sk.ScriptedRun):
                 "created_by_principal_id": person["principal_id"],
             },
         )
+        return str(uuid.UUID(person["principal_id"]))
+
+    def run_publication(self, github: Any) -> None:
+        self.bind_sender(github)
         early, late = uuid.uuid4().hex, uuid.uuid4().hex
         self.secrets.extend((early, late))
         self.label_issue(github)

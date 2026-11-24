@@ -1408,6 +1408,7 @@
           "/v1/internal/identity/binding-classification/check",
           "/channel-read",
           "/channels/admission",
+          "/channels/factory-slack/mapped-root",
           "/channels/token",
           "/channels/turns",
           "/channels/turns/admission",
@@ -1548,6 +1549,7 @@
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context",
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
+          "/v1/internal/factory-slack/voice",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/factory-slack/publication/{work_item_id}",
           "/v1/internal/channel-read/context",
@@ -1602,7 +1604,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 10360
+      "cardinality_bound": 10440
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1701,6 +1703,7 @@
           "/v1/internal/identity/binding-classification/check",
           "/channel-read",
           "/channels/admission",
+          "/channels/factory-slack/mapped-root",
           "/channels/token",
           "/channels/turns",
           "/channels/turns/admission",
@@ -1841,6 +1844,7 @@
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context",
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
+          "/v1/internal/factory-slack/voice",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/factory-slack/publication/{work_item_id}",
           "/v1/internal/channel-read/context",
@@ -1895,7 +1899,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 10360
+      "cardinality_bound": 10440
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1994,6 +1998,7 @@
           "/v1/internal/identity/binding-classification/check",
           "/channel-read",
           "/channels/admission",
+          "/channels/factory-slack/mapped-root",
           "/channels/token",
           "/channels/turns",
           "/channels/turns/admission",
@@ -2134,6 +2139,7 @@
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context",
           "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
+          "/v1/internal/factory-slack/voice",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/factory-slack/publication/{work_item_id}",
           "/v1/internal/channel-read/context",
@@ -2181,7 +2187,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 2072
+      "cardinality_bound": 2088
     },
     "curie.background.loop": {
       "type": "counter",

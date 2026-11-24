@@ -5393,3 +5393,30 @@ Before rolling back to an API version without retention support, stop intake
 and let the current API purge outstanding drafts after their deadlines.
 The confirmation response reports whether steering queued the
 guidance or applied it to an execution request.
+
+### Slack voice feedback in a factory run thread
+
+Factory voice feedback is off by default. With the voice service enabled, use
+a threaded app mention for the clip. Invite the app into the source channel.
+Its bot token needs `app_mentions:read` to receive the mention, `users:read`
+to verify its app identity, `files:read` to read the clip, and `chat:write` to
+deliver the draft. Reading the original message also requires the channel's
+history scope (`channels:history` for a public channel or `groups:history`
+for a private channel). Curie checks the sender's linked identity and current
+factory feedback permissions before retrieving any bytes. When Slack omits the
+duration, the gateway still caps the download at the smaller of its file limit
+and 10 MiB. The decoder enforces the five-minute limit before recognition.
+
+When the transcript arrives, mention the same app in the same thread with
+`confirm <code>` to submit the displayed text, `reject <code>` to close the
+draft, or `edit <code> <replacement text>` to request a correction. An edit
+produces a new code. Only the original author can confirm it. A queued
+acknowledgement means the factory has accepted guidance. An applied
+acknowledgement identifies guidance consumed by an execution.
+
+A deployed local Socket Mode replay transcribed a WebM clip and applied one
+confirmed Retry label edit to the same pull request, preserving the timeout.
+The WAV case exercised silence refusal. The AAC case exercised expiration of
+the source receipt without checking its transcript. Live Slack delivery with
+an app mention, the download fields, native clip encoding and workspace
+permissions remain unverified.

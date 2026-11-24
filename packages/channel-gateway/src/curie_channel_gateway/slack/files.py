@@ -1,8 +1,13 @@
 """Slack file reads behind the gateway file-source port."""
 
 import json
+import logging
+import re
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from time import monotonic
 
 import httpx
 
@@ -10,6 +15,35 @@ from ..ports.reads import FileSource
 
 _MAX_INFO_BYTES = 64 * 1024
 _SLACK_API_URL = "https://slack.com/api"
+_AUDIO_TYPE = re.compile(r"audio/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")
+_HTML_PAGE = re.compile(rb"(?:\xef\xbb\xbf)?\s*<(?:!doctype\s+html|html\b)", re.IGNORECASE)
+_VOICE_DEADLINE = ContextVar[float | None]("slack_voice_deadline", default=None)
+
+
+@contextmanager
+def private_voice_request() -> Iterator[None]:
+    marker = _VOICE_DEADLINE.set(_VOICE_DEADLINE.get() or monotonic() + 30)
+    try:
+        yield
+    finally:
+        _VOICE_DEADLINE.reset(marker)
+
+
+def _public_http_log(record: logging.LogRecord) -> bool:
+    return _VOICE_DEADLINE.get() is None
+
+
+# HTTPX logs the request URL at INFO. HTTP Core logs response headers, including
+# Location, at DEBUG. Filter only the current voice request's execution context.
+for _logger in (
+    "httpx",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.connection",
+    "httpcore.socks",
+):
+    logging.getLogger(_logger).addFilter(_public_http_log)
 
 
 @dataclass(frozen=True)
@@ -18,11 +52,27 @@ class FileResponse:
     headers: Mapping[str, str]
     chunks: Iterator[bytes]
 
+    def close(self) -> None:
+        close = getattr(self.chunks, "close", None)
+        if close is not None:
+            close()
+
+
+@dataclass(frozen=True)
+class SlackVoiceFile:
+    data: bytes = field(repr=False)
+    mime_type: str
+    duration_ms: int | None
+
 
 def file_transport(
     *, method: str, url: str, headers: Mapping[str, str], chunk_bytes: int
 ) -> FileResponse:
-    client = httpx.Client(timeout=30.0, follow_redirects=False)
+    deadline = _VOICE_DEADLINE.get()
+    timeout = 30.0 if deadline is None else deadline - monotonic()
+    if timeout <= 0:
+        raise SlackFileError("provider file deadline exceeded", status=503)
+    client = httpx.Client(timeout=timeout, follow_redirects=False)
     try:
         response = client.send(client.build_request(method, url, headers=headers), stream=True)
     except httpx.HTTPError:
@@ -31,7 +81,9 @@ def file_transport(
 
     class ResponseChunks:
         def __init__(self) -> None:
-            self._chunks = response.iter_bytes(chunk_bytes)
+            self._chunks = (
+                response.iter_bytes(chunk_bytes) if deadline is None else response.iter_raw()
+            )
 
         def __iter__(self) -> Iterator[bytes]:
             return self
@@ -103,69 +155,148 @@ class SlackFileClient:
         self._read_chunk_bytes = read_chunk_bytes
 
     def fetch(self, file_id: str) -> Iterator[bytes]:
-        download_url = self._download_url(file_id)
-        response = self._transport(
-            method="GET",
-            url=download_url,
-            headers=self._headers(),
-            chunk_bytes=self._read_chunk_bytes,
-        )
+        file_obj = self._file_info(file_id)
+        return self._download(file_obj).chunks
+
+    def fetch_voice(
+        self, file_id: str, uploader_id: str, *, max_bytes: int, max_duration_ms: int
+    ) -> SlackVoiceFile:
+        """Read a hosted audio file selected by an admitted human receipt."""
+        if max_bytes <= 0 or max_duration_ms <= 0:
+            raise ValueError("voice file limits must be positive")
+        if not file_id.strip() or not uploader_id.strip():
+            raise SlackFileError("voice file receipt is incomplete")
+
+        with private_voice_request():
+            return self._voice_bytes(file_id, uploader_id, max_bytes, max_duration_ms)
+
+    def _voice_bytes(
+        self, file_id: str, uploader_id: str, max_bytes: int, max_duration_ms: int
+    ) -> SlackVoiceFile:
+        try:
+            file_obj = self._file_info(file_id, bounded=True)
+            if (
+                file_obj.get("id") != file_id
+                or file_obj.get("user") != uploader_id
+                or file_obj.get("bot_id")
+                or file_obj.get("bot_user_id")
+            ):
+                raise SlackFileError("voice file uploader or identity refused", status=404)
+            if (
+                file_obj.get("mode") != "hosted"
+                or file_obj.get("is_external") is not False
+                or file_obj.get("external_type")
+                or file_obj.get("external_url")
+                or file_obj.get("file_access", "visible") != "visible"
+                or file_obj.get("is_deleted")
+                or file_obj.get("is_tombstoned")
+                or file_obj.get("is_hidden_by_limit")
+            ):
+                raise SlackFileError("voice file unavailable", status=403)
+            mime = file_obj.get("mimetype")
+            if not isinstance(mime, str) or not _AUDIO_TYPE.fullmatch(mime.lower()):
+                raise SlackFileError("voice file is not audio")
+            expected_size = _optional_measure(file_obj, "size", max_bytes)
+            duration_ms = _optional_measure(file_obj, "duration_ms", max_duration_ms)
+            byte_limit = expected_size or max_bytes
+            response = self._download(file_obj, byte_limit=byte_limit)
+            data = self._bounded_body(response, byte_limit, "voice file is oversized")
+            if expected_size is not None and len(data) != expected_size:
+                raise SlackFileError("voice file download was incomplete")
+            if not data or _HTML_PAGE.match(data):
+                raise SlackFileError("voice file contains no usable audio")
+            return SlackVoiceFile(data, mime.lower(), duration_ms)
+        except (httpx.HTTPError, OSError):
+            raise SlackFileError("voice file request failed", status=503) from None
+
+    def _download(
+        self, file_obj: Mapping[str, object], *, byte_limit: int | None = None
+    ) -> FileResponse:
+        response = self._request(self._download_url(file_obj), byte_limit=byte_limit)
         if response.status != 200:
-            close = getattr(response.chunks, "close", None)
-            if close is not None:
-                close()
+            response.close()
             raise SlackFileError(
                 f"slack file download failed: HTTP {response.status}", status=response.status
             )
-        content_type = self._content_type(response.headers)
+        content_type = self._header(response.headers, "content-type").partition(";")[0].strip()
         if content_type.startswith("text/html"):
-            close = getattr(response.chunks, "close", None)
-            if close is not None:
-                close()
-            # Slack serves its sign-in page, with a 200, when the bearer token
-            # is missing or lacks files:read. Storing that page as the
-            # "attachment" would hand the agent a login screen to read.
+            response.close()
             raise SlackFileError(
                 "slack file download returned an HTML page rather than file bytes; "
                 "the bot token is likely missing the files:read scope"
             )
-        return response.chunks
+        if byte_limit is not None and not (
+            _AUDIO_TYPE.fullmatch(content_type) or content_type == "application/octet-stream"
+        ):
+            response.close()
+            raise SlackFileError("voice download content type refused")
+        return response
 
-    def _download_url(self, file_id: str) -> str:
-        response = self._transport(
-            method="GET",
-            url=f"{self._api_url}/files.info?{httpx.QueryParams({'file': file_id})}",
-            headers=self._headers(),
-            chunk_bytes=self._read_chunk_bytes,
+    def _file_info(self, file_id: str, *, bounded: bool = False) -> Mapping[str, object]:
+        response = self._request(
+            f"{self._api_url}/files.info?{httpx.QueryParams({'file': file_id})}",
+            byte_limit=_MAX_INFO_BYTES if bounded else None,
         )
         if response.status != 200:
-            close = getattr(response.chunks, "close", None)
-            if close is not None:
-                close()
+            response.close()
             raise SlackFileError(
                 f"slack files.info failed: HTTP {response.status}", status=response.status
             )
-        body = self._bounded_body(response.chunks)
+        body = self._bounded_body(
+            response, _MAX_INFO_BYTES, "slack files.info response is oversized"
+        )
         try:
             payload = json.loads(body)
-            if not payload.get("ok"):
-                raise SlackFileError("slack file metadata request refused")
-            file_obj = payload["file"]
-            if not isinstance(file_obj, Mapping):
-                raise TypeError("file object is not a mapping")
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise SlackFileError("slack files.info returned an unusable envelope") from exc
-        # The envelope parsed fine and was ok, but the field this module reads
-        # instead of url_private (see the class docstring) may still be
-        # absent. Named explicitly rather than folded into the except above,
-        # since a missing field is not the same failure as a malformed
-        # envelope and an operator needs to be able to tell them apart.
+        except (ValueError, RecursionError):
+            raise SlackFileError("slack files.info returned an unusable envelope") from None
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            status = None
+            if bounded:
+                code = payload.get("error") if isinstance(payload, dict) else None
+                if code in ("file_not_found", "file_deleted"):
+                    status = 404
+                elif code in ("access_denied", "not_in_channel", "no_permission"):
+                    status = 403
+                else:
+                    status = 503
+            raise SlackFileError("slack file metadata request refused", status=status)
+        file_obj = payload.get("file")
+        if not isinstance(file_obj, dict):
+            raise SlackFileError("slack files.info returned an unusable envelope")
+        return file_obj
+
+    def _request(self, url: str, *, byte_limit: int | None) -> FileResponse:
+        headers = {"Authorization": f"Bearer {self._token}"}
+        chunk_bytes = self._read_chunk_bytes
+        if byte_limit is not None:
+            headers["Accept-Encoding"] = "identity"
+            chunk_bytes = min(chunk_bytes, byte_limit + 1)
+        response = self._transport(method="GET", url=url, headers=headers, chunk_bytes=chunk_bytes)
+        if byte_limit is not None:
+            if self._header(response.headers, "content-encoding") not in ("", "identity"):
+                response.close()
+                raise SlackFileError("voice file transfer encoding refused")
+            length = self._header(response.headers, "content-length")
+            if length:
+                try:
+                    valid = length.isascii() and length.isdecimal() and int(length) <= byte_limit
+                except ValueError:
+                    valid = False
+                if not valid:
+                    response.close()
+                    raise SlackFileError("voice transfer outside permitted bounds", status=413)
+        return response
+
+    @staticmethod
+    def _download_url(file_obj: Mapping[str, object]) -> str:
         if "url_private_download" not in file_obj:
             raise SlackFileError("slack files.info's file object has no url_private_download field")
-        download_url = str(file_obj["url_private_download"])
+        download_url = file_obj["url_private_download"]
+        if not isinstance(download_url, str):
+            raise SlackFileError("provider file URL is invalid")
         try:
             parsed = httpx.URL(download_url)
-        except httpx.InvalidURL:
+        except (httpx.InvalidURL, UnicodeError):
             raise SlackFileError("provider file URL is invalid") from None
         if (
             parsed.scheme != "https"
@@ -176,29 +307,38 @@ class SlackFileClient:
             raise SlackFileError("provider file download URL refused")
         return download_url
 
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}"}
-
     @staticmethod
-    def _content_type(headers: Mapping[str, str]) -> str:
+    def _header(headers: Mapping[str, str], name: str) -> str:
         for key, value in headers.items():
-            if str(key).lower() == "content-type":
-                return str(value).lower()
+            if key.lower() == name:
+                return value.strip().lower()
         return ""
 
     @staticmethod
-    def _bounded_body(chunks: Iterator[bytes]) -> bytes:
+    def _bounded_body(response: FileResponse, limit: int, oversized: str) -> bytes:
         body = bytearray()
         try:
-            for chunk in chunks:
+            for chunk in response.chunks:
+                deadline = _VOICE_DEADLINE.get()
+                if deadline is not None and monotonic() >= deadline:
+                    raise SlackFileError("provider file deadline exceeded", status=503)
+                if len(chunk) > limit - len(body):
+                    raise SlackFileError(oversized, status=413)
                 body.extend(chunk)
-                if len(body) > _MAX_INFO_BYTES:
-                    raise SlackFileError("slack files.info response is oversized")
             return bytes(body)
         finally:
-            close = getattr(chunks, "close", None)
-            if close is not None:
-                close()
+            response.close()
+
+
+def _optional_measure(file_obj: Mapping[str, object], key: str, maximum: int) -> int | None:
+    if key not in file_obj:
+        return None
+    value = file_obj[key]
+    if type(value) is int and value > maximum:
+        raise SlackFileError("voice file exceeds permitted bounds", status=413)
+    if type(value) is not int or value <= 0:
+        raise SlackFileError("voice file metadata outside permitted bounds")
+    return value
 
 
 _CONFORMS: type[FileSource] = SlackFileClient

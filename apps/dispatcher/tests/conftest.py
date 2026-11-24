@@ -174,6 +174,11 @@ class FakeAdmissionApi:
     delay_s: float = 0.0
     requests: list[dict[str, Any]] = dataclass_field(default_factory=list)
     headers: list[str | None] = dataclass_field(default_factory=list)
+    mapped_roots: set[tuple[str, str, str]] = dataclass_field(default_factory=set)
+    mapped_root_requests: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    mapped_root_headers: list[str | None] = dataclass_field(default_factory=list)
+    mapped_root_status: int = 200
+    mapped_root_body: bytes | None = None
 
 
 @contextmanager
@@ -186,6 +191,19 @@ def fake_admission_api() -> Iterator[FakeAdmissionApi]:
         def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
             length = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(length) or b"{}")
+            if self.path == "/channels/factory-slack/mapped-root":
+                state.mapped_root_requests.append(body)
+                state.mapped_root_headers.append(self.headers.get("X-API-Key"))
+                scope = (body.get("channel_identity"), body.get("channel"), body.get("root_ts"))
+                payload = state.mapped_root_body
+                if payload is None:
+                    payload = json.dumps(scope in state.mapped_roots).encode()
+                self.send_response(state.mapped_root_status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             state.requests.append(body)
             state.headers.append(self.headers.get("X-API-Key"))
             if self.path != "/channels/admission":
