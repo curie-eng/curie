@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import time
 import uuid
 from collections.abc import Callable
@@ -94,18 +95,21 @@ class SlackSteeringRun(sk.ScriptedRun):
         return self.guidance
 
     def ingress(self, operation: str, body: dict[str, Any] | None = None) -> Any:
-        raw = self.kubectl(
-            "-n",
-            self.namespace,
-            "exec",
-            f"deployment/{self.release}-api",
-            "--",
-            "python",
-            "-c",
-            _INGRESS.read_text(),
-            operation,
-            json.dumps(body or {}),
-        )
+        try:
+            raw = self.kubectl(
+                "-n",
+                self.namespace,
+                "exec",
+                f"deployment/{self.release}-api",
+                "--",
+                "python",
+                "-c",
+                _INGRESS.read_text(),
+                operation,
+                json.dumps(body or {}),
+            )
+        except subprocess.TimeoutExpired:
+            raise sk.ScriptedScenarioError("Slack ingress timed out") from None
         return json.loads(raw)
 
     def wait_for(self, name: str, ready: Callable[[], Any]) -> Any:

@@ -171,6 +171,9 @@ class SlackVoiceRun(SlackSteeringRun):
         for post in self.slack.posts()[start:]:
             text = html.unescape(post.text or "")
             matched = PROMPT.match(text)
+            if matched:
+                transcript, code = matched.groups()
+                self.secrets[:0] = [transcript, code, code.split(".")[0]]
             if not matched and not text.startswith("Voice feedback refused ("):
                 continue
             if post.channel != SLACK_CHANNEL or post.thread_ts != root:
@@ -263,6 +266,7 @@ class SlackVoiceRun(SlackSteeringRun):
         no_revision()
 
         edited = transcript + " Keep the existing timeout."
+        self.secrets.insert(0, edited)
         start_edit = len(self.slack.posts())
         self.send(root, f"edit {code} {edited}")
         display, current = self.draft(root, start_edit)

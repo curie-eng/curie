@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,8 @@ from typing import Any
 import factory_e2e as fe
 import pytest
 import scripted_kind as sk
+from scripted_lanes import SlackPost
+from scripted_scenario import SLACK_CHANNEL
 from slack_steering_model import ANCHOR, INSTRUCTION, SteeringRouter
 from slack_steering_run import SlackSteeringRun, verify_consumers, verify_revision
 from slack_voice_run import SlackVoiceRun, VoiceRouter
@@ -155,6 +158,45 @@ def test_voice_model_uses_the_confirmed_edit_and_keeps_the_button_timeout(tmp_pa
     assert before.tag == after.tag == "button"
     assert before.attrib == after.attrib == {"type": "button", "data-timeout-ms": "1500"}
     assert (before.text, after.text) == ("Try again", "Retry")
+
+
+def test_voice_ingress_timeout_keeps_private_arguments_out_of_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sensitive = "synthetic text in an unfinished ingress request"
+
+    def timeout(run: sk.ScriptedRun, *args: str) -> str:
+        raise subprocess.TimeoutExpired(args, 1)
+
+    def execute(run: SlackVoiceRun) -> None:
+        run.ingress("deliver", {"event": {"text": sensitive}})
+
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.ScriptedRun, "kubectl", timeout)
+    monkeypatch.setattr(SlackVoiceRun, "execute", execute)
+    monkeypatch.setattr(sk.ScriptedRun, "cleanup", lambda run: [])
+    args = fe.parse_args(
+        ["scripted", "--scenario", "slack-voice", "--transcript", str(sk.TRANSCRIPT)]
+    )
+    assert sk.main(args) == fe.EXIT_FAILED
+    (evidence,) = (tmp_path / "target/factory-e2e").glob("scripted-*.json")
+    emitted = capsys.readouterr()
+    assert sensitive not in (evidence.read_text() + emitted.err + emitted.out)
+    assert json.loads(evidence.read_text())["error"] == "Slack ingress timed out"
+
+
+def test_displayed_voice_content_is_redacted_from_diagnostics() -> None:
+    run = SlackVoiceRun(fe.parse_args(["scripted", "--scenario", "slack-voice"]))
+    root = "1800000000.000001"
+    transcript, code = "Synthetic speech.", "abcde1234567.1"
+    text = f"Voice transcript\n{transcript}\n\nChoose a reply\nconfirm {code}\nreject {code}"
+    post = SlackPost("chat.postMessage", SLACK_CHANNEL, text, root, "1800000000.000002")
+    run.slack = SimpleNamespace(posts=lambda: [post])
+    assert run.thread_text(root, 0) == (transcript, code)
+    diagnostic = f"status {transcript} {code} {code.split('.')[0]}"
+    assert fe.record_agent_text(diagnostic, run.secrets)[0] == (
+        "status [REDACTED] [REDACTED] [REDACTED]"
+    )
 
 
 def test_publication_requires_exact_edit_on_the_same_pull_request_and_branch() -> None:
