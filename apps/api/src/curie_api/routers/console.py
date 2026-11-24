@@ -84,6 +84,7 @@ from .identity_connect import (
     set_browser_proof_cookie,
     wants_html,
 )
+from .identity_me import FLOW_COOKIE
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,11 @@ async def logout(
     )
     # Same name, path and flags as the set, or the browser keeps its cookie.
     response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    # The ten-minute GitHub link flow cookie outlives its session by design,
+    # so a sign-out that leaves it keeps a live link-flow credential in the
+    # browser (#5829). Same flags start_github_link sets, so the browser
+    # replaces its cookie.
+    response.delete_cookie(FLOW_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
     return response
 
 

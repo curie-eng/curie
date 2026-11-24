@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .. import identity_audit, identity_fence
@@ -151,6 +151,19 @@ async def start_github_link(
     state = secrets.token_urlsafe(32)
     now = await session.scalar(select(func.now()))
     assert now is not None
+    # Every start sweeps the table in the same transaction as its insert
+    # (#5829): a consumed row and an expired row are dead one-use state for
+    # whichever principal minted them, and without this they accumulate
+    # forever. Another principal's live unconsumed row is not dead state and
+    # survives the sweep.
+    await session.execute(
+        delete(GithubLinkState).where(
+            or_(
+                GithubLinkState.consumed_at.is_not(None),
+                GithubLinkState.expires_at <= now,
+            )
+        )
+    )
     session.add(
         GithubLinkState(
             state_hash=hashlib.sha256(state.encode()).hexdigest(),
@@ -234,6 +247,17 @@ async def github_link_callback(
         return _result("failed")
     tenant_id, principal_id = principal.tenant_id, principal.id
     await session.rollback()
+    # The consume above succeeded against a live, unexpired state row bound to
+    # this principal, so the row is spent one-use state: drop it now instead of
+    # leaving it for the next start's sweep (#5829). Earlier refusal paths keep
+    # their consumed row, so an unauthenticated probe leaves no observable
+    # difference between an unknown and a just-consumed state.
+    await session.execute(
+        delete(GithubLinkState).where(
+            GithubLinkState.state_hash == hashlib.sha256(state.encode()).hexdigest()
+        )
+    )
+    await session.commit()
     try:
         native_id, login = await github_link.verified_account(settings, config, code)
     except github_link.ProviderRefused:
