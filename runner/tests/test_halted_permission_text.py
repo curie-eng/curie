@@ -1,4 +1,4 @@
-"""The text of a permission pause the runner halted at its blocked call (ADR 0295).
+"""The text of a permission pause the runner halted at its blocked call (ADR 0296).
 
 Only that pause takes the blocked call's own model response, and only that
 pause drops the aborted CLI result's failure text. Every other final keeps its

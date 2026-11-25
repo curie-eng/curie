@@ -3,7 +3,7 @@
 Drives the production Valkey consumer, the kernel, the real runner HTTP app and
 its ``SessionRunner`` with the real ``ApprovalGate`` permission callback. Only
 the model seam (``FakeModelSession``), the approval API and Slack are faked.
-ADR 0295: the blocked call's own model response is the requester's text above
+ADR 0296: the blocked call's own model response is the requester's text above
 the notice, and the aborted CLI result's failure text never is.
 """
 

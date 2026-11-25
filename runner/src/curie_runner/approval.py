@@ -694,7 +694,7 @@ class ApprovalGate:
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
     # The SDK call id of the call whose block wrote the pending record (ADR
-    # 0295), when the deciding callback knew it. The session uses it to find
+    # 0296), when the deciding callback knew it. The session uses it to find
     # that call's own model response. Runner-internal, per turn, never serialized.
     pending_call_id: str | None = None
     # Set by ``halt_for_questions`` once ``ask_questions`` has posted this
@@ -955,7 +955,7 @@ class ApprovalGate:
         # for a stop. Do not tidy this back inside the guard below.
         self.pending_halt = True
         if self._record_pending(tool_name, tool_input):
-            # Only the call that wrote the record names it (ADR 0295).
+            # Only the call that wrote the record names it (ADR 0296).
             self.pending_call_id = call_id
 
     def _record_pending(self, tool_name: str, tool_input: dict[str, Any]) -> bool:

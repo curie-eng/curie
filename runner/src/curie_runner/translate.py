@@ -334,7 +334,7 @@ class TurnState:
     # Call ids of the curie-slack read tools seen this turn (ADR 0100), so the
     # session stubs their results in the portable record. History only.
     channel_read_call_ids: set[str] = field(default_factory=set)
-    # Runner-internal, never wire fields (ADR 0295). The top-level assistant
+    # Runner-internal, never wire fields (ADR 0296). The top-level assistant
     # text of each provider response this turn, keyed by the response's message
     # id, and the response each top-level tool call belongs to. The CLI streams
     # one message per content block, all carrying the response's message id; a
@@ -348,7 +348,7 @@ class TurnState:
 
 
 def _response_key(message: AssistantMessage, state: TurnState) -> str:
-    """The provider response a top-level assistant message belongs to (ADR 0295)."""
+    """The provider response a top-level assistant message belongs to (ADR 0296)."""
 
     message_id = getattr(message, "message_id", None)
     if isinstance(message_id, str) and message_id:

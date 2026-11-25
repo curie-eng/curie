@@ -1,4 +1,4 @@
-# 295. A halted permission pause answers with the blocked call's own response
+# 296. A halted permission pause answers with the blocked call's own response
 
 Date: 2026-11-25
 

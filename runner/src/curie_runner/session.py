@@ -312,7 +312,7 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
     The captured summary rides the final so the platform can persist it on the
     durable Approval record.
 
-    ADR 0295 sets the text of one case: a permission pause the runner halted at
+    ADR 0296 sets the text of one case: a permission pause the runner halted at
     the exact call it blocked (``_halted_permission_call``). There the failure
     text the aborted CLI result carries, such as the ``run failed`` placeholder,
     is never kept, and an empty text becomes the top-level assistant text of
@@ -346,7 +346,7 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
 
 
 def _halted_permission_call(state: TurnState) -> str | None:
-    """The model response of the call a halted permission pause blocked (ADR 0295).
+    """The model response of the call a halted permission pause blocked (ADR 0296).
 
     None unless the merged record is a permission gate's, not a publication's,
     the gate named the call that wrote it, that call was a top-level call this
