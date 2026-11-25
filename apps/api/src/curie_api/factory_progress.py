@@ -293,8 +293,9 @@ async def record_run_handoff(
         await session.rollback()
         return RecordResult("request_not_found")
     if request.status not in {"running", "cancellation_requested"}:
+        request_id = request.id
         await session.rollback()
-        return RecordResult("no_active_request", request.id)
+        return RecordResult("no_active_request", request_id)
     # Legacy requests admitted before the status row existed may still report.
     await session.execute(
         insert(FactoryStatusComment)
