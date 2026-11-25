@@ -306,11 +306,16 @@ async def _attempt_turn(
     )
 
     lazy = self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+    # A targetless hook turn has no channel binding (ADR-0205: a hook turn has
+    # no current files), so the API can authorize no attachment context for
+    # its thread. Without files it runs without attachment access instead of
+    # failing (#5968); one that carries files is still refused below.
+    lazy_access = lazy and not (routing._is_targetless(qevent) and not qevent.attachments)
     attachment_turn = (
         attachment_access.AttachmentAccessTurn(
             str(agent_id), str(workspace_deployment_id), thread_key, qevent.event_id
         )
-        if lazy and agent_id is not None and workspace_deployment_id is not None
+        if lazy_access and agent_id is not None and workspace_deployment_id is not None
         else None
     )
     aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(attachment_turn)
@@ -385,7 +390,7 @@ async def _attempt_turn(
                     )
                 verified_review = verified
                 review_receipt = verified.receipt
-            if lazy:
+            if lazy_access:
                 if (
                     self._attachment_access is None
                     or agent_id is None
@@ -824,11 +829,15 @@ async def _attempt_turn(
             logger.warning("booting-state update failed for %s", qevent.event_id)
 
     if routed.canned_reply is not None:
-        # An enabled greeting/help pack matched a provably-fresh thread under
-        # the route lock (ADR-0018). Deliver the canned reply onto the
-        # placeholder and return terminal-ok so process_event marks the event
-        # done. No run was registered, no sandbox claimed, no turn started.
         await self._reply_for(qevent, route, routed.canned_reply)
+        hook_carry = constants._HOOK_RUN_CARRY.get()
+        if (
+            routed.canned_reply_from_pack
+            and hook_carry is not None
+            and hook_carry.ref is not None
+            and not routing._is_targetless(qevent)
+        ):
+            hook_carry.canned_reply_delivered = True
         return failures.TurnOutcome(terminal_ok=True)
 
     if routed.steered:
