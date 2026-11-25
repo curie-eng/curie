@@ -834,6 +834,13 @@ async def _attempt_turn(
         # placeholder and return terminal-ok so process_event marks the event
         # done. No run was registered, no sandbox claimed, no turn started.
         await self._reply_for(qevent, route, routed.canned_reply)
+        hook_carry = constants._HOOK_RUN_CARRY.get()
+        if (
+            hook_carry is not None
+            and hook_carry.ref is not None
+            and not routing._is_targetless(qevent)
+        ):
+            hook_carry.canned_reply_delivered = True
         return failures.TurnOutcome(terminal_ok=True)
 
     if routed.steered:

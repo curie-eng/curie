@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -198,6 +199,70 @@ def test_completed_cron_turn_closes_the_run_as_ran(
             assert ended_at is not None
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
             assert fires == [_fire_labels(outcome)]
+
+    asyncio.run(go())
+
+
+def test_targeted_cron_canned_reply_closes_the_run_as_ran(
+    make_harness,
+    make_hook_run,
+) -> None:
+    reply = "Hello from the greeting pack."
+
+    async def go() -> None:
+        async with make_hook_run() as run:
+            deployment_id = uuid.uuid4()
+            channel_id = uuid.uuid4()
+            greeting = {"greeting": {"enabled": True, "phrases": ["hello"], "reply": reply}}
+            async with run.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.agents SET behavior_packs = CAST(:packs AS jsonb) "
+                        "WHERE id = :id"
+                    ),
+                    {"packs": json.dumps(greeting), "id": run.agent_id},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.deployments "
+                        "(id, agent_id, version_id, environment, status) "
+                        "VALUES (:id, :agent_id, :version_id, 'prod', 'active')"
+                    ),
+                    {"id": deployment_id, "agent_id": run.agent_id, "version_id": run.version_id},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_channels "
+                        "(id, agent_id, kind, address, adapter) "
+                        "VALUES (:id, :agent_id, 'slack', 'C1', 'default')"
+                    ),
+                    {"id": channel_id, "agent_id": run.agent_id},
+                )
+            try:
+                async with make_harness(
+                    hook_runs=run.recorder(),
+                    binding_factory=lambda config: BindingResolver(run.engine, config),
+                ) as h:
+                    event = _event(hook_run=run.ref).model_copy(update={"text": "hello"})
+                    await h.kernel.process_event(event)
+
+                    assert h.sink.last_text == reply
+                    assert h.runner.opened == []
+                    assert h.fake_k8s.claim_envs == []
+                    outcome, ended_at = await run.state() or (None, None)
+                    assert outcome == "ran"
+                    assert ended_at is not None
+                    assert await run.reason() is None
+            finally:
+                async with run.engine.begin() as conn:
+                    await conn.execute(
+                        text("DELETE FROM curie.deployments WHERE id = :id"),
+                        {"id": deployment_id},
+                    )
+                    await conn.execute(
+                        text("DELETE FROM curie.agent_channels WHERE id = :id"),
+                        {"id": channel_id},
+                    )
 
     asyncio.run(go())
 
