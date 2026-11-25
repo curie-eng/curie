@@ -28,6 +28,21 @@ agent's instructions and tools to the same platform.
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
+## Build on Curie
+
+You can use local skills to prepare factory issues, adapt skills and MCP tools
+into a Curie bundle, or configure the Software Factory for your repositories.
+Curie has Kubernetes, Docker and static pool sandbox implementations. Another
+sandbox runtime requires platform integration work. Start with the
+[extension and contribution guide](docs/guides/extending-curie.md) to choose a
+path and understand its current limits.
+
+If a needed integration is missing, [open an issue](https://github.com/curie-eng/curie/issues)
+with your use case and the behavior you need. For an implementation proposal or
+fix, follow [CONTRIBUTING.md](CONTRIBUTING.md). Use
+[Discussions](https://github.com/curie-eng/curie/discussions) for an early design
+question, and [private disclosure](SECURITY.md) for a vulnerability.
+
 ## Platform capabilities
 
 Curie connects agents to supported external workspaces and work systems.

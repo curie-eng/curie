@@ -91,6 +91,9 @@ they are not substitutes for a supported quickstart.
 
 ## Develop and contribute
 
+- [Build on Curie](guides/extending-curie.md): choose the path for existing
+  skills and tools, factory runner environments, or sandbox runtime work, then
+  report gaps and contribute changes.
 - [Contributor onboarding](onboarding.md): fresh source checkout to a verified
   local turn; separate from adopting the released product.
 - [Contributing](../CONTRIBUTING.md) and [repository rules](../AGENTS.md): setup,
