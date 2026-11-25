@@ -25,6 +25,7 @@ from pathlib import Path
 import httpx
 import pytest
 from aci_protocol import (
+    Attachment,
     ErrorEvent,
     Final,
     HookRunRef,
@@ -469,6 +470,41 @@ def test_targetless_cron_runs_in_lazy_attachment_mode_without_attachment_access(
             assert ended_at is not None
             assert calls == []
             assert h.sink.events == []
+
+    asyncio.run(go())
+
+
+def test_targetless_cron_carrying_files_is_refused_in_lazy_attachment_mode(
+    make_harness, make_hook_run
+) -> None:
+    """The negative control for the test above: a targetless turn that carries
+    files has no inbound route to register them under, so it is refused before
+    runner start rather than run without them."""
+
+    async def go() -> None:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+                attachment_enabled=True,
+                attachment_mode="lazy",
+                internal_worker_token="worker",
+            ) as h,
+        ):
+            h.runner.attachment_access_enforced = True
+            h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+            event = _targetless(run.ref).model_copy(
+                update={"attachments": [Attachment(id="F1", name="report.pdf")]}
+            )
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == []
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "failed"
+            assert ended_at is not None
 
     asyncio.run(go())
 

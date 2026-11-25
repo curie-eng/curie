@@ -822,7 +822,10 @@ def test_attachment_register_timeout_before_cron_start_closes_failed(
     """
     from .test_thread_attachment_rebuild import _Binding
 
+    requests: list[tuple[str, str]] = []
+
     def timed_out(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
         raise httpx.ReadTimeout("register timed out", request=request)
 
     async def go() -> None:
@@ -847,6 +850,10 @@ def test_attachment_register_timeout_before_cron_start_closes_failed(
                 event = _event(hook_run=run.ref)
                 await h.kernel.process_event(event)
 
+                # The failure is the registration timeout, not an earlier refusal.
+                assert requests == [
+                    ("POST", "/v1/internal/attachment-access/register")
+                ]
                 assert h.runner.opened == []
                 outcome, ended_at = await run.state() or (None, None)
                 assert outcome == "failed"
