@@ -840,7 +840,10 @@ def test_reap_with_slow_healthy_lists_reconciles_admission(
 
     cleanup = [span for span in probe.spans if span.name == "curie.sandbox.cleanup"]
     assert len(cleanup) == 1
-    assert cleanup[0].events == [("sandbox.cleanup.completed", {"outcome": "observed"})]
+    assert cleanup[0].events == [
+        ("sandbox.cleanup.completed", {"outcome": "observed"}),
+        ("sandbox.inventory.reconciled", {"outcome": "reconciled"}),
+    ]
     assert [point.attributes["outcome"] for point in probe.points("curie.sandbox.cleanup")] == [
         "observed"
     ]
