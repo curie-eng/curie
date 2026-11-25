@@ -583,8 +583,14 @@ def render_connector_manifests(
     gated_tools: Mapping[str, tuple[str, ...]] | None = None,
     e2e: E2EInstall | None = None,
     service_accounts: Mapping[str, str] | None = None,
+    priority_class: str | None = None,
 ) -> list[dict[str, Any]]:
     """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
+
+    ``priority_class`` names the PriorityClass every connector pod template
+    carries (ADR-0059 decision 5): a hosted connector must outrank the
+    sandboxes whose turns call it, or a full node preempts it to admit one.
+    ``None`` or empty leaves the pod template without a class.
 
     ``service_accounts`` is the operator's connector-to-ServiceAccount mapping
     for this agent; an entry for a connector the bundle does not declare is
@@ -620,6 +626,10 @@ def render_connector_manifests(
         )
     if install.enabled and CONNECTOR_NAME in connectors.connectors:
         pin_server_command(objects, install)
+    if priority_class:
+        for obj in objects:
+            if obj.get("kind") == "Deployment":
+                obj["spec"]["template"]["spec"]["priorityClassName"] = priority_class
     return objects
 
 

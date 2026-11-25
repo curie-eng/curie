@@ -1777,6 +1777,15 @@ render. The runner-prewarm DaemonSet deliberately stays unclassed (priority
 0, below the sandbox class): the image-cache pod is the designated sacrifice
 a full node evicts first.
 
+Hosted connectors are not chart templates, so the inventory cannot see them.
+The chart passes `priorityClasses.platform.name` to the API as
+`CURIE_CONNECTOR_PRIORITY_CLASS`, and the API sets it as `priorityClassName`
+on every connector Deployment it renders. At priority 0 a connector was the pod
+a full node preempted to admit a new sandbox, and every turn that called it
+failed its capability probe until the connector was rescheduled. An empty name
+renders connectors without a class. Connector pods created before this change
+keep their old pod template until the agent's connectors are deployed again.
+
 **Priority class on hooks (#3206).** When
 `priorityClasses.platform.create: true`, preinstall and preupgrade hooks omit
 the platform priority class because it can be absent until normal resources

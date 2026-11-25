@@ -2592,6 +2592,8 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_E2E_REGISTRY_INSECURE",
     "CURIE_E2E_REGISTRY_TOKEN_HOSTS",
     "CURIE_E2E_SOURCE_HOSTS",
+    // The connector priority class derives from priorityClasses.platform.name from introduction.
+    "CURIE_CONNECTOR_PRIORITY_CLASS",
     // Trust file paths are generated from a mounted ConfigMap, not migrated extraEnv paths.
     "CURIE_CODE_HOST_CA_BUNDLE",
     "CURIE_REPO_CA_BUNDLE",

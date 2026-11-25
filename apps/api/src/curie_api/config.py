@@ -1012,6 +1012,16 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_SERVICE_ACCOUNTS", "connector_service_accounts"
         ),
     )
+    # The PriorityClass every rendered connector Deployment carries
+    # (ADR-0059 decision 5). The chart passes `priorityClasses.platform.name`,
+    # so a hosted connector outranks the sandboxes whose turns depend on it.
+    # Empty leaves the pod template without a class, as before.
+    connector_priority_class: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_PRIORITY_CLASS", "connector_priority_class"
+        ),
+    )
     e2e_connector_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),

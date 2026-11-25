@@ -1214,6 +1214,9 @@ async def read_version_connectors(
                     # The operator's ServiceAccount for each of this agent's
                     # connectors that has one; the bundle cannot name one.
                     service_accounts=settings.connector_service_accounts_for(agent_name),
+                    # ADR-0059 decision 5: the chart's platform class, so a
+                    # sandbox cannot preempt the connector its turn depends on.
+                    priority_class=settings.connector_priority_class.strip() or None,
                 )
             except ValueError as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
