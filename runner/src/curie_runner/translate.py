@@ -334,6 +334,28 @@ class TurnState:
     # Call ids of the curie-slack read tools seen this turn (ADR 0100), so the
     # session stubs their results in the portable record. History only.
     channel_read_call_ids: set[str] = field(default_factory=set)
+    # Runner-internal, never wire fields (ADR 0295). The top-level assistant
+    # text of each provider response this turn, keyed by the response's message
+    # id, and the response each top-level tool call belongs to. The CLI streams
+    # one message per content block, all carrying the response's message id; a
+    # message without one is its own response. Nested and errored messages,
+    # tool results and tool arguments never enter ``response_text``.
+    response_text: dict[str, str] = field(default_factory=dict)
+    call_responses: dict[str, str] = field(default_factory=dict)
+    anonymous_responses: int = 0
+    # The call id of the permission block the session merged, if the gate named one.
+    approval_call_id: str | None = None
+
+
+def _response_key(message: AssistantMessage, state: TurnState) -> str:
+    """The provider response a top-level assistant message belongs to (ADR 0295)."""
+
+    message_id = getattr(message, "message_id", None)
+    if isinstance(message_id, str) and message_id:
+        return f"id:{message_id}"
+    # No id proves no grouping: the message is a response of its own.
+    state.anonymous_responses += 1
+    return f"message:{state.anonymous_responses}"
 
 
 def _observe_final_answer(message: object, validation: FinalAnswerValidation) -> None:
@@ -488,15 +510,22 @@ def _translate_assistant(
                     gen.observe_output(block.text)
             elif isinstance(block, ToolUseBlock):
                 gen.observe_output(f"[tool_use {block.name}]")
+    response = _response_key(message, state) if not nested else None
     for block in message.content:
         if isinstance(block, TextBlock):
             if block.text and not nested:
                 if not collecting:
                     state.assistant_text += block.text
+                if response is not None and not error:
+                    state.response_text[response] = state.response_text.get(response, "") + (
+                        block.text
+                    )
                 if state.final_answer is None:
                     events.append(TextDelta(text=block.text))
         elif isinstance(block, ToolUseBlock):
             events.append(ToolNote(text=f"running tool {block.name}", tool=block.name))
+            if response is not None:
+                state.call_responses[block.id] = response
             if activity is not None:
                 activity.observe_tool(block.name)
             # Every tool call is evidence for the false-completion check (#517),

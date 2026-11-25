@@ -3,6 +3,8 @@
 Drives the production Valkey consumer, the kernel, the real runner HTTP app and
 its ``SessionRunner`` with the real ``ApprovalGate`` permission callback. Only
 the model seam (``FakeModelSession``), the approval API and Slack are faked.
+ADR 0295: the blocked call's own model response is the requester's text above
+the notice, and the aborted CLI result's failure text never is.
 """
 
 from __future__ import annotations
@@ -34,28 +36,56 @@ from queue_fixtures import qevent  # noqa: E402
 
 _GATED = "mcp__acme-access__grant_access"
 _ARGS = {"principal": "U0EXAMPLE2", "resource": "sample-reports", "level": "read"}
-# The model's own requester-facing sentence, written before the gated call.
-_INTENT = "I'll give the requester read access to sample-reports once an administrator approves it."
+# An earlier model response of the same turn. It is not the blocked call's.
+_EARLIER = "Checking the access policy first."
 # A raw tool result that also reads like a summary. It is never requester text.
 _TOOL_RESULT = "Policy lookup: grants to sample-reports require administrator approval."
+# Subagent text that even carries the blocked response's id. Nested, so excluded.
+_NESTED = "Subagent notes: the principal is U0EXAMPLE2."
+# The model's own requester-facing sentence, in the blocked call's response.
+_INTENT = "I'll give the requester read access to sample-reports once an administrator approves it."
+# What a provider result could carry on a halted turn that still ended cleanly.
+_RESULT = "An administrator needs to approve the read access first."
 _SHORT_NOTICE = "Approval requested. See the card below."
 
 
-def _assistant(*blocks: Any) -> AssistantMessage:
-    return AssistantMessage(content=list(blocks), model="example-model")
+def _assistant(*blocks: Any, message_id: str, parent: str | None = None) -> AssistantMessage:
+    return AssistantMessage(
+        content=list(blocks),
+        model="example-model",
+        parent_tool_use_id=parent,
+        message_id=message_id,
+    )
 
 
 def _script() -> list[Any]:
-    # The CLI streams one assistant message per content block, so the sentence
-    # and the gated call arrive as separate messages of one model response.
+    # The CLI streams one assistant message per content block, each carrying
+    # its provider response's message id.
     return [
-        _assistant(ToolUseBlock(id="t1", name="Read", input={"file_path": "policy.md"})),
+        _assistant(TextBlock(text=_EARLIER), message_id="msg-1"),
+        _assistant(
+            ToolUseBlock(id="t1", name="Read", input={"file_path": "policy.md"}),
+            message_id="msg-1",
+        ),
         UserMessage(content=[ToolResultBlock(tool_use_id="t1", content=_TOOL_RESULT)]),
-        _assistant(TextBlock(text=_INTENT)),
-        _assistant(ToolUseBlock(id="t2", name=_GATED, input=dict(_ARGS))),
+        _assistant(TextBlock(text=_NESTED), message_id="msg-2", parent="t1"),
+        _assistant(TextBlock(text=_INTENT), message_id="msg-2"),
+        _assistant(ToolUseBlock(id="t2", name=_GATED, input=dict(_ARGS)), message_id="msg-2"),
         # Never reached: the interrupting deny ends the turn (#1852).
-        _assistant(TextBlock(text="unreachable")),
+        _assistant(TextBlock(text="unreachable"), message_id="msg-3"),
     ]
+
+
+def _success(text: str) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="example-session",
+        result=text,
+    )
 
 
 class _HaltedModel(FakeModelSession):
@@ -67,17 +97,10 @@ class _HaltedModel(FakeModelSession):
 
     async def receive_turn(self) -> AsyncIterator[Any]:
         async for message in super().receive_turn():
-            if isinstance(message, ResultMessage) and self._terminal == "empty-success":
-                # The shape the observed turn ended on: no terminal text.
-                yield ResultMessage(
-                    subtype="success",
-                    duration_ms=1,
-                    duration_api_ms=1,
-                    is_error=False,
-                    num_turns=1,
-                    session_id="example-session",
-                    result="",
-                )
+            if isinstance(message, ResultMessage) and self._terminal != "error-result":
+                # The fake models the CLI's error-shaped abort; the observed
+                # turn ended success-shaped, with or without result text.
+                yield _success(_RESULT if self._terminal == "nonempty-success" else "")
                 continue
             yield message
 
@@ -129,50 +152,25 @@ async def _requester_reply(make_harness, terminal: str) -> tuple[str, Any]:
         assert _INTENT not in (card.text or "")
         reply = [text for _, ref, text in h.sink.updates if ref == "p-1"][-1]
         assert reply.endswith(_SHORT_NOTICE), reply
-        assert _TOOL_RESULT not in reply
+        for leaked in (_TOOL_RESULT, _EARLIER, _NESTED, "U0EXAMPLE2", "unreachable", "run failed"):
+            assert leaked not in reply, (leaked, reply)
         return reply, request
 
 
-_TERMINALS = pytest.mark.parametrize("terminal", ["error-result", "empty-success"])
-
-
-_FAILURE_TEXT_LEAKS = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The runner keeps the halted CLI's failure placeholder as the awaiting-approval "
-        "final text, and the worker places it above the pause notice."
-    ),
-)
-
-
-@pytest.mark.parametrize(
-    "terminal",
-    [pytest.param("error-result", marks=_FAILURE_TEXT_LEAKS), "empty-success"],
-)
-def test_halted_permission_pause_shows_no_failure_text(
-    make_harness, thread_reset_keys, terminal: str
-) -> None:
-    async def scenario() -> None:
-        reply, _ = await _requester_reply(make_harness, terminal)
-        assert "run failed" not in reply, reply
-
-    asyncio.run(scenario())
-
-
-@_TERMINALS
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ADR 0226 decision 1 drops text before the last top-level tool request, and the "
-        "#1852 halt allows no text after the gated call, so ADR 0179 decision 2's "
-        "model text before the pause cannot reach the requester. Needs a decision."
-    ),
-)
-def test_halted_permission_pause_keeps_the_model_sentence_above_the_notice(
+@pytest.mark.parametrize("terminal", ["error-result", "empty-success"])
+def test_halted_permission_pause_puts_the_model_sentence_above_the_notice(
     make_harness, thread_reset_keys, terminal: str
 ) -> None:
     async def scenario() -> None:
         reply, _ = await _requester_reply(make_harness, terminal)
         assert reply.split("\n\n") == [_INTENT, _SHORT_NOTICE], reply
+
+    asyncio.run(scenario())
+
+
+def test_halted_permission_pause_keeps_a_nonempty_result(make_harness, thread_reset_keys) -> None:
+    async def scenario() -> None:
+        reply, _ = await _requester_reply(make_harness, "nonempty-success")
+        assert reply.split("\n\n") == [_RESULT, _SHORT_NOTICE], reply
 
     asyncio.run(scenario())

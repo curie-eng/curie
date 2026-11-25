@@ -4,6 +4,8 @@ Date: 2026-10-14
 
 Status: Accepted
 
+Superseded in part by [ADR 0295](0295-a-halted-permission-pause-answers-with-the-blocked-calls-own-response.md): decision 1's empty-result fallback sentence, for a permission pause the runner halted at the call it blocked. The rest of this ADR stands.
+
 Accepted alongside implementation with explicit maintainer approval from Junwon Jung on 2026-10-14 under ADR 0102.
 
 Tracked in [#4560](https://github.com/curie-eng/curie/issues/4560).
