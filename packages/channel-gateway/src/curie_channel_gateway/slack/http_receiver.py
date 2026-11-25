@@ -460,11 +460,13 @@ class HttpReceiverRuntime:
             or type(profile) is not dict or profile.get("id") != bot_id
         ):
             return False
-        user, bot_user = event.get("user"), profile.get("user_id")
+        # A native delivery may omit the posting bot's user ID; checked when present.
+        user = event.get("user")
+        users = (user, profile["user_id"]) if "user_id" in profile else (user,)
         if (
             any(type(value) is not str or not re.fullmatch(r"[UW][A-Z0-9]+", value)
-                for value in (user, bot_user))
-            or user == bot_user or self._scope.bot_user_id in (user, bot_user)
+                for value in users)
+            or user in users[1:] or self._scope.bot_user_id in users
         ):
             return False
         app_ids = tuple(source["app_id"] for source in (event, profile) if "app_id" in source)
