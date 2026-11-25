@@ -846,6 +846,7 @@ async def _attempt_turn(
             # The live turn now holds this attempt's credential (#3776).
             memory_turns.steered = True
         # The SDK write can complete after the model's terminal result.
+        # Replaying a successful write could deliver the same input twice.
         await self._reply_for(qevent, route, "Your follow-up was sent to the session.")
         return failures.TurnOutcome(terminal_ok=True, steered=True)
 
