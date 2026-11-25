@@ -63,6 +63,7 @@ from curie_internal.driver_declaration import (
     parse_drivers,
     refuse_published_defaults,
 )
+from curie_internal.identity_context import CanonicalUUID
 from curie_internal.keyspace import (
     ADMISSION_KEY_PREFIX_DEFAULT,
     DEDUPE_KEY_PREFIX_DEFAULT,
@@ -93,6 +94,18 @@ class ThreadedBotAdmission(BaseModel):
 
     channel_id: str = Field(strict=True, pattern=r"^[CG][A-Z0-9]+$")
     bot_id: str = Field(strict=True, pattern=r"^B[A-Z0-9]+$")
+
+
+SLACK_APP_ID_PATTERN = r"^A[A-Z0-9]+$"
+
+
+class AppMentionAdmission(BaseModel):
+    """Trust one posting Slack app for one receiving installation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider_installation_id: CanonicalUUID
+    app_id: str = Field(strict=True, pattern=SLACK_APP_ID_PATTERN)
 
 
 class DispatcherConfig(BaseSettings):
@@ -130,6 +143,9 @@ class DispatcherConfig(BaseSettings):
     slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     slack_threaded_bot_allowlist: Annotated[tuple[ThreadedBotAdmission, ...], NoDecode] = Field(
         default=(), validation_alias="CURIE_SLACK_THREADED_BOT_ALLOWLIST"
+    )
+    slack_app_mention_allowlist: Annotated[tuple[AppMentionAdmission, ...], NoDecode] = Field(
+        default=(), validation_alias="CURIE_SLACK_APP_MENTION_ALLOWLIST"
     )
     # Channels whose mentions only prove delivery (#4960): counted and refused
     # before admission, so a scheduled poster can probe every identity.
@@ -295,9 +311,9 @@ class DispatcherConfig(BaseSettings):
         default=10.0, validation_alias=HEARTBEAT_INTERVAL_ENV
     )
 
-    @field_validator("slack_threaded_bot_allowlist", mode="before")
+    @field_validator("slack_threaded_bot_allowlist", "slack_app_mention_allowlist", mode="before")
     @classmethod
-    def _decode_threaded_bot_allowlist(cls, value: object) -> object:
+    def _decode_slack_allowlist(cls, value: object) -> object:
         # Decode here so JSON null is rejected instead of being discarded by
         # the settings env source and silently replaced by the empty default.
         return json.loads(value) if isinstance(value, str) else value

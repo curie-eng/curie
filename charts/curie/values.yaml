@@ -1999,6 +1999,13 @@ dispatcher:
   #
   # Declare this value in curie.yaml so a plain `curie cluster up` keeps it.
   threadedBotAllowlist: []
+  # App-authored Slack mentions admitted by a selected HTTP receiver. Each
+  # entry trusts one app's user attribution for one receiving installation.
+  # Set provider_installation_id to the UUID in that receiver's scope.
+  #   appMentionAllowlist:
+  #     - provider_installation_id: 22222222-2222-4222-8222-222222222222
+  #       app_id: A0EXAMPLEAPP
+  appMentionAllowlist: []
   # Extra env for the dispatcher container. Full Kubernetes EnvVar entries are
   # accepted, including valueFrom. For CURIE_SLACK_THREADED_BOT_ALLOWLIST prefer
   # the first-class threadedBotAllowlist above; use extraEnv for any other
