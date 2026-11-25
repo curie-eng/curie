@@ -49,12 +49,16 @@ BOT = "U0EXAMPLEBOT"
 SLACK_TOKEN = "xoxb-synthetic-threading-receiver"
 
 
+@pytest.mark.parametrize(
+    "bot_user", [None, "U0EXAMPLEAPPBOT"], ids=["native_profile", "profile_with_bot_user"],
+)
 def test_listed_app_mention_uses_the_human_for_real_admission(
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
     synthetic_provider: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
+    bot_user: str | None,
 ) -> None:
     scope = membership._scope(synthetic_provider.url, allowed_callers=[membership.SENDER])
     identity_client = HttpIdentityClient(tls_context=synthetic_provider.tls)
@@ -98,15 +102,19 @@ def test_listed_app_mention_uses_the_human_for_real_admission(
             )
 
         def deliver(runtime: HttpReceiverRuntime, delivery: str, user: str) -> ReceiverSubmission:
-            # Bot profile fields follow the observed shape documented in
-            # apps/dispatcher/tests/test_factory_slack_kickoff_receipt.py.
+            # The native shape is an authenticated Socket Mode events_api delivery
+            # of an app_mention posted through a listed app on behalf of a person:
+            # event and profile app IDs equal, event and profile bot IDs equal, and
+            # no bot_profile.user_id. The older bot-token-post shape in
+            # apps/dispatcher/tests/test_factory_slack_kickoff_receipt.py carries
+            # bot_profile.user_id, which the second case adds.
+            profile = {"id": "B0EXAMPLESENDER", "app_id": app_id}
+            if bot_user is not None:
+                profile["user_id"] = bot_user
             event = {
                 "type": "app_mention", "channel": scope["address"], "ts": MESSAGE_TS,
                 "user": user, "user_team": membership.ACCOUNT, "text": f"<@{BOT}> Hello",
-                "bot_id": "B0EXAMPLESENDER", "app_id": app_id,
-                "bot_profile": {
-                    "id": "B0EXAMPLESENDER", "app_id": app_id, "user_id": "U0EXAMPLEAPPBOT",
-                },
+                "bot_id": "B0EXAMPLESENDER", "app_id": app_id, "bot_profile": profile,
             }
             body = {
                 "type": "event_callback", "event_id": delivery, "api_app_id": "A0EXAMPLERECEIVER",
