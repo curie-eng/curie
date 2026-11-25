@@ -45,6 +45,7 @@ from .test_http_receiver import (
     binding_body,
     native,
     receipt,
+    receiving,
     scope_body,
 )
 from .test_test_actions import DRIVER
@@ -477,6 +478,7 @@ def _assert_api_refusal(web: Any, config: DispatcherConfig) -> None:
         "listed", "listed_with_bot_user", "profile_app_only", "event_app_only",
         "api_refused", "default", "unlisted", "wrong_installation", "own_bot", "own_app",
         "own_user", "bot_user", "own_bot_user", "malformed_bot_user", "non_string_bot_user",
+        "null_bot_user", "empty_bot_user", "other_receiver",
         "missing_user", "missing_app", "conflicting_app", "malformed_app", "conflicting_bot",
         "missing_bot_id", "missing_profile", "app_id_only", "no_receiving_app",
         "bad_receiving_app", "marked_driver", "bot_subtype", "plain_reply",
@@ -532,6 +534,14 @@ def test_app_authored_mentions_require_installation_opt_in(
         profile["user_id"] = "not-a-user"
     elif case == "non_string_bot_user":
         profile["user_id"] = 7
+    elif case == "null_bot_user":
+        # A supplied but empty value is malformed, unlike an absent field.
+        profile["user_id"] = None
+    elif case == "empty_bot_user":
+        profile["user_id"] = ""
+    elif case == "other_receiver":
+        # Only the envelope's authorization names the app that received it.
+        body["authorizations"] = receiving("U0EXAMPLEOTHERBOT")
     elif case == "missing_user":
         del event["user"]
     elif case == "missing_app":
