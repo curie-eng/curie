@@ -47,20 +47,28 @@ _INTENT = "I'll give the requester read access to sample-reports once an adminis
 # What a provider result could carry on a halted turn that still ended cleanly.
 _RESULT = "An administrator needs to approve the read access first."
 _SHORT_NOTICE = "Approval requested. See the card below."
+# A provider error inside the blocked call's response: a real failure.
+_UPSTREAM = "Upstream model error."
 
 
-def _assistant(*blocks: Any, message_id: str, parent: str | None = None) -> AssistantMessage:
+def _assistant(
+    *blocks: Any, message_id: str, parent: str | None = None, error: Any = None
+) -> AssistantMessage:
     return AssistantMessage(
         content=list(blocks),
         model="example-model",
         parent_tool_use_id=parent,
         message_id=message_id,
+        error=error,
     )
 
 
-def _script() -> list[Any]:
+def _script(*, provider_error: bool = False) -> list[Any]:
     # The CLI streams one assistant message per content block, each carrying
     # its provider response's message id.
+    failure = [
+        _assistant(TextBlock(text=_UPSTREAM), message_id="msg-2", error="server_error"),
+    ]
     return [
         _assistant(TextBlock(text=_EARLIER), message_id="msg-1"),
         _assistant(
@@ -70,6 +78,7 @@ def _script() -> list[Any]:
         UserMessage(content=[ToolResultBlock(tool_use_id="t1", content=_TOOL_RESULT)]),
         _assistant(TextBlock(text=_NESTED), message_id="msg-2", parent="t1"),
         _assistant(TextBlock(text=_INTENT), message_id="msg-2"),
+        *(failure if provider_error else []),
         _assistant(ToolUseBlock(id="t2", name=_GATED, input=dict(_ARGS)), message_id="msg-2"),
         # Never reached: the interrupting deny ends the turn (#1852).
         _assistant(TextBlock(text="unreachable"), message_id="msg-3"),
@@ -92,12 +101,15 @@ class _HaltedModel(FakeModelSession):
     """The fake model, with the terminal shape the halted CLI turn ends on."""
 
     def __init__(self, terminal: str, **kwargs: Any) -> None:
-        super().__init__(_script, **kwargs)
+        super().__init__(lambda: _script(provider_error=terminal == "provider-error"), **kwargs)
         self._terminal = terminal
 
     async def receive_turn(self) -> AsyncIterator[Any]:
         async for message in super().receive_turn():
-            if isinstance(message, ResultMessage) and self._terminal != "error-result":
+            if isinstance(message, ResultMessage) and self._terminal in {
+                "empty-success",
+                "nonempty-success",
+            }:
                 # The fake models the CLI's error-shaped abort; the observed
                 # turn ended success-shaped, with or without result text.
                 yield _success(_RESULT if self._terminal == "nonempty-success" else "")
@@ -105,8 +117,8 @@ class _HaltedModel(FakeModelSession):
             yield message
 
 
-async def _requester_reply(make_harness, terminal: str) -> tuple[str, Any]:
-    """Run one halted turn end to end; return the requester's reply and the request."""
+async def _drive(make_harness, terminal: str) -> tuple[list[Any], list[Any], str]:
+    """Run one gated turn end to end; return the requests, card posts and reply."""
 
     gate = ApprovalGate(required=frozenset({_GATED}))
     model = _HaltedModel(terminal, can_use_tool=build_can_use_tool(gate))
@@ -140,21 +152,27 @@ async def _requester_reply(make_harness, terminal: str) -> tuple[str, Any]:
         finally:
             consumer.request_stop()
             await asyncio.wait_for(consuming, 10)
-
-        # The gate recorded the exact call, and the in-thread card describes it.
-        [request] = approvals.requests
-        assert request.gate_kind == "permission"
-        assert request.granted_tool == _GATED
-        assert request.granted_arguments == _ARGS
-        assert _INTENT not in request.summary
-        [(_, card, _, _, _)] = h.sink.posts
-        assert card.interaction is not None and card.interaction.id == "appr-1"
-        assert _INTENT not in (card.text or "")
         reply = [text for _, ref, text in h.sink.updates if ref == "p-1"][-1]
-        assert reply.endswith(_SHORT_NOTICE), reply
-        for leaked in (_TOOL_RESULT, _EARLIER, _NESTED, "U0EXAMPLE2", "unreachable", "run failed"):
-            assert leaked not in reply, (leaked, reply)
-        return reply, request
+        return list(approvals.requests), list(h.sink.posts), reply
+
+
+async def _requester_reply(make_harness, terminal: str) -> tuple[str, Any]:
+    """Run one halted turn end to end; return the requester's reply and the request."""
+
+    requests, posts, reply = await _drive(make_harness, terminal)
+    # The gate recorded the exact call, and the in-thread card describes it.
+    [request] = requests
+    assert request.gate_kind == "permission"
+    assert request.granted_tool == _GATED
+    assert request.granted_arguments == _ARGS
+    assert _INTENT not in request.summary
+    [(_, card, _, _, _)] = posts
+    assert card.interaction is not None and card.interaction.id == "appr-1"
+    assert _INTENT not in (card.text or "")
+    assert reply.endswith(_SHORT_NOTICE), reply
+    for leaked in (_TOOL_RESULT, _EARLIER, _NESTED, "U0EXAMPLE2", "unreachable", "run failed"):
+        assert leaked not in reply, (leaked, reply)
+    return reply, request
 
 
 @pytest.mark.parametrize("terminal", ["error-result", "empty-success"])
@@ -172,5 +190,19 @@ def test_halted_permission_pause_keeps_a_nonempty_result(make_harness, thread_re
     async def scenario() -> None:
         reply, _ = await _requester_reply(make_harness, "nonempty-success")
         assert reply.split("\n\n") == [_RESULT, _SHORT_NOTICE], reply
+
+    asyncio.run(scenario())
+
+
+def test_provider_failure_beside_a_gate_reaches_the_requester_as_a_failure(
+    make_harness, thread_reset_keys
+) -> None:
+    async def scenario() -> None:
+        requests, posts, reply = await _drive(make_harness, "provider-error")
+        # A classified provider error outranks the halt: no approval, no card,
+        # and the requester gets the failure, never the model's sentence.
+        assert requests == [] and posts == []
+        assert reply.startswith("curie-turn-failure: server-error"), reply
+        assert _INTENT not in reply and _SHORT_NOTICE not in reply, reply
 
     asyncio.run(scenario())

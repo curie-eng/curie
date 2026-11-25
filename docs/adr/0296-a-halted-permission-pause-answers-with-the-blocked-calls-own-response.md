@@ -6,8 +6,9 @@ Status: Accepted
 
 Accepted by Brian Conn under [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md)
 alongside implementation, covering both decisions below. The realizing code path is
-`curie_runner.session._apply_approval_override` with `_halted_permission_call`,
-fed by `curie_runner.translate._translate_assistant` and
+`curie_runner.session._halted_pause_text` with `_halted_permission_call`, fed by
+`curie_runner.session._apply_approval_override`,
+`curie_runner.translate._translate_assistant` and
 `curie_runner.approval.ApprovalGate.block`.
 
 This ADR supersedes in part decision 1 of
@@ -54,10 +55,14 @@ notice of a pause that had not failed.
 3. "That same state" requires all of: the runner requested the halt, no
    operator interrupt or timeout, no classified model or transport error, the
    merged record is a permission gate's and not a publication's, the gate named
-   the call that wrote the record, and that call was a top-level call of this
-   turn. A bundle with a final-answer policy (ADR 0227) is excluded, because it
-   withholds provisional text in every turn. Every other final keeps its text,
-   including real failures, which still show `run failed`.
+   the call that wrote the record, that call was a top-level call of this
+   turn, and its response is the turn's last top-level response, so nothing
+   continued after the halt (such as a later response a background task
+   allows). A bundle with a final-answer policy (ADR 0227) is excluded, because
+   it withholds provisional text in every turn. The text is set at
+   publication, after the runner's last stop check, so a timeout or interrupt
+   that lands later still reports its own text. Every other final keeps its
+   text, including real failures, which still show `run failed`.
 4. The approval record, summary, display, grant, card, notice wording, reply
    placement, routed and direct message approvals, resume and dedupe behavior
    are unchanged. The worker already keeps the final text out of the summary,

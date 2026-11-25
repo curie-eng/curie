@@ -312,11 +312,11 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
     The captured summary rides the final so the platform can persist it on the
     durable Approval record.
 
-    ADR 0296 sets the text of one case: a permission pause the runner halted at
-    the exact call it blocked (``_halted_permission_call``). There the failure
-    text the aborted CLI result carries, such as the ``run failed`` placeholder,
-    is never kept, and an empty text becomes the top-level assistant text of
-    the blocked call's own model response. Every other final keeps its text.
+    The text is left as it came. ADR 0296 sets the text of one halted pause
+    only at publication (``_halted_pause_text``), after the last stop check, so
+    a timeout or interrupt that lands later still reports its own text. This
+    records whether the flipped final came from the aborted CLI result's
+    failure path, which that step needs.
     """
 
     if state.tool_access is not None:
@@ -324,16 +324,9 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
         return final
     runner_halted_the_turn = state.approval_halt_requested and state.error_classification is None
     if state.approval_summary and (final.status is SessionStatus.DONE or runner_halted_the_turn):
-        text = final.text
-        response = _halted_permission_call(state) if runner_halted_the_turn else None
-        if response is not None:
-            if final.status is not SessionStatus.DONE:
-                # The aborted CLI result's failure text; the turn did not fail.
-                text = ""
-            if not text.strip():
-                text = state.response_text.get(response, "").strip()
+        state.approval_flipped_failure = final.status is not SessionStatus.DONE
         return Final(
-            text=text,
+            text=final.text,
             status=SessionStatus.AWAITING_APPROVAL,
             approval_summary=state.approval_summary,
             approval_route=state.approval_route,
@@ -348,20 +341,50 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
 def _halted_permission_call(state: TurnState) -> str | None:
     """The model response of the call a halted permission pause blocked (ADR 0296).
 
-    None unless the merged record is a permission gate's, not a publication's,
-    the gate named the call that wrote it, that call was a top-level call this
-    turn, and the bundle declares no final-answer policy (ADR 0227 withholds
-    provisional text there). The caller has already checked the runner's halt.
+    None unless the runner itself halted the turn with no classified error, the
+    merged record is a permission gate's and not a publication's, the gate named
+    the call that wrote it, that call was a top-level call of this turn, its
+    response is the turn's last top-level response (nothing continued after the
+    halt, such as a background task's later response), and the bundle declares
+    no final-answer policy (ADR 0227 withholds provisional text there).
     """
 
     if (
-        state.approval_gate_kind != "permission"
+        not state.approval_halt_requested
+        or state.error_classification is not None
+        or state.tool_access is not None
+        or state.approval_gate_kind != "permission"
         or state.approval_granted_tool in (None, PLATFORM_PUBLISH_TOOL_NAME)
         or state.approval_call_id is None
         or state.final_answer is not None
     ):
         return None
-    return state.call_responses.get(state.approval_call_id)
+    response = state.call_responses.get(state.approval_call_id)
+    if response is None or response != state.last_response:
+        return None
+    return response
+
+
+def _halted_pause_text(final: Final, state: TurnState) -> Final:
+    """Set the text of a permission pause the runner halted at its call (ADR 0296).
+
+    Called at publication, after the last stop check, so only a final that is
+    still awaiting approval changes. The aborted CLI result's failure text, such
+    as the ``run failed`` placeholder, is dropped, and an empty text becomes the
+    top-level assistant text of the blocked call's own model response. A
+    nonempty provider result of that same invocation stays. Every other final
+    is returned unchanged.
+    """
+
+    if final.status is not SessionStatus.AWAITING_APPROVAL:
+        return final
+    response = _halted_permission_call(state)
+    if response is None:
+        return final
+    text = "" if state.approval_flipped_failure else final.text
+    if not text.strip():
+        text = state.response_text.get(response, "").strip()
+    return final.model_copy(update={"text": text})
 
 
 _HISTORY_CAPACITY_FINAL = Final(
@@ -2302,6 +2325,7 @@ class SessionRunner:
                         # before publishing the terminal final.
                         final = self._reclassify(final)
                         final, validation_failed = self._validate_publication(state, final)
+                        final = _halted_pause_text(final, state)
                         capacity_failure = False
                         if final.status in {
                             SessionStatus.DONE,
@@ -2383,6 +2407,7 @@ class SessionRunner:
             yield line
         final = self._reclassify(final)
         final, validation_failed = self._validate_publication(state, final)
+        final = _halted_pause_text(final, state)
         capacity_failure = False
         if final.status is SessionStatus.AWAITING_APPROVAL:
             final, capacity_failure = await self._persist_terminal(

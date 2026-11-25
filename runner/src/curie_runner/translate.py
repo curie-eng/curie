@@ -343,6 +343,10 @@ class TurnState:
     response_text: dict[str, str] = field(default_factory=dict)
     call_responses: dict[str, str] = field(default_factory=dict)
     anonymous_responses: int = 0
+    # The most recent top-level response of the turn, and whether the approval
+    # override flipped a final from the failure path (the aborted CLI result).
+    last_response: str | None = None
+    approval_flipped_failure: bool = False
     # The call id of the permission block the session merged, if the gate named one.
     approval_call_id: str | None = None
 
@@ -511,6 +515,8 @@ def _translate_assistant(
             elif isinstance(block, ToolUseBlock):
                 gen.observe_output(f"[tool_use {block.name}]")
     response = _response_key(message, state) if not nested else None
+    if response is not None:
+        state.last_response = response
     for block in message.content:
         if isinstance(block, TextBlock):
             if block.text and not nested:
