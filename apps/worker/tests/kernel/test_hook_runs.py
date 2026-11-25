@@ -213,6 +213,7 @@ def test_targeted_cron_canned_reply_closes_the_run_as_ran(
         async with make_hook_run() as run:
             deployment_id = uuid.uuid4()
             channel_id = uuid.uuid4()
+            channel = f"C-example-{channel_id.hex}"
             greeting = {"greeting": {"enabled": True, "phrases": ["hello"], "reply": reply}}
             async with run.engine.begin() as conn:
                 await conn.execute(
@@ -234,16 +235,23 @@ def test_targeted_cron_canned_reply_closes_the_run_as_ran(
                     text(
                         "INSERT INTO curie.agent_channels "
                         "(id, agent_id, kind, address, adapter) "
-                        "VALUES (:id, :agent_id, 'slack', 'C1', 'default')"
+                        "VALUES (:id, :agent_id, 'slack', :channel, 'default')"
                     ),
-                    {"id": channel_id, "agent_id": run.agent_id},
+                    {"id": channel_id, "agent_id": run.agent_id, "channel": channel},
                 )
             try:
                 async with make_harness(
                     hook_runs=run.recorder(),
                     binding_factory=lambda config: BindingResolver(run.engine, config),
                 ) as h:
-                    event = _event(hook_run=run.ref).model_copy(update={"text": "hello"})
+                    event = _event(hook_run=run.ref).model_copy(
+                        update={
+                            "text": "hello",
+                            "reply_handle": ReplyHandle(
+                                kind="slack", channel=channel, placeholder=None
+                            ),
+                        }
+                    )
                     await h.kernel.process_event(event)
 
                     assert h.sink.last_text == reply

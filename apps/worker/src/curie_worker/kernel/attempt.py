@@ -829,14 +829,11 @@ async def _attempt_turn(
             logger.warning("booting-state update failed for %s", qevent.event_id)
 
     if routed.canned_reply is not None:
-        # An enabled greeting/help pack matched a provably-fresh thread under
-        # the route lock (ADR-0018). Deliver the canned reply onto the
-        # placeholder and return terminal-ok so process_event marks the event
-        # done. No run was registered, no sandbox claimed, no turn started.
         await self._reply_for(qevent, route, routed.canned_reply)
         hook_carry = constants._HOOK_RUN_CARRY.get()
         if (
-            hook_carry is not None
+            routed.canned_reply_from_pack
+            and hook_carry is not None
             and hook_carry.ref is not None
             and not routing._is_targetless(qevent)
         ):
