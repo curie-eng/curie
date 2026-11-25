@@ -1164,7 +1164,7 @@ def test_steered_follow_up_with_the_url_is_not_announced(make_harness) -> None:
                 assert h.runner.steers == [_REPO_MESSAGE]
                 assert h.runner.opened == ["first"]
                 steer_updates = _updates_on(h, "p-steer")
-                assert steer_updates[-1] == "Folded into the in-progress reply above."
+                assert steer_updates[-1] == "Your follow-up was sent to the session."
                 assert not any("Working in" in t for t in steer_updates)
             finally:
                 hold.set()
@@ -6260,9 +6260,7 @@ def test_steered_followup_placeholder_is_retired(make_harness) -> None:
             e2 = qevent("second", thread="tPH", placeholder="ph-2")
             await h.kernel.process_event(e2)
 
-            folded = [u for u in h.sink.updates if u[1] == "ph-2"]
-            assert folded, "the steered follow-up's placeholder was never updated"
-            assert "folded" in folded[-1][2].lower()
+            assert _updates_on(h, "ph-2")[-1] == "Your follow-up was sent to the session."
 
             hold.set()
             await t1

@@ -618,11 +618,8 @@ class SessionRunner:
         self._admission_results: OrderedDict[str, str] = OrderedDict()
         self._status = SessionStatus.IDLE_AWAITING_INPUT
         self._started = False
-        # True only while a turn can still accept a steer: from turn start until
-        # the terminal final is produced. It is cleared the instant a turn
-        # terminates -- before the lock releases -- so a steer landing in the
-        # finish-race window (final produced, lock not yet freed) is rejected
-        # instead of writing into an already-terminal stream.
+        # Report the turn as active through terminal processing. Steering also
+        # requires a pending model result, which can settle earlier.
         self._turn_open = False
         self._persistence_owned = False
         # Safe-boundary fence for replacing a runner. A fresh runner has no
@@ -676,7 +673,7 @@ class SessionRunner:
 
     @property
     def turn_active(self) -> bool:
-        """True while a turn can still accept a steer (open, pre-terminal)."""
+        """True while a turn is open, including terminal processing."""
 
         return self._turn_open
 
@@ -1285,18 +1282,24 @@ class SessionRunner:
     ) -> bool:
         """Inject a follow-up message into the live turn without consuming output.
 
-        Returns False when no turn is active (the finish-race boundary F1 owns:
-        the caller falls back to opening a fresh turn). The steered output appears
-        on the already-open turn's NDJSON stream. A steer under a different tool
-        access than the live turn's is refused the same way, so neither message
-        runs under the other's access (RUNNER-TOOL-ACCESS-4).
+        Returns False when the turn cannot take input, including while the
+        runner is settling the terminal model result. The caller falls back
+        to opening a fresh turn. Any output from the steer appears on the open
+        NDJSON stream. A steer under a different tool access than the live
+        turn's is refused the same way, so neither message runs under the
+        other's access (RUNNER-TOOL-ACCESS-4).
 
         ``event`` is the steered frame. When given, the memory tools' author is
         rebound to its sender before the model sees the text (#1461), exactly as
         turn start does, so a fact saved in reply is attributed to whoever said it.
         """
 
-        if self._session is None or not self._turn_open or not self._turn_ready:
+        if (
+            self._session is None
+            or not self._turn_open
+            or not self._turn_ready
+            or not self._result_pending
+        ):
             return False
         if (
             self._active_state is None

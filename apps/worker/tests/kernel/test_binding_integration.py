@@ -806,8 +806,8 @@ def test_mid_live_thread_greeting_steers_and_is_not_short_circuited(make_harness
             # The canned greeting was NEVER delivered (the short-circuit did not fire).
             assert all(_GREET not in text for _c, _ts, text in h.sink.updates)
             # The follow-up's placeholder was retired as a fold, not a canned reply.
-            folded = [u for u in h.sink.updates if u[1] == "ph-2"]
-            assert folded and "folded" in folded[-1][2].lower()
+            updates = [text for _, ref, text in h.sink.updates if ref == "ph-2"]
+            assert updates[-1] == "Your follow-up was sent to the session."
 
             hold.set()
             await t1
