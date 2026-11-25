@@ -822,7 +822,11 @@ The scheduler producer must supply all three fields for every cron turn, with
 When a started turn exits, the worker writes `ran` for a normal exit, including
 an approval pause, or `failed` for a bad exit or deadline, with `ended_at`
 before writing the done marker. A prestart deferral leaves the row open for
-scheduler reconciliation. A cron failure is not retried within its fire.
+scheduler reconciliation. A turn that ends with an escalation or refusal
+before any attempt starts closes `failed` with reason `turn_error`, so the next
+fire is not skipped as `run_in_flight` until the claim lease runs out (#5968).
+A cron failure is not retried within its fire. A targetless turn runs without
+lazy attachment access: it has no channel binding to authorize a context.
 Slack and webhook turns perform no hook run writes.
 
 A long scheduled sweep is the one cron turn that continues past its delivery
