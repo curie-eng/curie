@@ -38,12 +38,14 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 import yaml
+from kind_install import DOCKER_HUB_MIRROR_PATCH, diagnose_helm_install
 
 ROOT = Path(__file__).resolve().parents[3]
 PREFIX = "test-4630"
@@ -768,6 +770,7 @@ class Rotation:
                 {
                     "kind": "Cluster",
                     "apiVersion": "kind.x-k8s.io/v1alpha4",
+                    "containerdConfigPatches": [DOCKER_HUB_MIRROR_PATCH],
                     "nodes": [{"role": "control-plane", "extraPortMappings": mappings}],
                 }
             )
@@ -1056,18 +1059,21 @@ class Rotation:
             "security": {"allowDevDefaults": True, "gvisor": {"mode": "off"}},
         }
         # Post-install migration and bucket hooks must run before API readiness.
-        self.helm(
-            "install",
-            RELEASE,
-            str(self.candidate.source / "charts/curie"),
-            "--skip-crds",
-            "-f",
-            "-",
-            "--timeout",
-            "600s",
-            stdin=json.dumps(values),
-            timeout=660,
-        )
+        with diagnose_helm_install(
+            self.kubectl, NAMESPACE, FULLNAME, partial(_redact, secrets=self.secrets)
+        ):
+            self.helm(
+                "install",
+                RELEASE,
+                str(self.candidate.source / "charts/curie"),
+                "--skip-crds",
+                "-f",
+                "-",
+                "--timeout",
+                "600s",
+                stdin=json.dumps(values),
+                timeout=660,
+            )
         self.rollout_api()
         self.http = httpx.Client(
             base_url=self.env["CURIE_API_URL"],

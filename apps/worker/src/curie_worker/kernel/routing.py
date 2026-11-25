@@ -237,10 +237,8 @@ class _RouteResult:
     steered: bool
     handle: SandboxHandle | None = None
     turn: TurnStream | None = None
-    # An enabled greeting/help pack matched a provably-fresh thread (no existing
-    # route) under the route lock: the canned reply to deliver instead of
-    # claiming a sandbox or starting a model turn. None on every other path.
     canned_reply: str | None = None
+    canned_reply_from_pack: bool = False
     # Set only on the new-turn return, when this message's own repository fact
     # selected a workspace the route snapshot taken under the lock did not
     # already carry (#2659). The reply announces it; None on every other path.

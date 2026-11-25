@@ -279,12 +279,19 @@ async def _complete(
         # before runner admission, a drop, an already-terminal row) is a
         # sweep stop: close it so the stop is recorded and reported (#2878).
         hook_outcome = "failed"
-    if hook_outcome is None and routing._is_targetless(qevent):
-        # A targeted terminal that started nothing (an escalation, a refused
-        # admission or workspace) leaves the row open for a human reading the
-        # reply. A targetless one has no reader and redelivery skips a done
-        # event, so every targetless terminal closes the row: "ran" only when
-        # an attempt started and ended ok, otherwise "failed" (#2963).
+    if hook_outcome is None and (
+        routing._is_targetless(qevent)
+        or (successor is None and qevent.source is TurnSource.CRON and outcome != "dropped")
+    ):
+        # Redelivery skips a done event, so a cron turn that answered its
+        # target without starting an attempt (an escalation, a refused
+        # admission or workspace) closes the row "failed": ADR-0099 records a
+        # refused run and waits for the next fire. Left open, the claim lease
+        # renewed at delivery start would skip every fire as run_in_flight
+        # for the delivery budget (#5968). A targeted drop (a refused
+        # identity, a stale entry) leaves the row as it found it, and a
+        # published sweep successor keeps it open for its next slice. Every
+        # targetless terminal closes the row (#2963).
         hook_outcome = "failed"
     hook_carry = constants._HOOK_RUN_CARRY.get()
     notice: str | None = None

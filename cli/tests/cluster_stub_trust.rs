@@ -245,7 +245,7 @@ def relay_body(reply_ref, after):
             "outcome": "delivered",
         },
     ]
-    if mode in ("close_once", "close_always"):
+    if mode in ("close_once", "close_always", "exit_once", "exit_partial", "exit_unavailable", "exit_stalled"):
         events.insert(0, {
             "version": "1.0", "event": "turn.status", "target": target,
             "event_id": payload["event_id"], "status": "running",
@@ -285,6 +285,10 @@ def serve_http(client):
                 })
                 return attempt
             attempt = update_state(record)
+            if mode.startswith("exit_") and attempt == 2:
+                if mode == "exit_partial":
+                    client.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 60\r\n\r\n{"events":[')
+                os._exit(1)
             if mode == "404":
                 status = "404 Not Found"
                 body = b'{"detail":"Not Found"}'
@@ -321,6 +325,22 @@ def serve_http(client):
 
 def serve_port_forward(component):
     requested, remote = args[-1].split(":", 1)
+    lifetime = open(f"{state_path}.{os.getpid()}", "w")
+    fcntl.flock(lifetime, fcntl.LOCK_EX)
+    def register(state):
+        pids = state.setdefault("forward_pids", {}).setdefault(component, [])
+        pids.append(os.getpid())
+        return len(pids)
+    starts = update_state(register)
+    if component == "api" and starts > 1:
+        mode = os.environ.get("CURIE_TEST_RELAY_MODE")
+        if mode == "exit_unavailable":
+            sys.exit(1)
+        if mode == "exit_stalled":
+            import signal
+            with open(log_path, "a") as log:
+                print("waiting for replacement readiness", file=log)
+            signal.pause()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", int(requested)))
@@ -551,6 +571,26 @@ impl Fixture {
             &fs::read_to_string(&self.state_path).expect("read fake cluster state"),
         )
         .expect("parse fake cluster state")
+    }
+
+    fn assert_forwards_stopped(&self) {
+        let state = self.state();
+        for group in state["forward_pids"].as_object().unwrap().values() {
+            for pid in group.as_array().unwrap() {
+                let path = self.state_path.with_extension(format!("json.{pid}"));
+                let file = fs::File::open(path).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match file.try_lock() {
+                        Ok(()) => break,
+                        Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("forward {pid} still owns its lifetime lock: {error}"),
+                    }
+                }
+            }
+        }
     }
 
     fn log(&self) -> String {
@@ -930,10 +970,24 @@ fn transient_relay_503_retries_without_duplicate_enqueue_then_replies() {
 
 #[test]
 fn relay_poll_recovers_after_connection_closes_before_headers() {
+    assert_relay_poll_recovers("close_once", 1);
+}
+
+#[test]
+fn relay_poll_replaces_exited_api_forward() {
+    assert_relay_poll_recovers("exit_once", 2);
+}
+
+#[test]
+fn relay_poll_replaces_forward_lost_during_response_body() {
+    assert_relay_poll_recovers("exit_partial", 2);
+}
+
+fn assert_relay_poll_recovers(mode: &str, api_starts: usize) {
     let fixture = Fixture::new();
     let output = fixture
         .command(fixture.state_home.path(), "alpha", false)
-        .env("CURIE_TEST_RELAY_MODE", "close_once")
+        .env("CURIE_TEST_RELAY_MODE", mode)
         .output()
         .expect("run through one relay connection close");
 
@@ -947,6 +1001,11 @@ fn relay_poll_recovers_after_connection_closes_before_headers() {
     let turn = &state["turns"][0];
     let reply_ref = assert_relay_turn(&turn["payload"], "alpha");
     let gets = state["http_gets"].as_array().expect("recorded relay GETs");
+    assert_eq!(
+        state["forward_pids"]["api"].as_array().unwrap().len(),
+        api_starts
+    );
+    assert_eq!(state["forward_pids"]["valkey"].as_array().unwrap().len(), 1);
     assert_eq!(gets.len(), 3, "{gets:#?}");
     for (get, cursor) in gets.iter().zip([0, 2, 2]) {
         assert_eq!(
@@ -960,10 +1019,25 @@ fn relay_poll_recovers_after_connection_closes_before_headers() {
         serde_json::json!([turn["stream_id"]])
     );
     assert_eq!(state["xack_commands"], serde_json::json!([]));
+    fixture.assert_forwards_stopped();
 }
 
 #[tokio::test]
 async fn relay_poll_transport_closes_respect_original_deadline() {
+    assert_relay_poll_times_out("close_always").await;
+}
+
+#[tokio::test]
+async fn relay_poll_exhausts_replacement_attempts_at_original_deadline() {
+    assert_relay_poll_times_out("exit_unavailable").await;
+}
+
+#[tokio::test]
+async fn relay_poll_bounds_replacement_readiness_by_original_deadline() {
+    assert_relay_poll_times_out("exit_stalled").await;
+}
+
+async fn assert_relay_poll_times_out(mode: &str) {
     let fixture = Fixture::new();
     let mut command = tokio::process::Command::from(fixture.command_with_timeout(
         fixture.state_home.path(),
@@ -972,7 +1046,7 @@ async fn relay_poll_transport_closes_respect_original_deadline() {
         "2",
     ));
     command
-        .env("CURIE_TEST_RELAY_MODE", "close_always")
+        .env("CURIE_TEST_RELAY_MODE", mode)
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1002,10 +1076,23 @@ async fn relay_poll_transport_closes_respect_original_deadline() {
     let turn = &state["turns"][0];
     let reply_ref = assert_relay_turn(&turn["payload"], "alpha");
     let gets = state["http_gets"].as_array().expect("recorded relay GETs");
-    assert!(
-        gets.len() >= 3,
-        "expected repeated connection closes: {gets:#?}"
-    );
+    let starts = state["forward_pids"]["api"].as_array().unwrap().len();
+    match mode {
+        "close_always" => {
+            assert!(gets.len() >= 3);
+            assert_eq!(starts, 1);
+        }
+        "exit_unavailable" => {
+            assert!((3..=8).contains(&starts), "{starts} API forwards started");
+            assert_eq!(gets.len(), 2);
+        }
+        "exit_stalled" => {
+            assert_eq!(starts, 2);
+            assert_eq!(gets.len(), 2);
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(state["forward_pids"]["valkey"].as_array().unwrap().len(), 1);
     assert_eq!(
         gets[0]["path"],
         format!("/cluster-message-replies/{reply_ref}?after=0")
@@ -1019,6 +1106,51 @@ async fn relay_poll_transport_closes_respect_original_deadline() {
     assert_eq!(turn["pending"], true);
     assert_eq!(state["worker_xacks"], serde_json::json!([]));
     assert_eq!(state["xack_commands"], serde_json::json!([]));
+    fixture.assert_forwards_stopped();
+}
+
+#[tokio::test]
+async fn relay_poll_interrupt_drops_replacement_and_valkey_children() {
+    use std::os::unix::process::ExitStatusExt;
+    let fixture = Fixture::new();
+    let mut command = tokio::process::Command::from(fixture.command_with_timeout(
+        fixture.state_home.path(),
+        "alpha",
+        false,
+        "15",
+    ));
+    let mut child = command
+        .env("CURIE_TEST_RELAY_MODE", "exit_stalled")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start CLI");
+    let pid = child.id().unwrap() as libc::pid_t;
+    struct Group(libc::pid_t);
+    impl Drop for Group {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-self.0, libc::SIGKILL) };
+        }
+    }
+    let _cleanup = Group(pid);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture.log().contains("waiting for replacement readiness") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("replacement started");
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGINT));
+    fixture.assert_forwards_stopped();
+    assert_eq!(fixture.state()["turns"].as_array().unwrap().len(), 1);
 }
 
 #[test]

@@ -26,7 +26,9 @@ use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::api::{Agent, ApiClient, ClusterMessageProgress, ClusterMessageReplyEvent};
+use crate::api::{
+    Agent, ApiClient, ClusterMessageProgress, ClusterMessageReplyEvent, ClusterMessageReplyPage,
+};
 use crate::chat::{
     await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
     failure_class_from_reply, parse_approval_id, resolve_targets, Outcome, SlackStub,
@@ -819,6 +821,69 @@ struct ClusterRelayObservation {
     next_cursor: usize,
 }
 
+struct RelayForward<'a> {
+    command: OpsCommand,
+    local_port: u16,
+    api_key: &'a str,
+    child: tokio::process::Child,
+    api: ApiClient,
+}
+
+impl<'a> RelayForward<'a> {
+    async fn open(command: OpsCommand, local_port: u16, api_key: &'a str) -> Result<Self> {
+        let (child, port) = start_port_forward(&command, local_port, "api").await?;
+        let api = ApiClient::new(&format!("http://127.0.0.1:{port}"), api_key)?;
+        Ok(Self {
+            command,
+            local_port,
+            api_key,
+            child,
+            api,
+        })
+    }
+
+    async fn page(
+        &mut self,
+        reply_ref: &uuid::Uuid,
+        cursor: usize,
+    ) -> Result<Option<ClusterMessageReplyPage>> {
+        if self.child.try_wait()?.is_some() {
+            let mut delay = CLUSTER_MESSAGE_RELAY_POLL_INTERVAL;
+            loop {
+                match start_port_forward(&self.command, self.local_port, "api").await {
+                    Ok((child, port)) => {
+                        self.api =
+                            ApiClient::new(&format!("http://127.0.0.1:{port}"), self.api_key)?;
+                        self.child = child;
+                        break;
+                    }
+                    Err(error) => {
+                        crate::ui::ui()
+                            .plumbing(&format!("waiting for the API port-forward: {error}"));
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(2));
+                    }
+                }
+            }
+        }
+        match self.api.cluster_message_replies(reply_ref, cursor).await {
+            Err(error) if error.downcast_ref::<reqwest::Error>().is_some() => {
+                // A torn response can reach the socket before the child's exit is observable.
+                match tokio::time::timeout(CLUSTER_MESSAGE_RELAY_POLL_INTERVAL, self.child.wait())
+                    .await
+                {
+                    Ok(status) => {
+                        status?;
+                        Ok(None)
+                    }
+                    Err(_) => Err(error),
+                }
+            }
+            page => page,
+        }
+    }
+}
+
 /// Observe one ref-keyed API relay until the worker reports a semantic
 /// completion, parks for approval, or the caller's deadline expires.
 ///
@@ -834,8 +899,7 @@ struct ClusterRelayObservation {
 /// waiting note until `--timeout-secs` (#2757). Session expiry still waits for
 /// the resume turn.
 async fn await_cluster_relay(
-    api: &ApiClient,
-    reply_ref: &uuid::Uuid,
+    mut read_page: impl AsyncFnMut(usize) -> Result<Option<ClusterMessageReplyPage>>,
     mut cursor: usize,
     timeout: Duration,
     observer: &mut impl FnMut(&str),
@@ -851,18 +915,15 @@ async fn await_cluster_relay(
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let page =
-            match tokio::time::timeout(remaining, api.cluster_message_replies(reply_ref, cursor))
-                .await
-            {
-                Ok(page) => page?,
-                Err(_) => {
-                    return Ok(ClusterRelayObservation {
-                        outcome: Outcome::TimedOut,
-                        next_cursor: cursor,
-                    });
-                }
-            };
+        let page = match tokio::time::timeout(remaining, read_page(cursor)).await {
+            Ok(page) => page?,
+            Err(_) => {
+                return Ok(ClusterRelayObservation {
+                    outcome: Outcome::TimedOut,
+                    next_cursor: cursor,
+                });
+            }
+        };
         if let Some(page) = page {
             if page.next_cursor < cursor {
                 bail!(
@@ -2902,7 +2963,7 @@ async fn resume_after_approval(
 #[allow(clippy::too_many_arguments)]
 async fn resume_cluster_after_approval(
     opts: &MessageOpts,
-    api: &ApiClient,
+    forward: &mut RelayForward<'_>,
     reply_ref: &uuid::Uuid,
     mut cursor: usize,
     id: &str,
@@ -2961,7 +3022,13 @@ async fn resume_cluster_after_approval(
                     step.tick_detail(line.trim());
                 }
             };
-            await_cluster_relay(api, reply_ref, cursor, remaining, &mut observe_update).await?
+            await_cluster_relay(
+                async |after| forward.page(reply_ref, after).await,
+                cursor,
+                remaining,
+                &mut observe_update,
+            )
+            .await?
         };
         step.clear();
         cursor = observed.next_cursor;
@@ -3531,12 +3598,36 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         return message_connected(opts, &fullname).await;
     }
 
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        // Leaving select drops the message future and its children before signal exit.
+        let sig = tokio::select! {
+            biased;
+            _ = interrupt.recv() => libc::SIGINT,
+            _ = terminate.recv() => libc::SIGTERM,
+            result = message_disconnected(opts, &fullname) => return result,
+        };
+        signal_hook::low_level::emulate_default_handler(sig)?;
+        std::process::exit(128 + sig);
+    }
+    #[cfg(not(unix))]
+    message_disconnected(opts, &fullname).await
+}
+
+async fn message_disconnected(
+    opts: MessageOpts,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Result<()> {
+    let ui = crate::ui::ui();
     // Valkey remains the enqueue transport. Replies use a separate API
     // port-forward below; neither path mutates any Deployment or replaces pods.
     let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
-            &fullname,
+            fullname,
             "valkey",
             opts.valkey_local_port,
             VALKEY_REMOTE_PORT,
@@ -3549,24 +3640,23 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // Channel: --agent's own binding, else explicit --channel, else the sole
     // deployed agent via a short-lived API port-forward (#766). Shared with
     // the connected path.
-    let (channel, agent_hint, identity) = resolve_cluster_channel(&opts, &fullname).await?;
+    let (channel, agent_hint, identity) = resolve_cluster_channel(&opts, fullname).await?;
     ui.plumbing(&format!("routing to channel {channel}"));
 
     // The worker self-dials the in-cluster API; this distinct loopback tunnel is
     // read-only and exists only for the CLI's ref-keyed polling.
-    let (_api_pf, api_local_port) = start_port_forward(
-        &port_forward_command(
+    let mut forward = RelayForward::open(
+        port_forward_command(
             &opts.namespace,
-            &fullname,
+            fullname,
             "api",
             opts.api_local_port,
             API_REMOTE_PORT,
         ),
         opts.api_local_port,
-        "api",
+        &opts.api_key,
     )
     .await?;
-    let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
 
     // Enqueue the exact Slack binding coordinates the dispatcher would produce,
     // with only the reserved adapter/ref selecting the built-in relay.
@@ -3596,8 +3686,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             }
         };
         await_cluster_relay(
-            &api,
-            &reply_ref,
+            async |cursor| forward.page(&reply_ref, cursor).await,
             0,
             Duration::from_secs(opts.timeout_secs),
             &mut observe_update,
@@ -3623,7 +3712,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                 failure_class: class,
             });
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
-            crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, (_api_pf, _valkey_pf));
+            crate::exit::exit_after_drop(crate::exit::ExitClass::Failure, (forward, _valkey_pf));
         }
         Outcome::CompletedNoEdit => {
             step.done("no edit");
@@ -3653,7 +3742,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                         .saturating_sub(wait_started.elapsed());
                     match resume_cluster_after_approval(
                         &opts,
-                        &api,
+                        &mut forward,
                         &reply_ref,
                         observed.next_cursor,
                         &id,
@@ -3668,11 +3757,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                         ResumeExit::Done => Ok(()),
                         ResumeExit::Failed => crate::exit::exit_after_drop(
                             crate::exit::ExitClass::Failure,
-                            (_api_pf, _valkey_pf),
+                            (forward, _valkey_pf),
                         ),
                         ResumeExit::Transient => crate::exit::exit_after_drop(
                             crate::exit::ExitClass::Transient,
-                            (_api_pf, _valkey_pf),
+                            (forward, _valkey_pf),
                         ),
                     }
                 }
@@ -3693,7 +3782,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                     persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
                     crate::exit::exit_after_drop(
                         crate::exit::ExitClass::Transient,
-                        (_api_pf, _valkey_pf),
+                        (forward, _valkey_pf),
                     );
                 }
             }
@@ -3721,7 +3810,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             });
             // A timeout is retryable. Drop both process-owned port-forwards
             // before the non-unwinding transient exit.
-            crate::exit::exit_after_drop(crate::exit::ExitClass::Transient, (_api_pf, _valkey_pf));
+            crate::exit::exit_after_drop(crate::exit::ExitClass::Transient, (forward, _valkey_pf));
         }
     }
 }
@@ -4305,8 +4394,7 @@ async fn run_eval_turns(
                             .as_ref()
                             .expect("cluster eval relay samples carry a reply ref");
                         await_cluster_relay(
-                            api,
-                            reply_ref,
+                            async |cursor| api.cluster_message_replies(reply_ref, cursor).await,
                             0,
                             Duration::from_secs(opts.timeout_secs),
                             &mut observe_update,

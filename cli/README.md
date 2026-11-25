@@ -841,19 +841,17 @@ approval-principal header and a body containing only `decision` plus optional `n
 
 `cluster message` targets a **deployed** Helm release and manages its own
 port-forwards. A connected dispatcher sends the placeholder and reply through
-the agent's bound Slack channel. A disconnected release uses the terminal reply
-stub, so a developer can exercise the whole deployed machinery without Slack
-access or tokens.
+the agent's bound Slack channel. On a disconnected release, the CLI enqueues
+the turn once and reads its reply through the API Service.
 
 ```bash
 curie cluster message "summarize the latest deploy"
 curie cluster message --channel CSIM123 "another question"
 ```
 
-What it does: self-manages its own port-forwards, then follows the release's
-transport. A connected dispatcher receives a placeholder and sends the reply to
-the bound Slack channel. Without a dispatcher, the terminal reply stub receives
-the reply and the command prints it in the terminal.
+If the API pod is replaced and the CLI's API port-forward exits while waiting
+for a reply, the CLI opens a new forward to the same Service. It continues
+from the last applied cursor for that turn within the original timeout.
 
 - **Picks a channel.** With no `--channel`, it looks up the sole deployed
   agent's channel via the API; zero or multiple agents is an error requiring

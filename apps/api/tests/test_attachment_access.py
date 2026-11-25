@@ -632,6 +632,57 @@ async def test_registration_retires_expired_transcript_without_losing_new_refs(a
 
 
 @pytest.mark.anyio
+async def test_registration_never_fetches_a_large_transcript_body(access: Any) -> None:
+    """#5968: a scheduled hook's thread transcript grows toward its 16 MiB cap,
+    and every lazy-mode turn registers first. Registration needs only the
+    transcript's lifetime, so Postgres must never send its body to the API.
+
+    The listener reads what each executed statement returned (the cursor's
+    result columns), so the assertion is on data that crossed the wire.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from curie_api.attachment_access import catalog
+    from curie_api.models import ThreadTranscript
+    from sqlalchemy import event
+
+    async with access["sessions"]() as db:
+        db.add(
+            ThreadTranscript(
+                agent_id=uuid.UUID(access["aid"]),
+                binding_scope=None,
+                thread_key=THREAD,
+                # About 2 MiB, a fraction of what a long-lived hook thread holds.
+                value=[{"role": "assistant", "text": "x" * 1024} for _ in range(2048)],
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+        )
+        await db.commit()
+    fetched: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        columns = [column[0] for column in cursor.description or ()]
+        if "thread_transcripts" in statement and "value" in columns:
+            fetched.append(statement)
+
+    sync_engine = access["engine"].sync_engine
+    event.listen(sync_engine, "after_cursor_execute", record)
+    try:
+        response = await access["client"].post(
+            INTERNAL + "/register", headers=worker(), json=registration(access["aid"])
+        )
+        async with access["sessions"]() as db:
+            live = await catalog.live_rows(db, uuid.UUID(access["aid"]), THREAD)
+    finally:
+        event.remove(sync_engine, "after_cursor_execute", record)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"appended": 1}
+    # The live transcript still keeps the new reference live.
+    assert [row.file_id for row in live] == ["FEXAMPLE1"]
+    assert fetched == [], "the transcript body was fetched to read its lifetime"
+
+
+@pytest.mark.anyio
 async def test_reset_then_register_new_catalog_cannot_revive_old_context(access: Any) -> None:
     from curie_api import thread_attachments
 

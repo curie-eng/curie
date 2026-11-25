@@ -37,6 +37,7 @@ from .test_dispatch import (
 from .test_http_receiver import (
     BOT,
     CHANNEL,
+    INSTALLATION,
     NAME,
     SENDER,
     HttpRig,
@@ -87,11 +88,12 @@ def _identity() -> SlackIdentityCredentials:
 
 
 def _selected(
-    config: DispatcherConfig, redis_client: redis.Redis, rig: HttpRig, *, bindings: Any = None
+    config: DispatcherConfig, redis_client: redis.Redis, rig: HttpRig, *,
+    bindings: Any = None, receiver_config: DispatcherConfig | None = None,
 ) -> tuple[Any, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-19: actual constructor and listener registration."""
     module = api()
-    runtime = rig.runtime(module, bindings=bindings)
+    runtime = rig.runtime(module, bindings=bindings, config=receiver_config)
     legacy = ForbiddenBoundary()
     for method in _SLACK_METHODS:
         setattr(rig.web, method, MagicMock(return_value={"ok": True, "ts": PLACEHOLDER_TS}))
@@ -430,6 +432,103 @@ def test_selected_bot_self_or_senderless_mention_never_gets_a_notice(
     assert _posted_texts(web) == []
     web.chat_postEphemeral.assert_not_called()
     web.chat_postMessage.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "listed", "profile_app_only", "event_app_only", "default", "unlisted",
+        "wrong_installation", "own_bot", "own_app", "own_user", "bot_user",
+        "missing_user", "missing_app", "conflicting_app", "conflicting_bot",
+        "missing_profile", "missing_bot_user", "no_receiving_app", "bad_receiving_app",
+        "marked_driver", "bot_subtype", "plain_reply",
+    ],
+)
+def test_app_authored_mentions_require_installation_opt_in(
+    config: DispatcherConfig, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    """Use the observed bot profile fields from test_factory_slack_kickoff_receipt."""
+    app_id = "A0EXAMPLESENDER"
+    receiver_app = "A0EXAMPLERECEIVER"
+    sender_bot = "B0EXAMPLESENDER"
+    sender_bot_user = "U0EXAMPLEAPPBOT"
+    monkeypatch.delenv("CURIE_SLACK_APP_MENTION_ALLOWLIST", raising=False)
+    if case != "default":
+        monkeypatch.setenv("CURIE_SLACK_APP_MENTION_ALLOWLIST", json.dumps([{
+            "provider_installation_id": (
+                "55555555-5555-4555-8555-555555555555"
+                if case == "wrong_installation" else INSTALLATION
+            ),
+            "app_id": (
+                "A0EXAMPLEOTHER" if case == "unlisted"
+                else receiver_app if case == "own_app" else app_id
+            ),
+        }]))
+    body, event = native()
+    body["api_app_id"] = receiver_app
+    profile = {"id": sender_bot, "app_id": app_id, "user_id": sender_bot_user}
+    event.update(bot_id=sender_bot, app_id=app_id, bot_profile=profile)
+    if case == "profile_app_only":
+        del event["app_id"]
+    elif case == "event_app_only":
+        del profile["app_id"]
+    elif case == "own_bot":
+        event["bot_id"] = profile["id"] = "B1"
+    elif case == "own_app":
+        event["app_id"] = profile["app_id"] = receiver_app
+    elif case == "own_user":
+        event["user"] = BOT
+    elif case == "bot_user":
+        event["user"] = sender_bot_user
+    elif case == "missing_user":
+        del event["user"]
+    elif case == "missing_app":
+        del event["app_id"]
+        del profile["app_id"]
+    elif case == "conflicting_app":
+        profile["app_id"] = "A0EXAMPLEOTHER"
+    elif case == "conflicting_bot":
+        profile["id"] = "B0EXAMPLEOTHER"
+    elif case == "missing_profile":
+        del event["bot_profile"]
+    elif case == "missing_bot_user":
+        del profile["user_id"]
+    elif case == "no_receiving_app":
+        del body["api_app_id"]
+    elif case == "bad_receiving_app":
+        body["api_app_id"] = "A0EXAMPLEOTHER"
+    elif case == "marked_driver":
+        event["text"] = f"<@{BOT}> [test action] approve"
+    elif case == "bot_subtype":
+        event["subtype"] = "bot_message"
+    elif case == "plain_reply":
+        event["type"] = "message"
+
+    rig = HttpRig(auth={
+        "ok": True, "team_id": "T1", "user_id": BOT, "bot_id": "B1",
+        "is_enterprise_install": False,
+        **({"app_id": receiver_app} if case == "bad_receiving_app" else {}),
+    })
+    app, legacy = _selected(
+        config, redis_client, rig, receiver_config=DispatcherConfig(
+            **config.model_dump(exclude={"slack_app_mention_allowlist"}),
+        ),
+    )
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    socket = FakeSocketClient()
+    request = SocketModeRequest(type="events_api", envelope_id="env-app", payload=body)
+    handler.handle(socket, request)
+    _finish_owned_listeners(app)
+    assert socket.acked_envelope_ids == ["env-app"]
+    if case in {"listed", "profile_app_only", "event_app_only"}:
+        (submitted,) = rig.requests
+        assert json.loads(submitted.content)["author"] == SENDER
+        rig.web.chat_postMessage.assert_called_once()
+    else:
+        assert rig.requests == []
+        rig.web.chat_postMessage.assert_not_called()
+        rig.web.chat_postEphemeral.assert_not_called()
+    assert legacy.calls == []
 
 
 def test_selected_repeated_refused_delivery_posts_one_notice(
