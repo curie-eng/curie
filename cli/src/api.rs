@@ -3547,12 +3547,13 @@ impl ApiClient {
             }
             return Ok(None);
         }
+        let body = Self::expect_ok(resp, "reading cluster-message replies")
+            .await?
+            .bytes()
+            .await
+            .context("reading cluster-message reply body")?;
         Ok(Some(
-            Self::expect_ok(resp, "reading cluster-message replies")
-                .await?
-                .json()
-                .await
-                .context("decoding cluster-message reply page")?,
+            serde_json::from_slice(&body).context("decoding cluster-message reply page")?,
         ))
     }
 
