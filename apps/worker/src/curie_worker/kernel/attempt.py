@@ -306,10 +306,11 @@ async def _attempt_turn(
     )
 
     lazy = self._config.attachment_enabled and self._config.attachment_mode == "lazy"
-    # A targetless hook turn has no channel binding and no inbound files
-    # (ADR-0205), so the API can authorize no attachment context for its
-    # thread. It runs without attachment access instead of failing (#5968).
-    lazy_access = lazy and not routing._is_targetless(qevent)
+    # A targetless hook turn has no channel binding (ADR-0205: a hook turn has
+    # no current files), so the API can authorize no attachment context for
+    # its thread. Without files it runs without attachment access instead of
+    # failing (#5968); one that carries files is still refused below.
+    lazy_access = lazy and not (routing._is_targetless(qevent) and not qevent.attachments)
     attachment_turn = (
         attachment_access.AttachmentAccessTurn(
             str(agent_id), str(workspace_deployment_id), thread_key, qevent.event_id
