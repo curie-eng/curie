@@ -24,7 +24,7 @@ from slack_sdk.web import WebClient
 from curie_channel_gateway.slack.approval_actions import ResolveOutcome, parse_decision_time
 from curie_channel_gateway.slack.approval_principal import mint_chat_principal
 
-from .config import DispatcherConfig
+from .config import SLACK_APP_ID_PATTERN, DispatcherConfig
 from .identities import SlackBotIds, bot_ids_from_auth_test, delivery_key
 from .identity import slack_evidence
 from .inbound_attachments import derive_attachments
@@ -372,12 +372,13 @@ class HttpReceiverRuntime:
 
     __slots__ = (
         "_scope", "_bindings", "_keys", "_url", "_api_base", "_client_factory",
-        "_config", "_redis", "_web", "_bot_ids",
+        "_config", "_redis", "_web", "_bot_ids", "_app_mention_ids",
     )
     _config: DispatcherConfig | None
     _redis: Redis | None
     _web: WebClient
     _bot_ids: SlackBotIds
+    _app_mention_ids: frozenset[str]
     _scope: HttpReceiverScopeV1
     _bindings: Mapping[str, HttpReceiverBindingV1]
     _keys: codec.IdentityKeyring
@@ -442,6 +443,39 @@ class HttpReceiverRuntime:
             return _REFUSED
         return self.send(prepared, reply_ref="")
 
+    def _allows_app_mention(self, body: dict[str, Any], event: dict[str, Any]) -> bool:
+        if not self._app_mention_ids or "subtype" in event:
+            return False
+        receiving_app = body.get("api_app_id")
+        if (
+            type(receiving_app) is not str
+            or not re.fullmatch(SLACK_APP_ID_PATTERN, receiving_app)
+            or (self._bot_ids.app_id is not None and receiving_app != self._bot_ids.app_id)
+        ):
+            return False
+        bot_id, profile = event.get("bot_id"), event.get("bot_profile")
+        if (
+            type(bot_id) is not str or not re.fullmatch(r"B[A-Z0-9]+", bot_id)
+            or not self._bot_ids.bot_id or bot_id == self._bot_ids.bot_id
+            or type(profile) is not dict or profile.get("id") != bot_id
+        ):
+            return False
+        user, bot_user = event.get("user"), profile.get("user_id")
+        if (
+            any(type(value) is not str or not re.fullmatch(r"[UW][A-Z0-9]+", value)
+                for value in (user, bot_user))
+            or user == bot_user or self._scope.bot_user_id in (user, bot_user)
+        ):
+            return False
+        app_ids = tuple(source["app_id"] for source in (event, profile) if "app_id" in source)
+        return bool(
+            app_ids
+            and type(app_ids[0]) is str
+            and app_ids[0] in self._app_mention_ids
+            and app_ids[0] != receiving_app
+            and all(value == app_ids[0] for value in app_ids)
+        )
+
     def prepare(
         self, *, body: dict[str, Any], event: dict[str, Any], slack_identity: str,
         bot_user_id: str | None, dm_continuity: Callable[[str], str] | None = None,
@@ -454,14 +488,27 @@ class HttpReceiverRuntime:
         """
         scope = self._scope
         try:
+            if (
+                type(body) is not dict or type(event) is not dict
+                or body.get("event") != event or body.get("type") != "event_callback"
+                or body.get("team_id") != scope.installation_account
+                or not (event.get("type") == "app_mention" or is_supported_direct_message(event))
+                or event.get("subtype") in NON_CONTENT_SUBTYPES
+                or slack_identity != scope.channel_identity_name or bot_user_id != scope.bot_user_id
+                or not _received_by(body, scope.bot_user_id)
+            ):
+                return None
+            channel = event.get("channel")
+            if type(channel) is not str or channel not in self._bindings:
+                return None
+            binding = self._bindings[channel]
+            text = strip_self_mention(derive_text(event), bot_user_id)
             driver = None
-            if type(event) is dict and event.get("bot_id") and self._config is not None:
-                text = strip_self_mention(derive_text(event), bot_user_id)
+            if event.get("bot_id") and self._config is not None and text.startswith(MARK):
                 candidate = declared_driver(self._config, event)
                 if (
                     self._config.test_installation_enabled
-                    and event.get("type") == "app_mention" and text.startswith(MARK)
-                    and candidate is not None and candidate.channel_id == event.get("channel")
+                    and candidate is not None and candidate.channel_id == channel
                     and event.get("bot_id") != self._bot_ids.bot_id
                     and event.get("user") != self._bot_ids.bot_user_id
                     and candidate.bot_user_id != self._bot_ids.bot_user_id
@@ -472,20 +519,12 @@ class HttpReceiverRuntime:
                         return None
                     driver = candidate
             if (
-                type(body) is not dict or type(event) is not dict
-                or body.get("event") != event or body.get("type") != "event_callback"
-                or body.get("team_id") != scope.installation_account
-                or not (event.get("type") == "app_mention" or is_supported_direct_message(event))
-                or (event.get("bot_id") and driver is None)
-                or event.get("subtype") in NON_CONTENT_SUBTYPES
-                or slack_identity != scope.channel_identity_name or bot_user_id != scope.bot_user_id
-                or not _received_by(body, scope.bot_user_id)
+                event.get("type") == "app_mention"
+                and {"bot_id", "app_id", "bot_profile"}.intersection(event)
+                and driver is None
+                and (text.startswith(MARK) or not self._allows_app_mention(body, event))
             ):
                 return None
-            channel = event.get("channel")
-            if type(channel) is not str or channel not in self._bindings:
-                return None
-            binding = self._bindings[channel]
             timestamp = event.get("thread_ts") or event.get("ts")
             sender = driver.bot_user_id if driver is not None else event.get("user")
             if type(timestamp) is not str or not timestamp or type(sender) is not str or not sender:
@@ -512,7 +551,6 @@ class HttpReceiverRuntime:
             # The except below treats ValueError, TypeError, AttributeError and
             # RecursionError as a refusal. Continuity is optional context, so its
             # failure has to be swallowed here or a history problem refuses the turn.
-            text = strip_self_mention(derive_text(event), bot_user_id)
             if dm_continuity is not None:
                 try:
                     continued = dm_continuity(text)
@@ -860,6 +898,10 @@ def build_http_receiver_runtime(
         object.__setattr__(runtime, "_redis", redis_client)
         object.__setattr__(runtime, "_web", web_client)
         object.__setattr__(runtime, "_bot_ids", bot_ids)
+        object.__setattr__(runtime, "_app_mention_ids", frozenset(
+            entry.app_id for entry in (() if config is None else config.slack_app_mention_allowlist)
+            if entry.provider_installation_id == scope.provider_installation_id
+        ))
         object.__setattr__(runtime, "_scope", scope)
         object.__setattr__(runtime, "_bindings", MappingProxyType(by_channel))
         object.__setattr__(runtime, "_keys", keys)

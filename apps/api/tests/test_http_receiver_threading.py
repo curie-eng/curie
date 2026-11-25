@@ -26,6 +26,14 @@ from channel_protocol import parse_scoped_conversation_id
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyUpdate
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_api.main import create_app
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.http_receiver import (
+    HttpReceiverBindingV1,
+    HttpReceiverRuntime,
+    HttpReceiverScopeV1,
+    ReceiverSubmission,
+    build_http_receiver_runtime,
+)
 from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_worker.kernel.routing import _target_for, _thread_key_for
 from curie_worker.reply_sink import TargetRoute
@@ -39,6 +47,87 @@ PARENT_TS = "1720000000.000100"
 MESSAGE_TS = "1720000000.000200"
 BOT = "U0EXAMPLEBOT"
 SLACK_TOKEN = "xoxb-synthetic-threading-receiver"
+
+
+def test_listed_app_mention_uses_the_human_for_real_admission(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    synthetic_provider: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = membership._scope(synthetic_provider.url, allowed_callers=[membership.SENDER])
+    identity_client = HttpIdentityClient(tls_context=synthetic_provider.tls)
+    responses: list[int] = []
+    slack = WebClient(token=SLACK_TOKEN)
+    slack.auth_test = MagicMock(return_value={
+        "ok": True, "team_id": membership.ACCOUNT, "user_id": BOT,
+        "bot_id": "B0EXAMPLERECEIVER", "is_enterprise_install": False,
+    })
+    receiver_scope = HttpReceiverScopeV1(
+        schema_version=1, receiver_id=scope["receiver_id"], receiver_generation=1,
+        channel_identity_id=scope["identity"], channel_identity_name=scope["adapter"],
+        provider_installation_id=scope["installation"], namespace=scope["namespace"].model_dump(),
+        installation_account=membership.ACCOUNT, bot_user_id=BOT,
+    )
+    app_id = "A0EXAMPLEAPP"
+    monkeypatch.setenv("CURIE_SLACK_APP_MENTION_ALLOWLIST", json.dumps([{
+        "provider_installation_id": scope["installation"], "app_id": app_id,
+    }]))
+    config = DispatcherConfig()
+    with TestClient(create_app(
+        http_identity_runtime=membership._runtime(membership._runtime_api(), scope),
+        http_identity_client=identity_client,
+    )) as client, _live_api(client) as api_url:
+        credential = membership._credential(client, scope)
+
+        async def observe(response: httpx.Response) -> None:
+            responses.append(response.status_code)
+
+        def build(generation: int) -> HttpReceiverRuntime:
+            return build_http_receiver_runtime(
+                receiver_scope,
+                (HttpReceiverBindingV1(
+                    schema_version=1, native_channel_id=scope["address"],
+                    binding_id=scope["binding"], binding_generation=generation,
+                    channel_credential=credential,
+                ),),
+                receiver_key=scope["receiver_key"], web_client=slack,
+                api_base_url=api_url, config=config,
+                http_client_factory=lambda: httpx.AsyncClient(event_hooks={"response": [observe]}),
+            )
+
+        def deliver(runtime: HttpReceiverRuntime, delivery: str, user: str) -> ReceiverSubmission:
+            # Bot profile fields follow the observed shape documented in
+            # apps/dispatcher/tests/test_factory_slack_kickoff_receipt.py.
+            event = {
+                "type": "app_mention", "channel": scope["address"], "ts": MESSAGE_TS,
+                "user": user, "user_team": membership.ACCOUNT, "text": f"<@{BOT}> Hello",
+                "bot_id": "B0EXAMPLESENDER", "app_id": app_id,
+                "bot_profile": {
+                    "id": "B0EXAMPLESENDER", "app_id": app_id, "user_id": "U0EXAMPLEAPPBOT",
+                },
+            }
+            body = {
+                "type": "event_callback", "event_id": delivery, "api_app_id": "A0EXAMPLERECEIVER",
+                "team_id": membership.ACCOUNT, "is_ext_shared_channel": False, "event": event,
+                "authorizations": [{"team_id": membership.ACCOUNT, "user_id": BOT, "is_bot": True}],
+            }
+            return runtime.submit(
+                body=body, event=event, slack_identity=scope["adapter"], bot_user_id=BOT,
+            )
+
+        runtime = build(scope["generation"])
+        allowed = deliver(runtime, "EvExampleAppAllowed", membership.SENDER)
+        assert allowed.status == "accepted"
+        assert deliver(runtime, "EvExampleAppAllowed", membership.SENDER).duplicate
+        assert deliver(runtime, "EvExampleAppDenied", "U0EXAMPLEOTHER").status == "refused"
+        stale = build(scope["generation"] + 1)
+        assert deliver(stale, "EvExampleAppStale", membership.SENDER).status == "refused"
+        assert responses == [200, 200, 403, 401]
+        ((stream_id, fields),) = valkey.xrange(runs_stream)
+        assert stream_id == allowed.stream_id
+        assert QueuedTurn.model_validate_json(fields["payload"]).author == membership.SENDER
 
 
 def test_http_receiver_preserves_native_parent_through_queue_and_actual_slack_reply(
@@ -211,13 +300,6 @@ def test_declared_http_driver_reaches_real_group_admission(
     synthetic_provider: SimpleNamespace, command: str,
 ) -> None:
     """A configured driver user passes receiver proofs and is refused by directory group."""
-    from curie_channel_gateway.slack.config import DispatcherConfig
-    from curie_channel_gateway.slack.http_receiver import (
-        HttpReceiverBindingV1,
-        HttpReceiverScopeV1,
-        build_http_receiver_runtime,
-    )
-
     scope = membership._scope(synthetic_provider.url)
     identity_client = HttpIdentityClient(tls_context=synthetic_provider.tls)
     responses: list[tuple[str, int]] = []

@@ -33,7 +33,8 @@ malformed allowlist still reports its invalid field first. */ -}}
 {{- $threadedReserved = dict "CURIE_SLACK_THREADED_BOT_ALLOWLIST" "dispatcher.threadedBotAllowlist" -}}
 {{- end -}}
 {{- $httpReceiver := include "curie.httpIdentity.receiverSecret" . -}}
-{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" (merge $threadedReserved (include "curie.slack.reservedEnv" (dict "root" . "workload" "dispatcher") | fromJson))) -}}
+{{- $appMentionReserved := dict "CURIE_SLACK_APP_MENTION_ALLOWLIST" "dispatcher.appMentionAllowlist" -}}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" (merge $appMentionReserved $threadedReserved (include "curie.slack.reservedEnv" (dict "root" . "workload" "dispatcher") | fromJson))) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -140,6 +141,10 @@ spec:
             # pre-existing extraEnv entry keeps working unchanged.
             - name: CURIE_SLACK_THREADED_BOT_ALLOWLIST
               value: {{ $threadedBotAllowlist | quote }}
+            {{- end }}
+            {{- with .Values.dispatcher.appMentionAllowlist }}
+            - name: CURIE_SLACK_APP_MENTION_ALLOWLIST
+              value: {{ toJson . | quote }}
             {{- end }}
             {{- if $httpReceiver }}
             # Selected HTTP receivers (HTTP-INVOCATION-EXECUTION-20).

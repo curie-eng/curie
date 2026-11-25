@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_internal import identity_context as codec
 from slack_sdk.web import WebClient
 
@@ -167,7 +168,8 @@ class HttpRig:
         return client
 
     def runtime(
-        self, module: Any, *, scope: Any = None, bindings: Any = None, key: Any = KEY
+        self, module: Any, *, scope: Any = None, bindings: Any = None, key: Any = KEY,
+        config: DispatcherConfig | None = None,
     ) -> Any:
         """@spec HTTP-INVOCATION-EXECUTION-19: the initializer calls the configured WebClient."""
         return module.build_http_receiver_runtime(
@@ -179,6 +181,7 @@ class HttpRig:
             web_client=self.web,
             api_base_url=BASE,
             http_client_factory=self.factory,
+            config=config,
         )
 
     def submit(self, runtime: Any, **changes: Any) -> Any:

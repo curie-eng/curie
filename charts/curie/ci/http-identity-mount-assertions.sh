@@ -3,6 +3,7 @@
 set -euo pipefail
 CHART="$(cd "$(dirname "$0")/.." && pwd)"
 python3 - "$CHART" <<'PY'
+import json
 import pathlib
 import subprocess
 import sys
@@ -75,6 +76,7 @@ def mentions(documents, needle):
 default = render()
 assert "CURIE_HTTP_IDENTITY_DIR" not in default.stdout
 assert "CURIE_HTTP_RECEIVER_DIR" not in default.stdout
+assert "CURIE_SLACK_APP_MENTION_ALLOWLIST" not in default.stdout
 assert "http-identity" not in default.stdout and "http-receiver" not in default.stdout
 # A release that predates the keys replays them as nil; the render is unchanged.
 retained = render("--set", "api.httpIdentity=null", "--set", "dispatcher.httpIdentity=null")
@@ -166,14 +168,31 @@ lonely = render("--set-string", f"dispatcher.httpIdentity.existingSecret={RECEIV
                 ok=False)
 assert lonely.returncode != 0 and "api.httpIdentity.existingSecret" in lonely.stderr, lonely.stderr
 
-# 5. Both environment names are chart-owned even while unselected.
+# 5. The environment names are chart-owned even while unselected.
 for workload_name, name, key in (
     ("api", "CURIE_HTTP_IDENTITY_DIR", "api.httpIdentity.existingSecret"),
     ("dispatcher", "CURIE_HTTP_RECEIVER_DIR", "dispatcher.httpIdentity.existingSecret"),
+    ("dispatcher", "CURIE_SLACK_APP_MENTION_ALLOWLIST", "dispatcher.appMentionAllowlist"),
 ):
     result = render("--set", f"{workload_name}.extraEnv[0].name={name}",
                     "--set-string", f"{workload_name}.extraEnv[0].value=/tmp/elsewhere", ok=False)
     assert result.returncode != 0 and name in result.stderr and key in result.stderr, result.stderr
+
+allowlist_env = "CURIE_SLACK_APP_MENTION_ALLOWLIST"
+allowlist_key = "dispatcher.appMentionAllowlist[0]"
+installation = "22222222-2222-4222-8222-222222222222"
+app_id = "A0EXAMPLEAPP"
+configured = docs(render(
+    "--set-string", f"{allowlist_key}.provider_installation_id={installation}",
+    "--set-string", f"{allowlist_key}.app_id={app_id}",
+))
+dispatcher = container(workload(configured, "dispatcher"), "dispatcher")
+(setting,) = env_value(dispatcher, allowlist_env)
+assert json.loads(setting["value"]) == [{"provider_installation_id": installation, "app_id": app_id}]
+assert mentions(configured, allowlist_env) == ["Deployment/acme-curie-dispatcher"]
+
+malformed = render("--set-string", f"{allowlist_key}.app_id={app_id}", ok=False)
+assert malformed.returncode != 0 and "provider_installation_id" in malformed.stderr
 
 # 6. A Secret name that Kubernetes cannot accept is refused by the schema.
 invalid = render("--set-string", "api.httpIdentity.existingSecret=Not_A_Name", ok=False)
