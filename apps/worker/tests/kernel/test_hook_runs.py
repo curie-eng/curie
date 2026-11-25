@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
+import httpx
 import pytest
 from aci_protocol import (
     ErrorEvent,
@@ -26,6 +27,7 @@ from aci_protocol import (
 from curie_telemetry import record_metric
 from curie_worker import hook_runs as hook_runs_module
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
+from curie_worker.attachment_access_client import AttachmentAccessClient
 from curie_worker.binding import BindingResolver
 from curie_worker.delivery_lease import DeliveryBudget, DeliveryLeaseStore
 from curie_worker.hook_runs import HookRunRecorder, HookRunRecorderError
@@ -777,10 +779,16 @@ def test_malformed_cron_ref_refuses_before_runner_start(
     asyncio.run(go())
 
 
-def test_quota_refusal_before_cron_start_leaves_run_open(
+def test_quota_refusal_before_cron_start_closes_failed(
     make_harness,
     make_hook_run,
 ) -> None:
+    """ADR-0099: a refused run is recorded and waits for the next fire (#5968).
+
+    Left open, the claim lease renewed at delivery start would make every
+    later fire skip as ``run_in_flight`` for the whole delivery budget.
+    """
+
     async def go() -> None:
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder(), claim_timeout_seconds=0.05
@@ -795,7 +803,57 @@ def test_quota_refusal_before_cron_start_leaves_run_open(
             await h.kernel.process_event(_event(hook_run=run.ref))
 
             assert h.runner.opened == []
-            assert await run.state() == (None, None)
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "failed"
+            assert ended_at is not None
+            assert await run.reason() == "turn_error"
+
+    asyncio.run(go())
+
+
+def test_attachment_register_timeout_before_cron_start_closes_failed(
+    make_harness,
+    make_hook_run,
+) -> None:
+    """#5968: a targeted cron turn whose lazy attachment registration times out
+    escalates before any attempt starts. The run closes ``failed`` so the next
+    fire runs, instead of skipping as ``run_in_flight`` until the claim lease
+    renewed at delivery start runs out. The escalation still reaches the target.
+    """
+    from .test_thread_attachment_rebuild import _Binding
+
+    def timed_out(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("register timed out", request=request)
+
+    async def go() -> None:
+        async with (
+            make_hook_run() as run,
+            httpx.AsyncClient(transport=httpx.MockTransport(timed_out)) as http,
+        ):
+            binding = _Binding()
+            binding.resolved.agent_id = run.agent_id
+            binding.resolved.deployment_id = uuid.uuid4()
+            access = AttachmentAccessClient(
+                api_base_url="http://api.example", worker_token="worker", client=http
+            )
+            async with make_harness(
+                hook_runs=run.recorder(),
+                binding=binding,
+                attachment_enabled=True,
+                attachment_mode="lazy",
+                internal_worker_token="worker",
+                attachment_access=access,
+            ) as h:
+                event = _event(hook_run=run.ref)
+                await h.kernel.process_event(event)
+
+                assert h.runner.opened == []
+                outcome, ended_at = await run.state() or (None, None)
+                assert outcome == "failed"
+                assert ended_at is not None
+                assert await run.reason() == "turn_error"
+                assert h.sink.text_posts, "the escalation must still reach the target"
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
 
     asyncio.run(go())
 
