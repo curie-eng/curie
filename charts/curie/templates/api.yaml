@@ -334,6 +334,11 @@ spec:
             # list it cannot render from; values.schema.json refuses the same.
             - name: CURIE_CONNECTOR_SERVICE_ACCOUNTS
               value: {{ .Values.connectorServiceAccounts | default list | toJson | quote }}
+            # The PriorityClass every rendered connector Deployment carries
+            # (ADR-0059 decision 5): connectors outrank the sandboxes that call
+            # them, like every other long-running workload a turn depends on.
+            - name: CURIE_CONNECTOR_PRIORITY_CLASS
+              value: {{ .Values.priorityClasses.platform.name | default "" | quote }}
             {{- $e2e := .Values.e2eConnector }}
             {{- if and $e2e.enabled (or (not $e2e.ownerLabel.value) (not $e2e.serviceAccount) (not $e2e.serviceAccountNamespace) (not $e2e.workerClusterRole)) }}
             {{- fail "e2eConnector.enabled requires ownerLabel.value, serviceAccount, serviceAccountNamespace, and workerClusterRole" }}

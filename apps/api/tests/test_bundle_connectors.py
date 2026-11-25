@@ -1199,6 +1199,72 @@ def test_render_connector_manifests_names_the_mapped_connector_alone(tmp_path: P
     assert _pod_accounts(manifests) == {"grafana": None, "storage": "acme-bot-storage"}
 
 
+# A hosted connector outranks the sandboxes that call it (ADR-0059 decision 5).
+# At priority 0 a connector is the pod a full node preempts to admit a new
+# sandbox, and every turn's capability probe then fails until the connector is
+# rescheduled. The chart hands the API its platform PriorityClass name, and
+# every rendered connector Deployment carries it.
+def _pod_priority_classes(manifests: list[dict[str, Any]]) -> dict[str, str | None]:
+    return {
+        _connector_of(o): o["spec"]["template"]["spec"].get("priorityClassName")
+        for o in manifests
+        if o["kind"] == "Deployment"
+    }
+
+
+def test_the_route_puts_every_connector_in_the_platform_priority_class(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CURIE_CONNECTOR_PRIORITY_CLASS", "acme-platform")
+    get_settings.cache_clear()
+    body = _rendered(client, auth_headers, _bundle(tmp_path, _HOSTED_AND_STORAGE))
+    assert _pod_priority_classes(body["manifests"]) == {
+        "grafana": "acme-platform",
+        "storage": "acme-platform",
+    }
+    # Only the pod template: the Services and NetworkPolicies are unchanged.
+    others = [o for o in body["manifests"] if o["kind"] != "Deployment"]
+    assert others and "acme-platform" not in json.dumps(others)
+
+
+def test_the_route_names_no_priority_class_without_the_setting(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CURIE_CONNECTOR_PRIORITY_CLASS", raising=False)
+    get_settings.cache_clear()
+    body = _rendered(client, auth_headers, _bundle(tmp_path, _HOSTED_AND_STORAGE))
+    assert _pod_priority_classes(body["manifests"]) == {"grafana": None, "storage": None}
+
+
+def test_render_connector_manifests_sets_the_priority_class_on_each_pod_template(
+    tmp_path: Path,
+) -> None:
+    manifests = bundles.render_connector_manifests(
+        bundles.read_connectors(_bundle(tmp_path, _HOSTED_AND_STORAGE)),
+        release=RELEASE,
+        agent=AGENT,
+        namespace=NAMESPACE,
+        app_name=APP_NAME,
+        secret_name=SECRET_NAME,
+        proxy=_api_proxy(),
+        priority_class="acme-platform",
+    )
+    assert _pod_priority_classes(manifests) == {
+        "grafana": "acme-platform",
+        "storage": "acme-platform",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # The probed restore verb joins the connector's gated set
 # (ACTION-EXECUTOR-8, ACTION-EXECUTOR-13; plan task 6)

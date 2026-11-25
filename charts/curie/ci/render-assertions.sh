@@ -1031,6 +1031,44 @@ PYEOF
 python3 "$PRIO_CHECK" "$PRIO_OUT" "curie-platform" "curie-sandbox" \
   || fail "default render did not set the expected priorityClassName on every long-running platform workload, the agent-sandbox controller, and the sandbox."
 
+echo "=== Assertion 8 connectors: the API is handed the platform class for connector Deployments ==="
+# Hosted connectors are rendered by the API, not by a chart template, so the
+# inventory above cannot see them. The API stamps CURIE_CONNECTOR_PRIORITY_CLASS
+# on every connector pod template; it must equal priorityClasses.platform.name,
+# including a renamed class, or connectors fall back to priority 0 and a full
+# node preempts them to admit the sandboxes that call them.
+PRIO_CONNECTOR_CHECK="$TMP/check_connector_priority_class.py"
+cat > "$PRIO_CONNECTOR_CHECK" <<'PYEOF'
+import pathlib
+import sys
+
+import yaml
+
+rendered, expected = sys.argv[1], sys.argv[2]
+values = []
+for path in sorted(pathlib.Path(rendered).rglob("*.yaml")):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
+            continue
+        for container in doc["spec"]["template"]["spec"].get("containers", []):
+            for entry in container.get("env") or []:
+                if entry.get("name") == "CURIE_CONNECTOR_PRIORITY_CLASS":
+                    values.append((doc["metadata"]["name"], entry.get("value")))
+if values != [("curie-api", expected)]:
+    sys.stderr.write(
+        f"CURIE_CONNECTOR_PRIORITY_CLASS renders as {values!r}, expected only "
+        f"[('curie-api', {expected!r})]\n")
+    sys.exit(1)
+print(f"  ok: the API alone receives CURIE_CONNECTOR_PRIORITY_CLASS={expected!r}")
+PYEOF
+python3 "$PRIO_CONNECTOR_CHECK" "$PRIO_OUT" "curie-platform" \
+  || fail "the API did not receive the platform class for connector Deployments."
+PRIO_RENAMED_OUT="$(mktemp -d -p "$TMP")"
+helm template curie "$CHART" --output-dir "$PRIO_RENAMED_OUT" \
+  "${PRIO_HELM_ARGS[@]}" --set priorityClasses.platform.name=acme-platform > /dev/null
+python3 "$PRIO_CONNECTOR_CHECK" "$PRIO_RENAMED_OUT" "acme-platform" \
+  || fail "the connector priority class did not follow a renamed priorityClasses.platform.name."
+
 echo "=== Assertion 8 negative control A: a platform workload without a class FAILS ==="
 # Mandatory, per Assertion 7's convention: an assert that has never been shown
 # failing is not a pin. Mutate a TEMP COPY of the chart (never the real

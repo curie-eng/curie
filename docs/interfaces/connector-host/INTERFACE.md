@@ -491,6 +491,21 @@ ServiceAccount and the Kubernetes API authority it carries.
   after the apply drops it.
 - The local tier runs no Kubernetes pods and ignores the setting.
 
+### A connector's priority class
+
+Every hosted connector Deployment the API renders carries
+`priorityClassName` set to the install's platform class (ADR-0059 decision 5),
+so a sandbox cannot preempt the connector its own turn calls.
+
+- The chart passes `priorityClasses.platform.name` to the API as
+  `CURIE_CONNECTOR_PRIORITY_CLASS`. The API reads it as
+  `Settings.connector_priority_class`
+  (`apps/api/src/curie_api/config.py`) and hands it to
+  `render_connector_manifests` (`apps/api/src/curie_api/bundles.py`), which
+  sets it on each connector Deployment's pod template and on nothing else.
+- An empty value renders the pod template without a class, as before.
+- The local tier runs no Kubernetes pods and ignores the setting.
+
 ## Implementations today
 
 One production host plus a fake:
