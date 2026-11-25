@@ -654,7 +654,22 @@
       "type": "object",
       "properties": {
         "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
-        "httpIdentity": {"$ref": "#/definitions/httpIdentityFile"}
+        "httpIdentity": {"$ref": "#/definitions/httpIdentityFile"},
+        "appMentionAllowlist": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider_installation_id", "app_id"],
+            "properties": {
+              "provider_installation_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              "app_id": {"type": "string", "pattern": "^A[A-Z0-9]+$"}
+            }
+          }
+        }
       }
     },
     "agentSandbox": {

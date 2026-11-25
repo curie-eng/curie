@@ -1438,10 +1438,7 @@ def control_step(
         check(not pending, f"a flag-off agent deferred a delivery: {pending[:3]}")
         steered = second_turn["position"] < first_turn["position"]
         seen["steered"] = steered
-        seen["folded_notice"] = any(
-            isinstance(text, str) and "folded into the in-progress reply" in text.lower()
-            for text in texts
-        )
+        seen["steer_receipt"] = "Your follow-up was sent to the session." in texts
         check(
             steered,
             f"{STEERING_NOT_EXERCISED}: {second}'s turn completed after {first}'s, so it never "

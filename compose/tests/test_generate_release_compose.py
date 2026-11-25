@@ -1095,16 +1095,28 @@ def test_generated_compose_validates_with_docker(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("raw", [None, '[{"channel_id":"C123","bot_id":"B2"}]'])
-def test_threaded_bot_allowlist_reaches_dev_and_generated_release_compose(raw, tmp_path):
+@pytest.mark.parametrize(
+    ("name", "entries"),
+    [
+        ("CURIE_SLACK_THREADED_BOT_ALLOWLIST", [{"channel_id": "C123", "bot_id": "B2"}]),
+        ("CURIE_SLACK_APP_MENTION_ALLOWLIST", [{
+            "provider_installation_id": "22222222-2222-4222-8222-222222222222",
+            "app_id": "A0EXAMPLEAPP",
+        }]),
+    ],
+)
+@pytest.mark.parametrize("configured", [False, True])
+def test_slack_allowlists_reach_dev_and_generated_release_compose(
+    name, entries, configured, tmp_path,
+):
     """Exercise Compose interpolation on both delivery paths, including opt-out."""
     generate = load_generate()
     env = os.environ.copy()
-    env.pop("CURIE_SLACK_THREADED_BOT_ALLOWLIST", None)
-    if raw is not None:
-        env["CURIE_SLACK_THREADED_BOT_ALLOWLIST"] = raw
-    for name, content in [("dev", DEV_TEXT), ("release", generate(DEV_TEXT, OTEL_TEXT, "9.9.9"))]:
-        path = tmp_path / f"{name}.yaml"
+    env.pop(name, None)
+    if configured:
+        env[name] = json.dumps(entries)
+    for mode, content in [("dev", DEV_TEXT), ("release", generate(DEV_TEXT, OTEL_TEXT, "9.9.9"))]:
+        path = tmp_path / f"{mode}.yaml"
         path.write_text(content)
         result = subprocess.run(
             [
@@ -1131,7 +1143,7 @@ def test_threaded_bot_allowlist_reaches_dev_and_generated_release_compose(raw, t
             timeout=30,
         )
         dispatcher = json.loads(result.stdout)["services"]["curie-dispatcher"]
-        assert dispatcher["environment"]["CURIE_SLACK_THREADED_BOT_ALLOWLIST"] == (raw or "[]")
+        assert json.loads(dispatcher["environment"][name]) == (entries if configured else [])
 
 
 # --- #3557: loopback-only published ports and per-install local credentials ---

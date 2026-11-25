@@ -1,6 +1,6 @@
 [package]
 name = "curie"
-version = "0.17.1"
+version = "0.17.2"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 # Test files are integration modules or independently declared Cargo targets.
@@ -101,6 +101,7 @@ tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
     "process",
+    "signal",
     "time",
     "fs",
     "io-util",

@@ -32,15 +32,18 @@ def scope(agent: uuid.UUID, thread: str) -> tuple[Any, ...]:
 
 
 async def live_rows(db: AsyncSession, agent: uuid.UUID, thread: str) -> list[AttachmentReference]:
-    transcript = await db.scalar(
-        select(ThreadTranscript)
-        .where(
-            ThreadTranscript.agent_id == agent,
-            ThreadTranscript.binding_scope.is_(None),
-            ThreadTranscript.thread_key == thread,
+    # Only the transcript's existence and lifetime matter here. Its body can
+    # be many megabytes on a long-lived hook thread, so it is never fetched
+    # (#5968).
+    transcript = (
+        await db.execute(
+            select(ThreadTranscript.id, ThreadTranscript.expires_at).where(
+                ThreadTranscript.agent_id == agent,
+                ThreadTranscript.binding_scope.is_(None),
+                ThreadTranscript.thread_key == thread,
+            )
         )
-        .execution_options(populate_existing=True)
-    )
+    ).first()
     now = (await db.execute(select(func.now()))).scalar_one()
     if (
         transcript is not None

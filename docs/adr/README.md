@@ -313,4 +313,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0291 | [A public Slack thread for each factory run](0291-a-public-slack-thread-for-each-factory-run.md) | Accepted |
 | 0292 | [A voice draft requires confirmation before it can steer factory work](0292-confirmed-factory-voice-feedback.md) | Accepted |
 | 0293 | [Registered Slack direct messages can carry file shares](0293-registered-slack-direct-messages-can-carry-file-shares.md) | Accepted |
+| 0294 | [Selected Slack receivers can trust app attribution per installation](0294-selected-slack-receivers-can-trust-app-attribution-per-installation.md) | Accepted |
 <!-- END GENERATED: adr-index -->

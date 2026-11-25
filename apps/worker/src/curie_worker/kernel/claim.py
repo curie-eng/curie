@@ -868,7 +868,9 @@ async def _route_and_start(
     if packs is not None and verified_review is None and event.tool_access is None:
         reply = match_greeting(packs, event.text) or match_help(packs, event.text)
         if reply is not None and existing_handle is None:
-            return routing._RouteResult(steered=False, canned_reply=reply)
+            return routing._RouteResult(
+                steered=False, canned_reply=reply, canned_reply_from_pack=True
+            )
     # claim() adopts the thread's live sandbox and refreshes its route TTL
     # (so a busy thread past route_ttl is not reaped), or claims a warm one /
     # resumes a suspended one. On a fresh claim the boot env binds the agent's

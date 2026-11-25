@@ -813,6 +813,7 @@ services:
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
       CURIE_SLACK_THREADED_BOT_ALLOWLIST: ${CURIE_SLACK_THREADED_BOT_ALLOWLIST:-[]}
+      CURIE_SLACK_APP_MENTION_ALLOWLIST: ${CURIE_SLACK_APP_MENTION_ALLOWLIST:-[]}
       # In-network form, matching the UI's CURIE_API_TARGET above. The
       # published host port is unreachable from this bridge-network container.
       CURIE_API_URL: http://curie-api:8000

@@ -37,7 +37,7 @@ from .log import logger
 
 @dataclass
 class _HookRunCarry:
-    """One delivery's validated hook run and actual start state."""
+    """One delivery's validated hook run and observed execution state."""
 
     recorder: HookRunRecorder | None = None
     ref: HookRunRef | None = None
@@ -46,6 +46,7 @@ class _HookRunCarry:
     retry_expires_at: datetime | None = None
     this_attempt_started: bool = False
     any_attempt_started: bool = False
+    canned_reply_delivered: bool = False
     # The run row as this delivery read it; a sweep's coverage read keys off it (#2878).
     state: HookRunState | None = None
     # This delivery's one sweep coverage read, reused by its notice (#2878).
@@ -61,7 +62,7 @@ def _hook_success_outcome() -> HookRunOutcome | None:
     carry = constants._HOOK_RUN_CARRY.get()
     if carry is None:
         return None
-    if carry.this_attempt_started:
+    if carry.this_attempt_started or carry.canned_reply_delivered:
         return "ran"
     if carry.any_attempt_started:
         return "failed"

@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 import httpx
 import pytest
 import yaml
+from kind_install import DOCKER_HUB_MIRROR_PATCH, diagnose_helm_install
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LABEL = "curie-factory"
@@ -542,6 +543,7 @@ class Installation:
         config = {
             "kind": "Cluster",
             "apiVersion": "kind.x-k8s.io/v1alpha4",
+            "containerdConfigPatches": [DOCKER_HUB_MIRROR_PATCH],
             "nodes": [
                 {
                     "role": "control-plane",
@@ -609,18 +611,21 @@ class Installation:
         )
         values = self.values()
         # Post-install migration and bucket hooks must run before API readiness.
-        self.helm(
-            "install",
-            self.release,
-            str(self.candidate.source / "charts/curie"),
-            "--skip-crds",
-            "-f",
-            "-",
-            "--timeout",
-            "600s",
-            stdin=json.dumps(values),
-            timeout=660,
-        )
+        with diagnose_helm_install(
+            self.kubectl, self.namespace, self.fullname, partial(_redact, secrets=self.secrets)
+        ):
+            self.helm(
+                "install",
+                self.release,
+                str(self.candidate.source / "charts/curie"),
+                "--skip-crds",
+                "-f",
+                "-",
+                "--timeout",
+                "600s",
+                stdin=json.dumps(values),
+                timeout=660,
+            )
         self.kubectl(
             "-n",
             self.namespace,

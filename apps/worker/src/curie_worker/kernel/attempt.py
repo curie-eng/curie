@@ -307,11 +307,16 @@ async def _attempt_turn(
     )
 
     lazy = self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+    # A targetless hook turn has no channel binding (ADR-0205: a hook turn has
+    # no current files), so the API can authorize no attachment context for
+    # its thread. Without files it runs without attachment access instead of
+    # failing (#5968); one that carries files is still refused below.
+    lazy_access = lazy and not (routing._is_targetless(qevent) and not qevent.attachments)
     attachment_turn = (
         attachment_access.AttachmentAccessTurn(
             str(agent_id), str(workspace_deployment_id), thread_key, qevent.event_id
         )
-        if lazy and agent_id is not None and workspace_deployment_id is not None
+        if lazy_access and agent_id is not None and workspace_deployment_id is not None
         else None
     )
     aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(attachment_turn)
@@ -386,7 +391,7 @@ async def _attempt_turn(
                     )
                 verified_review = verified
                 review_receipt = verified.receipt
-            if lazy:
+            if lazy_access:
                 if (
                     self._attachment_access is None
                     or agent_id is None
@@ -839,29 +844,25 @@ async def _attempt_turn(
             logger.warning("booting-state update failed for %s", qevent.event_id)
 
     if routed.canned_reply is not None:
-        # An enabled greeting/help pack matched a provably-fresh thread under
-        # the route lock (ADR-0018). Deliver the canned reply onto the
-        # placeholder and return terminal-ok so process_event marks the event
-        # done. No run was registered, no sandbox claimed, no turn started.
         await self._reply_for(qevent, route, routed.canned_reply)
+        hook_carry = constants._HOOK_RUN_CARRY.get()
+        if (
+            routed.canned_reply_from_pack
+            and hook_carry is not None
+            and hook_carry.ref is not None
+            and not routing._is_targetless(qevent)
+        ):
+            hook_carry.canned_reply_delivered = True
         return failures.TurnOutcome(terminal_ok=True)
 
     if routed.steered:
-        # Delivered into the thread's live turn; that turn streams the output
-        # onto its own placeholder. Retire this follow-up's placeholder so it
-        # does not sit stuck on "working" in the thread.
-        #
-        # Steering is best-effort by design (mirror Claude Code, arch 2b rule
-        # 3): the follow-up joins the live turn's context. If that owning turn
-        # later fails and retries, the retry replays only its own event, so a
-        # steer folded into a since-failed turn is not itself replayed. This is
-        # the accepted MVP semantic; durable per-steer replay is a deliberate
-        # follow-up, flagged to the orchestrator rather than silently assumed.
         memory_turns = constants._MEMORY_TURNS.get()
         if memory_turns is not None:
             # The live turn now holds this attempt's credential (#3776).
             memory_turns.steered = True
-        await self._reply_for(qevent, route, "Folded into the in-progress reply above.")
+        # The SDK write can complete after the model's terminal result.
+        # Replaying a successful write could deliver the same input twice.
+        await self._reply_for(qevent, route, "Your follow-up was sent to the session.")
         return failures.TurnOutcome(terminal_ok=True, steered=True)
 
     if routed.turn is None and routed.handle is not None:

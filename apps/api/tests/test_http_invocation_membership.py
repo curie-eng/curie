@@ -195,7 +195,10 @@ def _runtime_api() -> ModuleType:
     return module
 
 
-def _scope(endpoint: str, *, grid: bool = False, adopt_identity: bool = True) -> dict[str, Any]:
+def _scope(
+    endpoint: str, *, grid: bool = False, adopt_identity: bool = True,
+    allowed_callers: list[str] | None = None,
+) -> dict[str, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-4/5/15/21: real adopted scope, no legacy projections."""
     account = GRID_WORKSPACE if grid else ACCOUNT
     kind, key = ("slack_enterprise", GRID_ORG) if grid else ("slack_workspace", ACCOUNT)
@@ -260,7 +263,7 @@ def _scope(endpoint: str, *, grid: bool = False, adopt_identity: bool = True) ->
                 kind="slack",
                 address=scope["address"],
                 adapter=identity.name,
-                allowed_callers=None,
+                allowed_callers=allowed_callers,
             )
             session.add(binding)
             await session.flush()
