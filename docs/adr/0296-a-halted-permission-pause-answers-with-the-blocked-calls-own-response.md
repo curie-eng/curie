@@ -5,7 +5,8 @@ Date: 2026-11-25
 Status: Accepted
 
 Accepted by Brian Conn under [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md)
-alongside implementation, covering both decisions below. The realizing code path is
+alongside implementation, covering decisions 1 and 2 below and the scope that
+decisions 3 and 4 set for them. The realizing code path is
 `curie_runner.session._halted_pause_text` with `_halted_permission_call`, fed by
 `curie_runner.session._apply_approval_override`,
 `curie_runner.translate._translate_assistant` and
@@ -46,10 +47,12 @@ notice of a pause that had not failed.
    assistant text of that call's own model response, if the final text is
    otherwise empty. The response is identified by the provider message id that
    every content block of one response carries. A message without an id is its
-   own response, so no text is grouped without that proof. Tool results, tool
+   own response, so no text is grouped without that proof. The response's text
+   blocks are joined as paragraphs. Tool results, tool
    arguments, nested (subagent) text, errored messages and every other
    assistant response of the turn are excluded. A nonempty provider result
-   stays authoritative.
+   of that invocation stays authoritative; an empty one never lets the
+   fallback's later text replace the response.
 2. In that same state, the failure text the aborted CLI result carries, such as
    the `run failed` placeholder, is never the final text.
 3. "That same state" requires all of: the runner requested the halt, no

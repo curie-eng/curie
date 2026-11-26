@@ -381,7 +381,11 @@ def _halted_pause_text(final: Final, state: TurnState) -> Final:
     response = _halted_permission_call(state)
     if response is None:
         return final
-    text = "" if state.approval_flipped_failure else final.text
+    # Only a nonempty provider result of the halted invocation is kept. A
+    # failure-path final or a fallback (empty provider result) is replaced by
+    # the whole response, never by the part after the blocked call.
+    keep = not state.approval_flipped_failure and not state.provider_result_empty
+    text = final.text if keep else ""
     if not text.strip():
         text = state.response_text.get(response, "").strip()
     return final.model_copy(update={"text": text})

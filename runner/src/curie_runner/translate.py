@@ -347,6 +347,9 @@ class TurnState:
     # override flipped a final from the failure path (the aborted CLI result).
     last_response: str | None = None
     approval_flipped_failure: bool = False
+    # Whether the terminal result carried no text of its own, so its final text
+    # came from the fallback. Runner-internal, never a wire field (ADR 0296).
+    provider_result_empty: bool = False
     # The call id of the permission block the session merged, if the gate named one.
     approval_call_id: str | None = None
 
@@ -523,8 +526,10 @@ def _translate_assistant(
                 if not collecting:
                     state.assistant_text += block.text
                 if response is not None and not error:
-                    state.response_text[response] = state.response_text.get(response, "") + (
-                        block.text
+                    # Each block is a whole paragraph; join blocks as paragraphs.
+                    earlier = state.response_text.get(response)
+                    state.response_text[response] = (
+                        f"{earlier}\n\n{block.text}" if earlier else block.text
                     )
                 if state.final_answer is None:
                     events.append(TextDelta(text=block.text))
@@ -744,6 +749,7 @@ def _translate_result(
     message: ResultMessage,
     state: TurnState,
 ) -> list[OutboundEvent]:
+    state.provider_result_empty = not message.result
     subtype = message.subtype or ""
     if message.is_error or subtype.startswith("error"):
         text = message.result or "run failed"

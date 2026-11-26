@@ -168,6 +168,16 @@ def test_a_turn_that_continued_after_the_halt_keeps_its_text(
     assert final.text == expected
 
 
+def test_text_after_the_blocked_call_never_replaces_the_response() -> None:
+    # The same response continues after the blocked call and the provider
+    # result is empty: the fallback holds only the later block, so the whole
+    # response is used instead.
+    after = "The administrator will see the request in the access channel."
+    final = _run(later=[_assistant(TextBlock(text=after), message_id="msg-1"), _result()])
+    assert final.status is SessionStatus.AWAITING_APPROVAL
+    assert final.text == f"{_INTENT}\n\n{after}"
+
+
 def test_messages_without_an_id_are_never_grouped() -> None:
     # No message id proves no shared response, so a separate message's text
     # stays provisional and the halted CLI's failure text is still dropped.
@@ -240,6 +250,8 @@ def test_the_halted_permission_pause_takes_the_blocked_response() -> None:
     done = _halted_state(approval_flipped_failure=False)
     assert _halted_pause_text(_awaiting(""), done).text == _INTENT
     assert _halted_pause_text(_awaiting("Waiting."), done).text == "Waiting."
+    fallback = _halted_state(approval_flipped_failure=False, provider_result_empty=True)
+    assert _halted_pause_text(_awaiting("Later block."), fallback).text == _INTENT
 
 
 @pytest.mark.parametrize(
