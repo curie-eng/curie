@@ -46,6 +46,10 @@ NOT_ALLOWED = (
     "I couldn't finish this request because it needed an action this conversation does not allow."
 )
 GENERIC = "I couldn't finish this request. Please try again in a few minutes."
+LOST = (
+    "I couldn't finish this request because it was interrupted before it "
+    "completed. Please send it again."
+)
 
 #: Every sentence a failed turn can show a person. A consumer that only sees
 #: the delivered text (the local stub) recognizes a failed turn by these.
@@ -56,6 +60,7 @@ PLAIN_FAILURE_REPLIES = (
     APPROVAL_UNAVAILABLE,
     NOT_ALLOWED,
     GENERIC,
+    LOST,
 )
 
 _BY_CLASS = {
@@ -68,6 +73,7 @@ _BY_CLASS = {
     "requester-window": TOO_LONG,
     "prior-side-effect": MAY_HAVE_ACTED,
     "tool-access-violation": NOT_ALLOWED,
+    "delivery-exhausted": LOST,
 }
 
 

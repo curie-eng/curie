@@ -29,6 +29,7 @@
     "I couldn't finish this request. An earlier attempt may already have made changes, so I did not try again automatically. Please check the result before asking again.",
     "I couldn't finish this request because the approval it needs could not be set up. Please ask an administrator to check this agent's approval settings.",
     "I couldn't finish this request because it needed an action this conversation does not allow.",
-    "I couldn't finish this request. Please try again in a few minutes."
+    "I couldn't finish this request. Please try again in a few minutes.",
+    "I couldn't finish this request because it was interrupted before it completed. Please send it again."
   ]
 }

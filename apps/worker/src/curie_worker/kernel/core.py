@@ -355,6 +355,7 @@ class Kernel:
     notify_turn_not_started = delivery.notify_turn_not_started
     _steering_may_have_admitted = delivery._steering_may_have_admitted
     notify_broker_entry_vanished = delivery.notify_broker_entry_vanished
+    notify_delivery_exhausted = delivery.notify_delivery_exhausted
     interrupt_thread = delivery.interrupt_thread
     stop_owned_execution = delivery.stop_owned_execution
     _own_execution = delivery._own_execution

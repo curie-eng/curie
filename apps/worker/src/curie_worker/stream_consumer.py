@@ -144,6 +144,7 @@ class StreamConsumer:
         leases: DeliveryLeaseStore | None = None,
         on_lease_lost: LeaseLostHandler | None = None,
         on_entry_vanished: LeaseLostHandler | None = None,
+        on_over_cap_dead_lettered: LeaseLostHandler | None = None,
         drain: UpgradeDrainGate | None = None,
         liveness_store: ConsumerLivenessStore | None = None,
     ) -> None:
@@ -199,6 +200,10 @@ class StreamConsumer:
         # stop and leaves a turn producing effects on a sandbox we no longer own.
         self._on_lease_lost: LeaseLostHandler | None = on_lease_lost
         self._on_entry_vanished: LeaseLostHandler | None = on_entry_vanished
+        # Fired after an entry that spent its delivery budget is dead-lettered
+        # (#5985), so the owning lane can tell the person. No handler reached a
+        # result for it: its owners died, or every attempt failed.
+        self._on_over_cap_dead_lettered: LeaseLostHandler | None = on_over_cap_dead_lettered
         # Lease objects captured for a vanished-entry notice. The handler's
         # ``_delivery_lease`` finally drops ``_held_leases`` and cancels the
         # heartbeat task; the notice runs on a separate task and must still
@@ -1167,8 +1172,12 @@ class StreamConsumer:
         *,
         reason: str,
         delivery_count: int,
-    ) -> None:
+    ) -> bool | None:
         """Move an entry to the graveyard and ack it off the main group.
+
+        Returns True once the entry is settled on the graveyard, False when the
+        fence refused and nothing was written. A lane override that answers
+        None reports no settlement, so the lane sends no over-cap notice.
 
         ``fields`` are the original entry's fields, kept verbatim so a human or a
         replay tool can inspect them; ``None`` writes a metadata-only row (the
@@ -1232,7 +1241,7 @@ class StreamConsumer:
                 "curie.queue.settle",
                 attributes={**attributes, "outcome": "pending"},
             )
-            return
+            return False
 
         target = self._spec.dead_letter_target
         # Escape the original's own ``dl_*`` keys (see above) so the metadata
@@ -1316,6 +1325,21 @@ class StreamConsumer:
         )
         if error is not None:
             raise error
+        return True
+
+    async def _notice_over_cap(self, entry_id: str, fields: dict[str, str] | None) -> None:
+        """Hand a dead-lettered over-cap entry to the lane's notice, best effort."""
+
+        if self._on_over_cap_dead_lettered is None or fields is None:
+            return
+        try:
+            await self._on_over_cap_dead_lettered(entry_id, fields)
+        except Exception:
+            self._spec.logger.exception(
+                "over-cap notice failed for entry %s on stream %s",
+                entry_id,
+                self._spec.stream,
+            )
 
     async def _dead_letter_over_cap(self) -> set[str]:
         """Dead-letter pending entries that have exhausted their delivery budget.
@@ -1418,7 +1442,7 @@ class StreamConsumer:
                 try:
                     if self._spec.entry_eligibility is None:
                         fields = await self._entry_fields(entry_id)
-                    await self._dead_letter(
+                    settled = await self._dead_letter(
                         entry_id,
                         fields,
                         reason=self._spec.over_cap_reason,
@@ -1429,6 +1453,9 @@ class StreamConsumer:
                         self._spec.dead_letter_fail_log,
                         entry_id,
                     )
+                else:
+                    if settled:
+                        await self._notice_over_cap(entry_id, fields)
             if len(pending) < page_size:
                 break
             # Exclusive lower bound: resume after the last id of this page.
@@ -1732,7 +1759,7 @@ class StreamConsumer:
                 try:
                     if self._spec.entry_eligibility is None:
                         fields = await self._entry_fields(entry_id)
-                    await self._dead_letter(
+                    settled = await self._dead_letter(
                         entry_id,
                         fields,
                         reason=self._spec.over_cap_reason,
@@ -1743,6 +1770,9 @@ class StreamConsumer:
                         self._spec.dead_letter_fail_log,
                         entry_id,
                     )
+                else:
+                    if settled:
+                        await self._notice_over_cap(entry_id, fields)
                 continue
             idle_for_row = (
                 (

@@ -218,6 +218,7 @@ class Consumer(StreamConsumer):
             leases=leases,
             on_lease_lost=self._interrupt_on_lease_lost,
             on_entry_vanished=self._notice_vanished_entry,
+            on_over_cap_dead_lettered=self._notice_delivery_exhausted,
             drain=drain,
             liveness_store=ConsumerLivenessStore(redis),
         )
@@ -1108,6 +1109,19 @@ class Consumer(StreamConsumer):
             logger.exception(
                 "could not interrupt the runner for entry %s after its delivery "
                 "lease was lost; the fence still refuses every terminal write",
+                entry_id,
+            )
+
+    async def _notice_delivery_exhausted(self, entry_id: str, fields: dict[str, str]) -> None:
+        """Tell the person when a turn is dead-lettered at its delivery cap (#5985)."""
+        if APPROVAL_REMINDER_FIELD in fields:
+            return
+        try:
+            qevent = from_stream_fields(fields)
+            await self._kernel.notify_delivery_exhausted(qevent)
+        except Exception:
+            logger.exception(
+                "could not post the delivery-exhausted notice for entry %s",
                 entry_id,
             )
 

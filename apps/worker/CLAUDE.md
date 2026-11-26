@@ -102,6 +102,15 @@ simplification.
   double run and never a stranded turn.
 - **`XADD` before `XACK`, never the reverse.** A crash between them costs a
   duplicate graveyard row; the reverse costs the entry.
+- **A turn dead-lettered at the cap tells the person (#5985).** After an
+  over-cap entry settles on the graveyard, the runs consumer's
+  `on_over_cap_dead_lettered` hook calls
+  `apps/worker/src/curie_worker/kernel/delivery.py::notify_delivery_exhausted`,
+  which edits the placeholder with the `delivery-exhausted` failure record
+  (rendered as a plain sentence for a person) unless the turn is a factory
+  execution, has no placeholder, already settled terminally, or may have been
+  admitted by a steer. Owners that died with their node never reach the
+  in-process not-started notice, so without it the placeholder stayed forever.
 - **`max_delivery` is not `max_attempts`.** The latter is the kernel's
   flag-clean retry *classification* inside one delivery. Do not conflate them.
 - **Transient failure is unchanged**: a mid-turn crash still reclaims, retries,

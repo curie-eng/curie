@@ -47,6 +47,7 @@ import curie_worker.consumer as consumer_module
 import pytest
 from aci_protocol import Final, QueuedTurn, SessionStatus
 from curie_internal.turn_queue import to_stream_fields
+from curie_worker import failure_notice
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.dead_letter_alert import install_dead_letter_alerting
@@ -208,14 +209,16 @@ def test_permanently_failing_entry_is_dead_lettered_at_the_cap_and_group_progres
                 # however many times the entry is retried -- which is what makes
                 # a faster retry cadence safe for the person.
                 #
-                # F1 (a distinct terminal notice once the cap is spent) is the
-                # named limit of this copy, not a reason to skip the assertion:
-                # "if no answer appears here shortly, please send it again" is
-                # true both before the cap and at it.
+                # Once the cap is spent the dead-letter settles the placeholder
+                # with the terminal delivery-exhausted notice (#5985), which the
+                # reply sink renders as a plain sentence for a person (#5984).
                 poison_updates = _updates_for(h, "tdl-poison")
-                assert poison_updates == [h.config.turn_not_started_text] * 3, (
+                assert poison_updates[:-1] == [h.config.turn_not_started_text] * 3, (
                     "the poison thread was left silent, or told a different "
                     f"number of times than it was delivered: {poison_updates}"
+                )
+                assert poison_updates[-1].splitlines()[0] == (
+                    "curie-turn-failure: delivery-exhausted"
                 )
                 summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
                 assert summary["pending"] == 0
@@ -1865,5 +1868,83 @@ def test_the_graveyard_write_precedes_the_ack_so_a_failed_write_leaves_it_pendin
                 assert await h.async_redis.exists(state_key) == 1
             finally:
                 await h.async_redis.delete(dead)
+
+    asyncio.run(go())
+
+
+async def _deliver_to_owners_that_die(h, entry_id: str, owners: int) -> None:
+    """Charge ``owners`` deliveries to consumers that never run the handler.
+
+    The shape of owners lost with their node: each took the entry and died
+    before settling it, so no in-process failure branch ever ran.
+    """
+    await h.async_redis.xreadgroup(
+        h.config.consumer_group, "owner-lost-0", {h.config.stream: ">"}, count=10
+    )
+    for n in range(1, owners):
+        await h.async_redis.xclaim(
+            h.config.stream, h.config.consumer_group, f"owner-lost-{n}", 0, [entry_id]
+        )
+
+
+def test_turn_dead_lettered_after_its_owners_died_tells_the_person(make_harness) -> None:
+    """#5985: the cap dead-letter replaces a placeholder nobody else will edit."""
+
+    async def go() -> None:
+        async with make_harness(max_delivery=3, reclaim_min_idle_ms=0) as h:
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            lost = qevent("lost turn", thread="tdl-lost", event_id="lost-turn")
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(lost))
+            try:
+                await _deliver_to_owners_that_die(h, entry_id, owners=3)
+
+                await _reclaim_and_settle(consumer)
+
+                assert entry_id not in await _pending_ids(h)
+                assert len(await _dead_rows(h)) == 1
+                updates = _updates_for(h, "tdl-lost")
+                assert len(updates) == 1, updates
+                assert updates[0].splitlines()[0] == "curie-turn-failure: delivery-exhausted"
+                assert failure_notice.plain_failure_text("delivery-exhausted") == (
+                    failure_notice.LOST
+                )
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+def test_dead_lettered_turn_with_a_delivered_answer_keeps_it(make_harness) -> None:
+    """#5985: a turn that already settled terminally is never overwritten."""
+
+    async def go() -> None:
+        async with make_harness(max_delivery=3, reclaim_min_idle_ms=0) as h:
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            done = qevent("answered turn", thread="tdl-answered", event_id="answered-turn")
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(done))
+            await h.async_redis.set(h.config.done_key("answered-turn"), "1")
+            try:
+                await _deliver_to_owners_that_die(h, entry_id, owners=3)
+
+                await _reclaim_and_settle(consumer)
+
+                assert entry_id not in await _pending_ids(h)
+                assert _updates_for(h, "tdl-answered") == []
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
 
     asyncio.run(go())

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from ..sandbox.types import SandboxHandle
     from .core import Kernel
 
-from . import clock, constants, routing, workspace
+from . import clock, constants, failures, routing, workspace
 from .log import logger
 
 # A status answer that carries no ``turn_epoch`` key at all.
@@ -552,6 +552,71 @@ async def notify_broker_entry_vanished(
     except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
         logger.warning(
             "the not-started notice for event %s could not be delivered",
+            event_id,
+            exc_info=True,
+        )
+
+
+async def notify_delivery_exhausted(self: Kernel, qevent: QueuedTurn) -> None:
+    """Tell the person a turn was dropped at its delivery cap (#5985).
+
+    The consumer dead-lettered this entry because it was delivered
+    ``max_delivery`` times without settling: its owners died with their node,
+    were killed or evicted, or every attempt failed. When owners died outright,
+    no in-process failure branch ever ran, so nothing else will edit the
+    placeholder and the person would see "working on it" forever.
+
+    The dead-letter fence has already proved nobody owns the entry, so no lease
+    is checked. The edit is skipped for a factory execution, a turn with no
+    placeholder, a delivery of this process that already sent a result, a turn
+    that settled terminally or whose terminality is unreadable, and a turn a
+    steer may have admitted into a live turn. Best effort: a failure is logged.
+    The reply sink turns the marked record into a plain sentence for a person
+    (#5984), and the relay keeps the record.
+    """
+
+    event_id = qevent.event_id
+    attempted = event_id in self._terminal_reply_attempted
+    self._terminal_reply_attempted.discard(event_id)
+    factory_work_item_turn = self._is_factory_work_item_turn(event_id)
+    self._factory_work_item_events.discard(event_id)
+    handle = qevent.reply_handle
+    if factory_work_item_turn or handle is None or handle.placeholder is None:
+        return
+    if attempted:
+        logger.warning(
+            "skipping the delivery-exhausted notice for event %s: this process "
+            "already sent the person a result for it",
+            event_id,
+        )
+        return
+    try:
+        already_terminal = await self._markers.is_terminal(event_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
+        logger.warning(
+            "terminality unreadable for event %s; skipping the delivery-exhausted "
+            "notice rather than risk overwriting a delivered answer",
+            event_id,
+            exc_info=True,
+        )
+        return
+    if already_terminal or await self._steering_may_have_admitted(event_id):
+        return
+    text = failures.turn_failure_reply(
+        constants.DELIVERY_EXHAUSTED_FAILURE_CLASS,
+        f"The turn was dropped after {self._config.max_delivery} deliveries "
+        f"without a result. event_id={event_id}.",
+    )
+    logger.warning("dead-lettered event %s at its delivery cap: %s", event_id, text)
+    try:
+        await self._reply_for(qevent, routing._route_from_handle(qevent), text)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
+        logger.warning(
+            "the delivery-exhausted notice for event %s could not be delivered",
             event_id,
             exc_info=True,
         )

@@ -355,6 +355,10 @@ _RUNNER_DEFAULT_MAX_TURNS = 20
 # model sentence cannot satisfy the parser by mentioning the prefix.
 TURN_FAILURE_REPLY_PREFIX = "curie-turn-failure:"
 
+#: The class a turn reports when it is dead-lettered at its delivery cap
+#: without a result (#5985).
+DELIVERY_EXHAUSTED_FAILURE_CLASS = "delivery-exhausted"
+
 # The failure class a refused cluster message or cluster eval turn reports on
 # its relay (HTTP-INVOCATION-EXECUTION-31, #5518). Frozen with the CLI reader in
 # tests/vectors/turn-failure-reply.json.
