@@ -121,7 +121,10 @@ def test_transient_probe_failure_recovers_on_a_later_turn(
 
     assert not any(isinstance(e, ErrorEvent) for e in first)
     assert first[-1].status == SessionStatus.DONE
-    assert first[-1].text.startswith(notice)
+    # The first turn never called the unavailable connector, so its reply
+    # carries no connector notice; the hook still denies the connector's tools.
+    assert first[-1].text == "all done"
+    assert notice not in first[-1].text
     assert first_decision["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     assert not any(e.type == "error" for e in second)

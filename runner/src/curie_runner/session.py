@@ -57,6 +57,7 @@ from curie_internal.provider_scope import ProviderScope
 from curie_telemetry import agent_metric_label, record_metric
 from opentelemetry.context import Context
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
+from plugin_format.approval_policy import connector_tool_prefix
 
 from .adapter import (
     McpServerReconnector,
@@ -634,7 +635,6 @@ class SessionRunner:
         self._connector_availability = connector_availability
         # The notice for the turn in flight, or None. Set at turn start under
         # the turn lock and applied to a DONE final in _drive_turn.
-        self._connector_notice: str | None = None
 
         self._session: ModelSession | None = None
         # One turn consumes the SDK generator at a time. This MUST be a
@@ -2366,7 +2366,7 @@ class SessionRunner:
                             for line in _history_capacity_lines(self._capacity_detail):
                                 yield line
                         else:
-                            yield to_ndjson_line(self._with_connector_notice(final))
+                            yield to_ndjson_line(self._with_connector_notice(final, state))
                         return
                     yield to_ndjson_line(outbound)
 
@@ -2444,7 +2444,7 @@ class SessionRunner:
             for line in _history_capacity_lines(self._capacity_detail):
                 yield line
         else:
-            yield to_ndjson_line(self._with_connector_notice(final))
+            yield to_ndjson_line(self._with_connector_notice(final, state))
 
     def _observe_tool_results(self, state: TurnState) -> None:
         """Count every tool result that closed a call this turn (#3486).
@@ -2861,7 +2861,6 @@ class SessionRunner:
         that itself raises keeps the prior failures, logged by class only.
         """
 
-        self._connector_notice = None
         if self._connector_failures and self._connector_reprobe is not None:
             prior = self._connector_failures
             remaining = prior
@@ -2904,9 +2903,6 @@ class SessionRunner:
                     for name in failure.credential_names
                 ),
                 " ".join(failure.diagnostic_message() for failure in self._connector_failures),
-            )
-            self._connector_notice = " ".join(
-                failure.caller_message() for failure in self._connector_failures
             )
 
     async def _confirm_session_connectors(
@@ -2970,21 +2966,35 @@ class SessionRunner:
             return final.model_copy(update={"text_mode": "verbatim"}), False
         return Final(text=FINAL_ANSWER_DIAGNOSTIC, status=SessionStatus.CLASSIFIED_FAILURE), True
 
-    def _with_connector_notice(self, final: Final) -> Final:
-        """Lead a DONE final's text with this turn's one-line connector notice.
+    def _with_connector_notice(self, final: Final, state: TurnState) -> Final:
+        """Lead a DONE final's text with one connector-unavailable notice.
+
+        Only a turn that called a tool of a connector still unavailable after
+        the turn-start re-probe gets the notice: a reply that never needed the
+        connector is not about it, and the failure is already logged for
+        operators. Several unavailable connectors still give one notice, the
+        first called connector's, so notices never stack on one reply.
 
         Applied at emission only, after the status is decided, so the model's
         real status stands and the durable transcript keeps the model's answer
         without the notice. Non-DONE finals keep their own text.
         """
 
-        notice = self._connector_notice
-        if (
-            notice is None
-            or final.status is not SessionStatus.DONE
-            or final.text_mode == "verbatim"
-        ):
+        if final.status is not SessionStatus.DONE or final.text_mode == "verbatim":
             return final
+        called = set(state.open_tool_calls.values())
+        called.update(name for _, name, _, _ in state.tool_results)
+        failure = next(
+            (
+                failure
+                for failure in self._connector_failures
+                if any(name.startswith(connector_tool_prefix(failure.connector)) for name in called)
+            ),
+            None,
+        )
+        if failure is None:
+            return final
+        notice = failure.caller_message()
         text = f"{notice}\n\n{final.text}" if final.text else notice
         return final.model_copy(update={"text": text})
 
