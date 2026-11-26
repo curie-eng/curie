@@ -4,6 +4,12 @@ Date: 2026-11-25
 
 Status: Accepted
 
+**Superseded in part by [ADR-0295](0295-selected-slack-app-attribution-does-not-require-a-posting-bot-user.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+0295 drops the Decision's requirement that the bot profile identify the sending bot's user,
+along with the dependent check against a sender equal to that user when no such ID is supplied.
+Everything else here stands.
+
 Accepted by Brian Conn under [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md)
 alongside implementation in `curie_channel_gateway.slack.http_receiver.HttpReceiverRuntime`.
 

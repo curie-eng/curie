@@ -45,6 +45,7 @@ from .test_http_receiver import (
     binding_body,
     native,
     receipt,
+    receiving,
     scope_body,
 )
 from .test_test_actions import DRIVER
@@ -434,22 +435,67 @@ def test_selected_bot_self_or_senderless_mention_never_gets_a_notice(
     web.chat_postMessage.assert_not_called()
 
 
+LISTED_APP = "A0EXAMPLESENDER"
+RECEIVER_APP = "A0EXAMPLERECEIVER"
+_ACCEPTED_APP_CASES = {"listed", "listed_with_bot_user", "profile_app_only", "event_app_only"}
+
+
+def _deliver_with_env_allowlist(
+    config: DispatcherConfig, redis_client: redis.Redis, rig: HttpRig, body: dict[str, Any],
+) -> Any:
+    """Deliver one envelope through the real Socket Mode entry, reading the allowlist fresh."""
+    app, legacy = _selected(
+        config, redis_client, rig, receiver_config=DispatcherConfig(
+            **config.model_dump(exclude={"slack_app_mention_allowlist"}),
+        ),
+    )
+    socket = FakeSocketClient()
+    request = SocketModeRequest(type="events_api", envelope_id="env-app", payload=body)
+    try:
+        SocketModeHandler(app, app_token="xapp-test").handle(socket, request)
+    finally:
+        _finish_owned_listeners(app)
+    assert socket.acked_envelope_ids == ["env-app"]
+    assert legacy.calls == [] and redis_client.xlen(config.stream) == 0
+    return rig.web
+
+
+def _assert_api_refusal(web: Any, config: DispatcherConfig) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19/27: the 403 outcome a refused human mention gets."""
+    web.chat_postMessage.assert_called_once_with(
+        channel=CHANNEL, thread_ts="1700.0001", text=config.placeholder_text,
+    )
+    web.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=REFUSED_TEXT,
+    )
+    web.chat_delete.assert_called_once_with(channel=CHANNEL, ts=PLACEHOLDER_TS)
+    web.chat_update.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "case",
     [
-        "listed", "profile_app_only", "event_app_only", "default", "unlisted",
-        "wrong_installation", "own_bot", "own_app", "own_user", "bot_user",
-        "missing_user", "missing_app", "conflicting_app", "conflicting_bot",
-        "missing_profile", "missing_bot_user", "no_receiving_app", "bad_receiving_app",
-        "marked_driver", "bot_subtype", "plain_reply",
+        "listed", "listed_with_bot_user", "profile_app_only", "event_app_only",
+        "api_refused", "default", "unlisted", "wrong_installation", "own_bot", "own_app",
+        "own_user", "bot_user", "own_bot_user", "malformed_bot_user", "non_string_bot_user",
+        "null_bot_user", "empty_bot_user", "other_receiver",
+        "missing_user", "missing_app", "conflicting_app", "malformed_app", "conflicting_bot",
+        "missing_bot_id", "missing_profile", "app_id_only", "no_receiving_app",
+        "bad_receiving_app", "marked_driver", "bot_subtype", "plain_reply",
     ],
 )
 def test_app_authored_mentions_require_installation_opt_in(
     config: DispatcherConfig, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch, case: str,
 ) -> None:
-    """Use the observed bot profile fields from test_factory_slack_kickoff_receipt."""
-    app_id = "A0EXAMPLESENDER"
-    receiver_app = "A0EXAMPLERECEIVER"
+    """An allowlisted app's mention on behalf of a person, in its native provider shape.
+
+    The base event is an authenticated Socket Mode events_api delivery of an
+    app_mention posted through a listed app on behalf of a person: event and
+    profile app IDs equal, event and profile bot IDs equal, no
+    bot_profile.user_id, and api_app_id naming the receiving app. The older
+    bot-token-post shape in test_factory_slack_kickoff_receipt carries
+    bot_profile.user_id; ``listed_with_bot_user`` covers it.
+    """
     sender_bot = "B0EXAMPLESENDER"
     sender_bot_user = "U0EXAMPLEAPPBOT"
     monkeypatch.delenv("CURIE_SLACK_APP_MENTION_ALLOWLIST", raising=False)
@@ -461,25 +507,41 @@ def test_app_authored_mentions_require_installation_opt_in(
             ),
             "app_id": (
                 "A0EXAMPLEOTHER" if case == "unlisted"
-                else receiver_app if case == "own_app" else app_id
+                else RECEIVER_APP if case == "own_app" else LISTED_APP
             ),
         }]))
     body, event = native()
-    body["api_app_id"] = receiver_app
-    profile = {"id": sender_bot, "app_id": app_id, "user_id": sender_bot_user}
-    event.update(bot_id=sender_bot, app_id=app_id, bot_profile=profile)
-    if case == "profile_app_only":
+    body["api_app_id"] = RECEIVER_APP
+    profile: dict[str, Any] = {"id": sender_bot, "app_id": LISTED_APP}
+    event.update(bot_id=sender_bot, app_id=LISTED_APP, bot_profile=profile)
+    if case == "listed_with_bot_user":
+        profile["user_id"] = sender_bot_user
+    elif case == "profile_app_only":
         del event["app_id"]
     elif case == "event_app_only":
         del profile["app_id"]
     elif case == "own_bot":
         event["bot_id"] = profile["id"] = "B1"
     elif case == "own_app":
-        event["app_id"] = profile["app_id"] = receiver_app
+        event["app_id"] = profile["app_id"] = RECEIVER_APP
     elif case == "own_user":
         event["user"] = BOT
     elif case == "bot_user":
-        event["user"] = sender_bot_user
+        event["user"] = profile["user_id"] = sender_bot_user
+    elif case == "own_bot_user":
+        profile["user_id"] = BOT
+    elif case == "malformed_bot_user":
+        profile["user_id"] = "not-a-user"
+    elif case == "non_string_bot_user":
+        profile["user_id"] = 7
+    elif case == "null_bot_user":
+        # A supplied but empty value is malformed, unlike an absent field.
+        profile["user_id"] = None
+    elif case == "empty_bot_user":
+        profile["user_id"] = ""
+    elif case == "other_receiver":
+        # Only the envelope's authorization names the app that received it.
+        body["authorizations"] = receiving("U0EXAMPLEOTHERBOT")
     elif case == "missing_user":
         del event["user"]
     elif case == "missing_app":
@@ -487,12 +549,18 @@ def test_app_authored_mentions_require_installation_opt_in(
         del profile["app_id"]
     elif case == "conflicting_app":
         profile["app_id"] = "A0EXAMPLEOTHER"
+    elif case == "malformed_app":
+        profile["app_id"] = 7
     elif case == "conflicting_bot":
         profile["id"] = "B0EXAMPLEOTHER"
+    elif case == "missing_bot_id":
+        del event["bot_id"]
     elif case == "missing_profile":
         del event["bot_profile"]
-    elif case == "missing_bot_user":
-        del profile["user_id"]
+    elif case == "app_id_only":
+        # A person-looking event with partial app metadata gains nothing from the allowlist.
+        del event["bot_id"]
+        del event["bot_profile"]
     elif case == "no_receiving_app":
         del body["api_app_id"]
     elif case == "bad_receiving_app":
@@ -504,31 +572,73 @@ def test_app_authored_mentions_require_installation_opt_in(
     elif case == "plain_reply":
         event["type"] = "message"
 
-    rig = HttpRig(auth={
+    rig = HttpRig(_answering(403) if case == "api_refused" else None, auth={
         "ok": True, "team_id": "T1", "user_id": BOT, "bot_id": "B1",
         "is_enterprise_install": False,
-        **({"app_id": receiver_app} if case == "bad_receiving_app" else {}),
+        **({"app_id": RECEIVER_APP} if case == "bad_receiving_app" else {}),
     })
-    app, legacy = _selected(
-        config, redis_client, rig, receiver_config=DispatcherConfig(
-            **config.model_dump(exclude={"slack_app_mention_allowlist"}),
-        ),
-    )
-    handler = SocketModeHandler(app, app_token="xapp-test")
-    socket = FakeSocketClient()
-    request = SocketModeRequest(type="events_api", envelope_id="env-app", payload=body)
-    handler.handle(socket, request)
-    _finish_owned_listeners(app)
-    assert socket.acked_envelope_ids == ["env-app"]
-    if case in {"listed", "profile_app_only", "event_app_only"}:
+    web = _deliver_with_env_allowlist(config, redis_client, rig, body)
+    if case in _ACCEPTED_APP_CASES:
         (submitted,) = rig.requests
         assert json.loads(submitted.content)["author"] == SENDER
-        rig.web.chat_postMessage.assert_called_once()
+        web.chat_postMessage.assert_called_once()
+        web.chat_postEphemeral.assert_not_called()
+    elif case == "api_refused":
+        # The allowlist only lifts the local app-authored refusal; the API still
+        # authorizes the person. A refused app-authored event owes no notice, so
+        # its placeholder is removed and nothing else is posted.
+        (submitted,) = rig.requests
+        assert json.loads(submitted.content)["author"] == SENDER
+        web.chat_postMessage.assert_called_once_with(
+            channel=CHANNEL, thread_ts="1700.0001", text=config.placeholder_text,
+        )
+        web.chat_delete.assert_called_once_with(channel=CHANNEL, ts=PLACEHOLDER_TS)
+        web.chat_postEphemeral.assert_not_called()
+        web.chat_update.assert_not_called()
+    elif case in {"missing_bot_id", "app_id_only"}:
+        # Without a bot ID the event looks like a person's, so the local refusal
+        # gets the person's ordinary notice and never reaches the API.
+        assert rig.requests == []
+        web.chat_postMessage.assert_not_called()
+        web.chat_postEphemeral.assert_called_once_with(
+            channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=REFUSED_TEXT,
+        )
     else:
         assert rig.requests == []
-        rig.web.chat_postMessage.assert_not_called()
-        rig.web.chat_postEphemeral.assert_not_called()
-    assert legacy.calls == []
+        web.chat_postMessage.assert_not_called()
+        web.chat_postEphemeral.assert_not_called()
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["accepted", "api_refused"])
+@pytest.mark.parametrize("allowlisted", [False, True], ids=["no_allowlist", "allowlist"])
+def test_human_mention_without_app_metadata_ignores_the_app_allowlist(
+    config: DispatcherConfig, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch,
+    allowlisted: bool, refused: bool,
+) -> None:
+    """A person's mention with no app metadata takes the ordinary path either way.
+
+    Listing an app on this installation neither admits nor refuses it locally:
+    it is submitted with the person as author, and the API's answer decides.
+    """
+    monkeypatch.delenv("CURIE_SLACK_APP_MENTION_ALLOWLIST", raising=False)
+    if allowlisted:
+        monkeypatch.setenv("CURIE_SLACK_APP_MENTION_ALLOWLIST", json.dumps([{
+            "provider_installation_id": INSTALLATION, "app_id": LISTED_APP,
+        }]))
+    body, event = native()
+    assert not {"bot_id", "app_id", "bot_profile", "subtype"}.intersection(event)
+    rig = HttpRig(_answering(403) if refused else None)
+    web = _deliver_with_env_allowlist(config, redis_client, rig, body)
+    (submitted,) = rig.requests
+    assert json.loads(submitted.content)["author"] == SENDER
+    if refused:
+        _assert_api_refusal(web, config)
+    else:
+        web.chat_postMessage.assert_called_once_with(
+            channel=CHANNEL, thread_ts="1700.0001", text=config.placeholder_text,
+        )
+        assert _notice_texts(web, config) == []
+        web.chat_delete.assert_not_called()
 
 
 def test_selected_repeated_refused_delivery_posts_one_notice(

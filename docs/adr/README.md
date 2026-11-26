@@ -310,5 +310,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0288 | [The runner carries a connector's approval ticket to its gated call](0288-the-runner-carries-a-connector-approval-ticket-to-its-gated-call.md) | Accepted |
 | 0293 | [Registered Slack direct messages can carry file shares](0293-registered-slack-direct-messages-can-carry-file-shares.md) | Accepted |
 | 0294 | [Selected Slack receivers can trust app attribution per installation](0294-selected-slack-receivers-can-trust-app-attribution-per-installation.md) | Accepted |
+| 0295 | [Selected Slack app attribution does not require a posting bot user](0295-selected-slack-app-attribution-does-not-require-a-posting-bot-user.md) | Accepted |
 | 0296 | [A halted permission pause answers with the blocked call's own response](0296-a-halted-permission-pause-answers-with-the-blocked-calls-own-response.md) | Accepted |
 <!-- END GENERATED: adr-index -->
