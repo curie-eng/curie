@@ -693,6 +693,10 @@ class ApprovalGate:
     # ``SessionRunner`` knows the runner itself requested that stop. It is
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
+    # The SDK call id of the call whose block wrote the pending record (ADR
+    # 0296), when the deciding callback knew it. The session uses it to find
+    # that call's own model response. Runner-internal, per turn, never serialized.
+    pending_call_id: str | None = None
     # Set by ``halt_for_questions`` once ``ask_questions`` has posted this
     # turn's round (ADR 0286 decisions 2 and 11, #5785). From then on every
     # tool call of the turn is refused with the same turn-stopping flags a
@@ -790,6 +794,7 @@ class ApprovalGate:
         # than with the boot-turn grant below: a halt that leaked forward would
         # make every later errored turn finalize as awaiting-approval (#1852).
         self.pending_halt = False
+        self.pending_call_id = None
         self.questions_posted = False
         self.held_call_ids.clear()
         self.refused_call_ids.clear()
@@ -941,13 +946,17 @@ class ApprovalGate:
         except (TypeError, ValueError, RecursionError):
             return None
 
-    def block(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+    def block(
+        self, tool_name: str, tool_input: dict[str, Any], *, call_id: str | None = None
+    ) -> None:
         # Outside the first-block guard on purpose (#1852): the FIRST blocked
         # call still wins the summary the human resolves against, but a second
         # blocked call in the same turn must still assert that the runner asked
         # for a stop. Do not tidy this back inside the guard below.
         self.pending_halt = True
-        self._record_pending(tool_name, tool_input)
+        if self._record_pending(tool_name, tool_input):
+            # Only the call that wrote the record names it (ADR 0296).
+            self.pending_call_id = call_id
 
     def _record_pending(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
         """Write the first pending record of the turn; report whether it wrote.
@@ -1329,7 +1338,7 @@ async def _decide_gate(
         if gate.consume_grant(tool_name, tool_input):
             return _GateDecision(blocked=False, ungated=False, updated_input=granted)
         # ADR 0288 decision 1: record the connector's own ticket, not the copy.
-        gate.block(tool_name, gate.carried_input(tool_name, tool_input))
+        gate.block(tool_name, gate.carried_input(tool_name, tool_input), call_id=tool_use_id)
         if tool_use_id is not None:
             gate.held_call_ids.add(tool_use_id)
         return _GateDecision(blocked=True, ungated=False)
@@ -1349,7 +1358,7 @@ async def _decide_gate(
         )
     if gate.consume_grant(tool_name, tool_input):
         return _GateDecision(blocked=False, ungated=False, updated_input=granted)
-    gate.block(tool_name, gate.carried_input(tool_name, tool_input))
+    gate.block(tool_name, gate.carried_input(tool_name, tool_input), call_id=tool_use_id)
     if tool_use_id is not None:
         gate.held_call_ids.add(tool_use_id)
     return _GateDecision(blocked=True, ungated=False)

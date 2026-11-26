@@ -127,6 +127,7 @@ from .tool_names import PLATFORM_SLACK_TOOL_NAMES
 from .translate import (
     TurnState,
     credential_rejection_condition,
+    end_invocation,
     is_credit_refusal,
     is_usage_refusal,
     map_error_classification,
@@ -311,6 +312,12 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
 
     The captured summary rides the final so the platform can persist it on the
     durable Approval record.
+
+    The text is left as it came. ADR 0296 sets the text of one halted pause
+    only at publication (``_halted_pause_text``), after the last stop check, so
+    a timeout or interrupt that lands later still reports its own text. This
+    records whether the flipped final came from the aborted CLI result's
+    failure path, which that step needs.
     """
 
     if state.tool_access is not None:
@@ -318,6 +325,7 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
         return final
     runner_halted_the_turn = state.approval_halt_requested and state.error_classification is None
     if state.approval_summary and (final.status is SessionStatus.DONE or runner_halted_the_turn):
+        state.approval_flipped_failure = final.status is not SessionStatus.DONE
         return Final(
             text=final.text,
             status=SessionStatus.AWAITING_APPROVAL,
@@ -329,6 +337,59 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
             approval_display=state.approval_display,
         )
     return final
+
+
+def _halted_permission_call(state: TurnState) -> str | None:
+    """The model response of the call a halted permission pause blocked (ADR 0296).
+
+    None unless the runner itself halted the turn with no classified error, the
+    merged record is a permission gate's and not a publication's, the gate named
+    the call that wrote it, that call was a top-level call of this turn, its
+    response is the turn's last top-level response (nothing continued after the
+    halt, such as a background task's later response), and the bundle declares
+    no final-answer policy (ADR 0227 withholds provisional text there).
+    """
+
+    if (
+        not state.approval_halt_requested
+        or state.error_classification is not None
+        or state.tool_access is not None
+        or state.approval_gate_kind != "permission"
+        or state.approval_granted_tool in (None, PLATFORM_PUBLISH_TOOL_NAME)
+        or state.approval_call_id is None
+        or state.final_answer is not None
+    ):
+        return None
+    response = state.call_responses.get(state.approval_call_id)
+    if response is None or response != state.last_response:
+        return None
+    return response
+
+
+def _halted_pause_text(final: Final, state: TurnState) -> Final:
+    """Set the text of a permission pause the runner halted at its call (ADR 0296).
+
+    Called at publication, after the last stop check, so only a final that is
+    still awaiting approval changes. The aborted CLI result's failure text, such
+    as the ``run failed`` placeholder, is dropped, and an empty text becomes the
+    top-level assistant text of the blocked call's own model response. A
+    nonempty provider result of that same invocation stays. Every other final
+    is returned unchanged.
+    """
+
+    if final.status is not SessionStatus.AWAITING_APPROVAL:
+        return final
+    response = _halted_permission_call(state)
+    if response is None:
+        return final
+    # Only a nonempty provider result of the halted invocation is kept. A
+    # failure-path final or a fallback (empty provider result) is replaced by
+    # the whole response, never by the part after the blocked call.
+    keep = not state.approval_flipped_failure and not state.provider_result_empty
+    text = final.text if keep else ""
+    if not text.strip():
+        text = state.response_text.get(response, "").strip()
+    return final.model_copy(update={"text": text})
 
 
 _HISTORY_CAPACITY_FINAL = Final(
@@ -2152,6 +2213,7 @@ class SessionRunner:
                     # terminal result: record_result_usage keeps the first
                     # positive total and would hide the later one.
                     held_for_background = True
+                    end_invocation(state)
                     if self._usage_reporter is not None:
                         await self._usage_reporter.report(message, self._primary_model)
                     continue
@@ -2269,6 +2331,7 @@ class SessionRunner:
                         # before publishing the terminal final.
                         final = self._reclassify(final)
                         final, validation_failed = self._validate_publication(state, final)
+                        final = _halted_pause_text(final, state)
                         capacity_failure = False
                         if final.status in {
                             SessionStatus.DONE,
@@ -2350,6 +2413,7 @@ class SessionRunner:
             yield line
         final = self._reclassify(final)
         final, validation_failed = self._validate_publication(state, final)
+        final = _halted_pause_text(final, state)
         capacity_failure = False
         if final.status is SessionStatus.AWAITING_APPROVAL:
             final, capacity_failure = await self._persist_terminal(
@@ -2720,6 +2784,7 @@ class SessionRunner:
             state.approval_gate_kind = None
             state.approval_granted_tool = None
             state.approval_granted_arguments = None
+            state.approval_call_id = None
             return
 
         ledger = self._policy_approval_ledger
@@ -2733,6 +2798,7 @@ class SessionRunner:
                 gate.grantable_tool_for_route(policy.route) if gate is not None else None
             )
             state.approval_granted_arguments = None
+            state.approval_call_id = None
         elif gate is not None and gate.policy_rejected:
             state.approval_summary = None
             state.approval_display = None
@@ -2740,6 +2806,7 @@ class SessionRunner:
             state.approval_gate_kind = None
             state.approval_granted_tool = None
             state.approval_granted_arguments = None
+            state.approval_call_id = None
         if gate is None:
             return
 
@@ -2752,6 +2819,7 @@ class SessionRunner:
             state.approval_gate_kind = gate.pending_gate_kind
             state.approval_granted_tool = gate.pending_granted_tool
             state.approval_granted_arguments = gate.pending_granted_arguments
+            state.approval_call_id = gate.pending_call_id
 
         if gate.pending_halt and not self._interrupt_requested and not self._timeout_requested:
             state.approval_halt_requested = True
