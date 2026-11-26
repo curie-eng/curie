@@ -199,6 +199,20 @@ def _poll_sleeps(config: SubstrateConfig) -> Iterator[float]:
         yield interval
 
 
+def _inventory_unavailable(exc: BaseException) -> bool:
+    """Whether ``exc`` means the admission inventory could not be read in time.
+
+    A transport failure, a 5xx, or the bounded read budget running out leaves
+    the inventory incomplete rather than wrong. Admission turns this into
+    ``AdmissionUnavailableError`` (a durable wait), and maintenance reports it
+    as ``inventory-unavailable``; any other error stays its own failure.
+    """
+
+    if isinstance(exc, (TimeoutError, HTTPTimeoutError, KubeTransientError)):
+        return True
+    return isinstance(exc, MaxRetryError) and isinstance(exc.reason, HTTPTimeoutError)
+
+
 def _sandbox_attributes(operation: str, outcome: str) -> dict[str, str]:
     return {
         "service.name": "curie-worker",
@@ -386,10 +400,8 @@ class SandboxSubstrate:
                 raise ValueError("sandbox admission footprint is incomplete")
             inventory = self._reconcile_admission()
             quota = self._k8s.read_quota(config.quota_name, request_timeout_seconds=1.0)
-        except (TimeoutError, HTTPTimeoutError, KubeTransientError) as exc:
-            raise AdmissionUnavailableError("sandbox admission inventory unavailable") from exc
-        except MaxRetryError as exc:
-            if not isinstance(exc.reason, HTTPTimeoutError):
+        except Exception as exc:
+            if not _inventory_unavailable(exc):
                 raise
             raise AdmissionUnavailableError("sandbox admission inventory unavailable") from exc
         live_headroom = admission_quota_headroom(config, self._config.namespace, requested, quota)
@@ -1886,12 +1898,32 @@ class SandboxSubstrate:
         return None if view is None else view.bundle_ref
 
     def reap_orphans(self) -> list[str]:
-        """Measure orphan cleanup at the substrate seam for every backend."""
+        """Run the orphan sweep and the admission reconciliation as two operations.
+
+        Each runs whatever the other did, and each reports its own outcome
+        (#5976). The sweep is the cleanup outcome on ``curie.sandbox.cleanup``:
+        ``orphan-cleaned``, ``observed`` or ``failed``. Reconciling the
+        admission ledger against the full capacity inventory is reported as
+        ``curie.sandbox.lifecycle`` with ``operation=reconcile`` and outcome
+        ``reconciled``, ``inventory-unavailable`` (the inventory could not be
+        read completely, for example a Pod LIST 503) or ``failed``, plus a
+        ``sandbox.inventory.*`` event on the same cleanup span. A failed
+        inventory read therefore never hides orphans the sweep removed, and an
+        incomplete inventory is never counted as reconciled:
+        ``_reconcile_admission`` changes the ledger only from a complete read,
+        and the admission path reads its own inventory before every decision.
+
+        A sweep failure is raised, with any reconciliation failure attached as
+        a note; otherwise a reconciliation failure is raised. Either way the
+        maintenance tick logs the failing tick once and its other steps run.
+        """
 
         deleted: list[str] = []
         observed_claims: set[str] = set()
         inventory: dict[RouteState, set[str]] = {state: set() for state in RouteState}
-        error: Exception | None = None
+        sweep_error: Exception | None = None
+        reconcile_error: Exception | None = None
+        reconcile_outcome: str | None = None
         with operation_span(
             "curie.sandbox.cleanup",
             kind=SpanKind.INTERNAL,
@@ -1901,10 +1933,8 @@ class SandboxSubstrate:
                 self._retry_unreported_credentials()
                 inventory = self._affinity.route_inventory()
                 deleted, observed_claims = self._reap_orphans(inventory)
-                if self._config.admission is not None:
-                    self._reconcile_admission()
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
-                error = exc
+                sweep_error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
                 span.add_event(
@@ -1916,12 +1946,39 @@ class SandboxSubstrate:
                     "sandbox.cleanup.completed",
                     {"outcome": "orphan-cleaned" if deleted else "observed"},
                 )
-        outcome = "failed" if error is not None else ("orphan-cleaned" if deleted else "observed")
+            if self._config.admission is not None:
+                try:
+                    self._reconcile_admission()
+                except Exception as exc:  # noqa: BLE001 - reported, then re-raised below
+                    reconcile_error = exc
+                    reconcile_outcome = (
+                        "inventory-unavailable" if _inventory_unavailable(exc) else "failed"
+                    )
+                    span.add_event(
+                        "sandbox.inventory.failed",
+                        {"outcome": reconcile_outcome, "error.class": type(exc).__name__},
+                    )
+                else:
+                    reconcile_outcome = "reconciled"
+                    span.add_event("sandbox.inventory.reconciled", {"outcome": "reconciled"})
+        outcome = (
+            "failed" if sweep_error is not None else ("orphan-cleaned" if deleted else "observed")
+        )
         attributes = _sandbox_attributes("cleanup", outcome)
         record_metric("curie.sandbox.lifecycle", attributes=attributes)
         record_metric("curie.sandbox.cleanup", float(len(deleted)), attributes=attributes)
-        if error is not None:
-            raise error
+        if reconcile_outcome is not None:
+            record_metric(
+                "curie.sandbox.lifecycle",
+                attributes=_sandbox_attributes("reconcile", reconcile_outcome),
+            )
+        if sweep_error is not None:
+            if reconcile_error is not None:
+                sweep_error.add_note(
+                    f"admission inventory reconciliation also failed: "
+                    f"{type(reconcile_error).__name__}"
+                )
+            raise sweep_error
         active_routes = inventory[RouteState.LIVE]
         suspended_routes = inventory[RouteState.SUSPENDED]
         _record_inventory(
@@ -1937,6 +1994,8 @@ class SandboxSubstrate:
                 "outcome": "observed",
             },
         )
+        if reconcile_error is not None:
+            raise reconcile_error
         return deleted
 
     def _reap_orphans(self, inventory: dict[RouteState, set[str]]) -> tuple[list[str], set[str]]:

@@ -1328,7 +1328,15 @@ That tail consumes unused claim reserve and never authorizes requester retry.
   fixed margin: a claim still inside its bind window has no route yet, so "no
   live route" alone would read as litter and reaping it would delete a live
   sandbox out from under a blocked turn. A claim whose age is unknown is spared
-  and logged at WARNING.
+  and logged at WARNING. With admission configured, the same tick then
+  reconciles the admission ledger against the full capacity inventory as a
+  separate operation (#5976). Neither skips the other or changes the other's
+  outcome: the sweep reports `curie.sandbox.cleanup` as `orphan-cleaned`,
+  `observed` or `failed`, and the reconciliation reports
+  `curie.sandbox.lifecycle` with `operation=reconcile` and outcome
+  `reconciled`, `inventory-unavailable` (an incomplete inventory read, such as
+  a Pod LIST 503) or `failed`. An incomplete inventory never counts as
+  reconciled and releases no charged admission reservation.
 - The client seam (`SandboxClient` protocol) is sync; wrap calls in a thread if
   the kernel goes async. Unit tests fake only this protocol (the K8s control
   plane); Valkey is never mocked. The env-gated e2e

@@ -62,8 +62,9 @@ from curie_worker.kernel import routing as kernel_routing
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.sandbox import k8s as k8s_module
+from curie_worker.sandbox import substrate as substrate_module
 from curie_worker.sandbox.k8s import KubernetesSandboxClient
-from curie_worker.sandbox.types import KubeTransientError
+from curie_worker.sandbox.types import MANAGED_BY_LABEL, MANAGED_BY_VALUE, KubeTransientError
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
@@ -107,6 +108,7 @@ from .test_work_item_workspace import (
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from otel_fixtures import install  # noqa: E402
 from queue_fixtures import qevent as _qevent  # noqa: E402
 from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
@@ -3700,6 +3702,232 @@ def test_maintenance_inventory_503_with_failing_expiry_logs_the_substrate_error(
     assert "expiry reap also failed" in notes[0]
     assert "workspace ledger unreadable" in notes[0]
     assert "workspace ledger unreadable" in logging.Formatter().format(record)
+
+
+# -- #5976: orphan cleanup and inventory reconciliation are separate operations --
+
+_ORPHAN_CLAIM = "fixture-orphan-claim"
+
+
+async def _owed_completion_with_active_claim(
+    h: Any, consumer: Consumer, api: Any
+) -> tuple[QueuedTurn, str]:
+    """Run one admitted turn whose completion delivery fails, so it stays owed.
+
+    The turn's claim keeps a live route, so it is the active claim the orphan
+    sweep must preserve. Returns the turn and that claim's name.
+    """
+
+    h.runner.default_script = [Final(text="owed answer", status=DONE)]
+    h.sink.fail_events = {"turn.completed"}
+    event = _qevent("hello", thread="owed-thread", event_id="owed-turn")
+    entry_id, fields = await _pending_local_entry(h, event)
+    await consumer._sem.acquire()
+    with contextlib.suppress(Exception):
+        await consumer._handle(entry_id, fields)
+    h.sink.fail_events = set()
+    assert h.runner.opened == ["hello"]
+    assert h.sink.completions == []
+    assert await _owed_event_ids(h) == {event.event_id}
+    active = [name for plural, name in api.objects if plural == "sandboxclaims"]
+    assert len(active) == 1, active
+    # Owned by this substrate and older than the bind-window grace, the same
+    # as the orphan: only its live route keeps it.
+    assert (
+        api.objects[("sandboxclaims", active[0])]["metadata"]["labels"][MANAGED_BY_LABEL]
+        == MANAGED_BY_VALUE
+    )
+    api.seed(
+        "sandboxclaims",
+        _ORPHAN_CLAIM,
+        {"warmPoolRef": {"name": "test-pool"}},
+        labels={MANAGED_BY_LABEL: MANAGED_BY_VALUE},
+    )
+    return event, active[0]
+
+
+async def _owed_event_ids(h: Any) -> set[str]:
+    entries = await h.kernel._markers.pending_completion_entries(100)
+    return {entry.event_id for entry in entries}
+
+
+async def _run_maintenance_ticks(
+    consumer: Consumer, ticks: int, caplog: pytest.LogCaptureFixture
+) -> list[int]:
+    """Run the real maintenance loop for ``ticks`` ticks; return log boundaries."""
+
+    boundaries: list[int] = []
+    real_observe = consumer._observe_capacity_waits
+
+    async def last_observer() -> None:
+        await real_observe()
+        boundaries.append(len(caplog.records))
+        if len(boundaries) == ticks:
+            consumer.request_stop()
+
+    consumer._observe_capacity_waits = last_observer  # type: ignore[method-assign]
+    await consumer._maintenance_loop()
+    return boundaries
+
+
+def _cleanup_spans(probe: Any) -> list[list[tuple[str, dict[str, str]]]]:
+    return [span.events for span in probe.spans if span.name == "curie.sandbox.cleanup"]
+
+
+def _lifecycle_outcomes(probe: Any, operation: str) -> list[str]:
+    return [
+        point.attributes["outcome"]
+        for point in probe.points("curie.sandbox.lifecycle")
+        if point.attributes.get("operation") == operation
+    ]
+
+
+def test_maintenance_pod_list_503_preserves_orphan_cleanup(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5976: two maintenance ticks under a Pod LIST 503 report each inventory
+    failure as its own typed outcome, never as a failed orphan cleanup. The
+    first tick's sweep really removes the fixture orphan (owned, past the
+    bind-window grace, no route) and keeps the active claim; the owed completion
+    is delivered during the fault; the third tick, after recovery, reconciles."""
+
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=0
+    )
+
+    async def go() -> tuple[QueuedTurn, str, list[int], Any]:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            reclaim_interval_s=1e-6,
+            completion_sweep_grace_s=0.0,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event, active = await _owed_completion_with_active_claim(h, consumer, api)
+            probe = install(monkeypatch, substrate_module)
+            pod_lists = len(api.pod_list_calls)
+            api.failures_left = 2
+            delivered: list[int] = []
+            real_observe = consumer._observe_capacity_waits
+
+            async def sample_completions() -> None:
+                await real_observe()
+                delivered.append(len(h.sink.completions))
+
+            consumer._observe_capacity_waits = sample_completions  # type: ignore[method-assign]
+            boundaries = await _run_maintenance_ticks(consumer, 3, caplog)
+            # Delivered on the first tick, while the Pod LIST still fails.
+            assert delivered == [1, 1, 1]
+            assert api.failures_left == 0
+            # One inventory read per tick and no retry inside a tick.
+            assert len(api.pod_list_calls) - pod_lists == 3
+            assert [c.event_id for c in h.sink.completions] == [event.event_id]
+            assert await _owed_event_ids(h) == set()
+            return event, active, boundaries, probe
+
+    with caplog.at_level(logging.ERROR):
+        _event, active, boundaries, probe = asyncio.run(go())
+
+    unavailable = (
+        "sandbox.inventory.failed",
+        {"outcome": "inventory-unavailable", "error.class": "KubeTransientError"},
+    )
+    assert _cleanup_spans(probe) == [
+        [("sandbox.cleanup.completed", {"outcome": "orphan-cleaned"}), unavailable],
+        [("sandbox.cleanup.completed", {"outcome": "observed"}), unavailable],
+        [
+            ("sandbox.cleanup.completed", {"outcome": "observed"}),
+            ("sandbox.inventory.reconciled", {"outcome": "reconciled"}),
+        ],
+    ]
+    cleanup = probe.points("curie.sandbox.cleanup")
+    assert [(p.attributes["outcome"], p.value) for p in cleanup] == [
+        ("orphan-cleaned", 1.0),
+        ("observed", 0.0),
+        ("observed", 0.0),
+    ]
+    assert _lifecycle_outcomes(probe, "cleanup") == ["orphan-cleaned", "observed", "observed"]
+    assert _lifecycle_outcomes(probe, "reconcile") == [
+        "inventory-unavailable",
+        "inventory-unavailable",
+        "reconciled",
+    ]
+    # The orphan is really gone, deleted once; the active claim is untouched.
+    assert ("sandboxclaims", _ORPHAN_CLAIM) not in api.objects
+    assert api.deletes.count(("sandboxclaims", _ORPHAN_CLAIM)) == 1
+    assert ("sandboxclaims", active) in api.objects
+    assert ("sandboxclaims", active) not in api.deletes
+    # Each failing tick still logs its inventory failure once against the step.
+    start = 0
+    for index, end in enumerate(boundaries):
+        errors = caplog.records[start:end]
+        start = end
+        if index == 2:
+            assert errors == [], index
+            continue
+        assert [r.getMessage() for r in errors] == ["maintenance tick failed"], index
+        assert getattr(errors[0], "maintenance_step", None) == "reap_orphans"
+        assert errors[0].exc_info is not None
+        assert isinstance(errors[0].exc_info[1], KubeTransientError)
+
+
+def test_maintenance_orphan_sweep_failure_stays_failed_and_delivers_owed_completion(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5976 negative: a sweep that cannot delete an orphan is still a failed
+    cleanup, whatever the inventory says, and it does not stop owed completion
+    recovery. The healthy inventory reconciles on the same tick."""
+
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=0
+    )
+
+    async def go() -> tuple[str, Any]:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            reclaim_interval_s=1e-6,
+            completion_sweep_grace_s=0.0,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event, active = await _owed_completion_with_active_claim(h, consumer, api)
+            api.delete_failures[_ORPHAN_CLAIM] = kube.ApiException(status=500)
+            probe = install(monkeypatch, substrate_module)
+            await _run_maintenance_ticks(consumer, 1, caplog)
+            assert [c.event_id for c in h.sink.completions] == [event.event_id]
+            assert await _owed_event_ids(h) == set()
+            return active, probe
+
+    with caplog.at_level(logging.ERROR):
+        active, probe = asyncio.run(go())
+
+    [events] = _cleanup_spans(probe)
+    assert [name for name, _attributes in events] == [
+        "sandbox.cleanup.failed",
+        "sandbox.inventory.reconciled",
+    ]
+    assert events[0][1]["outcome"] == "failed"
+    assert [p.attributes["outcome"] for p in probe.points("curie.sandbox.cleanup")] == ["failed"]
+    assert _lifecycle_outcomes(probe, "cleanup") == ["failed"]
+    assert _lifecycle_outcomes(probe, "reconcile") == ["reconciled"]
+    assert ("sandboxclaims", _ORPHAN_CLAIM) in api.objects
+    assert ("sandboxclaims", active) in api.objects
+    assert ("sandboxclaims", active) not in api.deletes
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["maintenance tick failed"]
+    assert getattr(errors[0], "maintenance_step", None) == "reap_orphans"
 
 
 def _no_such_bucket() -> ClientError:

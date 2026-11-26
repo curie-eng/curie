@@ -215,6 +215,9 @@ _SANDBOX_ATTRIBUTES = {
         "release",
         "suspend",
         "cleanup",
+        # Admission ledger reconciliation against the capacity inventory,
+        # reported apart from the orphan sweep's cleanup outcome (#5976).
+        "reconcile",
         "reclaim",
         "terminate",
         "thread-reset",
@@ -241,6 +244,8 @@ _SANDBOX_ATTRIBUTES = {
         "scan-incomplete",
         "no-route",
         "timeout",
+        "reconciled",
+        "inventory-unavailable",
     ],
 }
 _SANDBOX_INVENTORY_ATTRIBUTES = {
