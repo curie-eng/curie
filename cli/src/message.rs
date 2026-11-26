@@ -9741,6 +9741,7 @@ mod tests {
             "identity_refused_class",
             "factory_class_line_prefix",
             "examples",
+            "plain_replies",
         ];
         let object = vector.as_object().expect("vector object");
         let unknown: Vec<_> = object
@@ -9764,5 +9765,18 @@ mod tests {
             failure_class_from_reply("Task complete.\ncurie-turn-failure: max-turns"),
             None
         );
+        let plain: Vec<&str> = vector["plain_replies"]
+            .as_array()
+            .expect("plain_replies")
+            .iter()
+            .map(|reply| reply.as_str().expect("plain reply"))
+            .collect();
+        assert_eq!(plain, crate::chat::PLAIN_FAILURE_REPLIES);
+        for reply in plain {
+            assert_eq!(
+                failure_class_from_reply(reply),
+                Some(crate::chat::PLAIN_FAILURE_CLASS)
+            );
+        }
     }
 }

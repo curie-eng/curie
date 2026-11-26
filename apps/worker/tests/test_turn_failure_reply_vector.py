@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from curie_worker import failure_notice
 from curie_worker.kernel.constants import (
     IDENTITY_REFUSED_FAILURE_CLASS,
     IDENTITY_REFUSED_RELAY_NOTICE,
@@ -19,6 +20,7 @@ _KEYS = {
     "identity_refused_class",
     "factory_class_line_prefix",
     "examples",
+    "plain_replies",
 }
 
 
@@ -40,3 +42,16 @@ def test_identity_refused_class_matches_the_frozen_vector() -> None:
     assert vector["identity_refused_class"] == IDENTITY_REFUSED_FAILURE_CLASS
     reply = turn_failure_reply(IDENTITY_REFUSED_FAILURE_CLASS, IDENTITY_REFUSED_RELAY_NOTICE)
     assert failure_class_from_reply(reply) == vector["identity_refused_class"]
+
+
+def test_plain_replies_match_the_frozen_vector() -> None:
+    """#5984: the person-facing sentences are the ones the local stub reader knows."""
+    vector = json.loads(_VECTOR.read_text())
+    assert tuple(vector["plain_replies"]) == failure_notice.PLAIN_FAILURE_REPLIES
+    assert failure_notice._REPLY_PREFIX == TURN_FAILURE_REPLY_PREFIX
+    for example in vector["examples"]:
+        reply = turn_failure_reply(example["classification"], "The run failed.")
+        assert failure_notice.failure_class(reply) == example["classification"]
+        assert failure_notice.plain_failure_text(example["classification"]) in (
+            vector["plain_replies"]
+        )

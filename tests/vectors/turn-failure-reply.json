@@ -1,5 +1,5 @@
 {
-  "comment": "The machine-readable marker on a delivered reply when a runner turn fails (#3401). The worker prefixes the channel reply. The factory status comment carries the same class on its own line. The CLI refuses to grade a reply that starts with the marker as a successful task reply. Python and Rust cannot share the literal, so it is frozen here. An unknown top-level key is rejected. identity_refused_class is the class the worker writes on the cluster message relay when it refuses a turn for lack of an HTTP identity (#5518); the CLI eval stops on it.",
+  "comment": "The machine-readable marker on a delivered reply when a runner turn fails (#3401). The worker prefixes the channel reply. The factory status comment carries the same class on its own line. The CLI refuses to grade a reply that starts with the marker as a successful task reply. Python and Rust cannot share the literal, so it is frozen here. An unknown top-level key is rejected. identity_refused_class is the class the worker writes on the cluster message relay when it refuses a turn for lack of an HTTP identity (#5518); the CLI eval stops on it. plain_replies are the sentences a person sees in place of the marked record on every route except the cluster message relay (#5984); a consumer that sees only the delivered channel text, the local Slack stub, counts a reply that is exactly one of them as a failed turn of class unclassified.",
   "reply_prefix": "curie-turn-failure:",
   "identity_refused_class": "identity-refused",
   "factory_class_line_prefix": "Failure class:",
@@ -22,5 +22,13 @@
       "factory_cause": "history_capacity",
       "factory_class_line": "Failure class: history-persistence-error"
     }
+  ],
+  "plain_replies": [
+    "I couldn't finish this request. It was too large to complete in one go. Please try again, or split it into smaller parts.",
+    "I couldn't finish this request because it took too long. Please try again, or split it into smaller parts.",
+    "I couldn't finish this request. An earlier attempt may already have made changes, so I did not try again automatically. Please check the result before asking again.",
+    "I couldn't finish this request because the approval it needs could not be set up. Please ask an administrator to check this agent's approval settings.",
+    "I couldn't finish this request because it needed an action this conversation does not allow.",
+    "I couldn't finish this request. Please try again in a few minutes."
   ]
 }
