@@ -37,7 +37,6 @@ from curie_test_support.static_shell import (
     ShellTls,
     claim_archive,
     client_context,
-    free_port,
     make_shell_tls,
     wait_until,
 )
@@ -81,6 +80,19 @@ def _docker(
     return result.stdout.decode()
 
 
+def _published_port(name: str, container_port: int) -> int:
+    """The loopback host port Docker assigned to ``container_port`` of ``name``.
+
+    Containers here publish ``127.0.0.1::<port>`` so Docker picks the host
+    port as it publishes it. A port chosen earlier by binding and closing a
+    socket can be published by another container before this one starts,
+    which fails the start with "port is already allocated".
+    """
+
+    host_port = _docker("port", name, f"{container_port}/tcp").split()[0]
+    return int(host_port.rpartition(":")[2])
+
+
 def _root_owned(files: dict[str, bytes]) -> bytes:
     """A tar of ``files`` owned by root, mode 0600: docker cp keeps the owner."""
 
@@ -110,7 +122,6 @@ class Shell:
         self.tls = tls
         self.slot = slot
         self.name = f"curie-shell-proof-{uuid.uuid4().hex[:8]}"
-        self.port = free_port()
         _docker(
             "create",
             "--name",
@@ -121,7 +132,7 @@ class Shell:
             f"curie.test.owner={self.name}",
             *(["--network", network] if network else []),
             "-p",
-            f"127.0.0.1:{self.port}:8443",
+            "127.0.0.1::8443",
             "-e",
             f"CURIE_SUPERVISOR_SLOT={slot}",
             "-e",
@@ -149,6 +160,7 @@ class Shell:
         archive = _root_owned({"tls.crt": tls.cert.read_bytes(), "tls.key": tls.key.read_bytes()})
         _docker("cp", "-", f"{self.name}:/etc/", stdin=archive)
         _docker("start", self.name)
+        self.port = _published_port(self.name, 8443)
 
     def running(self) -> bool:
         return _docker("inspect", "-f", "{{.State.Running}}", self.name).strip() == "true"
@@ -220,7 +232,6 @@ def _runner_status(port: int, token: str | None) -> tuple[int, dict[str, Any]]:
 @pytest.fixture(scope="module")
 def runner_container() -> Iterator[tuple[str, int, str]]:
     name = f"curie-runner-proof-{uuid.uuid4().hex[:8]}"
-    port = free_port()
     token = f"runner-{uuid.uuid4().hex}"
     environment = []
     for key, value in _runner_environment(token).items():
@@ -239,13 +250,13 @@ def runner_container() -> Iterator[tuple[str, int, str]]:
             "--label",
             f"curie.test.owner={name}",
             "-p",
-            f"127.0.0.1:{port}:8080",
+            "127.0.0.1::8080",
             *environment,
             RUNNER_IMAGE,
         )
         _docker("cp", "-", f"{name}:/tmp/", stdin=raw.getvalue())
         _docker("start", name)
-        yield name, port, token
+        yield name, _published_port(name, 8080), token
     finally:
         _docker("rm", "-f", name, check=False)
         assert not _docker("ps", "-aq", "--filter", f"name=^/{name}$").strip()
@@ -272,15 +283,6 @@ def upload_store():
     from curie_worker.config import WorkerConfig
 
     name = "curie-upload-store-" + uuid.uuid4().hex[:8]
-    port = free_port()
-    store = BundleStore(
-        WorkerConfig(
-            s3_endpoint_url=f"http://localhost:{port}",
-            s3_access_key="rustfs",
-            s3_secret_key="rustfssecret",
-            bundle_bucket="upload-proof-" + uuid.uuid4().hex,
-        )
-    )
     created = False
     try:
         _docker(
@@ -291,13 +293,22 @@ def upload_store():
             "--label",
             f"curie.test.owner={name}",
             "-p",
-            f"127.0.0.1:{port}:9000",
+            "127.0.0.1::9000",
             "-e",
             "RUSTFS_ACCESS_KEY=rustfs",
             "-e",
             "RUSTFS_SECRET_KEY=rustfssecret",
             "rustfs/rustfs:1.0.0-beta.12",
             "/data",
+        )
+        port = _published_port(name, 9000)
+        store = BundleStore(
+            WorkerConfig(
+                s3_endpoint_url=f"http://localhost:{port}",
+                s3_access_key="rustfs",
+                s3_secret_key="rustfssecret",
+                bundle_bucket="upload-proof-" + uuid.uuid4().hex,
+            )
         )
 
         def ready():
@@ -505,9 +516,7 @@ def crash_platform():
     token = uuid.uuid4().hex[:8]
     network = f"curie-crash-platform-{token}"
     names = {role: f"curie-crash-{role}-{token}" for role in ("postgres", "store", "valkey", "api")}
-    api_port, database_port, store_port = free_port(), free_port(), free_port()
     api_image = os.environ.get("CURIE_CRASH_API_IMAGE", "curie-ci/api:candidate")
-    database_url = f"postgresql://postgres:postgres@localhost:{database_port}/postgres"
 
     def run(role: str, image: str, *, env=None, ports=(), command=(), entrypoint=None):
         _docker(
@@ -538,16 +547,19 @@ def crash_platform():
             "postgres",
             "postgres:17.7-alpine",
             env={"POSTGRES_PASSWORD": "postgres"},
-            ports=[f"127.0.0.1:{database_port}:5432"],
+            ports=["127.0.0.1::5432"],
             command=["-c", "max_connections=600"],
         )
+        database_port = _published_port(names["postgres"], 5432)
+        database_url = f"postgresql://postgres:postgres@localhost:{database_port}/postgres"
         run(
             "store",
             "rustfs/rustfs:1.0.0-beta.12",
             env={"RUSTFS_ACCESS_KEY": "rustfs", "RUSTFS_SECRET_KEY": "rustfssecret"},
-            ports=[f"127.0.0.1:{store_port}:9000"],
+            ports=["127.0.0.1::9000"],
             command=["/data"],
         )
+        store_port = _published_port(names["store"], 9000)
         run(
             "valkey",
             "valkey/valkey:8.1.10-alpine",
@@ -570,7 +582,7 @@ def crash_platform():
             "api",
             api_image,
             entrypoint="sh",
-            ports=[f"127.0.0.1:{api_port}:8000"],
+            ports=["127.0.0.1::8000"],
             env={
                 "DATABASE_URL": "postgresql+asyncpg://postgres:postgres@crash-postgres:5432/postgres",
                 "VALKEY_HOST": "crash-valkey",
@@ -586,6 +598,7 @@ def crash_platform():
             },
             command=["-c", "alembic upgrade head && exec python -m curie_api"],
         )
+        api_port = _published_port(names["api"], 8000)
 
         def api_ready() -> bool:
             connection = http.client.HTTPConnection("localhost", api_port, timeout=2)
@@ -679,7 +692,6 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
     prefix = f"test:crash:{identity}"
     provider = f"curie-crash-provider-{identity[:8]}"
     network = crash_platform["network"]
-    port = free_port()
     shells: list[Shell] = []
     bucket_created = False
     workers = []
@@ -769,7 +781,7 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
             "--label",
             f"curie.test.owner={provider}",
             "-p",
-            f"127.0.0.1:{port}:8089",
+            "127.0.0.1::8089",
             "-e",
             f"CRASH_PHASE={phase}",
             "--entrypoint",
@@ -783,6 +795,7 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
             f"{provider}:/tmp/crash_provider.py",
         )
         _docker("start", provider)
+        port = _published_port(provider, 8089)
 
         def provider_ready() -> bool:
             try:
@@ -1391,6 +1404,21 @@ def test_an_image_path_the_runner_could_write_stops_the_shell(tls: ShellTls) -> 
         assert "/opt" in broken.logs()
     finally:
         broken.remove()
+
+
+def test_proof_containers_publish_a_docker_assigned_host_port(tls: ShellTls) -> None:
+    # A host port chosen before the container starts can be published by
+    # another container in between, and the start then fails with "port is
+    # already allocated". Docker must pick the port when it publishes it.
+    shell = Shell(tls)
+    try:
+        bindings = json.loads(
+            _docker("inspect", "-f", "{{json .HostConfig.PortBindings}}", shell.name)
+        )
+        assert bindings == {"8443/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]}
+        assert shell.port == _published_port(shell.name, 8443)
+    finally:
+        shell.remove()
 
 
 _PERMISSION_PROBE = b"""
