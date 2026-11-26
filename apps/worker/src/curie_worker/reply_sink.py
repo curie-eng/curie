@@ -50,6 +50,7 @@ from curie_channel_gateway.reply_transport import (
 )
 from pydantic import BaseModel, ConfigDict
 
+from . import failure_notice
 from .config import WorkerConfig
 
 logger = logging.getLogger(__name__)
@@ -323,6 +324,9 @@ class ReplySinkRouter:
             sink = self._cluster_message
         else:
             sink = self._adapters.get(event.target.kind, self._default)
+            # A person never sees the marked failure record (#5984); only the
+            # relay's API key holders and the worker log keep it.
+            event = failure_notice.for_person(event)
         return await sink.emit(event, route=route, best_effort_unreachable=best_effort_unreachable)
 
     def undeliverable_reason(self, kind: str, route: TargetRoute) -> str | None:

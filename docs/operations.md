@@ -2315,8 +2315,13 @@ classified run failure: `model_credit_exhausted`, `model_usage_limited`,
 termination includes the Kubernetes reason and, for an EmptyDir eviction, the
 volume limit in a `Details:` line. When the cause has a runner failure
 class, the next line is `Failure class:` and that token. The same token is the
-first line of the channel reply, `curie-turn-failure: <class>`, so a consumer
+first line of the failed turn's reply record, `curie-turn-failure: <class>`, so a consumer
 that sees only the delivered text can tell the turn from a successful reply.
+Only the cluster message relay delivers that record. Every channel a person reads
+gets one plain sentence chosen by the class instead, such as "I couldn't finish
+this request. It was too large to complete in one go. Please try again, or split
+it into smaller parts.", and the full record stays in the worker's `escalating
+event` warning log (#5984).
 Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
 `approval-approvers-unverifiable`, `approval-route-unsupported`, `approval-no-email-approvers`,

@@ -505,10 +505,31 @@ async fn handle_call(
 /// worker writer in `tests/vectors/turn-failure-reply.json`.
 pub const TURN_FAILURE_REPLY_PREFIX: &str = "curie-turn-failure:";
 
+/// The sentences a person sees in place of the marked record on every route
+/// except the cluster message relay (#5984). Frozen with the worker in
+/// `tests/vectors/turn-failure-reply.json`.
+pub const PLAIN_FAILURE_REPLIES: [&str; 6] = [
+    "I couldn't finish this request. It was too large to complete in one go. Please try again, or split it into smaller parts.",
+    "I couldn't finish this request because it took too long. Please try again, or split it into smaller parts.",
+    "I couldn't finish this request. An earlier attempt may already have made changes, so I did not try again automatically. Please check the result before asking again.",
+    "I couldn't finish this request because the approval it needs could not be set up. Please ask an administrator to check this agent's approval settings.",
+    "I couldn't finish this request because it needed an action this conversation does not allow.",
+    "I couldn't finish this request. Please try again in a few minutes.",
+];
+
+/// The class a reply that is exactly one of [`PLAIN_FAILURE_REPLIES`] reports:
+/// the plain sentence no longer carries the worker's class.
+pub const PLAIN_FAILURE_CLASS: &str = "unclassified";
+
 /// The failure class on a delivered reply, or `None` when the text is not a
 /// failed turn. Only a first line of `curie-turn-failure: <token>` counts. A
-/// later mention, or a token that contains whitespace, is model text.
+/// later mention, or a token that contains whitespace, is model text. The local
+/// Slack stub sees what a person sees, so a reply that is exactly one of the
+/// worker's plain failure sentences is a failed turn of class `unclassified`.
 pub fn failure_class_from_reply(text: &str) -> Option<&str> {
+    if PLAIN_FAILURE_REPLIES.contains(&text.trim()) {
+        return Some(PLAIN_FAILURE_CLASS);
+    }
     let line = text.trim_start_matches('\n').lines().next()?.trim();
     let rest = line.strip_prefix(TURN_FAILURE_REPLY_PREFIX)?.trim();
     if rest.is_empty() || rest.split_whitespace().nth(1).is_some() {
@@ -1252,6 +1273,22 @@ mod tests {
         assert_eq!(channel.as_deref(), Some("C2"));
         assert_eq!(ts.as_deref(), Some("3.4"));
         assert_eq!(text.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn plain_failure_sentence_is_a_failed_turn() {
+        for reply in PLAIN_FAILURE_REPLIES {
+            match completed_turn_outcome(Some(reply.to_string()), false, None) {
+                Outcome::Failed { class, reply: text } => {
+                    assert_eq!(class, PLAIN_FAILURE_CLASS);
+                    assert_eq!(text, reply);
+                }
+                other => panic!("expected Failed for {reply:?}, got {other:?}"),
+            }
+        }
+        // A model answer that only contains a plain sentence is not a failure.
+        let answer = format!("Here is the summary. {}", PLAIN_FAILURE_REPLIES[0]);
+        assert!(failure_class_from_reply(&answer).is_none());
     }
 
     #[test]
