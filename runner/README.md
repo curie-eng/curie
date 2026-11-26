@@ -74,6 +74,12 @@ connector identifiers, credential environment-variable names, MCP terminology or
 sandbox details. Only observed causes are described. Retry counts may be shown,
 without promising that a retry will succeed.
 
+A DONE reply carries at most one notice, and only when its turn called a tool of
+a connector that is still unavailable after the turn-start re-probe; the notice
+is the first such connector's. A reply that never needed an unavailable connector
+is the model's answer alone, and the failure is recorded in the runner's
+`declared connector capability failed` error log.
+
 Technical diagnosis retains the connector name, credential names (never values),
 reason and refusal in logs. The shared connector diagnosis vector continues to
 verify this diagnostic representation. The final reply and tool exclusion hook
