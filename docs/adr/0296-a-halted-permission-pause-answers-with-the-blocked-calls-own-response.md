@@ -9,8 +9,8 @@ alongside implementation, covering decisions 1 and 2 below and the scope that
 decisions 3 and 4 set for them. The realizing code path is
 `curie_runner.session._halted_pause_text` with `_halted_permission_call`, fed by
 `curie_runner.session._apply_approval_override`,
-`curie_runner.translate._translate_assistant` and
-`curie_runner.approval.ApprovalGate.block`.
+`curie_runner.translate._translate_assistant`, `_translate_result` and
+`end_invocation`, and `curie_runner.approval.ApprovalGate.block`.
 
 This ADR supersedes in part decision 1 of
 [ADR 0226](0226-persist-terminal-answers-before-channel-delivery.md): the sentence
@@ -56,12 +56,15 @@ notice of a pause that had not failed.
 2. In that same state, the failure text the aborted CLI result carries, such as
    the `run failed` placeholder, is never the final text.
 3. "That same state" requires all of: the runner requested the halt, no
-   operator interrupt or timeout, no classified model or transport error, the
-   merged record is a permission gate's and not a publication's, the gate named
+   operator interrupt or timeout, no classified model or transport error (a
+   terminal result that carries the provider's HTTP error status is one, even
+   with a success subtype and no errored assistant message), the merged record is a permission gate's and not a publication's, the gate named
    the call that wrote the record, that call was a top-level call of this
-   turn, and its response is the turn's last top-level response, so nothing
-   continued after the halt (such as a later response a background task
-   allows). A bundle with a final-answer policy (ADR 0227) is excluded, because
+   turn, and its response is the last top-level response of the CLI invocation
+   that ends the turn, so nothing continued after the halt. A result the
+   runner holds for a live background task ends its invocation, so no response
+   before that hold qualifies, even when the later invocation brings no
+   assistant message. A bundle with a final-answer policy (ADR 0227) is excluded, because
    it withholds provisional text in every turn. The text is set at
    publication, after the runner's last stop check, so a timeout or interrupt
    that lands later still reports its own text. Every other final keeps its

@@ -127,6 +127,7 @@ from .tool_names import PLATFORM_SLACK_TOOL_NAMES
 from .translate import (
     TurnState,
     credential_rejection_condition,
+    end_invocation,
     is_credit_refusal,
     is_usage_refusal,
     map_error_classification,
@@ -2212,6 +2213,7 @@ class SessionRunner:
                     # terminal result: record_result_usage keeps the first
                     # positive total and would hide the later one.
                     held_for_background = True
+                    end_invocation(state)
                     if self._usage_reporter is not None:
                         await self._usage_reporter.report(message, self._primary_model)
                     continue

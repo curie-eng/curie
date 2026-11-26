@@ -15,7 +15,14 @@ from typing import Any
 import anyio
 import pytest
 from aci_protocol import Event, Final, SessionStatus, parse_ndjson
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    ResultMessage,
+    TaskNotificationMessage,
+    TaskUpdatedMessage,
+    TextBlock,
+    ToolUseBlock,
+)
 from curie_runner.approval import ApprovalGate
 from curie_runner.fake import FakeModelSession
 from curie_runner.final_answer import FinalAnswerPolicy, FinalAnswerValidation
@@ -38,31 +45,61 @@ def _assistant(*blocks: Any, message_id: str | None = None, error: Any = None) -
     )
 
 
-def _result(text: str = "", *, is_error: bool = False) -> ResultMessage:
+def _result(
+    text: str = "",
+    *,
+    is_error: bool = False,
+    subtype: str | None = None,
+    api_error_status: int | None = None,
+) -> ResultMessage:
     return ResultMessage(
-        subtype="error_during_execution" if is_error else "success",
+        subtype=subtype or ("error_during_execution" if is_error else "success"),
         duration_ms=1,
         duration_api_ms=1,
         is_error=is_error,
         num_turns=1,
         session_id="example-session",
         result=text or None,
+        api_error_status=api_error_status,
     )
 
 
-class _Continuing(FakeModelSession):
-    """After the halt, a later response arrives, as a held background result allows."""
+def _backgrounded(task_id: str) -> TaskUpdatedMessage:
+    return TaskUpdatedMessage(
+        subtype="task_updated", data={}, task_id=task_id, patch={"is_backgrounded": True}
+    )
 
-    def __init__(self, later: list[Any], **kwargs: Any) -> None:
-        super().__init__(lambda: [_blocked_text(), _blocked_call()], **kwargs)
-        self._later = later
+
+def _notification(task_id: str) -> TaskNotificationMessage:
+    return TaskNotificationMessage(
+        subtype="task_notification",
+        data={},
+        task_id=task_id,
+        status="completed",
+        output_file="output",
+        summary="completed",
+        uuid="task-note",
+        session_id="example-session",
+    )
+
+
+class _Terminal(FakeModelSession):
+    """The fake model, ending the halted invocation on the given terminal result."""
+
+    def __init__(self, terminal: ResultMessage, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._terminal = terminal
 
     async def receive_turn(self) -> AsyncIterator[Any]:
         async for message in super().receive_turn():
-            if not isinstance(message, ResultMessage):
-                yield message
-        for message in self._later:
-            yield message
+            yield self._terminal if isinstance(message, ResultMessage) else message
+
+
+def _invocations(*scripts: list[Any]) -> Any:
+    """One script per ``receive_turn`` call, in order."""
+
+    pending = list(scripts)
+    return lambda: pending.pop(0)
 
 
 class _LateTimeout:
@@ -88,14 +125,23 @@ def _blocked_call() -> AssistantMessage:
 
 
 async def _final(
-    script: list[Any] | None = None, *, later: list[Any] | None = None, late_timeout: bool = False
+    script: list[Any] | None = None,
+    *,
+    later: list[Any] | None = None,
+    terminal: ResultMessage | None = None,
+    late_timeout: bool = False,
 ) -> Any:
     gate = ApprovalGate(required=frozenset({_GATED}))
     permission = build_can_use_tool(gate)
-    session: FakeModelSession = (
-        _Continuing(later, can_use_tool=permission)
+    factory = (
+        _invocations([_backgrounded("bg-1"), _blocked_text(), _blocked_call()], later)
         if later is not None
-        else FakeModelSession(lambda: list(script or []), can_use_tool=permission)
+        else lambda: list(script or [])
+    )
+    session: FakeModelSession = (
+        _Terminal(terminal, script_factory=factory, can_use_tool=permission)
+        if terminal is not None
+        else FakeModelSession(factory, can_use_tool=permission)
     )
     reporter = _LateTimeout() if late_timeout else None
     runner = SessionRunner(
@@ -143,6 +189,18 @@ def test_a_provider_failure_on_a_gated_turn_keeps_its_failure_text() -> None:
     assert final.text == "run failed"
 
 
+def test_a_result_only_provider_api_error_keeps_its_failure() -> None:
+    # No assistant message carried an error and the subtype reads success, but
+    # the provider answered with an HTTP error: a real failure, never the halt.
+    upstream = "API Error: 500 Internal server error"
+    final = _run(
+        [_blocked_text(), _blocked_call()],
+        terminal=_result(upstream, is_error=True, subtype="success", api_error_status=500),
+    )
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
+    assert final.text == upstream
+
+
 def test_a_timeout_landing_after_the_result_keeps_its_failure_text() -> None:
     final = _run([_blocked_text(), _blocked_call()], late_timeout=True)
     assert final.status is SessionStatus.CLASSIFIED_FAILURE
@@ -152,28 +210,57 @@ def test_a_timeout_landing_after_the_result_keeps_its_failure_text() -> None:
 @pytest.mark.parametrize(
     ("later", "expected"),
     [
-        ([_assistant(TextBlock(text=_LATER), message_id="msg-2"), _result()], _LATER),
         (
-            [_assistant(TextBlock(text=_LATER), message_id="msg-2"), _result(is_error=True)],
+            [
+                _notification("bg-1"),
+                _assistant(TextBlock(text=_LATER), message_id="msg-2"),
+                _result(),
+            ],
+            _LATER,
+        ),
+        (
+            [
+                _notification("bg-1"),
+                _assistant(TextBlock(text=_LATER), message_id="msg-2"),
+                _result(is_error=True),
+            ],
             "run failed",
         ),
+        ([_notification("bg-1"), _result()], ""),
     ],
-    ids=["later-answer", "later-failure"],
+    ids=["later-answer", "later-failure", "later-empty-result"],
 )
-def test_a_turn_that_continued_after_the_halt_keeps_its_text(
+def test_a_turn_held_for_a_background_task_keeps_its_later_text(
     later: list[Any], expected: str
 ) -> None:
+    # The halted invocation's result is held for the live background task, so
+    # the turn ends in a second receive_turn. Its result belongs to a later
+    # invocation, so the blocked response never supplies its text, even when
+    # no assistant message came in between.
     final = _run(later=later)
     assert final.status is SessionStatus.AWAITING_APPROVAL
     assert final.text == expected
 
 
-def test_text_after_the_blocked_call_never_replaces_the_response() -> None:
-    # The same response continues after the blocked call and the provider
-    # result is empty: the fallback holds only the later block, so the whole
-    # response is used instead.
+@pytest.mark.parametrize("terminal", [None, _result()], ids=["error-result", "empty-success"])
+def test_text_after_the_blocked_call_never_replaces_the_response(
+    terminal: ResultMessage | None,
+) -> None:
+    # The same response continues after the blocked call, before the deny
+    # halts it. The fallback holds only the later block, so the whole response
+    # is used instead, its blocks joined as paragraphs.
     after = "The administrator will see the request in the access channel."
-    final = _run(later=[_assistant(TextBlock(text=after), message_id="msg-1"), _result()])
+    final = _run(
+        [
+            _blocked_text(),
+            _assistant(
+                ToolUseBlock(id="t1", name=_GATED, input=dict(_ARGS)),
+                TextBlock(text=after),
+                message_id="msg-1",
+            ),
+        ],
+        terminal=terminal,
+    )
     assert final.status is SessionStatus.AWAITING_APPROVAL
     assert final.text == f"{_INTENT}\n\n{after}"
 

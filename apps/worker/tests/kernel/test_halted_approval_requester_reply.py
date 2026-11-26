@@ -49,6 +49,8 @@ _RESULT = "An administrator needs to approve the read access first."
 _SHORT_NOTICE = "Approval requested. See the card below."
 # A provider error inside the blocked call's response: a real failure.
 _UPSTREAM = "Upstream model error."
+# A provider HTTP error reported only on the terminal result.
+_API_ERROR = "API Error: 500 Internal server error"
 
 
 def _assistant(
@@ -85,15 +87,17 @@ def _script(*, provider_error: bool = False) -> list[Any]:
     ]
 
 
-def _success(text: str) -> ResultMessage:
+def _success(text: str, *, api_error_status: int | None = None) -> ResultMessage:
+    # A success subtype can still carry is_error and the provider's HTTP status.
     return ResultMessage(
         subtype="success",
         duration_ms=1,
         duration_api_ms=1,
-        is_error=False,
+        is_error=api_error_status is not None,
         num_turns=1,
         session_id="example-session",
         result=text,
+        api_error_status=api_error_status,
     )
 
 
@@ -113,6 +117,10 @@ class _HaltedModel(FakeModelSession):
                 # The fake models the CLI's error-shaped abort; the observed
                 # turn ended success-shaped, with or without result text.
                 yield _success(_RESULT if self._terminal == "nonempty-success" else "")
+                continue
+            if isinstance(message, ResultMessage) and self._terminal == "result-api-error":
+                # No assistant message carried an error: only the result does.
+                yield _success(_API_ERROR, api_error_status=500)
                 continue
             yield message
 
@@ -194,15 +202,25 @@ def test_halted_permission_pause_keeps_a_nonempty_result(make_harness, thread_re
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("terminal", "failure"),
+    [
+        ("provider-error", ("curie-turn-failure: server-error", _UPSTREAM)),
+        # The result path keeps its existing classification and diagnostic.
+        ("result-api-error", ("curie-turn-failure: unclassified", _API_ERROR)),
+    ],
+)
 def test_provider_failure_beside_a_gate_reaches_the_requester_as_a_failure(
-    make_harness, thread_reset_keys
+    make_harness, thread_reset_keys, terminal: str, failure: tuple[str, str]
 ) -> None:
     async def scenario() -> None:
-        requests, posts, reply = await _drive(make_harness, "provider-error")
-        # A classified provider error outranks the halt: no approval, no card,
-        # and the requester gets the failure, never the model's sentence.
+        requests, posts, reply = await _drive(make_harness, terminal)
+        # A provider error outranks the halt, whether an assistant message or
+        # only the terminal result reported it: no approval, no card, and the
+        # requester gets the failure, never the model's sentence.
         assert requests == [] and posts == []
-        assert reply.startswith("curie-turn-failure: server-error"), reply
+        prefix, diagnostic = failure
+        assert reply.startswith(prefix) and diagnostic in reply, reply
         assert _INTENT not in reply and _SHORT_NOTICE not in reply, reply
 
     asyncio.run(scenario())

@@ -354,6 +354,19 @@ class TurnState:
     approval_call_id: str | None = None
 
 
+def end_invocation(state: TurnState) -> None:
+    """Fence the responses of a CLI invocation whose result the session held (ADR 0296).
+
+    A result held for a live background task ends that invocation; the turn
+    continues in a later one. No response before the hold is the halted
+    invocation's own any more, so none can supply a later pause's text.
+    """
+
+    state.response_text.clear()
+    state.call_responses.clear()
+    state.last_response = None
+
+
 def _response_key(message: AssistantMessage, state: TurnState) -> str:
     """The provider response a top-level assistant message belongs to (ADR 0296)."""
 
@@ -772,6 +785,12 @@ def _translate_result(
             mapped = known or map_error_classification(raw)
             if known is not None:
                 state.error_classification = known
+            elif message.api_error_status is not None:
+                # The provider answered with an HTTP error, even when no
+                # assistant message carried an error and the subtype reads
+                # success: a real failure, never the runner's own halt, so the
+                # approval override must not relabel it (ADR 0296).
+                state.error_classification = mapped
             events.append(
                 ErrorEvent(
                     message=text if mapped == raw or known else f"{text}: {raw}",
