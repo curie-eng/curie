@@ -1113,11 +1113,21 @@ class Consumer(StreamConsumer):
             )
 
     async def _notice_delivery_exhausted(self, entry_id: str, fields: dict[str, str]) -> None:
-        """Tell the person when a turn is dead-lettered at its delivery cap (#5985)."""
-        if APPROVAL_REMINDER_FIELD in fields:
+        """Tell the person when a turn is dead-lettered at its delivery cap (#5985).
+
+        Silent where another path owns the person's answer: an approval
+        reminder; a capacity-parked turn, whose wait reconcile sends its own
+        terminal notice; and an approval resume, which may be a factory turn
+        this replica cannot recognise, or a duplicate of a resume still running.
+        """
+        if APPROVAL_REMINDER_FIELD in fields or WAIT_GENERATION_FIELD in fields:
             return
         try:
             qevent = from_stream_fields(fields)
+            if self._kernel._is_approval_resume(qevent.event_id):
+                return
+            if await self._waits.get(qevent.event_id) is not None:
+                return
             await self._kernel.notify_delivery_exhausted(qevent)
         except Exception:
             logger.exception(

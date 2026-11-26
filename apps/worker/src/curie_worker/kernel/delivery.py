@@ -581,7 +581,12 @@ async def notify_delivery_exhausted(self: Kernel, qevent: QueuedTurn) -> None:
     factory_work_item_turn = self._is_factory_work_item_turn(event_id)
     self._factory_work_item_events.discard(event_id)
     handle = qevent.reply_handle
-    if factory_work_item_turn or handle is None or handle.placeholder is None:
+    if (
+        factory_work_item_turn
+        or self._is_approval_resume(event_id)
+        or handle is None
+        or handle.placeholder is None
+    ):
         return
     if attempted:
         logger.warning(
@@ -611,7 +616,9 @@ async def notify_delivery_exhausted(self: Kernel, qevent: QueuedTurn) -> None:
     )
     logger.warning("dead-lettered event %s at its delivery cap: %s", event_id, text)
     try:
-        await self._reply_for(qevent, routing._route_from_handle(qevent), text)
+        # terminal=False only keeps this id out of _terminal_reply_attempted:
+        # the entry is gone, so nothing would ever discard it again.
+        await self._reply_for(qevent, routing._route_from_handle(qevent), text, terminal=False)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary

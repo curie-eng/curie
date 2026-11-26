@@ -48,6 +48,7 @@ import pytest
 from aci_protocol import Final, QueuedTurn, SessionStatus
 from curie_internal.turn_queue import to_stream_fields
 from curie_worker import failure_notice
+from curie_worker.capacity_wait import WAIT_GENERATION_FIELD
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.dead_letter_alert import install_dead_letter_alerting
@@ -104,6 +105,7 @@ async def _deliver_new(consumer: Consumer, h) -> int:
 async def _reclaim_and_settle(consumer: Consumer) -> None:
     await consumer._reclaim_once()
     await asyncio.gather(*list(consumer._inflight))
+    await asyncio.gather(*list(consumer._over_cap_notice_tasks))
 
 
 async def _pending_ids(h) -> set[str]:
@@ -1944,6 +1946,46 @@ def test_dead_lettered_turn_with_a_delivered_answer_keeps_it(make_harness) -> No
 
                 assert entry_id not in await _pending_ids(h)
                 assert _updates_for(h, "tdl-answered") == []
+            finally:
+                await h.async_redis.delete(_dead_stream(h.config))
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("event_id", "extra_fields"),
+    [
+        # A capacity-parked turn: the wait reconcile sends its own terminal notice.
+        pytest.param("parked-turn", {WAIT_GENERATION_FIELD: "1"}, id="capacity-parked"),
+        # An approval resume may be a factory turn or a duplicate of a live resume.
+        pytest.param("approval-abc-resolved", {}, id="approval-resume"),
+    ],
+)
+def test_dead_lettered_turn_another_path_answers_stays_silent(
+    make_harness, event_id: str, extra_fields: dict[str, str]
+) -> None:
+    """#5985: the delivery-exhausted notice never competes with another answer."""
+
+    async def go() -> None:
+        async with make_harness(max_delivery=3, reclaim_min_idle_ms=0) as h:
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            turn = qevent("turn", thread="tdl-silent", event_id=event_id)
+            fields = {**to_stream_fields(turn), **extra_fields}
+            entry_id = await h.async_redis.xadd(h.config.stream, fields)
+            try:
+                await _deliver_to_owners_that_die(h, entry_id, owners=3)
+
+                await _reclaim_and_settle(consumer)
+
+                assert entry_id not in await _pending_ids(h)
+                assert _updates_for(h, "tdl-silent") == []
             finally:
                 await h.async_redis.delete(_dead_stream(h.config))
 
