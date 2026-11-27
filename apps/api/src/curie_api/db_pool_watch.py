@@ -1,10 +1,11 @@
 """Watch the main database pool for a wedge nothing else releases (#5995).
 
-The pool becomes starved when it is at capacity and nobody, including a short
-probe checkout, has been handed a connection since the previous sample. Once
-starved it stays starved, even if a sample reads below capacity, until a
-handout happens: a slot freed by a discarded connection whose replacement
-cannot be opened serves nobody. A busy pool that keeps handing out
+The pool becomes starved when a sample finds it at capacity and nobody,
+including a short probe checkout, has been handed a connection since the
+previous sample. Once a sample has seen the pool at capacity, only a handout
+counts as recovery, even when a later sample reads below capacity: a slot
+freed by a discarded connection whose replacement cannot be opened serves
+nobody. A busy pool that keeps handing out
 connections is never unhealthy, however long its callers wait: the criterion
 is that the pool stopped turning over, not that a caller waited long.
 
@@ -184,6 +185,9 @@ class PoolWatch:
         # reported as starved since the idle period began.
         self._last_below_capacity = self._last_handout
         self._starved = False
+        # True while the previous sample saw the pool at capacity or starved:
+        # until a handout, a lower count is not taken as recovery.
+        self._watching = False
         self._database_reachable = False
         self._last_tick: float | None = None
         self._logged_at: float | None = None
@@ -238,11 +242,11 @@ class PoolWatch:
     async def tick(self) -> None:
         checked_out = self._pool.checkedout()
         at_capacity = checked_out >= self._capacity
-        if at_capacity or self._starved:
-            # A starved pool stays starved until something is handed out: a
-            # slot freed by a discarded connection whose replacement cannot
-            # be opened reads below capacity yet serves nobody, so a dip
-            # alone proves nothing and the probe is what decides.
+        if at_capacity or self._watching:
+            # Once a sample has seen the pool at capacity, only a handout is
+            # recovery: a slot freed by a discarded connection whose
+            # replacement cannot be opened reads below capacity yet serves
+            # nobody, so a dip alone proves nothing and the probe decides.
             if self._handouts == self._handouts_seen:
                 await self._probe()
             self._starved = self._handouts == self._handouts_seen
@@ -254,8 +258,9 @@ class PoolWatch:
             ):
                 self._logged_at = now
                 self._log_exhaustion(checked_out)
+            self._watching = at_capacity or self._starved
         else:
-            # A pool below capacity that is not starved can hand out a
+            # A pool below capacity that is not being watched can hand out a
             # connection; no database call is made, so the watch adds no load.
             # The log limiter is not reset here, so a pool oscillating at its
             # capacity still logs at most once per window.

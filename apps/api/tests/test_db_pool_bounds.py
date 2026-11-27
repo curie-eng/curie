@@ -19,7 +19,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
-from _tcp_blackhole import Blackhole, within
+from _tcp_blackhole import Blackhole, silent_listener, within
 from curie_api import db
 from curie_api.config import get_settings
 from curie_test_support.static_shell import wait_until
@@ -119,8 +119,11 @@ def test_blackholed_query_releases_its_connection_within_the_bound(bounds: Any) 
             try:
                 async with within(15, "a query on a dead flow"), engine.connect() as connection:
                     backend = await connection.scalar(text("SELECT pg_backend_pid()"))
-                    query = asyncio.create_task(connection.execute(text(sleeping)))
+                    # The observer is open before the query starts and the relay
+                    # freezes before it closes, so its setup and teardown never
+                    # spend the query's command timeout.
                     async with observer.connect() as watching:
+                        query = asyncio.create_task(connection.execute(text(sleeping)))
                         # Each check is a real round trip, so the loop paces itself.
                         while not await watching.scalar(
                             text(
@@ -131,8 +134,8 @@ def test_blackholed_query_releases_its_connection_within_the_bound(bounds: Any) 
                             {"pid": backend, "query": sleeping},
                         ):
                             assert not query.done()
-                    relay.freeze()
-                    started = time.monotonic()
+                        relay.freeze()
+                        started = time.monotonic()
                     with pytest.raises(TimeoutError):
                         await query
                     elapsed = time.monotonic() - started
@@ -150,6 +153,40 @@ def test_blackholed_query_releases_its_connection_within_the_bound(bounds: Any) 
                             text("SELECT pg_terminate_backend(:pid)"), {"pid": backend}
                         )
                 await observer.dispose()
+
+    run(check)
+
+
+def test_connect_to_a_server_that_never_answers_fails_within_the_bound(bounds: Any) -> None:
+    """Opening a connection is bounded by DB_CONNECT_TIMEOUT_SECONDS.
+
+    The asserted type is the builtin TimeoutError, read from the installed
+    sources: asyncpg 0.32.0 wraps its whole connect in ``asyncio.timeout``
+    (the builtin TimeoutError on Python 3.11 and later), and SQLAlchemy 2.0.52
+    wraps a connect failure only when it is a driver ``Error``, so the builtin
+    one reaches the caller unchanged. The outer deadline expiring is a test
+    failure, never this TimeoutError.
+    """
+
+    async def check() -> None:
+        async with silent_listener() as listener:
+            silent = make_url(get_settings().database_url).set(host="127.0.0.1", port=listener.port)
+            bounds(
+                DATABASE_URL=silent.render_as_string(hide_password=False),
+                DB_CONNECT_TIMEOUT_SECONDS=1,
+            )
+            engine = db.create_engine()
+            try:
+                started = time.monotonic()
+                # Far below asyncpg's own 60 second connect default.
+                async with within(8, "a connect to a server that never answers"):
+                    with pytest.raises(TimeoutError):
+                        await engine.connect()
+                assert time.monotonic() - started < 4
+                assert listener.accepted.is_set()
+                assert engine.pool.checkedout() == 0  # type: ignore[attr-defined]
+            finally:
+                await engine.dispose()
 
     run(check)
 

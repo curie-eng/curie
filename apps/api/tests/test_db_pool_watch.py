@@ -15,7 +15,7 @@ import contextlib
 import logging
 import socket
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
 
 import pytest
@@ -394,15 +394,22 @@ def test_starvation_is_timed_from_the_last_sample_below_capacity(
 
 
 async def starve_then_free_one_slot(
-    watch_env: Any, stall_replacements: bool, after: Callable[[PoolWatch, float], None]
+    watch_env: Any,
+    stall_replacements: bool,
+    after: Callable[[PoolWatch, float, Any], Awaitable[None]],
+    *,
+    starved_first: bool = True,
 ) -> None:
-    """Starve the full pool, then free one slot by discarding its connection.
+    """Fill the pool, then free one slot by discarding its connection.
 
     The engine reaches Postgres through a relay. With ``stall_replacements``
-    every connection opened after the starvation hangs at its first byte,
-    while the held ones keep relaying, so the freed slot cannot be refilled.
-    ``after`` receives the watch and its starvation age before the slot was
-    freed, once a sample has been taken with 14 checked out.
+    every connection opened after the discard hangs at its first byte, while
+    the held ones keep relaying, so the freed slot cannot be refilled. With
+    ``starved_first`` the discard lands once the watch is starved; without it,
+    right after the first sample, which sees the pool at capacity with recent
+    handouts and is not starved. ``after`` receives the watch, its starvation
+    age before the slot was freed and the pool, once a sample has been taken
+    with 14 checked out.
     """
     real_url = get_settings().database_url
     real = make_url(real_url)
@@ -424,8 +431,11 @@ async def starve_then_free_one_slot(
                 holders.hold()
             await holders.fill()
             await watch.tick()
-            await watch.tick()
-            assert watch.starved_for() > 0
+            if starved_first:
+                await watch.tick()
+                assert watch.starved_for() > 0
+            else:
+                assert watch.starved_for() == 0
             starved_before = watch.starved_for()
             if stall_replacements:
                 relay.stall_new_flows()
@@ -433,7 +443,7 @@ async def starve_then_free_one_slot(
             await discarded.close()
             assert engine.pool.checkedout() == CAPACITY - 1  # type: ignore[attr-defined]
             await watch.tick()
-            after(watch, starved_before)
+            await after(watch, starved_before, engine.sync_engine.pool)
         finally:
             with contextlib.suppress(Exception):
                 await discarded.close()
@@ -447,7 +457,9 @@ async def starve_then_free_one_slot(
 def test_starved_pool_whose_freed_slot_cannot_refill_stays_starved(watch_env: Any) -> None:
     """A slot freed by a discarded connection serves nobody if no new one opens."""
 
-    def after(watch: PoolWatch, starved_before: float) -> None:
+    async def after(watch: PoolWatch, starved_before: float, pool: Any) -> None:
+        # The tick's probe was cancelled mid connect; its pool slot came back.
+        assert pool.checkedout() == CAPACITY - 1
         assert watch.starved_for() > starved_before
         assert watch.database_reachable is True
         assert watch.readiness_failure() == POOL_EXHAUSTED
@@ -456,10 +468,31 @@ def test_starved_pool_whose_freed_slot_cannot_refill_stays_starved(watch_env: An
     run(lambda: starve_then_free_one_slot(watch_env, True, after))
 
 
+def test_pool_that_touched_capacity_recovers_only_on_a_handout(watch_env: Any) -> None:
+    """A dip below capacity right after a full, still turning sample is not recovery.
+
+    The first sample sees 15 checked out with recent handouts, so the pool is
+    not starved. The slot then freed cannot be refilled, so nothing is ever
+    handed out again, and starvation is timed from the last handout.
+    """
+
+    async def after(watch: PoolWatch, starved_before: float, pool: Any) -> None:
+        assert starved_before == 0
+        assert pool.checkedout() == CAPACITY - 1
+        first = watch.starved_for()
+        assert first > 0
+        await watch.tick()
+        assert pool.checkedout() == CAPACITY - 1
+        assert watch.starved_for() > first
+        assert watch.readiness_failure() == POOL_EXHAUSTED
+
+    run(lambda: starve_then_free_one_slot(watch_env, True, after, starved_first=False))
+
+
 def test_starved_pool_whose_freed_slot_refills_recovers(watch_env: Any) -> None:
     """The watch's own probe opening the replacement is the handout that ends it."""
 
-    def after(watch: PoolWatch, starved_before: float) -> None:
+    async def after(watch: PoolWatch, starved_before: float, pool: Any) -> None:
         assert watch.starved_for() == 0
         assert watch.readiness_failure() is None
         assert watch.liveness_failure() is None

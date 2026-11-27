@@ -95,15 +95,17 @@ class Settings(BaseSettings):
     # Postgres statement_timeout, lock_timeout and
     # idle_in_transaction_session_timeout for every API session. 0 leaves the
     # server's own setting in place. The idle transaction bound is deliberately
-    # long: API paths hold an open transaction across slow external calls, so it
-    # only ends a transaction that never ends by itself.
+    # long: API paths hold an open transaction across slow external calls. The
+    # server ends the session of any transaction idle that long, and the
+    # request holding it fails on its next database call.
     db_statement_timeout_seconds: float = Field(default=60.0, ge=0, allow_inf_nan=False)
     db_lock_timeout_seconds: float = Field(default=30.0, ge=0, allow_inf_nan=False)
     db_idle_in_transaction_timeout_seconds: float = Field(default=900.0, ge=0, allow_inf_nan=False)
     # TCP keepalive on both ends of each database connection, so a dead peer is
-    # noticed and the server releases a dead client's locks. An idle of 0
-    # disables keepalive entirely. The user timeout bounds unacknowledged sent
-    # data, which keepalive does not cover; 0 disables it.
+    # noticed and the server releases a dead client's locks. With an idle of 0
+    # the API sets neither side, so the operating system's and the server's own
+    # settings stay in effect. The user timeout bounds unacknowledged sent data,
+    # which keepalive does not cover; with 0 the API does not set it.
     db_tcp_keepalive_idle_seconds: int = Field(default=30, ge=0)
     db_tcp_keepalive_interval_seconds: int = Field(default=10, gt=0)
     db_tcp_keepalive_count: int = Field(default=3, gt=0)

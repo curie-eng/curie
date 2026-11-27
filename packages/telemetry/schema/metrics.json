@@ -2276,7 +2276,7 @@
     "curie.db.pool.starved.age": {
       "type": "gauge",
       "unit": "s",
-      "description": "Seconds the database pool has handed out no connection while at capacity, 0 if not.",
+      "description": "Seconds the database pool has been starved, including samples below capacity, until a connection is handed out; 0 when not starved.",
       "monotonic": false,
       "attributes": {
         "service.name": [

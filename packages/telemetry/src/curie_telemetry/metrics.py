@@ -1084,7 +1084,8 @@ _METRICS: dict[str, dict[str, Any]] = {
     "curie.db.pool.starved.age": _definition(
         "gauge",
         "s",
-        "Seconds the database pool has handed out no connection while at capacity, 0 if not.",
+        "Seconds the database pool has been starved, including samples below capacity,"
+        " until a connection is handed out; 0 when not starved.",
         False,
         _DB_POOL_ATTRIBUTES,
     ),

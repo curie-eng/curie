@@ -5140,9 +5140,9 @@ so.
 | `DB_COMMAND_TIMEOUT_SECONDS` | `75` | One database call when the server never answers, for example a dead TCP flow. Above the statement timeout on purpose, so on a healthy connection the server's own timeout fires first and the connection stays reusable. 0 disables it. |
 | `DB_STATEMENT_TIMEOUT_SECONDS` | `60` | Postgres `statement_timeout`. 0 leaves the server's setting. |
 | `DB_LOCK_TIMEOUT_SECONDS` | `30` | Postgres `lock_timeout`, advisory locks included. 0 leaves the server's setting. |
-| `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | `900` | Postgres `idle_in_transaction_session_timeout`. Deliberately long, because some requests hold a transaction open across slow external calls; it only ends a transaction that never ends. 0 leaves the server's setting. |
-| `DB_TCP_KEEPALIVE_IDLE_SECONDS`, `DB_TCP_KEEPALIVE_INTERVAL_SECONDS`, `DB_TCP_KEEPALIVE_COUNT` | `30`, `10`, `3` | TCP keepalive on both ends of each connection, so a dead peer is noticed and Postgres releases a dead client's locks. An idle of 0 disables keepalive. |
-| `DB_TCP_USER_TIMEOUT_SECONDS` | `60` | Unacknowledged sent data on a database socket, which keepalive does not cover. 0 disables it. |
+| `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | `900` | Postgres `idle_in_transaction_session_timeout`. Deliberately long, because some requests hold a transaction open across slow external calls. The server ends the session of any transaction left idle, with no statement running, for this long, even one whose request would have continued, for example a request still waiting on an external call after 901 seconds. That request fails on its next database call, and its pool connection returns when the request unwinds, not when the server ends the session. 0 leaves the server's setting. |
+| `DB_TCP_KEEPALIVE_IDLE_SECONDS`, `DB_TCP_KEEPALIVE_INTERVAL_SECONDS`, `DB_TCP_KEEPALIVE_COUNT` | `30`, `10`, `3` | TCP keepalive on both ends of each connection, so a dead peer is noticed and Postgres releases a dead client's locks. With an idle of 0 the API sets neither the client socket options nor the server session settings, so whatever the operating system and the Postgres server already apply stays in effect. |
+| `DB_TCP_USER_TIMEOUT_SECONDS` | `60` | Unacknowledged sent data on a database socket, which keepalive does not cover. With 0 the API does not set it, so the operating system default stays in effect. |
 | `VALKEY_SOCKET_TIMEOUT_SECONDS`, `VALKEY_SOCKET_CONNECT_TIMEOUT_SECONDS` | `5`, `2` | Every Valkey command and connection the API makes, so a Valkey that stops answering cannot hold a caller, or the database connection it holds. A `socket_timeout` or `socket_connect_timeout` query parameter on `VALKEY_URL` takes precedence over these. |
 | `IDENTITY_FENCE_ACQUIRE_TIMEOUT_SECONDS` | `30` | One deadline over an identity write's advisory lock wait and its Valkey acknowledgement. Expiry fails that write as unavailable. |
 | `DB_POOL_WATCH_INTERVAL_SECONDS` | `5` | How often the pool watch samples the main pool. 0 disables the watch, and both probes then ignore the pool. |
@@ -5163,9 +5163,10 @@ is not supported for the API.
 
 The pool watch calls the main pool starved when it is at capacity and nobody,
 including a one second probe checkout, has been handed a connection since its
-previous sample. It stays starved, even when a sample reads below capacity,
-until a connection is handed out again, because a slot freed by a discarded
-connection whose replacement cannot be opened serves nobody. A busy pool that
+previous sample. Once a sample has seen the pool at capacity, only a handout
+counts as recovery, even when a later sample reads below capacity, because a
+slot freed by a discarded connection whose replacement cannot be opened serves
+nobody. A busy pool that
 keeps handing out connections is never unhealthy, however long its callers
 wait.
 
