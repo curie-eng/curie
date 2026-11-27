@@ -1,6 +1,6 @@
 [package]
 name = "curie"
-version = "0.17.3"
+version = "0.17.4"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 # Test files are integration modules or independently declared Cargo targets.
