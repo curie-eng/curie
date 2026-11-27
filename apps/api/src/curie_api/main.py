@@ -15,7 +15,6 @@ from functools import partial
 import httpx
 import redis.asyncio as redis
 from curie_channel_gateway.tls import gateway_http_mounts
-from curie_internal.valkey import AsyncRedis
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -143,6 +142,7 @@ from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
 from .threadreset import ThreadResetRequests
 from .ui_evidence_reconciler import start_ui_evidence_reconciler
+from .valkey_client import create_valkey
 from .workitem_reconciler import WorkItemReconciler
 
 _LOG = logging.getLogger("curie_api")
@@ -185,9 +185,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # for a proxy most runs never touch.
     app.state.pod_log_reader = build_lazy_pod_log_reader(settings.kube_config_path)
     app.state.pod_lister = build_lazy_pod_lister(settings.kube_config_path)
-    valkey: redis.Redis = AsyncRedis.from_url(settings.valkey_dsn())
+    # Both clients carry a read deadline and a health check (#5995): a Valkey
+    # call awaited inside a transaction or under a lock must not hang forever.
+    valkey: redis.Redis = create_valkey(settings)
     app.state.valkey = valkey
-    credential_valkey = AsyncRedis.from_url(settings.valkey_dsn(), retry_reads=False)
+    credential_valkey = create_valkey(settings, retry_reads=False)
     app.state.credential_valkey = credential_valkey
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)

@@ -80,6 +80,49 @@ class Settings(BaseSettings):
     # of Langfuse's own tables on the same database.
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
     db_schema: str = "curie"
+    # How long one API database connection can be held (#5995). Without these, a
+    # statement whose reply never arrives, or a lock wait behind a stuck holder,
+    # keeps its pooled connection forever, and fifteen of them wedge every
+    # main-pool route until the process restarts. Each is applied per connection
+    # by `db.bounded_connect_args`, never via ALTER ROLE, so Alembic's own engine
+    # keeps its settings. 0 leaves that bound unset (the server's own default for
+    # the two Postgres settings, no client deadline for the command timeout).
+    #
+    # lock_timeout: Postgres refuses a lock wait longer than this with SQLSTATE
+    # 55P03, and the request or loop pass that waited fails. 30 s matches the
+    # pool's own 30 s checkout timeout: a request still queued behind a lock by
+    # then keeps a connection that others may already be failing to get.
+    db_lock_timeout_s: float = Field(
+        default=30.0,
+        ge=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices("CURIE_API_DB_LOCK_TIMEOUT_S", "db_lock_timeout_s"),
+    )
+    # idle_in_transaction_session_timeout: Postgres ends a session that sits in
+    # an open transaction with no statement running for longer than this. Ten
+    # minutes, not five: git-flow keeps the push's transaction open, with no
+    # statement running, across its clone, which allows three git subprocesses
+    # 120 s each.
+    db_idle_in_transaction_timeout_s: float = Field(
+        default=600.0,
+        ge=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices(
+            "CURIE_API_DB_IDLE_IN_TRANSACTION_TIMEOUT_S", "db_idle_in_transaction_timeout_s"
+        ),
+    )
+    # asyncpg command_timeout: the client-side deadline on each statement,
+    # including one whose reply is lost on a dead TCP flow, which no server
+    # setting can see. On expiry asyncpg also waits up to this long for the
+    # server to acknowledge cancelling it, so a dead flow releases its connection
+    # within about twice this. asyncpg exposes no TCP keepalive option, so this is
+    # the client-side bound on a dead connection.
+    db_command_timeout_s: float = Field(
+        default=120.0,
+        ge=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices("CURIE_API_DB_COMMAND_TIMEOUT_S", "db_command_timeout_s"),
+    )
 
     # Single shared API key. Dev-only default; override in any shared deployment.
     api_key: str = "curie-dev-key"
@@ -503,6 +546,32 @@ class Settings(BaseSettings):
     valkey_port: int = 26379
     valkey_tls: bool = False
     valkey_url: str | None = None
+    # Bounds on the API's Valkey clients (#5995), applied by
+    # `valkey_client.create_valkey`. socket_timeout fails a command whose reply
+    # does not arrive in time; some Valkey calls run inside an open database
+    # transaction or under an advisory lock. redis-py 8 already defaults it to
+    # 5 s; setting it explicitly keeps that bound if the library default
+    # changes. The API issues no blocking read (XREAD BLOCK, BLPOP, pub/sub
+    # listen), so no command is meant to wait server side. health_check_interval
+    # pings a pooled connection idle longer than this before reusing it. 0
+    # disables either. A socket_timeout or health_check_interval query option in
+    # VALKEY_URL takes precedence over these, as redis-py applies URL options last.
+    valkey_socket_timeout_s: float = Field(
+        default=5.0,
+        ge=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices(
+            "CURIE_API_VALKEY_SOCKET_TIMEOUT_S", "valkey_socket_timeout_s"
+        ),
+    )
+    valkey_health_check_interval_s: float = Field(
+        default=30.0,
+        ge=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices(
+            "CURIE_API_VALKEY_HEALTH_CHECK_INTERVAL_S", "valkey_health_check_interval_s"
+        ),
+    )
     # Terminal review reconciliation reads the worker's completion/dead-letter
     # keyspace. Match WorkerConfig's actual legacy environment contract:
     # KEY_PREFIX overrides it; CURIE_KEY_PREFIX deliberately does not.

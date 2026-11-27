@@ -59,9 +59,13 @@ Two things are exposed:
    `lock_timeout` stays the outer bound on every other wait.
 
    The operational property is unchanged and is the point of the design: a
-   concurrent writer BLOCKS and then SUCCEEDS, and is never refused. Under
-   ACCESS EXCLUSIVE a concurrent plain SELECT also blocks, for the fence's
-   duration only -- the accepted cost of removing an abort. The bounded
+   concurrent writer BLOCKS and then SUCCEEDS, and the fence never refuses it.
+   Under ACCESS EXCLUSIVE a concurrent plain SELECT also blocks, for the fence's
+   duration only -- the accepted cost of removing an abort. API sessions bound
+   that wait with their own `lock_timeout` (CURIE_API_DB_LOCK_TIMEOUT_S, 30 s
+   by default, #5995) and `command_timeout`, whichever is shorter: an API
+   request still waiting then fails rather than holding its pooled connection
+   for the rest of a long revision. The bounded
    `lock_timeout` is the other half -- if the fence cannot be taken the
    migration refuses BEFORE mutating anything and names what held the lock,
    rather than wedging a Job that has an `activeDeadlineSeconds`.

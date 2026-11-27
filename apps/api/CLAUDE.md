@@ -250,6 +250,16 @@ legacy traces/observations/metrics endpoints the compose and chart pin serve;
 Langfuse Cloud from 2026-11-16), the GitHub webhook secret, `api_key`, `kube_config_path` (empty = no cluster
 configured, the 503 case above), and `metrics_default_window_hours`.
 
+How long one connection can be held is bounded in code (#5995): the main and
+liveness engines open every connection with `lock_timeout`,
+`idle_in_transaction_session_timeout` and an asyncpg `command_timeout`
+(`db.bounded_connect_args`; `CURIE_API_DB_LOCK_TIMEOUT_S` 30,
+`CURIE_API_DB_IDLE_IN_TRANSACTION_TIMEOUT_S` 600, `CURIE_API_DB_COMMAND_TIMEOUT_S`
+120), and every API Valkey client comes from `valkey_client.create_valkey`
+(`CURIE_API_VALKEY_SOCKET_TIMEOUT_S` 5, `CURIE_API_VALKEY_HEALTH_CHECK_INTERVAL_S`
+30). 0 leaves a bound unset. Build a new long-lived engine or Valkey client
+through these rather than a bare `create_async_engine` or `from_url`.
+
 ## Verify
 
 ```bash

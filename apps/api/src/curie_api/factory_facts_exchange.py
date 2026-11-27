@@ -8,7 +8,6 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from curie_internal.valkey import AsyncRedis
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -29,6 +28,7 @@ from .forges.ports import TrackerFacts
 from .forges.types import ReplyTarget, TrackerComment, TrackerIssueRef
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
 from .models import FactoryFactsRequest
+from .valkey_client import create_valkey
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +298,7 @@ class FactsExchange:
                     answer.observed_at if prior_id == row.request_comment_id else datetime.now(UTC)
                 )
                 return
-        valkey = AsyncRedis.from_url(self.settings.valkey_dsn(), retry_reads=False)
+        valkey = create_valkey(self.settings, retry_reads=False)
         try:
             facts = await read_facts(
                 session,

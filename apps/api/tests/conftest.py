@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # keep pytest's assertion detail for them.
 pytest.register_assert_rewrite("forge_fakes")
 
+from _connection_bounds_support import BOUND_ENV, Blackhole  # noqa: E402
 from _migration_support import (  # noqa: E402
     IsolatedMigrationDb,
     MigrationTemplates,
@@ -348,3 +349,41 @@ def isolated_migration_db(
             os.environ["DATABASE_URL"] = saved_url
         get_settings.cache_clear()
         asyncio.run(admin_execute(base, f'DROP DATABASE IF EXISTS "{run_db}" WITH (FORCE)'))
+
+
+@pytest.fixture
+def connection_bounds(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """Set the API's connection bounds through their environment variables (#5995).
+
+    Clears every bound first, so a test sees the defaults for what it does
+    not set, and drops the cached settings before and after.
+    """
+
+    for name in BOUND_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    def apply(**env: str) -> None:
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        get_settings.cache_clear()
+
+    get_settings.cache_clear()
+    yield apply
+    monkeypatch.undo()
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def tcp_blackhole() -> Iterator[Any]:
+    """Start `Blackhole` relays to real servers; closes and joins them at teardown."""
+
+    relays: list[Blackhole] = []
+
+    def start(host: str, port: int) -> Blackhole:
+        relay = Blackhole(host, port)
+        relays.append(relay)
+        return relay
+
+    yield start
+    for relay in relays:
+        relay.close()
