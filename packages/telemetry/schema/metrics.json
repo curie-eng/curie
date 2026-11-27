@@ -2243,6 +2243,51 @@
       },
       "cardinality_bound": 10
     },
+    "curie.db.pool.checked_out": {
+      "type": "gauge",
+      "unit": "{connection}",
+      "description": "Database pool connections checked out.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "pool": [
+          "main"
+        ]
+      },
+      "cardinality_bound": 1
+    },
+    "curie.db.pool.oldest_checkout.age": {
+      "type": "gauge",
+      "unit": "s",
+      "description": "Age of the oldest checked out database pool connection.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "pool": [
+          "main"
+        ]
+      },
+      "cardinality_bound": 1
+    },
+    "curie.db.pool.starved.age": {
+      "type": "gauge",
+      "unit": "s",
+      "description": "Seconds the database pool has been starved, including samples below capacity, until a connection is handed out; 0 when not starved.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "pool": [
+          "main"
+        ]
+      },
+      "cardinality_bound": 1
+    },
     "curie.action_executor.execution": {
       "type": "counter",
       "unit": "{execution}",

@@ -5122,6 +5122,121 @@ start time. The eval matrix groups matching tagged observations by trace ID and
 uses the same root preference within its scan. A read that requires complete
 results returns an upstream error when it exceeds the pagination bound.
 
+## API database pool bounds
+
+The API serves its requests from one main database pool of 15 connections
+(5 plus 10 overflow). The readiness check and the worker's request heartbeat
+use a separate liveness pool of 4 connections, which gets the same connect,
+command, session and keepalive bounds, so they keep answering while the main
+pool is exhausted. The database and Valkey waits listed here are bounded,
+so a holder stuck on one of them releases its connection. A quarantined
+identity write lease is the exception: it keeps its connection by design
+until the process exits, and only a restart clears it, which is what the
+`/health` backstop below is for. Set any of these through `api.extraEnv`; no chart
+template change is needed. A value of 0 is accepted only where the table says
+so.
+
+| Variable | Default | What it bounds |
+|---|---|---|
+| `DB_POOL_TIMEOUT_SECONDS` | `30` | How long a request waits for a free slot in the main pool before it fails. Opening a new connection in that slot, or checking an idle one, comes after this wait and has its own bounds below. |
+| `DB_CONNECT_TIMEOUT_SECONDS` | `10` | The driver's handshake when it opens one database connection. |
+| `DB_COMMAND_TIMEOUT_SECONDS` | `75` | One database call when the server never answers, for example a dead TCP flow. Above the statement timeout on purpose, so on a healthy connection the server's own timeout fires first and the connection stays reusable. 0 disables it. |
+| `DB_STATEMENT_TIMEOUT_SECONDS` | `60` | Postgres `statement_timeout`. 0 leaves the server's setting. |
+| `DB_LOCK_TIMEOUT_SECONDS` | `30` | Postgres `lock_timeout`, advisory locks included. 0 leaves the server's setting. |
+| `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | `900` | Postgres `idle_in_transaction_session_timeout`. Deliberately long, because some requests hold a transaction open across slow external calls. The server ends the session of any transaction left idle, with no statement running, for this long, even one whose request would have continued, for example a request still waiting on an external call after 901 seconds. That request fails on its next database call, and its pool connection returns when the request unwinds, not when the server ends the session. 0 leaves the server's setting. |
+| `DB_TCP_KEEPALIVE_IDLE_SECONDS`, `DB_TCP_KEEPALIVE_INTERVAL_SECONDS`, `DB_TCP_KEEPALIVE_COUNT` | `30`, `10`, `3` | TCP keepalive on both ends of each connection, so a dead peer is noticed and Postgres releases a dead client's locks. With an idle of 0 the API sets neither the client socket options nor the server session settings, so whatever the operating system and the Postgres server already apply stays in effect. |
+| `DB_TCP_USER_TIMEOUT_SECONDS` | `60` | Unacknowledged sent data on a database socket, which keepalive does not cover. With 0 the API does not set it, so the operating system default stays in effect. |
+| `VALKEY_SOCKET_TIMEOUT_SECONDS`, `VALKEY_SOCKET_CONNECT_TIMEOUT_SECONDS` | `5`, `2` | Every Valkey command and connection the API makes, so a Valkey that stops answering cannot hold a caller, or the database connection it holds. A `socket_timeout` or `socket_connect_timeout` query parameter on `VALKEY_URL` takes precedence over these, and the API does not validate it, so keep any such value finite. |
+| `IDENTITY_FENCE_ACQUIRE_TIMEOUT_SECONDS` | `30` | One deadline over an identity write's advisory lock wait and its Valkey acknowledgement. Expiry fails that write as unavailable. |
+| `DB_POOL_WATCH_INTERVAL_SECONDS` | `5` | How often the pool watch samples the main pool. 0 disables the watch, and both probes then ignore the pool. |
+| `DB_POOL_PROBE_TIMEOUT_SECONDS` | `1` | How long the watch's own probe checkout may wait. |
+| `DB_POOL_READY_STARVED_SECONDS` | `30` | Starvation before `/ready` fails. |
+| `DB_POOL_RESTART_STARVED_SECONDS` | `120` | Starvation, with the database still answering, before `/health` fails. 0 disables this part of `/health`. |
+
+The session bounds are applied with `SET` right after each connection opens,
+not as connection startup parameters. The API must connect to Postgres
+directly or through a session mode connection pooler, because both these
+session settings and the identity write's session advisory lock need the same
+server connection across statements. A transaction mode pooler can move the
+API to a different server connection between transactions, so the lock and
+its unlock could land on different server sessions. A transaction mode pooler
+is not supported for the API.
+
+### Readiness, liveness and a wedged pool
+
+The pool watch calls the main pool starved when it is at capacity and nobody,
+including a one second probe checkout, has been handed a connection since its
+previous sample. Once a sample has seen the pool at capacity, only a handout
+counts as recovery, even when a later sample reads below capacity, because a
+slot freed by a discarded connection whose replacement cannot be opened serves
+nobody. A busy pool that
+keeps handing out connections is never unhealthy, however long its callers
+wait.
+
+1. `/ready` keeps its database check and also answers 503 with
+   `Database pool is exhausted` once the pool has been starved for
+   `DB_POOL_READY_STARVED_SECONDS`. Starvation is timed from the last
+   handout, or from the watch's last sample of a pool that was below
+   capacity, whichever is later, so the clock can start up to one sample
+   interval (5 seconds by default) before the pool actually filled. The
+   default equals the default pool timeout, but the two are separate
+   settings, and a request that arrived during the starvation may still be
+   waiting out its own pool timeout. The chart's readiness probe then needs
+   24 consecutive failures at 5 seconds (120 seconds) before the pod leaves
+   the Service, so a single replica does not flap on a short stall.
+2. `/health` answers 503 with `Database pool is wedged` once the pool has been
+   starved for `DB_POOL_RESTART_STARVED_SECONDS` while the database still
+   answers on the API's separate liveness pool. Kubernetes restarts a
+   container on a failing liveness probe, not a failing readiness probe, so
+   this is the restart backstop. An unreachable database never fails
+   `/health`: a restart cannot help, and the API refuses to boot without its
+   database. The chart's liveness probe needs 12 consecutive failures at 15
+   seconds (180 seconds), so a wedged pod restarts about five minutes after
+   the wedge begins.
+
+The connection bounds above release a stuck connection on their own. A lock
+wait ends at the lock timeout. A peer that has gone away is noticed by TCP
+keepalive in about 60 seconds (30 seconds idle, then 3 probes 10 seconds
+apart). A reply that never arrives on a connection that still looks alive
+ends within about 150 seconds, twice the command timeout. Any handout clears
+the starved state, so the next liveness probe succeeds, and a successful probe
+is what resets the kubelet's failure count. At the defaults each of those
+releases comes well before the 120 seconds of starvation plus 12 failed probes
+a restart needs, so a wedge those bounds can cure does not reach one. The restart exists for holders nothing else
+releases, such as a quarantined identity write lease, which keeps its
+connection until the process exits by design.
+
+The two endpoints read the watch differently. `/ready` first runs its own
+query on the liveness pool and answers 503 with
+`Database is unavailable` when that fails, then applies the watch's cached
+pool decision. `/health` makes no database or network call: it reads only
+the watch's last sample. A watch that is disabled or has stopped sampling
+never fails either probe.
+
+While the pool is at capacity the API records, on every sample, three gauges
+labelled `pool="main"`: `curie.db.pool.checked_out`,
+`curie.db.pool.oldest_checkout.age` (seconds) and `curie.db.pool.starved.age`
+(seconds starved, 0 when not). It also logs one ERROR line on the
+`curie_api.db_pool_watch` logger on the first such sample and then at most
+every 30 seconds:
+
+```text
+database pool exhausted pool=main checked_out=15 capacity=15 oldest_checkout_age_s=412 starved_for_s=398 holders=[15x412s@curie_api/identity_fence.py:LINE:mutation|awaiting=FILE:LINE:FUNCTION]
+```
+
+This example is 15 identity writes parked on the identity fence's advisory
+lock. Each holder is the age of its checkout, the innermost API code location
+of the task holding the connection (file, line number and function), and the
+innermost call it is waiting in, by file name, line number and function,
+oldest first and grouped with a count when identical. The walk follows a task
+into the body of an async context manager, so a write waiting inside the
+fence names `mutation` rather than the request middleware that entered it.
+Whether that innermost call is in the database driver or the Valkey client
+says whether the write waits on the lock or on its Valkey acknowledgement.
+The real line carries values where this example shows `LINE`, `FILE` and
+`FUNCTION`. A holder whose task has finished prints `unknown`. The line
+carries no SQL, parameters or exception text.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the

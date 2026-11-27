@@ -80,6 +80,48 @@ class Settings(BaseSettings):
     # of Langfuse's own tables on the same database.
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
     db_schema: str = "curie"
+    # Bounds on the API's database connections (#5995), applied by db.py to the
+    # main and liveness pools. Without them one stuck holder can keep a pooled
+    # connection for as long as the process lives. How long a caller waits for
+    # a main pool connection before its request fails.
+    db_pool_timeout_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    # How long opening one connection may take.
+    db_connect_timeout_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
+    # Client side bound on one database call, for a server that never answers
+    # (a dead TCP flow). Above the statement timeout on purpose: on a healthy
+    # connection the server's own timeout fires first and the connection stays
+    # reusable. 0 disables it.
+    db_command_timeout_seconds: float = Field(default=75.0, ge=0, allow_inf_nan=False)
+    # Postgres statement_timeout, lock_timeout and
+    # idle_in_transaction_session_timeout for every API session. 0 leaves the
+    # server's own setting in place. The idle transaction bound is deliberately
+    # long: API paths hold an open transaction across slow external calls. The
+    # server ends the session of any transaction idle that long, and the
+    # request holding it fails on its next database call.
+    db_statement_timeout_seconds: float = Field(default=60.0, ge=0, allow_inf_nan=False)
+    db_lock_timeout_seconds: float = Field(default=30.0, ge=0, allow_inf_nan=False)
+    db_idle_in_transaction_timeout_seconds: float = Field(default=900.0, ge=0, allow_inf_nan=False)
+    # TCP keepalive on both ends of each database connection, so a dead peer is
+    # noticed and the server releases a dead client's locks. With an idle of 0
+    # the API sets neither side, so the operating system's and the server's own
+    # settings stay in effect. The user timeout bounds unacknowledged sent data,
+    # which keepalive does not cover; with 0 the API does not set it.
+    db_tcp_keepalive_idle_seconds: int = Field(default=30, ge=0)
+    db_tcp_keepalive_interval_seconds: int = Field(default=10, gt=0)
+    db_tcp_keepalive_count: int = Field(default=3, gt=0)
+    db_tcp_user_timeout_seconds: int = Field(default=60, ge=0)
+    # The main pool watch (db_pool_watch.py): how often it samples the pool (0
+    # disables it), how long its probe checkout may wait, and how long nothing,
+    # the probe included, may be handed a connection before /ready fails and,
+    # with the database still answering, before /health fails so the kubelet
+    # restarts the process. A restart threshold of 0 disables the /health part.
+    db_pool_watch_interval_seconds: float = Field(default=5.0, ge=0, allow_inf_nan=False)
+    db_pool_probe_timeout_seconds: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    db_pool_ready_starved_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    db_pool_restart_starved_seconds: float = Field(default=120.0, ge=0, allow_inf_nan=False)
+    # One deadline over the identity fence's advisory lock wait and its Valkey
+    # acknowledgement; expiry answers identity_writer_unavailable.
+    identity_fence_acquire_timeout_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)
 
     # Single shared API key. Dev-only default; override in any shared deployment.
     api_key: str = "curie-dev-key"
@@ -503,6 +545,12 @@ class Settings(BaseSettings):
     valkey_port: int = 26379
     valkey_tls: bool = False
     valkey_url: str | None = None
+    # Socket bounds for every Valkey client the API process builds (#5995), so
+    # a server that stops answering cannot hold a caller, or a database
+    # connection the caller holds, forever. No API command blocks on the
+    # server by design, so a client wide read timeout is safe.
+    valkey_socket_timeout_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    valkey_socket_connect_timeout_seconds: float = Field(default=2.0, gt=0, allow_inf_nan=False)
     # Terminal review reconciliation reads the worker's completion/dead-letter
     # keyspace. Match WorkerConfig's actual legacy environment contract:
     # KEY_PREFIX overrides it; CURIE_KEY_PREFIX deliberately does not.
@@ -1245,6 +1293,17 @@ class Settings(BaseSettings):
         scheme = "rediss" if self.valkey_tls else "redis"
         password = quote(self.valkey_password, safe="")
         return f"{scheme}://:{password}@{self.valkey_host}:{self.valkey_port}/0"
+
+    def valkey_client_options(self) -> dict[str, Any]:
+        """Socket bounds every API Valkey client is built with (#5995).
+
+        Only options every redis-py connection class accepts: a unix:// URL
+        builds a connection that rejects socket_keepalive.
+        """
+        return {
+            "socket_timeout": self.valkey_socket_timeout_seconds,
+            "socket_connect_timeout": self.valkey_socket_connect_timeout_seconds,
+        }
 
     def upgrade_quiesce_key(self) -> str:
         return authoritative_key(self.worker_key_prefix, self.installation_id)

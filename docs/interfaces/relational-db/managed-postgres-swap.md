@@ -33,13 +33,16 @@ and the one validation that proves it.
      carries a TLS parameter rather than relying on the driver default of
      `prefer`. For Cloud SQL prefer the Auth Proxy (a localhost endpoint) so the
      DSN stays a plain host/port.
-   - **Neon:** use the pooled or direct endpoint host, and set
+   - **Neon:** use the direct endpoint host for the api, and set
      `postgres.sslMode: require` on the chart path. That renders `?ssl=require`
      for the api and worker (SQLAlchemy + asyncpg) and
      `?sslmode=require&sslaccept=accept_invalid_certs` for Langfuse (Prisma).
      Neither suffix authenticates the server certificate, so api, worker, and
      Langfuse traffic is encrypted but not authenticated; a `verify-full` mode
      needs a mounted CA bundle and is not this knob.
+     The pooled endpoint is a transaction mode pooler, and the api needs the
+     direct endpoint; see
+     [API database pool bounds](../../operations.md#api-database-pool-bounds).
    - The role must own (or be able to create) the `curie` schema. Migration
      `0001_initial` issues `CREATE SCHEMA IF NOT EXISTS curie`.
 

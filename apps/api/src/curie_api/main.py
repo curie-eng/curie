@@ -40,11 +40,14 @@ from .code_host_trust import code_host_verify
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import (
+    MAIN_POOL_MAX_OVERFLOW,
+    MAIN_POOL_SIZE,
     create_engine,
     create_liveness_engine,
     create_sessionmaker,
     create_source_gate_engine,
 )
+from .db_pool_watch import PoolWatch
 from .evalqueue import EvalQueue
 from .forges.registry import forges_registry
 from .github_app import credentials_for, log_credential_path
@@ -165,6 +168,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
+    # The pool watch (#5995) registers its pool listeners here, before any
+    # startup task can check a connection out of the main pool, so every
+    # holder is known to it. It needs the liveness pool, which opens no
+    # connection until first use. Sampling starts at the end of startup.
+    liveness_engine = create_liveness_engine()
+    app.state.liveness_engine = liveness_engine
+    app.state.liveness_sessionmaker = create_sessionmaker(liveness_engine)
+    db_pool_watch = PoolWatch(
+        engine,
+        app.state.liveness_sessionmaker,
+        MAIN_POOL_SIZE + MAIN_POOL_MAX_OVERFLOW,
+        settings,
+    )
+    app.state.db_pool_watch = db_pool_watch
     # The factory's forge registry, built once from CURIE_FORGES (#4397), so a
     # config the registry refuses fails boot rather than the first factory pass.
     app.state.forges = forges_registry(settings)
@@ -185,9 +202,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # for a proxy most runs never touch.
     app.state.pod_log_reader = build_lazy_pod_log_reader(settings.kube_config_path)
     app.state.pod_lister = build_lazy_pod_lister(settings.kube_config_path)
-    valkey: redis.Redis = AsyncRedis.from_url(settings.valkey_dsn())
+    valkey: redis.Redis = AsyncRedis.from_url(
+        settings.valkey_dsn(), **settings.valkey_client_options()
+    )
     app.state.valkey = valkey
-    credential_valkey = AsyncRedis.from_url(settings.valkey_dsn(), retry_reads=False)
+    credential_valkey = AsyncRedis.from_url(
+        settings.valkey_dsn(), retry_reads=False, **settings.valkey_client_options()
+    )
     app.state.credential_valkey = credential_valkey
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)
@@ -399,10 +420,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             },
         )
     async with AsyncExitStack() as source_resources:
-        liveness_engine = create_liveness_engine()
         source_resources.push_async_callback(liveness_engine.dispose)
-        app.state.liveness_engine = liveness_engine
-        app.state.liveness_sessionmaker = create_sessionmaker(liveness_engine)
         source_gate_engine = create_source_gate_engine()
         source_resources.push_async_callback(source_gate_engine.dispose)
         app.state.source_gate = SourceGate(source_gate_engine)
@@ -413,9 +431,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.protected_admission_reconciler = protected_reconciler
         protected_reconciler.start()
+        # Feeds /ready and /health from the main pool's turnover (#5995).
+        # Sampling starts last, right before the try, and stops first in its
+        # finally: the main engine is disposed inside that finally, before
+        # this exit stack unwinds, so an exit stack callback would stop it too
+        # late.
+        db_pool_watch.start()
         try:
             yield
         finally:
+            await db_pool_watch.stop()
             await protected_reconciler.stop()
             notice_task = app.state.deploy_notice_reconciler_task
             if notice_task is not None:
@@ -716,14 +741,24 @@ def create_app(
         },
     )
 
-    @app.get("/health", tags=["health"])
-    async def health() -> dict[str, str]:
+    @app.get(
+        "/health",
+        tags=["health"],
+        responses={503: {"description": "Database pool is wedged"}},
+    )
+    async def health(request: Request) -> dict[str, str]:
+        # In memory only: the pool watch decided this at its last tick (#5995).
+        # An app served without its lifespan has no watch, which is healthy.
+        watch = getattr(request.app.state, "db_pool_watch", None)
+        failure = watch.liveness_failure() if watch is not None else None
+        if failure is not None:
+            raise HTTPException(status_code=503, detail=failure)
         return {"status": "ok"}
 
     @app.get(
         "/ready",
         tags=["health"],
-        responses={503: {"description": "Database is unavailable"}},
+        responses={503: {"description": "Database is unavailable or its pool is exhausted"}},
     )
     async def ready(request: Request) -> dict[str, str]:
         try:
@@ -735,6 +770,10 @@ def create_app(
                 status_code=503,
                 detail="Database is unavailable",
             ) from None
+        watch = getattr(request.app.state, "db_pool_watch", None)
+        failure = watch.readiness_failure() if watch is not None else None
+        if failure is not None:
+            raise HTTPException(status_code=503, detail=failure)
         return {"status": "ok"}
 
     app.include_router(config.router)
