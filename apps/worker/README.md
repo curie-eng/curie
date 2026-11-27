@@ -152,13 +152,23 @@ EvalSuite (cases: input + grader)
       name a grader)
    -> EvalRunResult: per-case rows + the "N/M passed" summary
    -> LangfuseEvalRecorder: a trace + `eval_pass` score per case, tagged
-      `version:<sha>` and `suite:<name>`, via the Langfuse ingestion API
+      `version:<sha>` and `suite:<name>`. Completed traces use OTLP/HTTP and
+      grades use the Langfuse score ingestion API.
 ```
 
 Run a Job with `python -m curie_worker.eval`; it loads a suite JSON, runs it
 against a runner endpoint, records to Langfuse if configured, prints the
 `EvalRunResult` as JSON (for the PR-check reporter), and exits non-zero if any
 case failed (so the Job / GitHub check reflects the result).
+
+The recorder submits scores before exporting spans. If the export fails, the
+recording fails and any accepted scores stay attached to their original trace
+IDs under the Langfuse project's retention policy. An eval stream redelivery
+runs the suite again and records a new attempt with fresh trace and score IDs.
+If investigating an ambiguous export, check for the original trace IDs and look
+up accepted scores by score ID when available. Legacy trace filters can omit a
+score whose trace has not arrived. Some spans may have arrived, and replaying
+the original payload can duplicate observations.
 
 Env: `CURIE_EVAL_SUITE` (suite JSON path), `CURIE_EVAL_TARGET_URL` (runner
 base_url), `CURIE_EVAL_VERSION` (version/sha tag, default `local`),

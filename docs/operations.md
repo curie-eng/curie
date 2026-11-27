@@ -5236,9 +5236,9 @@ With Helm, set this through `api.extraEnv`; for a local Compose override, add it
 under the API service's `environment`.
 
 The setting switches trace and observation reads to Observations API v2 and
-aggregate reads to Metrics API v2. It does not migrate trace ingestion. The
-worker evaluation recorder still uses legacy ingestion and needs a separate
-migration before running it against a v4 backend in `events_only` mode.
+aggregate reads to Metrics API v2. The worker evaluation recorder sends trace
+spans over OTLP/HTTP and submits eval scores through the Langfuse score
+ingestion path supported by v4 in `events_only` mode.
 
 In v4, run counts and latency aggregates use logical root observations rather
 than trace rows. If a trace contains several application roots, each root

@@ -2,22 +2,20 @@
 
 Per the architecture (detailed-architecture section 4), eval Jobs write scores to
 Langfuse and the eval matrix reads the grid back keyed by version tag. This
-recorder posts, for each case, a Langfuse trace (input/output/metadata, tagged
-with the version and suite) plus, for a graded case, an ``eval_pass`` numeric score
-(1.0 / 0.0) to the public ingestion API. A non-graded case (the fake tier, ADR-0055)
-records its trace but no score: it has no grade, and either number would be a lie.
-The API server's matrix endpoint (a J1/observability handoff, not built here) then
-queries scores/traces filtered by the version tag to assemble the grid across N
-pinned versions.
+recorder exports one root OTLP span per case with output, metadata and the
+version and suite tags used by the eval matrix. Each graded case also gets an
+``eval_pass`` numeric score (1.0 / 0.0) through the batch ingestion API.
+Plumbing cases (ADR-0055) record only the span.
 
-Ingestion is asynchronous on Langfuse v3 (queued, then materialized in
-ClickHouse), so a read-back is eventually consistent, not immediate.
+Langfuse ingests both writes asynchronously, so a read-back is eventually consistent.
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
+from time import time_ns
 from typing import Any
 
 import httpx
@@ -32,7 +30,7 @@ class IngestionError(Exception):
 
 
 class LangfuseEvalRecorder:
-    """Writes eval traces + scores to a Langfuse project via the ingestion API."""
+    """Writes completed eval traces and scores to the configured Langfuse project."""
 
     def __init__(
         self,
@@ -47,40 +45,53 @@ class LangfuseEvalRecorder:
         self._client = client
 
     async def record(self, run: EvalRunResult) -> list[str]:
-        """Ingest one trace + score per case. Returns the created trace ids."""
+        """Ingest the case results and return their Langfuse trace IDs."""
         if not run.results:
             # No cases: don't POST a hollow ingestion batch (an empty trace shell
             # in Langfuse). Nothing to record, so return before touching the API.
             return []
-        now = _now_iso()
-        batch: list[dict[str, Any]] = []
+        timestamp_ns = time_ns()
+        now = datetime.fromtimestamp(timestamp_ns / 1_000_000_000, UTC).isoformat()
+        scores: list[dict[str, Any]] = []
+        spans: list[dict[str, Any]] = []
         trace_ids: list[str] = []
         for result in run.results:
             trace_id = uuid.uuid4().hex
             trace_ids.append(trace_id)
-            batch.append(self._trace_event(trace_id, run, result, now))
-            # A non-graded case has no grade to record: 0.0 would read as a fail
-            # that never happened and 1.0 is the false green. Omitting the score
-            # is the only honest shape -- the trace still lands, so the row stays
-            # visible with its outcome, it just carries no eval_pass.
+            spans.append(self._trace_span(trace_id, run, result, str(timestamp_ns)))
             if result.outcome is not EvalOutcome.PLUMBING_OK:
-                batch.append(self._score_event(trace_id, result, now))
+                scores.append(self._score_event(trace_id, result, now))
 
+        # Langfuse accepts a score before its trace exists. Submit scores first
+        # so a score error does not leave a published trace missing its grade.
+        if scores:
+            await self._post_scores(scores)
         resp = await self._client.post(
-            f"{self._base}/api/public/ingestion",
-            json={"batch": batch},
+            f"{self._base}/api/public/otel/v1/traces",
+            json={"resourceSpans": [{"scopeSpans": [{"spans": spans}]}]},
+            headers={"x-langfuse-ingestion-version": "4"},
             auth=self._auth,
         )
         resp.raise_for_status()
-        # Ingestion returns 207 with a per-event errors array; a 2xx alone does
-        # not mean every event was accepted, so surface partial failures.
+        # OTLP can report a partial rejection in an HTTP 200 response.
+        partial = resp.json().get("partialSuccess") if resp.content else None
+        if partial and int(partial.get("rejectedSpans", 0)):
+            raise IngestionError("Langfuse rejected one or more eval observations")
+        return trace_ids
+
+    async def _post_scores(self, scores: list[dict[str, Any]]) -> None:
+        resp = await self._client.post(
+            f"{self._base}/api/public/ingestion",
+            json={"batch": scores},
+            auth=self._auth,
+        )
+        resp.raise_for_status()
         errors = resp.json().get("errors") or []
         if errors:
             raise IngestionError(f"Langfuse rejected {len(errors)} eval event(s): {errors}")
-        return trace_ids
 
-    def _trace_event(
-        self, trace_id: str, run: EvalRunResult, result: EvalCaseResult, now: str
+    def _trace_span(
+        self, trace_id: str, run: EvalRunResult, result: EvalCaseResult, timestamp_ns: str
     ) -> dict[str, Any]:
         # The model dimension is a tag *and* a metadata field, mirroring the
         # version/suite convention: the tag lets the matrix reader filter/slice by
@@ -95,40 +106,53 @@ class LangfuseEvalRecorder:
         # judged this", never "this failed".
         if result.outcome is EvalOutcome.PLUMBING_OK:
             tags.append("plumbing")
+        name = f"eval:{run.suite}:{result.case_id}"
+        metadata = {
+            "version": run.version,
+            "suite": run.suite,
+            "model": run.model,
+            "stream_id": run.stream_id,
+            "scorer": run.scorer.value,
+            "case_count": run.total,
+            "case_id": result.case_id,
+            "outcome": result.outcome.value,
+            # Legacy readers use passed; null keeps plumbing cases ungraded.
+            "passed": result.passed,
+            "latency_ms": result.latency_ms,
+            "cost_usd": result.cost_usd,
+            "detail": result.detail,
+            "error": result.error,
+            "samples": result.samples,
+            "passes": result.passes,
+            "policy": result.policy,
+            "variance": result.variance,
+        }
+        output = json.dumps(result.output)
+        # v3 trace reads use trace.output; v4 reads the root observation's output.
+        # Keep metadata typed via the documented JSON object attribute.
+        # https://langfuse.com/integrations/native/opentelemetry/migration-to-v4
+        attributes = [
+            {"key": key, "value": {"stringValue": value}}
+            for key, value in (
+                ("langfuse.trace.name", name),
+                ("langfuse.trace.metadata", json.dumps(metadata)),
+                ("langfuse.trace.output", output),
+                ("langfuse.observation.output", output),
+            )
+        ]
+        attributes.append(
+            {
+                "key": "langfuse.trace.tags",
+                "value": {"arrayValue": {"values": [{"stringValue": tag} for tag in tags]}},
+            }
+        )
         return {
-            "id": uuid.uuid4().hex,
-            "type": "trace-create",
-            "timestamp": now,
-            "body": {
-                "id": trace_id,
-                "name": f"eval:{run.suite}:{result.case_id}",
-                "timestamp": now,
-                "tags": tags,
-                "input": None,
-                "output": result.output,
-                "metadata": {
-                    "version": run.version,
-                    "suite": run.suite,
-                    "model": run.model,
-                    "stream_id": run.stream_id,
-                    "scorer": run.scorer.value,
-                    "case_count": run.total,
-                    "case_id": result.case_id,
-                    "outcome": result.outcome.value,
-                    # Kept alongside `outcome` so an unmigrated reader stays
-                    # fail-safe: a plumbing row's null renders as missing, never as
-                    # a fabricated pass or fail. `outcome` is the authoritative one.
-                    "passed": result.passed,
-                    "latency_ms": result.latency_ms,
-                    "cost_usd": result.cost_usd,
-                    "detail": result.detail,
-                    "error": result.error,
-                    "samples": result.samples,
-                    "passes": result.passes,
-                    "policy": result.policy,
-                    "variance": result.variance,
-                },
-            },
+            "traceId": trace_id,
+            "spanId": trace_id[:16],
+            "name": name,
+            "startTimeUnixNano": timestamp_ns,
+            "endTimeUnixNano": timestamp_ns,
+            "attributes": attributes,
         }
 
     def _score_event(self, trace_id: str, result: EvalCaseResult, now: str) -> dict[str, Any]:
@@ -144,7 +168,3 @@ class LangfuseEvalRecorder:
                 "dataType": "NUMERIC",
             },
         }
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
