@@ -15,7 +15,7 @@
 #
 # Third-party dependencies install in their own layer ahead of the sources; see
 # the dependency-layer comment in the builder.
-FROM python:3.13.15-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS builder
+FROM python:3.15.1-slim@sha256:533b0b2f9b5d46fd097091cf826f27902f1d6c3bca714b6dc74551356aa97a51 AS builder
 RUN pip install --no-cache-dir uv==0.10.7
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \
@@ -54,7 +54,7 @@ RUN uv sync --frozen --no-dev --no-editable --no-install-workspace --package cur
 COPY . .
 RUN uv sync --frozen --no-dev --no-editable --package curie-api
 
-FROM python:3.13.15-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
+FROM python:3.15.1-slim@sha256:533b0b2f9b5d46fd097091cf826f27902f1d6c3bca714b6dc74551356aa97a51
 # git is a RUNTIME dependency: the git-flow engine (gitflow.py) shells out to
 # `git clone --mirror` / `git archive` to build a bundle from a pushed sha. The
 # slim base does not ship it, so without this a push webhook fails
