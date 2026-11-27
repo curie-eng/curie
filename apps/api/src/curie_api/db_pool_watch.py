@@ -1,14 +1,17 @@
 """Watch the main database pool for a wedge nothing else releases (#5995).
 
-The pool is starved when it is at capacity and nobody, including a short
-probe checkout, has been handed a connection since the previous sample. A busy
-pool that keeps handing out connections is never unhealthy, however long its
-callers wait: the criterion is that the pool stopped turning over, not that a
-caller waited long.
+The pool becomes starved when it is at capacity and nobody, including a short
+probe checkout, has been handed a connection since the previous sample. Once
+starved it stays starved, even if a sample reads below capacity, until a
+handout happens: a slot freed by a discarded connection whose replacement
+cannot be opened serves nobody. A busy pool that keeps handing out
+connections is never unhealthy, however long its callers wait: the criterion
+is that the pool stopped turning over, not that a caller waited long.
 
-Readiness fails once that has lasted db_pool_ready_starved_seconds (30 s by
-default, one full pool timeout, the point at which every request that arrived
-has already failed on its own pool timeout). The chart's readiness probe then
+Readiness fails once that has lasted db_pool_ready_starved_seconds. Its 30 s
+default equals the default pool timeout, so a stall shorter than one pool
+timeout never fails readiness; a request that arrived during starvation may
+still be waiting out its own pool timeout. The chart's readiness probe then
 needs 24 consecutive failures at 5 s, so one replica does not leave the
 Service on a short stall.
 
@@ -27,8 +30,8 @@ count, so a wedge those bounds can cure never reaches a restart. The restart
 exists for holders nothing else releases, such as a quarantined identity fence
 lease, which keeps its connection until the process exits by design.
 
-Every watch result the endpoints read is in memory. A watch that is disabled or has
-stopped ticking reports healthy: a broken monitor never fails a probe.
+Every watch result the endpoints read is in memory. A watch that is disabled
+or has stopped ticking reports healthy: a broken monitor never fails a probe.
 """
 
 from __future__ import annotations
@@ -234,23 +237,30 @@ class PoolWatch:
 
     async def tick(self) -> None:
         checked_out = self._pool.checkedout()
-        if checked_out < self._capacity:
-            # Below capacity the pool can hand out a connection by definition;
-            # no database call is made, so the watch adds no load. The log
-            # limiter is not reset here, so a pool oscillating at its capacity
-            # still logs at most once per window.
-            self._starved = False
-            self._last_below_capacity = monotonic()
-        else:
+        at_capacity = checked_out >= self._capacity
+        if at_capacity or self._starved:
+            # A starved pool stays starved until something is handed out: a
+            # slot freed by a discarded connection whose replacement cannot
+            # be opened reads below capacity yet serves nobody, so a dip
+            # alone proves nothing and the probe is what decides.
             if self._handouts == self._handouts_seen:
                 await self._probe()
             self._starved = self._handouts == self._handouts_seen
             if self._starved:
                 self._database_reachable = await self._database_answers()
             now = monotonic()
-            if self._logged_at is None or now - self._logged_at >= _LOG_EVERY_S:
+            if (at_capacity or self._starved) and (
+                self._logged_at is None or now - self._logged_at >= _LOG_EVERY_S
+            ):
                 self._logged_at = now
                 self._log_exhaustion(checked_out)
+        else:
+            # A pool below capacity that is not starved can hand out a
+            # connection; no database call is made, so the watch adds no load.
+            # The log limiter is not reset here, so a pool oscillating at its
+            # capacity still logs at most once per window.
+            self._starved = False
+            self._last_below_capacity = monotonic()
         self._handouts_seen = self._handouts
         record_metric("curie.db.pool.checked_out", checked_out, attributes=_ATTRIBUTES)
         record_metric(

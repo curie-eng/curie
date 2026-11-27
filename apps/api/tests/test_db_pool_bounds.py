@@ -102,7 +102,11 @@ def test_blackholed_query_releases_its_connection_within_the_bound(bounds: Any) 
     sleeping = "SELECT pg_sleep(30)"
 
     async def check() -> None:
-        observer = create_async_engine(get_settings().database_url, poolclass=NullPool)
+        # Autocommit gives every poll its own transaction, so each one reads a
+        # fresh activity snapshot instead of the first poll's frozen one.
+        observer = create_async_engine(
+            get_settings().database_url, poolclass=NullPool, isolation_level="AUTOCOMMIT"
+        )
         backend: int | None = None
         async with Blackhole(real.host or "127.0.0.1", real.port or 5432) as relay:
             url = real.set(host="127.0.0.1", port=relay.port)
@@ -122,6 +126,7 @@ def test_blackholed_query_releases_its_connection_within_the_bound(bounds: Any) 
                             text(
                                 "SELECT count(*) FROM pg_stat_activity"
                                 " WHERE pid = :pid AND state = 'active' AND query = :query"
+                                " AND wait_event = 'PgSleep'"
                             ),
                             {"pid": backend, "query": sleeping},
                         ):

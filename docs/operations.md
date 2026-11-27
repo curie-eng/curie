@@ -5125,9 +5125,11 @@ results returns an upstream error when it exceeds the pagination bound.
 ## API database pool bounds
 
 The API serves every request from one main database pool of 15 connections
-(5 plus 10 overflow). Every wait that can hold one of those connections is
-bounded, so a stuck holder releases its connection instead of keeping it until
-the process restarts. Set any of these through `api.extraEnv`; no chart
+(5 plus 10 overflow). The database and Valkey waits listed here are bounded,
+so a holder stuck on one of them releases its connection. A quarantined
+identity write lease is the exception: it keeps its connection by design
+until the process exits, and only a restart clears it, which is what the
+`/health` backstop below is for. Set any of these through `api.extraEnv`; no chart
 template change is needed. A value of 0 is accepted only where the table says
 so.
 
@@ -5149,29 +5151,30 @@ so.
 | `DB_POOL_RESTART_STARVED_SECONDS` | `120` | Starvation, with the database still answering, before `/health` fails. 0 disables this part of `/health`. |
 
 The session bounds are applied with `SET` right after each connection opens,
-not as connection startup parameters. They hold on a direct connection and
-behind a session mode connection pooler. A transaction mode pooler (for
-example a pooled managed endpoint) can hand each transaction a different
-server connection, so a session `SET` does not reliably stay with the API's
-connection there. Behind one, set `DB_STATEMENT_TIMEOUT_SECONDS`,
-`DB_LOCK_TIMEOUT_SECONDS` and `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` to 0
-and configure the same three values as defaults on the database role, for
-example `ALTER ROLE curie SET statement_timeout = '60s'`. The client side
-bounds (pool, connect and command timeouts, keepalive and user timeout) apply
-on every path.
+not as connection startup parameters. The API must connect to Postgres
+directly or through a session mode connection pooler, because both these
+session settings and the identity write's session advisory lock need the same
+server connection across statements. A transaction mode pooler can move the
+API to a different server connection between transactions, so the lock and
+its unlock could land on different server sessions. A transaction mode pooler
+is not supported for the API.
 
 ### Readiness, liveness and a wedged pool
 
 The pool watch calls the main pool starved when it is at capacity and nobody,
 including a one second probe checkout, has been handed a connection since its
-previous sample. A busy pool that keeps handing out connections is never
-unhealthy, however long its callers wait.
+previous sample. It stays starved, even when a sample reads below capacity,
+until a connection is handed out again, because a slot freed by a discarded
+connection whose replacement cannot be opened serves nobody. A busy pool that
+keeps handing out connections is never unhealthy, however long its callers
+wait.
 
 1. `/ready` keeps its database check and also answers 503 with
    `Database pool is exhausted` once the pool has been starved for
-   `DB_POOL_READY_STARVED_SECONDS`. That is one full pool timeout, the point at
-   which every request that arrived has already failed on its own pool
-   timeout. The chart's readiness probe then needs 24 consecutive failures at
+   `DB_POOL_READY_STARVED_SECONDS`. Its default equals the default pool
+   timeout, so a stall shorter than one pool timeout never fails readiness.
+   The two are separate settings, and a request that arrived during the
+   starvation may still be waiting out its own pool timeout. The chart's readiness probe then needs 24 consecutive failures at
    5 seconds (120 seconds) before the pod leaves the Service, so a single
    replica does not flap on a short stall.
 2. `/health` answers 503 with `Database pool is wedged` once the pool has been

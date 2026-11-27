@@ -15,11 +15,11 @@ import contextlib
 import logging
 import socket
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
-from _tcp_blackhole import silent_listener, within
+from _tcp_blackhole import Blackhole, silent_listener, within
 from curie_api import db, db_pool_watch, identity_fence
 from curie_api.config import get_settings
 from curie_api.db_pool_watch import POOL_EXHAUSTED, POOL_WEDGED, PoolWatch
@@ -391,6 +391,80 @@ def test_starvation_is_timed_from_the_last_sample_below_capacity(
                 await reachable.dispose()
 
     run(check)
+
+
+async def starve_then_free_one_slot(
+    watch_env: Any, stall_replacements: bool, after: Callable[[PoolWatch, float], None]
+) -> None:
+    """Starve the full pool, then free one slot by discarding its connection.
+
+    The engine reaches Postgres through a relay. With ``stall_replacements``
+    every connection opened after the starvation hangs at its first byte,
+    while the held ones keep relaying, so the freed slot cannot be refilled.
+    ``after`` receives the watch and its starvation age before the slot was
+    freed, once a sample has been taken with 14 checked out.
+    """
+    real_url = get_settings().database_url
+    real = make_url(real_url)
+    async with Blackhole(real.host or "127.0.0.1", real.port or 5432) as relay:
+        watch_env(
+            DATABASE_URL=real.set(host="127.0.0.1", port=relay.port).render_as_string(
+                hide_password=False
+            ),
+            DB_POOL_PROBE_TIMEOUT_SECONDS=0.3,
+        )
+        engine = db.create_engine()
+        reachable = create_async_engine(real_url, poolclass=NullPool)
+        watch = build_watch(engine, async_sessionmaker(reachable))
+        holders = Holders(engine)
+        discarded = await engine.connect()
+        try:
+            await discarded.execute(text("SELECT 1"))
+            for _ in range(CAPACITY - 1):
+                holders.hold()
+            await holders.fill()
+            await watch.tick()
+            await watch.tick()
+            assert watch.starved_for() > 0
+            starved_before = watch.starved_for()
+            if stall_replacements:
+                relay.stall_new_flows()
+            await discarded.invalidate()
+            await discarded.close()
+            assert engine.pool.checkedout() == CAPACITY - 1  # type: ignore[attr-defined]
+            await watch.tick()
+            after(watch, starved_before)
+        finally:
+            with contextlib.suppress(Exception):
+                await discarded.close()
+            await holders.release_all()
+            await watch.stop()
+            await relay.close()
+            await engine.dispose()
+            await reachable.dispose()
+
+
+def test_starved_pool_whose_freed_slot_cannot_refill_stays_starved(watch_env: Any) -> None:
+    """A slot freed by a discarded connection serves nobody if no new one opens."""
+
+    def after(watch: PoolWatch, starved_before: float) -> None:
+        assert watch.starved_for() > starved_before
+        assert watch.database_reachable is True
+        assert watch.readiness_failure() == POOL_EXHAUSTED
+        assert watch.liveness_failure() == POOL_WEDGED
+
+    run(lambda: starve_then_free_one_slot(watch_env, True, after))
+
+
+def test_starved_pool_whose_freed_slot_refills_recovers(watch_env: Any) -> None:
+    """The watch's own probe opening the replacement is the handout that ends it."""
+
+    def after(watch: PoolWatch, starved_before: float) -> None:
+        assert watch.starved_for() == 0
+        assert watch.readiness_failure() is None
+        assert watch.liveness_failure() is None
+
+    run(lambda: starve_then_free_one_slot(watch_env, False, after))
 
 
 def test_unreachable_database_never_fails_liveness(watch_env: Any) -> None:

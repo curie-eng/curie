@@ -105,7 +105,8 @@ def _bounded(engine: AsyncEngine, settings: Settings) -> AsyncEngine:
     The session bounds are SET after connect rather than sent as startup
     parameters: a session mode connection pooler in front of a bring your own
     Postgres refuses startup parameters outside a short allowlist, while a SET
-    works everywhere. asyncpg leaves SO_KEEPALIVE off on its socket, so the
+    holds on a direct or session mode connection, the only kinds the API
+    supports. asyncpg leaves SO_KEEPALIVE off on its socket, so the
     client side keepalive and user timeout are set here as well.
     """
     bounds = _session_bounds(settings)

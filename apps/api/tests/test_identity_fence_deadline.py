@@ -14,7 +14,7 @@ import contextlib
 import time
 from collections.abc import Iterator
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import urlsplit
 
 import pytest
 from _tcp_blackhole import Blackhole, silent_listener, within
@@ -170,11 +170,13 @@ def test_lost_fence_acknowledgement_is_unavailable_and_the_next_mutation_heals(
         healthy = AsyncRedis.from_url(settings.valkey_dsn(), **settings.valkey_client_options())
         key = identity_fence.FENCE_KEY
         try:
-            async with Blackhole(settings.valkey_host, settings.valkey_port) as relay:
-                password = quote(settings.valkey_password, safe="")
-                lossy = AsyncRedis.from_url(
-                    f"redis://:{password}@127.0.0.1:{relay.port}/0", socket_timeout=1
-                )
+            # The same DSN as the healthy client, only the address moved to the
+            # relay, so both share database and credentials.
+            dsn = urlsplit(settings.valkey_dsn())
+            async with Blackhole(dsn.hostname or "127.0.0.1", dsn.port or 6379) as relay:
+                userinfo, at, _ = dsn.netloc.rpartition("@")
+                relayed = dsn._replace(netloc=f"{userinfo}{at}127.0.0.1:{relay.port}").geturl()
+                lossy = AsyncRedis.from_url(relayed, socket_timeout=1)
                 try:
                     # One open connection through the relay, then lose its replies.
                     assert await lossy.ping() is True
@@ -230,7 +232,9 @@ def test_readers_fail_within_the_bound_while_the_writer_is_stuck(fence_env: Any)
         engine = db.create_engine()
         factory = async_sessionmaker(engine, expire_on_commit=False)
         async with silent_listener() as listener:
-            client = AsyncRedis.from_url(f"redis://127.0.0.1:{listener.port}/0")
+            # A socket timeout past every deadline below, so the writer stays
+            # stuck on Valkey for the whole test.
+            client = AsyncRedis.from_url(f"redis://127.0.0.1:{listener.port}/0", socket_timeout=60)
 
             async def stuck_writer() -> None:
                 async with identity_fence.mutation(writer_factory, client):

@@ -250,9 +250,12 @@ legacy traces/observations/metrics endpoints the compose and chart pin serve;
 Langfuse Cloud from 2026-11-16), the GitHub webhook secret, `api_key`, `kube_config_path` (empty = no cluster
 configured, the 503 case above), and `metrics_default_window_hours`.
 The `db_*`, `valkey_socket_*` and `identity_fence_acquire_timeout_seconds`
-settings bound every database and Valkey wait the API makes (#5995); `db.py`
-applies them to the main and liveness pools and `db_pool_watch.py` turns main
-pool starvation into `/ready` and `/health` answers. The operator reference is
+settings bound the database and Valkey waits that can hold an API connection
+(#5995); `db.py` applies them to the main and liveness pools and
+`db_pool_watch.py` turns main pool starvation into `/ready` and `/health`
+answers, the restart backstop for a quarantined identity write lease, which
+no bound releases. The API needs a direct or session mode Postgres
+connection; a transaction mode pooler is not supported. The operator reference is
 `docs/operations.md`, "API database pool bounds".
 
 ## Verify

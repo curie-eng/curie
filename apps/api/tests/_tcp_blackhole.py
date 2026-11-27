@@ -6,7 +6,9 @@ stay open, which is what a dead network path looks like to a client that has
 no bound of its own. ``freeze_replies`` drops only what the server sends, so
 requests still arrive and take effect while their answers are lost. Flows
 accepted after a freeze relay normally, so a fresh connection through the
-same address works. ``silent_listener`` accepts
+same address works, unless ``stall_new_flows`` was called: then every later
+flow is frozen from its first byte, so a new connection hangs while the
+existing ones keep relaying. ``silent_listener`` accepts
 connections and never answers at all. ``within`` turns a missing bound into a
 test failure instead of a hang.
 """
@@ -48,6 +50,7 @@ class Blackhole:
         self._writers: list[asyncio.StreamWriter] = []
         self._tasks: set[asyncio.Task[None]] = set()
         self._server: asyncio.Server | None = None
+        self._stall_new = False
         self.port = 0
 
     async def __aenter__(self) -> Blackhole:
@@ -69,6 +72,10 @@ class Blackhole:
         for flow in self._flows:
             flow.replies_frozen = True
 
+    def stall_new_flows(self) -> None:
+        """Freeze every flow accepted from now on; current flows keep relaying."""
+        self._stall_new = True
+
     async def close(self) -> None:
         if self._server is not None:
             self._server.close()
@@ -85,6 +92,7 @@ class Blackhole:
 
     async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         flow = _Flow()
+        flow.requests_frozen = flow.replies_frozen = self._stall_new
         self._flows.append(flow)
         self._writers.append(writer)
         upstream_reader, upstream_writer = await asyncio.open_connection(*self._target)
