@@ -968,7 +968,7 @@ Two signals name the cause:
    seconds, naming who took it:
 
    ```text
-   db pool checkout held past threshold state=held pool=main held_s=121.4 threshold_s=120 checked_out=15 capacity=15 route='GET /agents' task='RequestResponseCycle.run_asgi' trace_id=4bf92f3577b34da6a3ce929d0e0e4736 stack=curie_api/crud/agents.py:119:list_agents <- curie_api/routers/agents.py:294:list_agents
+   db pool checkout held past threshold state=held pool=main held_s=121.4 threshold_s=120 checked_out=15 capacity=15 route='GET /agents' task='RequestResponseCycle.run_asgi' trace_id=4bf92f3577b34da6a3ce929d0e0e4736 stack=curie_api/crud/agents.py:<line>:list_agents <- curie_api/routers/agents.py:<line>:list_agents
    ```
 
    `state=held` is written by the watch while the connection is still out;
