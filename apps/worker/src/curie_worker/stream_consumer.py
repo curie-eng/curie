@@ -51,6 +51,8 @@ from .upgrade_drain import UpgradeDrainGate
 # relative to any rollout, so a released fleet resumes claiming promptly, and far
 # longer than one EXISTS, so the poll costs nothing measurable while idle.
 _QUIESCE_POLL_S = 1.0
+# The most an over-cap notice may spend reaching the channel (#5985).
+_OVER_CAP_NOTICE_TIMEOUT_S = 30.0
 
 # One stream entry as redis returns it with decode_responses=True.
 StreamEntry = tuple[str, dict[str, str]]
@@ -144,6 +146,7 @@ class StreamConsumer:
         leases: DeliveryLeaseStore | None = None,
         on_lease_lost: LeaseLostHandler | None = None,
         on_entry_vanished: LeaseLostHandler | None = None,
+        on_over_cap_dead_lettered: LeaseLostHandler | None = None,
         drain: UpgradeDrainGate | None = None,
         liveness_store: ConsumerLivenessStore | None = None,
     ) -> None:
@@ -199,12 +202,20 @@ class StreamConsumer:
         # stop and leaves a turn producing effects on a sandbox we no longer own.
         self._on_lease_lost: LeaseLostHandler | None = on_lease_lost
         self._on_entry_vanished: LeaseLostHandler | None = on_entry_vanished
+        # Fired after an entry that spent its delivery budget is dead-lettered
+        # (#5985), so the owning lane can tell the person. No handler reached a
+        # result for it: its owners died, or every attempt failed.
+        self._on_over_cap_dead_lettered: LeaseLostHandler | None = on_over_cap_dead_lettered
         # Lease objects captured for a vanished-entry notice. The handler's
         # ``_delivery_lease`` finally drops ``_held_leases`` and cancels the
         # heartbeat task; the notice runs on a separate task and must still
         # see the lease after that.
         self._notice_lease: dict[str, DeliveryLease] = {}
         self._lease_loss_tasks: set[asyncio.Task[None]] = set()
+        # Over-cap notices in flight (#5985). They run off the maintenance
+        # tick, which holds the reclaim lock, so a slow channel never stalls
+        # crash recovery for the group.
+        self._over_cap_notice_tasks: set[asyncio.Task[None]] = set()
         # The pre-upgrade drain gate (#2010), or None for a consumer that has no
         # platform to be rolled by (compose, the base-only unit tests). While it
         # reports a drain in progress this consumer takes NO new work -- neither
@@ -1167,8 +1178,12 @@ class StreamConsumer:
         *,
         reason: str,
         delivery_count: int,
-    ) -> None:
+    ) -> bool | None:
         """Move an entry to the graveyard and ack it off the main group.
+
+        Returns True once the entry is settled on the graveyard, False when the
+        fence refused and nothing was written. A lane override that answers
+        None reports no settlement, so the lane sends no over-cap notice.
 
         ``fields`` are the original entry's fields, kept verbatim so a human or a
         replay tool can inspect them; ``None`` writes a metadata-only row (the
@@ -1232,7 +1247,7 @@ class StreamConsumer:
                 "curie.queue.settle",
                 attributes={**attributes, "outcome": "pending"},
             )
-            return
+            return False
 
         target = self._spec.dead_letter_target
         # Escape the original's own ``dl_*`` keys (see above) so the metadata
@@ -1316,6 +1331,33 @@ class StreamConsumer:
         )
         if error is not None:
             raise error
+        return True
+
+    def _notice_over_cap(self, entry_id: str, fields: dict[str, str] | None) -> None:
+        """Start the lane's notice for a dead-lettered over-cap entry (#5985).
+
+        On its own task and bounded, because the caller holds the reclaim lock:
+        a slow channel must not stall crash recovery for the whole group.
+        """
+
+        handler = self._on_over_cap_dead_lettered
+        if handler is None or fields is None:
+            return
+
+        async def notice() -> None:
+            try:
+                async with asyncio.timeout(_OVER_CAP_NOTICE_TIMEOUT_S):
+                    await handler(entry_id, fields)
+            except Exception:
+                self._spec.logger.exception(
+                    "over-cap notice failed for entry %s on stream %s",
+                    entry_id,
+                    self._spec.stream,
+                )
+
+        task = asyncio.create_task(notice())
+        self._over_cap_notice_tasks.add(task)
+        task.add_done_callback(self._over_cap_notice_tasks.discard)
 
     async def _dead_letter_over_cap(self) -> set[str]:
         """Dead-letter pending entries that have exhausted their delivery budget.
@@ -1418,7 +1460,7 @@ class StreamConsumer:
                 try:
                     if self._spec.entry_eligibility is None:
                         fields = await self._entry_fields(entry_id)
-                    await self._dead_letter(
+                    settled = await self._dead_letter(
                         entry_id,
                         fields,
                         reason=self._spec.over_cap_reason,
@@ -1429,6 +1471,9 @@ class StreamConsumer:
                         self._spec.dead_letter_fail_log,
                         entry_id,
                     )
+                else:
+                    if settled:
+                        self._notice_over_cap(entry_id, fields)
             if len(pending) < page_size:
                 break
             # Exclusive lower bound: resume after the last id of this page.
@@ -1732,7 +1777,7 @@ class StreamConsumer:
                 try:
                     if self._spec.entry_eligibility is None:
                         fields = await self._entry_fields(entry_id)
-                    await self._dead_letter(
+                    settled = await self._dead_letter(
                         entry_id,
                         fields,
                         reason=self._spec.over_cap_reason,
@@ -1743,6 +1788,9 @@ class StreamConsumer:
                         self._spec.dead_letter_fail_log,
                         entry_id,
                     )
+                else:
+                    if settled:
+                        self._notice_over_cap(entry_id, fields)
                 continue
             idle_for_row = (
                 (

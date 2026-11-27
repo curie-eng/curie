@@ -508,13 +508,14 @@ pub const TURN_FAILURE_REPLY_PREFIX: &str = "curie-turn-failure:";
 /// The sentences a person sees in place of the marked record on every route
 /// except the cluster message relay (#5984). Frozen with the worker in
 /// `tests/vectors/turn-failure-reply.json`.
-pub const PLAIN_FAILURE_REPLIES: [&str; 6] = [
+pub const PLAIN_FAILURE_REPLIES: [&str; 7] = [
     "I couldn't finish this request. It was too large to complete in one go. Please try again, or split it into smaller parts.",
     "I couldn't finish this request because it took too long. Please try again, or split it into smaller parts.",
     "I couldn't finish this request. An earlier attempt may already have made changes, so I did not try again automatically. Please check the result before asking again.",
     "I couldn't finish this request because the approval it needs could not be set up. Please ask an administrator to check this agent's approval settings.",
     "I couldn't finish this request because it needed an action this conversation does not allow.",
     "I couldn't finish this request. Please try again in a few minutes.",
+    "I couldn't finish this request because it was interrupted before it completed. Please send it again.",
 ];
 
 /// The class a reply that is exactly one of [`PLAIN_FAILURE_REPLIES`] reports:
