@@ -960,10 +960,13 @@ Two signals name the cause:
 
 1. The gauges `curie.db.pool.checked_out`, `curie.db.pool.capacity` and
    `curie.db.pool.checked_out.age` (attributes `service.name=curie-api`,
-   `pool=main`), recorded every 10 seconds. `checked_out` equal to `capacity`
-   with a rising `checked_out.age` is a wedged pool. For example, alert when
-   `curie.db.pool.checked_out.age` stays above 300 for five minutes. The alert
-   is not installed for you, and the default metrics exporter is `nop`.
+   `pool=main`), recorded every 10 seconds by each API process. A high
+   `checked_out.age` alone means one connection is out for a long time, not
+   that the pool is full. The pool is exhausted when `checked_out` equals
+   `capacity` on the same API instance, sample after sample. For example,
+   alert when that holds for five minutes while `checked_out.age` is above
+   120. No alert is installed for you, and the default metrics exporter is
+   `nop`.
 2. One WARNING line in the API log for each connection held longer than 120
    seconds, naming who took it:
 
@@ -971,14 +974,17 @@ Two signals name the cause:
    db pool checkout held past threshold state=held pool=main held_s=121.4 threshold_s=120 checked_out=15 capacity=15 route='GET /agents' task='RequestResponseCycle.run_asgi' trace_id=4bf92f3577b34da6a3ce929d0e0e4736 stack=curie_api/crud/agents.py:<line>:list_agents <- curie_api/routers/agents.py:<line>:list_agents
    ```
 
-   `state=held` is written by the watch while the connection is still out;
+   `state=held` is written by the watch while the connection is still out.
    `state=released` means it came back after the threshold but before a watch
-   pass saw it. `route` is the request that took the connection, `task` the
-   asyncio task (a background loop is named by its coroutine, such as
-   `WorkItemReconciler.run_forever`), and `stack` the innermost platform frames,
-   innermost first. Each connection is named at most once. Read it with
-   `kubectl logs` on the API pod; the OTLP copy of an API log line keeps only
-   its template.
+   pass saw it, and `state=detached` that SQLAlchemy dropped it from the pool
+   instead (as it does for a connection garbage collected without being
+   returned). `route` is the request during which the connection was taken,
+   or that started the task that took it, `task` the asyncio task (a
+   background loop is named by its coroutine, such as
+   `WorkItemReconciler.run_forever`), and `stack` the innermost platform
+   frames, innermost first. Each connection is named at most once. Read it
+   with `kubectl logs` on the API pod; the OTLP copy of an API log line keeps
+   only its template.
 
 The knobs, set through `api.extraEnv`:
 

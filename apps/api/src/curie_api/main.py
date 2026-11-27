@@ -424,6 +424,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
+            # First, so a failure in the teardown below cannot skip it; it only
+            # reads the pool, so stopping it early loses nothing.
+            pool_watch_task = app.state.db_pool_watch_task
+            pool_watch_task.cancel()
+            try:
+                await pool_watch_task
+            except asyncio.CancelledError:
+                pass
+            db_pool_watch.close()
             await protected_reconciler.stop()
             notice_task = app.state.deploy_notice_reconciler_task
             if notice_task is not None:
@@ -528,13 +537,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await poller_task
                 except asyncio.CancelledError:
                     pass
-            pool_watch_task = app.state.db_pool_watch_task
-            pool_watch_task.cancel()
-            try:
-                await pool_watch_task
-            except asyncio.CancelledError:
-                pass
-            db_pool_watch.close()
             try:
                 await credential_valkey.aclose()
                 await valkey.aclose()
@@ -639,7 +641,8 @@ class HttpTelemetryMiddleware:
         started = time.monotonic()
         status_code = 500
         record_metric("curie.http.server.active", 1, attributes=active_attributes)
-        # A main pool checkout made for this request names it (#5995).
+        # A main pool checkout made for this request, or by a task it starts,
+        # names it (#5995).
         holder_route = HOLDER_ROUTE.set(f"{active_attributes['source']} {operation}")
         try:
             with operation_span(
@@ -667,6 +670,7 @@ class HttpTelemetryMiddleware:
 
                 await self.app(scope, receive, observe_send)
         finally:
+            HOLDER_ROUTE.reset(holder_route)
             outcome = f"{status_code // 100}xx" if 100 <= status_code < 600 else "5xx"
             completed_attributes = {**active_attributes, "outcome": outcome}
             record_metric("curie.http.server.request", attributes=completed_attributes)
@@ -676,7 +680,6 @@ class HttpTelemetryMiddleware:
                 attributes=completed_attributes,
             )
             record_metric("curie.http.server.active", -1, attributes=active_attributes)
-            HOLDER_ROUTE.reset(holder_route)
 
 
 # @spec HTTP-INVOCATION-EXECUTION-15

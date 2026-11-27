@@ -182,10 +182,11 @@ than an open bag of `gen_ai.*` names.
   (10 seconds). `checked_out` equal to `capacity` (pool size plus maximum overflow) means
   the next checkout waits; the age is that of the oldest connection still out, 0 when
   none is. A connection out longer than `CURIE_DB_POOL_HOLD_WARNING_S` (120 seconds) is
-  named once in a WARNING line with the request route or asyncio task that took it, the
-  trace id in scope at checkout, and up to six `curie_api` and `curie_internal` frames
-  of the code that took it. The holder never becomes a metric label. SQLAlchemy has no
-  event for a checkout that timed out waiting, so no timeout counter exists.
+  named once in a WARNING line (while out, or when it is returned or detached) with the
+  request route or asyncio task that took it, the trace id in scope at checkout, and up
+  to six `curie_api` and `curie_internal` frames of the code that took it. The holder
+  never becomes a metric label. SQLAlchemy has no event for a checkout that timed out
+  waiting, so no timeout counter exists.
 - `curie.tool.result` counts each tool result the runner sees close a call made in the
   same turn, by `origin` and `outcome`
   (`runner/src/curie_runner/session.py::SessionRunner._observe_tool_results`). The

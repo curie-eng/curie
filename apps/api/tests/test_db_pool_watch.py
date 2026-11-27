@@ -228,6 +228,59 @@ def test_a_long_hold_returned_between_passes_is_named_on_its_way_back(
     assert line.split("stack=", 1)[1].split(" <- ")[0].endswith(":_hold_for_the_test")
 
 
+def test_a_long_hold_detached_between_passes_is_named_on_its_way_out(
+    clock: _Clock,
+    points: list[tuple[str, float, dict[str, str]]],
+    records: _Records,
+) -> None:
+    async def go() -> None:
+        async with _main_engine() as engine:
+            watch = PoolWatch(engine, hold_warning_s=120, packages=_WITH_TESTS)
+            try:
+                held = await _hold_for_the_test(engine)
+                clock.now += 125
+                # How the async dialect drops a connection that was garbage
+                # collected without being returned.
+                await held.run_sync(lambda connection: connection.detach())
+                watch.observe()
+                assert _latest(points, "curie.db.pool.checked_out.age") == 0
+                await held.close()
+            finally:
+                watch.close()
+
+    asyncio.run(go())
+    (line,) = records.warnings()
+    assert "state=detached" in line
+    assert line.split("stack=", 1)[1].split(" <- ")[0].endswith(":_hold_for_the_test")
+
+
+def test_a_disposed_pool_forgets_the_connections_it_lent(
+    clock: _Clock,
+    points: list[tuple[str, float, dict[str, str]]],
+    records: _Records,
+) -> None:
+    async def go() -> None:
+        async with _main_engine() as engine:
+            watch = PoolWatch(engine, hold_warning_s=120)
+            try:
+                old = await _hold_for_the_test(engine)
+                clock.now += 300
+                await engine.dispose()
+                fresh = await _hold_for_the_test(engine)
+                clock.now += 5
+                watch.observe()
+                # Only the replacement pool's checkout is counted and aged.
+                assert _latest(points, "curie.db.pool.checked_out") == 1
+                assert _latest(points, "curie.db.pool.checked_out.age") == 5
+                await old.close()
+                await fresh.close()
+            finally:
+                watch.close()
+
+    asyncio.run(go())
+    assert records.warnings() == []
+
+
 def test_the_app_names_the_route_holding_a_main_pool_connection(
     _disposable_db: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -274,16 +327,17 @@ def test_the_app_runs_the_watch_on_its_main_engine(
                             named.set()
 
                 signal = _Signal(level=logging.WARNING)
-                logging.getLogger("curie_api.db_pool_watch").addHandler(signal)
-                # The same marker the HTTP middleware sets, so this checkout is
-                # told apart from the app's own background loops.
-                HOLDER_ROUTE.set("TEST holder")
-                held = await _hold_for_the_test(app_state.engine)
+                watch_logger = logging.getLogger("curie_api.db_pool_watch")
+                watch_logger.addHandler(signal)
                 try:
-                    await asyncio.wait_for(named.wait(), 10)
+                    # The same marker the HTTP middleware sets, so this checkout
+                    # is told apart from the app's own background loops.
+                    HOLDER_ROUTE.set("TEST holder")
+                    async with app_state.engine.connect() as held:
+                        await held.execute(text("SELECT 1"))
+                        await asyncio.wait_for(named.wait(), 10)
                 finally:
-                    logging.getLogger("curie_api.db_pool_watch").removeHandler(signal)
-                    await held.close()
+                    watch_logger.removeHandler(signal)
                 return "named"
 
             assert client.portal.call(hold_until_named) == "named"

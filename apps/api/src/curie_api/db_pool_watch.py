@@ -12,7 +12,9 @@ events only, so it never changes how the engine is created:
   asyncio task that took it, the trace id in scope, and a few ``curie_api`` and
   ``curie_internal`` frames of the caller's stack.
 - ``checkin`` and ``detach`` forget it. A connection held past the threshold
-  that comes back before any pass named it is logged once on its way back.
+  that comes back (or is detached) before any pass named it is logged once on
+  its way out of the watch. ``engine_disposed`` forgets every checkout, since
+  the pool that lent them has been replaced.
 - ``observe`` (one pass of ``run_forever``) records three gauges
   (``curie.db.pool.checked_out``, ``curie.db.pool.capacity`` and
   ``curie.db.pool.checked_out.age``) and logs one WARNING for each checkout
@@ -62,6 +64,9 @@ HOLDER_ROUTE: ContextVar[str | None] = ContextVar("curie_api_db_pool_holder_rout
 # connection, not SQLAlchemy or asyncio around it.
 OWN_PACKAGES = ("/curie_api/", "/curie_internal/")
 _MAX_FRAMES = 6
+# The per file name cache is cleared when it reaches this size, so code
+# compiled at run time under fresh file names cannot grow it without bound.
+_MAX_KEPT_FILES = 4096
 _THIS_FILE = __file__
 _ATTRIBUTES = {"service.name": "curie-api", "pool": "main"}
 
@@ -115,6 +120,8 @@ def _caller_frames(packages: tuple[str, ...], kept: dict[str, bool]) -> tuple[_F
         keep = kept.get(filename)
         if keep is None:
             keep = filename != _THIS_FILE and any(package in filename for package in packages)
+            if len(kept) >= _MAX_KEPT_FILES:
+                kept.clear()
             kept[filename] = keep
         if keep:
             frames.append((filename, frame.f_lineno, code.co_name))
@@ -166,24 +173,26 @@ class PoolWatch:
         self._engine = engine.sync_engine
         self._hold_warning_s = hold_warning_s
         self._packages = packages
-        # File name -> whether its frames are kept. Bounded by the number of
-        # source files the process loads.
+        # File name -> whether its frames are kept (see _MAX_KEPT_FILES).
         self._kept: dict[str, bool] = {}
         # Keyed by SQLAlchemy's connection record, which stays the same object
         # from checkout to checkin or detach.
         self._held: dict[Any, _Checkout] = {}
-        event.listen(self._engine, "checkout", self._on_checkout)
-        event.listen(self._engine, "checkin", self._on_checkin)
-        event.listen(self._engine, "detach", self._on_detach)
+        for name, listener in self._listeners():
+            event.listen(self._engine, name, listener)
+
+    def _listeners(self) -> tuple[tuple[str, Callable[..., None]], ...]:
+        return (
+            ("checkout", self._on_checkout),
+            ("checkin", self._on_checkin),
+            ("detach", self._on_detach),
+            ("engine_disposed", self._on_disposed),
+        )
 
     def close(self) -> None:
         """Remove the listeners. Idempotent."""
 
-        for name, listener in (
-            ("checkout", self._on_checkout),
-            ("checkin", self._on_checkin),
-            ("detach", self._on_detach),
-        ):
+        for name, listener in self._listeners():
             if event.contains(self._engine, name, listener):
                 event.remove(self._engine, name, listener)
 
@@ -202,17 +211,29 @@ class PoolWatch:
             logger.debug("db pool watch could not record a checkout", exc_info=True)
 
     def _on_checkin(self, _dbapi_connection: Any, record: Any) -> None:
+        self._forget(record, "released")
+
+    def _on_detach(self, _dbapi_connection: Any, record: Any) -> None:
+        # The async dialect detaches a connection that was garbage collected
+        # without being returned, so this is also how a leaked one leaves.
+        self._forget(record, "detached")
+
+    def _on_disposed(self, _engine: Any) -> None:
+        # dispose() replaces the pool. Connections still out belong to the old
+        # one, block nothing in the new one, and are not counted by it.
+        self._held.clear()
+
+    def _forget(self, record: Any, state: str) -> None:
+        """Stop tracking a checkout, naming it first if it outlived the threshold."""
+
         try:
             checkout = self._held.pop(record, None)
             if checkout is not None and not checkout.named:
                 held = _monotonic() - checkout.started
                 if held >= self._hold_warning_s:
-                    self._warn("released", checkout, held)
+                    self._warn(state, checkout, held)
         except Exception:  # noqa: BLE001 - observability must not fail a checkin
-            logger.debug("db pool watch could not record a checkin", exc_info=True)
-
-    def _on_detach(self, _dbapi_connection: Any, record: Any) -> None:
-        self._held.pop(record, None)
+            logger.debug("db pool watch could not record a %s", state, exc_info=True)
 
     def _warn(self, state: str, checkout: _Checkout, held: float) -> None:
         checkout.named = True
