@@ -33407,6 +33407,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "503": {
+            "description": "Database pool is wedged"
           }
         },
         "summary": "Health",
@@ -36626,7 +36629,7 @@
             "description": "Successful Response"
           },
           "503": {
-            "description": "Database is unavailable"
+            "description": "Database is unavailable or its pool is exhausted"
           }
         },
         "summary": "Ready",

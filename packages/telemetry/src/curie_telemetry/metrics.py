@@ -641,6 +641,9 @@ _BACKGROUND_ATTRIBUTES = {
 _BACKGROUND_AGE_ATTRIBUTES = {
     key: values for key, values in _BACKGROUND_ATTRIBUTES.items() if key != "outcome"
 }
+# The API's main database pool watch (#5995). One series per metric: the
+# holders' code paths are in its exhaustion log line, never in a label.
+_DB_POOL_ATTRIBUTES = {"service.name": ["curie-api"], "pool": ["main"]}
 # One aggregate series: the count of agents the connector reconciler is
 # skipping right now (#1215). Which agents, and why, is in the log line each
 # skip transition emits; an agent label here would be a deployment identifier.
@@ -1063,6 +1066,27 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Age of the last successful background pass.",
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
+    ),
+    "curie.db.pool.checked_out": _definition(
+        "gauge",
+        "{connection}",
+        "Database pool connections checked out.",
+        False,
+        _DB_POOL_ATTRIBUTES,
+    ),
+    "curie.db.pool.oldest_checkout.age": _definition(
+        "gauge",
+        "s",
+        "Age of the oldest checked out database pool connection.",
+        False,
+        _DB_POOL_ATTRIBUTES,
+    ),
+    "curie.db.pool.starved.age": _definition(
+        "gauge",
+        "s",
+        "Seconds the database pool has handed out no connection while at capacity, 0 if not.",
+        False,
+        _DB_POOL_ATTRIBUTES,
     ),
     "curie.action_executor.execution": _definition(
         "counter",

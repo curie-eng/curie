@@ -5122,6 +5122,86 @@ start time. The eval matrix groups matching tagged observations by trace ID and
 uses the same root preference within its scan. A read that requires complete
 results returns an upstream error when it exceeds the pagination bound.
 
+## API database pool bounds
+
+The API serves every request from one main database pool of 15 connections
+(5 plus 10 overflow). Every wait that can hold one of those connections is
+bounded, so a stuck holder releases its connection instead of keeping it until
+the process restarts. Set any of these through `api.extraEnv`; no chart
+template change is needed. A value of 0 is accepted only where the table says
+so.
+
+| Variable | Default | What it bounds |
+|---|---|---|
+| `DB_POOL_TIMEOUT_SECONDS` | `30` | How long a request waits for a main pool connection before it fails. |
+| `DB_CONNECT_TIMEOUT_SECONDS` | `10` | Opening one database connection. |
+| `DB_COMMAND_TIMEOUT_SECONDS` | `75` | One database call when the server never answers, for example a dead TCP flow. Above the statement timeout on purpose, so on a healthy connection the server's own timeout fires first and the connection stays reusable. 0 disables it. |
+| `DB_STATEMENT_TIMEOUT_SECONDS` | `60` | Postgres `statement_timeout`. 0 leaves the server's setting. |
+| `DB_LOCK_TIMEOUT_SECONDS` | `30` | Postgres `lock_timeout`, advisory locks included. 0 leaves the server's setting. |
+| `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | `900` | Postgres `idle_in_transaction_session_timeout`. Deliberately long, because some requests hold a transaction open across slow external calls; it only ends a transaction that never ends. 0 leaves the server's setting. |
+| `DB_TCP_KEEPALIVE_IDLE_SECONDS`, `DB_TCP_KEEPALIVE_INTERVAL_SECONDS`, `DB_TCP_KEEPALIVE_COUNT` | `30`, `10`, `3` | TCP keepalive on both ends of each connection, so a dead peer is noticed and Postgres releases a dead client's locks. An idle of 0 disables keepalive. |
+| `DB_TCP_USER_TIMEOUT_SECONDS` | `60` | Unacknowledged sent data on a database socket, which keepalive does not cover. 0 disables it. |
+| `VALKEY_SOCKET_TIMEOUT_SECONDS`, `VALKEY_SOCKET_CONNECT_TIMEOUT_SECONDS` | `5`, `2` | Every Valkey command and connection the API makes, so a Valkey that stops answering cannot hold a caller, or the database connection it holds. |
+| `IDENTITY_FENCE_ACQUIRE_TIMEOUT_SECONDS` | `30` | One deadline over an identity write's advisory lock wait and its Valkey acknowledgement. Expiry fails that write as unavailable. |
+| `DB_POOL_WATCH_INTERVAL_SECONDS` | `5` | How often the pool watch samples the main pool. 0 disables the watch, and both probes then ignore the pool. |
+| `DB_POOL_PROBE_TIMEOUT_SECONDS` | `1` | How long the watch's own probe checkout may wait. |
+| `DB_POOL_READY_STARVED_SECONDS` | `30` | Starvation before `/ready` fails. |
+| `DB_POOL_RESTART_STARVED_SECONDS` | `120` | Starvation, with the database still answering, before `/health` fails. 0 disables this part of `/health`. |
+
+The session bounds are applied with `SET` right after each connection opens,
+not as connection startup parameters, so they also work behind a session mode
+connection pooler in front of your own Postgres.
+
+### Readiness, liveness and a wedged pool
+
+The pool watch calls the main pool starved when it is at capacity and nobody,
+including a one second probe checkout, has been handed a connection since its
+previous sample. A busy pool that keeps handing out connections is never
+unhealthy, however long its callers wait.
+
+1. `/ready` keeps its database check and also answers 503 with
+   `Database pool is exhausted` once the pool has been starved for
+   `DB_POOL_READY_STARVED_SECONDS`. That is one full pool timeout, the point at
+   which every request that arrived has already failed on its own pool
+   timeout. The chart's readiness probe then needs 24 consecutive failures at
+   5 seconds (120 seconds) before the pod leaves the Service, so a single
+   replica does not flap on a short stall.
+2. `/health` answers 503 with `Database pool is wedged` once the pool has been
+   starved for `DB_POOL_RESTART_STARVED_SECONDS` while the database still
+   answers on the API's separate liveness pool. Kubernetes restarts a
+   container on a failing liveness probe, not a failing readiness probe, so
+   this is the restart backstop. An unreachable database never fails
+   `/health`: a restart cannot help, and the API refuses to boot without its
+   database. The chart's liveness probe needs 12 consecutive failures at 15
+   seconds (180 seconds), so a wedged pod restarts about five minutes after
+   the wedge begins.
+
+The connection bounds above release a dead or stuck connection within about
+150 seconds (twice the command timeout), and any handout clears the starved
+state and the kubelet's failure count, so a wedge those bounds can cure never
+reaches a restart. The restart exists for holders nothing else releases, such
+as a quarantined identity write lease, which keeps its connection until the
+process exits by design. Both endpoints read only the watch's last sample and
+make no database or network call of their own; a watch that is disabled or has
+stopped sampling never fails either probe.
+
+While the pool is at capacity the API records, on every sample, three gauges
+labelled `pool="main"`: `curie.db.pool.checked_out`,
+`curie.db.pool.oldest_checkout.age` (seconds) and `curie.db.pool.starved.age`
+(seconds starved, 0 when not). It also logs one ERROR line on the
+`curie_api.db_pool_watch` logger on the first such sample and then at most
+every 30 seconds:
+
+```text
+database pool exhausted pool=main checked_out=15 capacity=15 oldest_checkout_age_s=412 starved_for_s=398 holders=[14x412s@curie_api/identity_fence.py:LINE:lock_identity_reader|awaiting=connection.py:LINE:_do_execute,398s@curie_api/identity_fence.py:LINE:mutation|awaiting=client.py:LINE:execute_command]
+```
+
+Each holder is the age of its checkout, the innermost API code location of the
+task holding the connection (file, line number and function), and the call it
+is waiting in, oldest first and grouped with a count when identical. The real
+line carries line numbers where this example shows `LINE`. A holder whose task has finished prints
+`unknown`. The line carries no SQL, parameters or exception text.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the

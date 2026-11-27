@@ -20545,6 +20545,13 @@ export interface operations {
                     };
                 };
             };
+            /** @description Database pool is wedged */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     ingest_hook_hooks__agent_id___hook__post: {
@@ -22197,7 +22204,7 @@ export interface operations {
                     };
                 };
             };
-            /** @description Database is unavailable */
+            /** @description Database is unavailable or its pool is exhausted */
             503: {
                 headers: {
                     [name: string]: unknown;

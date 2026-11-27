@@ -1523,7 +1523,10 @@ api:
     existingSecret: ""
     providerCaBundle: false
   # Probe cadences. Database aware /ready keeps the API out of the Service until
-  # Postgres responds, while process local /health keeps the process alive.
+  # Postgres responds and while its main database pool hands out nothing. /health
+  # makes no database call: it fails only when the in-process pool watch has seen
+  # that pool wedged while Postgres still answers, so an outage never restarts
+  # the API (docs/operations.md, "API database pool bounds").
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
   # Formula/rationale: ci/policy/engine.py (P3).
   # Kubelet withdrawal of a bounce shorter than the 120s readiness cutoff is

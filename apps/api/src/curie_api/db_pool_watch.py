@@ -1,0 +1,293 @@
+"""Watch the main database pool for a wedge nothing else releases (#5995).
+
+The pool is starved when it is at capacity and nobody, including a short
+probe checkout, has been handed a connection since the previous sample. A busy
+pool that keeps handing out connections is never unhealthy, however long its
+callers wait: the criterion is that the pool stopped turning over, not that a
+caller waited long.
+
+Readiness fails once that has lasted db_pool_ready_starved_seconds (30 s by
+default, one full pool timeout, the point at which every request that arrived
+has already failed on its own pool timeout). The chart's readiness probe then
+needs 24 consecutive failures at 5 s, so one replica does not leave the
+Service on a short stall.
+
+Kubernetes restarts a container on a failing liveness probe, not a failing
+readiness probe, so the restart backstop is /health. It fails only after
+db_pool_restart_starved_seconds (120 s) of starvation while the database still
+answers on the separate liveness pool: an unreachable database never triggers
+a restart, which could not help and would leave an API that refuses to boot
+without its database. The chart's liveness probe needs 12 consecutive failures
+at 15 s, so a wedged pod restarts about five minutes after the wedge begins.
+The client and server connection bounds (db.py) release a dead or stuck
+connection within about 150 s, twice the command timeout, and any handout
+clears the starved state and the kubelet's failure count, so a wedge those
+bounds can cure never reaches a restart. The restart exists for holders nothing
+else releases, such as a quarantined identity fence lease, which keeps its
+connection until the process exits by design.
+
+Every result the endpoints read is in memory. A watch that is disabled or has
+stopped ticking reports healthy: a broken monitor never fails a probe.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sysconfig
+import time
+from pathlib import Path
+from typing import Any, cast
+
+from curie_telemetry import record_metric
+from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.pool import QueuePool
+
+from .config import Settings
+
+_LOG = logging.getLogger(__name__)
+
+POOL_EXHAUSTED = "Database pool is exhausted"
+POOL_WEDGED = "Database pool is wedged"
+
+# The discriminator's own bound on asking the liveness pool for SELECT 1.
+_DATABASE_CHECK_TIMEOUT_S = 2.0
+# How often the exhaustion line repeats while the pool stays at capacity.
+_LOG_EVERY_S = 30.0
+_ATTRIBUTES = {"service.name": "curie-api", "pool": "main"}
+_PACKAGE = Path(__file__).resolve().parent
+_LIBRARY_ROOTS = tuple(
+    sorted(
+        {
+            str(Path(sysconfig.get_paths()[name]).resolve())
+            for name in ("stdlib", "platstdlib", "purelib", "platlib")
+        }
+    )
+)
+
+
+def _frames(task: asyncio.Task[Any] | None) -> list[tuple[str, int, str]] | None:
+    """The suspended task's coroutine frames, outermost first; None if unwalkable."""
+    if task is None or task.done():
+        return None
+    frames: list[tuple[str, int, str]] = []
+    awaited: Any = task.get_coro()
+    while awaited is not None and hasattr(awaited, "cr_frame"):
+        frame = awaited.cr_frame
+        if frame is None:
+            break
+        frames.append((frame.f_code.co_filename, frame.f_lineno, frame.f_code.co_name))
+        awaited = getattr(awaited, "cr_await", None)
+    return frames or None
+
+
+def _in_package(filename: str) -> str | None:
+    try:
+        relative = Path(filename).resolve().relative_to(_PACKAGE)
+    except ValueError:
+        return None
+    return f"{_PACKAGE.name}/{relative.as_posix()}"
+
+
+def _library(filename: str) -> bool:
+    resolved = str(Path(filename).resolve())
+    return resolved.startswith(_LIBRARY_ROOTS) or not Path(filename).is_absolute()
+
+
+def describe_holder(task: asyncio.Task[Any] | None) -> str:
+    """Where a checked out connection's task is: its own code, then the await.
+
+    The site is the innermost frame in this package, else the innermost frame
+    outside the standard library and installed libraries (by file name only).
+    """
+    frames = _frames(task)
+    if frames is None:
+        return "unknown"
+    site = "unknown"
+    for filename, line, function in reversed(frames):
+        relative = _in_package(filename)
+        if relative is not None:
+            site = f"{relative}:{line}:{function}"
+            break
+    else:
+        for filename, line, function in reversed(frames):
+            if not _library(filename):
+                site = f"{Path(filename).name}:{line}:{function}"
+                break
+    filename, line, function = frames[-1]
+    return f"{site}|awaiting={Path(filename).name}:{line}:{function}"
+
+
+class PoolWatch:
+    """Sample the main pool, decide starvation, report it to the probes."""
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        liveness: async_sessionmaker[AsyncSession],
+        capacity: int,
+        settings: Settings,
+    ) -> None:
+        self._engine = engine
+        self._pool = cast(QueuePool, engine.sync_engine.pool)
+        self._liveness = liveness
+        self._capacity = capacity
+        self._interval = settings.db_pool_watch_interval_seconds
+        self._probe_timeout = settings.db_pool_probe_timeout_seconds
+        self._ready_after = settings.db_pool_ready_starved_seconds
+        self._restart_after = settings.db_pool_restart_starved_seconds
+        # Keyed by connection record: checkout time and the checking out task.
+        self._checkouts: dict[Any, tuple[float, asyncio.Task[Any] | None]] = {}
+        self._handouts = 0
+        self._handouts_seen = 0
+        self._last_handout = time.monotonic()
+        self._starved = False
+        self._database_reachable = False
+        self._last_tick: float | None = None
+        self._logged_at: float | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._listeners: list[tuple[str, Any]] = [
+            ("checkout", self._checked_out),
+            ("checkin", self._released),
+            ("detach", self._released),
+        ]
+        for name, callback in self._listeners:
+            event.listen(self._pool, name, callback)
+
+    def _checked_out(self, dbapi_connection: Any, record: Any, proxy: Any) -> None:
+        # Runs inside SQLAlchemy's greenlet, where current_task() is still the
+        # task checking the connection out. O(1): no stack walking here.
+        now = time.monotonic()
+        self._checkouts[record] = (now, asyncio.current_task())
+        self._handouts += 1
+        self._last_handout = now
+
+    def _released(self, dbapi_connection: Any, record: Any) -> None:
+        self._checkouts.pop(record, None)
+
+    def start(self) -> None:
+        if self._interval > 0 and self._task is None:
+            self._task = asyncio.create_task(self.run_forever())
+
+    def close(self) -> None:
+        """Remove the pool listeners."""
+        for name, callback in self._listeners:
+            if event.contains(self._pool, name, callback):
+                event.remove(self._pool, name, callback)
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.close()
+
+    async def run_forever(self) -> None:
+        while True:
+            try:
+                await self.tick()
+            except Exception as error:  # noqa: BLE001 - the watch must keep sampling
+                _LOG.error("database pool watch tick failed error=%s", type(error).__name__)
+            await asyncio.sleep(self._interval)
+
+    async def tick(self) -> None:
+        checked_out = self._pool.checkedout()
+        if checked_out < self._capacity:
+            # Below capacity the pool can hand out a connection by definition;
+            # no database call is made, so the watch adds no load. The log
+            # limiter is not reset here, so a pool oscillating at its capacity
+            # still logs at most once per window.
+            self._starved = False
+        else:
+            if self._handouts == self._handouts_seen:
+                await self._probe()
+            self._starved = self._handouts == self._handouts_seen
+            if self._starved:
+                self._database_reachable = await self._database_answers()
+            now = time.monotonic()
+            if self._logged_at is None or now - self._logged_at >= _LOG_EVERY_S:
+                self._logged_at = now
+                self._log_exhaustion(checked_out)
+        self._handouts_seen = self._handouts
+        record_metric("curie.db.pool.checked_out", checked_out, attributes=_ATTRIBUTES)
+        record_metric(
+            "curie.db.pool.oldest_checkout.age", self.oldest_checkout_age(), attributes=_ATTRIBUTES
+        )
+        record_metric("curie.db.pool.starved.age", self.starved_for(), attributes=_ATTRIBUTES)
+        self._last_tick = time.monotonic()
+
+    async def _probe(self) -> None:
+        """Try one checkout; a success is recorded as a handout by the listener."""
+        connection = self._engine.connect()
+        try:
+            async with asyncio.timeout(self._probe_timeout):
+                await connection.start()
+        except Exception:  # noqa: BLE001 - any failure means nothing was handed out
+            return
+        await connection.close()
+
+    async def _database_answers(self) -> bool:
+        try:
+            async with asyncio.timeout(_DATABASE_CHECK_TIMEOUT_S):
+                async with self._liveness() as session:
+                    await session.execute(text("SELECT 1"))
+        except Exception:  # noqa: BLE001 - unreachable is the answer
+            return False
+        return True
+
+    def oldest_checkout_age(self) -> float:
+        starts = [started for started, _ in list(self._checkouts.values())]
+        return max(0.0, time.monotonic() - min(starts)) if starts else 0.0
+
+    def starved_for(self) -> float:
+        """Seconds since the last handout while starved, else 0."""
+        return max(0.0, time.monotonic() - self._last_handout) if self._starved else 0.0
+
+    @property
+    def database_reachable(self) -> bool:
+        return self._database_reachable
+
+    def _fresh(self) -> bool:
+        if self._interval <= 0 or self._last_tick is None:
+            return False
+        stale_after = 3 * self._interval + self._probe_timeout + _DATABASE_CHECK_TIMEOUT_S
+        return time.monotonic() - self._last_tick <= stale_after
+
+    def readiness_failure(self) -> str | None:
+        if self._fresh() and self.starved_for() >= self._ready_after:
+            return POOL_EXHAUSTED
+        return None
+
+    def liveness_failure(self) -> str | None:
+        if (
+            self._restart_after > 0
+            and self._fresh()
+            and self._database_reachable
+            and self.starved_for() >= self._restart_after
+        ):
+            return POOL_WEDGED
+        return None
+
+    def _log_exhaustion(self, checked_out: int) -> None:
+        now = time.monotonic()
+        held = sorted(list(self._checkouts.values()), key=lambda item: item[0])
+        groups: dict[str, list[float]] = {}
+        for started, task in held[: self._capacity]:
+            groups.setdefault(describe_holder(task), []).append(now - started)
+        holders = ",".join(
+            f"{len(ages)}x{int(ages[0])}s@{site}" if len(ages) > 1 else f"{int(ages[0])}s@{site}"
+            for site, ages in groups.items()
+        )
+        # Pre-rendered from a closed vocabulary (counts, ages and code
+        # locations), so the holder list survives the OTLP body, which keeps
+        # only a format string's template.
+        _LOG.error(
+            f"database pool exhausted pool=main checked_out={checked_out} "
+            f"capacity={self._capacity} "
+            f"oldest_checkout_age_s={int(self.oldest_checkout_age())} "
+            f"starved_for_s={int(self.starved_for())} holders=[{holders}]"
+        )

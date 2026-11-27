@@ -10,6 +10,8 @@ from uuid import uuid4
 import anyio
 from fastapi import HTTPException, Request
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.responses import JSONResponse
@@ -189,6 +191,8 @@ async def mutation(
     request: Request | None = None,
 ) -> AsyncIterator[AsyncSession]:
     """@spec IDENTITY-WRITER-LIFETIME-V1-2/3/5/6."""
+    from .config import get_settings
+
     if request is not None and _OWNER_KEY in request.scope.get("state", {}):
         raise IdentityWriterUnavailable()
     engine = factory.kw.get("bind")
@@ -199,11 +203,24 @@ async def mutation(
     pending: str | None = None
     primary: BaseException | None = None
     try:
-        await connection.execute(text("SELECT pg_advisory_lock(2250220)"))
-        await connection.commit()
-        token = f"pending:{uuid4().hex}"
-        if await client.set(FENCE_KEY, token) is not True:
-            raise IdentityWriterUnavailable()
+        # One deadline over the lock wait and the pending acknowledgement
+        # (#5995). Expiry leaves pending unset, so finish() discards the lease,
+        # and closing it releases the session lock on the server.
+        try:
+            async with asyncio.timeout(get_settings().identity_fence_acquire_timeout_seconds):
+                await connection.execute(text("SELECT pg_advisory_lock(2250220)"))
+                await connection.commit()
+                token = f"pending:{uuid4().hex}"
+                try:
+                    acknowledged = await client.set(FENCE_KEY, token)
+                except (RedisTimeoutError, RedisConnectionError):
+                    # Valkey did not answer within its socket bounds: the same
+                    # unavailability as the deadline, whichever fires first.
+                    raise IdentityWriterUnavailable() from None
+                if acknowledged is not True:
+                    raise IdentityWriterUnavailable()
+        except TimeoutError:
+            raise IdentityWriterUnavailable() from None
         pending = token
         owner.borrowable = True
         if request is not None:

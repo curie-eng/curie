@@ -298,7 +298,11 @@ class FactsExchange:
                     answer.observed_at if prior_id == row.request_comment_id else datetime.now(UTC)
                 )
                 return
-        valkey = AsyncRedis.from_url(self.settings.valkey_dsn(), retry_reads=False)
+        valkey = AsyncRedis.from_url(
+            self.settings.valkey_dsn(),
+            retry_reads=False,
+            **self.settings.valkey_client_options(),
+        )
         try:
             facts = await read_facts(
                 session,
