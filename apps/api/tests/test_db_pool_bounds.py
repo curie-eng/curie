@@ -91,35 +91,46 @@ def sqlstate(error: DBAPIError) -> str | None:
 def test_blackholed_query_releases_its_connection_within_the_bound(bounds: Any) -> None:
     """A reply that never arrives fails the call and frees its pool slot.
 
-    Observed with asyncpg 0.32.0: under ``command_timeout`` a query on a flow
-    that stops relaying raises the builtin TimeoutError after about twice the
-    command timeout, asyncpg closes the connection and SQLAlchemy invalidates
-    it, so the slot returns to the pool.
+    The query is running on the server before the flow dies, so only the
+    client's command timeout can end the wait: the statement timeout is off
+    and the server's reply is dropped. Observed with asyncpg 0.32.0 and
+    SQLAlchemy 2.0.52: the builtin TimeoutError reaches the caller unwrapped
+    after about twice the command timeout, asyncpg closes the connection and
+    SQLAlchemy invalidates it, so the slot returns to the pool.
     """
     real = make_url(get_settings().database_url)
+    sleeping = "SELECT pg_sleep(30)"
 
     async def check() -> None:
+        observer = create_async_engine(get_settings().database_url, poolclass=NullPool)
+        backend: int | None = None
         async with Blackhole(real.host or "127.0.0.1", real.port or 5432) as relay:
             url = real.set(host="127.0.0.1", port=relay.port)
             bounds(
                 DATABASE_URL=url.render_as_string(hide_password=False),
                 DB_COMMAND_TIMEOUT_SECONDS=1,
+                DB_STATEMENT_TIMEOUT_SECONDS=0,
             )
             engine = db.create_engine()
             try:
-                failure: BaseException | None = None
-                started = time.monotonic()
-                async with within(15, "a query on a dead flow"):
-                    try:
-                        async with engine.connect() as connection:
-                            assert await connection.scalar(text("SELECT 1")) == 1
-                            relay.freeze()
-                            started = time.monotonic()
-                            await connection.execute(text("SELECT 1"))
-                    except Exception as error:  # noqa: BLE001 - the failure is the outcome
-                        failure = error
-                elapsed = time.monotonic() - started
-                assert failure is not None
+                async with within(15, "a query on a dead flow"), engine.connect() as connection:
+                    backend = await connection.scalar(text("SELECT pg_backend_pid()"))
+                    query = asyncio.create_task(connection.execute(text(sleeping)))
+                    async with observer.connect() as watching:
+                        # Each check is a real round trip, so the loop paces itself.
+                        while not await watching.scalar(
+                            text(
+                                "SELECT count(*) FROM pg_stat_activity"
+                                " WHERE pid = :pid AND state = 'active' AND query = :query"
+                            ),
+                            {"pid": backend, "query": sleeping},
+                        ):
+                            assert not query.done()
+                    relay.freeze()
+                    started = time.monotonic()
+                    with pytest.raises(TimeoutError):
+                        await query
+                    elapsed = time.monotonic() - started
                 assert elapsed < 6, elapsed
                 assert engine.pool.checkedout() == 0  # type: ignore[attr-defined]
                 async with within(5, "a fresh checkout after the dead flow"):
@@ -128,6 +139,12 @@ def test_blackholed_query_releases_its_connection_within_the_bound(bounds: Any) 
             finally:
                 await relay.close()
                 await engine.dispose()
+                if backend is not None:
+                    async with observer.connect() as cleanup:
+                        await cleanup.execute(
+                            text("SELECT pg_terminate_backend(:pid)"), {"pid": backend}
+                        )
+                await observer.dispose()
 
     run(check)
 
@@ -259,6 +276,25 @@ def test_client_socket_keepalive_and_user_timeout(bounds: Any) -> None:
             await engine.dispose()
 
     run(check)
+
+
+def test_socket_options_skip_a_unix_domain_socket(bounds: Any) -> None:
+    """A unix socket DATABASE_URL connects: the TCP options are not applied.
+
+    Observed on Linux: SO_KEEPALIVE is accepted on a unix socket, the TCP
+    keepalive options raise EOPNOTSUPP.
+    """
+    bounds(DB_TCP_KEEPALIVE_IDLE_SECONDS=17, DB_TCP_USER_TIMEOUT_SECONDS=9)
+    options = db._socket_options(get_settings())
+    assert options
+    left, right = socket.socketpair()
+    try:
+        assert left.family == socket.AF_UNIX
+        db.apply_socket_options(left, options)
+        assert left.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 0
+    finally:
+        left.close()
+        right.close()
 
 
 def test_disabled_bounds_still_connect_and_query(bounds: Any) -> None:

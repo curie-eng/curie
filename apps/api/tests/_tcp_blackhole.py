@@ -3,8 +3,10 @@
 ``Blackhole`` relays to a real server and can freeze every flow it already
 carries: bytes in either direction are read and dropped while both sockets
 stay open, which is what a dead network path looks like to a client that has
-no bound of its own. Flows accepted after a freeze relay normally, so a fresh
-connection through the same address works. ``silent_listener`` accepts
+no bound of its own. ``freeze_replies`` drops only what the server sends, so
+requests still arrive and take effect while their answers are lost. Flows
+accepted after a freeze relay normally, so a fresh connection through the
+same address works. ``silent_listener`` accepts
 connections and never answers at all. ``within`` turns a missing bound into a
 test failure instead of a hang.
 """
@@ -33,7 +35,8 @@ async def within(seconds: float, what: str) -> AsyncIterator[None]:
 
 class _Flow:
     def __init__(self) -> None:
-        self.frozen = False
+        self.requests_frozen = False
+        self.replies_frozen = False
 
 
 class Blackhole:
@@ -58,7 +61,13 @@ class Blackhole:
     def freeze(self) -> None:
         """Stop relaying on every current flow; sockets stay open."""
         for flow in self._flows:
-            flow.frozen = True
+            flow.requests_frozen = True
+            flow.replies_frozen = True
+
+    def freeze_replies(self) -> None:
+        """Drop what the server sends on every current flow; requests still relay."""
+        for flow in self._flows:
+            flow.replies_frozen = True
 
     async def close(self) -> None:
         if self._server is not None:
@@ -81,8 +90,8 @@ class Blackhole:
         upstream_reader, upstream_writer = await asyncio.open_connection(*self._target)
         self._writers.append(upstream_writer)
         pumps = [
-            asyncio.create_task(self._pump(flow, reader, upstream_writer)),
-            asyncio.create_task(self._pump(flow, upstream_reader, writer)),
+            asyncio.create_task(self._pump(flow, "requests_frozen", reader, upstream_writer)),
+            asyncio.create_task(self._pump(flow, "replies_frozen", upstream_reader, writer)),
         ]
         self._tasks.update(pumps)
         try:
@@ -96,10 +105,13 @@ class Blackhole:
 
     @staticmethod
     async def _pump(
-        flow: _Flow, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        flow: _Flow,
+        frozen: str,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
     ) -> None:
         while data := await reader.read(65536):
-            if flow.frozen:
+            if getattr(flow, frozen):
                 continue
             writer.write(data)
             await writer.drain()

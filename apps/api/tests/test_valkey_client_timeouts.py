@@ -32,21 +32,17 @@ def valkey_bounds(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     get_settings.cache_clear()
 
 
-def bounded_kwargs(client: Any) -> tuple[Any, Any, Any]:
+def bounded_kwargs(client: Any) -> tuple[Any, Any]:
     kwargs = client.connection_pool.connection_kwargs
-    return (
-        kwargs.get("socket_timeout"),
-        kwargs.get("socket_connect_timeout"),
-        kwargs.get("socket_keepalive"),
-    )
+    return (kwargs.get("socket_timeout"), kwargs.get("socket_connect_timeout"))
 
 
 def test_lifespan_valkey_clients_carry_the_socket_bounds(
     valkey_bounds: None, _disposable_db: Any
 ) -> None:
     with TestClient(create_app()) as client:
-        assert bounded_kwargs(client.app.state.valkey) == (0.5, 0.4, True)
-        assert bounded_kwargs(client.app.state.credential_valkey) == (0.5, 0.4, True)
+        assert bounded_kwargs(client.app.state.valkey) == (0.5, 0.4)
+        assert bounded_kwargs(client.app.state.credential_valkey) == (0.5, 0.4)
         # retry_reads stays off on the credential client only.
         assert client.app.state.credential_valkey._retry_reads is False
         assert client.app.state.valkey._retry_reads is True
@@ -59,7 +55,7 @@ def test_unanswered_command_times_out_within_the_bound(valkey_bounds: None) -> N
                 f"redis://127.0.0.1:{listener.port}/0", **get_settings().valkey_client_options()
             )
             try:
-                assert bounded_kwargs(client) == (0.5, 0.4, True)
+                assert bounded_kwargs(client) == (0.5, 0.4)
                 started = time.monotonic()
                 async with within(10, "a command Valkey never answers"):
                     with pytest.raises(RedisTimeoutError):
@@ -84,3 +80,25 @@ def test_bounded_client_still_serves_real_commands(valkey_bounds: None) -> None:
             await client.aclose()
 
     run(check)
+
+
+def test_unix_socket_url_builds_a_bounded_connection(valkey_bounds: None) -> None:
+    client = AsyncRedis.from_url(
+        "unix:///tmp/does-not-exist.sock", **get_settings().valkey_client_options()
+    )
+    # Building the connection is where redis-py rejects an option the unix
+    # connection class does not take; nothing connects here.
+    connection = client.connection_pool.make_connection()
+    assert (connection.socket_timeout, connection.socket_connect_timeout) == (0.5, 0.4)
+
+
+def test_url_query_timeouts_take_precedence_over_the_settings(valkey_bounds: None) -> None:
+    # Observed with redis-py 8.1.0: from_url merges the URL's query
+    # parameters over the keyword arguments, so an operator's
+    # socket_timeout or socket_connect_timeout on VALKEY_URL wins.
+    client = AsyncRedis.from_url(
+        "redis://127.0.0.1:1/0?socket_timeout=9&socket_connect_timeout=8",
+        **get_settings().valkey_client_options(),
+    )
+    connection = client.connection_pool.make_connection()
+    assert (connection.socket_timeout, connection.socket_connect_timeout) == (9.0, 8.0)

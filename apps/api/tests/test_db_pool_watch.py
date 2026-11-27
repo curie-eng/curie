@@ -14,12 +14,13 @@ import asyncio
 import contextlib
 import logging
 import socket
+import time
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
-from _tcp_blackhole import within
-from curie_api import db, identity_fence
+from _tcp_blackhole import silent_listener, within
+from curie_api import db, db_pool_watch, identity_fence
 from curie_api.config import get_settings
 from curie_api.db_pool_watch import POOL_EXHAUSTED, POOL_WEDGED, PoolWatch
 from curie_internal.valkey import AsyncRedis
@@ -330,6 +331,64 @@ def test_busy_pool_that_keeps_turning_over_stays_ready(
             await watch.stop()
             await engine.dispose()
             await liveness_engine.dispose()
+
+    run(check)
+
+
+def test_starvation_is_timed_from_the_last_sample_below_capacity(
+    watch_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pool idle for ten minutes that then fills is not starved for ten minutes.
+
+    Every slot fills with a connection still being opened (the server never
+    answers the startup), so the pool reaches capacity without a single
+    handout. The watch's clock is moved forward ten minutes after it was
+    built, as if the pool had sat idle that long.
+    """
+    real_url = get_settings().database_url
+
+    async def check() -> None:
+        async with silent_listener() as listener:
+            silent = make_url(real_url).set(host="127.0.0.1", port=listener.port)
+            watch_env(
+                DATABASE_URL=silent.render_as_string(hide_password=False),
+                DB_CONNECT_TIMEOUT_SECONDS=30,
+                DB_POOL_READY_STARVED_SECONDS=300,
+                DB_POOL_RESTART_STARVED_SECONDS=300,
+            )
+            engine = db.create_engine()
+            reachable = create_async_engine(real_url, poolclass=NullPool)
+            watch = build_watch(engine, async_sessionmaker(reachable))
+            real_clock = time.monotonic
+            monkeypatch.setattr(db_pool_watch, "monotonic", lambda: real_clock() + 600)
+            connecting: list[asyncio.Task[Any]] = []
+            try:
+                await watch.tick()
+                assert watch.starved_for() == 0
+                pool = engine.sync_engine.pool
+                connecting = [
+                    asyncio.create_task(engine.connect().start()) for _ in range(CAPACITY)
+                ]
+                await asyncio.to_thread(
+                    wait_until,
+                    lambda: pool.checkedout() == CAPACITY,  # type: ignore[attr-defined]
+                    10,
+                    "every slot to be opening a connection",
+                )
+                await watch.tick()
+                assert watch.database_reachable is True
+                assert 0 < watch.starved_for() < 60
+                assert watch.readiness_failure() is None
+                assert watch.liveness_failure() is None
+            finally:
+                for task in connecting:
+                    task.cancel()
+                for task in connecting:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                await watch.stop()
+                await engine.dispose()
+                await reachable.dispose()
 
     run(check)
 

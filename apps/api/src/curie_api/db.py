@@ -87,6 +87,18 @@ def _socket_options(settings: Settings) -> list[tuple[int, int, int]]:
     return options
 
 
+def apply_socket_options(sock: Any, options: list[tuple[int, int, int]]) -> None:
+    """Set the client socket options on a TCP socket; any other family is left as is.
+
+    A unix domain socket (a DATABASE_URL with a host directory) rejects the
+    TCP options, and a local socket has no peer to lose.
+    """
+    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return
+    for level, name, value in options:
+        sock.setsockopt(level, name, value)
+
+
 def _bounded(engine: AsyncEngine, settings: Settings) -> AsyncEngine:
     """Bound every physical connection right after it opens.
 
@@ -102,8 +114,7 @@ def _bounded(engine: AsyncEngine, settings: Settings) -> AsyncEngine:
     def connected(dbapi_connection: Any, connection_record: Any) -> None:
         # The asyncpg version is locked and a test pins this transport shape.
         sock = dbapi_connection.driver_connection._transport.get_extra_info("socket")
-        for level, name, value in options:
-            sock.setsockopt(level, name, value)
+        apply_socket_options(sock, options)
         if bounds:
             dbapi_connection.run_async(lambda connection: connection.execute(bounds))
 

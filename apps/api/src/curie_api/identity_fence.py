@@ -13,11 +13,14 @@ from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy import event, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 FENCE_KEY = "curie:identity:admission-fence"
+# Postgres lock_not_available, raised when lock_timeout ends a lock wait.
+_LOCK_NOT_AVAILABLE = "55P03"
 _PUBLISH = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('SET', KEYS[1], ARGV[2])
@@ -208,7 +211,14 @@ async def mutation(
         # and closing it releases the session lock on the server.
         try:
             async with asyncio.timeout(get_settings().identity_fence_acquire_timeout_seconds):
-                await connection.execute(text("SELECT pg_advisory_lock(2250220)"))
+                try:
+                    await connection.execute(text("SELECT pg_advisory_lock(2250220)"))
+                except DBAPIError as error:
+                    # The server's lock_timeout ended the wait first: the same
+                    # unavailability as the deadline.
+                    if getattr(error.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE:
+                        raise IdentityWriterUnavailable() from None
+                    raise
                 await connection.commit()
                 token = f"pending:{uuid4().hex}"
                 try:

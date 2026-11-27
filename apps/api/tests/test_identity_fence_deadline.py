@@ -14,9 +14,10 @@ import contextlib
 import time
 from collections.abc import Iterator
 from typing import Any
+from urllib.parse import quote
 
 import pytest
-from _tcp_blackhole import silent_listener, within
+from _tcp_blackhole import Blackhole, silent_listener, within
 from curie_api import db, identity_fence
 from curie_api.config import get_settings
 from curie_internal.valkey import AsyncRedis
@@ -118,6 +119,92 @@ def test_fence_lock_wait_past_the_deadline_is_unavailable(fence_env: Any) -> Non
             await client.aclose()
             await engine.dispose()
             await holder.dispose()
+
+    run(check)
+
+
+def test_fence_lock_timeout_before_the_deadline_is_unavailable(fence_env: Any) -> None:
+    """The server's lock timeout ending the fence lock wait is the same outcome."""
+    fence_env(DB_LOCK_TIMEOUT_SECONDS=1, IDENTITY_FENCE_ACQUIRE_TIMEOUT_SECONDS=30)
+
+    async def check() -> None:
+        settings = get_settings()
+        engine = db.create_engine()
+        factory = async_sessionmaker(engine)
+        holder = create_async_engine(settings.database_url, poolclass=NullPool)
+        client = AsyncRedis.from_url(settings.valkey_dsn(), **settings.valkey_client_options())
+        try:
+            async with holder.connect() as held:
+                await held.execute(text("SELECT pg_advisory_lock(:key)"), {"key": FENCE_LOCK})
+                started = time.monotonic()
+                async with within(10, "a fence lock wait under a lock timeout"):
+                    with pytest.raises(identity_fence.IdentityWriterUnavailable):
+                        async with identity_fence.mutation(factory, client):
+                            pytest.fail("the fence was acquired while another session held it")
+                assert time.monotonic() - started < 4
+                assert engine.pool.checkedout() == 0  # type: ignore[attr-defined]
+                # The holder still owns the lock it took.
+                released = await held.scalar(
+                    text("SELECT pg_advisory_unlock(:key)"), {"key": FENCE_LOCK}
+                )
+                assert released is True
+        finally:
+            await client.aclose()
+            await engine.dispose()
+            await holder.dispose()
+
+    run(check)
+
+
+def test_lost_fence_acknowledgement_is_unavailable_and_the_next_mutation_heals(
+    fence_env: Any,
+) -> None:
+    """Valkey applies the pending write but its reply is lost on the way back."""
+    fence_env(IDENTITY_FENCE_ACQUIRE_TIMEOUT_SECONDS=30)
+
+    async def check() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url, pool_size=5, max_overflow=0)
+        factory = async_sessionmaker(engine)
+        observer = create_async_engine(settings.database_url, poolclass=NullPool)
+        healthy = AsyncRedis.from_url(settings.valkey_dsn(), **settings.valkey_client_options())
+        key = identity_fence.FENCE_KEY
+        try:
+            async with Blackhole(settings.valkey_host, settings.valkey_port) as relay:
+                password = quote(settings.valkey_password, safe="")
+                lossy = AsyncRedis.from_url(
+                    f"redis://:{password}@127.0.0.1:{relay.port}/0", socket_timeout=1
+                )
+                try:
+                    # One open connection through the relay, then lose its replies.
+                    assert await lossy.ping() is True
+                    await healthy.set(key, "stable:before")
+                    relay.freeze_replies()
+                    started = time.monotonic()
+                    async with within(10, "a fence acknowledgement lost in transit"):
+                        with pytest.raises(identity_fence.IdentityWriterUnavailable):
+                            async with identity_fence.mutation(factory, lossy):
+                                pytest.fail("the fence was acquired without an acknowledgement")
+                    assert time.monotonic() - started < 4
+                finally:
+                    await lossy.aclose()
+            assert engine.pool.checkedout() == 0  # type: ignore[attr-defined]
+            async with observer.connect() as probe:
+                taken = await probe.scalar(
+                    text("SELECT pg_try_advisory_lock(:key)"), {"key": FENCE_LOCK}
+                )
+                assert taken is True
+                await probe.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": FENCE_LOCK})
+            # The write landed although its reply did not.
+            assert (await healthy.get(key)).startswith(b"pending:")
+            async with identity_fence.mutation(factory, healthy):
+                pass
+            assert (await healthy.get(key)).startswith(b"stable:")
+        finally:
+            await healthy.delete(key)
+            await healthy.aclose()
+            await engine.dispose()
+            await observer.dispose()
 
     run(check)
 

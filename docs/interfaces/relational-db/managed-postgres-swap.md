@@ -40,6 +40,10 @@ and the one validation that proves it.
      Neither suffix authenticates the server certificate, so api, worker, and
      Langfuse traffic is encrypted but not authenticated; a `verify-full` mode
      needs a mounted CA bundle and is not this knob.
+     The pooled endpoint is a transaction mode pooler: see
+     [API database pool bounds](../../operations.md#api-database-pool-bounds)
+     for how to keep the API's statement, lock and idle transaction timeouts
+     behind one.
    - The role must own (or be able to create) the `curie` schema. Migration
      `0001_initial` issues `CREATE SCHEMA IF NOT EXISTS curie`.
 

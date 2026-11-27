@@ -1293,11 +1293,14 @@ class Settings(BaseSettings):
         return f"{scheme}://:{password}@{self.valkey_host}:{self.valkey_port}/0"
 
     def valkey_client_options(self) -> dict[str, Any]:
-        """Socket bounds every API Valkey client is built with (#5995)."""
+        """Socket bounds every API Valkey client is built with (#5995).
+
+        Only options every redis-py connection class accepts: a unix:// URL
+        builds a connection that rejects socket_keepalive.
+        """
         return {
             "socket_timeout": self.valkey_socket_timeout_seconds,
             "socket_connect_timeout": self.valkey_socket_connect_timeout_seconds,
-            "socket_keepalive": True,
         }
 
     def upgrade_quiesce_key(self) -> str:

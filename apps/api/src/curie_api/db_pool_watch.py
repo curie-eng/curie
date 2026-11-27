@@ -19,14 +19,15 @@ answers on the separate liveness pool: an unreachable database never triggers
 a restart, which could not help and would leave an API that refuses to boot
 without its database. The chart's liveness probe needs 12 consecutive failures
 at 15 s, so a wedged pod restarts about five minutes after the wedge begins.
-The client and server connection bounds (db.py) release a dead or stuck
-connection within about 150 s, twice the command timeout, and any handout
-clears the starved state and the kubelet's failure count, so a wedge those
-bounds can cure never reaches a restart. The restart exists for holders nothing
-else releases, such as a quarantined identity fence lease, which keeps its
-connection until the process exits by design.
+The client and server connection bounds (db.py) release a stuck connection:
+a lock wait at the lock timeout, a vanished peer through keepalive in about
+60 s, and a reply that never arrives within about 150 s, twice the command
+timeout. Any handout clears the starved state and the kubelet's failure
+count, so a wedge those bounds can cure never reaches a restart. The restart
+exists for holders nothing else releases, such as a quarantined identity fence
+lease, which keeps its connection until the process exits by design.
 
-Every result the endpoints read is in memory. A watch that is disabled or has
+Every watch result the endpoints read is in memory. A watch that is disabled or has
 stopped ticking reports healthy: a broken monitor never fails a probe.
 """
 
@@ -35,8 +36,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import sysconfig
-import time
 from pathlib import Path
+from time import monotonic
 from typing import Any, cast
 
 from curie_telemetry import record_metric
@@ -173,7 +174,12 @@ class PoolWatch:
         self._checkouts: dict[Any, tuple[float, asyncio.Task[Any] | None]] = {}
         self._handouts = 0
         self._handouts_seen = 0
-        self._last_handout = time.monotonic()
+        self._last_handout = monotonic()
+        # The last sample below capacity. Starvation is measured from the later
+        # of this and the last handout, so a pool that sat idle and then filled
+        # without a single checkout (every slot still connecting) is not
+        # reported as starved since the idle period began.
+        self._last_below_capacity = self._last_handout
         self._starved = False
         self._database_reachable = False
         self._last_tick: float | None = None
@@ -190,7 +196,7 @@ class PoolWatch:
     def _checked_out(self, dbapi_connection: Any, record: Any, proxy: Any) -> None:
         # Runs inside SQLAlchemy's greenlet, where current_task() is still the
         # task checking the connection out. O(1): no stack walking here.
-        now = time.monotonic()
+        now = monotonic()
         self._checkouts[record] = (now, asyncio.current_task())
         self._handouts += 1
         self._last_handout = now
@@ -234,13 +240,14 @@ class PoolWatch:
             # limiter is not reset here, so a pool oscillating at its capacity
             # still logs at most once per window.
             self._starved = False
+            self._last_below_capacity = monotonic()
         else:
             if self._handouts == self._handouts_seen:
                 await self._probe()
             self._starved = self._handouts == self._handouts_seen
             if self._starved:
                 self._database_reachable = await self._database_answers()
-            now = time.monotonic()
+            now = monotonic()
             if self._logged_at is None or now - self._logged_at >= _LOG_EVERY_S:
                 self._logged_at = now
                 self._log_exhaustion(checked_out)
@@ -250,7 +257,7 @@ class PoolWatch:
             "curie.db.pool.oldest_checkout.age", self.oldest_checkout_age(), attributes=_ATTRIBUTES
         )
         record_metric("curie.db.pool.starved.age", self.starved_for(), attributes=_ATTRIBUTES)
-        self._last_tick = time.monotonic()
+        self._last_tick = monotonic()
 
     async def _probe(self) -> None:
         """Try one checkout; a success is recorded as a handout by the listener."""
@@ -273,11 +280,14 @@ class PoolWatch:
 
     def oldest_checkout_age(self) -> float:
         starts = [started for started, _ in list(self._checkouts.values())]
-        return max(0.0, time.monotonic() - min(starts)) if starts else 0.0
+        return max(0.0, monotonic() - min(starts)) if starts else 0.0
 
     def starved_for(self) -> float:
-        """Seconds since the last handout while starved, else 0."""
-        return max(0.0, time.monotonic() - self._last_handout) if self._starved else 0.0
+        """Seconds starved: since the later of the last handout and the last
+        sample below capacity, else 0 when not starved."""
+        if not self._starved:
+            return 0.0
+        return max(0.0, monotonic() - max(self._last_handout, self._last_below_capacity))
 
     @property
     def database_reachable(self) -> bool:
@@ -287,7 +297,7 @@ class PoolWatch:
         if self._interval <= 0 or self._last_tick is None:
             return False
         stale_after = 3 * self._interval + self._probe_timeout + _DATABASE_CHECK_TIMEOUT_S
-        return time.monotonic() - self._last_tick <= stale_after
+        return monotonic() - self._last_tick <= stale_after
 
     def readiness_failure(self) -> str | None:
         if self._fresh() and self.starved_for() >= self._ready_after:
@@ -305,7 +315,7 @@ class PoolWatch:
         return None
 
     def _log_exhaustion(self, checked_out: int) -> None:
-        now = time.monotonic()
+        now = monotonic()
         held = sorted(list(self._checkouts.values()), key=lambda item: item[0])
         groups: dict[str, list[float]] = {}
         for started, task in held[: self._capacity]:

@@ -25,6 +25,7 @@ from curie_internal.valkey import Redis
 from curie_test_support.static_shell import wait_until
 from fastapi.testclient import TestClient
 from sqlalchemy import make_url
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 CAPACITY = 15
 FENCED_WRITE = "/teams"
@@ -78,8 +79,11 @@ def test_health_without_a_lifespan_is_ok() -> None:
 
 
 def test_wedged_pool_fails_readiness_and_times_out_requests(wedge_env: Any) -> None:
+    """Server exceptions are raised in the test, so the refused request's
+    failure is seen as SQLAlchemy's own pool timeout, not a status code."""
+    pool_timeout = 1
     wedge_env(
-        DB_POOL_TIMEOUT_SECONDS=1,
+        DB_POOL_TIMEOUT_SECONDS=pool_timeout,
         DB_POOL_WATCH_INTERVAL_SECONDS=0.2,
         DB_POOL_PROBE_TIMEOUT_SECONDS=0.5,
         DB_POOL_READY_STARVED_SECONDS=1,
@@ -89,7 +93,7 @@ def test_wedged_pool_fails_readiness_and_times_out_requests(wedge_env: Any) -> N
     )
     headers = {"X-API-Key": get_settings().api_key}
     with (
-        TestClient(create_app(), raise_server_exceptions=False) as client,
+        TestClient(create_app()) as client,
         outside_fence_lock(get_settings().database_url) as release,
         ThreadPoolExecutor(max_workers=CAPACITY) as requests,
     ):
@@ -104,9 +108,11 @@ def test_wedged_pool_fails_readiness_and_times_out_requests(wedge_env: Any) -> N
             wait_until(lambda: client.get("/ready").status_code == 503, 10, "/ready to fail")
             assert client.get("/ready").json() == {"detail": "Database pool is exhausted"}
             started = time.monotonic()
-            refused = client.get("/agents", headers=headers)
-            assert refused.status_code >= 500
-            assert time.monotonic() - started < 4
+            with pytest.raises(PoolTimeoutError):
+                client.get("/agents", headers=headers)
+            elapsed = time.monotonic() - started
+            # It waited out the pool timeout, and nothing longer.
+            assert 0.8 * pool_timeout <= elapsed < 4, elapsed
             wait_until(lambda: client.get("/health").status_code == 503, 10, "/health to fail")
             assert client.get("/health").json() == {"detail": "Database pool is wedged"}
             assert not any(request.done() for request in parked)

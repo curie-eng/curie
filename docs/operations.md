@@ -5141,7 +5141,7 @@ so.
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | `900` | Postgres `idle_in_transaction_session_timeout`. Deliberately long, because some requests hold a transaction open across slow external calls; it only ends a transaction that never ends. 0 leaves the server's setting. |
 | `DB_TCP_KEEPALIVE_IDLE_SECONDS`, `DB_TCP_KEEPALIVE_INTERVAL_SECONDS`, `DB_TCP_KEEPALIVE_COUNT` | `30`, `10`, `3` | TCP keepalive on both ends of each connection, so a dead peer is noticed and Postgres releases a dead client's locks. An idle of 0 disables keepalive. |
 | `DB_TCP_USER_TIMEOUT_SECONDS` | `60` | Unacknowledged sent data on a database socket, which keepalive does not cover. 0 disables it. |
-| `VALKEY_SOCKET_TIMEOUT_SECONDS`, `VALKEY_SOCKET_CONNECT_TIMEOUT_SECONDS` | `5`, `2` | Every Valkey command and connection the API makes, so a Valkey that stops answering cannot hold a caller, or the database connection it holds. |
+| `VALKEY_SOCKET_TIMEOUT_SECONDS`, `VALKEY_SOCKET_CONNECT_TIMEOUT_SECONDS` | `5`, `2` | Every Valkey command and connection the API makes, so a Valkey that stops answering cannot hold a caller, or the database connection it holds. A `socket_timeout` or `socket_connect_timeout` query parameter on `VALKEY_URL` takes precedence over these. |
 | `IDENTITY_FENCE_ACQUIRE_TIMEOUT_SECONDS` | `30` | One deadline over an identity write's advisory lock wait and its Valkey acknowledgement. Expiry fails that write as unavailable. |
 | `DB_POOL_WATCH_INTERVAL_SECONDS` | `5` | How often the pool watch samples the main pool. 0 disables the watch, and both probes then ignore the pool. |
 | `DB_POOL_PROBE_TIMEOUT_SECONDS` | `1` | How long the watch's own probe checkout may wait. |
@@ -5149,8 +5149,16 @@ so.
 | `DB_POOL_RESTART_STARVED_SECONDS` | `120` | Starvation, with the database still answering, before `/health` fails. 0 disables this part of `/health`. |
 
 The session bounds are applied with `SET` right after each connection opens,
-not as connection startup parameters, so they also work behind a session mode
-connection pooler in front of your own Postgres.
+not as connection startup parameters. They hold on a direct connection and
+behind a session mode connection pooler. A transaction mode pooler (for
+example a pooled managed endpoint) can hand each transaction a different
+server connection, so a session `SET` does not reliably stay with the API's
+connection there. Behind one, set `DB_STATEMENT_TIMEOUT_SECONDS`,
+`DB_LOCK_TIMEOUT_SECONDS` and `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` to 0
+and configure the same three values as defaults on the database role, for
+example `ALTER ROLE curie SET statement_timeout = '60s'`. The client side
+bounds (pool, connect and command timeouts, keepalive and user timeout) apply
+on every path.
 
 ### Readiness, liveness and a wedged pool
 
@@ -5176,14 +5184,22 @@ unhealthy, however long its callers wait.
    seconds (180 seconds), so a wedged pod restarts about five minutes after
    the wedge begins.
 
-The connection bounds above release a dead or stuck connection within about
-150 seconds (twice the command timeout), and any handout clears the starved
-state and the kubelet's failure count, so a wedge those bounds can cure never
-reaches a restart. The restart exists for holders nothing else releases, such
-as a quarantined identity write lease, which keeps its connection until the
-process exits by design. Both endpoints read only the watch's last sample and
-make no database or network call of their own; a watch that is disabled or has
-stopped sampling never fails either probe.
+The connection bounds above release a stuck connection on their own. A lock
+wait ends at the lock timeout. A peer that has gone away is noticed by TCP
+keepalive in about 60 seconds (30 seconds idle, then 3 probes 10 seconds
+apart). A reply that never arrives on a connection that still looks alive
+ends within about 150 seconds, twice the command timeout. Any handout clears
+the starved state and the kubelet's failure count, so a wedge those bounds
+can cure never reaches a restart. The restart exists for holders nothing else
+releases, such as a quarantined identity write lease, which keeps its
+connection until the process exits by design.
+
+The two endpoints read the watch differently. `/ready` first runs its own
+query on the liveness pool and answers 503 with
+`Database is unavailable` when that fails, then applies the watch's cached
+pool decision. `/health` makes no database or network call: it reads only
+the watch's last sample. A watch that is disabled or has stopped sampling
+never fails either probe.
 
 While the pool is at capacity the API records, on every sample, three gauges
 labelled `pool="main"`: `curie.db.pool.checked_out`,
