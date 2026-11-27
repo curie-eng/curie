@@ -122,7 +122,7 @@ def test_facts_delivery_against_a_silent_valkey_finishes_within_the_bound(
                 )
                 exchange = FactsExchange(sessions, settings, tracker)
                 started = time.monotonic()
-                # Well under redis-py's own default, which never times out a read.
+                # Well under redis-py 8.1.0's own default socket timeout of 5 s.
                 async with within(3, "a facts delivery against a silent Valkey"):
                     await exchange.deliver_owed()
                 assert time.monotonic() - started < 3

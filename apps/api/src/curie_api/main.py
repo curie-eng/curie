@@ -168,6 +168,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
+    # The pool watch (#5995) registers its pool listeners here, before any
+    # startup task can check a connection out of the main pool, so every
+    # holder is known to it. It needs the liveness pool, which opens no
+    # connection until first use. Sampling starts at the end of startup.
+    liveness_engine = create_liveness_engine()
+    app.state.liveness_engine = liveness_engine
+    app.state.liveness_sessionmaker = create_sessionmaker(liveness_engine)
+    db_pool_watch = PoolWatch(
+        engine,
+        app.state.liveness_sessionmaker,
+        MAIN_POOL_SIZE + MAIN_POOL_MAX_OVERFLOW,
+        settings,
+    )
+    app.state.db_pool_watch = db_pool_watch
     # The factory's forge registry, built once from CURIE_FORGES (#4397), so a
     # config the registry refuses fails boot rather than the first factory pass.
     app.state.forges = forges_registry(settings)
@@ -406,10 +420,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             },
         )
     async with AsyncExitStack() as source_resources:
-        liveness_engine = create_liveness_engine()
         source_resources.push_async_callback(liveness_engine.dispose)
-        app.state.liveness_engine = liveness_engine
-        app.state.liveness_sessionmaker = create_sessionmaker(liveness_engine)
         source_gate_engine = create_source_gate_engine()
         source_resources.push_async_callback(source_gate_engine.dispose)
         app.state.source_gate = SourceGate(source_gate_engine)
@@ -421,16 +432,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.protected_admission_reconciler = protected_reconciler
         protected_reconciler.start()
         # Feeds /ready and /health from the main pool's turnover (#5995).
-        # Started last, right before the try, and stopped first in its finally:
-        # the main engine is disposed inside that finally, before this exit
-        # stack unwinds, so an exit stack callback would stop it too late.
-        db_pool_watch = PoolWatch(
-            engine,
-            app.state.liveness_sessionmaker,
-            MAIN_POOL_SIZE + MAIN_POOL_MAX_OVERFLOW,
-            settings,
-        )
-        app.state.db_pool_watch = db_pool_watch
+        # Sampling starts last, right before the try, and stops first in its
+        # finally: the main engine is disposed inside that finally, before
+        # this exit stack unwinds, so an exit stack callback would stop it too
+        # late.
         db_pool_watch.start()
         try:
             yield

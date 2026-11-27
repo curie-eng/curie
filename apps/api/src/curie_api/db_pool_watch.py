@@ -9,10 +9,12 @@ nobody. A busy pool that keeps handing out
 connections is never unhealthy, however long its callers wait: the criterion
 is that the pool stopped turning over, not that a caller waited long.
 
-Readiness fails once that has lasted db_pool_ready_starved_seconds. Its 30 s
-default equals the default pool timeout, so a stall shorter than one pool
-timeout never fails readiness; a request that arrived during starvation may
-still be waiting out its own pool timeout. The chart's readiness probe then
+Readiness fails once that has lasted db_pool_ready_starved_seconds (30 s by
+default, the default pool timeout). Starvation is timed from the later of the
+last handout and the last sample below capacity, so the clock can start up to
+one sample interval before the pool actually filled, and a request that
+arrived during starvation may still be waiting out its own pool timeout. The
+chart's readiness probe then
 needs 24 consecutive failures at 5 s, so one replica does not leave the
 Service on a short stall.
 

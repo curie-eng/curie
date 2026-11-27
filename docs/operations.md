@@ -5175,12 +5175,15 @@ wait.
 
 1. `/ready` keeps its database check and also answers 503 with
    `Database pool is exhausted` once the pool has been starved for
-   `DB_POOL_READY_STARVED_SECONDS`. Its default equals the default pool
-   timeout, so a stall shorter than one pool timeout never fails readiness.
-   The two are separate settings, and a request that arrived during the
-   starvation may still be waiting out its own pool timeout. The chart's readiness probe then needs 24 consecutive failures at
-   5 seconds (120 seconds) before the pod leaves the Service, so a single
-   replica does not flap on a short stall.
+   `DB_POOL_READY_STARVED_SECONDS`. Starvation is timed from the last
+   handout, or from the watch's last sample of a pool that was below
+   capacity, whichever is later, so the clock can start up to one sample
+   interval (5 seconds by default) before the pool actually filled. The
+   default equals the default pool timeout, but the two are separate
+   settings, and a request that arrived during the starvation may still be
+   waiting out its own pool timeout. The chart's readiness probe then needs
+   24 consecutive failures at 5 seconds (120 seconds) before the pod leaves
+   the Service, so a single replica does not flap on a short stall.
 2. `/health` answers 503 with `Database pool is wedged` once the pool has been
    starved for `DB_POOL_RESTART_STARVED_SECONDS` while the database still
    answers on the API's separate liveness pool. Kubernetes restarts a
