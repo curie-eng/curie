@@ -26,8 +26,9 @@ at 15 s, so a wedged pod restarts about five minutes after the wedge begins.
 The client and server connection bounds (db.py) release a stuck connection:
 a lock wait at the lock timeout, a vanished peer through keepalive in about
 60 s, and a reply that never arrives within about 150 s, twice the command
-timeout. Any handout clears the starved state and the kubelet's failure
-count, so a wedge those bounds can cure never reaches a restart. The restart
+timeout. Any handout clears the starved state, so the next liveness probe
+succeeds and resets the kubelet's failure count; at the defaults a wedge those
+bounds can cure is released before a restart is reached. The restart
 exists for holders nothing else releases, such as a quarantined identity fence
 lease, which keeps its connection until the process exits by design.
 
