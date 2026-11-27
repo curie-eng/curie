@@ -5193,14 +5193,21 @@ labelled `pool="main"`: `curie.db.pool.checked_out`,
 every 30 seconds:
 
 ```text
-database pool exhausted pool=main checked_out=15 capacity=15 oldest_checkout_age_s=412 starved_for_s=398 holders=[14x412s@curie_api/identity_fence.py:LINE:lock_identity_reader|awaiting=connection.py:LINE:_do_execute,398s@curie_api/identity_fence.py:LINE:mutation|awaiting=client.py:LINE:execute_command]
+database pool exhausted pool=main checked_out=15 capacity=15 oldest_checkout_age_s=412 starved_for_s=398 holders=[15x412s@curie_api/identity_fence.py:LINE:mutation|awaiting=FILE:LINE:FUNCTION]
 ```
 
-Each holder is the age of its checkout, the innermost API code location of the
-task holding the connection (file, line number and function), and the call it
-is waiting in, oldest first and grouped with a count when identical. The real
-line carries line numbers where this example shows `LINE`. A holder whose task has finished prints
-`unknown`. The line carries no SQL, parameters or exception text.
+This example is 15 identity writes parked on the identity fence's advisory
+lock. Each holder is the age of its checkout, the innermost API code location
+of the task holding the connection (file, line number and function), and the
+innermost call it is waiting in, by file name, line number and function,
+oldest first and grouped with a count when identical. The walk follows a task
+into the body of an async context manager, so a write waiting inside the
+fence names `mutation` rather than the request middleware that entered it.
+Whether that innermost call is in the database driver or the Valkey client
+says whether the write waits on the lock or on its Valkey acknowledgement.
+The real line carries values where this example shows `LINE`, `FILE` and
+`FUNCTION`. A holder whose task has finished prints `unknown`. The line
+carries no SQL, parameters or exception text.
 
 ## Known gotchas
 

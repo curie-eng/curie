@@ -55,6 +55,8 @@ POOL_WEDGED = "Database pool is wedged"
 _DATABASE_CHECK_TIMEOUT_S = 2.0
 # How often the exhaustion line repeats while the pool stays at capacity.
 _LOG_EVERY_S = 30.0
+# Bound on one holder's await chain walk.
+_MAX_FRAMES = 64
 _ATTRIBUTES = {"service.name": "curie-api", "pool": "main"}
 _PACKAGE = Path(__file__).resolve().parent
 _LIBRARY_ROOTS = tuple(
@@ -67,18 +69,48 @@ _LIBRARY_ROOTS = tuple(
 )
 
 
+def _next_awaited(awaited: Any, frame: Any) -> Any:
+    """What a suspended coroutine or async generator frame is waiting on.
+
+    An ``@asynccontextmanager`` entering or leaving its body awaits
+    ``anext(self.gen)``, an object with no frame of its own; the generator it
+    drives is reachable only through the context manager, so the walk hops to
+    it there rather than stopping one level too high.
+    """
+    nested = getattr(awaited, "cr_await", None)
+    if nested is None:
+        nested = getattr(awaited, "ag_await", None)
+    if (
+        frame.f_code.co_name in {"__aenter__", "__aexit__"}
+        and Path(frame.f_code.co_filename).name == "contextlib.py"
+        and not hasattr(nested, "cr_frame")
+        and not hasattr(nested, "ag_frame")
+    ):
+        generator = getattr(frame.f_locals.get("self"), "gen", None)
+        if hasattr(generator, "ag_frame"):
+            return generator
+    return nested
+
+
 def _frames(task: asyncio.Task[Any] | None) -> list[tuple[str, int, str]] | None:
-    """The suspended task's coroutine frames, outermost first; None if unwalkable."""
+    """The suspended task's coroutine frames, outermost first; None if unwalkable.
+
+    Follows coroutines and async generators, at most _MAX_FRAMES deep; any
+    other shape ends the walk with what was collected.
+    """
     if task is None or task.done():
         return None
     frames: list[tuple[str, int, str]] = []
-    awaited: Any = task.get_coro()
-    while awaited is not None and hasattr(awaited, "cr_frame"):
-        frame = awaited.cr_frame
-        if frame is None:
-            break
-        frames.append((frame.f_code.co_filename, frame.f_lineno, frame.f_code.co_name))
-        awaited = getattr(awaited, "cr_await", None)
+    try:
+        awaited: Any = task.get_coro()
+        while awaited is not None and len(frames) < _MAX_FRAMES:
+            frame = getattr(awaited, "cr_frame", None) or getattr(awaited, "ag_frame", None)
+            if frame is None:
+                break
+            frames.append((frame.f_code.co_filename, frame.f_lineno, frame.f_code.co_name))
+            awaited = _next_awaited(awaited, frame)
+    except Exception:  # noqa: BLE001 - a diagnostic walk never fails the tick
+        pass
     return frames or None
 
 

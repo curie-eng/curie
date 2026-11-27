@@ -22,13 +22,14 @@ from _tcp_blackhole import within
 from curie_api import db, identity_fence
 from curie_api.config import get_settings
 from curie_api.db_pool_watch import POOL_EXHAUSTED, POOL_WEDGED, PoolWatch
+from curie_internal.valkey import AsyncRedis
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
 from curie_test_support.static_shell import wait_until
 from identity_writer_lifetime_support import blocking, run
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
-from sqlalchemy import make_url, text
+from sqlalchemy import event, make_url, text
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
@@ -138,6 +139,14 @@ async def read_identity_behind_writer(
         await release.wait()
 
 
+async def mutate_identity_behind_writer(
+    factory: async_sessionmaker[Any], client: Any, release: asyncio.Event
+) -> None:
+    """A real fence mutation, parked on the advisory lock the writer holds."""
+    async with identity_fence.mutation(factory, client):
+        await release.wait()
+
+
 class Holders:
     """Real tasks holding real main pool connections, each waited until parked.
 
@@ -165,6 +174,30 @@ class Holders:
         holder_pid = await writer.scalar(text("SELECT pg_backend_pid()"))
         async with within(10, "the reader waiting on the fence lock"):
             await blocking(writer, await backend, holder_pid)  # type: ignore[arg-type]
+        parked.set()
+
+    async def hold_fence_mutation(self, writer: AsyncConnection, client: Any) -> None:
+        """Park one real fence mutation on the lock ``writer`` holds, seen in Postgres."""
+        pool = self.engine.sync_engine.pool
+        backend: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        parked, release = asyncio.Event(), asyncio.Event()
+        task = asyncio.create_task(
+            mutate_identity_behind_writer(async_sessionmaker(self.engine), client, release)
+        )
+        self.tasks.append((task, parked, release))
+
+        def checked_out(dbapi_connection: Any, record: Any, proxy: Any) -> None:
+            # The fence's own connection; its server pid is known without a query.
+            if asyncio.current_task() is task and not backend.done():
+                backend.set_result(dbapi_connection.driver_connection.get_server_pid())
+
+        event.listen(pool, "checkout", checked_out)
+        try:
+            holder_pid = await writer.scalar(text("SELECT pg_backend_pid()"))
+            async with within(10, "the fence mutation waiting on its lock"):
+                await blocking(writer, await backend, holder_pid)  # type: ignore[arg-type]
+        finally:
+            event.remove(pool, "checkout", checked_out)
         parked.set()
 
     async def fill(self) -> None:
@@ -195,7 +228,8 @@ def build_watch(engine: AsyncEngine, liveness: async_sessionmaker[Any]) -> PoolW
 def test_exhausted_pool_reports_holders_metrics_and_probes(
     watch_env: Any, pool_metrics: InMemoryMetricReader, watch_log: list[str]
 ) -> None:
-    watch_env()
+    # No lock timeout and a long fence deadline keep the fence holders parked.
+    watch_env(DB_LOCK_TIMEOUT_SECONDS=0, IDENTITY_FENCE_ACQUIRE_TIMEOUT_SECONDS=60)
 
     async def check() -> None:
         url = get_settings().database_url
@@ -204,12 +238,15 @@ def test_exhausted_pool_reports_holders_metrics_and_probes(
         writer = create_async_engine(url, poolclass=NullPool)
         watch = build_watch(engine, async_sessionmaker(liveness_engine))
         holders = Holders(engine)
+        settings = get_settings()
+        client = AsyncRedis.from_url(settings.valkey_dsn(), **settings.valkey_client_options())
         try:
             async with writer.connect() as stuck:
                 await stuck.execute(text("SELECT pg_advisory_lock(:key)"), {"key": FENCE_LOCK})
-                for _ in range(CAPACITY - 1):
+                for _ in range(CAPACITY - 2):
                     holders.hold()
                 await holders.hold_behind_writer(stuck)
+                await holders.hold_fence_mutation(stuck, client)
                 await holders.fill()
                 await watch.tick()
                 await watch.tick()
@@ -228,6 +265,9 @@ def test_exhausted_pool_reports_holders_metrics_and_probes(
                 )
                 assert "curie_api/identity_fence.py:" in line
                 assert ":lock_identity_reader|awaiting=" in line
+                # Named inside the @asynccontextmanager body, not at its __aenter__.
+                assert ":mutation|awaiting=" in line
+                assert "contextlib.py" not in line
                 assert "test_db_pool_watch.py:" in line
                 assert ":hold_connection_in_test|awaiting=" in line
                 assert "SELECT" not in line
@@ -246,6 +286,8 @@ def test_exhausted_pool_reports_holders_metrics_and_probes(
             assert len(watch_log) == 1
         finally:
             await holders.release_all()
+            await client.delete(identity_fence.FENCE_KEY)
+            await client.aclose()
             await watch.stop()
             await engine.dispose()
             await liveness_engine.dispose()
