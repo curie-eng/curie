@@ -664,7 +664,9 @@ def test_unrelated_lookup_is_preserved_without_verbatim_mode(tmp_path):
     assert not any(f.get("classification") == "final-answer-validation" for f in frames)
 
 
-def test_unrelated_lookup_keeps_connector_notice(tmp_path):
+def test_unrelated_lookup_carries_no_connector_notice(tmp_path):
+    # The turn never called the unavailable connector, so the reply is the
+    # model's answer alone (#5986); the failure is only logged.
     async def exercise():
         runner, _ = runner_for(
             [_result(text=LOOKUP_ANSWER)],
@@ -678,8 +680,7 @@ def test_unrelated_lookup_keeps_connector_notice(tmp_path):
         await runner.start()
         try:
             frames = [json.loads(line) async for line in runner.run_turn(EVENT)]
-            assert frames[-1]["text"] != LOOKUP_ANSWER
-            assert frames[-1]["text"].endswith(LOOKUP_ANSWER)
+            assert frames[-1]["text"] == LOOKUP_ANSWER
             assert frames[-1]["text_mode"] is None
         finally:
             await runner.close()

@@ -224,7 +224,7 @@ class _FirstBlockedTranscriptStore(_RecordingTranscriptStore):
 
 class _ReplayExportSession(FakeModelSession):
     def __init__(self, mode: str) -> None:
-        super().__init__(default_turn)
+        super().__init__(_connector_turn)
         self.mode = mode
 
     async def export_replay_state(self) -> HarnessReplayState:
@@ -2648,10 +2648,30 @@ def _connector_failure() -> ConnectorCapabilityFailure:
     )
 
 
+def _connector_turn() -> list:
+    """The default turn, but its tool call goes to the declared connector.
+
+    The connector notice leads only a reply whose turn called a tool of an
+    unavailable connector (#5986), so these connector tests make that call.
+    """
+
+    from claude_agent_sdk import TextBlock, ToolUseBlock
+    from curie_runner.fake import _assistant, _result, _tool_result
+
+    usage = {"input_tokens": 20, "output_tokens": 8}
+    return [
+        _assistant(TextBlock(text="Looking into it")),
+        _assistant(ToolUseBlock(id="t1", name="mcp__github__search", input={})),
+        _tool_result("t1", "unavailable"),
+        _assistant(TextBlock(text="all done"), usage=usage),
+        _result(text="all done", usage=usage),
+    ]
+
+
 def _connector_runner(
     tracer: RunTracer | None = None, **kwargs
 ) -> tuple[SessionRunner, FakeModelSession]:
-    fake = FakeModelSession(default_turn)
+    fake = FakeModelSession(_connector_turn)
     runner = SessionRunner(
         max_usd_per_day=None,
         held_secrets=frozenset(),
@@ -2782,7 +2802,7 @@ class _ReconnectingFakeSession(FakeModelSession):
     """A fake session that also answers the MCP reconnector protocol."""
 
     def __init__(self, answers: list[bool]) -> None:
-        super().__init__(default_turn)
+        super().__init__(_connector_turn)
         self.answers = answers
         self.ensured: list[str] = []
 
@@ -3034,7 +3054,7 @@ def test_slow_session_confirmation_is_not_cancelled_by_the_budget(
             completed.append(name)
             return True
 
-    session = _SlowConfirmSession(default_turn)
+    session = _SlowConfirmSession(_connector_turn)
     availability = ConnectorAvailability()
 
     async def recovered(_failures):
