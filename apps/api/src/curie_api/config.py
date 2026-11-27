@@ -543,6 +543,22 @@ class Settings(BaseSettings):
     # agree on the stream name with no manual sync.
     dead_letter_watch_interval_s: float = 30.0
 
+    # The main database pool watch (#5995, `db_pool_watch.py`). A connection
+    # checked out longer than the threshold is named once in a WARNING line,
+    # and the pool gauges are recorded every interval.
+    db_pool_hold_warning_s: float = Field(
+        default=120.0,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices("CURIE_DB_POOL_HOLD_WARNING_S", "db_pool_hold_warning_s"),
+    )
+    db_pool_watch_interval_s: float = Field(
+        default=10.0,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices("CURIE_DB_POOL_WATCH_INTERVAL_S", "db_pool_watch_interval_s"),
+    )
+
     # The API mirror of the worker's CURIE_DEAD_LETTER_STREAM override, so the
     # graveyard watcher tracks the SAME stream the worker dead-letters to. Empty
     # derives `<runs_stream>:dead`. DISTINCT from `resume_dead_letter_stream` below

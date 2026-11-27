@@ -641,6 +641,9 @@ _BACKGROUND_ATTRIBUTES = {
 _BACKGROUND_AGE_ATTRIBUTES = {
     key: values for key, values in _BACKGROUND_ATTRIBUTES.items() if key != "outcome"
 }
+# The API's main SQLAlchemy pool (#5995). Which code holds a connection is in
+# the WARNING line a long hold emits, never in a label.
+_DB_POOL_ATTRIBUTES = {"service.name": ["curie-api"], "pool": ["main"]}
 # One aggregate series: the count of agents the connector reconciler is
 # skipping right now (#1215). Which agents, and why, is in the log line each
 # skip transition emits; an agent label here would be a deployment identifier.
@@ -1063,6 +1066,27 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Age of the last successful background pass.",
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
+    ),
+    "curie.db.pool.checked_out": _definition(
+        "gauge",
+        "{connection}",
+        "Database connections checked out of the pool.",
+        False,
+        _DB_POOL_ATTRIBUTES,
+    ),
+    "curie.db.pool.capacity": _definition(
+        "gauge",
+        "{connection}",
+        "Connections the pool hands out before a checkout waits: pool size plus maximum overflow.",
+        False,
+        _DB_POOL_ATTRIBUTES,
+    ),
+    "curie.db.pool.checked_out.age": _definition(
+        "gauge",
+        "s",
+        "Age of the oldest connection still checked out of the pool, 0 when none is.",
+        False,
+        _DB_POOL_ATTRIBUTES,
     ),
     "curie.action_executor.execution": _definition(
         "counter",

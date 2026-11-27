@@ -108,8 +108,9 @@ than an open bag of `gen_ai.*` names.
   transcript-capacity, capacity waits (`curie.capacity.wait`), state mutations,
   legacy state-token use (`curie.state.legacy_token`), supervised-task restarts,
   work-item reconciler step failures (`curie.work_item.reconciler.step.failure`), tool
-  results, Slack Socket Mode connection state, and Slack Socket Mode delivery
-  per identity (`curie.slack.socket.envelopes`, `curie.slack.delivery_canary`).
+  results, Slack Socket Mode connection state, Slack Socket Mode delivery
+  per identity (`curie.slack.socket.envelopes`, `curie.slack.delivery_canary`),
+  and the API's main database pool (`curie.db.pool.*`).
   `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
@@ -173,6 +174,18 @@ than an open bag of `gen_ai.*` names.
   page keys on `overdue`, since a healthy reaper always sees a few namespaces just past
   their TTL between sweeps. None of the three carries a namespace or run name; each reaped namespace logs one WARNING
   naming it and whether the TTL or a terminal run status caused the delete.
+- `curie.db.pool.checked_out`, `curie.db.pool.capacity` and
+  `curie.db.pool.checked_out.age` describe the API's main SQLAlchemy pool, labeled
+  only `service.name=curie-api` and `pool=main`. `PoolWatch`
+  (`apps/api/src/curie_api/db_pool_watch.py::PoolWatch`) attaches to the engine through
+  pool events and records the three gauges every `CURIE_DB_POOL_WATCH_INTERVAL_S`
+  (10 seconds). `checked_out` equal to `capacity` (pool size plus maximum overflow) means
+  the next checkout waits; the age is that of the oldest connection still out, 0 when
+  none is. A connection out longer than `CURIE_DB_POOL_HOLD_WARNING_S` (120 seconds) is
+  named once in a WARNING line with the request route or asyncio task that took it, the
+  trace id in scope at checkout, and up to six `curie_api` and `curie_internal` frames
+  of the code that took it. The holder never becomes a metric label. SQLAlchemy has no
+  event for a checkout that timed out waiting, so no timeout counter exists.
 - `curie.tool.result` counts each tool result the runner sees close a call made in the
   same turn, by `origin` and `outcome`
   (`runner/src/curie_runner/session.py::SessionRunner._observe_tool_results`). The

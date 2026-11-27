@@ -45,6 +45,7 @@ from .db import (
     create_sessionmaker,
     create_source_gate_engine,
 )
+from .db_pool_watch import HOLDER_ROUTE, PoolWatch
 from .evalqueue import EvalQueue
 from .forges.registry import forges_registry
 from .github_app import credentials_for, log_credential_path
@@ -164,6 +165,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await assert_servable()
     engine = create_engine()
     app.state.engine = engine
+    # Names whoever holds the main pool's connections (#5995). Attached before
+    # anything checks out, so every checkout is tracked.
+    db_pool_watch = PoolWatch(engine, hold_warning_s=settings.db_pool_hold_warning_s)
+    app.state.db_pool_watch = db_pool_watch
     app.state.sessionmaker = create_sessionmaker(engine)
     # The factory's forge registry, built once from CURIE_FORGES (#4397), so a
     # config the registry refuses fails boot rather than the first factory pass.
@@ -413,6 +418,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.protected_admission_reconciler = protected_reconciler
         protected_reconciler.start()
+        app.state.db_pool_watch_task = asyncio.create_task(
+            db_pool_watch.run_forever(settings.db_pool_watch_interval_s)
+        )
         try:
             yield
         finally:
@@ -520,6 +528,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await poller_task
                 except asyncio.CancelledError:
                     pass
+            pool_watch_task = app.state.db_pool_watch_task
+            pool_watch_task.cancel()
+            try:
+                await pool_watch_task
+            except asyncio.CancelledError:
+                pass
+            db_pool_watch.close()
             try:
                 await credential_valkey.aclose()
                 await valkey.aclose()
@@ -624,6 +639,8 @@ class HttpTelemetryMiddleware:
         started = time.monotonic()
         status_code = 500
         record_metric("curie.http.server.active", 1, attributes=active_attributes)
+        # A main pool checkout made for this request names it (#5995).
+        holder_route = HOLDER_ROUTE.set(f"{active_attributes['source']} {operation}")
         try:
             with operation_span(
                 "http.server.request",
@@ -659,6 +676,7 @@ class HttpTelemetryMiddleware:
                 attributes=completed_attributes,
             )
             record_metric("curie.http.server.active", -1, attributes=active_attributes)
+            HOLDER_ROUTE.reset(holder_route)
 
 
 # @spec HTTP-INVOCATION-EXECUTION-15

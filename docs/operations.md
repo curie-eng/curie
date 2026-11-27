@@ -948,6 +948,45 @@ revision is safe to roll back to (a first install, or a release whose every
 prior revision failed), the command tells you so rather than doing nothing or
 rolling back to something broken. See issue #1899 for the original report.
 
+### When the API runs out of database connections
+
+The API serves routes and background loops from one main database pool (5
+connections plus 10 overflow). If all of them are checked out and none comes
+back, every route and loop that needs one fails after 30 seconds with
+`QueuePool limit of size 5 overflow 10 reached`, while `/ready` stays 200
+because it uses a separate pool (#5995).
+
+Two signals name the cause:
+
+1. The gauges `curie.db.pool.checked_out`, `curie.db.pool.capacity` and
+   `curie.db.pool.checked_out.age` (attributes `service.name=curie-api`,
+   `pool=main`), recorded every 10 seconds. `checked_out` equal to `capacity`
+   with a rising `checked_out.age` is a wedged pool. For example, alert when
+   `curie.db.pool.checked_out.age` stays above 300 for five minutes. The alert
+   is not installed for you, and the default metrics exporter is `nop`.
+2. One WARNING line in the API log for each connection held longer than 120
+   seconds, naming who took it:
+
+   ```text
+   db pool checkout held past threshold state=held pool=main held_s=121.4 threshold_s=120 checked_out=15 capacity=15 route='GET /agents' task='RequestResponseCycle.run_asgi' trace_id=4bf92f3577b34da6a3ce929d0e0e4736 stack=curie_api/crud/agents.py:119:list_agents <- curie_api/routers/agents.py:294:list_agents
+   ```
+
+   `state=held` is written by the watch while the connection is still out;
+   `state=released` means it came back after the threshold but before a watch
+   pass saw it. `route` is the request that took the connection, `task` the
+   asyncio task (a background loop is named by its coroutine, such as
+   `WorkItemReconciler.run_forever`), and `stack` the innermost platform frames,
+   innermost first. Each connection is named at most once. Read it with
+   `kubectl logs` on the API pod; the OTLP copy of an API log line keeps only
+   its template.
+
+The knobs, set through `api.extraEnv`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CURIE_DB_POOL_HOLD_WARNING_S` | `120` | Seconds a connection may stay out before it is named |
+| `CURIE_DB_POOL_WATCH_INTERVAL_S` | `10` | Seconds between gauge recordings and threshold checks |
+
 ## Deploying your plugin bundle onto the Curie platform
 
 ### Manually, with `curie cluster deploy`
