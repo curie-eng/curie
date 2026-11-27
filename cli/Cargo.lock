@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "curie"
-version = "0.17.3"
+version = "0.17.4"
 dependencies = [
  "anstream",
  "anstyle",
