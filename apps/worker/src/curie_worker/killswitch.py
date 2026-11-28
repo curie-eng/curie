@@ -75,7 +75,7 @@ class KillSwitch:
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(self._stop.wait(), timeout=1.0)
         finally:
-            await pubsub.aclose()  # type: ignore[no-untyped-call]
+            await pubsub.aclose()
 
     async def _handle(self, message: dict[str, object]) -> None:
         try:
