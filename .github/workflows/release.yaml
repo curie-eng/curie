@@ -991,7 +991,7 @@ jobs:
       # a binary scan would need. Scanning the cli/ tree instead would also drag in
       # cli/target/, which the build step above has just filled with rlibs (#629).
       - name: Generate the CLI SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         with:
           file: cli/Cargo.lock
           format: spdx-json
@@ -1065,7 +1065,7 @@ jobs:
       # signature, and a GitHub build provenance attestation (see
       # docs/release-verification.md).
       - name: Generate the chart SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         with:
           file: dist/curie-${{ steps.ver.outputs.v }}.tgz
           format: spdx-json
@@ -1073,7 +1073,7 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
       - name: Generate the compose SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
         with:
           file: dist/compose.release.yaml
           format: spdx-json
