@@ -40,12 +40,21 @@ TABLE_ROWS_QUERY = (
 # checks for a cycle once, deadlock_timeout into a lock wait, and Postgres
 # aborts the backend whose check finds it. The reset began waiting first, so
 # at the shared 1 s default its check ran first and the reset was aborted.
-# The API keeps that default, so the live transaction now finds the cycle and
+# The API keeps that default, so the live transaction finds such a cycle and
 # is aborted instead, and its loop repeats the pass. The reset waits on lock
-# holders exactly as before. Only a cycle whose live members already ran their
-# one check before it closed still ends in the reset's abort, after a minute,
-# well inside the reset's 300 s psql command budget.
+# holders exactly as before. A cycle whose live members all ran their one
+# check before it closed is broken by reset_cycle_breaker_sql instead; this
+# timeout only bounds a reset whose breaker never ran.
 RESET_DEADLOCK_TIMEOUT = "1min"
+# The two-key advisory lock the reset holds for its whole transaction, so the
+# breaker can find the reset's backend in pg_locks. The API's two-key
+# advisory locks use other class ids.
+RESET_LOCK_KEYS = (0x6334, 0x7273)
+# How often the breaker looks for a cycle through the reset.
+RESET_BREAKER_INTERVAL_SECONDS = 0.05
+# The breaker's own bound, past the reset's 300 s psql command budget, for a
+# breaker whose psql client was killed without the server noticing.
+RESET_BREAKER_LIFETIME = "330 seconds"
 
 
 class CaseIsolationError(RuntimeError):
@@ -123,7 +132,9 @@ def reset_sql(table_rows: tuple[tuple[str, int], ...], tenants: frozenset[str]) 
     table that was empty in the baseline is truncated too, so a row a
     case created anywhere else is removed. A table with baseline rows is
     not cleaned: the verification snapshot reports a changed count. The text
-    runs inside transaction_sql, so its SET LOCAL lasts for the reset alone.
+    runs inside transaction_sql, so its SET LOCAL and its advisory lock last
+    for the reset alone. The advisory lock is how reset_cycle_breaker_sql,
+    which runs beside it, finds the reset's backend.
     """
 
     kept = ", ".join(f"'{uuid.UUID(tenant)}'" for tenant in sorted(tenants))
@@ -141,8 +152,50 @@ def reset_sql(table_rows: tuple[tuple[str, int], ...], tenants: frozenset[str]) 
     ]
     return (
         f"SET LOCAL deadlock_timeout = '{RESET_DEADLOCK_TIMEOUT}'; "
+        f"SELECT pg_advisory_xact_lock({RESET_LOCK_KEYS[0]}, {RESET_LOCK_KEYS[1]}); "
         "TRUNCATE " + ", ".join(swept) + " CASCADE; "
         "DELETE FROM curie.tenants" + (f" WHERE id NOT IN ({kept})" if kept else "")
+    )
+
+
+def reset_cycle_breaker_sql() -> str:
+    """The statement that runs beside the reset and breaks its lock cycles.
+
+    Postgres runs one deadlock check per lock wait, deadlock_timeout after
+    the wait starts. A live transaction that began waiting on a table the
+    reset already holds, while the reset was still waiting on some unrelated
+    holder, checks and finds no cycle. When the reset later waits on a table
+    that transaction holds, the cycle is complete, but only the reset's own
+    check is still to run, so Postgres aborts the reset.
+
+    The breaker looks for that cycle from the outside: every backend that
+    directly blocks the reset and is itself blocked, through any chain of
+    lock waits, by the reset. It cancels that backend's statement, which is
+    the victim Postgres picks when the live side's check runs first, and the
+    API's loops repeat a cancelled pass the same way. A backend that only
+    holds a lock the reset waits for, without waiting on the reset, is left
+    alone, and so is a reset in any other database on the server. The
+    statement loops until its client is gone or its lifetime ends.
+    """
+
+    classid, objid = RESET_LOCK_KEYS
+    return (
+        "DO $c4_breaker$ DECLARE until timestamptz := clock_timestamp() + "
+        f"interval '{RESET_BREAKER_LIFETIME}'; BEGIN "
+        "WHILE clock_timestamp() < until LOOP "
+        "PERFORM pg_cancel_backend(cycle.root) FROM ("
+        "WITH RECURSIVE reset AS ("
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
+        "AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+        f"AND classid = {classid} AND objid = {objid} AND objsubid = 2), "
+        "waits(root, pid) AS ("
+        "SELECT blocker, blocker FROM reset, unnest(pg_blocking_pids(reset.pid)) AS blocker "
+        "UNION SELECT waits.root, blocker FROM waits, "
+        "unnest(pg_blocking_pids(waits.pid)) AS blocker) "
+        "SELECT DISTINCT waits.root FROM waits JOIN reset ON waits.pid = reset.pid"
+        ") AS cycle; "
+        f"PERFORM pg_sleep({RESET_BREAKER_INTERVAL_SECONDS}); "
+        "END LOOP; END $c4_breaker$"
     )
 
 

@@ -24,6 +24,7 @@ pins what such a failure now shows: its SQLSTATE and nothing else.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import secrets
@@ -37,7 +38,7 @@ from typing import Any
 
 import asyncpg
 import pytest
-from sqlalchemy import make_url
+from sqlalchemy import make_url, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -51,6 +52,7 @@ from c4_admitted_kind import AdmittedKind  # noqa: E402
 from c4_shared_install import (  # noqa: E402
     TABLE_ROWS_QUERY,
     inventoried_table_rows,
+    reset_cycle_breaker_sql,
     reset_sql,
     transaction_sql,
 )
@@ -200,6 +202,104 @@ def test_reset_completes_when_the_live_poll_intake_closes_a_lock_cycle(
     reset_database: str,
 ) -> None:
     asyncio.run(reset_beside_poll(reset_database))
+
+
+# The live read's own deadlock_timeout, longer than the test. Postgres checks
+# a waiting backend for a cycle once, deadlock_timeout into its wait; a live
+# read that began waiting before the cycle closed has spent that one check, so
+# from then on it never looks again. A timeout the test cannot reach is that
+# state without waiting for the check to pass.
+LIVE_DEADLOCK_TIMEOUT = "1h"
+
+
+async def reset_closing_a_checked_cycle(url: str) -> None:
+    """The cycle shape #5524 left open: the reset is the last backend to wait.
+
+    A third transaction holds agents, so the reset takes work_items and stalls
+    there. The poll then waits on work_items while the reset waits on that
+    third holder, so its one deadlock check finds no cycle (modelled by
+    LIVE_DEADLOCK_TIMEOUT). When the holder commits, the reset moves on to
+    agent_channels, which the poll holds, and closes the cycle. Only the
+    reset's own check can find it now, so the reset runs beside the harness's
+    cycle breaker, as reset_case runs it.
+    """
+
+    engine = create_async_engine(url)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    observer = await asyncpg.connect(**connect_args(url))
+    psql = await asyncpg.connect(**connect_args(url))
+    holder = await asyncpg.connect(**connect_args(url))
+    breaker = await asyncpg.connect(**connect_args(url))
+    breaker_pid = await breaker.fetchval("SELECT pg_backend_pid()")
+    breaking = asyncio.create_task(breaker.execute(reset_cycle_breaker_sql()))
+    try:
+        baseline_rows, baseline_tenants = await install_state(observer)
+        async with sessions() as session:
+            tenant = Tenant(deployment_id="acme-case")
+            session.add(tenant)
+            await session.flush()
+            agent = Agent(name="acme-bot", tenant_id=tenant.id)
+            session.add(agent)
+            await session.flush()
+            session.add(
+                AgentChannel(
+                    agent_id=agent.id,
+                    tenant_id=tenant.id,
+                    kind="github",
+                    address=REPOSITORY,
+                    trigger_label="acme-label",
+                )
+            )
+            await session.commit()
+        pid = await psql.fetchval("SELECT pg_backend_pid()")
+        async with sessions() as poll:
+            await poll.execute(text(f"SET LOCAL deadlock_timeout = '{LIVE_DEADLOCK_TIMEOUT}'"))
+            poll_pid = await poll.scalar(text("SELECT pg_backend_pid()"))
+            assert await bound_repositories(poll) == [REPOSITORY]
+            holding = holder.transaction()
+            await holding.start()
+            await holder.fetchval("SELECT count(*) FROM curie.agents")
+            resetting = asyncio.create_task(
+                start_reset(psql, observer, baseline_rows, baseline_tenants)
+            )
+            await reset_waits_on(observer, pid, "curie.agents", resetting)
+            reading = asyncio.create_task(open_work_item_repositories(poll))
+            await reset_waits_on(observer, poll_pid, "curie.work_items", reading)
+            await holding.commit()
+            reset, read = await asyncio.gather(resetting, reading, return_exceptions=True)
+        assert not isinstance(reset, BaseException), (
+            f"the reset was aborted: {type(reset).__name__} "
+            f"SQLSTATE {getattr(reset, 'sqlstate', None)}: {reset}"
+        )
+        # The breaker cancelled the poll's read, which the reconciler repeats
+        # on its next pass like any failed pass.
+        assert isinstance(read, DBAPIError), f"the poll read was not cancelled: {read!r}"
+        assert getattr(read.orig, "sqlstate", None) == "57014", read
+        assert await install_state(observer) == (baseline_rows, baseline_tenants)
+    finally:
+        await observer.execute("SELECT pg_cancel_backend($1)", breaker_pid)
+        with contextlib.suppress(asyncpg.QueryCanceledError):
+            await breaking
+        await breaker.close()
+        await holder.close()
+        await psql.close()
+        await observer.close()
+        await engine.dispose()
+
+
+async def start_reset(
+    psql: asyncpg.Connection,
+    observer: asyncpg.Connection,
+    table_rows: tuple[tuple[str, int], ...],
+    tenants: frozenset[str],
+) -> None:
+    await psql.execute(transaction_sql(reset_sql(table_rows, tenants)))
+
+
+def test_reset_completes_when_it_is_the_last_to_wait_in_a_lock_cycle(
+    reset_database: str,
+) -> None:
+    asyncio.run(reset_closing_a_checked_cycle(reset_database))
 
 
 PSQL_EXEC = ("exec", "statefulset/curie-postgres", "--", "psql", "-c", "SELECT 1")
