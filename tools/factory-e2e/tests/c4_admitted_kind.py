@@ -69,14 +69,17 @@ VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "re
 # The pod-side script write_reset runs: $1 is the breaker statement, $2 the
 # reset, and the rest the psql command. The breaker starts first and is
 # stopped when the reset exits; its psql checks for a closed client every
-# 100 ms, so its server backend ends with it. Only the reset's exit status and
-# output are the command's.
+# 100 ms, so its server backend ends with it. The breaker is also stopped
+# when the shell itself is signalled. Only the reset's exit status and output
+# are the command's.
 RESET_WITH_BREAKER = (
-    "breaker=$1 reset=$2; shift 2; "
+    "breaker=$1 reset=$2; shift 2; breaking=; "
+    'trap \'[ -n "$breaking" ] && kill "$breaking" 2>/dev/null\' EXIT; '
+    "trap 'exit 143' INT TERM HUP; "
     'PGOPTIONS="-c client_connection_check_interval=100ms" "$@" -q -c "$breaker" '
     ">/dev/null 2>&1 & breaking=$!; "
     'status=0; "$@" -c "$reset" || status=$?; '
-    'kill "$breaking" 2>/dev/null; wait "$breaking" 2>/dev/null; exit "$status"'
+    'kill "$breaking" 2>/dev/null; wait "$breaking" 2>/dev/null; breaking=; exit "$status"'
 )
 # psql runs with VERBOSITY=verbose, so a server error report opens with its
 # SQLSTATE, as in "ERROR:  40P01: deadlock detected". The five character code

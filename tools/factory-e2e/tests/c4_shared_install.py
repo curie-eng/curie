@@ -174,7 +174,8 @@ def reset_cycle_breaker_sql() -> str:
     the victim Postgres picks when the live side's check runs first, and the
     API's loops repeat a cancelled pass the same way. A backend that only
     holds a lock the reset waits for, without waiting on the reset, is left
-    alone. The statement loops until its client is gone or its lifetime ends.
+    alone, and so is a reset in any other database on the server. The
+    statement loops until its client is gone or its lifetime ends.
     """
 
     classid, objid = RESET_LOCK_KEYS
@@ -185,6 +186,7 @@ def reset_cycle_breaker_sql() -> str:
         "PERFORM pg_cancel_backend(cycle.root) FROM ("
         "WITH RECURSIVE reset AS ("
         "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
+        "AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
         f"AND classid = {classid} AND objid = {objid} AND objsubid = 2), "
         "waits(root, pid) AS ("
         "SELECT blocker, blocker FROM reset, unnest(pg_blocking_pids(reset.pid)) AS blocker "
