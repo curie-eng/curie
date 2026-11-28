@@ -37,6 +37,7 @@ from c4_shared_install import (
     case_owned_streams,
     inventoried_table_rows,
     leftover_state,
+    reset_cycle_breaker_sql,
     reset_sql,
     transaction_sql,
 )
@@ -65,6 +66,18 @@ SCENARIO_ISSUE = 3815
 # WorkItems that dedupe them are truncated; 4 s allows several polls of each.
 RETIRE_OBSERVE_SECONDS = 4
 VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "resourceFieldRef"})
+# The pod-side script write_reset runs: $1 is the breaker statement, $2 the
+# reset, and the rest the psql command. The breaker starts first and is
+# stopped when the reset exits; its psql checks for a closed client every
+# 100 ms, so its server backend ends with it. Only the reset's exit status and
+# output are the command's.
+RESET_WITH_BREAKER = (
+    "breaker=$1 reset=$2; shift 2; "
+    'PGOPTIONS="-c client_connection_check_interval=100ms" "$@" -q -c "$breaker" '
+    ">/dev/null 2>&1 & breaking=$!; "
+    'status=0; "$@" -c "$reset" || status=$?; '
+    'kill "$breaking" 2>/dev/null; wait "$breaking" 2>/dev/null; exit "$status"'
+)
 # psql runs with VERBOSITY=verbose, so a server error report opens with its
 # SQLSTATE, as in "ERROR:  40P01: deadlock detected". The five character code
 # is the one part of a database error a visible failure message carries; the
@@ -1347,7 +1360,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         remaining = RETIRE_OBSERVE_SECONDS - (time.monotonic() - retired_at)
         if remaining > 0:
             time.sleep(remaining)
-        self.write_sql(reset_sql(baseline.table_rows, baseline.tenants))
+        self.write_reset(reset_sql(baseline.table_rows, baseline.tenants))
         self.valkey("XTRIM", RUNS_STREAM_DEFAULT, "MAXLEN", "0")
         for stream in sorted(self.stream_keys() - baseline.streams):
             self.valkey("DEL", stream)
@@ -1571,6 +1584,17 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             "-n", self.namespace, "exec", "statefulset/curie-postgres", "--",
             "psql", "-U", "postgres", "-d", "postgres", "-At",
             "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-c", transaction_sql(query),
+        )
+
+    def write_reset(self, query: str) -> None:
+        """Run the reset write with its lock cycle breaker beside it in the Postgres pod."""
+
+        self.kubectl(
+            "-n", self.namespace, "exec", "statefulset/curie-postgres", "--",
+            "sh", "-c", RESET_WITH_BREAKER, "c4-reset",
+            reset_cycle_breaker_sql(), transaction_sql(query),
+            "psql", "-U", "postgres", "-d", "postgres", "-At",
+            "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose",
         )
 
     def check_violation(self, query: str) -> Any:

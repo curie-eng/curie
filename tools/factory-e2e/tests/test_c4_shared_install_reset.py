@@ -24,6 +24,7 @@ pins what such a failure now shows: its SQLSTATE and nothing else.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import secrets
@@ -51,6 +52,7 @@ from c4_admitted_kind import AdmittedKind  # noqa: E402
 from c4_shared_install import (  # noqa: E402
     TABLE_ROWS_QUERY,
     inventoried_table_rows,
+    reset_cycle_breaker_sql,
     reset_sql,
     transaction_sql,
 )
@@ -218,7 +220,8 @@ async def reset_closing_a_checked_cycle(url: str) -> None:
     third holder, so its one deadlock check finds no cycle (modelled by
     LIVE_DEADLOCK_TIMEOUT). When the holder commits, the reset moves on to
     agent_channels, which the poll holds, and closes the cycle. Only the
-    reset's own check can find it now.
+    reset's own check can find it now, so the reset runs beside the harness's
+    cycle breaker, as reset_case runs it.
     """
 
     engine = create_async_engine(url)
@@ -226,6 +229,9 @@ async def reset_closing_a_checked_cycle(url: str) -> None:
     observer = await asyncpg.connect(**connect_args(url))
     psql = await asyncpg.connect(**connect_args(url))
     holder = await asyncpg.connect(**connect_args(url))
+    breaker = await asyncpg.connect(**connect_args(url))
+    breaker_pid = await breaker.fetchval("SELECT pg_backend_pid()")
+    breaking = asyncio.create_task(breaker.execute(reset_cycle_breaker_sql()))
     try:
         baseline_rows, baseline_tenants = await install_state(observer)
         async with sessions() as session:
@@ -271,6 +277,10 @@ async def reset_closing_a_checked_cycle(url: str) -> None:
         assert getattr(read.orig, "sqlstate", None) == "57014", read
         assert await install_state(observer) == (baseline_rows, baseline_tenants)
     finally:
+        await observer.execute("SELECT pg_cancel_backend($1)", breaker_pid)
+        with contextlib.suppress(asyncpg.QueryCanceledError):
+            await breaking
+        await breaker.close()
         await holder.close()
         await psql.close()
         await observer.close()
